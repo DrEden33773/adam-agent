@@ -15,9 +15,8 @@ Build a lightweight, inspectable local coding agent. Make the core coding path r
 - Fail closed on authorization and unknown effect classes. Keep model approval, user confirmation, permission policy, and OS sandbox enforcement as separate controls.
 - Do not claim production readiness, sandbox strength, or model improvement from deterministic fixtures or synthetic evaluation data.
 - Keep source provenance and third-party license notices at file or module level for reused or adapted code.
-- Every change must include proportionate contract, integration, security, or real-terminal tests at the interface it changes.
+- Every behavior change and bug fix must include proportionate tests at a pre-agreed caller-visible seam.
 - Linux is the only required platform until the first portfolio release is complete.
-- Use one durable progress record; do not create phase handoffs, freeze packets, evidence matrices, or repeated acceptance documents for routine continuation.
 
 ## Runtime ownership
 
@@ -65,10 +64,12 @@ Build a lightweight, inspectable local coding agent. Make the core coding path r
 
 ## Testing and toolchain
 
+- Before writing a behavior test, name the public interface and observable result under test. Work one failing behavior test and the minimum implementation to pass it at a time.
+- Do not pre-write a horizontal test suite, test private internals, or mock Adam-owned modules. Fake external providers, clocks, processes, filesystems, MCP servers, and Web sources only at their real seams.
 - Test through module interfaces and observable runtime events rather than private implementation state.
 - Use deterministic provider streams for tool ordering, rejection, cancellation, malformed output, compaction, and retry tests.
-- Add real-process tests for shell cancellation, MCP lifecycle, path confinement, and signal handling.
-- Add PTY or real-terminal coverage for resize, bracketed paste, wide-character input, permission prompts, interrupt, and cleanup.
+- Add real-process tests for shell cancellation, MCP lifecycle, path confinement, and signal handling when the corresponding adapters exist.
+- Add PTY or real-terminal coverage for resize, bracketed paste, wide-character input, permission prompts, interrupt, and cleanup when the interactive terminal exists.
 - Keep live-provider, live-Web, and external MCP tests opt-in; ordinary CI must not require credentials or network access.
 - Run focused tests while iterating and the complete Linux check once before merge.
 - Use Node.js 24 LTS, ESM, strict TypeScript, and the exact pnpm 11 release declared by `packageManager`. Commit `pnpm-lock.yaml`; do not use npm, Yarn, or Bun lockfiles.
