@@ -1,0 +1,27 @@
+{
+  "name": "adam-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.21.0",
+  "engines": {
+    "node": ">=24.0.0 <25",
+    "pnpm": ">=11.21.0 <12"
+  },
+  "scripts": {
+    "code:check": "biome check .",
+    "code:fix": "biome check --write .",
+    "hooks:install": "git config core.hooksPath .githooks",
+    "markdown:check": "markdownlint-cli2 \"**/*.md\" \"#node_modules\" \"#dist\" \"#coverage\"",
+    "markdown:fix": "markdownlint-cli2 --fix \"**/*.md\" \"#node_modules\" \"#dist\" \"#coverage\"",
+    "quality:check": "pnpm code:check && pnpm markdown:check && pnpm typecheck",
+    "quality:fix": "pnpm code:fix && pnpm markdown:fix",
+    "typecheck": "tsc -b --pretty false"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.8",
+    "@types/node": "24.13.3",
+    "markdownlint-cli2": "0.23.2",
+    "typescript": "7.0.2"
+  }
+}
