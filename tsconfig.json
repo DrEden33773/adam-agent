@@ -3,6 +3,10 @@
   "compilerOptions": {
     "noEmit": true
   },
-  "files": ["./package.json"],
-  "references": []
+  "files": [],
+  "references": [
+    { "path": "./apps/cli" },
+    { "path": "./packages/agent" },
+    { "path": "./packages/testkit" }
+  ]
 }

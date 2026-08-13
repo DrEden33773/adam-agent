@@ -9,19 +9,23 @@
     "pnpm": ">=11.21.0 <12"
   },
   "scripts": {
+    "adam": "tsc -b --pretty false && node apps/cli/dist/main.js",
+    "build": "tsc -b",
     "code:check": "biome check .",
     "code:fix": "biome check --write .",
     "hooks:install": "git config core.hooksPath .githooks",
     "markdown:check": "markdownlint-cli2 \"**/*.md\" \"#node_modules\" \"#dist\" \"#coverage\"",
     "markdown:fix": "markdownlint-cli2 --fix \"**/*.md\" \"#node_modules\" \"#dist\" \"#coverage\"",
-    "quality:check": "pnpm code:check && pnpm markdown:check && pnpm typecheck",
+    "quality:check": "pnpm code:check && pnpm markdown:check && pnpm typecheck && pnpm test",
     "quality:fix": "pnpm code:fix && pnpm markdown:fix",
+    "test": "tsc -b && vitest run",
     "typecheck": "tsc -b --pretty false"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.8",
     "@types/node": "24.13.3",
     "markdownlint-cli2": "0.23.2",
-    "typescript": "7.0.2"
+    "typescript": "7.0.2",
+    "vitest": "4.1.10"
   }
 }

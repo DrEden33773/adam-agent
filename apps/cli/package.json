@@ -1,0 +1,13 @@
+{
+  "name": "@adam-agent/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "adam-agent": "./dist/main.js"
+  },
+  "dependencies": {
+    "@adam-agent/agent": "workspace:*",
+    "@adam-agent/testkit": "workspace:*"
+  }
+}
