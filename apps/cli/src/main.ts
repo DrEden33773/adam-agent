@@ -2,6 +2,7 @@
 
 import {
   AgentSession,
+  createInMemorySessionStore,
   createPermissionPolicy,
   createReadToolRegistry,
   type JsonValue,
@@ -31,6 +32,7 @@ const model = new FakeModelDriver((request) => {
 });
 const session = new AgentSession({
   model,
+  store: createInMemorySessionStore(),
   tools: createReadToolRegistry({ workspaceRoot: process.cwd() }),
   permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
 });

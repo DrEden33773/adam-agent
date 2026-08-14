@@ -4,13 +4,27 @@ import { join } from "node:path";
 
 import {
   AgentSession,
+  type AgentSessionDependencies,
+  createInMemorySessionStore,
+  createJsonlSessionStore,
   createPermissionPolicy,
   createReadToolRegistry,
+  type ModelDriver,
   type RuntimeEvent,
+  type SessionEventRecord,
+  type SessionStore,
 } from "@adam-agent/agent";
 import { describe, expect, test } from "vitest";
 
 import { FakeModelDriver } from "./index.js";
+
+const cancelledResult = {
+  status: "cancelled",
+  error: {
+    code: "session_cancelled",
+    message: "The session was cancelled.",
+  },
+} as const;
 
 describe("AgentSession", () => {
   test("an answer-only turn emits ordered events and returns its terminal result", async () => {
@@ -19,7 +33,7 @@ describe("AgentSession", () => {
       { type: "text_delta", text: "Adam." },
       { type: "finish", reason: "stop" },
     ]);
-    const session = new AgentSession({ model });
+    const session = createTestSession({ model });
     const events: RuntimeEvent[] = [];
     session.subscribe((event) => events.push(event));
 
@@ -39,6 +53,629 @@ describe("AgentSession", () => {
     ]);
   });
 
+  test.each(["in-memory", "JSONL"] as const)(
+    "%s store persists canonical events while keeping text deltas live-only",
+    async (storeKind) => {
+      const storeHarness = await createAgentSessionStore(storeKind);
+      const model = new FakeModelDriver([
+        { type: "text_delta", text: "Durable answer." },
+        { type: "finish", reason: "stop" },
+      ]);
+      const { store } = storeHarness;
+      const session = createTestSession({ model, store });
+      const events: RuntimeEvent[] = [];
+      session.subscribe((event) => events.push(event));
+
+      try {
+        const result = await session.run({ text: "Persist this turn" });
+
+        expect({ result, events, records: await store.read() }).toEqual({
+          result: { status: "completed", answer: "Durable answer." },
+          events: [
+            { type: "user_message", text: "Persist this turn" },
+            { type: "model_message_started" },
+            { type: "model_message_delta", text: "Durable answer." },
+            { type: "model_message_completed", text: "Durable answer." },
+            {
+              type: "session_settled",
+              result: { status: "completed", answer: "Durable answer." },
+            },
+          ],
+          records: [
+            {
+              schemaVersion: 1,
+              runId: expect.any(String),
+              sequence: 1,
+              event: { type: "user_message", text: "Persist this turn" },
+            },
+            {
+              schemaVersion: 1,
+              runId: expect.any(String),
+              sequence: 2,
+              event: { type: "model_message_started" },
+            },
+            {
+              schemaVersion: 1,
+              runId: expect.any(String),
+              sequence: 3,
+              event: { type: "model_message_completed", text: "Durable answer." },
+            },
+            {
+              schemaVersion: 1,
+              runId: expect.any(String),
+              sequence: 4,
+              event: {
+                type: "session_settled",
+                result: { status: "completed", answer: "Durable answer." },
+              },
+            },
+          ],
+        });
+      } finally {
+        await storeHarness.cleanup();
+      }
+    },
+  );
+
+  test("fails before publishing or calling the model when the first event cannot persist", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-persistence-failure-"));
+    const stateRoot = join(testRoot, "state");
+    const workspaceRoot = join(testRoot, "workspace");
+    await mkdir(workspaceRoot);
+    const store = await createJsonlSessionStore({
+      stateRoot,
+      workspaceRoot,
+      sessionId: "session-failure",
+    });
+    let modelWasCalled = false;
+    const model = new FakeModelDriver(() => {
+      modelWasCalled = true;
+      return [{ type: "finish", reason: "stop" }];
+    });
+    const session = createTestSession({ model, store });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    try {
+      await chmod(stateRoot, 0o400);
+
+      const result = await session.run({ text: "Do not start" });
+
+      expect({ result, events, modelWasCalled }).toEqual({
+        result: {
+          status: "failed",
+          error: {
+            code: "session_persistence_failed",
+            message: "The session event could not be persisted.",
+          },
+        },
+        events: [],
+        modelWasCalled: false,
+      });
+    } finally {
+      await chmod(stateRoot, 0o700);
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("abort settles an active model wait once as cancelled", async () => {
+    let markModelStarted: (() => void) | undefined;
+    const modelStarted = new Promise<void>((resolve) => {
+      markModelStarted = resolve;
+    });
+    const model: ModelDriver = {
+      async *stream(request) {
+        markModelStarted?.();
+        await new Promise<void>((resolve) => {
+          request.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    };
+    const store = createInMemorySessionStore();
+    const session = createTestSession({ model, store });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const pendingResult = session.run({ text: "Wait for cancellation" });
+    await modelStarted;
+    session.abort();
+    session.abort();
+    const result = await pendingResult;
+
+    expect({
+      result,
+      settledEvents: events.filter((event) => event.type === "session_settled"),
+      finalRecord: (await store.read()).at(-1),
+    }).toEqual({
+      result: cancelledResult,
+      settledEvents: [{ type: "session_settled", result: cancelledResult }],
+      finalRecord: {
+        schemaVersion: 1,
+        runId: expect.any(String),
+        sequence: 4,
+        event: { type: "session_settled", result: cancelledResult },
+      },
+    });
+  });
+
+  test("persists one stable run identity and an interruption before cancelled settlement", async () => {
+    let markModelStarted: (() => void) | undefined;
+    const modelStarted = new Promise<void>((resolve) => {
+      markModelStarted = resolve;
+    });
+    const model: ModelDriver = {
+      async *stream(request) {
+        markModelStarted?.();
+        await new Promise<void>((resolve) => {
+          request.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    };
+    const store = createInMemorySessionStore();
+    const session = createTestSession({ model, store });
+
+    const pendingResult = session.run({ text: "Persist the interruption" });
+    await modelStarted;
+    session.abort();
+    await pendingResult;
+    const records = await store.read();
+
+    expect(new Set(records.map((record) => record.runId)).size).toBe(1);
+    expect(records[0]?.runId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+    expect(records.map((record) => record.event.type)).toEqual([
+      "user_message",
+      "model_message_started",
+      "session_interrupted",
+      "session_settled",
+    ]);
+  });
+
+  test("does not retry a cancellation terminal transition after persistence fails", async () => {
+    let markModelStarted: (() => void) | undefined;
+    const modelStarted = new Promise<void>((resolve) => {
+      markModelStarted = resolve;
+    });
+    const model: ModelDriver = {
+      async *stream(request) {
+        markModelStarted?.();
+        await new Promise<void>((resolve) => {
+          request.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    };
+    const records: SessionEventRecord[] = [];
+    const store: SessionStore = {
+      async append(record) {
+        records.push(record);
+        if (record.event.type === "session_interrupted") {
+          throw new Error("The durable write completed before the adapter reported failure.");
+        }
+      },
+      async read() {
+        return records;
+      },
+    };
+    const session = createTestSession({ model, store });
+
+    const pendingResult = session.run({ text: "Cancel exactly once" });
+    await modelStarted;
+    session.abort();
+    const result = await pendingResult;
+
+    expect({
+      result,
+      interruptionCount: records.filter((record) => record.event.type === "session_interrupted")
+        .length,
+    }).toEqual({
+      result: {
+        status: "failed",
+        error: {
+          code: "session_persistence_failed",
+          message: "The session event could not be persisted.",
+        },
+      },
+      interruptionCount: 1,
+    });
+  });
+
+  test("a caller AbortSignal converges on the same cancelled terminal state", async () => {
+    let markModelStarted: (() => void) | undefined;
+    const modelStarted = new Promise<void>((resolve) => {
+      markModelStarted = resolve;
+    });
+    const model: ModelDriver = {
+      async *stream(request) {
+        markModelStarted?.();
+        await new Promise<void>((resolve) => {
+          request.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    };
+    const session = createTestSession({ model });
+    const controller = new AbortController();
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const pendingResult = session.run(
+      { text: "Cancel from the caller" },
+      { signal: controller.signal },
+    );
+    await modelStarted;
+    controller.abort();
+    const result = await pendingResult;
+
+    expect({
+      result,
+      settledEvents: events.filter((event) => event.type === "session_settled"),
+    }).toEqual({
+      result: cancelledResult,
+      settledEvents: [{ type: "session_settled", result: cancelledResult }],
+    });
+  });
+
+  test("a pre-aborted caller signal never starts the model", async () => {
+    let modelCalls = 0;
+    const model = new FakeModelDriver(() => {
+      modelCalls += 1;
+      return [{ type: "finish", reason: "stop" }];
+    });
+    const controller = new AbortController();
+    controller.abort();
+    const session = createTestSession({ model });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const result = await session.run({ text: "Already cancelled" }, { signal: controller.signal });
+
+    expect({ result, modelCalls, events }).toEqual({
+      result: cancelledResult,
+      modelCalls: 0,
+      events: [
+        { type: "user_message", text: "Already cancelled" },
+        { type: "session_interrupted", reason: "cancelled" },
+        { type: "session_settled", result: cancelledResult },
+      ],
+    });
+  });
+
+  test("rejects a concurrent run without taking cancellation ownership from the active run", async () => {
+    let markModelStarted: (() => void) | undefined;
+    let releaseModel: (() => void) | undefined;
+    const modelStarted = new Promise<void>((resolve) => {
+      markModelStarted = resolve;
+    });
+    const modelReleased = new Promise<void>((resolve) => {
+      releaseModel = resolve;
+    });
+    const model: ModelDriver = {
+      async *stream() {
+        markModelStarted?.();
+        await modelReleased;
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const store = createInMemorySessionStore();
+    const session = createTestSession({ model, store });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const activeRun = session.run({ text: "Keep this run active" });
+    await modelStarted;
+    const concurrentRun = session.run({ text: "Do not start this run" });
+    session.abort();
+    releaseModel?.();
+    const [concurrentResult, activeResult] = await Promise.all([concurrentRun, activeRun]);
+
+    expect({ concurrentResult, activeResult, events }).toEqual({
+      concurrentResult: {
+        status: "failed",
+        error: {
+          code: "run_already_active",
+          message: "The session already has an active run.",
+        },
+      },
+      activeResult: cancelledResult,
+      events: [
+        { type: "user_message", text: "Keep this run active" },
+        { type: "model_message_started" },
+        { type: "session_interrupted", reason: "cancelled" },
+        { type: "session_settled", result: cancelledResult },
+      ],
+    });
+  });
+
+  test("cancellation after one tool completes prevents later tool and model work", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-tool-cancellation-"));
+    await writeFile(join(workspaceRoot, "first.txt"), "first\n", "utf8");
+    await writeFile(join(workspaceRoot, "second.txt"), "second\n", "utf8");
+    let modelCalls = 0;
+    const model = new FakeModelDriver(() => {
+      modelCalls += 1;
+      return modelCalls === 1
+        ? [
+            { type: "tool_call_start", id: "call-first", name: "read_file" },
+            { type: "tool_call_delta", id: "call-first", json: '{"path":"first.txt"}' },
+            { type: "tool_call_end", id: "call-first" },
+            { type: "tool_call_start", id: "call-second", name: "read_file" },
+            { type: "tool_call_delta", id: "call-second", json: '{"path":"second.txt"}' },
+            { type: "tool_call_end", id: "call-second" },
+            { type: "finish", reason: "tool_calls" },
+          ]
+        : [
+            { type: "text_delta", text: "A later model turn started." },
+            { type: "finish", reason: "stop" },
+          ];
+    });
+    const session = createTestSession({
+      model,
+      tools: createReadToolRegistry({ workspaceRoot }),
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+      if (event.type === "tool_completed" && event.callId === "call-first") {
+        session.abort();
+      }
+    });
+
+    try {
+      const result = await session.run({ text: "Read both files unless cancelled" });
+
+      expect({
+        result,
+        modelCalls,
+        secondToolEvents: events.filter(
+          (event) => "callId" in event && event.callId === "call-second",
+        ),
+      }).toEqual({
+        result: cancelledResult,
+        modelCalls: 1,
+        secondToolEvents: [],
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("cancellation before terminal settlement cannot be overwritten by model success", async () => {
+    const model = new FakeModelDriver([
+      { type: "text_delta", text: "This answer was interrupted." },
+      { type: "finish", reason: "stop" },
+    ]);
+    const session = createTestSession({ model });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+      if (event.type === "model_message_completed") {
+        session.abort();
+      }
+    });
+
+    const result = await session.run({ text: "Cancel before success settles" });
+
+    expect({ result, finalEvents: events.slice(-2) }).toEqual({
+      result: cancelledResult,
+      finalEvents: [
+        { type: "session_interrupted", reason: "cancelled" },
+        { type: "session_settled", result: cancelledResult },
+      ],
+    });
+  });
+
+  test("cancellation stops publishing buffered provider events", async () => {
+    const model = new FakeModelDriver([
+      { type: "text_delta", text: "first" },
+      { type: "text_delta", text: "second" },
+      { type: "finish", reason: "stop" },
+    ]);
+    const session = createTestSession({ model });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => {
+      events.push(event);
+      if (event.type === "model_message_delta") {
+        session.abort();
+      }
+    });
+
+    const result = await session.run({ text: "Stop the buffered stream" });
+
+    expect({
+      result,
+      deltas: events
+        .filter((event) => event.type === "model_message_delta")
+        .map((event) => event.text),
+    }).toEqual({
+      result: cancelledResult,
+      deltas: ["first"],
+    });
+  });
+
+  test("turn limits stop before the next model invocation", async () => {
+    let modelCalls = 0;
+    const model = new FakeModelDriver(() => {
+      modelCalls += 1;
+      return [
+        { type: "tool_call_start", id: "call-limited", name: "missing_tool" },
+        { type: "tool_call_delta", id: "call-limited", json: "{}" },
+        { type: "tool_call_end", id: "call-limited" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    });
+    const session = createTestSession({ model });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const result = await session.run(
+      { text: "Do not exceed one model turn" },
+      { limits: { maxTurns: 1 } },
+    );
+
+    expect({ result, modelCalls, finalEvent: events.at(-1) }).toEqual({
+      result: {
+        status: "failed",
+        error: {
+          code: "turn_limit_exceeded",
+          message: "The run reached its model turn limit.",
+        },
+      },
+      modelCalls: 1,
+      finalEvent: {
+        type: "session_settled",
+        result: {
+          status: "failed",
+          error: {
+            code: "turn_limit_exceeded",
+            message: "The run reached its model turn limit.",
+          },
+        },
+      },
+    });
+  });
+
+  test.each([
+    ["NaN turn limit", { maxTurns: Number.NaN }],
+    ["infinite token limit", { maxTokens: Number.POSITIVE_INFINITY }],
+    ["negative turn limit", { maxTurns: -1 }],
+    ["fractional token limit", { maxTokens: 1.5 }],
+  ] as const)("rejects a %s before starting a run", async (_name, limits) => {
+    let modelCalls = 0;
+    const model = new FakeModelDriver(() => {
+      modelCalls += 1;
+      return [{ type: "finish", reason: "stop" }];
+    });
+    const session = createTestSession({ model });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const result = await session.run({ text: "Use a valid finite limit" }, { limits });
+
+    expect({ result, modelCalls, events }).toEqual({
+      result: {
+        status: "failed",
+        error: {
+          code: "invalid_run_limits",
+          message: "Run limits must be positive safe integers.",
+        },
+      },
+      modelCalls: 0,
+      events: [],
+    });
+  });
+
+  test("provider-reported token limits stop before a requested tool", async () => {
+    const model = new FakeModelDriver([
+      { type: "tool_call_start", id: "call-over-budget", name: "read_file" },
+      {
+        type: "tool_call_delta",
+        id: "call-over-budget",
+        json: '{"path":"README.md"}',
+      },
+      { type: "tool_call_end", id: "call-over-budget" },
+      { type: "usage", inputTokens: 6, outputTokens: 5 },
+      { type: "finish", reason: "tool_calls" },
+    ]);
+    const session = createTestSession({ model });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const result = await session.run(
+      { text: "Stop before the tool" },
+      { limits: { maxTokens: 10 } },
+    );
+
+    expect({
+      result,
+      usageEvents: events.filter((event) => event.type === "model_usage"),
+      toolEvents: events.filter((event) => event.type.startsWith("tool_")),
+    }).toEqual({
+      result: {
+        status: "failed",
+        error: {
+          code: "token_limit_exceeded",
+          message: "The run reached its provider-reported token limit.",
+        },
+      },
+      usageEvents: [{ type: "model_usage", inputTokens: 6, outputTokens: 5, totalTokens: 11 }],
+      toolEvents: [],
+    });
+  });
+
+  test("active token limits fail closed when provider usage is missing", async () => {
+    let modelCalls = 0;
+    const model = new FakeModelDriver(() => {
+      modelCalls += 1;
+      return modelCalls === 1
+        ? [
+            { type: "tool_call_start", id: "call-no-usage", name: "read_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-no-usage",
+              json: '{"path":"README.md"}',
+            },
+            { type: "tool_call_end", id: "call-no-usage" },
+            { type: "finish", reason: "tool_calls" },
+          ]
+        : [
+            { type: "text_delta", text: "This second turn must not run." },
+            { type: "finish", reason: "stop" },
+          ];
+    });
+    const session = createTestSession({ model });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const result = await session.run(
+      { text: "Require provider usage" },
+      { limits: { maxTokens: 100 } },
+    );
+
+    expect({
+      result,
+      modelCalls,
+      toolEvents: events.filter((event) => event.type.startsWith("tool_")),
+    }).toEqual({
+      result: {
+        status: "failed",
+        error: {
+          code: "token_usage_missing",
+          message: "The provider did not report token usage for an active token limit.",
+        },
+      },
+      modelCalls: 1,
+      toolEvents: [],
+    });
+  });
+
+  test("rejects invalid provider token usage before it can affect accounting", async () => {
+    const model = new FakeModelDriver([
+      { type: "text_delta", text: "Do not accept this answer." },
+      { type: "usage", inputTokens: -1, outputTokens: 2 },
+      { type: "finish", reason: "stop" },
+    ]);
+    const session = createTestSession({ model });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const result = await session.run({ text: "Report trustworthy usage" });
+
+    expect({
+      result,
+      usageEvents: events.filter((event) => event.type === "model_usage"),
+    }).toEqual({
+      result: {
+        status: "failed",
+        error: {
+          code: "model_protocol_invalid",
+          message: "The model reported invalid token usage.",
+        },
+      },
+      usageEvents: [],
+    });
+  });
+
   test("sends the user input to the model driver", async () => {
     const model = new FakeModelDriver((request) => {
       const firstMessage = request.messages[0];
@@ -50,7 +687,7 @@ describe("AgentSession", () => {
         { type: "finish", reason: "stop" },
       ];
     });
-    const session = new AgentSession({ model });
+    const session = createTestSession({ model });
 
     const result = await session.run({ text: "Explain this repository" });
 
@@ -62,7 +699,7 @@ describe("AgentSession", () => {
 
   test("reports a failed terminal result when the model stream ends without finishing", async () => {
     const model = new FakeModelDriver([{ type: "text_delta", text: "Partial answer" }]);
-    const session = new AgentSession({ model });
+    const session = createTestSession({ model });
     const events: RuntimeEvent[] = [];
     session.subscribe((event) => events.push(event));
 
@@ -114,7 +751,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -164,7 +801,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -232,7 +869,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -285,7 +922,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: [] }),
@@ -346,7 +983,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -441,7 +1078,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -506,7 +1143,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -556,7 +1193,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -610,7 +1247,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -647,7 +1284,7 @@ describe("AgentSession", () => {
         { type: "finish", reason: "stop" },
       ];
     });
-    const session = new AgentSession({ model });
+    const session = createTestSession({ model });
 
     const result = await session.run({ text: "Read the README" });
 
@@ -698,7 +1335,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -731,7 +1368,7 @@ describe("AgentSession", () => {
         { type: "tool_call_end", id: "call-stop" },
         { type: "finish", reason: "stop" },
       ]);
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -790,7 +1427,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -822,7 +1459,7 @@ describe("AgentSession", () => {
         { type: "tool_call_end", id: "call-conflict" },
         { type: "finish", reason: "tool_calls" },
       ]);
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -882,7 +1519,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -927,7 +1564,7 @@ describe("AgentSession", () => {
         },
         { type: "finish", reason: "tool_calls" },
       ]);
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -999,7 +1636,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -1030,7 +1667,7 @@ describe("AgentSession", () => {
         { type: "tool_call_end", id: "call-start" },
         { type: "finish", reason: "tool_calls" },
       ]);
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -1071,7 +1708,7 @@ describe("AgentSession", () => {
     },
   ])("rejects an orphaned tool-call $label event", async ({ event, message }) => {
     const model = new FakeModelDriver([event, { type: "finish", reason: "tool_calls" }]);
-    const session = new AgentSession({ model });
+    const session = createTestSession({ model });
     const events: RuntimeEvent[] = [];
     session.subscribe((runtimeEvent) => events.push(runtimeEvent));
 
@@ -1131,7 +1768,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -1184,7 +1821,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -1230,7 +1867,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -1288,7 +1925,7 @@ describe("AgentSession", () => {
           { type: "finish", reason: "stop" },
         ];
       });
-      const session = new AgentSession({
+      const session = createTestSession({
         model,
         tools: createReadToolRegistry({ workspaceRoot }),
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -1305,3 +1942,33 @@ describe("AgentSession", () => {
     }
   });
 });
+
+async function createAgentSessionStore(storeKind: "in-memory" | "JSONL") {
+  if (storeKind === "in-memory") {
+    return {
+      store: createInMemorySessionStore(),
+      cleanup: async () => {},
+    };
+  }
+
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-adapter-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  return {
+    store: await createJsonlSessionStore({
+      stateRoot: join(testRoot, "state"),
+      workspaceRoot,
+      sessionId: "session-adapter-contract",
+    }),
+    cleanup: () => rm(testRoot, { recursive: true, force: true }),
+  };
+}
+
+function createTestSession(
+  dependencies: Omit<AgentSessionDependencies, "store"> & { readonly store?: SessionStore },
+): AgentSession {
+  return new AgentSession({
+    ...dependencies,
+    store: dependencies.store ?? createInMemorySessionStore(),
+  });
+}
