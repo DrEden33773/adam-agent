@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
 
+export {
+  type ArtifactReference,
+  type ArtifactSource,
+  type ArtifactStore,
+  createFileArtifactStore,
+} from "./artifact-store.js";
+
 import type { CanonicalRuntimeEvent, SessionStore } from "./session-store.js";
 import type {
   ModelToolDefinition,
@@ -22,6 +29,7 @@ export {
 } from "./session-store.js";
 
 export {
+  createCodingToolRegistry,
   createMutationToolRegistry,
   createPermissionPolicy,
   createReadToolRegistry,
@@ -31,6 +39,7 @@ export {
   type PermissionPolicy,
   type PermissionPolicyInput,
   type PermissionSubject,
+  type ShellRuntimeLimits,
   type ToolCall,
   type ToolEffect,
   type ToolRegistry,
@@ -585,7 +594,7 @@ export class AgentSession {
         if (signal.aborted) {
           return this.#settleCancelled();
         }
-        const result = await preparedCall.execute();
+        const result = await preparedCall.execute({ signal, callId: call.id, toolName: call.name });
         toolResultsById.set(call.id, { call, result });
         await this.#appendToolResult(messages, call, result);
       }

@@ -79,6 +79,8 @@ const toolErrorSchema = z.strictObject({
     "file_too_large",
     "no_match",
     "overlapping_edits",
+    "artifact_store_failed",
+    "shell_start_failed",
     "tool_io_failed",
   ]),
   message: z.string(),
@@ -86,6 +88,11 @@ const toolErrorSchema = z.strictObject({
 const permissionSubjectSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("file"), path: z.string() }),
   z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
+  z.strictObject({
+    type: z.literal("command"),
+    command: z.string(),
+    cwd: z.literal("."),
+  }),
 ]);
 const canonicalRuntimeEventSchema: z.ZodType<CanonicalRuntimeEvent> = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("user_message"), text: z.string() }),
