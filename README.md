@@ -32,7 +32,7 @@ The default live model is `deepseek-v4-pro`; set `ADAM_AGENT_MODEL` to override 
 With `DEEPSEEK_API_KEY` already present, the opt-in live smoke gate runs one answer-only turn and one real read-tool round trip:
 
 ```bash
-ADAM_AGENT_LIVE_TESTS=1 pnpm exec vitest run packages/testkit/src/openai-compatible-model-driver.live.test.ts
+ADAM_AGENT_LIVE_TESTS=1 pnpm test:live:deepseek
 ```
 
 Use `pnpm quality:fix` only when an intentional formatting rewrite is desired. The pre-commit hook is check-only.
