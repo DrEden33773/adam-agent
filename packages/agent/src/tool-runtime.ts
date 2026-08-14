@@ -1,8 +1,12 @@
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { type FileHandle, mkdir, open, opendir, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { type FileHandle, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { z } from "zod";
+
+import type { ArtifactStore } from "./artifact-store.js";
 
 export type ToolEffect = "read" | "write" | "execute" | "network" | "delegate" | "administrative";
 
@@ -18,6 +22,13 @@ export type ModelToolDefinition = {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: Readonly<Record<string, unknown>>;
+};
+
+export type ShellRuntimeLimits = {
+  readonly timeoutMs: number;
+  readonly terminationGraceMs: number;
+  readonly maximumInlineBytesPerStream: number;
+  readonly maximumArtifactBytesPerStream: number;
 };
 
 export type ToolCall = {
@@ -43,6 +54,8 @@ export type ToolResult =
           | "file_too_large"
           | "no_match"
           | "overlapping_edits"
+          | "artifact_store_failed"
+          | "shell_start_failed"
           | "tool_io_failed";
         readonly message: string;
       };
@@ -52,19 +65,13 @@ type ToolAdapter = {
   readonly definition: ModelToolDefinition;
   readonly outputSchema: z.ZodType<JsonValue>;
   readonly effect: ToolEffect;
-  readonly cancellation: "unsupported";
+  readonly cancellation: "unsupported" | "abort_signal";
   readonly maximumResult: ToolMaximumResultPolicy;
   prepare(argumentsJson: string): PreparedToolCall | FailedToolResult;
 };
 
 type ToolMaximumResultPolicy = {
   readonly maximumBytes?: number;
-  readonly maximumEntries?: number;
-  readonly maximumFiles?: number;
-  readonly maximumFileBytes?: number;
-  readonly maximumMatches?: number;
-  readonly maximumMatchCharacters?: number;
-  readonly maximumQueryCharacters?: number;
 };
 
 type FailedToolResult = Extract<ToolResult, { readonly status: "failed" }>;
@@ -72,7 +79,13 @@ type FailedToolResult = Extract<ToolResult, { readonly status: "failed" }>;
 type PreparedToolCall = {
   readonly status: "ready";
   readonly permissionSubject: PermissionSubject;
-  execute(): Promise<ToolResult>;
+  execute(context: ToolExecutionContext): Promise<ToolResult>;
+};
+
+type ToolExecutionContext = {
+  readonly signal: AbortSignal;
+  readonly callId: string;
+  readonly toolName: string;
 };
 
 class ToolExecutionError extends Error {
@@ -93,7 +106,12 @@ export type PermissionDecision = "allow" | "ask" | "deny";
 
 export type PermissionSubject =
   | { readonly type: "file"; readonly path: string }
-  | { readonly type: "workspace_path"; readonly path: string };
+  | { readonly type: "workspace_path"; readonly path: string }
+  | {
+      readonly type: "command";
+      readonly command: string;
+      readonly cwd: ".";
+    };
 
 export type PermissionPolicyInput = {
   readonly callId: string;
@@ -124,7 +142,6 @@ export function createPermissionPolicy(options: {
 }
 
 const readFileInputSchema = z.strictObject({ path: z.string().min(1) });
-const listFilesInputSchema = z.strictObject({ path: z.string().min(1) });
 const maximumMutationFileBytes = 1024 * 1024;
 const maximumEditArgumentsBytes = 1024 * 1024;
 const textMutationContentSchema = z
@@ -155,57 +172,17 @@ const editFileInputSchema = z
         0,
       ) <= maximumEditArgumentsBytes,
   );
+const defaultShellRuntimeLimits: ShellRuntimeLimits = {
+  timeoutMs: 120_000,
+  terminationGraceMs: 100,
+  maximumInlineBytesPerStream: 64 * 1024,
+  maximumArtifactBytesPerStream: 8 * 1024 * 1024,
+};
 const readFileMaximumResult = { maximumBytes: 64 * 1024 } as const;
-const listFilesMaximumResult = { maximumEntries: 200 } as const;
-const searchTextMaximumResult = {
-  maximumEntries: 1_000,
-  maximumFiles: 200,
-  maximumFileBytes: 64 * 1024,
-  maximumMatches: 200,
-  maximumMatchCharacters: 1_024,
-  maximumQueryCharacters: 1_024,
-} as const;
-const searchTextInputSchema = z.strictObject({
-  path: z.string().min(1),
-  query: z.string().min(1).max(searchTextMaximumResult.maximumQueryCharacters),
-});
-
-type ListedEntry = {
-  readonly path: string;
-  readonly type: "file" | "directory";
-};
-
-type SearchMatch = {
-  readonly path: string;
-  readonly line: number;
-  readonly column: number;
-  readonly text: string;
-};
 
 const readFileOutputSchema = z.strictObject({
   path: z.string(),
   content: z.string().max(readFileMaximumResult.maximumBytes),
-  truncated: z.boolean(),
-});
-const listedEntrySchema = z.strictObject({
-  path: z.string(),
-  type: z.enum(["file", "directory"]),
-});
-const listFilesOutputSchema = z.strictObject({
-  path: z.string(),
-  entries: z.array(listedEntrySchema).max(listFilesMaximumResult.maximumEntries),
-  truncated: z.boolean(),
-});
-const searchMatchSchema = z.strictObject({
-  path: z.string(),
-  line: z.number().int().positive(),
-  column: z.number().int().positive(),
-  text: z.string().max(searchTextMaximumResult.maximumMatchCharacters),
-});
-const searchTextOutputSchema = z.strictObject({
-  path: z.string(),
-  query: z.string().max(searchTextMaximumResult.maximumQueryCharacters),
-  matches: z.array(searchMatchSchema).max(searchTextMaximumResult.maximumMatches),
   truncated: z.boolean(),
 });
 const writeFileOutputSchema = z.strictObject({
@@ -216,6 +193,39 @@ const editFileOutputSchema = z.strictObject({
   path: z.string(),
   replacements: z.number().int().positive(),
   bytesWritten: z.number().int().nonnegative(),
+});
+const artifactSourceSchema = z.strictObject({
+  type: z.literal("tool_output"),
+  callId: z.string(),
+  toolName: z.string(),
+  stream: z.enum(["stdout", "stderr"]),
+  totalBytes: z.number().int().nonnegative(),
+  truncated: z.boolean(),
+});
+const artifactReferenceSchema = z.strictObject({
+  id: z.string(),
+  mediaType: z.string(),
+  byteCount: z.number().int().nonnegative(),
+  source: artifactSourceSchema,
+});
+const shellStreamOutputShape = {
+  tail: z.string(),
+  totalBytes: z.number().int().nonnegative(),
+  omittedBytes: z.number().int().nonnegative(),
+} as const;
+const shellStreamOutputSchema = z.union([
+  z.strictObject(shellStreamOutputShape),
+  z.strictObject({ ...shellStreamOutputShape, artifact: artifactReferenceSchema }),
+]);
+const runShellOutputSchema = z.strictObject({
+  termination: z.discriminatedUnion("type", [
+    z.strictObject({ type: z.literal("exited"), exitCode: z.number().int().nonnegative() }),
+    z.strictObject({ type: z.literal("timed_out") }),
+    z.strictObject({ type: z.literal("interrupted") }),
+    z.strictObject({ type: z.literal("signalled"), signal: z.string() }),
+  ]),
+  stdout: shellStreamOutputSchema,
+  stderr: shellStreamOutputSchema,
 });
 
 export function createReadToolRegistry(options: { readonly workspaceRoot: string }): ToolRegistry {
@@ -259,136 +269,7 @@ export function createReadToolRegistry(options: { readonly workspaceRoot: string
       };
     },
   };
-  const listFilesAdapter: ToolAdapter = {
-    definition: {
-      name: "list_files",
-      description: "List files and directories recursively inside the workspace.",
-      inputSchema: z.toJSONSchema(listFilesInputSchema),
-    },
-    outputSchema: listFilesOutputSchema,
-    effect: "read",
-    cancellation: "unsupported",
-    maximumResult: listFilesMaximumResult,
-    prepare(argumentsJson) {
-      const parsedArguments = parseInput(listFilesInputSchema, argumentsJson);
-      if (!parsedArguments.success) {
-        return invalidToolInput();
-      }
-      const permissionSubject = preparePermissionSubject(
-        workspaceRoot,
-        parsedArguments.data.path,
-        "workspace_path",
-      );
-      if ("status" in permissionSubject) {
-        return permissionSubject;
-      }
-      return {
-        status: "ready",
-        permissionSubject,
-        async execute() {
-          return executeSafely(listFilesOutputSchema, async () => {
-            const targetPath = await resolveConfinedPath(workspaceRoot, parsedArguments.data.path);
-            const listing = await collectEntries(
-              workspaceRoot,
-              targetPath,
-              listFilesMaximumResult.maximumEntries,
-            );
-            return {
-              path: parsedArguments.data.path,
-              entries: listing.entries,
-              truncated: listing.truncated,
-            };
-          });
-        },
-      };
-    },
-  };
-  const searchTextAdapter: ToolAdapter = {
-    definition: {
-      name: "search_text",
-      description: "Search for literal text recursively inside workspace files.",
-      inputSchema: z.toJSONSchema(searchTextInputSchema),
-    },
-    outputSchema: searchTextOutputSchema,
-    effect: "read",
-    cancellation: "unsupported",
-    maximumResult: searchTextMaximumResult,
-    prepare(argumentsJson) {
-      const parsedArguments = parseInput(searchTextInputSchema, argumentsJson);
-      if (!parsedArguments.success) {
-        return invalidToolInput();
-      }
-      const permissionSubject = preparePermissionSubject(
-        workspaceRoot,
-        parsedArguments.data.path,
-        "workspace_path",
-      );
-      if ("status" in permissionSubject) {
-        return permissionSubject;
-      }
-      return {
-        status: "ready",
-        permissionSubject,
-        async execute() {
-          return executeSafely(searchTextOutputSchema, async () => {
-            const targetPath = await resolveConfinedPath(workspaceRoot, parsedArguments.data.path);
-            const listing = await collectEntries(
-              workspaceRoot,
-              targetPath,
-              searchTextMaximumResult.maximumEntries,
-            );
-            const matches: SearchMatch[] = [];
-            let searchedFiles = 0;
-            let truncated = listing.truncated;
-            for (const entry of listing.entries) {
-              if (entry.type !== "file") {
-                continue;
-              }
-              if (searchedFiles >= searchTextMaximumResult.maximumFiles) {
-                truncated = true;
-                break;
-              }
-              searchedFiles += 1;
-              const file = await readTextFileBounded(
-                resolve(workspaceRoot, entry.path),
-                searchTextMaximumResult.maximumFileBytes,
-              );
-              const { content } = file;
-              truncated ||= file.truncated;
-              if (content.includes("\0")) {
-                continue;
-              }
-              const matchTextWasTruncated = collectTextMatches(
-                entry.path,
-                content,
-                parsedArguments.data.query,
-                matches,
-                searchTextMaximumResult.maximumMatches + 1,
-                searchTextMaximumResult.maximumMatchCharacters,
-              );
-              truncated ||= matchTextWasTruncated;
-              if (matches.length > searchTextMaximumResult.maximumMatches) {
-                truncated = true;
-                break;
-              }
-            }
-            return {
-              path: parsedArguments.data.path,
-              query: parsedArguments.data.query,
-              matches: matches.slice(0, searchTextMaximumResult.maximumMatches),
-              truncated,
-            };
-          });
-        },
-      };
-    },
-  };
-  const adapters = new Map(
-    [readFileAdapter, listFilesAdapter, searchTextAdapter].map((adapter) => [
-      adapter.definition.name,
-      adapter,
-    ]),
-  );
+  const adapters = new Map([[readFileAdapter.definition.name, readFileAdapter]]);
 
   return {
     definitions() {
@@ -612,6 +493,357 @@ export function createMutationToolRegistry(options: {
   };
 }
 
+export function createCodingToolRegistry(options: {
+  readonly workspaceRoot: string;
+  readonly artifactStore?: ArtifactStore;
+  readonly shellLimits?: ShellRuntimeLimits;
+}): ToolRegistry {
+  const workspaceRoot = resolve(options.workspaceRoot);
+  const shellLimits = options.shellLimits ?? defaultShellRuntimeLimits;
+  assertShellRuntimeLimits(shellLimits);
+  const runShellInputSchema = z.strictObject({
+    command: z.string().min(1),
+    timeoutMs: z.number().int().positive().max(shellLimits.timeoutMs).optional(),
+  });
+  const readTools = createReadToolRegistry({ workspaceRoot });
+  const mutationTools = createMutationToolRegistry({ workspaceRoot });
+  const shellAdapter: ToolAdapter = {
+    definition: {
+      name: "run_shell",
+      description:
+        "Run one approved command from the workspace root with /bin/sh -c. The process has no OS sandbox or network isolation.",
+      inputSchema: z.toJSONSchema(runShellInputSchema),
+    },
+    outputSchema: runShellOutputSchema,
+    effect: "execute",
+    cancellation: "abort_signal",
+    maximumResult: { maximumBytes: 2 * shellLimits.maximumInlineBytesPerStream },
+    prepare(argumentsJson) {
+      const parsedArguments = parseInput(runShellInputSchema, argumentsJson);
+      if (!parsedArguments.success) {
+        return invalidToolInput();
+      }
+      return {
+        status: "ready",
+        permissionSubject: {
+          type: "command",
+          command: parsedArguments.data.command,
+          cwd: ".",
+        },
+        async execute(context) {
+          return executeSafely(runShellOutputSchema, () =>
+            runShellCommand({
+              workspaceRoot,
+              command: parsedArguments.data.command,
+              timeoutMs: parsedArguments.data.timeoutMs ?? shellLimits.timeoutMs,
+              signal: context.signal,
+              callId: context.callId,
+              toolName: context.toolName,
+              artifactStore: options.artifactStore,
+              limits: shellLimits,
+            }),
+          );
+        },
+      };
+    },
+  };
+  const adapters = [
+    requireAdapter(readTools, "read_file"),
+    requireAdapter(mutationTools, "write_file"),
+    requireAdapter(mutationTools, "edit_file"),
+    shellAdapter,
+  ];
+  const adaptersByName = new Map(adapters.map((adapter) => [adapter.definition.name, adapter]));
+
+  return {
+    definitions() {
+      return adapters.map((adapter) => adapter.definition);
+    },
+    resolve(name) {
+      return adaptersByName.get(name);
+    },
+  };
+}
+
+function requireAdapter(registry: ToolRegistry, name: string): ToolAdapter {
+  const adapter = registry.resolve(name);
+  if (adapter === undefined) {
+    throw new Error(`Missing required coding tool: ${name}`);
+  }
+  return adapter;
+}
+
+async function runShellCommand(options: {
+  readonly workspaceRoot: string;
+  readonly command: string;
+  readonly timeoutMs: number;
+  readonly signal: AbortSignal;
+  readonly callId: string;
+  readonly toolName: string;
+  readonly artifactStore: ArtifactStore | undefined;
+  readonly limits: ShellRuntimeLimits;
+}): Promise<JsonValue> {
+  const isolatedHome = await mkdtemp(join(tmpdir(), "adam-agent-shell-home-"));
+  try {
+    const processOutput = await new Promise<ShellProcessOutput>((resolvePromise, rejectPromise) => {
+      let child: ChildProcessWithoutNullStreams;
+      try {
+        child = spawn("/bin/sh", ["-c", options.command], {
+          cwd: options.workspaceRoot,
+          detached: true,
+          env: createShellEnvironment(isolatedHome),
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        child.stdin.end();
+      } catch {
+        rejectPromise(
+          new ToolExecutionError("shell_start_failed", "The shell process could not be started."),
+        );
+        return;
+      }
+      let stdout = emptyShellStream();
+      let stderr = emptyShellStream();
+      let terminationCause: "timed_out" | "interrupted" | undefined;
+      let settled = false;
+      let terminationCleanup: Promise<void> | undefined;
+      const terminate = () => {
+        terminationCleanup ??= (async () => {
+          signalProcessGroup(child.pid, "SIGTERM");
+          await new Promise((resolveDelay) =>
+            setTimeout(resolveDelay, options.limits.terminationGraceMs),
+          );
+          signalProcessGroup(child.pid, "SIGKILL");
+        })();
+      };
+      const timeout = setTimeout(() => {
+        if (terminationCause === undefined) {
+          terminationCause = "timed_out";
+          terminate();
+        }
+      }, options.timeoutMs);
+      timeout.unref();
+      const abort = () => {
+        if (terminationCause === undefined) {
+          terminationCause = "interrupted";
+          terminate();
+        }
+      };
+      if (options.signal.aborted) {
+        abort();
+      } else {
+        options.signal.addEventListener("abort", abort, { once: true });
+      }
+      child.stdout.on("data", (chunk: Buffer) => {
+        stdout = appendShellOutput(stdout, chunk, options.limits);
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        stderr = appendShellOutput(stderr, chunk, options.limits);
+      });
+      child.once("error", () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        options.signal.removeEventListener("abort", abort);
+        void (terminationCleanup ?? Promise.resolve()).then(
+          () =>
+            rejectPromise(
+              new ToolExecutionError(
+                "shell_start_failed",
+                "The shell process could not be started.",
+              ),
+            ),
+          rejectPromise,
+        );
+      });
+      child.once("close", (exitCode, signal) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        options.signal.removeEventListener("abort", abort);
+        const termination =
+          terminationCause !== undefined
+            ? { type: terminationCause }
+            : exitCode !== null
+              ? { type: "exited" as const, exitCode }
+              : { type: "signalled" as const, signal: signal ?? "unknown" };
+        void (terminationCleanup ?? Promise.resolve()).then(
+          () =>
+            resolvePromise({
+              termination,
+              stdout,
+              stderr,
+            }),
+          rejectPromise,
+        );
+      });
+    });
+    return {
+      termination: processOutput.termination,
+      stdout: await finishShellStream(processOutput.stdout, "stdout", options, options.limits),
+      stderr: await finishShellStream(processOutput.stderr, "stderr", options, options.limits),
+    };
+  } finally {
+    await rm(isolatedHome, { recursive: true, force: true });
+  }
+}
+
+type ShellStreamAccumulator = {
+  readonly tail: Buffer;
+  readonly totalBytes: number;
+  readonly capturedChunks: readonly Buffer[];
+  readonly capturedBytes: number;
+};
+
+function emptyShellStream(): ShellStreamAccumulator {
+  return { tail: Buffer.alloc(0), totalBytes: 0, capturedChunks: [], capturedBytes: 0 };
+}
+
+function appendShellOutput(
+  stream: ShellStreamAccumulator,
+  chunk: Buffer,
+  limits: ShellRuntimeLimits,
+): ShellStreamAccumulator {
+  const combined = Buffer.concat([stream.tail, chunk]);
+  const remainingArtifactBytes = limits.maximumArtifactBytesPerStream - stream.capturedBytes;
+  const capturedChunk = chunk.subarray(0, Math.max(0, remainingArtifactBytes));
+  return {
+    tail:
+      combined.byteLength <= limits.maximumInlineBytesPerStream
+        ? combined
+        : combined.subarray(combined.byteLength - limits.maximumInlineBytesPerStream),
+    totalBytes: stream.totalBytes + chunk.byteLength,
+    capturedChunks:
+      capturedChunk.byteLength === 0
+        ? stream.capturedChunks
+        : [...stream.capturedChunks, capturedChunk],
+    capturedBytes: stream.capturedBytes + capturedChunk.byteLength,
+  };
+}
+
+async function finishShellStream(
+  stream: ShellStreamAccumulator,
+  streamName: "stdout" | "stderr",
+  context: {
+    readonly callId: string;
+    readonly toolName: string;
+    readonly artifactStore: ArtifactStore | undefined;
+  },
+  limits: ShellRuntimeLimits,
+): Promise<JsonValue> {
+  const output: { readonly [key: string]: JsonValue } = {
+    tail: stream.tail.toString("utf8"),
+    totalBytes: stream.totalBytes,
+    omittedBytes: stream.totalBytes - stream.tail.byteLength,
+  };
+  if (stream.totalBytes <= limits.maximumInlineBytesPerStream) {
+    return output;
+  }
+  if (context.artifactStore === undefined) {
+    throw new ToolExecutionError(
+      "artifact_store_failed",
+      "The overflowing shell output could not be stored.",
+    );
+  }
+  try {
+    const artifact = await context.artifactStore.write({
+      bytes: Buffer.concat(stream.capturedChunks, stream.capturedBytes),
+      mediaType: "application/octet-stream",
+      source: {
+        type: "tool_output",
+        callId: context.callId,
+        toolName: context.toolName,
+        stream: streamName,
+        totalBytes: stream.totalBytes,
+        truncated: stream.totalBytes > stream.capturedBytes,
+      },
+    });
+    return {
+      ...output,
+      artifact: {
+        id: artifact.id,
+        mediaType: artifact.mediaType,
+        byteCount: artifact.byteCount,
+        source: {
+          type: artifact.source.type,
+          callId: artifact.source.callId,
+          toolName: artifact.source.toolName,
+          stream: artifact.source.stream,
+          totalBytes: artifact.source.totalBytes,
+          truncated: artifact.source.truncated,
+        },
+      },
+    };
+  } catch (error) {
+    if (error instanceof ToolExecutionError) {
+      throw error;
+    }
+    throw new ToolExecutionError(
+      "artifact_store_failed",
+      "The overflowing shell output could not be stored.",
+    );
+  }
+}
+
+function assertShellRuntimeLimits(limits: ShellRuntimeLimits): void {
+  const values = [
+    limits.timeoutMs,
+    limits.terminationGraceMs,
+    limits.maximumInlineBytesPerStream,
+    limits.maximumArtifactBytesPerStream,
+  ];
+  if (
+    values.some((value) => !Number.isSafeInteger(value) || value <= 0) ||
+    limits.maximumInlineBytesPerStream > limits.maximumArtifactBytesPerStream
+  ) {
+    throw new RangeError(
+      "Shell limits must be positive safe integers and the artifact limit must cover the inline limit.",
+    );
+  }
+}
+
+type ShellProcessOutput = {
+  readonly termination:
+    | { readonly type: "exited"; readonly exitCode: number }
+    | { readonly type: "timed_out" }
+    | { readonly type: "interrupted" }
+    | { readonly type: "signalled"; readonly signal: string };
+  readonly stdout: ShellStreamAccumulator;
+  readonly stderr: ShellStreamAccumulator;
+};
+
+function createShellEnvironment(isolatedHome: string): NodeJS.ProcessEnv {
+  const { PATH: executablePath } = process.env;
+  const environment: NodeJS.ProcessEnv = {
+    HOME: isolatedHome,
+    PATH: executablePath ?? "/usr/local/bin:/usr/bin:/bin",
+    TMPDIR: tmpdir(),
+  };
+  for (const name of ["LANG", "LC_ALL", "TERM"] as const) {
+    const value = process.env[name];
+    if (value !== undefined) {
+      environment[name] = value;
+    }
+  }
+  return environment;
+}
+
+function signalProcessGroup(pid: number | undefined, signal: NodeJS.Signals): void {
+  if (pid === undefined) {
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "ESRCH") {
+      throw error;
+    }
+  }
+}
+
 async function readTextFileBounded(
   path: string,
   maximumBytes: number,
@@ -699,96 +931,6 @@ async function executeSafely(
   }
 }
 
-async function collectEntries(
-  workspaceRoot: string,
-  directoryPath: string,
-  maximumEntries: number,
-): Promise<{ readonly entries: readonly ListedEntry[]; readonly truncated: boolean }> {
-  const entries: ListedEntry[] = [];
-  const visit = async (currentDirectory: string): Promise<boolean> => {
-    const remaining = maximumEntries - entries.length;
-    if (remaining <= 0) {
-      return hasListableEntry(currentDirectory);
-    }
-
-    const directoryEntries = [];
-    const directory = await opendir(currentDirectory);
-    for await (const entry of directory) {
-      if (entry.isDirectory() || entry.isFile()) {
-        directoryEntries.push(entry);
-      }
-      if (directoryEntries.length > remaining) {
-        break;
-      }
-    }
-    directoryEntries.sort((left, right) => left.name.localeCompare(right.name));
-
-    const directoryWasTruncated = directoryEntries.length > remaining;
-    for (const entry of directoryEntries.slice(0, remaining)) {
-      if (entries.length >= maximumEntries) {
-        return true;
-      }
-      const entryPath = resolve(currentDirectory, entry.name);
-      const relativePath = relative(workspaceRoot, entryPath).split(sep).join("/");
-      if (entry.isDirectory()) {
-        entries.push({ path: relativePath, type: "directory" });
-        if (await visit(entryPath)) {
-          return true;
-        }
-      } else {
-        entries.push({ path: relativePath, type: "file" });
-      }
-    }
-
-    return directoryWasTruncated;
-  };
-
-  return { entries, truncated: await visit(directoryPath) };
-}
-
-async function hasListableEntry(directoryPath: string): Promise<boolean> {
-  const directory = await opendir(directoryPath);
-  for await (const entry of directory) {
-    if (entry.isDirectory() || entry.isFile()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function collectTextMatches(
-  path: string,
-  content: string,
-  query: string,
-  matches: SearchMatch[],
-  maximumMatches: number,
-  maximumMatchCharacters: number,
-): boolean {
-  let truncated = false;
-  const lines = content.split(/\r?\n/u);
-  for (const [lineIndex, line] of lines.entries()) {
-    let searchFrom = 0;
-    while (searchFrom <= line.length) {
-      const matchIndex = line.indexOf(query, searchFrom);
-      if (matchIndex === -1) {
-        break;
-      }
-      truncated ||= line.length > maximumMatchCharacters;
-      matches.push({
-        path,
-        line: lineIndex + 1,
-        column: matchIndex + 1,
-        text: line.slice(0, maximumMatchCharacters),
-      });
-      if (matches.length >= maximumMatches) {
-        return truncated;
-      }
-      searchFrom = matchIndex + Math.max(query.length, 1);
-    }
-  }
-  return truncated;
-}
-
 function detectLineEnding(content: string): "\n" | "\r" | "\r\n" | undefined {
   const firstCarriageReturn = content.indexOf("\r");
   const firstLineFeed = content.indexOf("\n");
@@ -829,7 +971,7 @@ function invalidToolInput(): FailedToolResult {
 function preparePermissionSubject(
   workspaceRoot: string,
   requestedPath: string,
-  type: PermissionSubject["type"],
+  type: "file" | "workspace_path",
 ): PermissionSubject | FailedToolResult {
   try {
     const lexicalPath = resolveLexicallyConfinedPath(workspaceRoot, requestedPath);
