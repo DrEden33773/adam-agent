@@ -19,6 +19,7 @@ import {
 } from "@adam-agent/agent";
 import { FakeModelDriver } from "@adam-agent/testkit";
 
+loadProjectEnvironment();
 const prompt = process.argv.slice(2).join(" ");
 const workspaceRoot = process.cwd();
 const { ADAM_AGENT_STATE_ROOT: configuredStateRoot } = process.env;
@@ -354,4 +355,15 @@ function selectModel(): ModelDriver {
 function failConfiguration(message: string): never {
   writeText(2, `${message}\n`);
   process.exit(1);
+}
+
+function loadProjectEnvironment(): void {
+  try {
+    process.loadEnvFile(join(process.cwd(), ".env"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return;
+    }
+    failConfiguration("Adam Agent could not load the project .env file.");
+  }
 }

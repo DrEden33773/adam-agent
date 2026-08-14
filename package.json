@@ -19,6 +19,7 @@
     "quality:check": "pnpm code:check && pnpm markdown:check && pnpm typecheck && pnpm test",
     "quality:fix": "pnpm code:fix && pnpm markdown:fix",
     "test": "tsc -b && vitest run",
+    "test:live:deepseek": "node --env-file-if-exists=.env ./node_modules/vitest/vitest.mjs run packages/testkit/src/openai-compatible-model-driver.live.test.ts",
     "typecheck": "tsc -b --pretty false"
   },
   "devDependencies": {
