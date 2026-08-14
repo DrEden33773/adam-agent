@@ -112,7 +112,8 @@ describe("one-shot CLI", () => {
 
       expect(result).toEqual({
         stdout: "The verification command was not run.\n",
-        stderr: 'Allow run_shell at ".": "printf first\\n\\u001b[31mforged" [y/N] ',
+        stderr:
+          'Allow run_shell at ".": "printf first\\n\\u001b[31m\\u202ecommand\\u009b\\u2028forged" [y/N] ',
         exitCode: 0,
         signal: null,
       });

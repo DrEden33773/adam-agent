@@ -65,7 +65,13 @@ type ToolAdapter = {
   readonly definition: ModelToolDefinition;
   readonly outputSchema: z.ZodType<JsonValue>;
   readonly effect: ToolEffect;
+  readonly cancellation: "unsupported" | "abort_signal";
+  readonly maximumResult: ToolMaximumResultPolicy;
   prepare(argumentsJson: string): PreparedToolCall | FailedToolResult;
+};
+
+type ToolMaximumResultPolicy = {
+  readonly maximumBytes?: number;
 };
 
 type FailedToolResult = Extract<ToolResult, { readonly status: "failed" }>;
@@ -232,6 +238,8 @@ export function createReadToolRegistry(options: { readonly workspaceRoot: string
     },
     outputSchema: readFileOutputSchema,
     effect: "read",
+    cancellation: "unsupported",
+    maximumResult: readFileMaximumResult,
     prepare(argumentsJson) {
       const parsedArguments = parseInput(readFileInputSchema, argumentsJson);
       if (!parsedArguments.success) {
@@ -285,6 +293,8 @@ export function createMutationToolRegistry(options: {
     },
     outputSchema: writeFileOutputSchema,
     effect: "write",
+    cancellation: "unsupported",
+    maximumResult: {},
     prepare(argumentsJson) {
       const parsedArguments = parseInput(writeFileInputSchema, argumentsJson);
       if (!parsedArguments.success) {
@@ -340,6 +350,8 @@ export function createMutationToolRegistry(options: {
     },
     outputSchema: editFileOutputSchema,
     effect: "write",
+    cancellation: "unsupported",
+    maximumResult: {},
     prepare(argumentsJson) {
       const parsedArguments = parseInput(editFileInputSchema, argumentsJson);
       if (!parsedArguments.success) {
@@ -504,6 +516,8 @@ export function createCodingToolRegistry(options: {
     },
     outputSchema: runShellOutputSchema,
     effect: "execute",
+    cancellation: "abort_signal",
+    maximumResult: { maximumBytes: 2 * shellLimits.maximumInlineBytesPerStream },
     prepare(argumentsJson) {
       const parsedArguments = parseInput(runShellInputSchema, argumentsJson);
       if (!parsedArguments.success) {

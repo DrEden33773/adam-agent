@@ -43,12 +43,13 @@ export async function createFileArtifactStore(options: {
       const temporaryPath = join(root, `.${digest}.${randomUUID()}.tmp`);
       const temporaryFile = await open(temporaryPath, "wx", 0o600);
       try {
-        await temporaryFile.writeFile(bytes);
-        await temporaryFile.sync();
-      } finally {
-        await temporaryFile.close();
-      }
-      try {
+        try {
+          await temporaryFile.writeFile(bytes);
+          await temporaryFile.chmod(0o400);
+          await temporaryFile.sync();
+        } finally {
+          await temporaryFile.close();
+        }
         try {
           await link(temporaryPath, targetPath);
           await syncDirectory(root);
@@ -60,15 +61,11 @@ export async function createFileArtifactStore(options: {
           if (!existingBytes.equals(bytes)) {
             throw new Error("The content-addressed artifact does not match its ID.");
           }
+          await chmod(targetPath, 0o400);
         }
       } finally {
-        await unlink(temporaryPath).catch((error: unknown) => {
-          if (!isNodeError(error) || error.code !== "ENOENT") {
-            throw error;
-          }
-        });
+        await unlinkTemporary(temporaryPath);
       }
-      await chmod(targetPath, 0o400);
       return {
         id,
         mediaType: input.mediaType,
@@ -93,6 +90,14 @@ export async function createFileArtifactStore(options: {
       }
     },
   };
+}
+
+async function unlinkTemporary(path: string): Promise<void> {
+  await unlink(path).catch((error: unknown) => {
+    if (!isNodeError(error) || error.code !== "ENOENT") {
+      throw error;
+    }
+  });
 }
 
 async function syncDirectory(path: string): Promise<void> {

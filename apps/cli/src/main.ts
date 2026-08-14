@@ -24,7 +24,7 @@ const stateRoot = configuredStateRoot ?? join(homedir(), ".local", "state", "ada
 const verificationPrompt = "Run the repository verification command";
 const verificationCommand = "printf cli-verified";
 const promptEscapingPrompt = "Run the prompt escaping command";
-const promptEscapingCommand = "printf first\n\u001b[31mforged";
+const promptEscapingCommand = "printf first\n\u001b[31m\u202ecommand\u009b\u2028forged";
 const longVerificationPrompt = "Run the long repository verification command";
 const longVerificationCommand =
   "trap '' TERM; printf started > started.txt; sleep 5; printf survived > survived.txt";
@@ -233,9 +233,18 @@ function formatPermissionPrompt(
   event: Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>,
 ): string {
   if (event.subject.type === "command") {
-    return `Allow ${event.name} at "${event.subject.cwd}": ${JSON.stringify(event.subject.command)} [y/N] `;
+    return `Allow ${event.name} at "${event.subject.cwd}": ${quoteForTerminal(event.subject.command)} [y/N] `;
   }
-  return `Allow ${event.name} for ${JSON.stringify(event.subject.path)} [y/N] `;
+  return `Allow ${event.name} for ${quoteForTerminal(event.subject.path)} [y/N] `;
+}
+
+function quoteForTerminal(value: string): string {
+  return JSON.stringify(value).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, (character) =>
+    Array.from(
+      { length: character.length },
+      (_, index) => `\\u${character.charCodeAt(index).toString(16).padStart(4, "0")}`,
+    ).join(""),
+  );
 }
 
 function verificationAnswer(message: ModelMessage | undefined): string {
