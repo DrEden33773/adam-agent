@@ -171,6 +171,36 @@ test("SessionStore adapters reject non-canonical records on append", async () =>
   }
 });
 
+test("SessionStore adapters require a category for model request failures", async () => {
+  const { testRoot, stores } = await createContractStores(
+    "adam-agent-session-model-failure-",
+    "session-model-failure",
+  );
+  const invalidRecord = {
+    schemaVersion: 1,
+    runId,
+    sequence: 1,
+    event: {
+      type: "session_settled",
+      result: {
+        status: "failed",
+        error: { code: "model_request_failed", message: "Missing category" },
+      },
+    },
+  } as unknown as SessionEventRecord;
+
+  try {
+    for (const [name, store] of stores) {
+      await expect(store.append(invalidRecord), name).rejects.toMatchObject({
+        name: "SessionStoreError",
+        code: "session_log_invalid",
+      });
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionStore adapters reject an oversized canonical record before modifying history", async () => {
   const { testRoot, stores } = await createContractStores(
     "adam-agent-session-record-bound-",

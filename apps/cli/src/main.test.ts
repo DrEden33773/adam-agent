@@ -44,6 +44,182 @@ describe("one-shot CLI", () => {
     }
   });
 
+  test("rejects explicit DeepSeek selection when its credential is missing", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-deepseek-missing-key-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    await mkdir(workspaceRoot);
+
+    try {
+      const result = await runCli({
+        cwd: workspaceRoot,
+        stateRoot: join(testRoot, "state"),
+        prompt: "Hello",
+        stdin: "",
+        env: { ADAM_AGENT_PROVIDER: "deepseek" },
+      });
+
+      expect(result).toEqual({
+        stdout: "",
+        stderr: "DEEPSEEK_API_KEY is required when ADAM_AGENT_PROVIDER=deepseek.\n",
+        exitCode: 1,
+        signal: null,
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("does not echo an unsupported provider value", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-provider-invalid-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    await mkdir(workspaceRoot);
+
+    try {
+      const result = await runCli({
+        cwd: workspaceRoot,
+        stateRoot: join(testRoot, "state"),
+        prompt: "Hello",
+        stdin: "",
+        env: { ADAM_AGENT_PROVIDER: "invalid\u001b[31m" },
+      });
+
+      expect(result).toEqual({
+        stdout: "",
+        stderr: "ADAM_AGENT_PROVIDER must be unset or deepseek.\n",
+        exitCode: 1,
+        signal: null,
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("selects DeepSeek with the current default model", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-deepseek-selection-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const fetchHookPath = join(testRoot, "fetch-hook.mjs");
+    await mkdir(workspaceRoot);
+    await writeFile(
+      fetchHookPath,
+      `globalThis.fetch = async (_input, init) => {
+  const request = JSON.parse(String(init?.body));
+  const chunks = [
+    {
+      id: "selection-1",
+      choices: [{ index: 0, delta: { content: "Selected " + request.model + "." }, finish_reason: null }],
+      created: 1,
+      model: request.model,
+      object: "chat.completion.chunk",
+      usage: null,
+    },
+    {
+      id: "selection-1",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      created: 1,
+      model: request.model,
+      object: "chat.completion.chunk",
+      usage: null,
+    },
+  ];
+  return new Response(chunks.map((chunk) => "data: " + JSON.stringify(chunk) + "\\n\\n").join("") + "data: [DONE]\\n\\n", {
+    headers: { "content-type": "text/event-stream" },
+    status: 200,
+  });
+
+};
+`,
+      "utf8",
+    );
+
+    try {
+      const defaultResult = await runCli({
+        cwd: workspaceRoot,
+        stateRoot: join(testRoot, "default-state"),
+        prompt: "Hello",
+        stdin: "",
+        env: {
+          ADAM_AGENT_PROVIDER: "deepseek",
+          DEEPSEEK_API_KEY: "test-deepseek-key",
+          NODE_OPTIONS: `--import=${fetchHookPath}`,
+        },
+      });
+      const overrideResult = await runCli({
+        cwd: workspaceRoot,
+        stateRoot: join(testRoot, "override-state"),
+        prompt: "Hello",
+        stdin: "",
+        env: {
+          ADAM_AGENT_PROVIDER: "deepseek",
+          DEEPSEEK_API_KEY: "test-deepseek-key",
+          ADAM_AGENT_MODEL: "deepseek-v4-flash",
+          NODE_OPTIONS: `--import=${fetchHookPath}`,
+        },
+      });
+
+      expect({ defaultResult, overrideResult }).toEqual({
+        defaultResult: {
+          stdout: "Selected deepseek-v4-pro.\n",
+          stderr: "",
+          exitCode: 0,
+          signal: null,
+        },
+        overrideResult: {
+          stdout: "Selected deepseek-v4-flash.\n",
+          stderr: "",
+          exitCode: 0,
+          signal: null,
+        },
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("reports a sanitized DeepSeek failure with exit code 1", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-deepseek-failure-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const fetchHookPath = join(testRoot, "fetch-hook.mjs");
+    await mkdir(workspaceRoot);
+    await writeFile(
+      fetchHookPath,
+      `globalThis.fetch = async () => new Response(JSON.stringify({
+  error: {
+    message: "Authentication failed for test-deepseek-key",
+    type: "authentication_error",
+    code: "invalid_api_key",
+  },
+}), {
+  headers: { "content-type": "application/json", "x-request-id": "cli-auth-1" },
+  status: 401,
+});
+`,
+      "utf8",
+    );
+
+    try {
+      const result = await runCli({
+        cwd: workspaceRoot,
+        stateRoot: join(testRoot, "state"),
+        prompt: "Hello",
+        stdin: "",
+        env: {
+          ADAM_AGENT_PROVIDER: "deepseek",
+          DEEPSEEK_API_KEY: "test-deepseek-key",
+          NODE_OPTIONS: `--import=${fetchHookPath}`,
+        },
+      });
+
+      expect(result).toEqual({
+        stdout: "",
+        stderr: "The model provider rejected authentication.\n",
+        exitCode: 1,
+        signal: null,
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
   test("asks on stderr and accepts a piped y before running a shell command", async () => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-shell-"));
     const workspaceRoot = join(testRoot, "workspace");
@@ -251,7 +427,7 @@ async function interruptCliDuringShell(options: {
   const input = await open(options.stdinPath, "r");
   const child = spawn(process.execPath, [cliPath, "Run the long repository verification command"], {
     cwd: options.cwd,
-    env: { ...process.env, ADAM_AGENT_STATE_ROOT: options.stateRoot },
+    env: cliEnvironment(options.stateRoot),
     stdio: [input.fd, "pipe", "pipe"],
   });
   await input.close();
@@ -296,7 +472,7 @@ async function interruptCliAtPermission(options: {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(process.execPath, [cliPath, "Run the repository verification command"], {
       cwd: options.cwd,
-      env: { ...process.env, ADAM_AGENT_STATE_ROOT: options.stateRoot },
+      env: cliEnvironment(options.stateRoot),
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -338,6 +514,7 @@ async function runCli(options: {
   readonly stateRoot: string;
   readonly prompt: string;
   readonly stdin: string;
+  readonly env?: Readonly<Record<string, string>>;
 }): Promise<{
   readonly stdout: string;
   readonly stderr: string;
@@ -357,11 +534,10 @@ async function runCli(options: {
       ],
       {
         cwd: options.cwd,
-        env: {
-          ...process.env,
+        env: cliEnvironment(options.stateRoot, {
           ADAM_AGENT_CLI_TEST_STDIN: options.stdin,
-          ADAM_AGENT_STATE_ROOT: options.stateRoot,
-        },
+          ...options.env,
+        }),
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
@@ -380,6 +556,21 @@ async function runCli(options: {
       resolvePromise({ stdout, stderr, exitCode, signal });
     });
   });
+}
+
+function cliEnvironment(
+  stateRoot: string,
+  additional: Readonly<Record<string, string>> = {},
+): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of ["ADAM_AGENT_PROVIDER", "DEEPSEEK_API_KEY", "ADAM_AGENT_MODEL"] as const) {
+    delete environment[name];
+  }
+  return {
+    ...environment,
+    ADAM_AGENT_STATE_ROOT: stateRoot,
+    ...additional,
+  };
 }
 
 async function waitForFile(path: string): Promise<void> {

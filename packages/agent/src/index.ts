@@ -1,11 +1,18 @@
 import { randomUUID } from "node:crypto";
 
+import { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
+
 export {
   type ArtifactReference,
   type ArtifactSource,
   type ArtifactStore,
   createFileArtifactStore,
 } from "./artifact-store.js";
+export { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
+export {
+  OpenAICompatibleModelDriver,
+  type OpenAICompatibleModelDriverOptions,
+} from "./openai-compatible-model-driver.js";
 
 import type { CanonicalRuntimeEvent, SessionStore } from "./session-store.js";
 import type {
@@ -59,10 +66,13 @@ export type RunOptions = {
 };
 
 export type ModelMessage =
+  | { readonly role: "system"; readonly content: string }
+  | { readonly role: "developer"; readonly content: string }
   | { readonly role: "user"; readonly content: string }
   | {
       readonly role: "assistant";
       readonly content: string;
+      readonly reasoning?: string;
       readonly toolCalls: readonly ToolCall[];
     }
   | {
@@ -80,6 +90,7 @@ export type ModelRequest = {
 
 export type ModelEvent =
   | { readonly type: "text_delta"; readonly text: string }
+  | { readonly type: "reasoning_delta"; readonly text: string }
   | { readonly type: "tool_call_start"; readonly id: string; readonly name: string }
   | { readonly type: "tool_call_delta"; readonly id: string; readonly json: string }
   | { readonly type: "tool_call_end"; readonly id: string }
@@ -87,8 +98,21 @@ export type ModelEvent =
       readonly type: "usage";
       readonly inputTokens: number;
       readonly outputTokens: number;
+      readonly reasoningTokens?: number | undefined;
+      readonly cachedInputTokens?: number | undefined;
+      readonly cacheMissInputTokens?: number | undefined;
     }
-  | { readonly type: "finish"; readonly reason: "stop" | "tool_calls" };
+  | {
+      readonly type: "finish";
+      readonly reason:
+        | "stop"
+        | "tool_calls"
+        | "length"
+        | "content_filter"
+        | "resource_exhausted"
+        | "unknown";
+      readonly rawReason?: string | undefined;
+    };
 
 export interface ModelDriver {
   stream(request: ModelRequest): AsyncIterable<ModelEvent>;
@@ -108,18 +132,34 @@ export type RunResult =
     }
   | {
       readonly status: "failed";
-      readonly error: {
-        readonly code:
-          | "model_stream_incomplete"
-          | "model_protocol_invalid"
-          | "invalid_run_limits"
-          | "run_already_active"
-          | "session_persistence_failed"
-          | "turn_limit_exceeded"
-          | "token_limit_exceeded"
-          | "token_usage_missing";
-        readonly message: string;
-      };
+      readonly error:
+        | {
+            readonly code:
+              | "model_stream_incomplete"
+              | "model_protocol_invalid"
+              | "model_output_truncated"
+              | "model_content_filtered"
+              | "invalid_run_limits"
+              | "run_already_active"
+              | "session_persistence_failed"
+              | "turn_limit_exceeded"
+              | "token_limit_exceeded"
+              | "token_usage_missing";
+            readonly message: string;
+          }
+        | {
+            readonly code: "model_resource_exhausted" | "model_finish_unknown";
+            readonly message: string;
+            readonly providerReason?: string | undefined;
+          }
+        | {
+            readonly code: "model_request_failed";
+            readonly message: string;
+            readonly category: ModelDriverErrorCategory;
+            readonly status?: number | undefined;
+            readonly providerCode?: string | undefined;
+            readonly requestId?: string | undefined;
+          };
     };
 
 export type PermissionDecisionCommand = {
@@ -147,6 +187,9 @@ export type RuntimeEvent =
       readonly inputTokens: number;
       readonly outputTokens: number;
       readonly totalTokens: number;
+      readonly reasoningTokens?: number | undefined;
+      readonly cachedInputTokens?: number | undefined;
+      readonly cacheMissInputTokens?: number | undefined;
     }
   | { readonly type: "tool_requested"; readonly callId: string; readonly name: string }
   | {
@@ -290,6 +333,9 @@ export class AgentSession {
         if (abortController.signal.aborted && this.#terminalResult === undefined) {
           return await this.#settleCancelled();
         }
+        if (error instanceof ModelDriverError) {
+          return await this.#settleModelRequestFailed(error);
+        }
         throw error;
       }
     } catch (error) {
@@ -342,7 +388,16 @@ export class AgentSession {
         return this.#settleCancelled();
       }
       let answer = "";
-      let finishReason: "stop" | "tool_calls" | undefined;
+      let reasoning = "";
+      let finishReason:
+        | "stop"
+        | "tool_calls"
+        | "length"
+        | "content_filter"
+        | "resource_exhausted"
+        | "unknown"
+        | undefined;
+      let rawFinishReason: string | undefined;
       let protocolError: string | undefined;
       let usageWasReported = false;
       const assemblingCalls = new Map<string, ToolCall>();
@@ -360,6 +415,9 @@ export class AgentSession {
           case "text_delta":
             answer += event.text;
             await this.#emit({ type: "model_message_delta", text: event.text });
+            break;
+          case "reasoning_delta":
+            reasoning += event.text;
             break;
           case "tool_call_start":
             if (assemblingCalls.has(event.id)) {
@@ -400,6 +458,7 @@ export class AgentSession {
             if (
               !isNonnegativeSafeInteger(event.inputTokens) ||
               !isNonnegativeSafeInteger(event.outputTokens) ||
+              !areOptionalUsageDetailsValid(event) ||
               !Number.isSafeInteger(totalTokens) ||
               !Number.isSafeInteger(nextReportedTokens)
             ) {
@@ -413,11 +472,21 @@ export class AgentSession {
               inputTokens: event.inputTokens,
               outputTokens: event.outputTokens,
               totalTokens,
+              ...(event.reasoningTokens === undefined
+                ? {}
+                : { reasoningTokens: event.reasoningTokens }),
+              ...(event.cachedInputTokens === undefined
+                ? {}
+                : { cachedInputTokens: event.cachedInputTokens }),
+              ...(event.cacheMissInputTokens === undefined
+                ? {}
+                : { cacheMissInputTokens: event.cacheMissInputTokens }),
             });
             break;
           }
           case "finish":
             finishReason = event.reason;
+            rawFinishReason = event.rawReason;
             break;
         }
         if (signal.aborted || finishReason !== undefined) {
@@ -435,6 +504,19 @@ export class AgentSession {
 
       if (protocolError !== undefined) {
         return this.#settleProtocolInvalid(protocolError);
+      }
+
+      if (finishReason === "length") {
+        return this.#settleOutputTruncated();
+      }
+      if (finishReason === "content_filter") {
+        return this.#settleContentFiltered();
+      }
+      if (finishReason === "resource_exhausted") {
+        return this.#settleResourceExhausted(rawFinishReason);
+      }
+      if (finishReason === "unknown") {
+        return this.#settleUnknownFinish(rawFinishReason);
       }
 
       await this.#emit({ type: "model_message_completed", text: answer });
@@ -487,7 +569,12 @@ export class AgentSession {
         uniqueCalls.set(call.id, call);
       }
 
-      messages.push({ role: "assistant", content: answer, toolCalls: completedCalls });
+      messages.push({
+        role: "assistant",
+        content: answer,
+        ...(reasoning.length === 0 ? {} : { reasoning }),
+        toolCalls: completedCalls,
+      });
       for (const call of uniqueCalls.values()) {
         if (signal.aborted) {
           return this.#settleCancelled();
@@ -612,10 +699,72 @@ export class AgentSession {
     return this.#settle(result);
   }
 
+  async #settleModelRequestFailed(error: ModelDriverError): Promise<RunResult> {
+    const result: RunResult = {
+      status: "failed",
+      error: {
+        code: "model_request_failed",
+        message: error.message,
+        category: error.category,
+        ...(error.status === undefined ? {} : { status: error.status }),
+        ...(error.providerCode === undefined ? {} : { providerCode: error.providerCode }),
+        ...(error.requestId === undefined ? {} : { requestId: error.requestId }),
+      },
+    };
+    return this.#settle(result);
+  }
+
   async #settleProtocolInvalid(message: string): Promise<RunResult> {
     const result: RunResult = {
       status: "failed",
       error: { code: "model_protocol_invalid", message },
+    };
+    return this.#settle(result);
+  }
+
+  async #settleOutputTruncated(): Promise<RunResult> {
+    const result: RunResult = {
+      status: "failed",
+      error: {
+        code: "model_output_truncated",
+        message: "The model response reached its output-token limit.",
+      },
+    };
+    return this.#settle(result);
+  }
+
+  async #settleContentFiltered(): Promise<RunResult> {
+    const result: RunResult = {
+      status: "failed",
+      error: {
+        code: "model_content_filtered",
+        message: "The provider filtered the model response.",
+      },
+    };
+    return this.#settle(result);
+  }
+
+  async #settleResourceExhausted(providerReason: string | undefined): Promise<RunResult> {
+    const result: RunResult = {
+      status: "failed",
+      error: {
+        code: "model_resource_exhausted",
+        message:
+          "The provider could not complete the model response because resources were unavailable.",
+        ...(providerReason === undefined ? {} : { providerReason }),
+      },
+    };
+    return this.#settle(result);
+  }
+
+  async #settleUnknownFinish(providerReason: string | undefined): Promise<RunResult> {
+    const result: RunResult = {
+      status: "failed",
+      error: {
+        code: "model_finish_unknown",
+        message: "The provider ended the model response for an unknown reason.",
+        ...(providerReason === undefined ? {} : { providerReason }),
+      },
     };
     return this.#settle(result);
   }
@@ -762,6 +911,14 @@ export class AgentSession {
 
 function isNonnegativeSafeInteger(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+function areOptionalUsageDetailsValid(
+  usage: Extract<ModelEvent, { readonly type: "usage" }>,
+): boolean {
+  return [usage.reasoningTokens, usage.cachedInputTokens, usage.cacheMissInputTokens].every(
+    (value) => value === undefined || isNonnegativeSafeInteger(value),
+  );
 }
 
 function areRunLimitsValid(limits: RunOptions["limits"]): boolean {
