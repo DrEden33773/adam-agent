@@ -4,7 +4,10 @@ import type { CanonicalRuntimeEvent, SessionStore } from "./session-store.js";
 import type {
   ModelToolDefinition,
   PermissionPolicy,
+  PermissionPolicyInput,
+  PermissionSubject,
   ToolCall,
+  ToolEffect,
   ToolRegistry,
   ToolResult,
 } from "./tool-runtime.js";
@@ -19,12 +22,15 @@ export {
 } from "./session-store.js";
 
 export {
+  createMutationToolRegistry,
   createPermissionPolicy,
   createReadToolRegistry,
   type JsonValue,
   type ModelToolDefinition,
   type PermissionDecision,
   type PermissionPolicy,
+  type PermissionPolicyInput,
+  type PermissionSubject,
   type ToolCall,
   type ToolEffect,
   type ToolRegistry,
@@ -107,6 +113,21 @@ export type RunResult =
       };
     };
 
+export type PermissionDecisionCommand = {
+  readonly requestId: string;
+  readonly decision: "allow" | "deny";
+};
+
+export type PermissionDecisionCommandResult =
+  | { readonly status: "accepted" }
+  | {
+      readonly status: "rejected";
+      readonly error: {
+        readonly code: "permission_request_not_pending" | "invalid_permission_decision";
+        readonly message: string;
+      };
+    };
+
 export type RuntimeEvent =
   | { readonly type: "user_message"; readonly text: string }
   | { readonly type: "model_message_started" }
@@ -120,10 +141,23 @@ export type RuntimeEvent =
     }
   | { readonly type: "tool_requested"; readonly callId: string; readonly name: string }
   | {
+      readonly type: "tool_permission_requested";
+      readonly requestId: string;
+      readonly callId: string;
+      readonly name: string;
+      readonly effect: ToolEffect;
+      readonly scope: "call";
+      readonly subject: PermissionSubject;
+    }
+  | {
       readonly type: "tool_permission_decided";
       readonly callId: string;
       readonly name: string;
       readonly decision: "allow" | "deny";
+      readonly requestId?: string | undefined;
+      readonly effect?: ToolEffect | undefined;
+      readonly scope?: "call" | undefined;
+      readonly subject?: PermissionSubject | undefined;
     }
   | { readonly type: "tool_started"; readonly callId: string; readonly name: string }
   | {
@@ -162,6 +196,12 @@ export class AgentSession {
   #activeRunId: string | undefined;
   #nextSequence = 1;
   #terminalResult: RunResult | undefined;
+  #pendingPermission:
+    | {
+        readonly requestId: string;
+        readonly resolve: (decision: "allow" | "deny") => void;
+      }
+    | undefined;
 
   constructor(dependencies: AgentSessionDependencies) {
     this.#model = dependencies.model;
@@ -179,6 +219,30 @@ export class AgentSession {
 
   abort(): void {
     this.#activeAbortController?.abort();
+  }
+
+  decidePermission(command: PermissionDecisionCommand): PermissionDecisionCommandResult {
+    if (command.decision !== "allow" && command.decision !== "deny") {
+      return {
+        status: "rejected",
+        error: {
+          code: "invalid_permission_decision",
+          message: "The permission decision must be allow or deny.",
+        },
+      };
+    }
+    const pendingPermission = this.#pendingPermission;
+    if (pendingPermission === undefined || pendingPermission.requestId !== command.requestId) {
+      return {
+        status: "rejected",
+        error: {
+          code: "permission_request_not_pending",
+          message: "The permission request is not pending.",
+        },
+      };
+    }
+    pendingPermission.resolve(command.decision);
+    return { status: "accepted" };
   }
 
   async run(input: UserInput, options: RunOptions = {}): Promise<RunResult> {
@@ -455,13 +519,53 @@ export class AgentSession {
           await this.#appendToolResult(messages, call, preparedCall);
           continue;
         }
-        const decision = this.#permissions?.decide(adapter.effect) ?? "deny";
-        await this.#emit({
-          type: "tool_permission_decided",
+        const permissionInput: PermissionPolicyInput = {
           callId: call.id,
           name: call.name,
-          decision,
-        });
+          effect: adapter.effect,
+          scope: "call",
+          subject: preparedCall.permissionSubject,
+        };
+        const policyDecision = this.#permissions?.decide(permissionInput) ?? "deny";
+        if (signal.aborted) {
+          return this.#settleCancelled();
+        }
+        let decision: "allow" | "deny";
+        if (policyDecision === "ask") {
+          const runId = this.#activeRunId;
+          if (runId === undefined) {
+            throw new Error("Cannot request permission without an active run ID.");
+          }
+          const requestId = `${runId}:${call.id}`;
+          const pendingDecision = this.#createPendingPermissionDecision(requestId, signal);
+          try {
+            await this.#emit({
+              type: "tool_permission_requested",
+              requestId,
+              ...permissionInput,
+            });
+            const userDecision = await pendingDecision.promise;
+            if (userDecision === undefined) {
+              return this.#settleCancelled();
+            }
+            decision = userDecision;
+            await this.#emit({
+              type: "tool_permission_decided",
+              requestId,
+              decision,
+              ...permissionInput,
+            });
+          } finally {
+            pendingDecision.cancel();
+          }
+        } else {
+          decision = policyDecision;
+          await this.#emit({
+            type: "tool_permission_decided",
+            decision,
+            ...permissionInput,
+          });
+        }
         if (signal.aborted) {
           return this.#settleCancelled();
         }
@@ -584,6 +688,42 @@ export class AgentSession {
       });
     }
     messages.push({ role: "tool", callId: call.id, name: call.name, result });
+  }
+
+  #createPendingPermissionDecision(
+    requestId: string,
+    signal: AbortSignal,
+  ): {
+    readonly promise: Promise<"allow" | "deny" | undefined>;
+    readonly cancel: () => void;
+  } {
+    let settle: (decision: "allow" | "deny" | undefined) => void = () => {};
+    const promise = new Promise<"allow" | "deny" | undefined>((resolve) => {
+      let settled = false;
+      const finish = (decision: "allow" | "deny" | undefined) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        signal.removeEventListener("abort", abortPending);
+        if (this.#pendingPermission?.requestId === requestId) {
+          this.#pendingPermission = undefined;
+        }
+        resolve(decision);
+      };
+      const abortPending = () => finish(undefined);
+      settle = finish;
+      this.#pendingPermission = {
+        requestId,
+        resolve: (decision) => finish(decision),
+      };
+      if (signal.aborted) {
+        abortPending();
+      } else {
+        signal.addEventListener("abort", abortPending, { once: true });
+      }
+    });
+    return { promise, cancel: () => settle(undefined) };
   }
 
   async #emit(event: RuntimeEvent): Promise<void> {
