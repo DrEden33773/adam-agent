@@ -142,7 +142,7 @@ describe("one-shot CLI", () => {
     } finally {
       await rm(testRoot, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("SIGINT during an approved shell command cancels and cleans up the command", async () => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-shell-interrupt-"));
@@ -302,6 +302,7 @@ async function interruptCliAtPermission(options: {
     let stdout = "";
     let stderr = "";
     let interrupted = false;
+    let shutdownGuard: NodeJS.Timeout | undefined;
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
@@ -311,11 +312,22 @@ async function interruptCliAtPermission(options: {
       stderr += chunk;
       if (!interrupted && stderr.includes("[y/N] ")) {
         interrupted = true;
-        child.kill("SIGINT");
+        if (!child.kill("SIGINT")) {
+          rejectPromise(new Error("The CLI process did not accept SIGINT."));
+          return;
+        }
+        shutdownGuard = setTimeout(() => {
+          child.kill("SIGKILL");
+          rejectPromise(new Error("The CLI process did not exit after SIGINT."));
+        }, 10_000);
       }
     });
-    child.once("error", rejectPromise);
+    child.once("error", (error) => {
+      clearTimeout(shutdownGuard);
+      rejectPromise(error);
+    });
     child.once("close", (exitCode, signal) => {
+      clearTimeout(shutdownGuard);
       resolvePromise({ stdout, stderr, exitCode, signal });
     });
   });

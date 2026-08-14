@@ -165,6 +165,7 @@ class PermissionLineReader {
 
   close(): void {
     this.#handleEnd();
+    this.#input.pause();
     this.#input.removeListener("data", this.#handleData);
     this.#input.removeListener("end", this.#handleEnd);
   }
