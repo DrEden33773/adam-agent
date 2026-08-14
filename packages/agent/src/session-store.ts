@@ -4,8 +4,8 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import { z } from "zod";
-
 import type { RunResult, RuntimeEvent } from "./index.js";
+import { modelDriverErrorCategories } from "./model-driver-error.js";
 
 export type CanonicalRuntimeEvent = Exclude<RuntimeEvent, { readonly type: "model_message_delta" }>;
 
@@ -42,15 +42,37 @@ export class SessionStoreError extends Error {
   }
 }
 
-const runErrorCodeSchema = z.enum([
+const ordinaryRunErrorCodeSchema = z.enum([
   "model_stream_incomplete",
   "model_protocol_invalid",
+  "model_output_truncated",
+  "model_content_filtered",
   "invalid_run_limits",
   "run_already_active",
   "session_persistence_failed",
   "turn_limit_exceeded",
   "token_limit_exceeded",
   "token_usage_missing",
+]);
+type RunFailure = Extract<RunResult, { readonly status: "failed" }>["error"];
+const runFailureSchema: z.ZodType<RunFailure> = z.discriminatedUnion("code", [
+  z.strictObject({
+    code: ordinaryRunErrorCodeSchema,
+    message: z.string(),
+  }),
+  z.strictObject({
+    code: z.enum(["model_resource_exhausted", "model_finish_unknown"]),
+    message: z.string(),
+    providerReason: z.string().max(128).optional(),
+  }),
+  z.strictObject({
+    code: z.literal("model_request_failed"),
+    message: z.string(),
+    category: z.enum(modelDriverErrorCategories),
+    status: z.number().int().min(100).max(599).optional(),
+    providerCode: z.string().max(128).optional(),
+    requestId: z.string().max(128).optional(),
+  }),
 ]);
 const runResultSchema: z.ZodType<RunResult> = z.discriminatedUnion("status", [
   z.strictObject({ status: z.literal("completed"), answer: z.string() }),
@@ -63,7 +85,7 @@ const runResultSchema: z.ZodType<RunResult> = z.discriminatedUnion("status", [
   }),
   z.strictObject({
     status: z.literal("failed"),
-    error: z.strictObject({ code: runErrorCodeSchema, message: z.string() }),
+    error: runFailureSchema,
   }),
 ]);
 const toolErrorSchema = z.strictObject({
@@ -104,6 +126,9 @@ const canonicalRuntimeEventSchema: z.ZodType<CanonicalRuntimeEvent> = z.discrimi
       inputTokens: z.number().int().nonnegative(),
       outputTokens: z.number().int().nonnegative(),
       totalTokens: z.number().int().nonnegative(),
+      reasoningTokens: z.number().int().nonnegative().optional(),
+      cachedInputTokens: z.number().int().nonnegative().optional(),
+      cacheMissInputTokens: z.number().int().nonnegative().optional(),
     })
     .refine((usage) => usage.totalTokens === usage.inputTokens + usage.outputTokens),
   z.strictObject({

@@ -12,7 +12,9 @@ import {
   createJsonlSessionStore,
   createPermissionPolicy,
   type JsonValue,
+  type ModelDriver,
   type ModelMessage,
+  OpenAICompatibleModelDriver,
   type RuntimeEvent,
 } from "@adam-agent/agent";
 import { FakeModelDriver } from "@adam-agent/testkit";
@@ -30,7 +32,7 @@ const longVerificationCommand =
   "trap '' TERM; printf started > started.txt; sleep 5; printf survived > survived.txt";
 const codingTaskPrompt = "Update the demo file and verify it";
 const codingTaskVerificationCommand = 'test "$(cat demo.txt)" = after && printf verified';
-const model = new FakeModelDriver((request) => {
+const fakeModel = new FakeModelDriver((request) => {
   const latestMessage = request.messages.at(-1);
   if (latestMessage?.role === "user") {
     if (prompt === codingTaskPrompt) {
@@ -110,6 +112,7 @@ const model = new FakeModelDriver((request) => {
     { type: "finish", reason: "stop" },
   ];
 });
+const model: ModelDriver = selectModel();
 const store = await createJsonlSessionStore({
   stateRoot,
   workspaceRoot,
@@ -319,4 +322,36 @@ function jsonProperty(object: { readonly [key: string]: JsonValue }, name: strin
 
 function writeText(fileDescriptor: number, text: string): void {
   writeSync(fileDescriptor, text);
+}
+
+function selectModel(): ModelDriver {
+  const {
+    ADAM_AGENT_PROVIDER: provider,
+    DEEPSEEK_API_KEY: apiKey,
+    ADAM_AGENT_MODEL: configuredModel,
+  } = process.env;
+  if (provider === undefined) {
+    return fakeModel;
+  }
+  if (provider !== "deepseek") {
+    return failConfiguration("ADAM_AGENT_PROVIDER must be unset or deepseek.");
+  }
+  if (apiKey === undefined || apiKey.trim().length === 0) {
+    return failConfiguration("DEEPSEEK_API_KEY is required when ADAM_AGENT_PROVIDER=deepseek.");
+  }
+  if (configuredModel !== undefined && configuredModel.trim().length === 0) {
+    return failConfiguration("ADAM_AGENT_MODEL must be non-empty when set.");
+  }
+  return new OpenAICompatibleModelDriver({
+    profile: "deepseek",
+    apiKey,
+    baseURL: "https://api.deepseek.com",
+    model: configuredModel ?? "deepseek-v4-pro",
+    maximumOutputTokens: 32_768,
+  });
+}
+
+function failConfiguration(message: string): never {
+  writeText(2, `${message}\n`);
+  process.exit(1);
 }
