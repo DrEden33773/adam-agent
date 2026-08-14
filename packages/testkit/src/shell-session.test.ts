@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -382,6 +382,108 @@ test("a timed-out shell command cannot outlive the process-group termination gra
   }
 });
 
+test("timeout cleanup kills a detached descendant after the shell leader exits", async () => {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-shell-descendant-timeout-"));
+  const command =
+    '(trap "" TERM; sleep 0.5; printf survived > survived.txt) </dev/null >/dev/null 2>/dev/null & wait';
+
+  try {
+    const model = new FakeModelDriver((request) => {
+      if (request.messages.at(-1)?.role === "user") {
+        return [
+          { type: "tool_call_start", id: "call-shell-descendant-timeout", name: "run_shell" },
+          {
+            type: "tool_call_delta",
+            id: "call-shell-descendant-timeout",
+            json: JSON.stringify({ command, timeoutMs: 20 }),
+          },
+          { type: "tool_call_end", id: "call-shell-descendant-timeout" },
+          { type: "finish", reason: "tool_calls" },
+        ];
+      }
+      return [
+        { type: "text_delta", text: "The descendant process was cleaned up." },
+        { type: "finish", reason: "stop" },
+      ];
+    });
+    const session = new AgentSession({
+      model,
+      tools: createCodingToolRegistry({ workspaceRoot }),
+      permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
+      store: createInMemorySessionStore(),
+    });
+
+    const result = await session.run({ text: "Time out a shell with a detached descendant" });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 650));
+
+    expect({
+      result,
+      survived: await readFile(join(workspaceRoot, "survived.txt"), "utf8").catch(() => undefined),
+    }).toEqual({
+      result: { status: "completed", answer: "The descendant process was cleaned up." },
+      survived: undefined,
+    });
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("the first timeout remains the shell outcome when caller cancellation races afterward", async () => {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-shell-timeout-race-"));
+  const store = createInMemorySessionStore();
+  const command = "trap 'printf timeout > timeout.txt' TERM; while :; do sleep 1; done";
+
+  try {
+    const model = new FakeModelDriver((request) => {
+      if (request.messages.at(-1)?.role === "user") {
+        return [
+          { type: "tool_call_start", id: "call-shell-timeout-race", name: "run_shell" },
+          {
+            type: "tool_call_delta",
+            id: "call-shell-timeout-race",
+            json: JSON.stringify({ command, timeoutMs: 20 }),
+          },
+          { type: "tool_call_end", id: "call-shell-timeout-race" },
+          { type: "finish", reason: "tool_calls" },
+        ];
+      }
+      return [
+        { type: "text_delta", text: "Cancellation must not overwrite the timeout." },
+        { type: "finish", reason: "stop" },
+      ];
+    });
+    const session = new AgentSession({
+      model,
+      tools: createCodingToolRegistry({ workspaceRoot }),
+      permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
+      store,
+    });
+
+    const run = session.run({ text: "Time out and then cancel the command" });
+    await waitForFile(join(workspaceRoot, "timeout.txt"));
+    session.abort();
+    const result = await run;
+    const completed = (await store.read())
+      .map((record) => record.event)
+      .find(
+        (event) => event.type === "tool_completed" && event.callId === "call-shell-timeout-race",
+      );
+    const output = requireJsonObject(
+      completed?.type === "tool_completed" ? completed.output : null,
+    );
+
+    expect({ result, termination: jsonProperty(output, "termination") }).toEqual({
+      result: {
+        status: "cancelled",
+        error: { code: "session_cancelled", message: "The session was cancelled." },
+      },
+      termination: { type: "timed_out" },
+    });
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
 test("aborting an active shell command records interruption and removes its process group", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-shell-abort-"));
   const store = createInMemorySessionStore();
@@ -554,6 +656,60 @@ test("overflowing shell output is durably referenced before its bounded result i
     });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a file artifact is published without owner write permission", async () => {
+  const artifactRoot = await mkdtemp(join(tmpdir(), "adam-agent-artifact-mode-"));
+  const artifactStore = await createFileArtifactStore({ root: artifactRoot });
+
+  try {
+    const artifact = await artifactStore.write({
+      bytes: Buffer.from("immutable bytes", "utf8"),
+      mediaType: "application/octet-stream",
+      source: {
+        type: "tool_output",
+        callId: "call-artifact-mode",
+        toolName: "run_shell",
+        stream: "stdout",
+        totalBytes: 15,
+        truncated: false,
+      },
+    });
+    const artifactPath = join(artifactRoot, artifact.id.slice("sha256:".length));
+
+    expect((await stat(artifactPath)).mode & 0o777).toBe(0o400);
+  } finally {
+    await rm(artifactRoot, { recursive: true, force: true });
+  }
+});
+
+test("a file artifact read rejects bytes that no longer match its content address", async () => {
+  const artifactRoot = await mkdtemp(join(tmpdir(), "adam-agent-artifact-integrity-"));
+  const artifactStore = await createFileArtifactStore({ root: artifactRoot });
+
+  try {
+    const artifact = await artifactStore.write({
+      bytes: Buffer.from("original bytes", "utf8"),
+      mediaType: "application/octet-stream",
+      source: {
+        type: "tool_output",
+        callId: "call-artifact-integrity",
+        toolName: "run_shell",
+        stream: "stderr",
+        totalBytes: 14,
+        truncated: false,
+      },
+    });
+    const artifactPath = join(artifactRoot, artifact.id.slice("sha256:".length));
+    await chmod(artifactPath, 0o600);
+    await writeFile(artifactPath, "tampered bytes", "utf8");
+
+    await expect(artifactStore.read(artifact.id)).rejects.toThrow(
+      "The content-addressed artifact does not match its ID.",
+    );
+  } finally {
+    await rm(artifactRoot, { recursive: true, force: true });
   }
 });
 

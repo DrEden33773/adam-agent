@@ -23,6 +23,8 @@ const { ADAM_AGENT_STATE_ROOT: configuredStateRoot } = process.env;
 const stateRoot = configuredStateRoot ?? join(homedir(), ".local", "state", "adam-agent");
 const verificationPrompt = "Run the repository verification command";
 const verificationCommand = "printf cli-verified";
+const promptEscapingPrompt = "Run the prompt escaping command";
+const promptEscapingCommand = "printf first\n\u001b[31mforged";
 const longVerificationPrompt = "Run the long repository verification command";
 const longVerificationCommand =
   "trap '' TERM; printf started > started.txt; sleep 5; printf survived > survived.txt";
@@ -46,8 +48,17 @@ const model = new FakeModelDriver((request) => {
         { type: "finish", reason: "tool_calls" },
       ];
     }
-    if (prompt === verificationPrompt || prompt === longVerificationPrompt) {
-      const command = prompt === verificationPrompt ? verificationCommand : longVerificationCommand;
+    if (
+      prompt === verificationPrompt ||
+      prompt === longVerificationPrompt ||
+      prompt === promptEscapingPrompt
+    ) {
+      const command =
+        prompt === verificationPrompt
+          ? verificationCommand
+          : prompt === longVerificationPrompt
+            ? longVerificationCommand
+            : promptEscapingCommand;
       return [
         { type: "tool_call_start", id: "verify-repository", name: "run_shell" },
         {
@@ -87,7 +98,9 @@ const model = new FakeModelDriver((request) => {
   const answer =
     prompt === codingTaskPrompt
       ? codingTaskAnswer(latestMessage)
-      : prompt === verificationPrompt || prompt === longVerificationPrompt
+      : prompt === verificationPrompt ||
+          prompt === longVerificationPrompt ||
+          prompt === promptEscapingPrompt
         ? verificationAnswer(latestMessage)
         : latestMessage?.role === "tool" && latestMessage.result.status === "completed"
           ? firstReadmeParagraph(latestMessage.result.output)
@@ -121,7 +134,7 @@ async function answerPermissionRequest(
   const answer = await input.next();
   activeSession.decidePermission({
     requestId: event.requestId,
-    decision: answer?.trim() === "y" ? "allow" : "deny",
+    decision: answer === "y" ? "allow" : "deny",
   });
 }
 
@@ -204,7 +217,7 @@ const handleInterrupt = () => {
 };
 process.once("SIGINT", handleInterrupt);
 
-const result = await session.run({ text: prompt });
+const result = await session.run({ text: prompt }, { limits: { maxTurns: 8 } });
 permissionInput.close();
 await Promise.allSettled(pendingPermissionHandlers);
 process.removeListener("SIGINT", handleInterrupt);
@@ -220,9 +233,9 @@ function formatPermissionPrompt(
   event: Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>,
 ): string {
   if (event.subject.type === "command") {
-    return `Allow ${event.name} at "${event.subject.cwd}": ${event.subject.command} [y/N] `;
+    return `Allow ${event.name} at "${event.subject.cwd}": ${JSON.stringify(event.subject.command)} [y/N] `;
   }
-  return `Allow ${event.name} for ${event.subject.path} [y/N] `;
+  return `Allow ${event.name} for ${JSON.stringify(event.subject.path)} [y/N] `;
 }
 
 function verificationAnswer(message: ModelMessage | undefined): string {

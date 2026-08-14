@@ -68,7 +68,7 @@ export async function createFileArtifactStore(options: {
           }
         });
       }
-      await chmod(targetPath, 0o600);
+      await chmod(targetPath, 0o400);
       return {
         id,
         mediaType: input.mediaType,
@@ -79,7 +79,12 @@ export async function createFileArtifactStore(options: {
     async read(id) {
       const digest = parseArtifactId(id);
       try {
-        return await readFile(join(root, digest));
+        const bytes = await readFile(join(root, digest));
+        const actualDigest = createHash("sha256").update(bytes).digest("hex");
+        if (actualDigest !== digest) {
+          throw new Error("The content-addressed artifact does not match its ID.");
+        }
+        return bytes;
       } catch (error) {
         if (isNodeError(error) && error.code === "ENOENT") {
           return undefined;

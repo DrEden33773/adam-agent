@@ -1,6 +1,6 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { constants } from "node:fs";
-import { type FileHandle, mkdir, mkdtemp, open, opendir, realpath, rm } from "node:fs/promises";
+import { type FileHandle, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -65,19 +65,7 @@ type ToolAdapter = {
   readonly definition: ModelToolDefinition;
   readonly outputSchema: z.ZodType<JsonValue>;
   readonly effect: ToolEffect;
-  readonly cancellation: "unsupported" | "abort_signal";
-  readonly maximumResult: ToolMaximumResultPolicy;
   prepare(argumentsJson: string): PreparedToolCall | FailedToolResult;
-};
-
-type ToolMaximumResultPolicy = {
-  readonly maximumBytes?: number;
-  readonly maximumEntries?: number;
-  readonly maximumFiles?: number;
-  readonly maximumFileBytes?: number;
-  readonly maximumMatches?: number;
-  readonly maximumMatchCharacters?: number;
-  readonly maximumQueryCharacters?: number;
 };
 
 type FailedToolResult = Extract<ToolResult, { readonly status: "failed" }>;
@@ -148,7 +136,6 @@ export function createPermissionPolicy(options: {
 }
 
 const readFileInputSchema = z.strictObject({ path: z.string().min(1) });
-const listFilesInputSchema = z.strictObject({ path: z.string().min(1) });
 const maximumMutationFileBytes = 1024 * 1024;
 const maximumEditArgumentsBytes = 1024 * 1024;
 const textMutationContentSchema = z
@@ -186,56 +173,10 @@ const defaultShellRuntimeLimits: ShellRuntimeLimits = {
   maximumArtifactBytesPerStream: 8 * 1024 * 1024,
 };
 const readFileMaximumResult = { maximumBytes: 64 * 1024 } as const;
-const listFilesMaximumResult = { maximumEntries: 200 } as const;
-const searchTextMaximumResult = {
-  maximumEntries: 1_000,
-  maximumFiles: 200,
-  maximumFileBytes: 64 * 1024,
-  maximumMatches: 200,
-  maximumMatchCharacters: 1_024,
-  maximumQueryCharacters: 1_024,
-} as const;
-const searchTextInputSchema = z.strictObject({
-  path: z.string().min(1),
-  query: z.string().min(1).max(searchTextMaximumResult.maximumQueryCharacters),
-});
-
-type ListedEntry = {
-  readonly path: string;
-  readonly type: "file" | "directory";
-};
-
-type SearchMatch = {
-  readonly path: string;
-  readonly line: number;
-  readonly column: number;
-  readonly text: string;
-};
 
 const readFileOutputSchema = z.strictObject({
   path: z.string(),
   content: z.string().max(readFileMaximumResult.maximumBytes),
-  truncated: z.boolean(),
-});
-const listedEntrySchema = z.strictObject({
-  path: z.string(),
-  type: z.enum(["file", "directory"]),
-});
-const listFilesOutputSchema = z.strictObject({
-  path: z.string(),
-  entries: z.array(listedEntrySchema).max(listFilesMaximumResult.maximumEntries),
-  truncated: z.boolean(),
-});
-const searchMatchSchema = z.strictObject({
-  path: z.string(),
-  line: z.number().int().positive(),
-  column: z.number().int().positive(),
-  text: z.string().max(searchTextMaximumResult.maximumMatchCharacters),
-});
-const searchTextOutputSchema = z.strictObject({
-  path: z.string(),
-  query: z.string().max(searchTextMaximumResult.maximumQueryCharacters),
-  matches: z.array(searchMatchSchema).max(searchTextMaximumResult.maximumMatches),
   truncated: z.boolean(),
 });
 const writeFileOutputSchema = z.strictObject({
@@ -291,8 +232,6 @@ export function createReadToolRegistry(options: { readonly workspaceRoot: string
     },
     outputSchema: readFileOutputSchema,
     effect: "read",
-    cancellation: "unsupported",
-    maximumResult: readFileMaximumResult,
     prepare(argumentsJson) {
       const parsedArguments = parseInput(readFileInputSchema, argumentsJson);
       if (!parsedArguments.success) {
@@ -322,136 +261,7 @@ export function createReadToolRegistry(options: { readonly workspaceRoot: string
       };
     },
   };
-  const listFilesAdapter: ToolAdapter = {
-    definition: {
-      name: "list_files",
-      description: "List files and directories recursively inside the workspace.",
-      inputSchema: z.toJSONSchema(listFilesInputSchema),
-    },
-    outputSchema: listFilesOutputSchema,
-    effect: "read",
-    cancellation: "unsupported",
-    maximumResult: listFilesMaximumResult,
-    prepare(argumentsJson) {
-      const parsedArguments = parseInput(listFilesInputSchema, argumentsJson);
-      if (!parsedArguments.success) {
-        return invalidToolInput();
-      }
-      const permissionSubject = preparePermissionSubject(
-        workspaceRoot,
-        parsedArguments.data.path,
-        "workspace_path",
-      );
-      if ("status" in permissionSubject) {
-        return permissionSubject;
-      }
-      return {
-        status: "ready",
-        permissionSubject,
-        async execute() {
-          return executeSafely(listFilesOutputSchema, async () => {
-            const targetPath = await resolveConfinedPath(workspaceRoot, parsedArguments.data.path);
-            const listing = await collectEntries(
-              workspaceRoot,
-              targetPath,
-              listFilesMaximumResult.maximumEntries,
-            );
-            return {
-              path: parsedArguments.data.path,
-              entries: listing.entries,
-              truncated: listing.truncated,
-            };
-          });
-        },
-      };
-    },
-  };
-  const searchTextAdapter: ToolAdapter = {
-    definition: {
-      name: "search_text",
-      description: "Search for literal text recursively inside workspace files.",
-      inputSchema: z.toJSONSchema(searchTextInputSchema),
-    },
-    outputSchema: searchTextOutputSchema,
-    effect: "read",
-    cancellation: "unsupported",
-    maximumResult: searchTextMaximumResult,
-    prepare(argumentsJson) {
-      const parsedArguments = parseInput(searchTextInputSchema, argumentsJson);
-      if (!parsedArguments.success) {
-        return invalidToolInput();
-      }
-      const permissionSubject = preparePermissionSubject(
-        workspaceRoot,
-        parsedArguments.data.path,
-        "workspace_path",
-      );
-      if ("status" in permissionSubject) {
-        return permissionSubject;
-      }
-      return {
-        status: "ready",
-        permissionSubject,
-        async execute() {
-          return executeSafely(searchTextOutputSchema, async () => {
-            const targetPath = await resolveConfinedPath(workspaceRoot, parsedArguments.data.path);
-            const listing = await collectEntries(
-              workspaceRoot,
-              targetPath,
-              searchTextMaximumResult.maximumEntries,
-            );
-            const matches: SearchMatch[] = [];
-            let searchedFiles = 0;
-            let truncated = listing.truncated;
-            for (const entry of listing.entries) {
-              if (entry.type !== "file") {
-                continue;
-              }
-              if (searchedFiles >= searchTextMaximumResult.maximumFiles) {
-                truncated = true;
-                break;
-              }
-              searchedFiles += 1;
-              const file = await readTextFileBounded(
-                resolve(workspaceRoot, entry.path),
-                searchTextMaximumResult.maximumFileBytes,
-              );
-              const { content } = file;
-              truncated ||= file.truncated;
-              if (content.includes("\0")) {
-                continue;
-              }
-              const matchTextWasTruncated = collectTextMatches(
-                entry.path,
-                content,
-                parsedArguments.data.query,
-                matches,
-                searchTextMaximumResult.maximumMatches + 1,
-                searchTextMaximumResult.maximumMatchCharacters,
-              );
-              truncated ||= matchTextWasTruncated;
-              if (matches.length > searchTextMaximumResult.maximumMatches) {
-                truncated = true;
-                break;
-              }
-            }
-            return {
-              path: parsedArguments.data.path,
-              query: parsedArguments.data.query,
-              matches: matches.slice(0, searchTextMaximumResult.maximumMatches),
-              truncated,
-            };
-          });
-        },
-      };
-    },
-  };
-  const adapters = new Map(
-    [readFileAdapter, listFilesAdapter, searchTextAdapter].map((adapter) => [
-      adapter.definition.name,
-      adapter,
-    ]),
-  );
+  const adapters = new Map([[readFileAdapter.definition.name, readFileAdapter]]);
 
   return {
     definitions() {
@@ -475,8 +285,6 @@ export function createMutationToolRegistry(options: {
     },
     outputSchema: writeFileOutputSchema,
     effect: "write",
-    cancellation: "unsupported",
-    maximumResult: {},
     prepare(argumentsJson) {
       const parsedArguments = parseInput(writeFileInputSchema, argumentsJson);
       if (!parsedArguments.success) {
@@ -532,8 +340,6 @@ export function createMutationToolRegistry(options: {
     },
     outputSchema: editFileOutputSchema,
     effect: "write",
-    cancellation: "unsupported",
-    maximumResult: {},
     prepare(argumentsJson) {
       const parsedArguments = parseInput(editFileInputSchema, argumentsJson);
       if (!parsedArguments.success) {
@@ -698,8 +504,6 @@ export function createCodingToolRegistry(options: {
     },
     outputSchema: runShellOutputSchema,
     effect: "execute",
-    cancellation: "abort_signal",
-    maximumResult: { maximumBytes: 2 * shellLimits.maximumInlineBytesPerStream },
     prepare(argumentsJson) {
       const parsedArguments = parseInput(runShellInputSchema, argumentsJson);
       if (!parsedArguments.success) {
@@ -785,25 +589,30 @@ async function runShellCommand(options: {
       }
       let stdout = emptyShellStream();
       let stderr = emptyShellStream();
-      let timedOut = false;
-      let interrupted = false;
+      let terminationCause: "timed_out" | "interrupted" | undefined;
       let settled = false;
-      let forceKill: NodeJS.Timeout | undefined;
+      let terminationCleanup: Promise<void> | undefined;
       const terminate = () => {
-        signalProcessGroup(child.pid, "SIGTERM");
-        forceKill ??= setTimeout(() => {
+        terminationCleanup ??= (async () => {
+          signalProcessGroup(child.pid, "SIGTERM");
+          await new Promise((resolveDelay) =>
+            setTimeout(resolveDelay, options.limits.terminationGraceMs),
+          );
           signalProcessGroup(child.pid, "SIGKILL");
-        }, options.limits.terminationGraceMs);
-        forceKill.unref();
+        })();
       };
       const timeout = setTimeout(() => {
-        timedOut = true;
-        terminate();
+        if (terminationCause === undefined) {
+          terminationCause = "timed_out";
+          terminate();
+        }
       }, options.timeoutMs);
       timeout.unref();
       const abort = () => {
-        interrupted = true;
-        terminate();
+        if (terminationCause === undefined) {
+          terminationCause = "interrupted";
+          terminate();
+        }
       };
       if (options.signal.aborted) {
         abort();
@@ -822,10 +631,16 @@ async function runShellCommand(options: {
         }
         settled = true;
         clearTimeout(timeout);
-        clearTimeout(forceKill);
         options.signal.removeEventListener("abort", abort);
-        rejectPromise(
-          new ToolExecutionError("shell_start_failed", "The shell process could not be started."),
+        void (terminationCleanup ?? Promise.resolve()).then(
+          () =>
+            rejectPromise(
+              new ToolExecutionError(
+                "shell_start_failed",
+                "The shell process could not be started.",
+              ),
+            ),
+          rejectPromise,
         );
       });
       child.once("close", (exitCode, signal) => {
@@ -834,20 +649,22 @@ async function runShellCommand(options: {
         }
         settled = true;
         clearTimeout(timeout);
-        clearTimeout(forceKill);
         options.signal.removeEventListener("abort", abort);
-        const termination = interrupted
-          ? { type: "interrupted" as const }
-          : timedOut
-            ? { type: "timed_out" as const }
+        const termination =
+          terminationCause !== undefined
+            ? { type: terminationCause }
             : exitCode !== null
               ? { type: "exited" as const, exitCode }
               : { type: "signalled" as const, signal: signal ?? "unknown" };
-        resolvePromise({
-          termination,
-          stdout,
-          stderr,
-        });
+        void (terminationCleanup ?? Promise.resolve()).then(
+          () =>
+            resolvePromise({
+              termination,
+              stdout,
+              stderr,
+            }),
+          rejectPromise,
+        );
       });
     });
     return {
@@ -1098,96 +915,6 @@ async function executeSafely(
       error: { code: "tool_io_failed", message: "The filesystem operation failed." },
     };
   }
-}
-
-async function collectEntries(
-  workspaceRoot: string,
-  directoryPath: string,
-  maximumEntries: number,
-): Promise<{ readonly entries: readonly ListedEntry[]; readonly truncated: boolean }> {
-  const entries: ListedEntry[] = [];
-  const visit = async (currentDirectory: string): Promise<boolean> => {
-    const remaining = maximumEntries - entries.length;
-    if (remaining <= 0) {
-      return hasListableEntry(currentDirectory);
-    }
-
-    const directoryEntries = [];
-    const directory = await opendir(currentDirectory);
-    for await (const entry of directory) {
-      if (entry.isDirectory() || entry.isFile()) {
-        directoryEntries.push(entry);
-      }
-      if (directoryEntries.length > remaining) {
-        break;
-      }
-    }
-    directoryEntries.sort((left, right) => left.name.localeCompare(right.name));
-
-    const directoryWasTruncated = directoryEntries.length > remaining;
-    for (const entry of directoryEntries.slice(0, remaining)) {
-      if (entries.length >= maximumEntries) {
-        return true;
-      }
-      const entryPath = resolve(currentDirectory, entry.name);
-      const relativePath = relative(workspaceRoot, entryPath).split(sep).join("/");
-      if (entry.isDirectory()) {
-        entries.push({ path: relativePath, type: "directory" });
-        if (await visit(entryPath)) {
-          return true;
-        }
-      } else {
-        entries.push({ path: relativePath, type: "file" });
-      }
-    }
-
-    return directoryWasTruncated;
-  };
-
-  return { entries, truncated: await visit(directoryPath) };
-}
-
-async function hasListableEntry(directoryPath: string): Promise<boolean> {
-  const directory = await opendir(directoryPath);
-  for await (const entry of directory) {
-    if (entry.isDirectory() || entry.isFile()) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function collectTextMatches(
-  path: string,
-  content: string,
-  query: string,
-  matches: SearchMatch[],
-  maximumMatches: number,
-  maximumMatchCharacters: number,
-): boolean {
-  let truncated = false;
-  const lines = content.split(/\r?\n/u);
-  for (const [lineIndex, line] of lines.entries()) {
-    let searchFrom = 0;
-    while (searchFrom <= line.length) {
-      const matchIndex = line.indexOf(query, searchFrom);
-      if (matchIndex === -1) {
-        break;
-      }
-      truncated ||= line.length > maximumMatchCharacters;
-      matches.push({
-        path,
-        line: lineIndex + 1,
-        column: matchIndex + 1,
-        text: line.slice(0, maximumMatchCharacters),
-      });
-      if (matches.length >= maximumMatches) {
-        return truncated;
-      }
-      searchFrom = matchIndex + Math.max(query.length, 1);
-    }
-  }
-  return truncated;
 }
 
 function detectLineEnding(content: string): "\n" | "\r" | "\r\n" | undefined {

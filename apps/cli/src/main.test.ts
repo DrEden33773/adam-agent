@@ -59,7 +59,7 @@ describe("one-shot CLI", () => {
 
       expect(result).toEqual({
         stdout: "The verification command produced cli-verified.\n",
-        stderr: 'Allow run_shell at ".": printf cli-verified [y/N] ',
+        stderr: 'Allow run_shell at ".": "printf cli-verified" [y/N] ',
         exitCode: 0,
         signal: null,
       });
@@ -71,6 +71,7 @@ describe("one-shot CLI", () => {
   test.each([
     { label: "n", stdin: "n\n" },
     { label: "invalid input", stdin: "yes\n" },
+    { label: "surrounding whitespace", stdin: " y \n" },
     { label: "EOF", stdin: "" },
   ])("treats $label as a denied shell approval", async ({ stdin }) => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-shell-deny-"));
@@ -87,7 +88,31 @@ describe("one-shot CLI", () => {
 
       expect(result).toEqual({
         stdout: "The verification command was not run.\n",
-        stderr: 'Allow run_shell at ".": printf cli-verified [y/N] ',
+        stderr: 'Allow run_shell at ".": "printf cli-verified" [y/N] ',
+        exitCode: 0,
+        signal: null,
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("escapes model-controlled control characters in an approval prompt", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-prompt-escaping-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    await mkdir(workspaceRoot);
+
+    try {
+      const result = await runCli({
+        cwd: workspaceRoot,
+        stateRoot: join(testRoot, "state"),
+        prompt: "Run the prompt escaping command",
+        stdin: "n\n",
+      });
+
+      expect(result).toEqual({
+        stdout: "The verification command was not run.\n",
+        stderr: 'Allow run_shell at ".": "printf first\\n\\u001b[31mforged" [y/N] ',
         exitCode: 0,
         signal: null,
       });
@@ -109,7 +134,7 @@ describe("one-shot CLI", () => {
 
       expect(result).toEqual({
         stdout: "",
-        stderr: 'Allow run_shell at ".": printf cli-verified [y/N] The session was cancelled.\n',
+        stderr: 'Allow run_shell at ".": "printf cli-verified" [y/N] The session was cancelled.\n',
         exitCode: 130,
         signal: null,
       });
@@ -138,7 +163,7 @@ describe("one-shot CLI", () => {
       }).toEqual({
         stdout: "",
         stderr:
-          "Allow run_shell at \".\": trap '' TERM; printf started > started.txt; sleep 5; printf survived > survived.txt [y/N] The session was cancelled.\n",
+          'Allow run_shell at ".": "trap \'\' TERM; printf started > started.txt; sleep 5; printf survived > survived.txt" [y/N] The session was cancelled.\n',
         exitCode: 130,
         signal: null,
         survived: undefined,
@@ -175,7 +200,7 @@ describe("one-shot CLI", () => {
       }).toEqual({
         stdout: "The demo file was updated and verified.\n",
         stderr:
-          'Allow edit_file for demo.txt [y/N] Allow run_shell at ".": test "$(cat demo.txt)" = after && printf verified [y/N] ',
+          'Allow edit_file for "demo.txt" [y/N] Allow run_shell at ".": "test \\"$(cat demo.txt)\\" = after && printf verified" [y/N] ',
         exitCode: 0,
         signal: null,
         content: "after\n",
