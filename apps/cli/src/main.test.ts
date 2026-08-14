@@ -69,6 +69,70 @@ describe("one-shot CLI", () => {
     }
   });
 
+  test("loads DeepSeek from project .env without overriding the process environment", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-dotenv-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const fetchHookPath = join(testRoot, "fetch-hook.mjs");
+    await mkdir(workspaceRoot);
+    await writeFile(
+      join(workspaceRoot, ".env"),
+      "ADAM_AGENT_PROVIDER=deepseek\nDEEPSEEK_API_KEY=test-dotenv-key\nADAM_AGENT_MODEL=deepseek-dotenv-model\n",
+      "utf8",
+    );
+    await writeFile(
+      fetchHookPath,
+      `globalThis.fetch = async (_input, init) => {
+  const request = JSON.parse(String(init?.body));
+  const chunks = [
+    {
+      id: "dotenv-1",
+      choices: [{ index: 0, delta: { content: "Selected " + request.model + "." }, finish_reason: null }],
+      created: 1,
+      model: request.model,
+      object: "chat.completion.chunk",
+      usage: null,
+    },
+    {
+      id: "dotenv-1",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      created: 1,
+      model: request.model,
+      object: "chat.completion.chunk",
+      usage: null,
+    },
+  ];
+  return new Response(chunks.map((chunk) => "data: " + JSON.stringify(chunk) + "\\n\\n").join("") + "data: [DONE]\\n\\n", {
+    headers: { "content-type": "text/event-stream" },
+    status: 200,
+  });
+};
+`,
+      "utf8",
+    );
+
+    try {
+      const result = await runCli({
+        cwd: workspaceRoot,
+        stateRoot: join(testRoot, "state"),
+        prompt: "Hello",
+        stdin: "",
+        env: {
+          ADAM_AGENT_MODEL: "deepseek-process-model",
+          NODE_OPTIONS: `--import=${fetchHookPath}`,
+        },
+      });
+
+      expect(result).toEqual({
+        stdout: "Selected deepseek-process-model.\n",
+        stderr: "",
+        exitCode: 0,
+        signal: null,
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
   test("does not echo an unsupported provider value", async () => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-provider-invalid-"));
     const workspaceRoot = join(testRoot, "workspace");

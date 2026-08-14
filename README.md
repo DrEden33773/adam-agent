@@ -16,12 +16,16 @@ pnpm --silent adam "What is this repository?"
 
 With no provider environment variable, the `adam` command exercises deterministic read, edit, and shell scenarios through the fake provider. It asks on stderr before write or execute effects. Session JSONL and overflow artifacts are written under `ADAM_AGENT_STATE_ROOT` when set, otherwise under `~/.local/state/adam-agent`.
 
-To use the live DeepSeek Adapter, supply the credential from the environment and select the provider explicitly:
+To use the live DeepSeek Adapter locally, copy the tracked placeholder file, restrict its permissions, and add the credential to the ignored project-root `.env`:
 
 ```bash
-export DEEPSEEK_API_KEY="..."
-ADAM_AGENT_PROVIDER=deepseek pnpm --silent adam "Summarize this repository"
+cp .env.example .env
+chmod 600 .env
+# Edit .env and set DEEPSEEK_API_KEY, then run:
+pnpm --silent adam "Summarize this repository"
 ```
+
+Adam loads only `.env` from the current project root and ignores it through the repository's committed `.gitignore`; `.env.example` contains names and non-secret defaults only. Values already present in the process environment take precedence, so CI or a shell export can override the local file. The file is still plaintext local credential material: do not share it, print it, pass it to the model, or rely on `.gitignore` as protection from other local processes or backups.
 
 The default live model is `deepseek-v4-pro`; set `ADAM_AGENT_MODEL` to override it, for example `deepseek-v4-flash`. Adam sends requests only to `https://api.deepseek.com` in this slice and does not persist credentials, raw provider responses, or reasoning content. Provider failures are reduced to bounded Adam-owned metadata before session persistence. The live model can request the same four tools as the fake path, and write or execute effects still require the existing call-scoped approval.
 
