@@ -73,10 +73,20 @@ const toolErrorSchema = z.strictObject({
     "permission_denied",
     "outside_workspace",
     "not_found",
+    "already_exists",
+    "ambiguous_match",
+    "binary_file",
+    "file_too_large",
+    "no_match",
+    "overlapping_edits",
     "tool_io_failed",
   ]),
   message: z.string(),
 });
+const permissionSubjectSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("file"), path: z.string() }),
+  z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
+]);
 const canonicalRuntimeEventSchema: z.ZodType<CanonicalRuntimeEvent> = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("user_message"), text: z.string() }),
   z.strictObject({ type: z.literal("model_message_started") }),
@@ -95,10 +105,25 @@ const canonicalRuntimeEventSchema: z.ZodType<CanonicalRuntimeEvent> = z.discrimi
     name: z.string(),
   }),
   z.strictObject({
+    type: z.literal("tool_permission_requested"),
+    requestId: z.string(),
+    callId: z.string(),
+    name: z.string(),
+    effect: z.enum(["read", "write", "execute", "network", "delegate", "administrative"]),
+    scope: z.literal("call"),
+    subject: permissionSubjectSchema,
+  }),
+  z.strictObject({
     type: z.literal("tool_permission_decided"),
     callId: z.string(),
     name: z.string(),
     decision: z.enum(["allow", "deny"]),
+    requestId: z.string().optional(),
+    effect: z
+      .enum(["read", "write", "execute", "network", "delegate", "administrative"])
+      .optional(),
+    scope: z.literal("call").optional(),
+    subject: permissionSubjectSchema.optional(),
   }),
   z.strictObject({
     type: z.literal("tool_started"),
