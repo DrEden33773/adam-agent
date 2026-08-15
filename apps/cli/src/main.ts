@@ -32,10 +32,32 @@ const longVerificationPrompt = "Run the long repository verification command";
 const longVerificationCommand =
   "trap '' TERM; printf started > started.txt; sleep 5; printf survived > survived.txt";
 const codingTaskPrompt = "Update the demo file and verify it";
+const multiFilePatchPrompt = "Apply the demo multi-file patch";
 const codingTaskVerificationCommand = 'test "$(cat demo.txt)" = after && printf verified';
 const fakeModel = new FakeModelDriver((request) => {
   const latestMessage = request.messages.at(-1);
   if (latestMessage?.role === "user") {
+    if (prompt === multiFilePatchPrompt) {
+      return [
+        { type: "tool_call_start", id: "edit-demo-multi-file", name: "edit_file" },
+        {
+          type: "tool_call_delta",
+          id: "edit-demo-multi-file",
+          json: JSON.stringify({
+            operations: [
+              {
+                kind: "update",
+                path: "demo.txt",
+                edits: [{ oldText: "before", newText: "after" }],
+              },
+              { kind: "create", path: "added.txt", content: "added\n" },
+            ],
+          }),
+        },
+        { type: "tool_call_end", id: "edit-demo-multi-file" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
     if (prompt === codingTaskPrompt) {
       return [
         { type: "tool_call_start", id: "edit-demo", name: "edit_file" },
@@ -43,8 +65,13 @@ const fakeModel = new FakeModelDriver((request) => {
           type: "tool_call_delta",
           id: "edit-demo",
           json: JSON.stringify({
-            path: "demo.txt",
-            edits: [{ oldText: "before", newText: "after" }],
+            operations: [
+              {
+                kind: "update",
+                path: "demo.txt",
+                edits: [{ oldText: "before", newText: "after" }],
+              },
+            ],
           }),
         },
         { type: "tool_call_end", id: "edit-demo" },
@@ -99,15 +126,19 @@ const fakeModel = new FakeModelDriver((request) => {
   }
 
   const answer =
-    prompt === codingTaskPrompt
-      ? codingTaskAnswer(latestMessage)
-      : prompt === verificationPrompt ||
-          prompt === longVerificationPrompt ||
-          prompt === promptEscapingPrompt
-        ? verificationAnswer(latestMessage)
-        : latestMessage?.role === "tool" && latestMessage.result.status === "completed"
-          ? firstReadmeParagraph(latestMessage.result.output)
-          : "I could not read README.md.";
+    prompt === multiFilePatchPrompt
+      ? latestMessage?.role === "tool" && latestMessage.result.status === "completed"
+        ? "The demo multi-file patch was applied."
+        : "The demo multi-file patch failed."
+      : prompt === codingTaskPrompt
+        ? codingTaskAnswer(latestMessage)
+        : prompt === verificationPrompt ||
+            prompt === longVerificationPrompt ||
+            prompt === promptEscapingPrompt
+          ? verificationAnswer(latestMessage)
+          : latestMessage?.role === "tool" && latestMessage.result.status === "completed"
+            ? firstReadmeParagraph(latestMessage.result.output)
+            : "I could not read README.md.";
   return [
     { type: "text_delta", text: answer },
     { type: "finish", reason: "stop" },
@@ -123,7 +154,7 @@ const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "art
 const session = new AgentSession({
   model,
   store,
-  tools: createCodingToolRegistry({ workspaceRoot, artifactStore }),
+  tools: createCodingToolRegistry({ workspaceRoot, stateRoot, artifactStore }),
   permissions: createPermissionPolicy({
     allowedEffects: ["read"],
     askedEffects: ["write", "execute"],
@@ -239,6 +270,16 @@ function formatPermissionPrompt(
 ): string {
   if (event.subject.type === "command") {
     return `Allow ${event.name} at "${event.subject.cwd}": ${quoteForTerminal(event.subject.command)} [y/N] `;
+  }
+  if (event.subject.type === "patch") {
+    const operations = event.subject.operations
+      .map((operation) =>
+        operation.kind === "move"
+          ? `move ${quoteForTerminal(operation.from)} -> ${quoteForTerminal(operation.to)}`
+          : `${operation.kind} ${quoteForTerminal(operation.path)}`,
+      )
+      .join(", ");
+    return `Allow ${event.name} patch (${operations}; ${event.subject.digest}) [y/N] `;
   }
   return `Allow ${event.name} for ${quoteForTerminal(event.subject.path)} [y/N] `;
 }

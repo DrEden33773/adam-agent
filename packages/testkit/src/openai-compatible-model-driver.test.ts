@@ -940,6 +940,107 @@ describe("OpenAICompatibleModelDriver", () => {
     ]);
   });
 
+  test("preserves a raw tool argument above the normalized patch limit", async () => {
+    const argumentsJson = `${JSON.stringify({ operations: [] })}${" ".repeat(520 * 1024)}`;
+    const driver = new OpenAICompatibleModelDriver({
+      profile: "deepseek",
+      apiKey: "test-key",
+      baseURL: "https://deepseek.invalid",
+      model: "deepseek-test",
+      maximumOutputTokens: 4_096,
+      fetch: async () =>
+        new Response(
+          `data: ${JSON.stringify({
+            id: "raw-patch-arguments-1",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "patch-repository",
+                      type: "function",
+                      function: { name: "edit_file", arguments: argumentsJson },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+            created: 1,
+            model: "deepseek-test",
+            object: "chat.completion.chunk",
+          })}\n\ndata: [DONE]\n\n`,
+          { headers: { "content-type": "text/event-stream" }, status: 200 },
+        ),
+    });
+
+    const events = await collect(
+      driver.stream({
+        messages: [{ role: "user", content: "Apply the patch" }],
+        tools: [],
+        signal: new AbortController().signal,
+      }),
+    );
+    const argumentDelta = events.find((event) => event.type === "tool_call_delta");
+
+    expect({
+      eventTypes: events.map((event) => event.type),
+      argumentBytes:
+        argumentDelta?.type === "tool_call_delta"
+          ? Buffer.byteLength(argumentDelta.json, "utf8")
+          : undefined,
+    }).toEqual({
+      eventTypes: ["tool_call_start", "tool_call_delta", "tool_call_end", "finish"],
+      argumentBytes: Buffer.byteLength(argumentsJson, "utf8"),
+    });
+  });
+
+  test("rejects aggregate raw tool arguments above the transport limit", async () => {
+    const argumentsJson = `${JSON.stringify({ operations: [] })}${" ".repeat(2 * 1024 * 1024)}`;
+    const driver = new OpenAICompatibleModelDriver({
+      profile: "deepseek",
+      apiKey: "test-key",
+      baseURL: "https://deepseek.invalid",
+      model: "deepseek-test",
+      maximumOutputTokens: 4_096,
+      fetch: async () =>
+        new Response(
+          `data: ${JSON.stringify({
+            id: "oversized-raw-patch-arguments-1",
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "patch-repository",
+                      type: "function",
+                      function: { name: "edit_file", arguments: argumentsJson },
+                    },
+                  ],
+                },
+                finish_reason: "tool_calls",
+              },
+            ],
+            created: 1,
+            model: "deepseek-test",
+            object: "chat.completion.chunk",
+          })}\n\ndata: [DONE]\n\n`,
+          { headers: { "content-type": "text/event-stream" }, status: 200 },
+        ),
+    });
+
+    const error = await captureDriverError(driver);
+
+    expect(error).toMatchObject({
+      category: "protocol_incompatibility",
+      message: "The model provider response exceeded Adam's stream limit.",
+    });
+  });
+
   test("rejects one incomplete parallel tool call before any valid call executes", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-provider-incomplete-tool-"));
     const events: Array<{ readonly type: string }> = [];

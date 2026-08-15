@@ -20,15 +20,44 @@ test("the default coding registry exposes exactly the four approved tools", asyn
 
   try {
     const registry = createCodingToolRegistry({ workspaceRoot });
+    const writeFileDefinition = registry
+      .definitions()
+      .find((definition) => definition.name === "write_file");
+    const editFileDefinition = registry
+      .definitions()
+      .find((definition) => definition.name === "edit_file");
+    const editFileSchema = editFileDefinition?.inputSchema as
+      | {
+          readonly properties?: Readonly<Record<string, unknown>>;
+        }
+      | undefined;
+    const editFileProperties = editFileSchema?.properties;
 
     expect({
       definitions: registry.definitions().map((definition) => definition.name),
       listFiles: registry.resolve("list_files"),
       searchText: registry.resolve("search_text"),
+      writeFileDescription: writeFileDefinition?.description,
+      editFileDescription: editFileDefinition?.description,
+      editFileRootProperties: Object.keys(editFileProperties ?? {}),
+      editFileSchema: editFileDefinition?.inputSchema,
     }).toEqual({
       definitions: ["read_file", "write_file", "edit_file", "run_shell"],
       listFiles: undefined,
       searchText: undefined,
+      writeFileDescription:
+        "Create one new UTF-8 text file inside the workspace, including missing parents. Use edit_file for existing-file or multi-file work.",
+      editFileDescription:
+        "Apply one structured patch across workspace text files. Use it for existing-file edits or multi-file create, update, delete, and move work.",
+      editFileRootProperties: ["operations"],
+      editFileSchema: expect.objectContaining({
+        type: "object",
+        required: ["operations"],
+        additionalProperties: false,
+        properties: {
+          operations: expect.objectContaining({ minItems: 1, maxItems: 32, type: "array" }),
+        },
+      }),
     });
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });

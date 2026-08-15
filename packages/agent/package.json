@@ -7,6 +7,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./internal-testing": {
+      "types": "./dist/internal-testing.d.ts",
+      "default": "./dist/internal-testing.js"
     }
   },
   "dependencies": {
