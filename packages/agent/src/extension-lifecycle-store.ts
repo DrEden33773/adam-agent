@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, type FileHandle, mkdir, open } from "node:fs/promises";
+import { type FileHandle, mkdir, open } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import { z } from "zod";
 
@@ -26,67 +26,34 @@ export type ExtensionLifecycleStore = {
   write(identity: ExtensionIdentity, enabled: boolean): Promise<void>;
 };
 
+const lifecycleOperationQueues = new Map<string, Promise<void>>();
+
 export function createExtensionLifecycleStore(stateRoot?: string): ExtensionLifecycleStore {
-  const directory = join(stateRoot ?? defaultStateRoot(), "extensions");
-  let appendQueue = Promise.resolve();
+  const directory = join(resolve(stateRoot ?? defaultStateRoot()), "extensions");
 
   return {
-    async read(identity) {
-      await appendQueue;
-      const path = lifecycleLogPath(directory, identity);
-      let file: FileHandle;
-      try {
-        file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-      } catch (error) {
-        if (isNodeError(error) && error.code === "ENOENT") {
-          return undefined;
-        }
-        throw error;
-      }
-      try {
-        const stats = await file.stat();
-        if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
-          throw new TypeError("The extension lifecycle log must be an ordinary file.");
-        }
-        const buffer = Buffer.alloc(maxLifecycleLogBytes + 1);
-        let offset = 0;
-        while (offset < buffer.byteLength) {
-          const { bytesRead } = await file.read(buffer, offset, buffer.byteLength - offset, null);
-          if (bytesRead === 0) {
-            break;
+    read(identity) {
+      return enqueueLifecycleOperation(directory, async () => {
+        const path = lifecycleLogPath(directory, identity);
+        let file: FileHandle;
+        try {
+          file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        } catch (error) {
+          if (isNodeError(error) && error.code === "ENOENT") {
+            return undefined;
           }
-          offset += bytesRead;
+          throw error;
         }
-        if (offset > maxLifecycleLogBytes) {
-          throw new TypeError("The extension lifecycle log exceeds its read limit.");
+        try {
+          return await readLifecycleTruth(file, identity, false);
+        } finally {
+          await file.close();
         }
-        const content = buffer.subarray(0, offset).toString("utf8");
-        if (content.length === 0 || !content.endsWith("\n")) {
-          throw new TypeError("The extension lifecycle log is invalid.");
-        }
-        const records = content
-          .slice(0, -1)
-          .split("\n")
-          .map((line) => lifecycleRecordSchema.parse(JSON.parse(line)));
-        if (
-          records.some(
-            (record) =>
-              record.extensionId !== identity.extensionId ||
-              record.packageName !== identity.packageName ||
-              record.packageVersion !== identity.packageVersion,
-          )
-        ) {
-          throw new TypeError("The extension lifecycle log identity is invalid.");
-        }
-        return records.at(-1)?.enabled;
-      } finally {
-        await file.close();
-      }
+      });
     },
     write(identity, enabled) {
-      const operation = appendQueue.then(async () => {
-        await mkdir(directory, { recursive: true, mode: 0o700 });
-        await chmod(directory, 0o700);
+      return enqueueLifecycleOperation(directory, async () => {
+        await ensureLifecycleDirectory(directory);
         const serialized = JSON.stringify({
           schemaVersion: 1,
           extensionId: identity.extensionId,
@@ -100,12 +67,13 @@ export function createExtensionLifecycleStore(stateRoot?: string): ExtensionLife
           path,
           constants.O_APPEND |
             constants.O_CREAT |
-            constants.O_WRONLY |
+            constants.O_RDWR |
             constants.O_NOFOLLOW |
             constants.O_NONBLOCK,
           0o600,
         );
         try {
+          await readLifecycleTruth(file, identity, true);
           const stats = await file.stat();
           if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
             throw new TypeError("The extension lifecycle log must be an ordinary file.");
@@ -120,10 +88,86 @@ export function createExtensionLifecycleStore(stateRoot?: string): ExtensionLife
           await file.close();
         }
       });
-      appendQueue = operation.catch(() => {});
-      return operation;
     },
   };
+}
+
+function enqueueLifecycleOperation<T>(directory: string, run: () => Promise<T>): Promise<T> {
+  const previous = lifecycleOperationQueues.get(directory) ?? Promise.resolve();
+  const operation = previous.then(run);
+  const settled = operation.then(
+    () => undefined,
+    () => undefined,
+  );
+  lifecycleOperationQueues.set(directory, settled);
+  void settled.then(() => {
+    if (lifecycleOperationQueues.get(directory) === settled) {
+      lifecycleOperationQueues.delete(directory);
+    }
+  });
+  return operation;
+}
+
+async function ensureLifecycleDirectory(directory: string): Promise<void> {
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const handle = await open(
+    directory,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const stats = await handle.stat();
+    if (!stats.isDirectory()) {
+      throw new TypeError("The extension lifecycle root must be an ordinary directory.");
+    }
+    await handle.chmod(0o700);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function readLifecycleTruth(
+  file: FileHandle,
+  identity: ExtensionIdentity,
+  allowEmpty: boolean,
+): Promise<boolean | undefined> {
+  const stats = await file.stat();
+  if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
+    throw new TypeError("The extension lifecycle log must be an ordinary file.");
+  }
+  const buffer = Buffer.alloc(maxLifecycleLogBytes + 1);
+  let offset = 0;
+  while (offset < buffer.byteLength) {
+    const { bytesRead } = await file.read(buffer, offset, buffer.byteLength - offset, offset);
+    if (bytesRead === 0) {
+      break;
+    }
+    offset += bytesRead;
+  }
+  if (offset > maxLifecycleLogBytes) {
+    throw new TypeError("The extension lifecycle log exceeds its read limit.");
+  }
+  const content = buffer.subarray(0, offset).toString("utf8");
+  if (allowEmpty && content.length === 0) {
+    return undefined;
+  }
+  if (content.length === 0 || !content.endsWith("\n")) {
+    throw new TypeError("The extension lifecycle log is invalid.");
+  }
+  const records = content
+    .slice(0, -1)
+    .split("\n")
+    .map((line) => lifecycleRecordSchema.parse(JSON.parse(line)));
+  if (
+    records.some(
+      (record) =>
+        record.extensionId !== identity.extensionId ||
+        record.packageName !== identity.packageName ||
+        record.packageVersion !== identity.packageVersion,
+    )
+  ) {
+    throw new TypeError("The extension lifecycle log identity is invalid.");
+  }
+  return records.at(-1)?.enabled;
 }
 
 function lifecycleLogPath(directory: string, identity: ExtensionIdentity): string {

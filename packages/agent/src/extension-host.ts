@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
-import { extname, isAbsolute, relative, resolve } from "node:path";
+import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -244,13 +244,13 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
         throw new TypeError("The configured extension cannot be enabled.");
       }
       const loadedSnapshot = loadedSnapshots.get(extensionId);
-      if (loadedSnapshot?.status === "active") {
-        return loadedSnapshot;
-      }
       try {
         await lifecycleStore.write(configured, true);
       } catch (error) {
         throw new ExtensionHostError("extension_state_persistence_failed", { cause: error });
+      }
+      if (loadedSnapshot?.status === "active") {
+        return loadedSnapshot;
       }
       loadedSnapshots.delete(extensionId);
       const snapshot = await this.loadConfiguredExtensions();
@@ -530,9 +530,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
           let entryPath: string;
           try {
             entryPath = await resolveConfinedEntry(packageRoot, manifest.adamAgent.runtime.entry);
-            if (![".js", ".mjs"].includes(extname(entryPath))) {
-              throw new TypeError("The extension runtime entry must be an ES module.");
-            }
+            await assertEsmRuntimeEntry(packageRoot, entryPath);
           } catch {
             extensions.push({
               diagnostics: [{ code: "runtime_entry_invalid" }],
@@ -583,8 +581,9 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
             registrations,
           );
           if (!registrationMatch.ok) {
+            const deactivationDiagnostics = await deactivateRuntime(configured, deactivate);
             extensions.push({
-              diagnostics: [registrationMatch.diagnostic],
+              diagnostics: [registrationMatch.diagnostic, ...deactivationDiagnostics],
               extensionId: configured.extensionId,
               packageName: configured.packageName,
               packageVersion: configured.packageVersion,
@@ -596,12 +595,14 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
             publishedContributions.some((published) => published.id === candidate.id),
           );
           if (existingContribution !== undefined) {
+            const deactivationDiagnostics = await deactivateRuntime(configured, deactivate);
             extensions.push({
               diagnostics: [
                 {
                   code: "contribution_collision",
                   contributionId: existingContribution.id,
                 },
+                ...deactivationDiagnostics,
               ],
               extensionId: configured.extensionId,
               packageName: configured.packageName,
@@ -659,13 +660,21 @@ const maxPackageManifestBytes = 1024 * 1024;
 
 async function readPackageManifest(packageRoot: string): Promise<string> {
   const path = await resolveConfinedEntry(packageRoot, "package.json");
+  return readBoundedOrdinaryTextFile(path, maxPackageManifestBytes, "package manifest");
+}
+
+async function readBoundedOrdinaryTextFile(
+  path: string,
+  maxBytes: number,
+  label: string,
+): Promise<string> {
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const stats = await file.stat();
     if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
-      throw new TypeError("The extension package manifest must be an ordinary file.");
+      throw new TypeError(`The extension ${label} must be an ordinary file.`);
     }
-    const content = Buffer.alloc(maxPackageManifestBytes + 1);
+    const content = Buffer.alloc(maxBytes + 1);
     let offset = 0;
     while (offset < content.byteLength) {
       const { bytesRead } = await file.read(content, offset, content.byteLength - offset, null);
@@ -674,13 +683,57 @@ async function readPackageManifest(packageRoot: string): Promise<string> {
       }
       offset += bytesRead;
     }
-    if (offset > maxPackageManifestBytes) {
-      throw new TypeError("The extension package manifest exceeds its read limit.");
+    if (offset > maxBytes) {
+      throw new TypeError(`The extension ${label} exceeds its read limit.`);
     }
     return content.subarray(0, offset).toString("utf8");
   } finally {
     await file.close();
   }
+}
+
+async function assertEsmRuntimeEntry(packageRoot: string, entryPath: string): Promise<void> {
+  const extension = extname(entryPath);
+  if (extension === ".mjs") {
+    return;
+  }
+  if (extension !== ".js" && extension !== "") {
+    throw new TypeError("The extension runtime entry must be an ES module.");
+  }
+  let directory = dirname(entryPath);
+  while (true) {
+    try {
+      const packageJson: unknown = JSON.parse(
+        await readBoundedOrdinaryTextFile(
+          resolve(directory, "package.json"),
+          maxPackageManifestBytes,
+          "package scope manifest",
+        ),
+      );
+      if (
+        typeof packageJson !== "object" ||
+        packageJson === null ||
+        !("type" in packageJson) ||
+        packageJson.type !== "module"
+      ) {
+        throw new TypeError("The extension runtime entry must be in an ES module package scope.");
+      }
+      return;
+    } catch (error) {
+      if (!isNodeErrorWithCode(error, "ENOENT")) {
+        throw error;
+      }
+    }
+    if (directory === packageRoot) {
+      break;
+    }
+    directory = dirname(directory);
+  }
+  throw new TypeError("The extension runtime entry must be in an ES module package scope.");
+}
+
+function isNodeErrorWithCode(error: unknown, code: string): boolean {
+  return error instanceof Error && "code" in error && error.code === code;
 }
 
 function isSingleMajorGrantRange(range: string): boolean {
@@ -691,12 +744,13 @@ function isSingleMajorGrantRange(range: string): boolean {
   const exact = valid(range);
   return (
     minimum !== null &&
-    (exact !== null || subset(range, `>=${minimum.major}.0.0-0 <${minimum.major + 1}.0.0-0`))
+    (exact !== null || subset(range, `>=${minimum.major}.0.0-0 <${minimum.major + 1}.0.0`))
   );
 }
 
 function usesOnlyExplicitSemanticVersions(range: string): boolean {
   return range
+    .replace(/([~^<>=])\s+(?=v?\d)/gu, "$1")
     .split(/\s+|\|\|/u)
     .filter((token) => token.length > 0 && token !== "-")
     .every((token) => {

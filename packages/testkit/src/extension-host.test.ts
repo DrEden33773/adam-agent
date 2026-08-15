@@ -196,6 +196,96 @@ exports.activate = async function activate() {};
   await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 });
 
+test("a nested CommonJS package scope cannot override the locked ESM runtime", async () => {
+  const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(packageRoot);
+  const nestedRoot = join(packageRoot, "nested");
+  const markerPath = join(packageRoot, "runtime-imported.txt");
+  await mkdir(nestedRoot);
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/nested-commonjs-runtime",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.nested-commonjs-runtime",
+        apiVersion: "^0.1.0",
+        runtime: { entry: "./nested/extension.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(join(nestedRoot, "package.json"), JSON.stringify({ type: "commonjs" }), "utf8");
+  await writeFile(
+    join(nestedRoot, "extension.js"),
+    `const { writeFileSync } = require("node:fs");
+writeFileSync(${JSON.stringify(markerPath)}, "imported", "utf8");
+exports.activate = async function activate() {};
+`,
+    "utf8",
+  );
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.nested-commonjs-runtime",
+        grants: [],
+        packageName: "@fixture/nested-commonjs-runtime",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+  });
+
+  await expect(host.loadConfiguredExtensions()).resolves.toMatchObject({
+    extensions: [{ diagnostics: [{ code: "runtime_entry_invalid" }], status: "rejected" }],
+  });
+  await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test("an extensionless runtime in a module package scope activates as ESM", async () => {
+  const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(packageRoot);
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/extensionless-esm-runtime",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.extensionless-esm-runtime",
+        apiVersion: "^0.1.0",
+        runtime: { entry: "./extension" },
+        capabilities: { required: [], optional: [] },
+        contributions: [],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(join(packageRoot, "extension"), "export async function activate() {}\n", "utf8");
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extensionless-esm-runtime",
+        grants: [],
+        packageName: "@fixture/extensionless-esm-runtime",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+  });
+
+  await expect(host.loadConfiguredExtensions()).resolves.toMatchObject({
+    extensions: [{ diagnostics: [], status: "active" }],
+  });
+});
+
 test("a declared operation becomes visible only after its matching runtime registration", async () => {
   const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
   temporaryRoots.push(packageRoot);
@@ -1615,6 +1705,65 @@ test("enabling an already active extension is idempotent", async () => {
   Reflect.deleteProperty(globalThis, activationCountKey);
 });
 
+test("enabling an active extension refreshes shared lifecycle truth without reactivation", async () => {
+  const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(packageRoot);
+  const stateRoot = join(packageRoot, "state");
+  const activationCountKey = Symbol.for("adam-agent.test.shared-enable-count");
+  Reflect.set(globalThis, activationCountKey, 0);
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/shared-enable",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.shared-enable",
+        apiVersion: "^0.1.0",
+        runtime: { entry: "./extension.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "extension.js"),
+    `export async function activate() {
+  const key = Symbol.for("adam-agent.test.shared-enable-count");
+  globalThis[key] += 1;
+}
+`,
+    "utf8",
+  );
+  const options = {
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.shared-enable",
+        grants: [],
+        packageName: "@fixture/shared-enable",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    stateRoot,
+  };
+  const activeHost = createExtensionHost(options);
+  await activeHost.loadConfiguredExtensions();
+  await createExtensionHost(options).disableExtension("fixture.shared-enable");
+
+  await expect(activeHost.enableExtension("fixture.shared-enable")).resolves.toMatchObject({
+    status: "active",
+  });
+  await expect(createExtensionHost(options).loadConfiguredExtensions()).resolves.toMatchObject({
+    extensions: [{ status: "active" }],
+  });
+  expect(Reflect.get(globalThis, activationCountKey)).toBe(2);
+  Reflect.deleteProperty(globalThis, activationCountKey);
+});
+
 test("disabling an idle extension invokes its optional deactivation hook", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
   temporaryRoots.push(testRoot);
@@ -2520,6 +2669,52 @@ test("an exact prerelease capability grant containing x activates", async () => 
   });
 });
 
+test("a full-version capability range with spaced comparators activates", async () => {
+  const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(packageRoot);
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/spaced-comparator-grant",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.spaced-comparator-grant",
+        apiVersion: "^0.1.0",
+        runtime: { entry: "./extension.js" },
+        capabilities: {
+          required: [{ id: "fixture.capability", version: "^1.0.0" }],
+          optional: [],
+        },
+        contributions: [],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "extension.js"),
+    "export async function activate() {}\n",
+    "utf8",
+  );
+  const host = createExtensionHost({
+    capabilities: [{ id: "fixture.capability", version: "1.2.3" }],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.spaced-comparator-grant",
+        grants: [{ id: "fixture.capability", version: ">= 1.0.0 < 2.0.0" }],
+        packageName: "@fixture/spaced-comparator-grant",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+  });
+
+  await expect(host.loadConfiguredExtensions()).resolves.toMatchObject({
+    extensions: [{ diagnostics: [], status: "active" }],
+  });
+});
+
 test("an implicit partial-version capability grant rejects before runtime import", async () => {
   const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
   temporaryRoots.push(packageRoot);
@@ -2903,6 +3098,70 @@ export async function activate() {}
   await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 });
 
+test("disable rejects before deactivation when the lifecycle truth is corrupt", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(testRoot);
+  const packageRoot = join(testRoot, "package");
+  const stateRoot = join(testRoot, "state");
+  const deactivatedMarker = join(testRoot, "runtime-deactivated.txt");
+  await mkdir(packageRoot);
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/corrupt-disable",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.corrupt-disable",
+        apiVersion: "^0.1.0",
+        runtime: { entry: "./extension.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "extension.js"),
+    `import { writeFile } from "node:fs/promises";
+export async function activate() {}
+export async function deactivate() {
+  await writeFile(${JSON.stringify(deactivatedMarker)}, "deactivated", "utf8");
+}
+`,
+    "utf8",
+  );
+  const options = {
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.corrupt-disable",
+        grants: [],
+        packageName: "@fixture/corrupt-disable",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    stateRoot,
+  };
+  const host = createExtensionHost(options);
+  await host.disableExtension("fixture.corrupt-disable");
+  await host.enableExtension("fixture.corrupt-disable");
+  const lifecycleDirectory = join(stateRoot, "extensions");
+  const [lifecycleFilename] = await readdir(lifecycleDirectory);
+  if (lifecycleFilename === undefined) {
+    throw new Error("The lifecycle fixture was not persisted.");
+  }
+  await writeFile(join(lifecycleDirectory, lifecycleFilename), "not-json\n", "utf8");
+
+  await expect(host.disableExtension("fixture.corrupt-disable")).rejects.toMatchObject({
+    code: "extension_state_persistence_failed",
+    name: "ExtensionHostError",
+  });
+  await expect(readFile(deactivatedMarker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+});
+
 test("a lifecycle symlink cannot redirect enable persistence", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
   temporaryRoots.push(testRoot);
@@ -2963,6 +3222,59 @@ test("a lifecycle symlink cannot redirect enable persistence", async () => {
     name: "ExtensionHostError",
   });
   await expect(readFile(victimPath, "utf8")).resolves.toBe("unchanged");
+});
+
+test("a lifecycle directory symlink cannot redirect persistence", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(testRoot);
+  const packageRoot = join(testRoot, "package");
+  const stateRoot = join(testRoot, "state");
+  const redirectRoot = join(testRoot, "redirect-target");
+  await mkdir(packageRoot);
+  await mkdir(stateRoot);
+  await mkdir(redirectRoot);
+  await symlink(redirectRoot, join(stateRoot, "extensions"), "dir");
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/lifecycle-directory-symlink",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.lifecycle-directory-symlink",
+        apiVersion: "^0.1.0",
+        runtime: { entry: "./extension.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "extension.js"),
+    "export async function activate() {}\n",
+    "utf8",
+  );
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.lifecycle-directory-symlink",
+        grants: [],
+        packageName: "@fixture/lifecycle-directory-symlink",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    stateRoot,
+  });
+
+  await expect(host.disableExtension("fixture.lifecycle-directory-symlink")).rejects.toMatchObject({
+    code: "extension_state_persistence_failed",
+    name: "ExtensionHostError",
+  });
+  await expect(readdir(redirectRoot)).resolves.toEqual([]);
 });
 
 test("disable wins over an activation already in progress", async () => {
@@ -3124,6 +3436,7 @@ test("concurrent loads share one activation transaction", async () => {
 test("a malformed runtime registration becomes a bounded activation rejection", async () => {
   const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
   temporaryRoots.push(packageRoot);
+  const deactivatedMarker = join(packageRoot, "runtime-deactivated.txt");
   const contribution = {
     kind: "operation",
     id: "fixture.malformed-registration",
@@ -3149,8 +3462,12 @@ test("a malformed runtime registration becomes a bounded activation rejection", 
   );
   await writeFile(
     join(packageRoot, "extension.js"),
-    `export async function activate(context) {
+    `import { writeFile } from "node:fs/promises";
+export async function activate(context) {
   context.registerOperation(null);
+}
+export async function deactivate() {
+  await writeFile(${JSON.stringify(deactivatedMarker)}, "deactivated", "utf8");
 }
 `,
     "utf8",
@@ -3178,6 +3495,7 @@ test("a malformed runtime registration becomes a bounded activation rejection", 
     ],
   });
   expect(host.listContributions()).toEqual([]);
+  await expect(readFile(deactivatedMarker, "utf8")).resolves.toBe("deactivated");
 });
 
 test("a throwing runtime registration accessor becomes a bounded activation rejection", async () => {
