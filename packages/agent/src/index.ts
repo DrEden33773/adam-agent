@@ -8,6 +8,19 @@ export {
   type ArtifactStore,
   createFileArtifactStore,
 } from "./artifact-store.js";
+export {
+  type ConfiguredExtension,
+  createExtensionHost,
+  type ExtensionCapabilityAvailability,
+  type ExtensionCapabilityGrant,
+  type ExtensionContributionSummary,
+  type ExtensionDiagnostic,
+  type ExtensionHost,
+  ExtensionHostError,
+  type ExtensionHostOptions,
+  type ExtensionHostSnapshot,
+  type ExtensionStateSnapshot,
+} from "./extension-host.js";
 export { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
 export {
   OpenAICompatibleModelDriver,
