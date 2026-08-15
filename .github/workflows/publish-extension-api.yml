@@ -1,0 +1,42 @@
+name: Stage Extension API
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  stage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out exact release ref
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up Node.js and npm registry
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.19.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Install release npm CLI
+        run: npm install --global npm@12.0.1 --ignore-scripts
+      - name: Enable Corepack
+        run: corepack enable
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Fetch current product main
+        run: git fetch --no-tags --depth=1 origin main
+      - name: Require the tag to target current product main
+        run: test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)"
+      - name: Verify release identity
+        run: node packages/extension-api/verify-release.mjs
+      - name: Run quality checks
+        run: pnpm quality:check
+      - name: Stage package through npm Trusted Publishing
+        working-directory: packages/extension-api
+        run: npm stage publish --access public

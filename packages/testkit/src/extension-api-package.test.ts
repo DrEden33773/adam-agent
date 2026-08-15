@@ -107,8 +107,13 @@ test("the packed extension API imports with only its public runtime shape", asyn
       engines: { node: ">=24.0.0 <25" },
       license: "Apache-2.0",
       name: "@adam-agent/extension-api",
-      publishConfig: { access: "public", provenance: true },
-      version: "0.1.0",
+      publishConfig: { access: "public", provenance: true, tag: "bootstrap" },
+      repository: {
+        directory: "packages/extension-api",
+        type: "git",
+        url: "git+https://github.com/DrEden33773/adam-agent.git",
+      },
+      version: "0.0.0-bootstrap.0",
     });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
