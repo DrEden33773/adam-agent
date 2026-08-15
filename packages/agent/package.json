@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@adam-agent/extension-api": "workspace:*",
+    "@biomejs/biome": "2.5.8",
     "openai": "7.4.0",
     "semver": "7.8.5",
     "zod": "4.4.3"

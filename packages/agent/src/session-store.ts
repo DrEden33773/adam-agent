@@ -3,6 +3,7 @@ import { chmod, type FileHandle, mkdir, open, realpath } from "node:fs/promises"
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { valid } from "semver";
 import { z } from "zod";
 import type { RunResult, RuntimeEvent } from "./index.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
@@ -10,7 +11,10 @@ import type { PermissionSubject } from "./tool-runtime.js";
 
 export type CanonicalRuntimeEvent = Exclude<RuntimeEvent, { readonly type: "model_message_delta" }>;
 
-type V1PermissionSubject = Exclude<PermissionSubject, { readonly type: "patch" }>;
+type V1PermissionSubject = Exclude<
+  PermissionSubject,
+  { readonly type: "extension_capability" | "patch" }
+>;
 type V1ToolError = {
   readonly code:
     | "unknown_tool"
@@ -246,9 +250,22 @@ const patchPermissionSubjectSchema = z
       }
     }
   });
+const extensionCapabilityPermissionSubjectSchema = z.strictObject({
+  type: z.literal("extension_capability"),
+  capabilityId: z.string().min(1).max(256),
+  contributionId: z.string().min(1).max(256),
+  extensionId: z.string().min(1).max(256),
+  extensionVersion: z
+    .string()
+    .min(1)
+    .max(128)
+    .refine((version) => valid(version) !== null),
+  operationId: z.uuid(),
+});
 const v2PermissionSubjectSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("file"), path: z.string() }),
   z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
+  extensionCapabilityPermissionSubjectSchema,
   patchPermissionSubjectSchema,
   z.strictObject({
     type: z.literal("command"),

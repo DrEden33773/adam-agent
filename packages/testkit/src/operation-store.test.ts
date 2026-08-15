@@ -259,6 +259,21 @@ test("OperationStore adapters preserve a typed failed terminal fact", async () =
       recordedAt: "2026-08-15T08:01:00.000Z",
       event: {
         type: "operation_failed",
+        artifacts: [
+          {
+            byteCount: 13,
+            contract: { id: "fixture.review-result", version: 1 },
+            id: "sha256:533caf6e8ff7bb7489e0b64fdff813b635dfb5abc30b387b79e13000ebd268c5",
+            mediaType: "application/json",
+            provenance: {
+              contributionId: "fixture.review",
+              extensionId: "fixture.extension",
+              extensionVersion: "1.0.0",
+              operationId,
+              projectId: projectIdForWorkspace(workspaceRoot),
+            },
+          },
+        ],
         error: {
           code: "operation_deadline_exceeded",
           message: "The operation exceeded its deadline.",

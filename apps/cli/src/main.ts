@@ -281,6 +281,9 @@ function formatPermissionPrompt(
       .join(", ");
     return `Allow ${event.name} patch (${operations}; ${event.subject.digest}) [y/N] `;
   }
+  if (event.subject.type === "extension_capability") {
+    return `Allow ${event.subject.capabilityId} for extension ${quoteForTerminal(event.subject.extensionId)} operation ${quoteForTerminal(event.subject.operationId)} [y/N] `;
+  }
   return `Allow ${event.name} for ${quoteForTerminal(event.subject.path)} [y/N] `;
 }
 

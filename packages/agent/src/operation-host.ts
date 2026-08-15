@@ -3,12 +3,31 @@ import { realpath } from "node:fs/promises";
 
 import type {
   ExtensionActivationDiagnostic,
+  ExtensionArtifactSummary,
+  ExtensionBiomeAnalysis,
+  ExtensionBiomeFileSnapshot,
   ExtensionJsonValue,
   ExtensionOperationBudgetSnapshot,
+  ExtensionOperationCapabilities,
   ExtensionOperationContext,
   ExtensionOperationRegistration,
+  ExtensionRecord,
+  ExtensionRecordList,
+  ExtensionRecordSummary,
 } from "@adam-agent/extension-api";
 import {
+  EXTENSION_ARTIFACT_CAPABILITY_ID,
+  EXTENSION_ARTIFACT_MAX_AGGREGATE_BYTES,
+  EXTENSION_ARTIFACT_MAX_BYTES,
+  EXTENSION_ARTIFACT_MAX_COUNT,
+  EXTENSION_BIOME_CAPABILITY_ID,
+  EXTENSION_BIOME_MAX_FILE_BYTES,
+  EXTENSION_BIOME_MAX_FILES,
+  EXTENSION_BIOME_MAX_REPORT_BYTES,
+  EXTENSION_BIOME_MAX_SNAPSHOT_BYTES,
+  EXTENSION_BIOME_MAX_STDERR_BYTES,
+  EXTENSION_BIOME_MAX_STDOUT_BYTES,
+  EXTENSION_BIOME_PROFILE,
   EXTENSION_OPERATION_DEADLINE_DEFAULT_MS,
   EXTENSION_OPERATION_DEADLINE_MAX_MS,
   EXTENSION_OPERATION_INPUT_MAX_BYTES,
@@ -18,7 +37,14 @@ import {
   EXTENSION_OPERATION_PROGRESS_MAX_BYTES,
   EXTENSION_OPERATION_PROGRESS_MAX_RECORDS,
   EXTENSION_OPERATION_PROGRESS_RECORD_MAX_BYTES,
+  EXTENSION_RECORD_MAX_AGGREGATE_BYTES,
+  EXTENSION_RECORD_MAX_BYTES,
+  EXTENSION_RECORD_MAX_CREATES,
+  EXTENSION_RECORDS_CAPABILITY_ID,
 } from "@adam-agent/extension-api";
+import type { ArtifactStore } from "./artifact-store.js";
+import type { BiomeExecutionAdapter, BiomeExecutionOutput } from "./biome-execution.js";
+import { type ExtensionRecordStore, ExtensionRecordStoreError } from "./extension-record-store.js";
 import {
   createInMemoryOperationStore,
   type OperationCancellationReason,
@@ -29,8 +55,10 @@ import {
   type OperationStore,
   OperationStoreError,
 } from "./operation-store.js";
+import type { PermissionPolicy } from "./tool-runtime.js";
 
 export type RegisteredOperation = {
+  readonly capabilityIds: readonly string[];
   readonly contributionId: string;
   readonly diagnostics: readonly ExtensionActivationDiagnostic[];
   readonly extensionId: string;
@@ -64,14 +92,17 @@ export type OperationSnapshot =
   | (OperationSnapshotBase & { readonly status: "running" | "cancel_requested" })
   | (OperationSnapshotBase & {
       readonly status: "completed";
+      readonly artifacts?: readonly ExtensionArtifactSummary[];
       readonly output: ExtensionJsonValue;
     })
   | (OperationSnapshotBase & {
       readonly status: "failed";
+      readonly artifacts?: readonly ExtensionArtifactSummary[];
       readonly error: OperationFailure;
     })
   | (OperationSnapshotBase & {
       readonly status: "cancelled";
+      readonly artifacts?: readonly ExtensionArtifactSummary[];
       readonly reason: OperationCancellationReason;
     })
   | (OperationSnapshotBase & {
@@ -118,8 +149,13 @@ export class OperationHostError extends Error {
 
 type ActiveOperation = {
   readonly abortController: AbortController;
+  artifactBytes: number;
+  readonly artifacts: ExtensionArtifactSummary[];
   readonly deadlineAt: string;
+  artifactCount: number;
+  capabilityCalls: number;
   readonly operationId: string;
+  readonly projectId: string;
   readonly registered: RegisteredOperation;
   appendQueue: Promise<void>;
   cancelPromise?: Promise<void>;
@@ -131,6 +167,8 @@ type ActiveOperation = {
   nextSequence: number;
   progressBytes: number;
   progressRecords: number;
+  recordBytes: number;
+  recordCreates: number;
   readonly settled: Promise<void>;
   readonly signalHandlerSettled: () => void;
   readonly signalSettled: () => void;
@@ -139,9 +177,18 @@ type ActiveOperation = {
   terminalPersistenceFailed: boolean;
 };
 
+type OperationTerminalEvent = Extract<
+  OperationEvent,
+  { readonly type: "operation_cancelled" | "operation_completed" | "operation_failed" }
+>;
+
 export function createOperationHost(options: {
+  readonly artifactStore?: ArtifactStore;
+  readonly biomeExecution?: BiomeExecutionAdapter;
   readonly defaultDeadlineMs?: number;
   readonly projectRoot: string;
+  readonly permissions?: PermissionPolicy;
+  readonly recordStore?: ExtensionRecordStore;
   readonly resolveOperation: (contributionId: string) => RegisteredOperation | undefined;
   readonly store?: OperationStore;
 }): OperationHostControl {
@@ -278,6 +325,10 @@ export function createOperationHost(options: {
           });
           const active: ActiveOperation = {
             abortController: new AbortController(),
+            artifactBytes: 0,
+            artifacts: [],
+            artifactCount: 0,
+            capabilityCalls: 0,
             appendQueue: Promise.resolve(),
             deadlineAt,
             handlerDidSettle: false,
@@ -285,8 +336,11 @@ export function createOperationHost(options: {
             inputBytes: normalizedInput.byteLength,
             nextSequence: 2,
             operationId,
+            projectId,
             progressBytes: 0,
             progressRecords: 0,
+            recordBytes: 0,
+            recordCreates: 0,
             registered,
             settled,
             signalHandlerSettled,
@@ -297,9 +351,16 @@ export function createOperationHost(options: {
           };
           activeOperations.set(operationId, active);
           queueMicrotask(() => {
-            void executeOperation(active, decodedInput, appendAndPublish, activeOperations).catch(
-              () => undefined,
-            );
+            void executeOperation(
+              active,
+              decodedInput,
+              appendAndPublish,
+              activeOperations,
+              options.artifactStore,
+              options.biomeExecution,
+              options.permissions,
+              options.recordStore,
+            ).catch(() => undefined);
           });
           return { operationId };
         },
@@ -404,11 +465,440 @@ function enqueueExtensionAdmission<T>(
   return operation;
 }
 
+function createOperationCapabilities(
+  active: ActiveOperation,
+  artifactStore: ArtifactStore | undefined,
+  biomeExecution: BiomeExecutionAdapter | undefined,
+  permissions: PermissionPolicy | undefined,
+  recordStore: ExtensionRecordStore | undefined,
+): ExtensionOperationCapabilities {
+  const artifactCapability =
+    artifactStore !== undefined &&
+    active.registered.capabilityIds.includes(EXTENSION_ARTIFACT_CAPABILITY_ID)
+      ? createArtifactCapability(active, artifactStore)
+      : undefined;
+  const recordCapability =
+    recordStore !== undefined &&
+    active.registered.capabilityIds.includes(EXTENSION_RECORDS_CAPABILITY_ID)
+      ? createRecordCapability(active, recordStore)
+      : undefined;
+  const biomeCapability =
+    biomeExecution !== undefined &&
+    permissions !== undefined &&
+    active.registered.capabilityIds.includes(EXTENSION_BIOME_CAPABILITY_ID)
+      ? createBiomeCapability(active, biomeExecution, permissions)
+      : undefined;
+  return Object.freeze({
+    ...(biomeCapability === undefined ? {} : { [EXTENSION_BIOME_CAPABILITY_ID]: biomeCapability }),
+    ...(artifactCapability === undefined
+      ? {}
+      : { [EXTENSION_ARTIFACT_CAPABILITY_ID]: artifactCapability }),
+    ...(recordCapability === undefined
+      ? {}
+      : { [EXTENSION_RECORDS_CAPABILITY_ID]: recordCapability }),
+  });
+}
+
+function createArtifactCapability(active: ActiveOperation, artifactStore: ArtifactStore) {
+  return Object.freeze({
+    async publish(input: {
+      readonly bytes: Uint8Array;
+      readonly contract: { readonly id: string; readonly version: number };
+      readonly mediaType: string;
+    }): Promise<ExtensionArtifactSummary> {
+      if (active.settling || active.abortController.signal.aborted) {
+        throw new Error("The operation no longer accepts capability calls.");
+      }
+      if (typeof input !== "object" || input === null) {
+        rejectInvalidCapabilityInput(active);
+      }
+      if (
+        input.bytes instanceof Uint8Array &&
+        input.bytes.byteLength > EXTENSION_ARTIFACT_MAX_BYTES
+      ) {
+        markArtifactLimitExceeded(active);
+        throw new OperationCapabilityLimitError();
+      }
+      if (
+        !(input.bytes instanceof Uint8Array) ||
+        typeof input.mediaType !== "string" ||
+        input.mediaType.length === 0 ||
+        input.mediaType.length > 256 ||
+        typeof input.contract?.id !== "string" ||
+        input.contract.id.length === 0 ||
+        input.contract.id.length > 256 ||
+        !Number.isSafeInteger(input.contract.version) ||
+        input.contract.version <= 0
+      ) {
+        rejectInvalidCapabilityInput(active);
+      }
+      if (
+        active.artifactCount + 1 > EXTENSION_ARTIFACT_MAX_COUNT ||
+        active.artifactBytes + input.bytes.byteLength > EXTENSION_ARTIFACT_MAX_AGGREGATE_BYTES
+      ) {
+        markArtifactLimitExceeded(active);
+        throw new OperationCapabilityLimitError();
+      }
+      active.artifactBytes += input.bytes.byteLength;
+      active.artifactCount += 1;
+      const contract = Object.freeze({ ...input.contract });
+      const provenance = createCapabilityProvenance(active);
+      let artifact: {
+        readonly byteCount: number;
+        readonly id: string;
+        readonly mediaType: string;
+      };
+      try {
+        artifact = await artifactStore.write({
+          bytes: Buffer.from(input.bytes),
+          mediaType: input.mediaType,
+          source: {
+            type: "extension_operation",
+            contract,
+            ...provenance,
+          },
+        });
+      } catch {
+        markArtifactPersistenceFailed(active);
+        throw new OperationCapabilityPersistenceError();
+      }
+      const summary = Object.freeze({
+        byteCount: artifact.byteCount,
+        contract,
+        id: artifact.id,
+        mediaType: artifact.mediaType,
+        provenance,
+      });
+      active.artifacts.push(summary);
+      assertCapabilityActive(active);
+      return summary;
+    },
+  });
+}
+
+function assertCapabilityActive(active: ActiveOperation): void {
+  if (active.settling || active.abortController.signal.aborted) {
+    throw new Error("The operation no longer accepts capability calls.");
+  }
+}
+
+function assertContractReference(value: { readonly id: string; readonly version: number }): void {
+  if (
+    typeof value?.id !== "string" ||
+    value.id.length === 0 ||
+    value.id.length > 256 ||
+    !Number.isSafeInteger(value.version) ||
+    value.version <= 0
+  ) {
+    throw new TypeError("The capability contract reference is invalid.");
+  }
+}
+
+function assertRecordKey(value: string): void {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 512 ||
+    value.startsWith("/") ||
+    value.endsWith("/") ||
+    value.split("/").some((segment) => !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(segment))
+  ) {
+    throw new TypeError("The extension record key is invalid.");
+  }
+}
+
+function assertRecordPrefix(value: string): void {
+  if (typeof value !== "string" || value.length > 512 || value.startsWith("/")) {
+    throw new TypeError("The extension record prefix is invalid.");
+  }
+  if (value.length > 0) {
+    assertRecordKey(value.endsWith("/") ? value.slice(0, -1) : value);
+  }
+}
+
+function createCapabilityProvenance(active: ActiveOperation) {
+  return Object.freeze({
+    contributionId: active.registered.contributionId,
+    extensionId: active.registered.extensionId,
+    extensionVersion: active.registered.extensionVersion,
+    operationId: active.operationId,
+    projectId: active.projectId,
+  });
+}
+
+function toRecordSummary(record: ExtensionRecord): ExtensionRecordSummary {
+  return {
+    byteCount: record.byteCount,
+    contract: record.contract,
+    digest: record.digest,
+    key: record.key,
+    provenance: record.provenance,
+  };
+}
+
+function createBiomeCapability(
+  active: ActiveOperation,
+  execution: BiomeExecutionAdapter,
+  permissions: PermissionPolicy,
+) {
+  return Object.freeze({
+    async analyze(input: {
+      readonly files: readonly ExtensionBiomeFileSnapshot[];
+      readonly profile: typeof EXTENSION_BIOME_PROFILE;
+    }): Promise<ExtensionBiomeAnalysis> {
+      assertCapabilityActive(active);
+      let files: readonly ExtensionBiomeFileSnapshot[];
+      try {
+        files = normalizeBiomeFiles(input);
+      } catch (error) {
+        if (error instanceof OperationCapabilityLimitError) {
+          markBiomeLimitExceeded(active);
+          throw error;
+        }
+        rejectInvalidCapabilityInput(active);
+      }
+      let permissionDecision: ReturnType<PermissionPolicy["decide"]> = "deny";
+      active.capabilityCalls += 1;
+      try {
+        permissionDecision = permissions.decide({
+          callId: `${active.operationId}:biome:${active.capabilityCalls}`,
+          effect: "execute",
+          name: EXTENSION_BIOME_CAPABILITY_ID,
+          scope: "call",
+          subject: {
+            capabilityId: EXTENSION_BIOME_CAPABILITY_ID,
+            contributionId: active.registered.contributionId,
+            extensionId: active.registered.extensionId,
+            extensionVersion: active.registered.extensionVersion,
+            operationId: active.operationId,
+            type: "extension_capability",
+          },
+        });
+      } catch {
+        permissionDecision = "deny";
+      }
+      if (permissionDecision !== "allow") {
+        markBiomePermissionDenied(active);
+        throw new OperationCapabilityPermissionDeniedError();
+      }
+      let output: BiomeExecutionOutput;
+      try {
+        output = await execution.execute(
+          Object.freeze({
+            deadlineAt: active.deadlineAt,
+            files,
+            profile: EXTENSION_BIOME_PROFILE,
+            signal: active.abortController.signal,
+          }),
+        );
+      } catch {
+        if (active.cancelReason !== undefined || active.abortController.signal.aborted) {
+          throw new Error("The Biome execution was cancelled.");
+        }
+        markBiomeExecutionFailed(active);
+        throw new OperationCapabilityExecutionError();
+      }
+      if (active.settling || active.abortController.signal.aborted) {
+        throw new Error("The operation no longer accepts capability results.");
+      }
+      let report: ExtensionJsonValue;
+      try {
+        if (
+          typeof output.analyzerVersion !== "string" ||
+          output.analyzerVersion.length === 0 ||
+          output.analyzerVersion.length > 128 ||
+          !Number.isSafeInteger(output.exitCode) ||
+          output.exitCode < 0 ||
+          output.exitCode > 255 ||
+          !(output.report instanceof Uint8Array) ||
+          output.report.byteLength > EXTENSION_BIOME_MAX_REPORT_BYTES ||
+          !(output.stdout instanceof Uint8Array) ||
+          output.stdout.byteLength > EXTENSION_BIOME_MAX_STDOUT_BYTES ||
+          !(output.stderr instanceof Uint8Array) ||
+          output.stderr.byteLength > EXTENSION_BIOME_MAX_STDERR_BYTES
+        ) {
+          throw new TypeError("The Biome execution output is invalid.");
+        }
+        const reportJson = new TextDecoder("utf-8", { fatal: true }).decode(output.report);
+        report = normalizeJson(JSON.parse(reportJson), EXTENSION_BIOME_MAX_REPORT_BYTES).value;
+      } catch {
+        markBiomeOutputInvalid(active);
+        throw new OperationCapabilityOutputError();
+      }
+      return Object.freeze({
+        execution: Object.freeze({
+          analyzer: "biome" as const,
+          analyzerVersion: output.analyzerVersion,
+          exitCode: output.exitCode,
+          profile: EXTENSION_BIOME_PROFILE,
+          provenance: createCapabilityProvenance(active),
+        }),
+        report,
+      });
+    },
+  });
+}
+
+function normalizeBiomeFiles(input: {
+  readonly files: readonly ExtensionBiomeFileSnapshot[];
+  readonly profile: typeof EXTENSION_BIOME_PROFILE;
+}): readonly ExtensionBiomeFileSnapshot[] {
+  if (
+    input?.profile !== EXTENSION_BIOME_PROFILE ||
+    !Array.isArray(input.files) ||
+    input.files.length === 0 ||
+    input.files.length > EXTENSION_BIOME_MAX_FILES
+  ) {
+    throw new TypeError("The Biome snapshot input is invalid.");
+  }
+  let aggregateBytes = 0;
+  const paths = new Set<string>();
+  const files = input.files.map((file) => {
+    assertRecordKey(file.path);
+    if (paths.has(file.path) || typeof file.content !== "string" || !file.content.isWellFormed()) {
+      throw new TypeError("The Biome snapshot input is invalid.");
+    }
+    paths.add(file.path);
+    const byteLength = Buffer.byteLength(file.content, "utf8");
+    if (byteLength > EXTENSION_BIOME_MAX_FILE_BYTES) {
+      throw new OperationCapabilityLimitError();
+    }
+    aggregateBytes += byteLength;
+    if (aggregateBytes > EXTENSION_BIOME_MAX_SNAPSHOT_BYTES) {
+      throw new OperationCapabilityLimitError();
+    }
+    return Object.freeze({ content: file.content, path: file.path });
+  });
+  return Object.freeze(files);
+}
+
+function createRecordCapability(active: ActiveOperation, recordStore: ExtensionRecordStore) {
+  const namespace = Object.freeze({
+    extensionId: active.registered.extensionId,
+    extensionVersion: active.registered.extensionVersion,
+    projectId: active.projectId,
+  });
+  return Object.freeze({
+    async create(input: {
+      readonly contract: { readonly id: string; readonly version: number };
+      readonly key: string;
+      readonly value: ExtensionJsonValue;
+    }): Promise<ExtensionRecordSummary> {
+      assertCapabilityActive(active);
+      try {
+        assertRecordKey(input.key);
+        assertContractReference(input.contract);
+      } catch {
+        rejectInvalidCapabilityInput(active);
+      }
+      let normalized: ReturnType<typeof normalizeJson>;
+      try {
+        normalized = normalizeJson(input.value, EXTENSION_RECORD_MAX_BYTES);
+      } catch (error) {
+        if (error instanceof OperationHostError && error.code === "operation_input_too_large") {
+          markRecordLimitExceeded(active);
+          throw new OperationCapabilityLimitError();
+        }
+        rejectInvalidCapabilityInput(active);
+      }
+      if (
+        active.recordCreates + 1 > EXTENSION_RECORD_MAX_CREATES ||
+        active.recordBytes + normalized.byteLength > EXTENSION_RECORD_MAX_AGGREGATE_BYTES
+      ) {
+        markRecordLimitExceeded(active);
+        throw new OperationCapabilityLimitError();
+      }
+      active.recordCreates += 1;
+      active.recordBytes += normalized.byteLength;
+      const record: ExtensionRecord = {
+        byteCount: normalized.byteLength,
+        contract: Object.freeze({ ...input.contract }),
+        digest: normalized.digest,
+        key: input.key,
+        provenance: createCapabilityProvenance(active),
+        value: normalized.value,
+      };
+      try {
+        await recordStore.create(record);
+      } catch (error) {
+        if (error instanceof ExtensionRecordStoreError && error.code === "record_already_exists") {
+          markRecordConflict(active);
+          throw new OperationCapabilityConflictError();
+        }
+        markRecordPersistenceFailed(active);
+        throw new OperationCapabilityPersistenceError();
+      }
+      assertCapabilityActive(active);
+      return Object.freeze(toRecordSummary(record));
+    },
+    async get(key: string): Promise<ExtensionRecord | undefined> {
+      assertCapabilityActive(active);
+      try {
+        assertRecordKey(key);
+      } catch {
+        rejectInvalidCapabilityInput(active);
+      }
+      let record: ExtensionRecord | undefined;
+      try {
+        record = await recordStore.get(namespace, key);
+      } catch {
+        markRecordPersistenceFailed(active);
+        throw new OperationCapabilityPersistenceError();
+      }
+      assertCapabilityActive(active);
+      return record === undefined ? undefined : Object.freeze(record);
+    },
+    async list(input: {
+      readonly cursor?: string;
+      readonly limit?: number;
+      readonly prefix: string;
+    }): Promise<ExtensionRecordList> {
+      assertCapabilityActive(active);
+      try {
+        assertRecordPrefix(input.prefix);
+        if (input.cursor !== undefined) {
+          assertRecordKey(input.cursor);
+          if (!input.cursor.startsWith(input.prefix)) {
+            throw new TypeError("The extension record cursor is outside the requested prefix.");
+          }
+        }
+        const limit = input.limit ?? 100;
+        if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 256) {
+          throw new TypeError("The extension record list limit is invalid.");
+        }
+      } catch {
+        rejectInvalidCapabilityInput(active);
+      }
+      const limit = input.limit ?? 100;
+      let result: ExtensionRecordList;
+      try {
+        result = await recordStore.list(namespace, {
+          ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+          limit,
+          prefix: input.prefix,
+        });
+      } catch {
+        markRecordPersistenceFailed(active);
+        throw new OperationCapabilityPersistenceError();
+      }
+      assertCapabilityActive(active);
+      return Object.freeze({
+        ...(result.nextCursor === undefined ? {} : { nextCursor: result.nextCursor }),
+        records: Object.freeze(result.records.map((record) => Object.freeze(record))),
+      });
+    },
+  });
+}
+
 async function executeOperation(
   active: ActiveOperation,
   input: unknown,
   appendAndPublish: (record: OperationEventRecord) => Promise<void>,
   activeOperations: Map<string, ActiveOperation>,
+  artifactStore: ArtifactStore | undefined,
+  biomeExecution: BiomeExecutionAdapter | undefined,
+  permissions: PermissionPolicy | undefined,
+  recordStore: ExtensionRecordStore | undefined,
 ): Promise<void> {
   const deadlineDelay = Math.max(0, Date.parse(active.deadlineAt) - Date.now());
   const deadline = setTimeout(() => {
@@ -431,6 +921,13 @@ async function executeOperation(
       progressBytesRemaining: EXTENSION_OPERATION_PROGRESS_MAX_BYTES,
       progressRecordsRemaining: EXTENSION_OPERATION_PROGRESS_MAX_RECORDS,
     }),
+    capabilities: createOperationCapabilities(
+      active,
+      artifactStore,
+      biomeExecution,
+      permissions,
+      recordStore,
+    ),
     deadlineAt: active.deadlineAt,
     diagnostics: Object.freeze(
       active.registered.diagnostics.map((diagnostic) => Object.freeze({ ...diagnostic })),
@@ -440,6 +937,7 @@ async function executeOperation(
       contributionId: active.registered.contributionId,
       extensionId: active.registered.extensionId,
       extensionVersion: active.registered.extensionVersion,
+      projectId: active.projectId,
     }),
     signal: active.abortController.signal,
     async progress(value) {
@@ -617,7 +1115,7 @@ async function settleFailed(
 
 async function settleTerminal(
   active: ActiveOperation,
-  event: OperationEvent,
+  event: OperationTerminalEvent,
   appendAndPublish: (record: OperationEventRecord) => Promise<void>,
   activeOperations: Map<string, ActiveOperation>,
 ): Promise<void> {
@@ -632,7 +1130,7 @@ async function settleTerminal(
       operationId: active.operationId,
       sequence: active.nextSequence,
       recordedAt: new Date().toISOString(),
-      event,
+      event: attachPublishedArtifacts(event, active.artifacts),
     });
     active.nextSequence += 1;
   } catch (error) {
@@ -645,6 +1143,19 @@ async function settleTerminal(
   }
 }
 
+function attachPublishedArtifacts(
+  event: OperationTerminalEvent,
+  artifacts: readonly ExtensionArtifactSummary[],
+): OperationTerminalEvent {
+  if (artifacts.length === 0) {
+    return event;
+  }
+  return {
+    ...event,
+    artifacts: Object.freeze([...artifacts]),
+  };
+}
+
 function releaseActiveOperation(
   active: ActiveOperation,
   activeOperations: Map<string, ActiveOperation>,
@@ -655,23 +1166,99 @@ function releaseActiveOperation(
 }
 
 class OperationProgressLimitError extends Error {}
+class OperationCapabilityConflictError extends Error {}
+class OperationCapabilityExecutionError extends Error {}
+class OperationCapabilityInputError extends Error {}
+class OperationCapabilityLimitError extends Error {}
+class OperationCapabilityPermissionDeniedError extends Error {}
+class OperationCapabilityPersistenceError extends Error {}
+class OperationCapabilityOutputError extends Error {}
 class OperationProgressInvalidError extends Error {}
 class OperationOutputInvalidError extends Error {}
 
 function markProgressLimitExceeded(active: ActiveOperation): void {
-  active.forcedFailure = {
+  forceOperationFailure(active, {
     code: "operation_progress_limit_exceeded",
     message: "The operation exceeded its progress budget.",
-  };
-  active.abortController.abort(new Error("The operation exceeded its progress budget."));
+  });
+}
+
+function markArtifactLimitExceeded(active: ActiveOperation): void {
+  forceOperationFailure(active, {
+    code: "operation_capability_limit_exceeded",
+    message: "The operation exceeded an artifact capability limit.",
+  });
+}
+
+function markArtifactPersistenceFailed(active: ActiveOperation): void {
+  forceOperationFailure(active, {
+    code: "operation_capability_persistence_failed",
+    message: "The operation could not persist an artifact.",
+  });
+}
+
+function markRecordLimitExceeded(active: ActiveOperation): void {
+  forceOperationFailure(active, {
+    code: "operation_capability_limit_exceeded",
+    message: "The operation exceeded a record capability limit.",
+  });
+}
+
+function markRecordConflict(active: ActiveOperation): void {
+  forceOperationFailure(active, {
+    code: "operation_capability_conflict",
+    message: "The immutable extension record already exists.",
+  });
+}
+
+function rejectInvalidCapabilityInput(active: ActiveOperation): never {
+  forceOperationFailure(active, {
+    code: "operation_capability_input_invalid",
+    message: "The operation supplied invalid capability input.",
+  });
+  throw new OperationCapabilityInputError();
+}
+
+function markRecordPersistenceFailed(active: ActiveOperation): void {
+  forceOperationFailure(active, {
+    code: "operation_capability_persistence_failed",
+    message: "The operation could not persist extension records.",
+  });
+}
+
+function markBiomeLimitExceeded(active: ActiveOperation): void {
+  forceOperationFailure(active, {
+    code: "operation_capability_limit_exceeded",
+    message: "The operation exceeded a Biome capability limit.",
+  });
+}
+
+function markBiomePermissionDenied(active: ActiveOperation): void {
+  forceOperationFailure(active, {
+    code: "operation_capability_permission_denied",
+    message: "The Biome analyzer execution was denied by policy.",
+  });
+}
+
+function markBiomeExecutionFailed(active: ActiveOperation): void {
+  forceOperationFailure(active, {
+    code: "operation_capability_execution_failed",
+    message: "The Biome analyzer execution failed.",
+  });
+}
+
+function markBiomeOutputInvalid(active: ActiveOperation): void {
+  forceOperationFailure(active, {
+    code: "operation_capability_output_invalid",
+    message: "The Biome analyzer produced invalid bounded output.",
+  });
 }
 
 function markProgressInvalid(active: ActiveOperation): void {
-  active.forcedFailure = {
+  forceOperationFailure(active, {
     code: "operation_progress_invalid",
     message: "The extension reported invalid operation progress.",
-  };
-  active.abortController.abort(new Error("The extension reported invalid operation progress."));
+  });
 }
 
 function markProgressPersistenceFailed(active: ActiveOperation): OperationFailure {
@@ -679,9 +1266,13 @@ function markProgressPersistenceFailed(active: ActiveOperation): OperationFailur
     code: "operation_persistence_failed",
     message: "The operation could not persist its progress.",
   };
-  active.forcedFailure = failure;
-  active.abortController.abort(new Error("The operation could not persist its progress."));
+  forceOperationFailure(active, failure);
   return failure;
+}
+
+function forceOperationFailure(active: ActiveOperation, failure: OperationFailure): void {
+  active.forcedFailure = failure;
+  active.abortController.abort(new Error(failure.message));
 }
 
 async function* streamEvents(
@@ -769,13 +1360,28 @@ function createSnapshot(
   };
   const terminal = records.find((record) => isTerminal(record.event))?.event;
   if (terminal?.type === "operation_completed") {
-    return { ...base, output: terminal.output, status: "completed" };
+    return {
+      ...base,
+      ...(terminal.artifacts === undefined ? {} : { artifacts: terminal.artifacts }),
+      output: terminal.output,
+      status: "completed",
+    };
   }
   if (terminal?.type === "operation_failed") {
-    return { ...base, error: terminal.error, status: "failed" };
+    return {
+      ...base,
+      ...(terminal.artifacts === undefined ? {} : { artifacts: terminal.artifacts }),
+      error: terminal.error,
+      status: "failed",
+    };
   }
   if (terminal?.type === "operation_cancelled") {
-    return { ...base, reason: terminal.reason, status: "cancelled" };
+    return {
+      ...base,
+      ...(terminal.artifacts === undefined ? {} : { artifacts: terminal.artifacts }),
+      reason: terminal.reason,
+      status: "cancelled",
+    };
   }
   if (!isActive) {
     return {
@@ -973,7 +1579,7 @@ async function createProjectId(projectRoot: string): Promise<string> {
   }
 }
 
-function isTerminal(event: OperationEvent): boolean {
+function isTerminal(event: OperationEvent): event is OperationTerminalEvent {
   return (
     event.type === "operation_cancelled" ||
     event.type === "operation_completed" ||

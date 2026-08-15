@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, link, mkdir, open, readFile, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
-export type ArtifactSource = {
+export type ToolArtifactSource = {
   readonly type: "tool_output";
   readonly callId: string;
   readonly toolName: string;
@@ -11,19 +11,31 @@ export type ArtifactSource = {
   readonly truncated: boolean;
 };
 
-export type ArtifactReference = {
+export type ExtensionArtifactSource = {
+  readonly type: "extension_operation";
+  readonly contract: { readonly id: string; readonly version: number };
+  readonly contributionId: string;
+  readonly extensionId: string;
+  readonly extensionVersion: string;
+  readonly operationId: string;
+  readonly projectId: string;
+};
+
+export type ArtifactSource = ExtensionArtifactSource | ToolArtifactSource;
+
+export type ArtifactReference<TSource extends ArtifactSource = ArtifactSource> = {
   readonly id: string;
   readonly mediaType: string;
   readonly byteCount: number;
-  readonly source: ArtifactSource;
+  readonly source: TSource;
 };
 
 export type ArtifactStore = {
-  write(input: {
+  write<TSource extends ArtifactSource>(input: {
     readonly bytes: Uint8Array;
     readonly mediaType: string;
-    readonly source: ArtifactSource;
-  }): Promise<ArtifactReference>;
+    readonly source: TSource;
+  }): Promise<ArtifactReference<TSource>>;
   read(id: string): Promise<Uint8Array | undefined>;
 };
 

@@ -5,6 +5,8 @@ import { pathToFileURL } from "node:url";
 
 import {
   EXTENSION_API_VERSION,
+  EXTENSION_ARTIFACT_CAPABILITY_ID,
+  EXTENSION_BIOME_CAPABILITY_ID,
   EXTENSION_ID_MAX_LENGTH,
   EXTENSION_OPERATION_DEADLINE_MAX_MS,
   EXTENSION_PACKAGE_NAME_MAX_LENGTH,
@@ -21,7 +23,10 @@ import {
   parseExtensionPackageManifest,
 } from "@adam-agent/extension-api";
 import { minVersion, satisfies, subset, valid, validRange } from "semver";
+import type { ArtifactStore } from "./artifact-store.js";
+import type { BiomeExecutionAdapter } from "./biome-execution.js";
 import { createExtensionLifecycleStore } from "./extension-lifecycle-store.js";
+import { createExtensionRecordStore } from "./extension-record-store.js";
 import {
   createOperationHost,
   type OperationHost,
@@ -29,6 +34,7 @@ import {
   type RegisteredOperation,
 } from "./operation-host.js";
 import type { OperationStore } from "./operation-store.js";
+import type { PermissionPolicy } from "./tool-runtime.js";
 
 export type ExtensionCapabilityAvailability = {
   readonly id: string;
@@ -51,11 +57,14 @@ export type ConfiguredExtension = {
 };
 
 export type ExtensionHostOptions = {
+  readonly artifactStore?: ArtifactStore;
+  readonly biomeExecution?: BiomeExecutionAdapter;
   readonly capabilities: readonly ExtensionCapabilityAvailability[];
   readonly extensions: readonly ConfiguredExtension[];
   readonly operationDeadlineMs?: number;
   readonly operationDisableGraceMs?: number;
   readonly operationStore?: OperationStore;
+  readonly permissions?: PermissionPolicy;
   readonly projectRoot?: string;
   readonly stateRoot?: string;
 };
@@ -227,6 +236,12 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
         valid(extension.packageVersion) === null,
     ) ||
     options.capabilities.some((capability) => valid(capability.version) === null) ||
+    (options.capabilities.some(
+      (capability) => capability.id === EXTENSION_ARTIFACT_CAPABILITY_ID,
+    ) &&
+      options.artifactStore === undefined) ||
+    (options.capabilities.some((capability) => capability.id === EXTENSION_BIOME_CAPABILITY_ID) &&
+      (options.biomeExecution === undefined || options.permissions === undefined)) ||
     (options.operationDeadlineMs !== undefined &&
       (!Number.isSafeInteger(options.operationDeadlineMs) ||
         options.operationDeadlineMs <= 0 ||
@@ -250,12 +265,17 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
   >();
   const loadedSnapshots = new Map<string, ExtensionStateSnapshot>();
   const lifecycleStore = createExtensionLifecycleStore(options.stateRoot);
+  const recordStore = createExtensionRecordStore(options.stateRoot);
   const lifecycleCommandQueues = new Map<string, Promise<void>>();
   const operationHost: OperationHostControl = createOperationHost({
+    ...(options.artifactStore === undefined ? {} : { artifactStore: options.artifactStore }),
     ...(options.operationDeadlineMs === undefined
       ? {}
       : { defaultDeadlineMs: options.operationDeadlineMs }),
+    ...(options.biomeExecution === undefined ? {} : { biomeExecution: options.biomeExecution }),
     projectRoot: options.projectRoot ?? process.cwd(),
+    ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
+    recordStore,
     resolveOperation: (contributionId) => registeredOperations.get(contributionId),
     ...(options.operationStore === undefined ? {} : { store: options.operationStore }),
   });
@@ -687,8 +707,15 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
             continue;
           }
           publishedContributions.push(...registrationMatch.contributions);
+          const capabilityIds = [
+            ...activationContext.compatibility.capabilities.required,
+            ...activationContext.compatibility.capabilities.optional,
+          ]
+            .filter((capability) => capability.granted && capability.availableVersion !== undefined)
+            .map((capability) => capability.id);
           for (const registration of registrationMatch.registrations) {
             registeredOperations.set(registration.id, {
+              capabilityIds,
               contributionId: registration.id,
               diagnostics: optionalDiagnostics,
               extensionId: configured.extensionId,
