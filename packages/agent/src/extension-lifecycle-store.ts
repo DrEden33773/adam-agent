@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
 import { chmod, type FileHandle, mkdir, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -35,7 +36,7 @@ export function createExtensionLifecycleStore(stateRoot?: string): ExtensionLife
       const path = lifecycleLogPath(directory, identity);
       let file: FileHandle;
       try {
-        file = await open(path, "r");
+        file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
       } catch (error) {
         if (isNodeError(error) && error.code === "ENOENT") {
           return undefined;
@@ -43,11 +44,23 @@ export function createExtensionLifecycleStore(stateRoot?: string): ExtensionLife
         throw error;
       }
       try {
-        const { size } = await file.stat();
-        if (!Number.isSafeInteger(size) || size > maxLifecycleLogBytes) {
+        const stats = await file.stat();
+        if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
+          throw new TypeError("The extension lifecycle log must be an ordinary file.");
+        }
+        const buffer = Buffer.alloc(maxLifecycleLogBytes + 1);
+        let offset = 0;
+        while (offset < buffer.byteLength) {
+          const { bytesRead } = await file.read(buffer, offset, buffer.byteLength - offset, null);
+          if (bytesRead === 0) {
+            break;
+          }
+          offset += bytesRead;
+        }
+        if (offset > maxLifecycleLogBytes) {
           throw new TypeError("The extension lifecycle log exceeds its read limit.");
         }
-        const content = await file.readFile("utf8");
+        const content = buffer.subarray(0, offset).toString("utf8");
         if (content.length === 0 || !content.endsWith("\n")) {
           throw new TypeError("The extension lifecycle log is invalid.");
         }
@@ -83,10 +96,21 @@ export function createExtensionLifecycleStore(stateRoot?: string): ExtensionLife
         });
         const storedBytes = Buffer.byteLength(`${serialized}\n`, "utf8");
         const path = lifecycleLogPath(directory, identity);
-        const file = await open(path, "a", 0o600);
+        const file = await open(
+          path,
+          constants.O_APPEND |
+            constants.O_CREAT |
+            constants.O_WRONLY |
+            constants.O_NOFOLLOW |
+            constants.O_NONBLOCK,
+          0o600,
+        );
         try {
-          const { size } = await file.stat();
-          if (!Number.isSafeInteger(size) || size + storedBytes > maxLifecycleLogBytes) {
+          const stats = await file.stat();
+          if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
+            throw new TypeError("The extension lifecycle log must be an ordinary file.");
+          }
+          if (stats.size + storedBytes > maxLifecycleLogBytes) {
             throw new TypeError("The extension lifecycle log exceeds its write limit.");
           }
           await file.chmod(0o600);

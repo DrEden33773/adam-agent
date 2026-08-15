@@ -1,5 +1,6 @@
+import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
-import { isAbsolute, relative, resolve } from "node:path";
+import { extname, isAbsolute, relative, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -96,9 +97,15 @@ export type ExtensionDiagnostic =
       readonly expected: ExtensionContractReference;
     }
   | {
+      readonly code: "contribution_codec_invalid";
+      readonly contract: "input" | "output" | "progress";
+      readonly contributionId: string;
+    }
+  | {
       readonly code: "contribution_handler_invalid";
       readonly contributionId: string;
     }
+  | { readonly code: "contribution_registration_invalid" }
   | {
       readonly code: "contribution_collision";
       readonly contributionId: string;
@@ -235,6 +242,10 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       );
       if (configured === undefined || !configured.enabled) {
         throw new TypeError("The configured extension cannot be enabled.");
+      }
+      const loadedSnapshot = loadedSnapshots.get(extensionId);
+      if (loadedSnapshot?.status === "active") {
+        return loadedSnapshot;
       }
       try {
         await lifecycleStore.write(configured, true);
@@ -482,7 +493,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
             });
             continue;
           }
-          const registrations: ExtensionOperationRegistration[] = [];
+          const registrations: unknown[] = [];
           const activationContext: ExtensionActivationContext = Object.freeze({
             compatibility: deepFreeze({
               api: {
@@ -519,6 +530,9 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
           let entryPath: string;
           try {
             entryPath = await resolveConfinedEntry(packageRoot, manifest.adamAgent.runtime.entry);
+            if (![".js", ".mjs"].includes(extname(entryPath))) {
+              throw new TypeError("The extension runtime entry must be an ES module.");
+            }
           } catch {
             extensions.push({
               diagnostics: [{ code: "runtime_entry_invalid" }],
@@ -645,24 +659,50 @@ const maxPackageManifestBytes = 1024 * 1024;
 
 async function readPackageManifest(packageRoot: string): Promise<string> {
   const path = await resolveConfinedEntry(packageRoot, "package.json");
-  const file = await open(path, "r");
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
-    const { size } = await file.stat();
-    if (!Number.isSafeInteger(size) || size > maxPackageManifestBytes) {
+    const stats = await file.stat();
+    if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
+      throw new TypeError("The extension package manifest must be an ordinary file.");
+    }
+    const content = Buffer.alloc(maxPackageManifestBytes + 1);
+    let offset = 0;
+    while (offset < content.byteLength) {
+      const { bytesRead } = await file.read(content, offset, content.byteLength - offset, null);
+      if (bytesRead === 0) {
+        break;
+      }
+      offset += bytesRead;
+    }
+    if (offset > maxPackageManifestBytes) {
       throw new TypeError("The extension package manifest exceeds its read limit.");
     }
-    return await file.readFile("utf8");
+    return content.subarray(0, offset).toString("utf8");
   } finally {
     await file.close();
   }
 }
 
 function isSingleMajorGrantRange(range: string): boolean {
-  if (validRange(range) === null || /[*xX]/u.test(range)) {
+  if (validRange(range) === null || !usesOnlyExplicitSemanticVersions(range)) {
     return false;
   }
   const minimum = minVersion(range);
-  return minimum !== null && subset(range, `>=${minimum.major}.0.0 <${minimum.major + 1}.0.0-0`);
+  const exact = valid(range);
+  return (
+    minimum !== null &&
+    (exact !== null || subset(range, `>=${minimum.major}.0.0-0 <${minimum.major + 1}.0.0-0`))
+  );
+}
+
+function usesOnlyExplicitSemanticVersions(range: string): boolean {
+  return range
+    .split(/\s+|\|\|/u)
+    .filter((token) => token.length > 0 && token !== "-")
+    .every((token) => {
+      const versionCore = token.replace(/^[~^<>=]*v?/u, "").split(/[+-]/u, 1)[0] ?? "";
+      return /^\d+\.\d+\.\d+$/u.test(versionCore);
+    });
 }
 
 function negotiateCapabilities(
@@ -760,7 +800,6 @@ async function activateWithDeadline(
           () => reject(new ExtensionActivationTimeoutError()),
           activationTimeoutMs,
         );
-        timeout.unref();
       }),
     ]);
   } finally {
@@ -786,11 +825,34 @@ function disabledSnapshot(
 function matchOperationRegistrations(
   extensionId: string,
   declarations: readonly ExtensionOperationContribution[],
-  registrations: readonly ExtensionOperationRegistration[],
+  registrations: readonly unknown[],
+):
+  | { readonly ok: true; readonly contributions: readonly ExtensionContributionSummary[] }
+  | { readonly ok: false; readonly diagnostic: ExtensionDiagnostic } {
+  try {
+    return matchOperationRegistrationsUnchecked(extensionId, declarations, registrations);
+  } catch {
+    return {
+      ok: false,
+      diagnostic: { code: "contribution_registration_invalid" },
+    };
+  }
+}
+
+function matchOperationRegistrationsUnchecked(
+  extensionId: string,
+  declarations: readonly ExtensionOperationContribution[],
+  registrations: readonly unknown[],
 ):
   | { readonly ok: true; readonly contributions: readonly ExtensionContributionSummary[] }
   | { readonly ok: false; readonly diagnostic: ExtensionDiagnostic } {
   const contributions: ExtensionContributionSummary[] = [];
+  if (!registrations.every(isOperationRegistrationCandidate)) {
+    return {
+      ok: false,
+      diagnostic: { code: "contribution_registration_invalid" },
+    };
+  }
   const duplicateRegistrationId = findDuplicateId(registrations);
   if (duplicateRegistrationId !== undefined) {
     return {
@@ -833,6 +895,17 @@ function matchOperationRegistrations(
         },
       };
     }
+    const invalidCodec = findInvalidCodec(registration);
+    if (invalidCodec !== undefined) {
+      return {
+        ok: false,
+        diagnostic: {
+          code: "contribution_codec_invalid",
+          contract: invalidCodec,
+          contributionId: declaration.id,
+        },
+      };
+    }
     const contractMismatch = findContractMismatch(declaration, registration);
     if (contractMismatch !== undefined) {
       return {
@@ -852,8 +925,59 @@ function matchOperationRegistrations(
   return { ok: true, contributions };
 }
 
+function findInvalidCodec(
+  registration: OperationRegistrationCandidate,
+): "input" | "output" | "progress" | undefined {
+  return (["input", "output", "progress"] as const).find(
+    (contract) =>
+      typeof registration[contract].decode !== "function" ||
+      typeof registration[contract].encode !== "function",
+  );
+}
+
+type OperationRegistrationCandidate = {
+  readonly execute: unknown;
+  readonly id: string;
+  readonly input: ExtensionContractCodecCandidate;
+  readonly output: ExtensionContractCodecCandidate;
+  readonly progress: ExtensionContractCodecCandidate;
+};
+
+type ExtensionContractCodecCandidate = ExtensionContractReference & {
+  readonly decode?: unknown;
+  readonly encode?: unknown;
+};
+
+function isOperationRegistrationCandidate(value: unknown): value is OperationRegistrationCandidate {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "id" in value &&
+    typeof value.id === "string" &&
+    "input" in value &&
+    isContractCodecCandidate(value.input) &&
+    "output" in value &&
+    isContractCodecCandidate(value.output) &&
+    "progress" in value &&
+    isContractCodecCandidate(value.progress) &&
+    "execute" in value
+  );
+}
+
+function isContractCodecCandidate(value: unknown): value is ExtensionContractCodecCandidate {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "id" in value &&
+    typeof value.id === "string" &&
+    "version" in value &&
+    Number.isInteger(value.version) &&
+    Number(value.version) > 0
+  );
+}
+
 function findDuplicateId(
-  registrations: readonly ExtensionOperationRegistration[],
+  registrations: readonly OperationRegistrationCandidate[],
 ): string | undefined {
   const seen = new Set<string>();
   for (const registration of registrations) {
@@ -867,7 +991,7 @@ function findDuplicateId(
 
 function findContractMismatch(
   declaration: ExtensionOperationContribution,
-  registration: ExtensionOperationRegistration,
+  registration: OperationRegistrationCandidate,
 ):
   | {
       readonly actual: ExtensionContractReference;
