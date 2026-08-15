@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import {
   EXTENSION_API_VERSION,
   EXTENSION_ID_MAX_LENGTH,
+  EXTENSION_OPERATION_DEADLINE_MAX_MS,
   EXTENSION_PACKAGE_NAME_MAX_LENGTH,
   EXTENSION_PACKAGE_VERSION_MAX_LENGTH,
   type ExtensionActivationCapability,
@@ -21,6 +22,13 @@ import {
 } from "@adam-agent/extension-api";
 import { minVersion, satisfies, subset, valid, validRange } from "semver";
 import { createExtensionLifecycleStore } from "./extension-lifecycle-store.js";
+import {
+  createOperationHost,
+  type OperationHost,
+  type OperationHostControl,
+  type RegisteredOperation,
+} from "./operation-host.js";
+import type { OperationStore } from "./operation-store.js";
 
 export type ExtensionCapabilityAvailability = {
   readonly id: string;
@@ -45,6 +53,10 @@ export type ConfiguredExtension = {
 export type ExtensionHostOptions = {
   readonly capabilities: readonly ExtensionCapabilityAvailability[];
   readonly extensions: readonly ConfiguredExtension[];
+  readonly operationDeadlineMs?: number;
+  readonly operationDisableGraceMs?: number;
+  readonly operationStore?: OperationStore;
+  readonly projectRoot?: string;
   readonly stateRoot?: string;
 };
 
@@ -159,6 +171,13 @@ export type ExtensionStateSnapshot =
       readonly packageName: string;
       readonly packageVersion: string;
       readonly status: "active";
+    }
+  | {
+      readonly diagnostics: readonly ExtensionDiagnostic[];
+      readonly extensionId: string;
+      readonly packageName: string;
+      readonly packageVersion: string;
+      readonly status: "disabled_with_pending_operations";
     };
 
 export type ExtensionHostSnapshot = {
@@ -166,6 +185,7 @@ export type ExtensionHostSnapshot = {
 };
 
 export interface ExtensionHost {
+  readonly operations: OperationHost;
   disableExtension(extensionId: string): Promise<ExtensionStateSnapshot>;
   enableExtension(extensionId: string): Promise<ExtensionStateSnapshot>;
   listContributions(): readonly ExtensionContributionSummary[];
@@ -206,11 +226,20 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
         extension.packageVersion.length > EXTENSION_PACKAGE_VERSION_MAX_LENGTH ||
         valid(extension.packageVersion) === null,
     ) ||
-    options.capabilities.some((capability) => valid(capability.version) === null)
+    options.capabilities.some((capability) => valid(capability.version) === null) ||
+    (options.operationDeadlineMs !== undefined &&
+      (!Number.isSafeInteger(options.operationDeadlineMs) ||
+        options.operationDeadlineMs <= 0 ||
+        options.operationDeadlineMs > EXTENSION_OPERATION_DEADLINE_MAX_MS)) ||
+    (options.operationDisableGraceMs !== undefined &&
+      (!Number.isSafeInteger(options.operationDisableGraceMs) ||
+        options.operationDisableGraceMs <= 0 ||
+        options.operationDisableGraceMs > 30_000))
   ) {
     throw new ExtensionHostError("extension_configuration_invalid");
   }
   const publishedContributions: ExtensionContributionSummary[] = [];
+  const registeredOperations = new Map<string, RegisteredOperation>();
   const activeExtensions = new Map<
     string,
     {
@@ -222,8 +251,17 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
   const loadedSnapshots = new Map<string, ExtensionStateSnapshot>();
   const lifecycleStore = createExtensionLifecycleStore(options.stateRoot);
   const lifecycleCommandQueues = new Map<string, Promise<void>>();
+  const operationHost: OperationHostControl = createOperationHost({
+    ...(options.operationDeadlineMs === undefined
+      ? {}
+      : { defaultDeadlineMs: options.operationDeadlineMs }),
+    projectRoot: options.projectRoot ?? process.cwd(),
+    resolveOperation: (contributionId) => registeredOperations.get(contributionId),
+    ...(options.operationStore === undefined ? {} : { store: options.operationStore }),
+  });
   let loadInFlight: Promise<ExtensionHostSnapshot> | undefined;
   return {
+    operations: operationHost,
     disableExtension(extensionId) {
       return enqueueLifecycleCommand(lifecycleCommandQueues, extensionId, async () => {
         const configured = options.extensions.find(
@@ -239,10 +277,26 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
         }
         for (let index = publishedContributions.length - 1; index >= 0; index -= 1) {
           if (publishedContributions[index]?.extensionId === extensionId) {
+            registeredOperations.delete(publishedContributions[index]?.id ?? "");
             publishedContributions.splice(index, 1);
           }
         }
         const activeExtension = activeExtensions.get(extensionId);
+        const settled = await operationHost.disableExtensionOperations(
+          extensionId,
+          options.operationDisableGraceMs ?? 1_000,
+        );
+        if (!settled) {
+          const snapshot: ExtensionStateSnapshot = {
+            diagnostics: [],
+            extensionId: configured.extensionId,
+            packageName: configured.packageName,
+            packageVersion: configured.packageVersion,
+            status: "disabled_with_pending_operations",
+          };
+          loadedSnapshots.set(extensionId, snapshot);
+          return snapshot;
+        }
         activeExtensions.delete(extensionId);
         const snapshot = disabledSnapshot(
           configured,
@@ -261,6 +315,9 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
           throw new TypeError("The configured extension cannot be enabled.");
         }
         const loadedSnapshot = loadedSnapshots.get(extensionId);
+        if (loadedSnapshot?.status === "disabled_with_pending_operations") {
+          throw new TypeError("The extension still has pending operations.");
+        }
         try {
           await lifecycleStore.write(configured, true);
         } catch (error) {
@@ -630,7 +687,17 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
             continue;
           }
           publishedContributions.push(...registrationMatch.contributions);
+          for (const registration of registrationMatch.registrations) {
+            registeredOperations.set(registration.id, {
+              contributionId: registration.id,
+              diagnostics: optionalDiagnostics,
+              extensionId: configured.extensionId,
+              extensionVersion: configured.packageVersion,
+              registration,
+            });
+          }
           activeExtensions.set(configured.extensionId, { deactivate });
+          await operationHost.enableExtensionOperations(configured.extensionId);
           extensions.push({
             diagnostics: optionalDiagnostics,
             extensionId: configured.extensionId,
@@ -919,7 +986,11 @@ function matchOperationRegistrations(
   declarations: readonly ExtensionOperationContribution[],
   registrations: readonly unknown[],
 ):
-  | { readonly ok: true; readonly contributions: readonly ExtensionContributionSummary[] }
+  | {
+      readonly ok: true;
+      readonly contributions: readonly ExtensionContributionSummary[];
+      readonly registrations: readonly ExtensionOperationRegistration[];
+    }
   | { readonly ok: false; readonly diagnostic: ExtensionDiagnostic } {
   try {
     return matchOperationRegistrationsUnchecked(extensionId, declarations, registrations);
@@ -936,7 +1007,11 @@ function matchOperationRegistrationsUnchecked(
   declarations: readonly ExtensionOperationContribution[],
   registrations: readonly unknown[],
 ):
-  | { readonly ok: true; readonly contributions: readonly ExtensionContributionSummary[] }
+  | {
+      readonly ok: true;
+      readonly contributions: readonly ExtensionContributionSummary[];
+      readonly registrations: readonly ExtensionOperationRegistration[];
+    }
   | { readonly ok: false; readonly diagnostic: ExtensionDiagnostic } {
   const contributions: ExtensionContributionSummary[] = [];
   if (!registrations.every(isOperationRegistrationCandidate)) {
@@ -1014,7 +1089,11 @@ function matchOperationRegistrationsUnchecked(
   if (declarations.length !== registrations.length) {
     throw new TypeError("Runtime operation registrations must match the static manifest.");
   }
-  return { ok: true, contributions };
+  return {
+    ok: true,
+    contributions,
+    registrations: registrations as readonly ExtensionOperationRegistration[],
+  };
 }
 
 function findInvalidCodec(

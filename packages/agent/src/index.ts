@@ -26,6 +26,30 @@ export {
   OpenAICompatibleModelDriver,
   type OpenAICompatibleModelDriverOptions,
 } from "./openai-compatible-model-driver.js";
+export {
+  type OperationHost,
+  OperationHostError,
+  type OperationReference,
+  type OperationSnapshot,
+  type OperationStartOptions,
+} from "./operation-host.js";
+export {
+  createInMemoryOperationStore,
+  createJsonlOperationStore,
+  type OperationCancellationReason,
+  type OperationCancelledEvent,
+  type OperationCancelRequestedEvent,
+  type OperationCompletedEvent,
+  type OperationEvent,
+  type OperationEventRecord,
+  type OperationFailedEvent,
+  type OperationFailure,
+  type OperationIdempotencyScope,
+  type OperationProgressEvent,
+  type OperationStartedEvent,
+  type OperationStore,
+  OperationStoreError,
+} from "./operation-store.js";
 
 import type { CanonicalRuntimeEvent, SessionStore } from "./session-store.js";
 import type {
