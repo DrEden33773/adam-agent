@@ -136,6 +136,7 @@ type ActiveOperation = {
   readonly signalSettled: () => void;
   settling: boolean;
   terminalDidSettle: boolean;
+  terminalPersistenceFailed: boolean;
 };
 
 export function createOperationHost(options: {
@@ -152,18 +153,23 @@ export function createOperationHost(options: {
   const extensionAdmissionQueues = new Map<string, Promise<void>>();
   const listeners = new Map<string, Set<() => void>>();
 
+  function notifyOperationListeners(operationId: string): void {
+    for (const listener of listeners.get(operationId) ?? []) {
+      listener();
+    }
+  }
+
   async function appendAndPublish(record: OperationEventRecord): Promise<void> {
     try {
       await store.append(record);
     } catch (error) {
+      notifyOperationListeners(record.operationId);
       if (error instanceof OperationStoreError && error.code === "operation_idempotency_conflict") {
         throw error;
       }
       throw new OperationHostError("operation_persistence_failed", { cause: error });
     }
-    for (const listener of listeners.get(record.operationId) ?? []) {
-      listener();
-    }
+    notifyOperationListeners(record.operationId);
   }
 
   const host: OperationHostControl = {
@@ -287,6 +293,7 @@ export function createOperationHost(options: {
             signalSettled,
             settling: false,
             terminalDidSettle: false,
+            terminalPersistenceFailed: false,
           };
           activeOperations.set(operationId, active);
           queueMicrotask(() => {
@@ -304,7 +311,8 @@ export function createOperationHost(options: {
       if (records.length === 0) {
         throw new OperationHostError("operation_not_found");
       }
-      return createSnapshot(records, activeOperations.has(operationId));
+      const active = activeOperations.get(operationId);
+      return createSnapshot(records, active !== undefined && !active.terminalPersistenceFailed);
     },
 
     events({ afterSequence = 0, operationId }) {
@@ -475,7 +483,10 @@ async function executeOperation(
       try {
         await append;
       } catch (error) {
-        markProgressPersistenceFailed(active);
+        const failure = markProgressPersistenceFailed(active);
+        await settleFailed(active, failure, appendAndPublish, activeOperations).catch(
+          () => undefined,
+        );
         throw error;
       }
     },
@@ -624,6 +635,9 @@ async function settleTerminal(
       event,
     });
     active.nextSequence += 1;
+  } catch (error) {
+    active.terminalPersistenceFailed = true;
+    throw error;
   } finally {
     active.terminalDidSettle = true;
     active.signalSettled();
@@ -660,12 +674,14 @@ function markProgressInvalid(active: ActiveOperation): void {
   active.abortController.abort(new Error("The extension reported invalid operation progress."));
 }
 
-function markProgressPersistenceFailed(active: ActiveOperation): void {
-  active.forcedFailure = {
+function markProgressPersistenceFailed(active: ActiveOperation): OperationFailure {
+  const failure: OperationFailure = {
     code: "operation_persistence_failed",
     message: "The operation could not persist its progress.",
   };
+  active.forcedFailure = failure;
   active.abortController.abort(new Error("The operation could not persist its progress."));
+  return failure;
 }
 
 async function* streamEvents(
@@ -701,7 +717,7 @@ async function* streamEvents(
       if (records.some((record) => isTerminal(record.event))) {
         return;
       }
-      if (!activeOperations.has(operationId)) {
+      if (!isDurablyActive(activeOperations.get(operationId))) {
         const finalRecords = await store.read(operationId);
         for (const record of finalRecords) {
           if (record.sequence > cursor) {
@@ -727,6 +743,10 @@ async function* streamEvents(
       listeners.delete(operationId);
     }
   }
+}
+
+function isDurablyActive(active: ActiveOperation | undefined): boolean {
+  return active !== undefined && !active.terminalPersistenceFailed;
 }
 
 function createSnapshot(

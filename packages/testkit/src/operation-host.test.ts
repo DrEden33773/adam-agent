@@ -1,5 +1,4 @@
-import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,6 +6,7 @@ import {
   createExtensionHost,
   createInMemoryOperationStore,
   createJsonlOperationStore,
+  type OperationStore,
 } from "@adam-agent/agent";
 import { expect, test } from "vitest";
 
@@ -406,41 +406,16 @@ test("ExtensionHost cannot complete after a caught progress persistence failure"
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-progress-persistence-"));
   const workspaceRoot = join(testRoot, "workspace");
   const packageRoot = join(testRoot, "extension");
-  const stateRoot = join(testRoot, "state");
-  const controlKey = `__adamOperationProgressPersistence${Date.now()}${Math.random()}`;
-  let beginProgress = () => {};
-  let finishHandler = () => {};
-  let reportFailure = () => {};
-  const begin = new Promise<void>((resolve) => {
-    beginProgress = resolve;
-  });
-  const finish = new Promise<void>((resolve) => {
-    finishHandler = resolve;
-  });
-  const progressFailed = new Promise<void>((resolve) => {
-    reportFailure = resolve;
-  });
-  (globalThis as Record<string, unknown>)[controlKey] = {
-    begin,
-    finish,
-    progressFailed: reportFailure,
-  };
 
   try {
     await mkdir(workspaceRoot);
     await writeOperationExtension(
       packageRoot,
-      `const control = globalThis[${JSON.stringify(controlKey)}];
-      await control.begin;
-      try {
+      `try {
         await context.progress({ phase: "persist" });
-      } catch {
-        control.progressFailed();
-      }
-      await control.finish;
+      } catch {}
       return { accepted: true, revision: input.revision };`,
     );
-    const store = await createJsonlOperationStore({ stateRoot, workspaceRoot });
     const host = createExtensionHost({
       capabilities: [],
       extensions: [
@@ -453,9 +428,9 @@ test("ExtensionHost cannot complete after a caught progress persistence failure"
           packageVersion: "1.0.0",
         },
       ],
-      operationStore: store,
+      operationStore: createProgressFailingOperationStore(),
       projectRoot: workspaceRoot,
-      stateRoot,
+      stateRoot: join(testRoot, "state"),
     });
     await host.loadConfiguredExtensions();
     const started = await host.operations.start({
@@ -463,16 +438,6 @@ test("ExtensionHost cannot complete after a caught progress persistence failure"
       idempotencyKey: "review-progress-persistence-1",
       input: { revision: "persistence" },
     });
-    const projectId = createHash("sha256")
-      .update(await realpath(workspaceRoot))
-      .digest("hex");
-    const logPath = join(stateRoot, "projects", projectId, "operations", "events-v1.jsonl");
-
-    await chmod(logPath, 0o000);
-    beginProgress();
-    await progressFailed;
-    await chmod(logPath, 0o600);
-    finishHandler();
     const records = [];
     for await (const record of host.operations.events({ operationId: started.operationId })) {
       records.push(record);
@@ -489,7 +454,120 @@ test("ExtensionHost cannot complete after a caught progress persistence failure"
       },
     ]);
   } finally {
-    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost settles a progress persistence failure without waiting for the handler", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-progress-terminal-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(
+      packageRoot,
+      `try {
+        await context.progress({ phase: "persist" });
+      } catch {
+        await new Promise(() => {});
+      }`,
+    );
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationStore: createProgressFailingOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+    const started = await host.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-progress-terminal-1",
+      input: { revision: "terminal" },
+    });
+    const records = [];
+    for await (const record of host.operations.events({ operationId: started.operationId })) {
+      records.push(record);
+    }
+
+    expect(records.map((record) => record.event)).toEqual([
+      expect.objectContaining({ type: "operation_started" }),
+      {
+        type: "operation_failed",
+        error: {
+          code: "operation_persistence_failed",
+          message: "The operation could not persist its progress.",
+        },
+      },
+    ]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost reports recovery-required when terminal persistence fails", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-terminal-persistence-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const durableStore = createInMemoryOperationStore();
+  const store: OperationStore = {
+    append(record) {
+      if (record.event.type === "operation_failed") {
+        return Promise.reject(new Error("injected terminal persistence failure"));
+      }
+      return durableStore.append(record);
+    },
+    findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    read: (operationId) => durableStore.read(operationId),
+  };
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(packageRoot, "await new Promise(() => {});");
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationStore: store,
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+    const started = await host.operations.start({
+      contributionId: "fixture.review",
+      deadlineMs: 1,
+      idempotencyKey: "review-terminal-persistence-1",
+      input: { revision: "recovery" },
+    });
+    const records = [];
+    for await (const record of host.operations.events({ operationId: started.operationId })) {
+      records.push(record);
+    }
+
+    expect(records.map((record) => record.event.type)).toEqual(["operation_started"]);
+    await expect(host.operations.query(started.operationId)).resolves.toMatchObject({
+      error: { code: "operation_recovery_required" },
+      status: "recovery_required",
+    });
+  } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -1488,6 +1566,22 @@ test("ExtensionHost finalizes disable after a previously pending handler settles
     await rm(testRoot, { recursive: true, force: true });
   }
 });
+
+function createProgressFailingOperationStore(): OperationStore {
+  const durableStore = createInMemoryOperationStore();
+  let rejectProgress = true;
+  return {
+    append(record) {
+      if (rejectProgress && record.event.type === "operation_progress") {
+        rejectProgress = false;
+        return Promise.reject(new Error("injected progress persistence failure"));
+      }
+      return durableStore.append(record);
+    },
+    findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    read: (operationId) => durableStore.read(operationId),
+  };
+}
 
 async function writeOperationExtension(
   packageRoot: string,
