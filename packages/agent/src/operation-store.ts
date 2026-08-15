@@ -136,6 +136,7 @@ const operationFailedEventSchema = z.strictObject({
       "extension_execution_failed",
       "operation_deadline_exceeded",
       "operation_output_invalid",
+      "operation_persistence_failed",
       "operation_progress_invalid",
       "operation_progress_limit_exceeded",
     ]),

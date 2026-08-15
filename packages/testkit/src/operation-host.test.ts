@@ -1,4 +1,5 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -129,6 +130,70 @@ test("ExtensionHost canonicalizes input for idempotency and rejects changed inpu
       name: "OperationHostError",
     });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost resolves an existing idempotency key before decoding input again", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-idempotency-decode-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamOperationDecode${Date.now()}${Math.random()}`;
+  (globalThis as Record<string, unknown>)[controlKey] = { calls: 0 };
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(
+      packageRoot,
+      undefined,
+      `const control = globalThis[${JSON.stringify(controlKey)}];
+      control.calls += 1;
+      return control.calls === 1
+        ? { ok: true, value }
+        : { ok: false, issues: [{ code: "decode_called_again" }] };`,
+    );
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+
+    const first = await host.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "decode-once-1",
+      input: { revision: "original" },
+    });
+    await expect(
+      host.operations.start({
+        contributionId: "fixture.review",
+        idempotencyKey: "decode-once-1",
+        input: { revision: "original" },
+      }),
+    ).resolves.toEqual(first);
+    await expect(
+      host.operations.start({
+        contributionId: "fixture.review",
+        idempotencyKey: "decode-once-1",
+        input: { revision: "changed" },
+      }),
+    ).rejects.toMatchObject({ code: "operation_idempotency_conflict" });
+    expect(((globalThis as Record<string, unknown>)[controlKey] as { calls: number }).calls).toBe(
+      1,
+    );
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -333,6 +398,98 @@ test("ExtensionHost persists progress before completed output and exposes the la
       status: "completed",
     });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost cannot complete after a caught progress persistence failure", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-progress-persistence-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const stateRoot = join(testRoot, "state");
+  const controlKey = `__adamOperationProgressPersistence${Date.now()}${Math.random()}`;
+  let beginProgress = () => {};
+  let finishHandler = () => {};
+  let reportFailure = () => {};
+  const begin = new Promise<void>((resolve) => {
+    beginProgress = resolve;
+  });
+  const finish = new Promise<void>((resolve) => {
+    finishHandler = resolve;
+  });
+  const progressFailed = new Promise<void>((resolve) => {
+    reportFailure = resolve;
+  });
+  (globalThis as Record<string, unknown>)[controlKey] = {
+    begin,
+    finish,
+    progressFailed: reportFailure,
+  };
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(
+      packageRoot,
+      `const control = globalThis[${JSON.stringify(controlKey)}];
+      await control.begin;
+      try {
+        await context.progress({ phase: "persist" });
+      } catch {
+        control.progressFailed();
+      }
+      await control.finish;
+      return { accepted: true, revision: input.revision };`,
+    );
+    const store = await createJsonlOperationStore({ stateRoot, workspaceRoot });
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationStore: store,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await host.loadConfiguredExtensions();
+    const started = await host.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-progress-persistence-1",
+      input: { revision: "persistence" },
+    });
+    const projectId = createHash("sha256")
+      .update(await realpath(workspaceRoot))
+      .digest("hex");
+    const logPath = join(stateRoot, "projects", projectId, "operations", "events-v1.jsonl");
+
+    await chmod(logPath, 0o000);
+    beginProgress();
+    await progressFailed;
+    await chmod(logPath, 0o600);
+    finishHandler();
+    const records = [];
+    for await (const record of host.operations.events({ operationId: started.operationId })) {
+      records.push(record);
+    }
+
+    expect(records.map((record) => record.event)).toEqual([
+      expect.objectContaining({ type: "operation_started" }),
+      {
+        type: "operation_failed",
+        error: {
+          code: "operation_persistence_failed",
+          message: "The operation could not persist its progress.",
+        },
+      },
+    ]);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -1218,6 +1375,55 @@ test("ExtensionHost disables new work but reports a non-settling active operatio
       expect.objectContaining({ type: "operation_started" }),
       { type: "operation_cancel_requested", reason: "extension_disabled" },
     ]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost retains a deadline-failed extension while its handler is still running", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-disable-deadline-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(packageRoot, "await new Promise(() => {});");
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationDisableGraceMs: 1,
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+    const started = await host.operations.start({
+      contributionId: "fixture.review",
+      deadlineMs: 1,
+      idempotencyKey: "review-disable-deadline-1",
+      input: { revision: "deadline-pending" },
+    });
+    for await (const _record of host.operations.events({ operationId: started.operationId })) {
+      // The durable deadline terminal fact is the synchronization point.
+    }
+
+    await expect(host.disableExtension("fixture.extension")).resolves.toMatchObject({
+      extensionId: "fixture.extension",
+      status: "disabled_with_pending_operations",
+    });
+    await expect(host.operations.query(started.operationId)).resolves.toMatchObject({
+      error: { code: "operation_deadline_exceeded" },
+      status: "failed",
+    });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

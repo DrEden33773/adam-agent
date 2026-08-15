@@ -125,13 +125,17 @@ type ActiveOperation = {
   cancelPromise?: Promise<void>;
   cancelReason?: OperationCancellationReason;
   forcedFailure?: OperationFailure;
+  handlerDidSettle: boolean;
+  readonly handlerSettled: Promise<void>;
   readonly inputBytes: number;
   nextSequence: number;
   progressBytes: number;
   progressRecords: number;
   readonly settled: Promise<void>;
+  readonly signalHandlerSettled: () => void;
   readonly signalSettled: () => void;
   settling: boolean;
+  terminalDidSettle: boolean;
 };
 
 export function createOperationHost(options: {
@@ -199,7 +203,6 @@ export function createOperationHost(options: {
             }
             throw new OperationHostError("operation_input_invalid", { cause: error });
           }
-          const decodedInput = decodeInput(registered.registration, normalizedInput.value);
           projectIdPromise ??= createProjectId(options.projectRoot);
           const projectId = await projectIdPromise;
           if (store.projectId !== undefined && store.projectId !== projectId) {
@@ -219,6 +222,7 @@ export function createOperationHost(options: {
             }
             return { operationId: existing.operationId };
           }
+          const decodedInput = decodeInput(registered.registration, normalizedInput.value);
 
           const operationId = randomUUID();
           const now = Date.now();
@@ -262,10 +266,16 @@ export function createOperationHost(options: {
           const settled = new Promise<void>((resolve) => {
             signalSettled = resolve;
           });
+          let signalHandlerSettled = () => {};
+          const handlerSettled = new Promise<void>((resolve) => {
+            signalHandlerSettled = resolve;
+          });
           const active: ActiveOperation = {
             abortController: new AbortController(),
             appendQueue: Promise.resolve(),
             deadlineAt,
+            handlerDidSettle: false,
+            handlerSettled,
             inputBytes: normalizedInput.byteLength,
             nextSequence: 2,
             operationId,
@@ -273,8 +283,10 @@ export function createOperationHost(options: {
             progressRecords: 0,
             registered,
             settled,
+            signalHandlerSettled,
             signalSettled,
             settling: false,
+            terminalDidSettle: false,
           };
           activeOperations.set(operationId, active);
           queueMicrotask(() => {
@@ -340,7 +352,9 @@ export function createOperationHost(options: {
         let timer: NodeJS.Timeout | undefined;
         try {
           return await Promise.race([
-            Promise.all(active.map((operation) => operation.settled)).then(() => true),
+            Promise.all(
+              active.flatMap((operation) => [operation.handlerSettled, operation.settled]),
+            ).then(() => true),
             new Promise<boolean>((resolve) => {
               timer = setTimeout(() => resolve(false), graceMs);
             }),
@@ -458,7 +472,12 @@ async function executeOperation(
         active.nextSequence += 1;
       });
       active.appendQueue = append.catch(() => undefined);
-      return append;
+      try {
+        await append;
+      } catch (error) {
+        markProgressPersistenceFailed(active);
+        throw error;
+      }
     },
   });
   try {
@@ -529,6 +548,9 @@ async function executeOperation(
     );
   } finally {
     clearTimeout(deadline);
+    active.handlerDidSettle = true;
+    active.signalHandlerSettled();
+    releaseActiveOperation(active, activeOperations);
   }
 }
 
@@ -603,8 +625,18 @@ async function settleTerminal(
     });
     active.nextSequence += 1;
   } finally {
-    activeOperations.delete(active.operationId);
+    active.terminalDidSettle = true;
     active.signalSettled();
+    releaseActiveOperation(active, activeOperations);
+  }
+}
+
+function releaseActiveOperation(
+  active: ActiveOperation,
+  activeOperations: Map<string, ActiveOperation>,
+): void {
+  if (active.handlerDidSettle && active.terminalDidSettle) {
+    activeOperations.delete(active.operationId);
   }
 }
 
@@ -626,6 +658,14 @@ function markProgressInvalid(active: ActiveOperation): void {
     message: "The extension reported invalid operation progress.",
   };
   active.abortController.abort(new Error("The extension reported invalid operation progress."));
+}
+
+function markProgressPersistenceFailed(active: ActiveOperation): void {
+  active.forcedFailure = {
+    code: "operation_persistence_failed",
+    message: "The operation could not persist its progress.",
+  };
+  active.abortController.abort(new Error("The operation could not persist its progress."));
 }
 
 async function* streamEvents(
