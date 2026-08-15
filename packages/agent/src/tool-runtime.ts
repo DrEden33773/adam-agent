@@ -135,6 +135,14 @@ export type PermissionSubject =
   | { readonly type: "file"; readonly path: string }
   | { readonly type: "workspace_path"; readonly path: string }
   | {
+      readonly type: "extension_capability";
+      readonly capabilityId: string;
+      readonly contributionId: string;
+      readonly extensionId: string;
+      readonly extensionVersion: string;
+      readonly operationId: string;
+    }
+  | {
       readonly type: "patch";
       readonly version: 1;
       readonly operations: readonly (

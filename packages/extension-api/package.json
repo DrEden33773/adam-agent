@@ -1,12 +1,26 @@
 {
   "name": "@adam-agent/extension-api",
   "version": "0.1.0",
+  "description": "Versioned public contracts for trusted Adam Agent extensions.",
   "type": "module",
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ],
+  "license": "Apache-2.0",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }
+  },
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
   },
   "dependencies": {
     "semver": "7.8.5",

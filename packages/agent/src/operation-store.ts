@@ -17,6 +17,9 @@ import type {
   ExtensionOperationStartedEvent,
 } from "@adam-agent/extension-api";
 import {
+  EXTENSION_ARTIFACT_MAX_AGGREGATE_BYTES,
+  EXTENSION_ARTIFACT_MAX_BYTES,
+  EXTENSION_ARTIFACT_MAX_COUNT,
   EXTENSION_OPERATION_DEADLINE_MAX_MS,
   EXTENSION_OPERATION_INPUT_MAX_BYTES,
   EXTENSION_OPERATION_JSON_MAX_CONTAINERS,
@@ -54,6 +57,11 @@ export type OperationFailure = ExtensionOperationFailure;
 export type OperationFailedEvent = ExtensionOperationFailedEvent;
 
 export type OperationEvent = ExtensionOperationEvent;
+
+type OperationTerminalEvent = Extract<
+  OperationEvent,
+  { readonly type: "operation_cancelled" | "operation_completed" | "operation_failed" }
+>;
 
 export type OperationEventRecord = {
   readonly schemaVersion: 1;
@@ -121,19 +129,58 @@ const operationCancelRequestedEventSchema = z.strictObject({
   type: z.literal("operation_cancel_requested"),
   reason: z.enum(["caller", "extension_disabled"]),
 });
+const artifactSummarySchema = z.strictObject({
+  byteCount: z.number().int().nonnegative().max(EXTENSION_ARTIFACT_MAX_BYTES),
+  contract: z.strictObject({
+    id: z.string().min(1).max(256),
+    version: z.number().int().positive(),
+  }),
+  id: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  mediaType: z.string().min(1).max(256),
+  provenance: z.strictObject({
+    contributionId: z.string().min(1).max(256),
+    extensionId: z.string().min(1).max(256),
+    extensionVersion: z
+      .string()
+      .min(1)
+      .max(128)
+      .refine((version) => valid(version) !== null),
+    operationId: z.uuid(),
+    projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  }),
+});
+const terminalArtifactsSchema = z
+  .array(artifactSummarySchema)
+  .min(1)
+  .max(EXTENSION_ARTIFACT_MAX_COUNT)
+  .refine(
+    (artifacts) =>
+      artifacts.reduce((total, artifact) => total + artifact.byteCount, 0) <=
+      EXTENSION_ARTIFACT_MAX_AGGREGATE_BYTES,
+  );
 const operationCompletedEventSchema = z.strictObject({
+  artifacts: terminalArtifactsSchema.optional(),
   type: z.literal("operation_completed"),
   output: z.json(),
 });
 const operationCancelledEventSchema = z.strictObject({
+  artifacts: terminalArtifactsSchema.optional(),
   type: z.literal("operation_cancelled"),
   reason: z.enum(["caller", "extension_disabled"]),
 });
 const operationFailedEventSchema = z.strictObject({
+  artifacts: terminalArtifactsSchema.optional(),
   type: z.literal("operation_failed"),
   error: z.strictObject({
     code: z.enum([
       "extension_execution_failed",
+      "operation_capability_conflict",
+      "operation_capability_execution_failed",
+      "operation_capability_input_invalid",
+      "operation_capability_limit_exceeded",
+      "operation_capability_permission_denied",
+      "operation_capability_persistence_failed",
+      "operation_capability_output_invalid",
       "operation_deadline_exceeded",
       "operation_output_invalid",
       "operation_persistence_failed",
@@ -516,6 +563,23 @@ function validateNextRecord(
       throw new OperationStoreError();
     }
   }
+  if (isTerminalEvent(candidate.event) && candidate.event.artifacts !== undefined) {
+    const started = history[0]?.event;
+    if (started?.type !== "operation_started") {
+      throw new OperationStoreError();
+    }
+    for (const artifact of candidate.event.artifacts) {
+      if (
+        artifact.provenance.operationId !== candidate.operationId ||
+        artifact.provenance.projectId !== started.projectId ||
+        artifact.provenance.extensionId !== started.extensionId ||
+        artifact.provenance.extensionVersion !== started.extensionVersion ||
+        artifact.provenance.contributionId !== started.contributionId
+      ) {
+        throw new OperationStoreError();
+      }
+    }
+  }
   if (candidate.event.type === "operation_progress") {
     if (history.some((record) => record.event.type === "operation_cancel_requested")) {
       throw new OperationStoreError();
@@ -639,7 +703,7 @@ function canonicalizeJson(value: ExtensionJsonValue): ExtensionJsonValue {
   return value;
 }
 
-function isTerminalEvent(event: OperationEvent): boolean {
+function isTerminalEvent(event: OperationEvent): event is OperationTerminalEvent {
   return (
     event.type === "operation_cancelled" ||
     event.type === "operation_completed" ||

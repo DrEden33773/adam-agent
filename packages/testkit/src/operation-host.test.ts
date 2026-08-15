@@ -1263,6 +1263,7 @@ test("ExtensionHost gives each operation fresh immutable identity and provenance
           contributionId: "fixture.review",
           extensionId: "fixture.extension",
           extensionVersion: "1.0.0",
+          projectId: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
         },
       },
     });

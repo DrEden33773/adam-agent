@@ -9,6 +9,12 @@ export {
   createFileArtifactStore,
 } from "./artifact-store.js";
 export {
+  type BiomeExecutionAdapter,
+  type BiomeExecutionInput,
+  type BiomeExecutionOutput,
+  createBiomeExecutionAdapter,
+} from "./biome-execution.js";
+export {
   type ConfiguredExtension,
   createExtensionHost,
   type ExtensionCapabilityAvailability,
