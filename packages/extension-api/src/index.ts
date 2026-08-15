@@ -2,6 +2,9 @@ import { valid, validRange } from "semver";
 import { z } from "zod";
 
 export const EXTENSION_API_VERSION = "0.1.0";
+export const EXTENSION_ID_MAX_LENGTH = 256;
+export const EXTENSION_PACKAGE_NAME_MAX_LENGTH = 256;
+export const EXTENSION_PACKAGE_VERSION_MAX_LENGTH = 128;
 
 const capabilityRequirementSchema = z.strictObject({
   id: z.string().min(1),
@@ -26,14 +29,15 @@ const operationContributionSchema = z.strictObject({
 
 const extensionPackageManifestSchema = z
   .object({
-    name: z.string().min(1),
+    name: z.string().min(1).max(EXTENSION_PACKAGE_NAME_MAX_LENGTH),
     version: z
       .string()
       .min(1)
+      .max(EXTENSION_PACKAGE_VERSION_MAX_LENGTH)
       .refine((version) => valid(version) !== null),
     type: z.literal("module"),
     adamAgent: z.strictObject({
-      id: z.string().min(1),
+      id: z.string().min(1).max(EXTENSION_ID_MAX_LENGTH),
       apiVersion: z
         .string()
         .min(1)

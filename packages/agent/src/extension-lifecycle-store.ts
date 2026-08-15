@@ -4,14 +4,19 @@ import { type FileHandle, mkdir, open } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 
+import {
+  EXTENSION_ID_MAX_LENGTH,
+  EXTENSION_PACKAGE_NAME_MAX_LENGTH,
+  EXTENSION_PACKAGE_VERSION_MAX_LENGTH,
+} from "@adam-agent/extension-api";
 import { z } from "zod";
 
 const maxLifecycleLogBytes = 1024 * 1024;
 const lifecycleRecordSchema = z.strictObject({
   schemaVersion: z.literal(1),
-  extensionId: z.string().min(1).max(256),
-  packageName: z.string().min(1).max(256),
-  packageVersion: z.string().min(1).max(128),
+  extensionId: z.string().min(1).max(EXTENSION_ID_MAX_LENGTH),
+  packageName: z.string().min(1).max(EXTENSION_PACKAGE_NAME_MAX_LENGTH),
+  packageVersion: z.string().min(1).max(EXTENSION_PACKAGE_VERSION_MAX_LENGTH),
   enabled: z.boolean(),
 });
 
@@ -54,13 +59,15 @@ export function createExtensionLifecycleStore(stateRoot?: string): ExtensionLife
     write(identity, enabled) {
       return enqueueLifecycleOperation(directory, async () => {
         await ensureLifecycleDirectory(directory);
-        const serialized = JSON.stringify({
-          schemaVersion: 1,
-          extensionId: identity.extensionId,
-          packageName: identity.packageName,
-          packageVersion: identity.packageVersion,
-          enabled,
-        });
+        const serialized = JSON.stringify(
+          lifecycleRecordSchema.parse({
+            schemaVersion: 1,
+            extensionId: identity.extensionId,
+            packageName: identity.packageName,
+            packageVersion: identity.packageVersion,
+            enabled,
+          }),
+        );
         const storedBytes = Buffer.byteLength(`${serialized}\n`, "utf8");
         const path = lifecycleLogPath(directory, identity);
         const file = await open(

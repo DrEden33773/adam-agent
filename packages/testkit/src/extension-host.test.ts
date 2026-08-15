@@ -1764,6 +1764,70 @@ test("enabling an active extension refreshes shared lifecycle truth without reac
   Reflect.deleteProperty(globalThis, activationCountKey);
 });
 
+test("concurrent disable then enable settles with durable and active truth aligned", async () => {
+  const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(packageRoot);
+  const activationCountKey = Symbol.for("adam-agent.test.concurrent-lifecycle-activation-count");
+  const deactivationCountKey = Symbol.for(
+    "adam-agent.test.concurrent-lifecycle-deactivation-count",
+  );
+  Reflect.set(globalThis, activationCountKey, 0);
+  Reflect.set(globalThis, deactivationCountKey, 0);
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/concurrent-lifecycle",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.concurrent-lifecycle",
+        apiVersion: "^0.1.0",
+        runtime: { entry: "./extension.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "extension.js"),
+    `export async function activate() {
+  const key = Symbol.for("adam-agent.test.concurrent-lifecycle-activation-count");
+  globalThis[key] += 1;
+}
+export async function deactivate() {
+  const key = Symbol.for("adam-agent.test.concurrent-lifecycle-deactivation-count");
+  globalThis[key] += 1;
+}
+`,
+    "utf8",
+  );
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.concurrent-lifecycle",
+        grants: [],
+        packageName: "@fixture/concurrent-lifecycle",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    stateRoot: join(packageRoot, "state"),
+  });
+  await host.loadConfiguredExtensions();
+
+  const disabling = host.disableExtension("fixture.concurrent-lifecycle");
+  const enabling = host.enableExtension("fixture.concurrent-lifecycle");
+  await expect(disabling).resolves.toMatchObject({ status: "disabled" });
+  await expect(enabling).resolves.toMatchObject({ status: "active" });
+  expect(Reflect.get(globalThis, activationCountKey)).toBe(2);
+  expect(Reflect.get(globalThis, deactivationCountKey)).toBe(1);
+  Reflect.deleteProperty(globalThis, activationCountKey);
+  Reflect.deleteProperty(globalThis, deactivationCountKey);
+});
+
 test("disabling an idle extension invokes its optional deactivation hook", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
   temporaryRoots.push(testRoot);
@@ -2566,7 +2630,7 @@ export async function activate() {}
         grants: [],
         packageName: "@fixture/invalid-package-version",
         packageRoot,
-        packageVersion: "not-semver",
+        packageVersion: "1.0.0",
       },
     ],
   });
@@ -2991,6 +3055,29 @@ test("duplicate configured extension IDs fail closed at Host construction", () =
     createExtensionHost({
       capabilities: [],
       extensions: [configured, { ...configured, packageRoot: "/also-not-observed" }],
+    }),
+  ).toThrowError(
+    expect.objectContaining({
+      code: "extension_configuration_invalid",
+      name: "ExtensionHostError",
+    }),
+  );
+});
+
+test("an oversized configured extension identity fails closed at Host construction", () => {
+  expect(() =>
+    createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: false,
+          extensionId: "x".repeat(257),
+          grants: [],
+          packageName: "@fixture/oversized-identity",
+          packageRoot: "/not-observed",
+          packageVersion: "1.0.0",
+        },
+      ],
     }),
   ).toThrowError(
     expect.objectContaining({

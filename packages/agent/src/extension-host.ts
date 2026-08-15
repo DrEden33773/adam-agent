@@ -5,6 +5,9 @@ import { pathToFileURL } from "node:url";
 
 import {
   EXTENSION_API_VERSION,
+  EXTENSION_ID_MAX_LENGTH,
+  EXTENSION_PACKAGE_NAME_MAX_LENGTH,
+  EXTENSION_PACKAGE_VERSION_MAX_LENGTH,
   type ExtensionActivationCapability,
   type ExtensionActivationContext,
   type ExtensionActivationDiagnostic,
@@ -193,6 +196,16 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
   if (
     new Set(extensionIds).size !== extensionIds.length ||
     new Set(capabilityIds).size !== capabilityIds.length ||
+    options.extensions.some(
+      (extension) =>
+        extension.extensionId.length === 0 ||
+        extension.extensionId.length > EXTENSION_ID_MAX_LENGTH ||
+        extension.packageName.length === 0 ||
+        extension.packageName.length > EXTENSION_PACKAGE_NAME_MAX_LENGTH ||
+        extension.packageVersion.length === 0 ||
+        extension.packageVersion.length > EXTENSION_PACKAGE_VERSION_MAX_LENGTH ||
+        valid(extension.packageVersion) === null,
+    ) ||
     options.capabilities.some((capability) => valid(capability.version) === null)
   ) {
     throw new ExtensionHostError("extension_configuration_invalid");
@@ -208,59 +221,64 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
   >();
   const loadedSnapshots = new Map<string, ExtensionStateSnapshot>();
   const lifecycleStore = createExtensionLifecycleStore(options.stateRoot);
+  const lifecycleCommandQueues = new Map<string, Promise<void>>();
   let loadInFlight: Promise<ExtensionHostSnapshot> | undefined;
   return {
-    async disableExtension(extensionId) {
-      const configured = options.extensions.find(
-        (candidate) => candidate.extensionId === extensionId,
-      );
-      if (configured === undefined) {
-        throw new TypeError("The configured extension does not exist.");
-      }
-      try {
-        await lifecycleStore.write(configured, false);
-      } catch (error) {
-        throw new ExtensionHostError("extension_state_persistence_failed", { cause: error });
-      }
-      for (let index = publishedContributions.length - 1; index >= 0; index -= 1) {
-        if (publishedContributions[index]?.extensionId === extensionId) {
-          publishedContributions.splice(index, 1);
+    disableExtension(extensionId) {
+      return enqueueLifecycleCommand(lifecycleCommandQueues, extensionId, async () => {
+        const configured = options.extensions.find(
+          (candidate) => candidate.extensionId === extensionId,
+        );
+        if (configured === undefined) {
+          throw new TypeError("The configured extension does not exist.");
         }
-      }
-      const activeExtension = activeExtensions.get(extensionId);
-      activeExtensions.delete(extensionId);
-      const snapshot = disabledSnapshot(
-        configured,
-        await deactivateRuntime(configured, activeExtension?.deactivate),
-      );
-      loadedSnapshots.set(extensionId, snapshot);
-      return snapshot;
+        try {
+          await lifecycleStore.write(configured, false);
+        } catch (error) {
+          throw new ExtensionHostError("extension_state_persistence_failed", { cause: error });
+        }
+        for (let index = publishedContributions.length - 1; index >= 0; index -= 1) {
+          if (publishedContributions[index]?.extensionId === extensionId) {
+            publishedContributions.splice(index, 1);
+          }
+        }
+        const activeExtension = activeExtensions.get(extensionId);
+        activeExtensions.delete(extensionId);
+        const snapshot = disabledSnapshot(
+          configured,
+          await deactivateRuntime(configured, activeExtension?.deactivate),
+        );
+        loadedSnapshots.set(extensionId, snapshot);
+        return snapshot;
+      });
     },
-    async enableExtension(extensionId) {
-      const configured = options.extensions.find(
-        (candidate) => candidate.extensionId === extensionId,
-      );
-      if (configured === undefined || !configured.enabled) {
-        throw new TypeError("The configured extension cannot be enabled.");
-      }
-      const loadedSnapshot = loadedSnapshots.get(extensionId);
-      try {
-        await lifecycleStore.write(configured, true);
-      } catch (error) {
-        throw new ExtensionHostError("extension_state_persistence_failed", { cause: error });
-      }
-      if (loadedSnapshot?.status === "active") {
-        return loadedSnapshot;
-      }
-      loadedSnapshots.delete(extensionId);
-      const snapshot = await this.loadConfiguredExtensions();
-      const extension = snapshot.extensions.find(
-        (candidate) => candidate.extensionId === extensionId,
-      );
-      if (extension === undefined) {
-        throw new TypeError("The configured extension disappeared during activation.");
-      }
-      return extension;
+    enableExtension(extensionId) {
+      return enqueueLifecycleCommand(lifecycleCommandQueues, extensionId, async () => {
+        const configured = options.extensions.find(
+          (candidate) => candidate.extensionId === extensionId,
+        );
+        if (configured === undefined || !configured.enabled) {
+          throw new TypeError("The configured extension cannot be enabled.");
+        }
+        const loadedSnapshot = loadedSnapshots.get(extensionId);
+        try {
+          await lifecycleStore.write(configured, true);
+        } catch (error) {
+          throw new ExtensionHostError("extension_state_persistence_failed", { cause: error });
+        }
+        if (loadedSnapshot?.status === "active") {
+          return loadedSnapshot;
+        }
+        loadedSnapshots.delete(extensionId);
+        const snapshot = await this.loadConfiguredExtensions();
+        const extension = snapshot.extensions.find(
+          (candidate) => candidate.extensionId === extensionId,
+        );
+        if (extension === undefined) {
+          throw new TypeError("The configured extension disappeared during activation.");
+        }
+        return extension;
+      });
     },
     listContributions() {
       return [...publishedContributions];
@@ -636,6 +654,26 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       return operation;
     },
   };
+}
+
+function enqueueLifecycleCommand<T>(
+  queues: Map<string, Promise<void>>,
+  extensionId: string,
+  run: () => Promise<T>,
+): Promise<T> {
+  const previous = queues.get(extensionId) ?? Promise.resolve();
+  const operation = previous.then(run);
+  const settled = operation.then(
+    () => undefined,
+    () => undefined,
+  );
+  queues.set(extensionId, settled);
+  void settled.then(() => {
+    if (queues.get(extensionId) === settled) {
+      queues.delete(extensionId);
+    }
+  });
+  return operation;
 }
 
 async function deactivateRuntime(
