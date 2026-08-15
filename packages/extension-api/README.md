@@ -2,7 +2,7 @@
 
 Public, schema-library-neutral contracts for trusted first-party Adam Agent extensions.
 
-Package version `0.0.0-bootstrap.0` exists only to establish the npm package identity under the non-default `bootstrap` dist-tag. It is not a supported consumer release; the first supported version remains `0.1.0`, staged from an exact product tag through npm Trusted Publishing before human approval.
+Version `0.1.0` is the first supported consumer release. Earlier version `0.0.0-bootstrap.0` established the npm package identity and is deprecated; do not depend on it. Releases are staged from an exact product tag through npm Trusted Publishing before human approval.
 
 The package defines static manifest parsing, capability identifiers and bounds, operation contexts and events, artifact summaries, immutable namespaced records, and the fixed-profile Biome analyzer contract. It does not export Adam runtime implementations, stores, provider access, raw filesystem or process handles, model-facing tools, or a global host.
 
