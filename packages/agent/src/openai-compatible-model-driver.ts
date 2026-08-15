@@ -14,7 +14,7 @@ import { ModelDriverError } from "./model-driver-error.js";
 
 const maximumNormalizedTextBytes = 512 * 1024;
 const maximumNormalizedReasoningBytes = 512 * 1024;
-const maximumToolArgumentBytes = 512 * 1024;
+const maximumToolArgumentBytes = 2 * 1024 * 1024;
 const maximumToolCallCount = 128;
 const maximumToolCallIdBytes = 1_024;
 const maximumToolNameBytes = 256;

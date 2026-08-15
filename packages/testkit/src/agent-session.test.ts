@@ -1,10 +1,25 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import {
+  chmod,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rename,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   AgentSession,
   type AgentSessionDependencies,
+  createCodingToolRegistry,
   createInMemorySessionStore,
   createJsonlSessionStore,
   createMutationToolRegistry,
@@ -15,7 +30,8 @@ import {
   type SessionEventRecord,
   type SessionStore,
 } from "@adam-agent/agent";
-import { describe, expect, test } from "vitest";
+import { createCodingToolRegistryForTesting } from "@adam-agent/agent/internal-testing";
+import { describe, expect, expectTypeOf, test } from "vitest";
 
 import { FakeModelDriver } from "./index.js";
 
@@ -28,6 +44,12 @@ const cancelledResult = {
 } as const;
 
 describe("AgentSession", () => {
+  test("the production mutation registry type excludes filesystem fault injection", () => {
+    expectTypeOf<Parameters<typeof createMutationToolRegistry>[0]>().not.toHaveProperty(
+      "patchFileSystem",
+    );
+  });
+
   test("an answer-only turn emits ordered events and returns its terminal result", async () => {
     const model = new FakeModelDriver([
       { type: "text_delta", text: "Hello, " },
@@ -84,25 +106,25 @@ describe("AgentSession", () => {
           ],
           records: [
             {
-              schemaVersion: 1,
+              schemaVersion: 2,
               runId: expect.any(String),
               sequence: 1,
               event: { type: "user_message", text: "Persist this turn" },
             },
             {
-              schemaVersion: 1,
+              schemaVersion: 2,
               runId: expect.any(String),
               sequence: 2,
               event: { type: "model_message_started" },
             },
             {
-              schemaVersion: 1,
+              schemaVersion: 2,
               runId: expect.any(String),
               sequence: 3,
               event: { type: "model_message_completed", text: "Durable answer." },
             },
             {
-              schemaVersion: 1,
+              schemaVersion: 2,
               runId: expect.any(String),
               sequence: 4,
               event: {
@@ -191,7 +213,7 @@ describe("AgentSession", () => {
       result: cancelledResult,
       settledEvents: [{ type: "session_settled", result: cancelledResult }],
       finalRecord: {
-        schemaVersion: 1,
+        schemaVersion: 2,
         runId: expect.any(String),
         sequence: 4,
         event: { type: "session_settled", result: cancelledResult },
@@ -957,7 +979,10 @@ describe("AgentSession", () => {
       });
       const session = createTestSession({
         model,
-        tools: createMutationToolRegistry({ workspaceRoot }),
+        tools: createMutationToolRegistry({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+        }),
         permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["write"] }),
       });
       const toolEvents: RuntimeEvent[] = [];
@@ -1439,7 +1464,10 @@ describe("AgentSession", () => {
       });
       const session = createTestSession({
         model,
-        tools: createMutationToolRegistry({ workspaceRoot }),
+        tools: createMutationToolRegistry({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+        }),
         permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
       });
 
@@ -1473,8 +1501,13 @@ describe("AgentSession", () => {
               type: "tool_call_delta",
               id: "call-edit-symlink",
               json: JSON.stringify({
-                path: "linked.txt",
-                edits: [{ oldText: "unchanged", newText: "changed" }],
+                operations: [
+                  {
+                    kind: "update",
+                    path: "linked.txt",
+                    edits: [{ oldText: "unchanged", newText: "changed" }],
+                  },
+                ],
               }),
             },
             { type: "tool_call_end", id: "call-edit-symlink" },
@@ -1498,7 +1531,10 @@ describe("AgentSession", () => {
       });
       const session = createTestSession({
         model,
-        tools: createMutationToolRegistry({ workspaceRoot }),
+        tools: createMutationToolRegistry({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+        }),
         permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
       });
 
@@ -1513,40 +1549,351 @@ describe("AgentSession", () => {
     }
   });
 
-  test("edit_file applies exact multi-replacements against one original file", async () => {
-    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-edit-"));
-    const targetPath = join(workspaceRoot, "fruit.ts");
+  test.each([
+    {
+      label: "create",
+      operation: { kind: "create", path: "destination.txt", content: "created\n" } as const,
+    },
+    {
+      label: "move",
+      operation: { kind: "move", from: "source.txt", to: "destination.txt" } as const,
+    },
+  ])(
+    "edit_file $label refuses to replace a dangling destination symlink",
+    async ({ operation }) => {
+      const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-dangling-target-"));
+      const destinationPath = join(workspaceRoot, "destination.txt");
+      const sourcePath = join(workspaceRoot, "source.txt");
+
+      try {
+        await writeFile(sourcePath, "source\n", "utf8");
+        await symlink("missing-target.txt", destinationPath);
+        const model = new FakeModelDriver((request) => {
+          const latestMessage = request.messages.at(-1);
+          if (latestMessage?.role === "user") {
+            return [
+              { type: "tool_call_start", id: "call-dangling-target", name: "edit_file" },
+              {
+                type: "tool_call_delta",
+                id: "call-dangling-target",
+                json: JSON.stringify({ operations: [operation] }),
+              },
+              { type: "tool_call_end", id: "call-dangling-target" },
+              { type: "finish", reason: "tool_calls" },
+            ];
+          }
+          const alreadyExistsReceived =
+            latestMessage?.role === "tool" &&
+            latestMessage.result.status === "failed" &&
+            latestMessage.result.error.code === "already_exists";
+          return [
+            {
+              type: "text_delta",
+              text: alreadyExistsReceived
+                ? "The dangling destination was preserved."
+                : "The dangling destination result was unexpected.",
+            },
+            { type: "finish", reason: "stop" },
+          ];
+        });
+        const session = createTestSession({
+          model,
+          tools: createMutationToolRegistry({
+            workspaceRoot,
+            stateRoot: join(workspaceRoot, ".adam-agent-state"),
+          }),
+          permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+        });
+
+        const result = await session.run({ text: "Apply a patch to a dangling destination" });
+
+        expect({
+          result,
+          destinationIsSymlink: (await lstat(destinationPath)).isSymbolicLink(),
+          source: await readFile(sourcePath, "utf8"),
+        }).toEqual({
+          result: { status: "completed", answer: "The dangling destination was preserved." },
+          destinationIsSymlink: true,
+          source: "source\n",
+        });
+      } finally {
+        await rm(workspaceRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test("edit_file applies one approved structured patch across a file lifecycle", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const sourceRoot = join(workspaceRoot, "src");
+    const digest = "sha256:1020df7e320a81fde67837a5518aedb05da4cafcda1f8b8c495bece2896b7943";
 
     try {
-      await writeFile(targetPath, 'const fruit = "apple";\nconst color = "green";\n', "utf8");
+      await mkdir(workspaceRoot);
+      await mkdir(sourceRoot);
+      await writeFile(join(sourceRoot, "old.ts"), 'export const oldName = "old";\n', "utf8");
+      await writeFile(join(sourceRoot, "stale.ts"), "export const stale = true;\n", "utf8");
+      await writeFile(
+        join(sourceRoot, "index.ts"),
+        'export { oldName } from "./old.js";\nexport { stale } from "./stale.js";\n',
+        "utf8",
+      );
       const model = new FakeModelDriver((request) => {
         const latestMessage = request.messages.at(-1);
         if (latestMessage?.role === "user") {
           return [
-            { type: "tool_call_start", id: "call-edit", name: "edit_file" },
+            { type: "tool_call_start", id: "call-patch", name: "edit_file" },
             {
               type: "tool_call_delta",
-              id: "call-edit",
-              json: '{"path":"fruit.ts","edits":[{"oldText":"apple","newText":"pear"},{"oldText":"green","newText":"gold"}]}',
+              id: "call-patch",
+              json: JSON.stringify({
+                operations: [
+                  {
+                    kind: "update",
+                    path: "src/index.ts",
+                    edits: [
+                      {
+                        oldText: 'export { oldName } from "./old.js";',
+                        newText: 'export { currentName } from "./current.js";',
+                      },
+                      {
+                        oldText: 'export { stale } from "./stale.js";',
+                        newText: 'export { extra } from "./extra.js";',
+                      },
+                    ],
+                  },
+                  {
+                    kind: "create",
+                    path: "src/extra.ts",
+                    content: 'export const extra = "extra";\n',
+                  },
+                  {
+                    kind: "move",
+                    from: "src/old.ts",
+                    to: "src/current.ts",
+                    edits: [
+                      { oldText: "oldName", newText: "currentName" },
+                      { oldText: '"old"', newText: '"current"' },
+                    ],
+                  },
+                  { kind: "delete", path: "src/stale.ts" },
+                ],
+              }),
             },
-            { type: "tool_call_end", id: "call-edit" },
+            { type: "tool_call_end", id: "call-patch" },
             { type: "finish", reason: "tool_calls" },
           ];
         }
 
-        const receivedEditResult =
+        const receivedPatchResult =
           latestMessage?.role === "tool" &&
-          latestMessage.callId === "call-edit" &&
+          latestMessage.callId === "call-patch" &&
           latestMessage.name === "edit_file" &&
           latestMessage.result.status === "completed" &&
           JSON.stringify(latestMessage.result.output) ===
-            JSON.stringify({ path: "fruit.ts", replacements: 2, bytesWritten: 44 });
+            JSON.stringify({
+              digest,
+              operations: [
+                { kind: "create", path: "src/extra.ts", bytesWritten: 30 },
+                { kind: "delete", path: "src/stale.ts" },
+                {
+                  kind: "move",
+                  from: "src/old.ts",
+                  to: "src/current.ts",
+                  replacements: 2,
+                  bytesWritten: 38,
+                },
+                { kind: "update", path: "src/index.ts", replacements: 2, bytesWritten: 80 },
+              ],
+            });
         return [
           {
             type: "text_delta",
-            text: receivedEditResult
-              ? "Both edits were applied."
-              : "The edit result was unexpected.",
+            text: receivedPatchResult
+              ? "The repository lifecycle patch was applied."
+              : "The patch result was unexpected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistry({ workspaceRoot, stateRoot }),
+        permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["write"] }),
+      });
+      const permissionSubjects: unknown[] = [];
+      session.subscribe((event) => {
+        if (event.type === "tool_permission_requested") {
+          permissionSubjects.push(event.subject);
+          session.decidePermission({ requestId: event.requestId, decision: "allow" });
+        }
+      });
+
+      const result = await session.run({ text: "Apply the repository lifecycle patch" });
+
+      expect({
+        result,
+        permissionSubjects,
+        current: await readFile(join(sourceRoot, "current.ts"), "utf8").catch(() => undefined),
+        extra: await readFile(join(sourceRoot, "extra.ts"), "utf8").catch(() => undefined),
+        index: await readFile(join(sourceRoot, "index.ts"), "utf8"),
+        oldExists: await readFile(join(sourceRoot, "old.ts")).then(
+          () => true,
+          () => false,
+        ),
+        staleExists: await readFile(join(sourceRoot, "stale.ts")).then(
+          () => true,
+          () => false,
+        ),
+        recoveryEntries: await readdir(join(stateRoot, "patch-recovery")),
+      }).toEqual({
+        result: { status: "completed", answer: "The repository lifecycle patch was applied." },
+        permissionSubjects: [
+          {
+            type: "patch",
+            version: 1,
+            operations: [
+              { kind: "create", path: "src/extra.ts" },
+              { kind: "delete", path: "src/stale.ts" },
+              { kind: "move", from: "src/old.ts", to: "src/current.ts" },
+              { kind: "update", path: "src/index.ts" },
+            ],
+            digest,
+          },
+        ],
+        current: 'export const currentName = "current";\n',
+        extra: 'export const extra = "extra";\n',
+        index: 'export { currentName } from "./current.js";\nexport { extra } from "./extra.js";\n',
+        oldExists: false,
+        staleExists: false,
+        recoveryEntries: [],
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file creates safe missing parents for create and move destinations", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-parents-"));
+    const sourcePath = join(workspaceRoot, "source.txt");
+
+    try {
+      await writeFile(sourcePath, "move me\n", "utf8");
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-patch-parents", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-patch-parents",
+              json: JSON.stringify({
+                operations: [
+                  {
+                    kind: "create",
+                    path: "generated/nested/new.txt",
+                    content: "created\n",
+                  },
+                  {
+                    kind: "move",
+                    from: "source.txt",
+                    to: "renamed/nested/moved.txt",
+                    edits: [],
+                  },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-patch-parents" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        return [
+          {
+            type: "text_delta",
+            text:
+              latestMessage?.role === "tool" && latestMessage.result.status === "completed"
+                ? "Both nested destinations were created."
+                : "The nested patch failed.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createMutationToolRegistry({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+
+      const result = await session.run({ text: "Create nested patch destinations" });
+
+      expect({
+        result,
+        created: await readFile(
+          join(workspaceRoot, "generated", "nested", "new.txt"),
+          "utf8",
+        ).catch(() => undefined),
+        moved: await readFile(join(workspaceRoot, "renamed", "nested", "moved.txt"), "utf8").catch(
+          () => undefined,
+        ),
+        sourceExists: await readFile(sourcePath).then(
+          () => true,
+          () => false,
+        ),
+      }).toEqual({
+        result: { status: "completed", answer: "Both nested destinations were created." },
+        created: "created\n",
+        moved: "move me\n",
+        sourceExists: false,
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file rejects conflicting path roles before permission or mutation", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-conflict-"));
+    const targetPath = join(workspaceRoot, "shared.txt");
+    const originalContent = "before\n";
+
+    try {
+      await writeFile(targetPath, originalContent, "utf8");
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-patch-conflict", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-patch-conflict",
+              json: JSON.stringify({
+                operations: [
+                  {
+                    kind: "update",
+                    path: "shared.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                  { kind: "delete", path: "shared.txt" },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-patch-conflict" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const receivedConflict =
+          latestMessage?.role === "tool" &&
+          latestMessage.result.status === "failed" &&
+          latestMessage.result.error.code === "path_conflict";
+        return [
+          {
+            type: "text_delta",
+            text: receivedConflict
+              ? "The path conflict was rejected."
+              : "The conflict was unclear.",
           },
           { type: "finish", reason: "stop" },
         ];
@@ -1554,16 +1901,1133 @@ describe("AgentSession", () => {
       const session = createTestSession({
         model,
         tools: createMutationToolRegistry({ workspaceRoot }),
+        permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["write"] }),
+      });
+      const toolEvents: RuntimeEvent[] = [];
+      session.subscribe((event) => {
+        if (event.type.startsWith("tool_")) {
+          toolEvents.push(event);
+        }
+      });
+
+      const result = await session.run({ text: "Apply conflicting path roles" });
+
+      expect({ result, content: await readFile(targetPath, "utf8"), toolEvents }).toEqual({
+        result: { status: "completed", answer: "The path conflict was rejected." },
+        content: originalContent,
+        toolEvents: [
+          { type: "tool_requested", callId: "call-patch-conflict", name: "edit_file" },
+          {
+            type: "tool_failed",
+            callId: "call-patch-conflict",
+            name: "edit_file",
+            error: {
+              code: "path_conflict",
+              message: "A normalized patch path participates in more than one operation.",
+            },
+          },
+        ],
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file rejects ancestor and descendant file roles before permission", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-tree-conflict-"));
+    const treePath = join(workspaceRoot, "tree");
+
+    try {
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-patch-tree-conflict", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-patch-tree-conflict",
+              json: JSON.stringify({
+                operations: [
+                  { kind: "create", path: "tree", content: "file\n" },
+                  { kind: "create", path: "tree/child.txt", content: "child\n" },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-patch-tree-conflict" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const receivedConflict =
+          latestMessage?.role === "tool" &&
+          latestMessage.result.status === "failed" &&
+          latestMessage.result.error.code === "path_conflict";
+        return [
+          {
+            type: "text_delta",
+            text: receivedConflict
+              ? "The tree path conflict was rejected."
+              : "The tree conflict was unclear.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createMutationToolRegistry({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["write"] }),
+      });
+      const permissionRequests: RuntimeEvent[] = [];
+      session.subscribe((event) => {
+        if (event.type === "tool_permission_requested") {
+          permissionRequests.push(event);
+          session.decidePermission({ requestId: event.requestId, decision: "allow" });
+        }
+      });
+
+      const result = await session.run({ text: "Apply conflicting tree paths" });
+
+      expect({
+        result,
+        permissionRequests,
+        treeExists: await lstat(treePath).then(
+          () => true,
+          () => false,
+        ),
+      }).toEqual({
+        result: { status: "completed", answer: "The tree path conflict was rejected." },
+        permissionRequests: [],
+        treeExists: false,
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    {
+      label: "legacy path-and-edits input",
+      argumentsJson: JSON.stringify({
+        path: "value.txt",
+        edits: [{ oldText: "before", newText: "after" }],
+      }),
+    },
+    {
+      label: "a 33-operation request",
+      argumentsJson: JSON.stringify({
+        operations: Array.from({ length: 33 }, (_, index) => ({
+          kind: "create",
+          path: `created-${index}.txt`,
+          content: "created\n",
+        })),
+      }),
+    },
+    {
+      label: "a workspace-root path after normalization",
+      argumentsJson: JSON.stringify({ operations: [{ kind: "delete", path: "." }] }),
+    },
+  ])("edit_file rejects $label before permission", async ({ argumentsJson }) => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-schema-rejection-"));
+    const targetPath = join(workspaceRoot, "value.txt");
+
+    try {
+      await writeFile(targetPath, "before\n", "utf8");
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-invalid-patch-schema", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-invalid-patch-schema",
+              json: argumentsJson,
+            },
+            { type: "tool_call_end", id: "call-invalid-patch-schema" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const invalidInputReceived =
+          latestMessage?.role === "tool" &&
+          latestMessage.result.status === "failed" &&
+          latestMessage.result.error.code === "invalid_tool_input";
+        return [
+          {
+            type: "text_delta",
+            text: invalidInputReceived ? "The patch schema was rejected." : "Unexpected result.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createMutationToolRegistry({ workspaceRoot }),
+        permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["write"] }),
+      });
+      const permissionRequests: RuntimeEvent[] = [];
+      session.subscribe((event) => {
+        if (event.type === "tool_permission_requested") {
+          permissionRequests.push(event);
+          session.decidePermission({ requestId: event.requestId, decision: "allow" });
+        }
+      });
+
+      const result = await session.run({ text: "Apply an invalid patch schema" });
+
+      expect({
+        result,
+        permissionRequests,
+        content: await readFile(targetPath, "utf8"),
+        createdFiles: (await readdir(workspaceRoot)).filter((path) => path.startsWith("created-")),
+      }).toEqual({
+        result: { status: "completed", answer: "The patch schema was rejected." },
+        permissionRequests: [],
+        content: "before\n",
+        createdFiles: [],
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file compensates an earlier commit when a later commit fails", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-rollback-"));
+    const recoveryRoot = join(workspaceRoot, ".adam-agent-state", "patch-recovery");
+    const firstPath = join(workspaceRoot, "first.txt");
+    const secondPath = join(workspaceRoot, "second.txt");
+    let injectedFailure = false;
+    let permissionsDrifted = false;
+
+    try {
+      await writeFile(firstPath, "first before\n", "utf8");
+      await writeFile(secondPath, "second before\n", "utf8");
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-patch-rollback", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-patch-rollback",
+              json: JSON.stringify({
+                operations: [
+                  {
+                    kind: "update",
+                    path: "first.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                  {
+                    kind: "update",
+                    path: "second.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-patch-rollback" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const receivedRollbackFailure =
+          latestMessage?.role === "tool" &&
+          latestMessage.result.status === "failed" &&
+          latestMessage.result.error.code === "tool_io_failed";
+        return [
+          {
+            type: "text_delta",
+            text: receivedRollbackFailure
+              ? "The failed patch was rolled back."
+              : "The rollback result was unexpected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+          patchFileSystem: {
+            async rename(source, destination) {
+              if (!permissionsDrifted && destination === firstPath) {
+                permissionsDrifted = true;
+                await chmod(recoveryRoot, 0o400);
+              }
+              if (!injectedFailure && destination === secondPath) {
+                injectedFailure = true;
+                throw Object.assign(new Error("injected commit failure"), { code: "EIO" });
+              }
+              await rename(source, destination);
+            },
+            unlink,
+          },
+        }),
         permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
       });
 
-      const result = await session.run({ text: "Update the fruit module" });
+      const result = await session.run({ text: "Update both files transactionally" });
 
-      expect({ result, content: await readFile(targetPath, "utf8") }).toEqual({
-        result: { status: "completed", answer: "Both edits were applied." },
-        content: 'const fruit = "pear";\nconst color = "gold";\n',
+      expect({
+        result,
+        injectedFailure,
+        permissionsDrifted,
+        first: await readFile(firstPath, "utf8"),
+        second: await readFile(secondPath, "utf8"),
+        recoveryEntries: await readdir(join(workspaceRoot, ".adam-agent-state", "patch-recovery")),
+      }).toEqual({
+        result: { status: "completed", answer: "The failed patch was rolled back." },
+        injectedFailure: true,
+        permissionsDrifted: true,
+        first: "first before\n",
+        second: "second before\n",
+        recoveryEntries: [],
       });
     } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file removes recovery data after commit when owner-only permissions drift", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-cleanup-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const targetPath = join(workspaceRoot, "target.txt");
+    const recoveryRoot = join(stateRoot, "patch-recovery");
+    let permissionsDrifted = false;
+
+    try {
+      await mkdir(workspaceRoot);
+      await writeFile(targetPath, "before\n", "utf8");
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-patch-cleanup", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-patch-cleanup",
+              json: JSON.stringify({
+                operations: [
+                  {
+                    kind: "update",
+                    path: "target.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-patch-cleanup" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const patchCompleted =
+          latestMessage?.role === "tool" && latestMessage.result.status === "completed";
+        return [
+          {
+            type: "text_delta",
+            text: patchCompleted
+              ? "The patch committed cleanly."
+              : "The patch result was unexpected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          stateRoot,
+          patchFileSystem: {
+            async rename(source, destination) {
+              if (!permissionsDrifted && destination === targetPath) {
+                permissionsDrifted = true;
+                await chmod(recoveryRoot, 0o400);
+              }
+              await rename(source, destination);
+            },
+            unlink,
+          },
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+
+      const result = await session.run({ text: "Update one file transactionally" });
+      const recoveryRootMode = (await stat(recoveryRoot)).mode & 0o777;
+      await chmod(recoveryRoot, 0o700);
+
+      expect({
+        result,
+        permissionsDrifted,
+        content: await readFile(targetPath, "utf8"),
+        recoveryRootMode,
+        recoveryEntries: await readdir(recoveryRoot),
+      }).toEqual({
+        result: { status: "completed", answer: "The patch committed cleanly." },
+        permissionsDrifted: true,
+        content: "after\n",
+        recoveryRootMode: 0o700,
+        recoveryEntries: [],
+      });
+    } finally {
+      await chmod(recoveryRoot, 0o700).catch(() => undefined);
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file reports committed settlement when recovery cleanup remains blocked", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-cleanup-blocked-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const targetPath = join(workspaceRoot, "target.txt");
+    const recoveryRoot = join(stateRoot, "patch-recovery");
+    let cleanupBlocked = false;
+
+    try {
+      await mkdir(workspaceRoot);
+      await writeFile(targetPath, "before\n", "utf8");
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-cleanup-blocked", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-cleanup-blocked",
+              json: JSON.stringify({
+                operations: [
+                  {
+                    kind: "update",
+                    path: "target.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-cleanup-blocked" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const feedback = latestMessage?.role === "tool" ? latestMessage.result : undefined;
+        const committedCleanupFailure =
+          feedback?.status === "failed" &&
+          String(feedback.error.code) === "patch_recovery_cleanup_failed" &&
+          "settlement" in feedback.error &&
+          feedback.error.settlement === "committed";
+        return [
+          {
+            type: "text_delta",
+            text: committedCleanupFailure
+              ? "The patch committed but recovery cleanup needs inspection."
+              : "The cleanup settlement was unexpected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          stateRoot,
+          patchFileSystem: {
+            async rename(source, destination) {
+              if (!cleanupBlocked && destination === targetPath) {
+                cleanupBlocked = true;
+                await chmod(stateRoot, 0o000);
+              }
+              await rename(source, destination);
+            },
+            unlink,
+          },
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+      const toolFailures: unknown[] = [];
+      session.subscribe((event) => {
+        if (event.type === "tool_failed") {
+          toolFailures.push(event.error);
+        }
+      });
+
+      const result = await session.run({ text: "Update one file transactionally" });
+      await chmod(stateRoot, 0o700);
+      const recoveryEntries = await readdir(recoveryRoot);
+
+      expect({
+        result,
+        cleanupBlocked,
+        content: await readFile(targetPath, "utf8"),
+        toolFailures,
+        recoveryEntries,
+      }).toEqual({
+        result: {
+          status: "completed",
+          answer: "The patch committed but recovery cleanup needs inspection.",
+        },
+        cleanupBlocked: true,
+        content: "after\n",
+        toolFailures: [
+          {
+            code: "patch_recovery_cleanup_failed",
+            message:
+              "The patch committed, but its recovery data could not be removed. Do not retry the patch automatically.",
+            settlement: "committed",
+            recoveryReference: { id: expect.any(String) },
+          },
+        ],
+        recoveryEntries: [expect.any(String)],
+      });
+      expect(recoveryEntries).toEqual([
+        (toolFailures[0] as { recoveryReference: { id: string } }).recoveryReference.id,
+      ]);
+    } finally {
+      await chmod(stateRoot, 0o700).catch(() => undefined);
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file reports rolled-back settlement when recovery cleanup remains blocked", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-rollback-cleanup-blocked-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const firstPath = join(workspaceRoot, "first.txt");
+    const secondPath = join(workspaceRoot, "second.txt");
+    const recoveryRoot = join(stateRoot, "patch-recovery");
+    let cleanupBlocked = false;
+    let commitFailed = false;
+
+    try {
+      await mkdir(workspaceRoot);
+      await writeFile(firstPath, "first before\n", "utf8");
+      await writeFile(secondPath, "second before\n", "utf8");
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-rollback-cleanup-blocked", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-rollback-cleanup-blocked",
+              json: JSON.stringify({
+                operations: [
+                  {
+                    kind: "update",
+                    path: "first.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                  {
+                    kind: "update",
+                    path: "second.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-rollback-cleanup-blocked" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const feedback = latestMessage?.role === "tool" ? latestMessage.result : undefined;
+        const rolledBackCleanupFailure =
+          feedback?.status === "failed" &&
+          String(feedback.error.code) === "patch_recovery_cleanup_failed" &&
+          "settlement" in feedback.error &&
+          feedback.error.settlement === "rolled_back";
+        return [
+          {
+            type: "text_delta",
+            text: rolledBackCleanupFailure
+              ? "The patch rolled back but recovery cleanup needs inspection."
+              : "The rollback cleanup settlement was unexpected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          stateRoot,
+          patchFileSystem: {
+            async rename(source, destination) {
+              if (!commitFailed && destination === secondPath) {
+                commitFailed = true;
+                throw Object.assign(new Error("injected commit failure"), { code: "EIO" });
+              }
+              if (!cleanupBlocked && destination === firstPath) {
+                cleanupBlocked = true;
+                await chmod(stateRoot, 0o000);
+              }
+              await rename(source, destination);
+            },
+            unlink,
+          },
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+      const toolFailures: unknown[] = [];
+      session.subscribe((event) => {
+        if (event.type === "tool_failed") {
+          toolFailures.push(event.error);
+        }
+      });
+
+      const result = await session.run({ text: "Update two files transactionally" });
+      await chmod(stateRoot, 0o700);
+      const recoveryEntries = await readdir(recoveryRoot);
+
+      expect({
+        result,
+        cleanupBlocked,
+        commitFailed,
+        first: await readFile(firstPath, "utf8"),
+        second: await readFile(secondPath, "utf8"),
+        toolFailures,
+        recoveryEntries,
+      }).toEqual({
+        result: {
+          status: "completed",
+          answer: "The patch rolled back but recovery cleanup needs inspection.",
+        },
+        cleanupBlocked: true,
+        commitFailed: true,
+        first: "first before\n",
+        second: "second before\n",
+        toolFailures: [
+          {
+            code: "patch_recovery_cleanup_failed",
+            message:
+              "The patch was rolled back, but its recovery data could not be removed. Inspect recovery data before retrying.",
+            settlement: "rolled_back",
+            recoveryReference: { id: expect.any(String) },
+          },
+        ],
+        recoveryEntries: [expect.any(String)],
+      });
+      expect(recoveryEntries).toEqual([
+        (toolFailures[0] as { recoveryReference: { id: string } }).recoveryReference.id,
+      ]);
+    } finally {
+      await chmod(stateRoot, 0o700).catch(() => undefined);
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file removes newly created parent directories during compensation", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-parent-rollback-"));
+    const secondPath = join(workspaceRoot, "second.txt");
+    const nestedRoot = join(workspaceRoot, "nested");
+    let injectedFailure = false;
+
+    try {
+      await writeFile(secondPath, "second before\n", "utf8");
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-patch-parent-rollback", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-patch-parent-rollback",
+              json: JSON.stringify({
+                operations: [
+                  {
+                    kind: "create",
+                    path: "nested/child/created.txt",
+                    content: "created\n",
+                  },
+                  {
+                    kind: "update",
+                    path: "second.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-patch-parent-rollback" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const receivedRollbackFailure =
+          latestMessage?.role === "tool" &&
+          latestMessage.result.status === "failed" &&
+          latestMessage.result.error.code === "tool_io_failed";
+        return [
+          {
+            type: "text_delta",
+            text: receivedRollbackFailure
+              ? "The nested patch was rolled back."
+              : "The nested rollback result was unexpected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+          patchFileSystem: {
+            async rename(source, destination) {
+              if (!injectedFailure && destination === secondPath) {
+                injectedFailure = true;
+                throw Object.assign(new Error("injected commit failure"), { code: "EIO" });
+              }
+              await rename(source, destination);
+            },
+            unlink,
+          },
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+
+      const result = await session.run({ text: "Apply a nested patch" });
+
+      expect({
+        result,
+        injectedFailure,
+        second: await readFile(secondPath, "utf8"),
+        nestedRootExists: await stat(nestedRoot).then(
+          () => true,
+          () => false,
+        ),
+      }).toEqual({
+        result: { status: "completed", answer: "The nested patch was rolled back." },
+        injectedFailure: true,
+        second: "second before\n",
+        nestedRootExists: false,
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file retains recovery when rollback cannot remove a created parent", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-parent-uncertain-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const secondPath = join(workspaceRoot, "second.txt");
+    const nestedPath = join(workspaceRoot, "nested");
+    let injectedFailure = false;
+
+    try {
+      await mkdir(workspaceRoot);
+      await writeFile(secondPath, "second before\n", "utf8");
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-parent-uncertain", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-parent-uncertain",
+              json: JSON.stringify({
+                operations: [
+                  { kind: "create", path: "nested/child/created.txt", content: "created\n" },
+                  {
+                    kind: "update",
+                    path: "second.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-parent-uncertain" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const cleanupUncertain =
+          latestMessage?.role === "tool" &&
+          latestMessage.result.status === "failed" &&
+          latestMessage.result.error.code === "patch_state_uncertain" &&
+          latestMessage.result.error.affectedPaths.join(",") ===
+            "nested/child/created.txt,second.txt";
+        return [
+          {
+            type: "text_delta",
+            text: cleanupUncertain
+              ? "The created parent needs recovery inspection."
+              : "The cleanup result was unexpected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          stateRoot,
+          patchFileSystem: {
+            async rename(source, destination) {
+              if (!injectedFailure && destination === secondPath) {
+                injectedFailure = true;
+                await chmod(workspaceRoot, 0o500);
+                throw Object.assign(new Error("injected commit failure"), { code: "EIO" });
+              }
+              await rename(source, destination);
+            },
+            unlink,
+          },
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+      const toolEvents: RuntimeEvent[] = [];
+      session.subscribe((event) => {
+        if (event.type.startsWith("tool_")) {
+          toolEvents.push(event);
+        }
+      });
+
+      const result = await session.run({ text: "Apply a patch with nested parents" });
+      await chmod(workspaceRoot, 0o700);
+      const failure = toolEvents.find(
+        (event) => event.type === "tool_failed" && event.error.code === "patch_state_uncertain",
+      );
+      if (failure?.type !== "tool_failed" || failure.error.code !== "patch_state_uncertain") {
+        throw new Error("Expected created-parent cleanup to settle as uncertain.");
+      }
+
+      expect({
+        result,
+        injectedFailure,
+        second: await readFile(secondPath, "utf8"),
+        nestedExists: await lstat(nestedPath).then(
+          () => true,
+          () => false,
+        ),
+        affectedPaths: failure.error.affectedPaths,
+        recoveryEntries: await readdir(
+          join(stateRoot, "patch-recovery", failure.error.recoveryReference.id),
+        ),
+      }).toEqual({
+        result: {
+          status: "completed",
+          answer: "The created parent needs recovery inspection.",
+        },
+        injectedFailure: true,
+        second: "second before\n",
+        nestedExists: true,
+        affectedPaths: ["nested/child/created.txt", "second.txt"],
+        recoveryEntries: ["manifest.json", "preimage-0.bin"],
+      });
+    } finally {
+      await chmod(workspaceRoot, 0o700).catch(() => undefined);
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file reports uncertain state and retains recovery data when compensation fails", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-patch-uncertain-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const firstPath = join(workspaceRoot, "first.txt");
+    const secondPath = join(workspaceRoot, "second.txt");
+    let injectedCommitFailure = false;
+    let injectedRollbackFailure = false;
+
+    try {
+      await mkdir(workspaceRoot);
+      await writeFile(firstPath, "first before\n", "utf8");
+      await writeFile(secondPath, "second before\n", "utf8");
+      await chmod(firstPath, 0o640);
+      await chmod(secondPath, 0o600);
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-patch-uncertain", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-patch-uncertain",
+              json: JSON.stringify({
+                operations: [
+                  {
+                    kind: "update",
+                    path: "first.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                  {
+                    kind: "update",
+                    path: "second.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-patch-uncertain" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const receivedUncertainFailure =
+          latestMessage?.role === "tool" &&
+          latestMessage.result.status === "failed" &&
+          latestMessage.result.error.code === "patch_state_uncertain" &&
+          latestMessage.result.error.affectedPaths.join(",") === "first.txt" &&
+          latestMessage.result.error.recoveryReference.id.length > 0;
+        return [
+          {
+            type: "text_delta",
+            text: receivedUncertainFailure
+              ? "The workspace needs recovery inspection."
+              : "The uncertain result was incomplete.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          stateRoot,
+          patchFileSystem: {
+            async rename(source, destination) {
+              if (!injectedCommitFailure && destination === secondPath) {
+                injectedCommitFailure = true;
+                throw Object.assign(new Error("injected commit failure"), { code: "EIO" });
+              }
+              if (
+                injectedCommitFailure &&
+                !injectedRollbackFailure &&
+                destination === firstPath &&
+                source.includes(".adam-agent-")
+              ) {
+                injectedRollbackFailure = true;
+                throw Object.assign(new Error("injected rollback failure"), { code: "EIO" });
+              }
+              await rename(source, destination);
+            },
+            unlink,
+          },
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+      const toolEvents: RuntimeEvent[] = [];
+      session.subscribe((event) => {
+        if (event.type.startsWith("tool_")) {
+          toolEvents.push(event);
+        }
+      });
+
+      const result = await session.run({ text: "Update both files transactionally" });
+      const failure = toolEvents.find(
+        (event) => event.type === "tool_failed" && event.error.code === "patch_state_uncertain",
+      );
+      if (failure?.type !== "tool_failed" || failure.error.code !== "patch_state_uncertain") {
+        throw new Error("Expected a typed uncertain patch failure.");
+      }
+      const recoveryDirectory = join(
+        stateRoot,
+        "patch-recovery",
+        failure.error.recoveryReference.id,
+      );
+      const recoveryEntries = (await readdir(recoveryDirectory)).sort();
+      const recoveryFileModes = await Promise.all(
+        recoveryEntries.map(
+          async (entry) => (await stat(join(recoveryDirectory, entry))).mode & 0o777,
+        ),
+      );
+
+      expect({
+        result,
+        injectedCommitFailure,
+        injectedRollbackFailure,
+        first: await readFile(firstPath, "utf8"),
+        second: await readFile(secondPath, "utf8"),
+        toolEvents,
+        recoveryEntries,
+        recoveryFileModes,
+        recoveryDirectoryMode: (await stat(recoveryDirectory)).mode & 0o777,
+        manifest: JSON.parse(await readFile(join(recoveryDirectory, "manifest.json"), "utf8")),
+        preimages: await Promise.all([
+          readFile(join(recoveryDirectory, "preimage-0.bin"), "utf8"),
+          readFile(join(recoveryDirectory, "preimage-1.bin"), "utf8"),
+        ]),
+      }).toEqual({
+        result: { status: "completed", answer: "The workspace needs recovery inspection." },
+        injectedCommitFailure: true,
+        injectedRollbackFailure: true,
+        first: "first after\n",
+        second: "second before\n",
+        toolEvents: [
+          { type: "tool_requested", callId: "call-patch-uncertain", name: "edit_file" },
+          {
+            type: "tool_permission_decided",
+            callId: "call-patch-uncertain",
+            name: "edit_file",
+            decision: "allow",
+            effect: "write",
+            scope: "call",
+            subject: {
+              type: "patch",
+              version: 1,
+              operations: [
+                { kind: "update", path: "first.txt" },
+                { kind: "update", path: "second.txt" },
+              ],
+              digest: "sha256:7870fa67e46ed0a329c7b1b598719110057f8e6eee684f410489668b9356a1f1",
+            },
+          },
+          { type: "tool_started", callId: "call-patch-uncertain", name: "edit_file" },
+          {
+            type: "tool_failed",
+            callId: "call-patch-uncertain",
+            name: "edit_file",
+            error: {
+              code: "patch_state_uncertain",
+              message:
+                "The patch failed and automatic rollback could not confirm the workspace state.",
+              affectedPaths: ["first.txt"],
+              recoveryReference: { id: expect.any(String) },
+            },
+          },
+        ],
+        recoveryEntries: ["manifest.json", "preimage-0.bin", "preimage-1.bin"],
+        recoveryFileModes: [0o600, 0o600, 0o600],
+        recoveryDirectoryMode: 0o700,
+        manifest: {
+          schemaVersion: 1,
+          digest: "sha256:7870fa67e46ed0a329c7b1b598719110057f8e6eee684f410489668b9356a1f1",
+          operations: [
+            { kind: "update", path: "first.txt" },
+            { kind: "update", path: "second.txt" },
+          ],
+          preimages: [
+            { path: "first.txt", filename: "preimage-0.bin", mode: 0o640 },
+            { path: "second.txt", filename: "preimage-1.bin", mode: 0o600 },
+          ],
+        },
+        preimages: ["first before\n", "second before\n"],
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("one registry serializes concurrent first-party workspace mutations", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-mutation-coordinator-"));
+    const firstPath = join(workspaceRoot, "first.txt");
+    const secondPath = join(workspaceRoot, "second.txt");
+    let markFirstCommitStarted: (() => void) | undefined;
+    let releaseFirstCommit: (() => void) | undefined;
+    const firstCommitStarted = new Promise<void>((resolve) => {
+      markFirstCommitStarted = resolve;
+    });
+    const firstCommitReleased = new Promise<void>((resolve) => {
+      releaseFirstCommit = resolve;
+    });
+    const commitOrder: string[] = [];
+
+    try {
+      await writeFile(firstPath, "first before\n", "utf8");
+      const registry = createCodingToolRegistryForTesting({
+        workspaceRoot,
+        stateRoot: join(workspaceRoot, ".adam-agent-state"),
+        patchFileSystem: {
+          async rename(source, destination) {
+            if (destination === firstPath) {
+              commitOrder.push("first-started");
+              markFirstCommitStarted?.();
+              await firstCommitReleased;
+              commitOrder.push("first-released");
+            }
+            await rename(source, destination);
+          },
+          unlink,
+        },
+      });
+      const editModel = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-first-mutation", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-first-mutation",
+              json: JSON.stringify({
+                operations: [
+                  {
+                    kind: "update",
+                    path: "first.txt",
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-first-mutation" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        return [
+          { type: "text_delta", text: "Mutation settled." },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const writeModel = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-second-mutation", name: "write_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-second-mutation",
+              json: JSON.stringify({ path: "second.txt", content: "second after\n" }),
+            },
+            { type: "tool_call_end", id: "call-second-mutation" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        return [
+          { type: "text_delta", text: "Mutation settled." },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const firstSession = createTestSession({
+        model: editModel,
+        tools: registry,
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+      const secondSession = createTestSession({
+        model: writeModel,
+        tools: registry,
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+      let markSecondStarted: (() => void) | undefined;
+      const secondStarted = new Promise<void>((resolve) => {
+        markSecondStarted = resolve;
+      });
+      secondSession.subscribe((event) => {
+        if (event.type === "tool_started") {
+          markSecondStarted?.();
+        } else if (event.type === "tool_completed") {
+          commitOrder.push("write-completed");
+        }
+      });
+
+      const firstRun = firstSession.run({ text: "Update the first file" });
+      await firstCommitStarted;
+      const secondRun = secondSession.run({ text: "Create the second file" });
+      await secondStarted;
+      releaseFirstCommit?.();
+      const results = await Promise.all([firstRun, secondRun]);
+
+      expect({
+        definitions: registry.definitions().map((definition) => definition.name),
+        commitOrder,
+        results,
+        first: await readFile(firstPath, "utf8"),
+        second: await readFile(secondPath, "utf8"),
+      }).toEqual({
+        definitions: ["read_file", "write_file", "edit_file", "run_shell"],
+        commitOrder: ["first-started", "first-released", "write-completed"],
+        results: [
+          { status: "completed", answer: "Mutation settled." },
+          { status: "completed", answer: "Mutation settled." },
+        ],
+        first: "first after\n",
+        second: "second after\n",
+      });
+    } finally {
+      releaseFirstCommit?.();
       await rm(workspaceRoot, { recursive: true, force: true });
     }
   });
@@ -1583,7 +3047,7 @@ describe("AgentSession", () => {
             {
               type: "tool_call_delta",
               id: "call-ambiguous",
-              json: '{"path":"fruit.txt","edits":[{"oldText":"apple","newText":"pear"},{"oldText":"green","newText":"gold"}]}',
+              json: '{"operations":[{"kind":"update","path":"fruit.txt","edits":[{"oldText":"apple","newText":"pear"},{"oldText":"green","newText":"gold"}]}]}',
             },
             { type: "tool_call_end", id: "call-ambiguous" },
             { type: "finish", reason: "tool_calls" },
@@ -1636,7 +3100,7 @@ describe("AgentSession", () => {
             {
               type: "tool_call_delta",
               id: "call-overlapping-match",
-              json: '{"path":"letters.txt","edits":[{"oldText":"aa","newText":"x"}]}',
+              json: '{"operations":[{"kind":"update","path":"letters.txt","edits":[{"oldText":"aa","newText":"x"}]}]}',
             },
             { type: "tool_call_end", id: "call-overlapping-match" },
             { type: "finish", reason: "tool_calls" },
@@ -1689,7 +3153,7 @@ describe("AgentSession", () => {
             {
               type: "tool_call_delta",
               id: "call-overlap",
-              json: '{"path":"letters.txt","edits":[{"oldText":"abc","newText":"X"},{"oldText":"bcd","newText":"Y"}]}',
+              json: '{"operations":[{"kind":"update","path":"letters.txt","edits":[{"oldText":"abc","newText":"X"},{"oldText":"bcd","newText":"Y"}]}]}',
             },
             { type: "tool_call_end", id: "call-overlap" },
             { type: "finish", reason: "tool_calls" },
@@ -1742,7 +3206,7 @@ describe("AgentSession", () => {
             {
               type: "tool_call_delta",
               id: "call-no-match",
-              json: '{"path":"fruit.txt","edits":[{"oldText":"orange","newText":"pear"}]}',
+              json: '{"operations":[{"kind":"create","path":"should-not-exist.txt","content":"not created\\n"},{"kind":"update","path":"fruit.txt","edits":[{"oldText":"orange","newText":"pear"}]}]}',
             },
             { type: "tool_call_end", id: "call-no-match" },
             { type: "finish", reason: "tool_calls" },
@@ -1771,9 +3235,17 @@ describe("AgentSession", () => {
 
       const result = await session.run({ text: "Replace orange with pear" });
 
-      expect({ result, content: await readFile(targetPath, "utf8") }).toEqual({
+      expect({
+        result,
+        content: await readFile(targetPath, "utf8"),
+        created: await readFile(join(workspaceRoot, "should-not-exist.txt")).then(
+          () => true,
+          () => false,
+        ),
+      }).toEqual({
         result: { status: "completed", answer: "The missing match was reported." },
         content: originalContent,
+        created: false,
       });
     } finally {
       await rm(workspaceRoot, { recursive: true, force: true });
@@ -1786,7 +3258,7 @@ describe("AgentSession", () => {
 
     try {
       await writeFile(targetPath, Buffer.from("\uFEFFone\r\ntwo\r\n", "utf8"));
-      await chmod(targetPath, 0o744);
+      await chmod(targetPath, 0o4744);
       const model = new FakeModelDriver((request) => {
         const latestMessage = request.messages.at(-1);
         if (latestMessage?.role === "user") {
@@ -1795,7 +3267,7 @@ describe("AgentSession", () => {
             {
               type: "tool_call_delta",
               id: "call-format",
-              json: '{"path":"formatted.txt","edits":[{"oldText":"one\\r\\ntwo","newText":"one\\nchanged"}]}',
+              json: '{"operations":[{"kind":"update","path":"formatted.txt","edits":[{"oldText":"one\\r\\ntwo","newText":"one\\nchanged"}]}]}',
             },
             { type: "tool_call_end", id: "call-format" },
             { type: "finish", reason: "tool_calls" },
@@ -1803,10 +3275,7 @@ describe("AgentSession", () => {
         }
 
         const receivedFormatPreservingResult =
-          latestMessage?.role === "tool" &&
-          latestMessage.result.status === "completed" &&
-          JSON.stringify(latestMessage.result.output) ===
-            JSON.stringify({ path: "formatted.txt", replacements: 1, bytesWritten: 17 });
+          latestMessage?.role === "tool" && latestMessage.result.status === "completed";
         return [
           {
             type: "text_delta",
@@ -1819,7 +3288,10 @@ describe("AgentSession", () => {
       });
       const session = createTestSession({
         model,
-        tools: createMutationToolRegistry({ workspaceRoot }),
+        tools: createMutationToolRegistry({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+        }),
         permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
       });
 
@@ -1829,11 +3301,11 @@ describe("AgentSession", () => {
       expect({
         result,
         bytes: [...(await readFile(targetPath))],
-        mode: fileStats.mode & 0o777,
+        mode: fileStats.mode & 0o7777,
       }).toEqual({
         result: { status: "completed", answer: "The formatted file was updated." },
         bytes: [...Buffer.from("\uFEFFone\r\nchanged\r\n", "utf8")],
-        mode: 0o744,
+        mode: 0o4744,
       });
     } finally {
       await rm(workspaceRoot, { recursive: true, force: true });
@@ -1856,8 +3328,13 @@ describe("AgentSession", () => {
               type: "tool_call_delta",
               id: "call-cr-format",
               json: JSON.stringify({
-                path: "classic-mac.txt",
-                edits: [{ oldText: "one", newText: "first\nsecond" }],
+                operations: [
+                  {
+                    kind: "update",
+                    path: "classic-mac.txt",
+                    edits: [{ oldText: "one", newText: "first\nsecond" }],
+                  },
+                ],
               }),
             },
             { type: "tool_call_end", id: "call-cr-format" },
@@ -1877,7 +3354,10 @@ describe("AgentSession", () => {
       });
       const session = createTestSession({
         model,
-        tools: createMutationToolRegistry({ workspaceRoot }),
+        tools: createMutationToolRegistry({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+        }),
         permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
       });
 
@@ -1907,7 +3387,7 @@ describe("AgentSession", () => {
             {
               type: "tool_call_delta",
               id: "call-binary",
-              json: '{"path":"binary.dat","edits":[{"oldText":"a","newText":"x"}]}',
+              json: '{"operations":[{"kind":"update","path":"binary.dat","edits":[{"oldText":"a","newText":"x"}]}]}',
             },
             { type: "tool_call_end", id: "call-binary" },
             { type: "finish", reason: "tool_calls" },
@@ -1945,6 +3425,112 @@ describe("AgentSession", () => {
     }
   });
 
+  test("edit_file refuses to delete a non-text file", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-delete-binary-"));
+    const targetPath = join(workspaceRoot, "binary.dat");
+    const originalBytes = Buffer.from([0x61, 0x00, 0x62]);
+
+    try {
+      await writeFile(targetPath, originalBytes);
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-delete-binary", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-delete-binary",
+              json: '{"operations":[{"kind":"delete","path":"binary.dat"}]}',
+            },
+            { type: "tool_call_end", id: "call-delete-binary" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const receivedBinaryFailure =
+          latestMessage?.role === "tool" &&
+          latestMessage.result.status === "failed" &&
+          latestMessage.result.error.code === "binary_file";
+        return [
+          {
+            type: "text_delta",
+            text: receivedBinaryFailure
+              ? "The binary delete was rejected."
+              : "The binary delete result was unexpected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createMutationToolRegistry({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+
+      const result = await session.run({ text: "Delete the binary file" });
+
+      expect({ result, bytes: [...(await readFile(targetPath))] }).toEqual({
+        result: { status: "completed", answer: "The binary delete was rejected." },
+        bytes: [...originalBytes],
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file rejects a FIFO target without waiting for a writer", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-edit-fifo-"));
+    const fifoPath = join(workspaceRoot, "stream.pipe");
+
+    try {
+      execFileSync("mkfifo", [fifoPath]);
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-fifo", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-fifo",
+              json: '{"operations":[{"kind":"delete","path":"stream.pipe"}]}',
+            },
+            { type: "tool_call_end", id: "call-fifo" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const ordinaryFileRejected =
+          latestMessage?.role === "tool" &&
+          latestMessage.result.status === "failed" &&
+          latestMessage.result.error.code === "binary_file";
+        return [
+          {
+            type: "text_delta",
+            text: ordinaryFileRejected
+              ? "The FIFO target was rejected."
+              : "The FIFO result was unexpected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createMutationToolRegistry({ workspaceRoot }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+
+      const result = await session.run({ text: "Delete the named pipe" });
+
+      expect({ result, targetIsFifo: (await lstat(fifoPath)).isFIFO() }).toEqual({
+        result: { status: "completed", answer: "The FIFO target was rejected." },
+        targetIsFifo: true,
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
   test("edit_file rejects a target larger than one MiB before matching", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-edit-large-"));
     const targetPath = join(workspaceRoot, "large.txt");
@@ -1960,7 +3546,7 @@ describe("AgentSession", () => {
             {
               type: "tool_call_delta",
               id: "call-large",
-              json: '{"path":"large.txt","edits":[{"oldText":"b","newText":"c"}]}',
+              json: '{"operations":[{"kind":"update","path":"large.txt","edits":[{"oldText":"b","newText":"c"}]}]}',
             },
             { type: "tool_call_end", id: "call-large" },
             { type: "finish", reason: "tool_calls" },
@@ -2016,10 +3602,15 @@ describe("AgentSession", () => {
               type: "tool_call_delta",
               id: "call-large-input",
               json: JSON.stringify({
-                path: "words.txt",
-                edits: [
-                  { oldText: "left", newText: largeLeft },
-                  { oldText: "right", newText: largeRight },
+                operations: [
+                  {
+                    kind: "update",
+                    path: "words.txt",
+                    edits: [
+                      { oldText: "left", newText: largeLeft },
+                      { oldText: "right", newText: largeRight },
+                    ],
+                  },
                 ],
               }),
             },
@@ -2059,6 +3650,118 @@ describe("AgentSession", () => {
     }
   });
 
+  test("edit_file stages an update beside a long valid filename", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-edit-long-name-"));
+    const stateRoot = join(workspaceRoot, ".adam-agent-state");
+    const filename = `${"a".repeat(236)}.txt`;
+    const targetPath = join(workspaceRoot, filename);
+
+    try {
+      await writeFile(targetPath, "before\n", "utf8");
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-long-name", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-long-name",
+              json: JSON.stringify({
+                operations: [
+                  {
+                    kind: "update",
+                    path: filename,
+                    edits: [{ oldText: "before", newText: "after" }],
+                  },
+                ],
+              }),
+            },
+            { type: "tool_call_end", id: "call-long-name" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const patchCompleted =
+          latestMessage?.role === "tool" && latestMessage.result.status === "completed";
+        return [
+          {
+            type: "text_delta",
+            text: patchCompleted
+              ? "The long filename was updated."
+              : "The long filename result was unexpected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createMutationToolRegistry({ workspaceRoot, stateRoot }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+
+      const result = await session.run({ text: "Update the long filename" });
+
+      expect({ result, content: await readFile(targetPath, "utf8") }).toEqual({
+        result: { status: "completed", answer: "The long filename was updated." },
+        content: "after\n",
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("edit_file applies the 512 KiB limit to normalized arguments", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-edit-normalized-bound-"));
+    const targetPath = join(workspaceRoot, "value.txt");
+    const paddedArguments = `{"operations":${" ".repeat(520 * 1024)}[{"kind":"update","path":"value.txt","edits":[{"oldText":"before","newText":"after"}]}]}`;
+
+    try {
+      await writeFile(targetPath, "before\n", "utf8");
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-normalized-bound", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-normalized-bound",
+              json: paddedArguments,
+            },
+            { type: "tool_call_end", id: "call-normalized-bound" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const editCompleted =
+          latestMessage?.role === "tool" && latestMessage.result.status === "completed";
+        return [
+          {
+            type: "text_delta",
+            text: editCompleted
+              ? "The normalized patch was accepted."
+              : "The normalized patch was rejected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createMutationToolRegistry({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+
+      const result = await session.run({ text: "Apply a whitespace-padded patch" });
+
+      expect({ result, content: await readFile(targetPath, "utf8") }).toEqual({
+        result: { status: "completed", answer: "The normalized patch was accepted." },
+        content: "after\n",
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
   test("edit_file rejects an updated result larger than one MiB before writing", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-edit-output-large-"));
     const targetPath = join(workspaceRoot, "growing.txt");
@@ -2076,8 +3779,13 @@ describe("AgentSession", () => {
               type: "tool_call_delta",
               id: "call-large-output",
               json: JSON.stringify({
-                path: "growing.txt",
-                edits: [{ oldText: "marker", newText: largeReplacement }],
+                operations: [
+                  {
+                    kind: "update",
+                    path: "growing.txt",
+                    edits: [{ oldText: "marker", newText: largeReplacement }],
+                  },
+                ],
               }),
             },
             { type: "tool_call_end", id: "call-large-output" },
@@ -2116,6 +3824,76 @@ describe("AgentSession", () => {
     }
   });
 
+  test("edit_file rejects more than eight MiB of aggregate staged results", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-edit-aggregate-large-"));
+    const originalContent = `${"a".repeat(1024 * 1024 - 6)}before`;
+    const paths = Array.from({ length: 9 }, (_, index) => `file-${index}.txt`);
+
+    try {
+      await Promise.all(
+        paths.map((path) => writeFile(join(workspaceRoot, path), originalContent, "utf8")),
+      );
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return [
+            { type: "tool_call_start", id: "call-aggregate-large", name: "edit_file" },
+            {
+              type: "tool_call_delta",
+              id: "call-aggregate-large",
+              json: JSON.stringify({
+                operations: paths.map((path) => ({
+                  kind: "update",
+                  path,
+                  edits: [{ oldText: "before", newText: "after" }],
+                })),
+              }),
+            },
+            { type: "tool_call_end", id: "call-aggregate-large" },
+            { type: "finish", reason: "tool_calls" },
+          ];
+        }
+        const receivedSizeFailure =
+          latestMessage?.role === "tool" &&
+          latestMessage.result.status === "failed" &&
+          latestMessage.result.error.code === "file_too_large";
+        return [
+          {
+            type: "text_delta",
+            text: receivedSizeFailure
+              ? "The aggregate patch was rejected."
+              : "The aggregate patch result was unexpected.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createMutationToolRegistry({
+          workspaceRoot,
+          stateRoot: join(workspaceRoot, ".adam-agent-state"),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
+      });
+
+      const result = await session.run({ text: "Update nine large files" });
+
+      expect({
+        result,
+        unchanged: await Promise.all(
+          paths.map(
+            async (path) => (await readFile(join(workspaceRoot, path), "utf8")) === originalContent,
+          ),
+        ),
+      }).toEqual({
+        result: { status: "completed", answer: "The aggregate patch was rejected." },
+        unchanged: Array.from({ length: 9 }, () => true),
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
   test("edit_file reports a missing target without creating it", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-edit-missing-file-"));
     const targetPath = join(workspaceRoot, "missing.txt");
@@ -2129,7 +3907,7 @@ describe("AgentSession", () => {
             {
               type: "tool_call_delta",
               id: "call-missing-file",
-              json: '{"path":"missing.txt","edits":[{"oldText":"before","newText":"after"}]}',
+              json: '{"operations":[{"kind":"update","path":"missing.txt","edits":[{"oldText":"before","newText":"after"}]}]}',
             },
             { type: "tool_call_end", id: "call-missing-file" },
             { type: "finish", reason: "tool_calls" },

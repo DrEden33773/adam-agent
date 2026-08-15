@@ -1,12 +1,21 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { type FileHandle, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { z } from "zod";
 
 import type { ArtifactStore } from "./artifact-store.js";
+import { createMutationCoordinator, type MutationCoordinator } from "./mutation-coordinator.js";
+import { createPatchRecoveryStore } from "./patch-recovery-store.js";
+import {
+  createPatchTransaction,
+  type NormalizedPatchOperation,
+  type PatchFileSystem,
+  PatchTransactionError,
+} from "./patch-transaction.js";
 
 export type ToolEffect = "read" | "write" | "execute" | "network" | "delegate" | "administrative";
 
@@ -41,24 +50,38 @@ export type ToolResult =
   | { readonly status: "completed"; readonly output: JsonValue }
   | {
       readonly status: "failed";
-      readonly error: {
-        readonly code:
-          | "unknown_tool"
-          | "invalid_tool_input"
-          | "permission_denied"
-          | "outside_workspace"
-          | "not_found"
-          | "already_exists"
-          | "ambiguous_match"
-          | "binary_file"
-          | "file_too_large"
-          | "no_match"
-          | "overlapping_edits"
-          | "artifact_store_failed"
-          | "shell_start_failed"
-          | "tool_io_failed";
-        readonly message: string;
-      };
+      readonly error:
+        | {
+            readonly code:
+              | "unknown_tool"
+              | "invalid_tool_input"
+              | "permission_denied"
+              | "outside_workspace"
+              | "not_found"
+              | "already_exists"
+              | "ambiguous_match"
+              | "binary_file"
+              | "file_too_large"
+              | "no_match"
+              | "overlapping_edits"
+              | "path_conflict"
+              | "artifact_store_failed"
+              | "shell_start_failed"
+              | "tool_io_failed";
+            readonly message: string;
+          }
+        | {
+            readonly code: "patch_recovery_cleanup_failed";
+            readonly message: string;
+            readonly settlement: "committed" | "rolled_back";
+            readonly recoveryReference: { readonly id: string };
+          }
+        | {
+            readonly code: "patch_state_uncertain";
+            readonly message: string;
+            readonly affectedPaths: readonly string[];
+            readonly recoveryReference: { readonly id: string };
+          };
     };
 
 type ToolAdapter = {
@@ -75,6 +98,10 @@ type ToolMaximumResultPolicy = {
 };
 
 type FailedToolResult = Extract<ToolResult, { readonly status: "failed" }>;
+type OrdinaryToolError = Exclude<
+  FailedToolResult["error"],
+  { readonly code: "patch_recovery_cleanup_failed" | "patch_state_uncertain" }
+>;
 
 type PreparedToolCall = {
   readonly status: "ready";
@@ -89,9 +116,9 @@ type ToolExecutionContext = {
 };
 
 class ToolExecutionError extends Error {
-  readonly code: FailedToolResult["error"]["code"];
+  readonly code: OrdinaryToolError["code"];
 
-  constructor(code: FailedToolResult["error"]["code"], message: string) {
+  constructor(code: OrdinaryToolError["code"], message: string) {
     super(message);
     this.code = code;
   }
@@ -107,6 +134,15 @@ export type PermissionDecision = "allow" | "ask" | "deny";
 export type PermissionSubject =
   | { readonly type: "file"; readonly path: string }
   | { readonly type: "workspace_path"; readonly path: string }
+  | {
+      readonly type: "patch";
+      readonly version: 1;
+      readonly operations: readonly (
+        | { readonly kind: "create" | "delete" | "update"; readonly path: string }
+        | { readonly kind: "move"; readonly from: string; readonly to: string }
+      )[];
+      readonly digest: string;
+    }
   | {
       readonly type: "command";
       readonly command: string;
@@ -143,7 +179,8 @@ export function createPermissionPolicy(options: {
 
 const readFileInputSchema = z.strictObject({ path: z.string().min(1) });
 const maximumMutationFileBytes = 1024 * 1024;
-const maximumEditArgumentsBytes = 1024 * 1024;
+const maximumEditArgumentsBytes = 512 * 1024;
+const maximumRawEditArgumentsBytes = 2 * 1024 * 1024;
 const textMutationContentSchema = z
   .string()
   .refine((content) => !content.includes("\0"))
@@ -152,26 +189,40 @@ const writeFileInputSchema = z.strictObject({
   path: z.string().min(1),
   content: textMutationContentSchema,
 });
-const editFileInputSchema = z
-  .strictObject({
-    path: z.string().min(1),
-    edits: z
-      .array(
+const patchPathSchema = z
+  .string()
+  .min(1)
+  .refine((path) => !path.includes("\0"));
+const exactTextEditInputSchema = z.strictObject({
+  oldText: textMutationContentSchema.refine((text) => text.length > 0),
+  newText: textMutationContentSchema,
+});
+const editFileInputSchema = z.strictObject({
+  operations: z
+    .array(
+      z.discriminatedUnion("kind", [
         z.strictObject({
-          oldText: textMutationContentSchema.refine((text) => text.length > 0),
-          newText: textMutationContentSchema,
+          kind: z.literal("create"),
+          path: patchPathSchema,
+          content: textMutationContentSchema,
         }),
-      )
-      .min(1),
-  })
-  .refine(
-    (input) =>
-      input.edits.reduce(
-        (total, edit) =>
-          total + Buffer.byteLength(edit.oldText, "utf8") + Buffer.byteLength(edit.newText, "utf8"),
-        0,
-      ) <= maximumEditArgumentsBytes,
-  );
+        z.strictObject({ kind: z.literal("delete"), path: patchPathSchema }),
+        z.strictObject({
+          kind: z.literal("move"),
+          from: patchPathSchema,
+          to: patchPathSchema,
+          edits: z.array(exactTextEditInputSchema).optional(),
+        }),
+        z.strictObject({
+          kind: z.literal("update"),
+          path: patchPathSchema,
+          edits: z.array(exactTextEditInputSchema).min(1),
+        }),
+      ]),
+    )
+    .min(1)
+    .max(32),
+});
 const defaultShellRuntimeLimits: ShellRuntimeLimits = {
   timeoutMs: 120_000,
   terminationGraceMs: 100,
@@ -190,9 +241,30 @@ const writeFileOutputSchema = z.strictObject({
   bytesWritten: z.number().int().nonnegative(),
 });
 const editFileOutputSchema = z.strictObject({
-  path: z.string(),
-  replacements: z.number().int().positive(),
-  bytesWritten: z.number().int().nonnegative(),
+  digest: z.string(),
+  operations: z.array(
+    z.discriminatedUnion("kind", [
+      z.strictObject({
+        kind: z.literal("create"),
+        path: z.string(),
+        bytesWritten: z.number().int().nonnegative(),
+      }),
+      z.strictObject({ kind: z.literal("delete"), path: z.string() }),
+      z.strictObject({
+        kind: z.literal("move"),
+        from: z.string(),
+        to: z.string(),
+        replacements: z.number().int().nonnegative(),
+        bytesWritten: z.number().int().nonnegative(),
+      }),
+      z.strictObject({
+        kind: z.literal("update"),
+        path: z.string(),
+        replacements: z.number().int().positive(),
+        bytesWritten: z.number().int().nonnegative(),
+      }),
+    ]),
+  ),
 });
 const artifactSourceSchema = z.strictObject({
   type: z.literal("tool_output"),
@@ -283,12 +355,24 @@ export function createReadToolRegistry(options: { readonly workspaceRoot: string
 
 export function createMutationToolRegistry(options: {
   readonly workspaceRoot: string;
+  readonly stateRoot?: string;
+}): ToolRegistry {
+  return createMutationToolRegistryInternal(options);
+}
+
+function createMutationToolRegistryInternal(options: {
+  readonly workspaceRoot: string;
+  readonly stateRoot?: string;
+  readonly patchFileSystem?: PatchFileSystem;
 }): ToolRegistry {
   const workspaceRoot = resolve(options.workspaceRoot);
+  const stateRoot = resolve(options.stateRoot ?? defaultStateRoot());
+  const mutationCoordinator = createMutationCoordinator();
   const writeFileAdapter: ToolAdapter = {
     definition: {
       name: "write_file",
-      description: "Create a UTF-8 text file inside the workspace, including missing parents.",
+      description:
+        "Create one new UTF-8 text file inside the workspace, including missing parents. Use edit_file for existing-file or multi-file work.",
       inputSchema: z.toJSONSchema(writeFileInputSchema),
     },
     outputSchema: writeFileOutputSchema,
@@ -342,10 +426,16 @@ export function createMutationToolRegistry(options: {
       };
     },
   };
+  const patchTransaction = createPatchTransaction({
+    workspaceRoot,
+    recoveryStore: createPatchRecoveryStore({ root: join(stateRoot, "patch-recovery") }),
+    ...(options.patchFileSystem === undefined ? {} : { fileSystem: options.patchFileSystem }),
+  });
   const editFileAdapter: ToolAdapter = {
     definition: {
       name: "edit_file",
-      description: "Apply exact text replacements to one existing workspace file.",
+      description:
+        "Apply one structured patch across workspace text files. Use it for existing-file edits or multi-file create, update, delete, and move work.",
       inputSchema: z.toJSONSchema(editFileInputSchema),
     },
     outputSchema: editFileOutputSchema,
@@ -353,134 +443,56 @@ export function createMutationToolRegistry(options: {
     cancellation: "unsupported",
     maximumResult: {},
     prepare(argumentsJson) {
+      if (Buffer.byteLength(argumentsJson, "utf8") > maximumRawEditArgumentsBytes) {
+        return invalidToolInput();
+      }
       const parsedArguments = parseInput(editFileInputSchema, argumentsJson);
       if (!parsedArguments.success) {
         return invalidToolInput();
       }
-      const permissionSubject = preparePermissionSubject(
-        workspaceRoot,
-        parsedArguments.data.path,
-        "file",
-      );
-      if ("status" in permissionSubject) {
-        return permissionSubject;
+      const normalized = normalizePatchOperations(workspaceRoot, parsedArguments.data.operations);
+      if ("status" in normalized) {
+        return normalized;
       }
+      const normalizedArguments = JSON.stringify({ operations: normalized.operations });
+      if (Buffer.byteLength(normalizedArguments, "utf8") > maximumEditArgumentsBytes) {
+        return invalidToolInput();
+      }
+      const canonical = JSON.stringify({ version: 1, operations: normalized.operations });
+      const digest = `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
       return {
         status: "ready",
-        permissionSubject,
-        async execute() {
-          return executeSafely(editFileOutputSchema, async () => {
-            const target = await openConfinedMutationTarget(
-              workspaceRoot,
-              parsedArguments.data.path,
-              false,
-            );
-            try {
-              const file = await open(target.path, constants.O_RDWR);
-              try {
-                await assertOpenedHandleIsConfined(target.canonicalRoot, file);
-                const originalBytes = await readBytesFromHandleBounded(
-                  file,
-                  maximumMutationFileBytes + 1,
-                );
-                if (originalBytes.byteLength > maximumMutationFileBytes) {
-                  throw new ToolExecutionError(
-                    "file_too_large",
-                    "The requested file exceeds the one MiB edit limit.",
-                  );
-                }
-                if (originalBytes.includes(0)) {
-                  throw new ToolExecutionError(
-                    "binary_file",
-                    "The requested file is not supported UTF-8 text.",
-                  );
-                }
-                let originalContent: string;
-                try {
-                  originalContent = new TextDecoder("utf-8", { fatal: true }).decode(originalBytes);
-                  if (
-                    originalBytes[0] === 0xef &&
-                    originalBytes[1] === 0xbb &&
-                    originalBytes[2] === 0xbf
-                  ) {
-                    originalContent = `\uFEFF${originalContent}`;
-                  }
-                } catch {
-                  throw new ToolExecutionError(
-                    "binary_file",
-                    "The requested file is not supported UTF-8 text.",
-                  );
-                }
-                const lineEnding = detectLineEnding(originalContent);
-                const replacements = parsedArguments.data.edits.map((edit) => {
-                  const firstMatch = originalContent.indexOf(edit.oldText);
-                  if (firstMatch === -1) {
-                    throw new ToolExecutionError(
-                      "no_match",
-                      "The edit text was not found in the file.",
-                    );
-                  }
-                  if (originalContent.indexOf(edit.oldText, firstMatch + 1) !== -1) {
-                    throw new ToolExecutionError(
-                      "ambiguous_match",
-                      "The edit text matched more than one location.",
-                    );
-                  }
-                  return {
-                    start: firstMatch,
-                    end: firstMatch + edit.oldText.length,
-                    newText:
-                      lineEnding === undefined
-                        ? edit.newText
-                        : edit.newText.replace(/\r\n|\r|\n/gu, lineEnding),
-                  };
-                });
-                replacements.sort((left, right) => left.start - right.start);
-                for (let index = 1; index < replacements.length; index += 1) {
-                  const prior = replacements[index - 1];
-                  const current = replacements[index];
-                  if (prior !== undefined && current !== undefined && current.start < prior.end) {
-                    throw new ToolExecutionError(
-                      "overlapping_edits",
-                      "The requested edits overlap in the original file.",
-                    );
-                  }
-                }
-                let updatedContent = "";
-                let originalOffset = 0;
-                for (const replacement of replacements) {
-                  updatedContent += originalContent.slice(originalOffset, replacement.start);
-                  updatedContent += replacement.newText;
-                  originalOffset = replacement.end;
-                }
-                updatedContent += originalContent.slice(originalOffset);
-                if (Buffer.byteLength(updatedContent, "utf8") > maximumMutationFileBytes) {
-                  throw new ToolExecutionError(
-                    "file_too_large",
-                    "The updated file exceeds the one MiB edit limit.",
-                  );
-                }
-                const updatedBytes = Buffer.from(updatedContent, "utf8");
-                await file.truncate(0);
-                await writeBytesFully(file, updatedBytes);
-                return {
-                  path: parsedArguments.data.path,
-                  replacements: parsedArguments.data.edits.length,
-                  bytesWritten: updatedBytes.byteLength,
-                };
-              } finally {
-                await file.close();
-              }
-            } finally {
-              await target.parent.close();
+        permissionSubject: {
+          type: "patch",
+          version: 1,
+          operations: normalized.operations.map((operation) => {
+            switch (operation.kind) {
+              case "create":
+              case "delete":
+              case "update":
+                return { kind: operation.kind, path: operation.path };
+              case "move":
+                return { kind: operation.kind, from: operation.from, to: operation.to };
             }
-          });
+            return assertNever(operation);
+          }),
+          digest,
+        },
+        async execute() {
+          return executeSafely(editFileOutputSchema, async () => ({
+            digest,
+            ...(await patchTransaction.execute({ digest, operations: normalized.operations })),
+          }));
         },
       };
     },
   };
+  const coordinatedAdapters = coordinateWriteAdapters(
+    [writeFileAdapter, editFileAdapter],
+    mutationCoordinator,
+  );
   const adapters = new Map(
-    [writeFileAdapter, editFileAdapter].map((adapter) => [adapter.definition.name, adapter]),
+    coordinatedAdapters.map((adapter) => [adapter.definition.name, adapter]),
   );
 
   return {
@@ -493,10 +505,57 @@ export function createMutationToolRegistry(options: {
   };
 }
 
+function coordinateWriteAdapters(
+  adapters: readonly ToolAdapter[],
+  coordinator: MutationCoordinator,
+): readonly ToolAdapter[] {
+  return adapters.map((adapter) => {
+    if (adapter.effect !== "write") {
+      return adapter;
+    }
+    return {
+      ...adapter,
+      prepare(argumentsJson) {
+        const prepared = adapter.prepare(argumentsJson);
+        if (prepared.status !== "ready") {
+          return prepared;
+        }
+        return {
+          ...prepared,
+          execute(context) {
+            return coordinator.run(() => prepared.execute(context));
+          },
+        };
+      },
+    };
+  });
+}
+
 export function createCodingToolRegistry(options: {
   readonly workspaceRoot: string;
+  readonly stateRoot?: string;
   readonly artifactStore?: ArtifactStore;
   readonly shellLimits?: ShellRuntimeLimits;
+}): ToolRegistry {
+  return createCodingToolRegistryInternal(options);
+}
+
+export function createCodingToolRegistryForTesting(options: {
+  readonly workspaceRoot: string;
+  readonly stateRoot?: string;
+  readonly artifactStore?: ArtifactStore;
+  readonly shellLimits?: ShellRuntimeLimits;
+  readonly patchFileSystem: PatchFileSystem;
+}): ToolRegistry {
+  return createCodingToolRegistryInternal(options);
+}
+
+function createCodingToolRegistryInternal(options: {
+  readonly workspaceRoot: string;
+  readonly stateRoot?: string;
+  readonly artifactStore?: ArtifactStore;
+  readonly shellLimits?: ShellRuntimeLimits;
+  readonly patchFileSystem?: PatchFileSystem;
 }): ToolRegistry {
   const workspaceRoot = resolve(options.workspaceRoot);
   const shellLimits = options.shellLimits ?? defaultShellRuntimeLimits;
@@ -506,7 +565,11 @@ export function createCodingToolRegistry(options: {
     timeoutMs: z.number().int().positive().max(shellLimits.timeoutMs).optional(),
   });
   const readTools = createReadToolRegistry({ workspaceRoot });
-  const mutationTools = createMutationToolRegistry({ workspaceRoot });
+  const mutationTools = createMutationToolRegistryInternal({
+    workspaceRoot,
+    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+    ...(options.patchFileSystem === undefined ? {} : { patchFileSystem: options.patchFileSystem }),
+  });
   const shellAdapter: ToolAdapter = {
     definition: {
       name: "run_shell",
@@ -788,6 +851,10 @@ async function finishShellStream(
   }
 }
 
+function defaultStateRoot(): string {
+  return join(homedir(), ".local", "state", "adam-agent");
+}
+
 function assertShellRuntimeLimits(limits: ShellRuntimeLimits): void {
   const values = [
     limits.timeoutMs,
@@ -861,40 +928,6 @@ async function readTextFileBounded(
   }
 }
 
-async function readBytesFromHandleBounded(file: FileHandle, maximumBytes: number): Promise<Buffer> {
-  const buffer = Buffer.alloc(maximumBytes);
-  let totalBytesRead = 0;
-  while (totalBytesRead < buffer.length) {
-    const { bytesRead } = await file.read(
-      buffer,
-      totalBytesRead,
-      buffer.length - totalBytesRead,
-      totalBytesRead,
-    );
-    if (bytesRead === 0) {
-      break;
-    }
-    totalBytesRead += bytesRead;
-  }
-  return buffer.subarray(0, totalBytesRead);
-}
-
-async function writeBytesFully(file: FileHandle, content: Buffer): Promise<void> {
-  let totalBytesWritten = 0;
-  while (totalBytesWritten < content.byteLength) {
-    const { bytesWritten } = await file.write(
-      content,
-      totalBytesWritten,
-      content.byteLength - totalBytesWritten,
-      totalBytesWritten,
-    );
-    if (bytesWritten === 0) {
-      throw new Error("The filesystem made no progress while writing.");
-    }
-    totalBytesWritten += bytesWritten;
-  }
-}
-
 async function executeSafely(
   outputSchema: z.ZodType<JsonValue>,
   operation: () => Promise<JsonValue>,
@@ -909,6 +942,51 @@ async function executeSafely(
     }
     return { status: "completed", output: output.data };
   } catch (error) {
+    if (error instanceof PatchTransactionError) {
+      if (
+        error.code === "patch_recovery_cleanup_failed" &&
+        error.settlement !== undefined &&
+        error.recoveryReference !== undefined
+      ) {
+        return {
+          status: "failed",
+          error: {
+            code: error.code,
+            message: error.message,
+            settlement: error.settlement,
+            recoveryReference: error.recoveryReference,
+          },
+        };
+      }
+      if (
+        error.code === "patch_state_uncertain" &&
+        error.affectedPaths !== undefined &&
+        error.recoveryReference !== undefined
+      ) {
+        return {
+          status: "failed",
+          error: {
+            code: error.code,
+            message: error.message,
+            affectedPaths: error.affectedPaths,
+            recoveryReference: error.recoveryReference,
+          },
+        };
+      }
+      if (error.code === "patch_state_uncertain") {
+        return {
+          status: "failed",
+          error: { code: "tool_io_failed", message: "The patch failure was incomplete." },
+        };
+      }
+      if (error.code === "patch_recovery_cleanup_failed") {
+        return {
+          status: "failed",
+          error: { code: "tool_io_failed", message: "The patch cleanup failure was incomplete." },
+        };
+      }
+      return { status: "failed", error: { code: error.code, message: error.message } };
+    }
     if (error instanceof ToolExecutionError) {
       return { status: "failed", error: { code: error.code, message: error.message } };
     }
@@ -931,16 +1009,87 @@ async function executeSafely(
   }
 }
 
-function detectLineEnding(content: string): "\n" | "\r" | "\r\n" | undefined {
-  const firstCarriageReturn = content.indexOf("\r");
-  const firstLineFeed = content.indexOf("\n");
-  if (firstCarriageReturn === -1 && firstLineFeed === -1) {
-    return undefined;
+function normalizePatchOperations(
+  workspaceRoot: string,
+  operations: z.infer<typeof editFileInputSchema>["operations"],
+): { readonly operations: readonly NormalizedPatchOperation[] } | FailedToolResult {
+  try {
+    const affectedPaths = new Set<string>();
+    const normalized = operations.map((operation): NormalizedPatchOperation => {
+      switch (operation.kind) {
+        case "create": {
+          const path = normalizePatchPath(workspaceRoot, operation.path);
+          assertUnusedPatchPath(affectedPaths, path);
+          return { kind: operation.kind, path, content: operation.content };
+        }
+        case "delete": {
+          const path = normalizePatchPath(workspaceRoot, operation.path);
+          assertUnusedPatchPath(affectedPaths, path);
+          return { kind: operation.kind, path };
+        }
+        case "move": {
+          const from = normalizePatchPath(workspaceRoot, operation.from);
+          const to = normalizePatchPath(workspaceRoot, operation.to);
+          assertUnusedPatchPath(affectedPaths, from);
+          assertUnusedPatchPath(affectedPaths, to);
+          return operation.edits === undefined || operation.edits.length === 0
+            ? { kind: operation.kind, from, to }
+            : { kind: operation.kind, from, to, edits: operation.edits };
+        }
+        case "update": {
+          const path = normalizePatchPath(workspaceRoot, operation.path);
+          assertUnusedPatchPath(affectedPaths, path);
+          return { kind: operation.kind, path, edits: operation.edits };
+        }
+      }
+      return assertNever(operation);
+    });
+    if (affectedPaths.size > 64) {
+      return invalidToolInput();
+    }
+    normalized.sort((left, right) => {
+      const leftKey = patchOperationSortKey(left);
+      const rightKey = patchOperationSortKey(right);
+      return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+    });
+    return { operations: normalized };
+  } catch (error) {
+    if (error instanceof ToolExecutionError) {
+      return { status: "failed", error: { code: error.code, message: error.message } };
+    }
+    return invalidToolInput();
   }
-  if (firstCarriageReturn !== -1 && (firstLineFeed === -1 || firstCarriageReturn < firstLineFeed)) {
-    return content[firstCarriageReturn + 1] === "\n" ? "\r\n" : "\r";
+}
+
+function normalizePatchPath(workspaceRoot: string, path: string): string {
+  const absolutePath = resolveLexicallyConfinedPath(workspaceRoot, path);
+  const normalizedPath = relative(workspaceRoot, absolutePath).split(sep).join("/");
+  if (normalizedPath.length === 0) {
+    throw new TypeError("A patch path must identify a workspace entry.");
   }
-  return "\n";
+  return normalizedPath;
+}
+
+function assertUnusedPatchPath(paths: Set<string>, path: string): void {
+  for (const existingPath of paths) {
+    if (
+      path === existingPath ||
+      path.startsWith(`${existingPath}/`) ||
+      existingPath.startsWith(`${path}/`)
+    ) {
+      throw new ToolExecutionError(
+        "path_conflict",
+        "A normalized patch path participates in more than one operation.",
+      );
+    }
+  }
+  paths.add(path);
+}
+
+function patchOperationSortKey(operation: NormalizedPatchOperation): string {
+  return operation.kind === "move"
+    ? `${operation.kind}\0${operation.from}\0${operation.to}`
+    : `${operation.kind}\0${operation.path}`;
 }
 
 function parseInput<T>(
@@ -1127,6 +1276,10 @@ function resolveLexicallyConfinedPath(workspaceRoot: string, requestedPath: stri
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected tool operation: ${String(value)}`);
 }
 
 function isOutside(root: string, target: string): boolean {

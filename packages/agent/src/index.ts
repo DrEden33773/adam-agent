@@ -893,7 +893,7 @@ export class AgentSession {
       }
       try {
         await this.#store.append({
-          schemaVersion: 1,
+          schemaVersion: 2,
           runId,
           sequence: this.#nextSequence,
           event: canonicalEvent,

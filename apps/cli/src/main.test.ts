@@ -441,12 +441,50 @@ describe("one-shot CLI", () => {
       }).toEqual({
         stdout: "The demo file was updated and verified.\n",
         stderr:
-          'Allow edit_file for "demo.txt" [y/N] Allow run_shell at ".": "test \\"$(cat demo.txt)\\" = after && printf verified" [y/N] ',
+          'Allow edit_file patch (update "demo.txt"; sha256:3140812d57f41d8a7cd3d7631794832d62016234af63f1bc9ea87fc29fd6a441) [y/N] Allow run_shell at ".": "test \\"$(cat demo.txt)\\" = after && printf verified" [y/N] ',
         exitCode: 0,
         signal: null,
         content: "after\n",
         completedTools: ["edit_file", "run_shell"],
         settled: "session_settled",
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("presents one normalized approval for a multi-file patch", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-multi-file-patch-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(workspaceRoot);
+    await writeFile(join(workspaceRoot, "demo.txt"), "before\n", "utf8");
+
+    try {
+      const result = await runCli({
+        cwd: workspaceRoot,
+        stateRoot,
+        prompt: "Apply the demo multi-file patch",
+        stdin: "y\n",
+      });
+      const persistedEvents = await readOnlySessionEvents(stateRoot);
+
+      expect({
+        ...result,
+        demo: await readFile(join(workspaceRoot, "demo.txt"), "utf8"),
+        added: await readFile(join(workspaceRoot, "added.txt"), "utf8"),
+        completedTools: persistedEvents
+          .filter((event) => event.type === "tool_completed")
+          .map((event) => event.name),
+      }).toEqual({
+        stdout: "The demo multi-file patch was applied.\n",
+        stderr:
+          'Allow edit_file patch (create "added.txt", update "demo.txt"; sha256:f408d32c63eb9205adc9635b7cab6f80ac60829806ad07d83e0c400a17e1a1ec) [y/N] ',
+        exitCode: 0,
+        signal: null,
+        demo: "after\n",
+        added: "added\n",
+        completedTools: ["edit_file"],
       });
     } finally {
       await rm(testRoot, { recursive: true, force: true });
