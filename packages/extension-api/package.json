@@ -1,8 +1,13 @@
 {
   "name": "@adam-agent/extension-api",
-  "version": "0.1.0",
+  "version": "0.0.0-bootstrap.0",
   "description": "Versioned public contracts for trusted Adam Agent extensions.",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DrEden33773/adam-agent.git",
+    "directory": "packages/extension-api"
+  },
   "files": [
     "dist",
     "LICENSE",
@@ -20,7 +25,8 @@
   },
   "publishConfig": {
     "access": "public",
-    "provenance": true
+    "provenance": true,
+    "tag": "bootstrap"
   },
   "dependencies": {
     "semver": "7.8.5",
