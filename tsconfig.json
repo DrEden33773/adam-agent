@@ -6,6 +6,7 @@
   "files": [],
   "references": [
     { "path": "./apps/cli" },
+    { "path": "./packages/extension-api" },
     { "path": "./packages/agent" },
     { "path": "./packages/testkit" }
   ]
