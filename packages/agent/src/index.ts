@@ -29,6 +29,16 @@ export {
 } from "./extension-host.js";
 export { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
 export {
+  createModelTargets,
+  ModelTargetError,
+  type ModelTargetIdentity,
+  type ModelTargetReadiness,
+  type ModelTargetSnapshot,
+  type ModelTargets,
+  type ModelTargetsOptions,
+  selectModelTargetId,
+} from "./model-targets.js";
+export {
   OpenAICompatibleModelDriver,
   type OpenAICompatibleModelDriverOptions,
 } from "./openai-compatible-model-driver.js";

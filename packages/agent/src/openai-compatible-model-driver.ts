@@ -98,7 +98,9 @@ export class OpenAICompatibleModelDriver implements ModelDriver {
   }
 
   async *#stream(request: ModelRequest): AsyncIterable<ModelEvent> {
-    const messages = request.messages.map(mapMessage);
+    const messages = request.messages.map((message) =>
+      mapMessage(message, this.#model.startsWith("deepseek-v4-")),
+    );
     const tools: ChatCompletionTool[] = request.tools.map((tool) => ({
       type: "function",
       function: {
@@ -362,6 +364,13 @@ function classifyModelDriverError(
       apiErrorOptions(error, sensitiveValues),
     );
   }
+  if (error instanceof APIError && error.status === 402) {
+    return new ModelDriverError(
+      "billing",
+      "The model provider account has insufficient balance.",
+      apiErrorOptions(error, sensitiveValues),
+    );
+  }
   if (error instanceof APIError && error.status === 403) {
     return new ModelDriverError(
       "authorization",
@@ -376,7 +385,7 @@ function classifyModelDriverError(
       apiErrorOptions(error, sensitiveValues),
     );
   }
-  if (error instanceof APIError && error.status === 400) {
+  if (error instanceof APIError && (error.status === 400 || error.status === 422)) {
     return new ModelDriverError(
       "invalid_request",
       "The model provider rejected the request as invalid.",
@@ -472,7 +481,7 @@ function redactSensitiveValues(value: string, sensitiveValues: readonly string[]
     .reduce((redacted, sensitiveValue) => redacted.split(sensitiveValue).join("[REDACTED]"), value);
 }
 
-function mapMessage(message: ModelMessage): ChatCompletionMessageParam {
+function mapMessage(message: ModelMessage, isDeepSeekV4: boolean): ChatCompletionMessageParam {
   switch (message.role) {
     case "system":
       return { role: "system", content: message.content };
@@ -487,7 +496,11 @@ function mapMessage(message: ModelMessage): ChatCompletionMessageParam {
       return {
         role: "assistant",
         content: message.content,
-        ...(message.reasoning === undefined ? {} : { reasoning_content: message.reasoning }),
+        ...(message.reasoning === undefined
+          ? isDeepSeekV4
+            ? { reasoning_content: "" }
+            : {}
+          : { reasoning_content: message.reasoning }),
         ...(message.toolCalls.length === 0
           ? {}
           : {

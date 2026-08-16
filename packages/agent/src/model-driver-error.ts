@@ -1,6 +1,7 @@
 export const modelDriverErrorCategories = [
   "authentication",
   "authorization",
+  "billing",
   "rate_limit",
   "invalid_request",
   "provider",
