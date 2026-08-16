@@ -10,12 +10,14 @@ import {
   createCodingToolRegistry,
   createFileArtifactStore,
   createJsonlSessionStore,
+  createModelTargets,
   createPermissionPolicy,
   type JsonValue,
   type ModelDriver,
   type ModelMessage,
-  OpenAICompatibleModelDriver,
+  ModelTargetError,
   type RuntimeEvent,
+  selectModelTargetId,
 } from "@adam-agent/agent";
 import { FakeModelDriver } from "@adam-agent/testkit";
 
@@ -144,7 +146,7 @@ const fakeModel = new FakeModelDriver((request) => {
     { type: "finish", reason: "stop" },
   ];
 });
-const model: ModelDriver = selectModel();
+const model: ModelDriver = await selectModel();
 const store = await createJsonlSessionStore({
   stateRoot,
   workspaceRoot,
@@ -369,31 +371,34 @@ function writeText(fileDescriptor: number, text: string): void {
   writeSync(fileDescriptor, text);
 }
 
-function selectModel(): ModelDriver {
-  const {
-    ADAM_AGENT_PROVIDER: provider,
-    DEEPSEEK_API_KEY: apiKey,
-    ADAM_AGENT_MODEL: configuredModel,
-  } = process.env;
-  if (provider === undefined) {
+async function selectModel(): Promise<ModelDriver> {
+  let targetId: string;
+  try {
+    targetId = selectModelTargetId(process.env);
+  } catch (error) {
+    if (error instanceof ModelTargetError) {
+      return failConfiguration(error.message);
+    }
+    throw error;
+  }
+  if (targetId === "fake.local") {
     return fakeModel;
   }
-  if (provider !== "deepseek") {
-    return failConfiguration("ADAM_AGENT_PROVIDER must be unset or deepseek.");
+  const targets = createModelTargets({ environment: process.env });
+  try {
+    return (
+      await targets.resolve({
+        targetId,
+        allowExperimental: false,
+        signal: new AbortController().signal,
+      })
+    ).driver;
+  } catch (error) {
+    if (error instanceof ModelTargetError) {
+      return failConfiguration(error.message);
+    }
+    throw error;
   }
-  if (apiKey === undefined || apiKey.trim().length === 0) {
-    return failConfiguration("DEEPSEEK_API_KEY is required when ADAM_AGENT_PROVIDER=deepseek.");
-  }
-  if (configuredModel !== undefined && configuredModel.trim().length === 0) {
-    return failConfiguration("ADAM_AGENT_MODEL must be non-empty when set.");
-  }
-  return new OpenAICompatibleModelDriver({
-    profile: "deepseek",
-    apiKey,
-    baseURL: "https://api.deepseek.com",
-    model: configuredModel ?? "deepseek-v4-pro",
-    maximumOutputTokens: 32_768,
-  });
 }
 
 function failConfiguration(message: string): never {

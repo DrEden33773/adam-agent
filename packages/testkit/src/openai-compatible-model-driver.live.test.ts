@@ -6,6 +6,7 @@ import {
   AgentSession,
   createCodingToolRegistry,
   createInMemorySessionStore,
+  createModelTargets,
   createPermissionPolicy,
   createReadToolRegistry,
   OpenAICompatibleModelDriver,
@@ -22,6 +23,34 @@ const liveTestsEnabled = liveTestSelection === "1";
 const liveTest = test.skipIf(!liveTestsEnabled || apiKey === undefined || apiKey.length === 0);
 const liveApiKey = apiKey ?? "";
 const model = configuredModel ?? "deepseek-v4-pro";
+
+for (const targetId of ["deepseek-v4-flash.direct", "deepseek-v4-pro.direct"] as const) {
+  liveTest(
+    `completes one answer-only turn through the unified ${targetId} target`,
+    async () => {
+      const { driver } = await createModelTargets({
+        environment: { DEEPSEEK_API_KEY: liveApiKey },
+        deadlineMs: 90_000,
+      }).resolve({
+        targetId,
+        allowExperimental: false,
+        signal: new AbortController().signal,
+      });
+      const session = new AgentSession({
+        model: driver,
+        store: createInMemorySessionStore(),
+      });
+
+      const result = await session.run({ text: "Reply with exactly: adam-unified-live-ok" });
+
+      expect(result.status).toBe("completed");
+      if (result.status === "completed") {
+        expect(result.answer.trim()).toBe("adam-unified-live-ok");
+      }
+    },
+    120_000,
+  );
+}
 
 test.skipIf(!liveTestsEnabled)("requires DEEPSEEK_API_KEY for the live gate", () => {
   expect(liveApiKey.length).toBeGreaterThan(0);

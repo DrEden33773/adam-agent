@@ -44,6 +44,32 @@ describe("one-shot CLI", () => {
     }
   });
 
+  test("fails with copy-pastable guidance when no model target is selected", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-target-missing-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    await mkdir(workspaceRoot);
+
+    try {
+      const result = await runCli({
+        cwd: workspaceRoot,
+        stateRoot: join(testRoot, "state"),
+        prompt: "Hello",
+        stdin: "",
+        omitDefaultTarget: true,
+      });
+
+      expect(result).toEqual({
+        stdout: "",
+        stderr:
+          "No model target selected. Set ADAM_AGENT_TARGET=deepseek-v4-pro.direct or ADAM_AGENT_TARGET=fake.local.\n",
+        exitCode: 1,
+        signal: null,
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
   test("rejects explicit DeepSeek selection when its credential is missing", async () => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-deepseek-missing-key-"));
     const workspaceRoot = join(testRoot, "workspace");
@@ -60,7 +86,8 @@ describe("one-shot CLI", () => {
 
       expect(result).toEqual({
         stdout: "",
-        stderr: "DEEPSEEK_API_KEY is required when ADAM_AGENT_PROVIDER=deepseek.\n",
+        stderr:
+          "DEEPSEEK_API_KEY is required for deepseek-v4-pro.direct. Set it and retry the same target.\n",
         exitCode: 1,
         signal: null,
       });
@@ -76,7 +103,7 @@ describe("one-shot CLI", () => {
     await mkdir(workspaceRoot);
     await writeFile(
       join(workspaceRoot, ".env"),
-      "ADAM_AGENT_PROVIDER=deepseek\nDEEPSEEK_API_KEY=test-dotenv-key\nADAM_AGENT_MODEL=deepseek-dotenv-model\n",
+      "ADAM_AGENT_PROVIDER=deepseek\nDEEPSEEK_API_KEY=test-dotenv-key\nADAM_AGENT_MODEL=deepseek-v4-flash\n",
       "utf8",
     );
     await writeFile(
@@ -117,13 +144,13 @@ describe("one-shot CLI", () => {
         prompt: "Hello",
         stdin: "",
         env: {
-          ADAM_AGENT_MODEL: "deepseek-process-model",
+          ADAM_AGENT_MODEL: "deepseek-v4-pro",
           NODE_OPTIONS: `--import=${fetchHookPath}`,
         },
       });
 
       expect(result).toEqual({
-        stdout: "Selected deepseek-process-model.\n",
+        stdout: "Selected deepseek-v4-pro.\n",
         stderr: "",
         exitCode: 0,
         signal: null,
@@ -158,7 +185,7 @@ describe("one-shot CLI", () => {
     }
   });
 
-  test("selects DeepSeek with the current default model", async () => {
+  test("selects exact DeepSeek targets through the new selector and legacy alias", async () => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-deepseek-selection-"));
     const workspaceRoot = join(testRoot, "workspace");
     const fetchHookPath = join(testRoot, "fetch-hook.mjs");
@@ -213,9 +240,8 @@ describe("one-shot CLI", () => {
         prompt: "Hello",
         stdin: "",
         env: {
-          ADAM_AGENT_PROVIDER: "deepseek",
+          ADAM_AGENT_TARGET: "deepseek-v4-flash.direct",
           DEEPSEEK_API_KEY: "test-deepseek-key",
-          ADAM_AGENT_MODEL: "deepseek-v4-flash",
           NODE_OPTIONS: `--import=${fetchHookPath}`,
         },
       });
@@ -617,6 +643,7 @@ async function runCli(options: {
   readonly prompt: string;
   readonly stdin: string;
   readonly env?: Readonly<Record<string, string>>;
+  readonly omitDefaultTarget?: boolean;
 }): Promise<{
   readonly stdout: string;
   readonly stderr: string;
@@ -636,10 +663,14 @@ async function runCli(options: {
       ],
       {
         cwd: options.cwd,
-        env: cliEnvironment(options.stateRoot, {
-          ADAM_AGENT_CLI_TEST_STDIN: options.stdin,
-          ...options.env,
-        }),
+        env: cliEnvironment(
+          options.stateRoot,
+          {
+            ADAM_AGENT_CLI_TEST_STDIN: options.stdin,
+            ...options.env,
+          },
+          options.omitDefaultTarget !== true,
+        ),
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
@@ -663,14 +694,27 @@ async function runCli(options: {
 function cliEnvironment(
   stateRoot: string,
   additional: Readonly<Record<string, string>> = {},
+  includeDefaultTarget = true,
 ): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = { ...process.env };
-  for (const name of ["ADAM_AGENT_PROVIDER", "DEEPSEEK_API_KEY", "ADAM_AGENT_MODEL"] as const) {
+  const { ADAM_AGENT_MODEL, ADAM_AGENT_PROVIDER, ADAM_AGENT_TARGET } = additional;
+  for (const name of [
+    "ADAM_AGENT_TARGET",
+    "ADAM_AGENT_PROVIDER",
+    "DEEPSEEK_API_KEY",
+    "ADAM_AGENT_MODEL",
+  ] as const) {
     delete environment[name];
   }
   return {
     ...environment,
     ADAM_AGENT_STATE_ROOT: stateRoot,
+    ...(includeDefaultTarget &&
+    ADAM_AGENT_TARGET === undefined &&
+    ADAM_AGENT_PROVIDER === undefined &&
+    ADAM_AGENT_MODEL === undefined
+      ? { ADAM_AGENT_TARGET: "fake.local" }
+      : {}),
     ...additional,
   };
 }

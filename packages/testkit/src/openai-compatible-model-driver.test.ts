@@ -414,6 +414,36 @@ describe("OpenAICompatibleModelDriver", () => {
     });
   });
 
+  test("classifies documented DeepSeek insufficient-balance responses", async () => {
+    const error = await collectDriverError(402, {
+      message: "Insufficient balance",
+      type: "billing_error",
+      code: "insufficient_balance",
+    });
+
+    expect(error).toMatchObject({
+      category: "billing",
+      status: 402,
+      providerCode: "insufficient_balance",
+      responseSummary: "Insufficient balance",
+    });
+  });
+
+  test("classifies documented DeepSeek HTTP 422 as an invalid request", async () => {
+    const error = await collectDriverError(422, {
+      message: "Invalid parameters",
+      type: "invalid_request_error",
+      code: "invalid_parameters",
+    });
+
+    expect(error).toMatchObject({
+      category: "invalid_request",
+      status: 422,
+      providerCode: "invalid_parameters",
+      responseSummary: "Invalid parameters",
+    });
+  });
+
   test("classifies a DeepSeek server response", async () => {
     const error = await collectDriverError(503, {
       message: "Service unavailable",
@@ -902,6 +932,55 @@ describe("OpenAICompatibleModelDriver", () => {
         ],
       },
     ]);
+  });
+
+  test("the Direct V4 baseline backfills empty reasoning for assistant tool history", async () => {
+    const requests: Array<{ readonly messages: readonly unknown[] }> = [];
+    const driver = new OpenAICompatibleModelDriver({
+      profile: "deepseek",
+      apiKey: "test-deepseek-key",
+      baseURL: "https://deepseek.invalid",
+      model: "deepseek-v4-pro",
+      maximumOutputTokens: 4_096,
+      fetch: async (_input, init) => {
+        const body = JSON.parse(String(init?.body)) as { readonly messages: readonly unknown[] };
+        requests.push({ messages: body.messages });
+        return new Response(answerOnlyStream, {
+          headers: { "content-type": "text/event-stream" },
+          status: 200,
+        });
+      },
+    });
+
+    await collect(
+      driver.stream({
+        messages: [
+          { role: "user", content: "Read the README." },
+          {
+            role: "assistant",
+            content: "",
+            toolCalls: [
+              { id: "read-project", name: "read_file", argumentsJson: '{"path":"README.md"}' },
+            ],
+          },
+        ],
+        tools: [],
+        signal: new AbortController().signal,
+      }),
+    );
+
+    expect(requests[0]?.messages[1]).toEqual({
+      role: "assistant",
+      content: "",
+      reasoning_content: "",
+      tool_calls: [
+        {
+          id: "read-project",
+          type: "function",
+          function: { name: "read_file", arguments: '{"path":"README.md"}' },
+        },
+      ],
+    });
   });
 
   test("normalizes interleaved fragmented tool calls in stable index order", async () => {
