@@ -61,7 +61,7 @@ describe("one-shot CLI", () => {
       expect(result).toEqual({
         stdout: "",
         stderr:
-          "No model target selected. Set ADAM_AGENT_TARGET=deepseek-v4-pro.direct or ADAM_AGENT_TARGET=fake.local.\n",
+          "No model target selected. Set ADAM_AGENT_TARGET=deepseek-v4-flash.direct or ADAM_AGENT_TARGET=fake.local.\n",
         exitCode: 1,
         signal: null,
       });
