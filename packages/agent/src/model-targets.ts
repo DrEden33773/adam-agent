@@ -98,7 +98,7 @@ export function selectModelTargetId(
   }
   throw new ModelTargetError(
     "target_not_selected",
-    "No model target selected. Set ADAM_AGENT_TARGET=deepseek-v4-pro.direct or ADAM_AGENT_TARGET=fake.local.",
+    "No model target selected. Set ADAM_AGENT_TARGET=deepseek-v4-flash.direct or ADAM_AGENT_TARGET=fake.local.",
   );
 }
 
