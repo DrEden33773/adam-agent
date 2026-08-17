@@ -454,6 +454,72 @@ test("JSONL SessionStore rejects a non-canonical persisted event", async () => {
   }
 });
 
+test.each(["invalid UTF-8", "torn final line"] as const)(
+  "JSONL SessionStore rejects %s with the bounded line reader",
+  async (damage) => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-bounded-line-reader-"));
+    const stateRoot = join(testRoot, "state");
+    const workspaceRoot = join(testRoot, "workspace");
+    await mkdir(workspaceRoot);
+    const store = await createJsonlSessionStore({
+      stateRoot,
+      workspaceRoot,
+      sessionId: "session-bounded-line-reader",
+    });
+
+    try {
+      const storedPaths = await readdir(stateRoot, { recursive: true });
+      const sessionRelativePath = storedPaths.find((path) => path.endsWith(".jsonl"));
+      if (sessionRelativePath === undefined) {
+        throw new Error("The JSONL session file was not created.");
+      }
+      const validLine = JSON.stringify({
+        schemaVersion: 2,
+        runId,
+        sequence: 1,
+        event: { type: "user_message", text: "valid" },
+      });
+      await writeFile(
+        join(stateRoot, sessionRelativePath),
+        damage === "torn final line"
+          ? Buffer.from(validLine, "utf8")
+          : Buffer.concat([Buffer.from(validLine.slice(0, -2), "utf8"), Buffer.from([0xff, 0x0a])]),
+      );
+
+      await expect(store.read()).rejects.toMatchObject({
+        name: "SessionStoreError",
+        code: "session_log_invalid",
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test("JSONL SessionStore persists and reopens a canonical log above 8 MiB", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-expanded-session-store-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const options = { stateRoot, workspaceRoot, sessionId: "session-expanded" } as const;
+  const store = await createJsonlSessionStore<SessionEventRecord>(options);
+  const text = "j".repeat(450 * 1024);
+
+  try {
+    for (let index = 1; index <= 20; index += 1) {
+      await store.append({
+        schemaVersion: 2,
+        runId,
+        sequence: index,
+        event: { type: "user_message", text },
+      });
+    }
+    expect(await store.read()).toHaveLength(20);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("JSONL SessionStore rejects an oversized restored log before parsing records", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-oversized-session-store-"));
   const stateRoot = join(testRoot, "state");
@@ -471,7 +537,7 @@ test("JSONL SessionStore rejects an oversized restored log before parsing record
     if (sessionRelativePath === undefined) {
       throw new Error("The JSONL session file was not created.");
     }
-    await writeFile(join(stateRoot, sessionRelativePath), "x".repeat(8 * 1024 * 1024 + 1), "utf8");
+    await writeFile(join(stateRoot, sessionRelativePath), "x".repeat(32 * 1024 * 1024 + 1), "utf8");
 
     await expect(store.read()).rejects.toMatchObject({
       name: "SessionStoreError",
@@ -571,7 +637,7 @@ test("SessionStore adapters reject the first append beyond the readable log boun
 
   try {
     for (const [name, store] of stores) {
-      for (let sequence = 1; sequence <= 8; sequence += 1) {
+      for (let sequence = 1; sequence <= 35; sequence += 1) {
         await store.append({
           schemaVersion: 1,
           runId,
@@ -583,7 +649,7 @@ test("SessionStore adapters reject the first append beyond the readable log boun
         store.append({
           schemaVersion: 1,
           runId,
-          sequence: 9,
+          sequence: 36,
           event: { type: "model_message_completed", text: boundedText },
         }),
         name,
@@ -591,7 +657,7 @@ test("SessionStore adapters reject the first append beyond the readable log boun
         name: "SessionStoreError",
         code: "session_log_too_large",
       });
-      expect(await store.read(), name).toHaveLength(8);
+      expect(await store.read(), name).toHaveLength(35);
     }
   } finally {
     await rm(testRoot, { recursive: true, force: true });

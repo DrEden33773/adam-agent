@@ -511,8 +511,11 @@ async function continueAndPresent(
   process.once("SIGINT", handleInterrupt);
   try {
     const continued = await lifecycle.continue({ ...input, signal: abortController.signal });
-    if (continued.result.status === "completed") {
+    if (continued.result.status === "completed" || continued.result.status === "incomplete") {
       writeText(1, `${continued.result.answer}\n`);
+      if (continued.result.status === "incomplete") {
+        process.exitCode = 1;
+      }
     } else {
       writeText(2, `${continued.result.error.message}\n`);
       process.exitCode = continued.result.status === "cancelled" && interrupted ? 130 : 1;

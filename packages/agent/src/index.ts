@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { ArtifactStore, ModelResponseArtifactSource } from "./artifact-store.js";
 import { type ContextProfile, resolveOrdinaryMaximumOutputTokens } from "./context-profile.js";
 import {
   type ContextCallUsage,
@@ -18,7 +19,9 @@ import {
 import { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
 import {
   type AgentSessionDurableContext,
+  type AgentSessionDurableOutputLimits,
   sessionDurableContext,
+  sessionDurableOutputLimits,
 } from "./session-durable-context.js";
 
 export {
@@ -93,6 +96,8 @@ export {
 import {
   type CanonicalRuntimeEvent,
   isSessionRecordWithinSizeLimit,
+  type SessionModelResponse,
+  type SessionModelResponseField,
   type SessionRecord,
   type SessionStore,
   type SessionToolIntent,
@@ -221,6 +226,11 @@ export type RunResult =
       readonly answer: string;
     }
   | {
+      readonly status: "incomplete";
+      readonly reason: "output_limit";
+      readonly answer: string;
+    }
+  | {
       readonly status: "cancelled";
       readonly error: {
         readonly code: "session_cancelled";
@@ -236,6 +246,8 @@ export type RunResult =
               | "model_protocol_invalid"
               | "model_output_truncated"
               | "model_content_filtered"
+              | "model_response_artifact_quota_exceeded"
+              | "model_response_too_large"
               | "replay_envelope_too_large"
               | "invalid_run_limits"
               | "run_already_active"
@@ -403,6 +415,7 @@ export type RuntimeEventListener = (event: RuntimeEvent) => void;
 class SessionPersistenceError extends Error {}
 
 type AgentSessionBaseDependencies = {
+  readonly artifactStore?: ArtifactStore;
   readonly model: ModelDriver;
   readonly tools?: ToolRegistry;
   readonly permissions?: PermissionPolicy;
@@ -423,10 +436,12 @@ export type AgentSessionDependencies = AgentSessionBaseDependencies &
 
 export class AgentSession {
   readonly #listeners = new Set<RuntimeEventListener>();
+  readonly #artifactStore: ArtifactStore | undefined;
   readonly #model: ModelDriver;
   readonly #tools: ToolRegistry | undefined;
   readonly #permissions: PermissionPolicy | undefined;
   readonly #durableContext: AgentSessionDurableContext | undefined;
+  readonly #durableOutputLimits: Required<AgentSessionDurableOutputLimits>;
   readonly #contextProfile: ContextProfile | undefined;
   readonly #maximumOutputTokens: number;
   readonly #store: SessionStore<SessionRecord>;
@@ -439,6 +454,10 @@ export class AgentSession {
   #contextWindowNumber = 0;
   #lastContextCheckpoint: { readonly checkpointId: string; readonly sequence: number } | undefined;
   #terminalResult: RunResult | undefined;
+  #latestDurableResponse:
+    | { readonly sequence: number; readonly artifactBacked: boolean }
+    | undefined;
+  #referencedModelResponseArtifactBytes: number;
   #pendingPermission:
     | {
         readonly requestId: string;
@@ -447,11 +466,33 @@ export class AgentSession {
     | undefined;
 
   constructor(dependencies: AgentSessionDependencies) {
+    this.#artifactStore = dependencies.artifactStore;
     this.#durableContext = (
       dependencies as AgentSessionDependencies & {
         readonly [sessionDurableContext]?: AgentSessionDurableContext;
       }
     )[sessionDurableContext];
+    const configuredDurableOutputLimits = (
+      dependencies as AgentSessionDependencies & {
+        readonly [sessionDurableOutputLimits]?: AgentSessionDurableOutputLimits;
+      }
+    )[sessionDurableOutputLimits];
+    this.#durableOutputLimits = {
+      maximumInlineFieldBytes:
+        configuredDurableOutputLimits?.maximumInlineFieldBytes ??
+        defaultMaximumInlineModelResponseFieldBytes,
+      maximumReferencedArtifactBytes:
+        configuredDurableOutputLimits?.maximumReferencedArtifactBytes ??
+        defaultMaximumReferencedModelResponseArtifactBytes,
+      maximumResponseContentBytes:
+        configuredDurableOutputLimits?.maximumResponseContentBytes ??
+        defaultMaximumModelResponseContentBytes,
+    };
+    if (!Object.values(this.#durableOutputLimits).every((value) => isPositiveSafeInteger(value))) {
+      throw new RangeError("Durable model-response limits must be positive safe integers.");
+    }
+    this.#referencedModelResponseArtifactBytes =
+      this.#durableContext?.referencedModelResponseArtifactBytes ?? 0;
     this.#contextProfile = dependencies.contextProfile;
     const maximumOutputTokens =
       dependencies.contextProfile?.maximumOutputTokens ?? dependencies.maximumOutputTokens;
@@ -737,8 +778,10 @@ export class AgentSession {
       if (signal.aborted) {
         return this.#settleCancelled();
       }
-      let answer = "";
-      let reasoning = "";
+      const answerChunks: string[] = [];
+      const reasoningChunks: string[] = [];
+      let answerBytes = 0;
+      let reasoningBytes = 0;
       let finishReason:
         | "stop"
         | "tool_calls"
@@ -750,6 +793,7 @@ export class AgentSession {
       let rawFinishReason: string | undefined;
       let protocolError: string | undefined;
       let replayEnvelopeTooLarge = false;
+      let responseContentTooLarge = false;
       let usageWasReported = false;
       let responseUsage:
         | {
@@ -777,28 +821,33 @@ export class AgentSession {
           }
           switch (event.type) {
             case "text_delta":
+              {
+                const deltaBytes = Buffer.byteLength(event.text, "utf8");
+                if (
+                  answerBytes + reasoningBytes + deltaBytes >
+                  this.#durableOutputLimits.maximumResponseContentBytes
+                ) {
+                  responseContentTooLarge = true;
+                  break;
+                }
+                answerBytes += deltaBytes;
+                answerChunks.push(event.text);
+                await this.#emit({ type: "model_message_delta", text: event.text });
+              }
+              break;
+            case "reasoning_delta": {
+              const deltaBytes = Buffer.byteLength(event.text, "utf8");
               if (
-                this.#durableContext !== undefined &&
-                Buffer.byteLength(answer, "utf8") + Buffer.byteLength(event.text, "utf8") >
-                  maximumReplayFieldBytes
+                answerBytes + reasoningBytes + deltaBytes >
+                this.#durableOutputLimits.maximumResponseContentBytes
               ) {
-                replayEnvelopeTooLarge = true;
+                responseContentTooLarge = true;
                 break;
               }
-              answer += event.text;
-              await this.#emit({ type: "model_message_delta", text: event.text });
+              reasoningBytes += deltaBytes;
+              reasoningChunks.push(event.text);
               break;
-            case "reasoning_delta":
-              if (
-                this.#durableContext !== undefined &&
-                Buffer.byteLength(reasoning, "utf8") + Buffer.byteLength(event.text, "utf8") >
-                  maximumReplayFieldBytes
-              ) {
-                replayEnvelopeTooLarge = true;
-                break;
-              }
-              reasoning += event.text;
-              break;
+            }
             case "tool_call_start":
               if (
                 this.#durableContext !== undefined &&
@@ -908,13 +957,20 @@ export class AgentSession {
               rawFinishReason = event.rawReason;
               break;
           }
-          if (signal.aborted || finishReason !== undefined || replayEnvelopeTooLarge) {
+          if (
+            signal.aborted ||
+            finishReason !== undefined ||
+            replayEnvelopeTooLarge ||
+            responseContentTooLarge
+          ) {
             break;
           }
         }
       } catch (error) {
         streamError = error;
       }
+      const answer = answerChunks.join("");
+      const reasoning = reasoningChunks.join("");
 
       if (signal.aborted) {
         return this.#settleCancelled();
@@ -980,6 +1036,10 @@ export class AgentSession {
         return this.#settleReplayEnvelopeTooLarge();
       }
 
+      if (responseContentTooLarge) {
+        return this.#settleModelResponseTooLarge();
+      }
+
       if (finishReason === undefined) {
         return this.#settleIncompleteStream();
       }
@@ -989,7 +1049,30 @@ export class AgentSession {
       }
 
       if (finishReason === "length") {
-        return this.#settleOutputTruncated();
+        const persisted = await this.#persistDurableModelResponse({
+          answer,
+          reasoning,
+          answerBytes,
+          reasoningBytes,
+          toolCalls: [],
+          toolIntents: [],
+          finishReason,
+          usage: responseUsage,
+          turn: modelTurns,
+          attempt: attemptNumber,
+        });
+        if (persisted === "artifact_quota_exceeded") {
+          return this.#settleModelResponseArtifactQuotaExceeded();
+        }
+        if (persisted === "replay_envelope_too_large") {
+          return this.#settleReplayEnvelopeTooLarge();
+        }
+        nextAttemptNumber = 1;
+        await this.#emit({ type: "model_message_completed", text: answer });
+        if (signal.aborted) {
+          return this.#settleCancelled();
+        }
+        return this.#settle({ status: "incomplete", reason: "output_limit", answer });
       }
       if (finishReason === "content_filter") {
         return this.#settleContentFiltered();
@@ -1036,31 +1119,23 @@ export class AgentSession {
       }
       const toolIntents = completedCalls.map((call) => this.#createToolIntent(call));
 
-      if (this.#durableContext !== undefined) {
-        const completedResponseRecord: SessionRecord = {
-          schemaVersion: 3,
-          sequence: this.#nextSequence,
-          record: {
-            type: "model_response_completed",
-            runId: this.#activeRunId as string,
-            turn: modelTurns,
-            attempt: attemptNumber,
-            targetIdentity: this.#durableContext.targetIdentity,
-            response: {
-              text: answer,
-              ...(reasoning.length === 0 ? {} : { reasoning }),
-              toolCalls: completedCalls,
-              toolIntents,
-              finishReason,
-              ...(responseUsage === undefined ? {} : { usage: responseUsage }),
-            },
-          },
-        };
-        if (!isSessionRecordWithinSizeLimit(completedResponseRecord)) {
-          return this.#settleReplayEnvelopeTooLarge();
-        }
-        await this.#appendRecord(completedResponseRecord);
-        this.#activeProviderAttempt = undefined;
+      const persisted = await this.#persistDurableModelResponse({
+        answer,
+        reasoning,
+        answerBytes,
+        reasoningBytes,
+        toolCalls: completedCalls,
+        toolIntents,
+        finishReason,
+        usage: responseUsage,
+        turn: modelTurns,
+        attempt: attemptNumber,
+      });
+      if (persisted === "artifact_quota_exceeded") {
+        return this.#settleModelResponseArtifactQuotaExceeded();
+      }
+      if (persisted === "replay_envelope_too_large") {
+        return this.#settleReplayEnvelopeTooLarge();
       }
       nextAttemptNumber = 1;
       await this.#emit({ type: "model_message_completed", text: answer });
@@ -1579,6 +1654,28 @@ export class AgentSession {
     return this.#settle(result);
   }
 
+  async #settleModelResponseTooLarge(): Promise<RunResult> {
+    const result: RunResult = {
+      status: "failed",
+      error: {
+        code: "model_response_too_large",
+        message: "The model response exceeded Adam's 64 MiB text and reasoning limit.",
+      },
+    };
+    return this.#settle(result);
+  }
+
+  async #settleModelResponseArtifactQuotaExceeded(): Promise<RunResult> {
+    const result: RunResult = {
+      status: "failed",
+      error: {
+        code: "model_response_artifact_quota_exceeded",
+        message: "The session exceeded Adam's logical model-response artifact quota.",
+      },
+    };
+    return this.#settle(result);
+  }
+
   async #settleModelRequestFailed(error: ModelDriverError): Promise<RunResult> {
     const result: RunResult = {
       status: "failed",
@@ -1598,17 +1695,6 @@ export class AgentSession {
     const result: RunResult = {
       status: "failed",
       error: { code: "model_protocol_invalid", message },
-    };
-    return this.#settle(result);
-  }
-
-  async #settleOutputTruncated(): Promise<RunResult> {
-    const result: RunResult = {
-      status: "failed",
-      error: {
-        code: "model_output_truncated",
-        message: "The model response reached its output-token limit.",
-      },
     };
     return this.#settle(result);
   }
@@ -1727,6 +1813,29 @@ export class AgentSession {
     if (interrupted) {
       await this.#emit({ type: "session_interrupted", reason: "cancelled" });
     }
+    if (
+      (result.status === "completed" || result.status === "incomplete") &&
+      this.#durableContext !== undefined &&
+      this.#latestDurableResponse?.artifactBacked === true
+    ) {
+      const settlement =
+        result.status === "completed"
+          ? ({ status: "completed" } as const)
+          : ({ status: "incomplete", reason: result.reason } as const);
+      await this.#appendRecord({
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "run_settled",
+          recordVersion: 1,
+          runId: this.#activeRunId as string,
+          responseSequence: this.#latestDurableResponse.sequence,
+          ...settlement,
+        },
+      });
+      this.#publish({ type: "session_settled", result });
+      return result;
+    }
     await this.#emit({ type: "session_settled", result });
     return result;
   }
@@ -1830,6 +1939,28 @@ export class AgentSession {
   }
 
   async #emit(event: RuntimeEvent): Promise<void> {
+    if (
+      event.type === "model_message_completed" &&
+      this.#durableContext !== undefined &&
+      this.#latestDurableResponse?.artifactBacked === true
+    ) {
+      const runId = this.#activeRunId;
+      if (runId === undefined) {
+        throw new Error("Cannot persist a session event without an active run ID.");
+      }
+      await this.#appendRecord({
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "model_response_published",
+          recordVersion: 1,
+          runId,
+          responseSequence: this.#latestDurableResponse.sequence,
+        },
+      });
+      this.#publish(event);
+      return;
+    }
     if (event.type !== "model_message_delta") {
       const canonicalEvent: CanonicalRuntimeEvent = event;
       const runId = this.#activeRunId;
@@ -1886,6 +2017,190 @@ export class AgentSession {
       throw new SessionPersistenceError();
     }
     this.#nextSequence += 1;
+  }
+
+  async #persistDurableModelResponse(input: {
+    readonly answer: string;
+    readonly reasoning: string;
+    readonly answerBytes: number;
+    readonly reasoningBytes: number;
+    readonly toolCalls: readonly ToolCall[];
+    readonly toolIntents: readonly SessionToolIntent[];
+    readonly finishReason: "length" | "stop" | "tool_calls";
+    readonly usage:
+      | {
+          readonly inputTokens: number;
+          readonly outputTokens: number;
+          readonly reasoningTokens?: number;
+          readonly cachedInputTokens?: number;
+          readonly cacheMissInputTokens?: number;
+        }
+      | undefined;
+    readonly turn: number;
+    readonly attempt: number;
+  }): Promise<"artifact_quota_exceeded" | "persisted" | "replay_envelope_too_large"> {
+    const durableContext = this.#durableContext;
+    if (durableContext === undefined) {
+      return "persisted";
+    }
+    const responseSequence = this.#nextSequence;
+    const responseFields = {
+      toolCalls: input.toolCalls,
+      toolIntents: input.toolIntents,
+      ...(input.usage === undefined ? {} : { usage: input.usage }),
+    };
+    const inlineResponse: SessionModelResponse =
+      input.finishReason === "length"
+        ? {
+            recordVersion: 2,
+            text: { storage: "inline", text: input.answer },
+            ...(input.reasoning.length === 0
+              ? {}
+              : { reasoning: { storage: "inline", text: input.reasoning } as const }),
+            ...responseFields,
+            finishReason: "length",
+          }
+        : {
+            text: input.answer,
+            ...(input.reasoning.length === 0 ? {} : { reasoning: input.reasoning }),
+            ...responseFields,
+            finishReason: input.finishReason,
+          };
+    const candidateInlineRecord: SessionRecord = {
+      schemaVersion: 3,
+      sequence: responseSequence,
+      record: {
+        type: "model_response_completed",
+        runId: this.#activeRunId as string,
+        turn: input.turn,
+        attempt: input.attempt,
+        targetIdentity: durableContext.targetIdentity,
+        response: inlineResponse,
+      },
+    };
+    const spillResponseGroup = !isSessionRecordWithinSizeLimit(candidateInlineRecord);
+    const useVersionedResponse =
+      input.finishReason === "length" ||
+      spillResponseGroup ||
+      input.answerBytes > this.#durableOutputLimits.maximumInlineFieldBytes ||
+      input.reasoningBytes > this.#durableOutputLimits.maximumInlineFieldBytes;
+    let response = inlineResponse;
+    let referencedArtifactBytes = 0;
+    if (useVersionedResponse) {
+      referencedArtifactBytes =
+        (input.answer.length > 0 &&
+        (spillResponseGroup ||
+          input.answerBytes > this.#durableOutputLimits.maximumInlineFieldBytes)
+          ? input.answerBytes
+          : 0) +
+        (input.reasoning.length > 0 &&
+        (spillResponseGroup ||
+          input.reasoningBytes > this.#durableOutputLimits.maximumInlineFieldBytes)
+          ? input.reasoningBytes
+          : 0);
+      if (
+        this.#referencedModelResponseArtifactBytes + referencedArtifactBytes >
+        this.#durableOutputLimits.maximumReferencedArtifactBytes
+      ) {
+        return "artifact_quota_exceeded";
+      }
+      const text = await this.#createDurableResponseField(
+        input.answer,
+        "text",
+        input.turn,
+        input.attempt,
+        spillResponseGroup && input.answer.length > 0,
+      );
+      const reasoning =
+        input.reasoning.length === 0
+          ? undefined
+          : await this.#createDurableResponseField(
+              input.reasoning,
+              "reasoning",
+              input.turn,
+              input.attempt,
+              spillResponseGroup,
+            );
+      response = {
+        recordVersion: 2,
+        text,
+        ...(reasoning === undefined ? {} : { reasoning }),
+        ...responseFields,
+        finishReason: input.finishReason,
+      };
+    }
+    const completedResponseRecord: SessionRecord = {
+      schemaVersion: 3,
+      sequence: responseSequence,
+      record: {
+        type: "model_response_completed",
+        runId: this.#activeRunId as string,
+        turn: input.turn,
+        attempt: input.attempt,
+        targetIdentity: durableContext.targetIdentity,
+        response,
+      },
+    };
+    if (!isSessionRecordWithinSizeLimit(completedResponseRecord)) {
+      return "replay_envelope_too_large";
+    }
+    await this.#appendRecord(completedResponseRecord);
+    this.#referencedModelResponseArtifactBytes += referencedArtifactBytes;
+    this.#latestDurableResponse = {
+      sequence: responseSequence,
+      artifactBacked:
+        response.recordVersion === 2 &&
+        (response.text.storage === "artifact" || response.reasoning?.storage === "artifact"),
+    };
+    this.#activeProviderAttempt = undefined;
+    return "persisted";
+  }
+
+  async #createDurableResponseField(
+    text: string,
+    field: ModelResponseArtifactSource["field"],
+    turn: number,
+    attempt: number,
+    forceArtifact = false,
+  ): Promise<SessionModelResponseField> {
+    const bytes = Buffer.from(text, "utf8");
+    if (!forceArtifact && bytes.byteLength <= this.#durableOutputLimits.maximumInlineFieldBytes) {
+      return { storage: "inline", text };
+    }
+    const artifactStore = this.#artifactStore;
+    const durableContext = this.#durableContext;
+    const runId = this.#activeRunId;
+    if (
+      artifactStore === undefined ||
+      durableContext?.projectId === undefined ||
+      durableContext.sessionId === undefined ||
+      runId === undefined
+    ) {
+      throw new SessionPersistenceError();
+    }
+    try {
+      return {
+        storage: "artifact",
+        reference: await artifactStore.write({
+          bytes,
+          mediaType: "text/plain; charset=utf-8",
+          source: {
+            type: "model_response",
+            schemaVersion: 1,
+            field,
+            projectId: durableContext.projectId,
+            sessionId: durableContext.sessionId,
+            runId,
+            turn,
+            attempt,
+            targetIdentity: durableContext.targetIdentity,
+            provenance: "provider_model_response",
+          },
+        }),
+      };
+    } catch {
+      throw new SessionPersistenceError();
+    }
   }
 
   #createToolIntent(call: ToolCall): SessionToolIntent {
@@ -2026,6 +2341,9 @@ function mergeContextCallUsages(
 }
 
 const maximumReplayFieldBytes = 512 * 1024;
+const defaultMaximumInlineModelResponseFieldBytes = 256 * 1024;
+const defaultMaximumModelResponseContentBytes = 64 * 1024 * 1024;
+const defaultMaximumReferencedModelResponseArtifactBytes = 512 * 1024 * 1024;
 const maximumReplayToolCalls = 128;
 
 function samePermissionInput(left: PermissionPolicyInput, right: PermissionPolicyInput): boolean {

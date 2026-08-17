@@ -11,17 +11,16 @@ import { APICallError } from "@ai-sdk/provider";
 import type { ModelDriver, ModelEvent, ModelRequest } from "./index.js";
 import { ModelDriverError } from "./model-driver-error.js";
 
-const maximumNormalizedTextBytes = 512 * 1024;
-const maximumNormalizedReasoningBytes = 512 * 1024;
+const maximumNormalizedContentBytes = 64 * 1024 * 1024;
 const maximumToolArgumentBytes = 2 * 1024 * 1024;
 const maximumToolCallCount = 128;
 const maximumToolCallIdBytes = 1_024;
 const maximumToolNameBytes = 256;
-const maximumStreamPartCount = 100_000;
+const maximumStreamPartCount = 2_000_000;
 
 type StreamNormalization = {
-  textBytes: number;
-  reasoningBytes: number;
+  activeToolCallIds: Set<string>;
+  contentBytes: number;
   toolArgumentBytes: number;
   toolCallCount: number;
   streamPartCount: number;
@@ -51,16 +50,23 @@ export class AiSdkModelDriver implements ModelDriver {
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
     const attemptController = new AbortController();
     let deadlineExpired = false;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     const abortFromCaller = () => attemptController.abort(request.signal.reason);
     if (request.signal.aborted) {
       abortFromCaller();
     } else {
       request.signal.addEventListener("abort", abortFromCaller, { once: true });
     }
-    const deadlineTimer = setTimeout(() => {
-      deadlineExpired = true;
-      attemptController.abort(new Error("The model provider request reached its deadline."));
-    }, this.#deadlineMs);
+    const armDeadline = () => {
+      if (deadlineTimer !== undefined) {
+        clearTimeout(deadlineTimer);
+      }
+      deadlineTimer = setTimeout(() => {
+        deadlineExpired = true;
+        attemptController.abort(new Error("The model provider request reached its deadline."));
+      }, this.#deadlineMs);
+    };
+    armDeadline();
     try {
       const result = await this.#model.doStream({
         prompt: mapPrompt(request),
@@ -82,8 +88,8 @@ export class AiSdkModelDriver implements ModelDriver {
       });
 
       const normalization: StreamNormalization = {
-        textBytes: 0,
-        reasoningBytes: 0,
+        activeToolCallIds: new Set(),
+        contentBytes: 0,
         toolArgumentBytes: 0,
         toolCallCount: 0,
         streamPartCount: 0,
@@ -91,7 +97,16 @@ export class AiSdkModelDriver implements ModelDriver {
       for await (const part of result.stream) {
         normalization.streamPartCount += 1;
         assertWithinLimit(normalization.streamPartCount, maximumStreamPartCount);
-        yield* mapStreamPart(part, normalization);
+        const events = [...mapStreamPart(part, normalization)];
+        if (part.type === "finish") {
+          if (deadlineTimer !== undefined) {
+            clearTimeout(deadlineTimer);
+            deadlineTimer = undefined;
+          }
+        } else if (isAcceptedProgressPart(part)) {
+          armDeadline();
+        }
+        yield* events;
       }
       if (deadlineExpired) {
         throw new ModelDriverError("timeout", "The model provider request reached its deadline.", {
@@ -114,7 +129,9 @@ export class AiSdkModelDriver implements ModelDriver {
       }
       throw classifyAiSdkError(error, this.#sensitiveValues);
     } finally {
-      clearTimeout(deadlineTimer);
+      if (deadlineTimer !== undefined) {
+        clearTimeout(deadlineTimer);
+      }
       request.signal.removeEventListener("abort", abortFromCaller);
     }
   }
@@ -192,18 +209,18 @@ function* mapStreamPart(
     case "reasoning-end":
       return;
     case "text-delta":
-      normalization.textBytes = addBytesWithinLimit(
-        normalization.textBytes,
+      normalization.contentBytes = addBytesWithinLimit(
+        normalization.contentBytes,
         part.delta,
-        maximumNormalizedTextBytes,
+        maximumNormalizedContentBytes,
       );
       yield { type: "text_delta", text: part.delta };
       return;
     case "reasoning-delta":
-      normalization.reasoningBytes = addBytesWithinLimit(
-        normalization.reasoningBytes,
+      normalization.contentBytes = addBytesWithinLimit(
+        normalization.contentBytes,
         part.delta,
-        maximumNormalizedReasoningBytes,
+        maximumNormalizedContentBytes,
       );
       yield { type: "reasoning_delta", text: part.delta };
       return;
@@ -215,9 +232,16 @@ function* mapStreamPart(
       assertWithinLimit(normalization.toolCallCount, maximumToolCallCount);
       assertWithinLimit(Buffer.byteLength(part.id, "utf8"), maximumToolCallIdBytes);
       assertWithinLimit(Buffer.byteLength(part.toolName, "utf8"), maximumToolNameBytes);
+      if (normalization.activeToolCallIds.has(part.id)) {
+        throw invalidToolStreamError();
+      }
+      normalization.activeToolCallIds.add(part.id);
       yield { type: "tool_call_start", id: part.id, name: part.toolName };
       return;
     case "tool-input-delta":
+      if (!normalization.activeToolCallIds.has(part.id)) {
+        throw invalidToolStreamError();
+      }
       normalization.toolArgumentBytes = addBytesWithinLimit(
         normalization.toolArgumentBytes,
         part.delta,
@@ -226,6 +250,9 @@ function* mapStreamPart(
       yield { type: "tool_call_delta", id: part.id, json: part.delta };
       return;
     case "tool-input-end":
+      if (!normalization.activeToolCallIds.delete(part.id)) {
+        throw invalidToolStreamError();
+      }
       yield { type: "tool_call_end", id: part.id };
       return;
     case "tool-call":
@@ -271,6 +298,28 @@ function* mapStreamPart(
     default:
       throw unsupportedPromptError(part.type);
   }
+}
+
+function isAcceptedProgressPart(part: LanguageModelV4StreamPart): boolean {
+  switch (part.type) {
+    case "text-delta":
+    case "reasoning-delta":
+    case "tool-input-delta":
+      return Buffer.byteLength(part.delta, "utf8") > 0;
+    case "tool-input-start":
+    case "tool-input-end":
+      return true;
+    default:
+      return false;
+  }
+}
+
+function invalidToolStreamError(): ModelDriverError {
+  return new ModelDriverError(
+    "protocol_incompatibility",
+    "The model provider returned an invalid tool-call stream sequence.",
+    { cause: undefined },
+  );
 }
 
 function addBytesWithinLimit(current: number, value: string, maximum: number): number {

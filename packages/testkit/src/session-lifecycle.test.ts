@@ -614,10 +614,11 @@ test("SessionLifecycle branches to an explicit compatible exact target only when
         status: 200,
       }),
   });
+  const currentTargetIdentity = { ...targetIdentity, profileVersion: 2 };
 
   try {
     const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
-    const parent = await lifecycle.create({ targetIdentity });
+    const parent = await lifecycle.create({ targetIdentity: currentTargetIdentity });
     const parentRun = await lifecycle.continue({
       sessionId: parent.sessionId,
       input: { text: "Establish compatible DeepSeek history" },
@@ -634,7 +635,7 @@ test("SessionLifecycle branches to an explicit compatible exact target only when
       sessionId: expect.any(String),
       projectId: parent.projectId,
       targetIdentity: {
-        ...targetIdentity,
+        ...currentTargetIdentity,
         targetId: "deepseek-v4-pro.direct",
         modelId: "deepseek-v4-pro",
       },
@@ -1461,7 +1462,7 @@ test("SessionLifecycle completes a durable run-terminal intent instead of starti
   }
 });
 
-test("SessionLifecycle fails explicitly instead of truncating replay-critical reasoning", async () => {
+test("SessionLifecycle artifactizes replay-critical reasoning instead of truncating it", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-replay-overflow-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -1505,30 +1506,26 @@ test("SessionLifecycle fails explicitly instead of truncating replay-critical re
       ),
     );
 
-    expect({ continued, completedResponses }).toEqual({
-      continued: {
-        result: {
-          status: "failed",
-          error: {
-            code: "replay_envelope_too_large",
-            message: "The complete model response exceeds the durable replay envelope limit.",
-          },
-        },
-        snapshot: expect.objectContaining({
-          status: "settled",
-          run: expect.objectContaining({
-            result: {
-              status: "failed",
-              error: {
-                code: "replay_envelope_too_large",
-                message: "The complete model response exceeds the durable replay envelope limit.",
-              },
-            },
-          }),
-        }),
+    expect(continued).toMatchObject({
+      result: { status: "completed", answer: "" },
+      snapshot: {
+        status: "settled",
+        run: { result: { status: "completed", answer: "" } },
       },
-      completedResponses: [],
     });
+    expect(completedResponses).toHaveLength(1);
+    const completedResponse = completedResponses[0];
+    if (
+      completedResponse?.schemaVersion !== 3 ||
+      completedResponse.record.type !== "model_response_completed" ||
+      completedResponse.record.response.recordVersion !== 2 ||
+      completedResponse.record.response.reasoning?.storage !== "artifact"
+    ) {
+      throw new Error("Expected artifact-backed replay-critical reasoning.");
+    }
+    expect(completedResponse.record.response.reasoning.reference.byteCount).toBe(
+      Buffer.byteLength(oversizedReasoning, "utf8"),
+    );
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

@@ -15,6 +15,7 @@ import {
   type RuntimeEvent,
   selectModelTargetId,
 } from "@adam-agent/agent";
+import { AiSdkModelDriverForTesting } from "@adam-agent/agent/internal-testing";
 import { expect, test, vi } from "vitest";
 
 test("an exact Direct DeepSeek target returns a public answer-only model driver", async () => {
@@ -42,7 +43,7 @@ test("an exact Direct DeepSeek target returns a public answer-only model driver"
     resolved.driver.stream({
       messages: [{ role: "user", content: "Introduce yourself" }],
       tools: [],
-      maximumOutputTokens: 12_345,
+      maximumOutputTokens: resolved.contextProfile.maximumOutputTokens,
       signal: new AbortController().signal,
     }),
   );
@@ -53,7 +54,7 @@ test("an exact Direct DeepSeek target returns a public answer-only model driver"
       vendor: "deepseek",
       modelId: "deepseek-v4-flash",
       route: "direct",
-      profileVersion: 1,
+      profileVersion: 2,
       certification: "certified",
     },
     requests: [
@@ -62,7 +63,7 @@ test("an exact Direct DeepSeek target returns a public answer-only model driver"
         body: expect.objectContaining({
           model: "deepseek-v4-flash",
           messages: [{ role: "user", content: "Introduce yourself" }],
-          max_tokens: 12_345,
+          max_tokens: 384_000,
           stream: true,
         }),
       },
@@ -532,7 +533,7 @@ test("the unified driver preserves caller cancellation while a provider request 
   });
 });
 
-test("the unified driver owns one deadline across the complete provider stream", async () => {
+test("the unified driver enforces the first-response deadline", async () => {
   vi.useFakeTimers();
   try {
     let reportStarted = (): void => undefined;
@@ -574,6 +575,284 @@ test("the unified driver owns one deadline across the complete provider stream",
       category: "timeout",
       message: "The model provider request reached its deadline.",
     });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("the unified driver resets inactivity only after accepted non-empty progress", async () => {
+  vi.useFakeTimers();
+  try {
+    let streamController: ReadableStreamDefaultController<unknown> | undefined;
+    let reportStreamReady = (): void => undefined;
+    const streamReady = new Promise<void>((resolve) => {
+      reportStreamReady = resolve;
+    });
+    const model = {
+      specificationVersion: "v4",
+      provider: "test",
+      modelId: "progress-timeout",
+      supportedUrls: {},
+      async doGenerate() {
+        throw new Error("Generation is not used by this test.");
+      },
+      async doStream(options: { readonly abortSignal?: AbortSignal }) {
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              streamController = controller;
+              options.abortSignal?.addEventListener(
+                "abort",
+                () => controller.error(options.abortSignal?.reason),
+                { once: true },
+              );
+              reportStreamReady();
+            },
+          }),
+        };
+      },
+    } as unknown as ConstructorParameters<typeof AiSdkModelDriverForTesting>[0]["model"];
+    const driver = new AiSdkModelDriverForTesting({
+      model,
+      maximumOutputTokens: 4_096,
+      deadlineMs: 1_000,
+      sensitiveValues: [],
+    });
+    const iterator = driver
+      .stream({
+        maximumOutputTokens: 4_096,
+        messages: [{ role: "user", content: "Keep progressing." }],
+        tools: [],
+        signal: new AbortController().signal,
+      })
+      [Symbol.asyncIterator]();
+    const firstEvent = iterator.next();
+    await streamReady;
+    await vi.advanceTimersByTimeAsync(900);
+    streamController?.enqueue({ type: "text-delta", id: "text-0", delta: "a" });
+    await expect(firstEvent).resolves.toEqual({
+      done: false,
+      value: { type: "text_delta", text: "a" },
+    });
+
+    const completion = iterator.next();
+    await vi.advanceTimersByTimeAsync(900);
+    streamController?.close();
+    await expect(completion).resolves.toEqual({ done: true, value: undefined });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("the unified driver does not reset inactivity for metadata or empty deltas", async () => {
+  vi.useFakeTimers();
+  try {
+    let streamController: ReadableStreamDefaultController<unknown> | undefined;
+    let reportStreamReady = (): void => undefined;
+    const streamReady = new Promise<void>((resolve) => {
+      reportStreamReady = resolve;
+    });
+    const model = {
+      specificationVersion: "v4",
+      provider: "test",
+      modelId: "non-progress-timeout",
+      supportedUrls: {},
+      async doGenerate() {
+        throw new Error("Generation is not used by this test.");
+      },
+      async doStream(options: { readonly abortSignal?: AbortSignal }) {
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              streamController = controller;
+              options.abortSignal?.addEventListener(
+                "abort",
+                () => controller.error(options.abortSignal?.reason),
+                { once: true },
+              );
+              reportStreamReady();
+            },
+          }),
+        };
+      },
+    } as unknown as ConstructorParameters<typeof AiSdkModelDriverForTesting>[0]["model"];
+    const driver = new AiSdkModelDriverForTesting({
+      model,
+      maximumOutputTokens: 4_096,
+      deadlineMs: 1_000,
+      sensitiveValues: [],
+    });
+    const iterator = driver
+      .stream({
+        maximumOutputTokens: 4_096,
+        messages: [{ role: "user", content: "Ignore non-progress." }],
+        tools: [],
+        signal: new AbortController().signal,
+      })
+      [Symbol.asyncIterator]();
+    const emptyEvent = iterator.next();
+    await streamReady;
+    await vi.advanceTimersByTimeAsync(900);
+    streamController?.enqueue({ type: "response-metadata" });
+    await vi.advanceTimersByTimeAsync(50);
+    streamController?.enqueue({ type: "text-delta", id: "text-0", delta: "" });
+    await expect(emptyEvent).resolves.toEqual({
+      done: false,
+      value: { type: "text_delta", text: "" },
+    });
+
+    const timeout = iterator.next();
+    const timeoutExpectation = expect(timeout).rejects.toMatchObject({ category: "timeout" });
+    await vi.advanceTimersByTimeAsync(50);
+    await timeoutExpectation;
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("valid tool-state transitions keep a long provider stream alive", async () => {
+  vi.useFakeTimers();
+  try {
+    let streamController: ReadableStreamDefaultController<unknown> | undefined;
+    let reportStreamReady = (): void => undefined;
+    const streamReady = new Promise<void>((resolve) => {
+      reportStreamReady = resolve;
+    });
+    const model = {
+      specificationVersion: "v4",
+      provider: "test",
+      modelId: "tool-progress-timeout",
+      supportedUrls: {},
+      async doGenerate() {
+        throw new Error("Generation is not used by this test.");
+      },
+      async doStream(options: { readonly abortSignal?: AbortSignal }) {
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              streamController = controller;
+              options.abortSignal?.addEventListener(
+                "abort",
+                () => controller.error(options.abortSignal?.reason),
+                { once: true },
+              );
+              reportStreamReady();
+            },
+          }),
+        };
+      },
+    } as unknown as ConstructorParameters<typeof AiSdkModelDriverForTesting>[0]["model"];
+    const driver = new AiSdkModelDriverForTesting({
+      model,
+      maximumOutputTokens: 4_096,
+      deadlineMs: 1_000,
+      sensitiveValues: [],
+    });
+    const iterator = driver
+      .stream({
+        maximumOutputTokens: 4_096,
+        messages: [{ role: "user", content: "Call a tool slowly." }],
+        tools: [],
+        signal: new AbortController().signal,
+      })
+      [Symbol.asyncIterator]();
+    const started = iterator.next();
+    await streamReady;
+    await vi.advanceTimersByTimeAsync(900);
+    streamController?.enqueue({
+      type: "tool-input-start",
+      id: "call-1",
+      toolName: "read_file",
+    });
+    await expect(started).resolves.toMatchObject({
+      done: false,
+      value: { type: "tool_call_start", id: "call-1" },
+    });
+
+    const ended = iterator.next();
+    await vi.advanceTimersByTimeAsync(900);
+    streamController?.enqueue({ type: "tool-input-end", id: "call-1" });
+    await expect(ended).resolves.toMatchObject({
+      done: false,
+      value: { type: "tool_call_end", id: "call-1" },
+    });
+
+    const completion = iterator.next();
+    await vi.advanceTimersByTimeAsync(900);
+    streamController?.close();
+    await expect(completion).resolves.toEqual({ done: true, value: undefined });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test("a finish part settles before a simultaneous inactivity deadline", async () => {
+  vi.useFakeTimers();
+  try {
+    let streamController: ReadableStreamDefaultController<unknown> | undefined;
+    let reportStreamReady = (): void => undefined;
+    const streamReady = new Promise<void>((resolve) => {
+      reportStreamReady = resolve;
+    });
+    const model = {
+      specificationVersion: "v4",
+      provider: "test",
+      modelId: "finish-timeout-race",
+      supportedUrls: {},
+      async doGenerate() {
+        throw new Error("Generation is not used by this test.");
+      },
+      async doStream(options: { readonly abortSignal?: AbortSignal }) {
+        return {
+          stream: new ReadableStream({
+            start(controller) {
+              streamController = controller;
+              options.abortSignal?.addEventListener(
+                "abort",
+                () => controller.error(options.abortSignal?.reason),
+                { once: true },
+              );
+              reportStreamReady();
+            },
+          }),
+        };
+      },
+    } as unknown as ConstructorParameters<typeof AiSdkModelDriverForTesting>[0]["model"];
+    const driver = new AiSdkModelDriverForTesting({
+      model,
+      maximumOutputTokens: 4_096,
+      deadlineMs: 1_000,
+      sensitiveValues: [],
+    });
+    const iterator = driver
+      .stream({
+        maximumOutputTokens: 4_096,
+        messages: [{ role: "user", content: "Finish at the boundary." }],
+        tools: [],
+        signal: new AbortController().signal,
+      })
+      [Symbol.asyncIterator]();
+    const usage = iterator.next();
+    await streamReady;
+    await vi.advanceTimersByTimeAsync(999);
+    streamController?.enqueue({
+      type: "finish",
+      finishReason: { unified: "stop", raw: "stop" },
+      usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } },
+    });
+    await expect(usage).resolves.toMatchObject({
+      done: false,
+      value: { type: "usage", inputTokens: 1, outputTokens: 1 },
+    });
+    await expect(iterator.next()).resolves.toMatchObject({
+      done: false,
+      value: { type: "finish", reason: "stop" },
+    });
+
+    const completion = iterator.next();
+    await vi.advanceTimersByTimeAsync(1_000);
+    streamController?.close();
+    await expect(completion).resolves.toEqual({ done: true, value: undefined });
   } finally {
     vi.useRealTimers();
   }
@@ -623,7 +902,7 @@ test("the unified driver makes one external attempt when DeepSeek returns a retr
   });
 });
 
-test("the unified driver rejects normalized text beyond Adam's stream limit", async () => {
+test("the unified driver accepts normalized text above the former 512 KiB field limit", async () => {
   const oversizedText = "x".repeat(512 * 1024 + 1);
   const targets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
@@ -645,7 +924,7 @@ test("the unified driver rejects normalized text beyond Adam's stream limit", as
     signal: new AbortController().signal,
   });
 
-  const error = await collectError(
+  const events = await collect(
     driver.stream({
       maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Answer" }],
@@ -654,26 +933,43 @@ test("the unified driver rejects normalized text beyond Adam's stream limit", as
     }),
   );
 
-  expect(error).toMatchObject({
-    category: "protocol_incompatibility",
-    message: "The model provider response exceeded Adam's stream limit.",
-  });
+  expect(events.length).toBeGreaterThanOrEqual(1);
+  expect(events[0]).toMatchObject({ type: "text_delta" });
+  expect(events[0]?.type === "text_delta" ? events[0].text.length : 0).toBe(oversizedText.length);
 });
 
-test.each([
-  {
-    name: "reasoning",
-    stream: () => oversizedReasoningDeepSeekStream,
-  },
-  {
-    name: "tool arguments",
-    stream: () => oversizedToolArgumentsDeepSeekStream,
-  },
-])("the unified driver rejects oversized $name", async ({ stream }) => {
+test("the unified driver accepts reasoning above the former 512 KiB field limit", async () => {
   const targets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
     fetch: async () =>
-      new Response(stream(), {
+      new Response(oversizedReasoningDeepSeekStream, {
+        headers: { "content-type": "text/event-stream" },
+        status: 200,
+      }),
+  });
+  const { driver } = await targets.resolve({
+    targetId: "deepseek-v4-pro.direct",
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+
+  const events = await collect(
+    driver.stream({
+      maximumOutputTokens: 4_096,
+      messages: [{ role: "user", content: "Answer" }],
+      tools: [],
+      signal: new AbortController().signal,
+    }),
+  );
+  const reasoning = events.find((event) => event.type === "reasoning_delta");
+  expect(reasoning?.type === "reasoning_delta" ? reasoning.text.length : 0).toBe(512 * 1024 + 1);
+});
+
+test("the unified driver retains the independent tool-argument stream limit", async () => {
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async () =>
+      new Response(oversizedToolArgumentsDeepSeekStream, {
         headers: { "content-type": "text/event-stream" },
         status: 200,
       }),
@@ -699,6 +995,60 @@ test.each([
   });
 });
 
+test("the unified driver counts every Provider V4 part against the 2,000,000 part ceiling", async () => {
+  const createDriver = (partCount: number) => {
+    let emitted = 0;
+    const model = {
+      specificationVersion: "v4",
+      provider: "test",
+      modelId: "part-count",
+      supportedUrls: {},
+      async doGenerate() {
+        throw new Error("Generation is not used by this test.");
+      },
+      async doStream() {
+        return {
+          stream: new ReadableStream({
+            pull(controller) {
+              if (emitted === partCount) {
+                controller.close();
+                return;
+              }
+              emitted += 1;
+              controller.enqueue({ type: "response-metadata" });
+            },
+          }),
+        };
+      },
+    } as unknown as ConstructorParameters<typeof AiSdkModelDriverForTesting>[0]["model"];
+    return {
+      driver: new AiSdkModelDriverForTesting({
+        model,
+        maximumOutputTokens: 4_096,
+        deadlineMs: 120_000,
+        sensitiveValues: [],
+      }),
+      emitted: () => emitted,
+    };
+  };
+  const request = {
+    maximumOutputTokens: 4_096,
+    messages: [{ role: "user", content: "Count parts." }] as const,
+    tools: [],
+    signal: new AbortController().signal,
+  };
+  const accepted = createDriver(2_000_000);
+  await expect(collect(accepted.driver.stream(request))).resolves.toEqual([]);
+  expect(accepted.emitted()).toBe(2_000_000);
+
+  const rejected = createDriver(2_000_001);
+  await expect(collectError(rejected.driver.stream(request))).resolves.toMatchObject({
+    category: "protocol_incompatibility",
+    message: "The model provider response exceeded Adam's stream limit.",
+  });
+  expect(rejected.emitted()).toBe(2_000_001);
+});
+
 test("the target snapshot reports exact Certified identities and safe credential readiness", async () => {
   const targets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-secret-key" },
@@ -717,15 +1067,17 @@ test("the target snapshot reports exact Certified identities and safe credential
           vendor: "deepseek",
           modelId: "deepseek-v4-flash",
           route: "direct",
-          profileVersion: 1,
+          profileVersion: 2,
           certification: "certified",
         },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
         contextProfile: {
-          version: 1,
+          version: 2,
           contextWindowTokens: 1_000_000,
-          maximumOutputTokens: 32_768,
-          compactAtTokens: 800_000,
+          maximumOutputTokens: 384_000,
+          ordinaryOutputReserveTokens: 4_096,
+          compactionSummaryMaximumOutputTokens: 32_768,
+          compactAtTokens: 900_000,
           postCompactTargetTokens: 200_000,
           retainedTargetTokens: 20_000,
           estimatorVersion: 1,
@@ -737,15 +1089,17 @@ test("the target snapshot reports exact Certified identities and safe credential
           vendor: "deepseek",
           modelId: "deepseek-v4-pro",
           route: "direct",
-          profileVersion: 1,
+          profileVersion: 2,
           certification: "certified",
         },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
         contextProfile: {
-          version: 1,
+          version: 2,
           contextWindowTokens: 1_000_000,
-          maximumOutputTokens: 32_768,
-          compactAtTokens: 800_000,
+          maximumOutputTokens: 384_000,
+          ordinaryOutputReserveTokens: 4_096,
+          compactionSummaryMaximumOutputTokens: 32_768,
+          compactAtTokens: 900_000,
           postCompactTargetTokens: 200_000,
           retainedTargetTokens: 20_000,
           estimatorVersion: 1,
@@ -778,29 +1132,39 @@ test("the target snapshot reports exact Certified identities and safe credential
   expect(snapshot.targets.every(({ identity }) => Object.isFrozen(identity))).toBe(true);
 });
 
-test("the prepared Direct DeepSeek v2 profile is not selectable before B5.5b", async () => {
+test("current Direct DeepSeek v2 selection retains exact historical v1 resolution", async () => {
   const targets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
   });
-  const resolution = targets.resolve({
+  const current = await targets.resolve({
+    targetId: "deepseek-v4-flash.direct",
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+  const historical = await targets.resolve({
     targetId: "deepseek-v4-flash.direct",
     targetIdentity: {
-      targetId: "deepseek-v4-flash.direct",
-      vendor: "deepseek",
-      modelId: "deepseek-v4-flash",
-      route: "direct",
-      profileVersion: 2,
-      certification: "certified",
+      ...current.identity,
+      profileVersion: 1,
     },
     allowExperimental: false,
     signal: new AbortController().signal,
   });
 
-  await expect(resolution).rejects.toMatchObject({ code: "target_not_found" });
+  expect(current).toMatchObject({
+    identity: { profileVersion: 2 },
+    contextProfile: { version: 2, maximumOutputTokens: 384_000 },
+  });
+  expect(historical).toMatchObject({
+    identity: { profileVersion: 1 },
+    contextProfile: { version: 1, maximumOutputTokens: 32_768 },
+  });
   await expect(
     targets.snapshot({ includeHistoricalProfiles: true, signal: new AbortController().signal }),
   ).resolves.toMatchObject({
     targets: [
+      { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 2 } },
+      { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 2 } },
       { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 1 } },
       { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 1 } },
       { identity: { targetId: "poolside-laguna-s-2.1-free.gateway", profileVersion: 1 } },

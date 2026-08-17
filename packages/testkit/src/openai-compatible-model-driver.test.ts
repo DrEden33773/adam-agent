@@ -96,20 +96,16 @@ describe("OpenAICompatibleModelDriver", () => {
 
     expect({ result, settled: records.at(-1)?.event }).toEqual({
       result: {
-        status: "failed",
-        error: {
-          code: "model_output_truncated",
-          message: "The model response reached its output-token limit.",
-        },
+        status: "incomplete",
+        reason: "output_limit",
+        answer: "Partial",
       },
       settled: {
         type: "session_settled",
         result: {
-          status: "failed",
-          error: {
-            code: "model_output_truncated",
-            message: "The model response reached its output-token limit.",
-          },
+          status: "incomplete",
+          reason: "output_limit",
+          answer: "Partial",
         },
       },
     });
