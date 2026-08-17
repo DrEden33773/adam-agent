@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  type ContextProfile,
   createCodingToolRegistry,
   createJsonlSessionStore,
   createModelTargets,
@@ -31,6 +32,16 @@ const targetIdentity: ModelTargetIdentity = {
   route: "direct",
   profileVersion: 1,
   certification: "certified",
+};
+
+const testContextProfile: ContextProfile = {
+  version: 1,
+  contextWindowTokens: 1_000_000,
+  maximumOutputTokens: 32_768,
+  compactAtTokens: 800_000,
+  postCompactTargetTokens: 200_000,
+  retainedTargetTokens: 20_000,
+  estimatorVersion: 1,
 };
 
 const lifecycleOwnerFixturePath = fileURLToPath(
@@ -296,7 +307,7 @@ test("SessionLifecycle continues a branch from its referenced parent context", a
   });
   const modelTargets: ModelTargets = {
     async resolve() {
-      return { identity: targetIdentity, driver };
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
     },
     async snapshot() {
       return {
@@ -304,6 +315,7 @@ test("SessionLifecycle continues a branch from its referenced parent context", a
           {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
           },
         ],
       };
@@ -372,7 +384,7 @@ test("SessionLifecycle retains inherited branch context across a cold continuati
   });
   const modelTargets: ModelTargets = {
     async resolve() {
-      return { identity: targetIdentity, driver };
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
     },
     async snapshot() {
       return {
@@ -380,6 +392,7 @@ test("SessionLifecycle retains inherited branch context across a cold continuati
           {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
           },
         ],
       };
@@ -520,7 +533,7 @@ test("SessionLifecycle rejects an incompatible retarget hidden behind an empty b
   ]);
   const modelTargets: ModelTargets = {
     async resolve() {
-      return { identity: targetIdentity, driver };
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
     },
     async snapshot() {
       return {
@@ -528,10 +541,12 @@ test("SessionLifecycle rejects an incompatible retarget hidden behind an empty b
           {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
           },
           {
             identity: incompatibleTarget,
             readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
           },
         ],
       };
@@ -728,7 +743,11 @@ test("SessionLifecycle branches completed failed and cancelled runs without reop
     };
     const cancellingTargets: ModelTargets = {
       async resolve() {
-        return { identity: targetIdentity, driver: cancellingDriver };
+        return {
+          identity: targetIdentity,
+          driver: cancellingDriver,
+          contextProfile: testContextProfile,
+        };
       },
       async snapshot() {
         return {
@@ -736,6 +755,7 @@ test("SessionLifecycle branches completed failed and cancelled runs without reop
             {
               identity: targetIdentity,
               readiness: { status: "available", credentialSource: "deterministic test adapter" },
+              contextProfile: testContextProfile,
             },
           ],
         };
@@ -896,6 +916,26 @@ test("SessionLifecycle durably completes a canonical provider response while kee
           inputTokens: 7,
           outputTokens: 3,
           totalTokens: 10,
+        },
+        {
+          type: "context_usage",
+          ordinary: {
+            inputTokens: 7,
+            outputTokens: 3,
+            reasoningTokens: 0,
+            cachedInputTokens: 0,
+            cacheMissInputTokens: 0,
+            unknownCalls: 0,
+          },
+          compaction: {
+            inputTokens: 0,
+            outputTokens: 0,
+            reasoningTokens: 0,
+            cachedInputTokens: 0,
+            cacheMissInputTokens: 0,
+            unknownCalls: 0,
+          },
+          active: { source: "provider_reported", tokens: 7, throughSequence: 6 },
         },
         { type: "model_message_completed", text: "Hello, Adam." },
         {
@@ -1298,7 +1338,7 @@ test("SessionLifecycle fails explicitly instead of truncating replay-critical re
   ]);
   const modelTargets: ModelTargets = {
     async resolve() {
-      return { identity: targetIdentity, driver };
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
     },
     async snapshot() {
       return {
@@ -1306,6 +1346,7 @@ test("SessionLifecycle fails explicitly instead of truncating replay-critical re
           {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
           },
         ],
       };
@@ -1374,7 +1415,7 @@ test("SessionLifecycle classifies an oversized complete response batch as replay
   ]);
   const modelTargets: ModelTargets = {
     async resolve() {
-      return { identity: targetIdentity, driver };
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
     },
     async snapshot() {
       return {
@@ -1382,6 +1423,7 @@ test("SessionLifecycle classifies an oversized complete response batch as replay
           {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
           },
         ],
       };
@@ -1656,6 +1698,26 @@ test("SessionLifecycle cold continuation interrupts the old attempt and reuses i
           outputTokens: 3,
           totalTokens: 10,
         },
+        {
+          type: "context_usage",
+          ordinary: {
+            inputTokens: 7,
+            outputTokens: 3,
+            reasoningTokens: 0,
+            cachedInputTokens: 0,
+            cacheMissInputTokens: 0,
+            unknownCalls: 0,
+          },
+          compaction: {
+            inputTokens: 0,
+            outputTokens: 0,
+            reasoningTokens: 0,
+            cachedInputTokens: 0,
+            cacheMissInputTokens: 0,
+            unknownCalls: 0,
+          },
+          active: { source: "provider_reported", tokens: 7, throughSequence: 9 },
+        },
         { type: "model_message_completed", text: "Hello, Adam." },
         {
           type: "session_settled",
@@ -1680,7 +1742,7 @@ test("SessionLifecycle retains reported token usage from an interrupted provider
   });
   const modelTargets: ModelTargets = {
     async resolve() {
-      return { identity: targetIdentity, driver };
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
     },
     async snapshot() {
       return {
@@ -1688,6 +1750,7 @@ test("SessionLifecycle retains reported token usage from an interrupted provider
           {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
           },
         ],
       };

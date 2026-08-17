@@ -1,3 +1,4 @@
+import type { ContextEvidenceV1 } from "./durable-context.js";
 import type { ModelMessage } from "./index.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import type { PermissionPolicyInput, ToolCall, ToolResult } from "./tool-runtime.js";
@@ -5,6 +6,7 @@ import type { PermissionPolicyInput, ToolCall, ToolResult } from "./tool-runtime
 export const sessionDurableContext = Symbol("adam-agent.session-durable-context");
 
 export type AgentSessionDurableContext = {
+  readonly inheritedEvidence?: ContextEvidenceV1 | undefined;
   readonly initialMessages?: readonly ModelMessage[];
   readonly nextSequence: number;
   readonly targetIdentity: ModelTargetIdentity;
@@ -14,6 +16,7 @@ export type AgentSessionDurableContext = {
     readonly nextTurn: number;
     readonly nextAttempt: number;
     readonly reportedTokens: number;
+    readonly compactionUsageUnknown: boolean;
     readonly toolResults: readonly {
       readonly call: ToolCall;
       readonly result: ToolResult;

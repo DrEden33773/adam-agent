@@ -1,8 +1,15 @@
 /** Tests only. This internal fault-injection surface has no compatibility promise. */
 
+export { type ContextProfile, sessionContextProfile } from "./context-profile.js";
+export { digestContextRecordPrefix } from "./durable-context.js";
 export type { PatchFileSystem } from "./patch-transaction.js";
+export { sessionDurableContext } from "./session-durable-context.js";
 export {
   openJsonlSessionStore,
+  type SessionContextCompactionCommittedRecord,
+  type SessionContextCompactionFailedRecord,
+  type SessionContextCompactionInterruptedRecord,
+  type SessionContextCompactionStartedRecord,
   type SessionGenesisRecord,
   type SessionModelResponseCompletedRecord,
   type SessionProviderAttemptInterruptedRecord,

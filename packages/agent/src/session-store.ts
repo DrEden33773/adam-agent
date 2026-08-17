@@ -5,6 +5,8 @@ import { join } from "node:path";
 
 import { valid } from "semver";
 import { z } from "zod";
+import type { ContextProfile } from "./context-profile.js";
+import type { ContextCallUsage, ContextEvidenceV1, ContextSummaryV1 } from "./durable-context.js";
 import type { RunResult, RuntimeEvent } from "./index.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
@@ -120,6 +122,7 @@ export type SessionProviderAttemptInterruptedRecord = {
     readonly attempt: number;
   } & (
     | { readonly reason: "process_restart"; readonly result?: never }
+    | { readonly reason: "context_overflow"; readonly result?: never }
     | { readonly reason: "run_terminal"; readonly result: RunResult }
   );
 };
@@ -169,12 +172,101 @@ export type SessionRuntimeEventRecord = {
   };
 };
 
+export type SessionContextCompactionStartedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "context_compaction_started";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly attemptId: string;
+    readonly attemptNumber: number;
+    readonly windowNumber: number;
+    readonly trigger: "automatic_threshold" | "provider_overflow";
+    readonly sourceThrough: number;
+    readonly previousCheckpointSequence?: number;
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly contextProfile: ContextProfile;
+    readonly projectionVersion: 1;
+    readonly sourceDigest: `sha256:${string}`;
+  };
+};
+
+export type SessionContextCompactionCommittedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "context_compaction_committed";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly attemptId: string;
+    readonly attemptNumber: number;
+    readonly checkpointId: string;
+    readonly windowNumber: number;
+    readonly trigger: "automatic_threshold" | "provider_overflow";
+    readonly sourceThrough: number;
+    readonly retainedFrom: number;
+    readonly previousCheckpointSequence?: number;
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly contextProfile: ContextProfile;
+    readonly projectionVersion: 1;
+    readonly sourceDigest: `sha256:${string}`;
+    readonly replacementDigest: `sha256:${string}`;
+    readonly summary: ContextSummaryV1;
+    readonly evidence: ContextEvidenceV1;
+    readonly usage?: ContextCallUsage;
+  };
+};
+
+export type SessionContextCompactionFailedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "context_compaction_failed";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly attemptId: string;
+    readonly attemptNumber: number;
+    readonly windowNumber: number;
+    readonly trigger: "automatic_threshold" | "provider_overflow";
+    readonly sourceThrough: number;
+    readonly reason:
+      | "replacement_too_large"
+      | "context_window_unrecoverable"
+      | "summary_invalid"
+      | "model_request_failed"
+      | "input_unrecoverable";
+    readonly usage?: ContextCallUsage;
+  };
+};
+
+export type SessionContextCompactionInterruptedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "context_compaction_interrupted";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly attemptId: string;
+    readonly attemptNumber: number;
+    readonly windowNumber: number;
+    readonly trigger: "automatic_threshold" | "provider_overflow";
+    readonly sourceThrough: number;
+    readonly reason: "caller_cancelled" | "process_restart";
+    readonly usage: ContextCallUsage | { readonly status: "unknown" };
+  };
+};
+
 export type SessionV3Record =
   | SessionGenesisRecord
   | SessionLogicalRunStartedRecord
   | SessionProviderAttemptStartedRecord
   | SessionProviderAttemptInterruptedRecord
   | SessionModelResponseCompletedRecord
+  | SessionContextCompactionStartedRecord
+  | SessionContextCompactionCommittedRecord
+  | SessionContextCompactionFailedRecord
+  | SessionContextCompactionInterruptedRecord
   | SessionRuntimeEventRecord;
 
 export type SessionRecord = SessionEventRecord | SessionV3Record;
@@ -218,6 +310,9 @@ const ordinaryRunErrorCodeSchema = z.enum([
   "turn_limit_exceeded",
   "token_limit_exceeded",
   "token_usage_missing",
+  "context_compaction_invalid",
+  "context_compaction_input_unrecoverable",
+  "context_window_unrecoverable",
 ]);
 type RunFailure = Extract<RunResult, { readonly status: "failed" }>["error"];
 const runFailureSchema: z.ZodType<RunFailure> = z.discriminatedUnion("code", [
@@ -232,6 +327,14 @@ const runFailureSchema: z.ZodType<RunFailure> = z.discriminatedUnion("code", [
   }),
   z.strictObject({
     code: z.literal("model_request_failed"),
+    message: z.string(),
+    category: z.enum(modelDriverErrorCategories),
+    status: z.number().int().min(100).max(599).optional(),
+    providerCode: z.string().max(128).optional(),
+    requestId: z.string().max(128).optional(),
+  }),
+  z.strictObject({
+    code: z.literal("context_compaction_failed"),
     message: z.string(),
     category: z.enum(modelDriverErrorCategories),
     status: z.number().int().min(100).max(599).optional(),
@@ -508,6 +611,115 @@ const responseUsageSchema = z.strictObject({
   cachedInputTokens: z.number().int().nonnegative().optional(),
   cacheMissInputTokens: z.number().int().nonnegative().optional(),
 });
+const contextProfileSchema: z.ZodType<ContextProfile> = z.strictObject({
+  version: z.number().int().positive(),
+  contextWindowTokens: z.number().int().positive(),
+  maximumOutputTokens: z.number().int().positive(),
+  compactAtTokens: z.number().int().positive(),
+  postCompactTargetTokens: z.number().int().positive(),
+  retainedTargetTokens: z.number().int().nonnegative(),
+  estimatorVersion: z.literal(1),
+});
+const contextSummarySchema: z.ZodType<ContextSummaryV1> = z.strictObject({
+  schemaVersion: z.literal(1),
+  objective: z
+    .string()
+    .min(1)
+    .max(64 * 1024),
+  constraints: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .max(16 * 1024),
+    )
+    .max(128),
+  progress: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .max(16 * 1024),
+    )
+    .max(128),
+  unresolvedQuestions: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .max(16 * 1024),
+    )
+    .max(128),
+  failures: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .max(16 * 1024),
+    )
+    .max(128),
+  remainingVerification: z
+    .array(
+      z
+        .string()
+        .min(1)
+        .max(16 * 1024),
+    )
+    .max(128),
+  nextSafeAction: z
+    .string()
+    .min(1)
+    .max(64 * 1024),
+});
+const contextEvidenceSchema: z.ZodType<ContextEvidenceV1> = z.strictObject({
+  schemaVersion: z.literal(1),
+  modifiedFiles: z
+    .array(
+      z.strictObject({
+        sessionId: z.uuid().optional(),
+        path: z.string().min(1).max(4096),
+        callId: z.string().min(1).max(256),
+        sequence: z.number().int().positive(),
+      }),
+    )
+    .max(256),
+  permissions: z
+    .array(
+      z.strictObject({
+        sessionId: z.uuid().optional(),
+        callId: z.string().min(1).max(256),
+        name: z.string().min(1).max(256),
+        decision: z.enum(["allow", "deny"]),
+        effect: z.string().min(1).max(64).optional(),
+        subject: v2PermissionSubjectSchema.optional(),
+        sequence: z.number().int().positive(),
+      }),
+    )
+    .max(512),
+  toolResults: z
+    .array(
+      z.strictObject({
+        sessionId: z.uuid().optional(),
+        callId: z.string().min(1).max(256),
+        name: z.string().min(1).max(256),
+        status: z.enum(["completed", "failed"]),
+        sequence: z.number().int().positive(),
+        artifactIds: z.array(z.string().regex(/^sha256:[0-9a-f]{64}$/u)).max(64),
+      }),
+    )
+    .max(512),
+  failures: z
+    .array(
+      z.strictObject({
+        sessionId: z.uuid().optional(),
+        callId: z.string().min(1).max(256),
+        name: z.string().min(1).max(256),
+        code: z.string().min(1).max(128),
+        sequence: z.number().int().positive(),
+      }),
+    )
+    .max(512),
+});
 const sessionV3RecordSchema = z.discriminatedUnion("type", [
   z.strictObject({
     type: z.literal("session_genesis"),
@@ -540,7 +752,7 @@ const sessionV3RecordSchema = z.discriminatedUnion("type", [
     runId: z.uuid(),
     turn: z.number().int().positive(),
     attempt: z.number().int().positive(),
-    reason: z.enum(["process_restart", "run_terminal"]),
+    reason: z.enum(["process_restart", "context_overflow", "run_terminal"]),
     result: runResultSchema.optional(),
   }),
   z.strictObject({
@@ -565,6 +777,72 @@ const sessionV3RecordSchema = z.discriminatedUnion("type", [
     type: z.literal("runtime_event"),
     runId: z.uuid(),
     event: v2CanonicalRuntimeEventSchema,
+  }),
+  z.strictObject({
+    type: z.literal("context_compaction_started"),
+    recordVersion: z.literal(1),
+    runId: z.uuid(),
+    attemptId: z.uuid(),
+    attemptNumber: z.number().int().positive(),
+    windowNumber: z.number().int().positive(),
+    trigger: z.enum(["automatic_threshold", "provider_overflow"]),
+    sourceThrough: z.number().int().positive(),
+    previousCheckpointSequence: z.number().int().positive().optional(),
+    targetIdentity: modelTargetIdentitySchema,
+    contextProfile: contextProfileSchema,
+    projectionVersion: z.literal(1),
+    sourceDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  }),
+  z.strictObject({
+    type: z.literal("context_compaction_committed"),
+    recordVersion: z.literal(1),
+    runId: z.uuid(),
+    attemptId: z.uuid(),
+    attemptNumber: z.number().int().positive(),
+    checkpointId: z.uuid(),
+    windowNumber: z.number().int().positive(),
+    trigger: z.enum(["automatic_threshold", "provider_overflow"]),
+    sourceThrough: z.number().int().positive(),
+    retainedFrom: z.number().int().positive(),
+    previousCheckpointSequence: z.number().int().positive().optional(),
+    targetIdentity: modelTargetIdentitySchema,
+    contextProfile: contextProfileSchema,
+    projectionVersion: z.literal(1),
+    sourceDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    replacementDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    summary: contextSummarySchema,
+    evidence: contextEvidenceSchema,
+    usage: responseUsageSchema.optional(),
+  }),
+  z.strictObject({
+    type: z.literal("context_compaction_failed"),
+    recordVersion: z.literal(1),
+    runId: z.uuid(),
+    attemptId: z.uuid(),
+    attemptNumber: z.number().int().positive(),
+    windowNumber: z.number().int().positive(),
+    trigger: z.enum(["automatic_threshold", "provider_overflow"]),
+    sourceThrough: z.number().int().positive(),
+    reason: z.enum([
+      "replacement_too_large",
+      "context_window_unrecoverable",
+      "summary_invalid",
+      "model_request_failed",
+      "input_unrecoverable",
+    ]),
+    usage: responseUsageSchema.optional(),
+  }),
+  z.strictObject({
+    type: z.literal("context_compaction_interrupted"),
+    recordVersion: z.literal(1),
+    runId: z.uuid(),
+    attemptId: z.uuid(),
+    attemptNumber: z.number().int().positive(),
+    windowNumber: z.number().int().positive(),
+    trigger: z.enum(["automatic_threshold", "provider_overflow"]),
+    sourceThrough: z.number().int().positive(),
+    reason: z.enum(["caller_cancelled", "process_restart"]),
+    usage: z.union([responseUsageSchema, z.strictObject({ status: z.literal("unknown") })]),
   }),
 ]);
 const sessionRecordSchema = z.union([

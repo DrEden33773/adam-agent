@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import {
   type ArtifactStore,
+  type ContextProfile,
   createBiomeExecutionAdapter,
   createCodingToolRegistry,
   createExtensionHost,
@@ -58,6 +59,15 @@ const fakeTargetIdentity: ModelTargetIdentity = {
   route: "direct",
   profileVersion: 1,
   certification: "certified",
+};
+const fakeContextProfile: ContextProfile = {
+  version: 1,
+  contextWindowTokens: 32_768,
+  maximumOutputTokens: 4_096,
+  compactAtTokens: 24_576,
+  postCompactTargetTokens: 8_192,
+  retainedTargetTokens: 4_096,
+  estimatorVersion: 1,
 };
 const fakeModel = new FakeModelDriver((request) => {
   const prompt = request.messages.find((message) => message.role === "user")?.content ?? "";
@@ -520,7 +530,11 @@ function createCliModelTargets(): ModelTargets {
   return {
     async resolve(input) {
       if (input.targetId === fakeTargetIdentity.targetId) {
-        return { identity: fakeTargetIdentity, driver: fakeModel };
+        return {
+          identity: fakeTargetIdentity,
+          driver: fakeModel,
+          contextProfile: fakeContextProfile,
+        };
       }
       return configured.resolve(input);
     },
@@ -532,6 +546,7 @@ function createCliModelTargets(): ModelTargets {
           {
             identity: fakeTargetIdentity,
             readiness: { status: "available", credentialSource: "built-in test fixture" },
+            contextProfile: fakeContextProfile,
           },
         ],
       };

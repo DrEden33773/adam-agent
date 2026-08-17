@@ -8,6 +8,7 @@ import {
   type SessionEventRecord,
   SessionStoreError,
 } from "@adam-agent/agent";
+import type { ContextProfile, SessionRecord } from "@adam-agent/agent/internal-testing";
 import { expect, expectTypeOf, test } from "vitest";
 
 const runId = "123e4567-e89b-42d3-a456-426614174000";
@@ -55,6 +56,132 @@ test("SessionStore adapters append and read versioned records in order", async (
       },
     },
   ];
+
+  try {
+    for (const [name, store] of stores) {
+      for (const record of records) {
+        await store.append(record);
+      }
+      expect(await store.read(), name).toEqual(records);
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore adapters preserve additive v3 compaction records", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-store-contract-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const contextProfile: ContextProfile = {
+    version: 1,
+    contextWindowTokens: 800,
+    maximumOutputTokens: 100,
+    compactAtTokens: 500,
+    postCompactTargetTokens: 400,
+    retainedTargetTokens: 100,
+    estimatorVersion: 1,
+  };
+  const targetIdentity = {
+    targetId: "fake.local",
+    vendor: "adam",
+    modelId: "fake",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+  const sessionId = "10000000-0000-4000-8000-000000000010";
+  const attemptId = "10000000-0000-4000-8000-000000000011";
+  const checkpointId = "10000000-0000-4000-8000-000000000012";
+  const records: readonly SessionRecord[] = [
+    {
+      schemaVersion: 3,
+      sequence: 1,
+      record: {
+        type: "session_genesis",
+        sessionId,
+        projectId: `sha256:${"a".repeat(64)}`,
+        targetIdentity,
+      },
+    },
+    {
+      schemaVersion: 3,
+      sequence: 2,
+      record: {
+        type: "logical_run_started",
+        runId,
+        userMessage: "Persist a context checkpoint.",
+      },
+    },
+    {
+      schemaVersion: 3,
+      sequence: 3,
+      record: {
+        type: "context_compaction_started",
+        recordVersion: 1,
+        runId,
+        attemptId,
+        attemptNumber: 1,
+        windowNumber: 1,
+        trigger: "automatic_threshold",
+        sourceThrough: 2,
+        targetIdentity,
+        contextProfile,
+        projectionVersion: 1,
+        sourceDigest: `sha256:${"b".repeat(64)}`,
+      },
+    },
+    {
+      schemaVersion: 3,
+      sequence: 4,
+      record: {
+        type: "context_compaction_committed",
+        recordVersion: 1,
+        runId,
+        attemptId,
+        attemptNumber: 1,
+        checkpointId,
+        windowNumber: 1,
+        trigger: "automatic_threshold",
+        sourceThrough: 2,
+        retainedFrom: 3,
+        targetIdentity,
+        contextProfile,
+        projectionVersion: 1,
+        sourceDigest: `sha256:${"b".repeat(64)}`,
+        replacementDigest: `sha256:${"c".repeat(64)}`,
+        summary: {
+          schemaVersion: 1,
+          objective: "Persist the checkpoint.",
+          constraints: [],
+          progress: [],
+          unresolvedQuestions: [],
+          failures: [],
+          remainingVerification: [],
+          nextSafeAction: "Read it back.",
+        },
+        evidence: {
+          schemaVersion: 1,
+          modifiedFiles: [],
+          permissions: [],
+          toolResults: [],
+          failures: [],
+        },
+        usage: { inputTokens: 20, outputTokens: 5 },
+      },
+    },
+  ];
+  const stores = [
+    ["in-memory", createInMemorySessionStore<SessionRecord>()],
+    [
+      "JSONL",
+      await createJsonlSessionStore<SessionRecord>({
+        stateRoot: join(testRoot, "state"),
+        workspaceRoot,
+        sessionId,
+      }),
+    ],
+  ] as const;
 
   try {
     for (const [name, store] of stores) {

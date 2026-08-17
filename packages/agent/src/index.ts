@@ -1,5 +1,20 @@
 import { createHash, randomUUID } from "node:crypto";
-
+import { type ContextProfile, sessionContextProfile } from "./context-profile.js";
+import {
+  type ContextCallUsage,
+  ContextCompactionError,
+  ContextCompactionInterruptedError,
+  ContextCompactionRequestError,
+  digestContextMessages,
+  digestContextRecordPrefix,
+  estimateActiveContextTokens,
+  estimateContextSummaryRequestTokens,
+  generateContextSummary,
+  mergeContextEvidence,
+  reduceContextEvidence,
+  shrinkContextMessagesForRetry,
+  splitContextForCompaction,
+} from "./durable-context.js";
 import { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
 import {
   type AgentSessionDurableContext,
@@ -18,6 +33,7 @@ export {
   type BiomeExecutionOutput,
   createBiomeExecutionAdapter,
 } from "./biome-execution.js";
+export type { ContextProfile } from "./context-profile.js";
 export {
   type ConfiguredExtension,
   createExtensionHost,
@@ -97,6 +113,7 @@ export {
   createSessionLifecycle,
   type LegacySessionSnapshot,
   type SessionCommand,
+  type SessionContextSnapshot,
   type SessionContinueResult,
   type SessionLifecycle,
   SessionLifecycleError,
@@ -225,7 +242,10 @@ export type RunResult =
               | "tool_effect_indeterminate"
               | "turn_limit_exceeded"
               | "token_limit_exceeded"
-              | "token_usage_missing";
+              | "token_usage_missing"
+              | "context_compaction_input_unrecoverable"
+              | "context_compaction_invalid"
+              | "context_window_unrecoverable";
             readonly message: string;
           }
         | {
@@ -235,6 +255,14 @@ export type RunResult =
           }
         | {
             readonly code: "model_request_failed";
+            readonly message: string;
+            readonly category: ModelDriverErrorCategory;
+            readonly status?: number | undefined;
+            readonly providerCode?: string | undefined;
+            readonly requestId?: string | undefined;
+          }
+        | {
+            readonly code: "context_compaction_failed";
             readonly message: string;
             readonly category: ModelDriverErrorCategory;
             readonly status?: number | undefined;
@@ -258,6 +286,26 @@ export type PermissionDecisionCommandResult =
       };
     };
 
+export type ContextUsageTotals = {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningTokens: number;
+  readonly cachedInputTokens: number;
+  readonly cacheMissInputTokens: number;
+  readonly unknownCalls: number;
+};
+
+export type ActiveContextUsage =
+  | {
+      readonly source: "provider_reported" | "estimated";
+      readonly tokens: number;
+      readonly throughSequence: number;
+    }
+  | {
+      readonly source: "unknown";
+      readonly throughSequence: number;
+    };
+
 export type RuntimeEvent =
   | { readonly type: "user_message"; readonly text: string }
   | { readonly type: "model_message_started" }
@@ -271,6 +319,47 @@ export type RuntimeEvent =
       readonly reasoningTokens?: number | undefined;
       readonly cachedInputTokens?: number | undefined;
       readonly cacheMissInputTokens?: number | undefined;
+    }
+  | {
+      readonly type: "context_compaction_started";
+      readonly attemptId: string;
+      readonly attemptNumber: number;
+      readonly windowNumber: number;
+      readonly trigger: "automatic_threshold" | "provider_overflow";
+    }
+  | {
+      readonly type: "context_compaction_committed";
+      readonly attemptId: string;
+      readonly checkpointId: string;
+      readonly windowNumber: number;
+      readonly sourceThrough: number;
+      readonly retainedFrom: number;
+    }
+  | {
+      readonly type: "context_compaction_failed";
+      readonly attemptId: string;
+      readonly attemptNumber: number;
+      readonly windowNumber: number;
+      readonly reason:
+        | "replacement_too_large"
+        | "context_window_unrecoverable"
+        | "summary_invalid"
+        | "model_request_failed"
+        | "input_unrecoverable";
+    }
+  | {
+      readonly type: "context_compaction_interrupted";
+      readonly attemptId: string;
+      readonly attemptNumber: number;
+      readonly windowNumber: number;
+      readonly reason: "caller_cancelled" | "process_restart";
+      readonly usage: ContextCallUsage | { readonly status: "unknown" };
+    }
+  | {
+      readonly type: "context_usage";
+      readonly ordinary: ContextUsageTotals;
+      readonly compaction: ContextUsageTotals;
+      readonly active: ActiveContextUsage;
     }
   | { readonly type: "tool_requested"; readonly callId: string; readonly name: string }
   | {
@@ -325,6 +414,7 @@ export class AgentSession {
   readonly #tools: ToolRegistry | undefined;
   readonly #permissions: PermissionPolicy | undefined;
   readonly #durableContext: AgentSessionDurableContext | undefined;
+  readonly #contextProfile: ContextProfile | undefined;
   readonly #store: SessionStore<SessionRecord>;
   #activeAbortController: AbortController | undefined;
   #activeProviderAttempt:
@@ -332,6 +422,8 @@ export class AgentSession {
     | undefined;
   #activeRunId: string | undefined;
   #nextSequence = 1;
+  #contextWindowNumber = 0;
+  #lastContextCheckpoint: { readonly checkpointId: string; readonly sequence: number } | undefined;
   #terminalResult: RunResult | undefined;
   #pendingPermission:
     | {
@@ -346,6 +438,11 @@ export class AgentSession {
         readonly [sessionDurableContext]?: AgentSessionDurableContext;
       }
     )[sessionDurableContext];
+    this.#contextProfile = (
+      dependencies as AgentSessionDependencies & {
+        readonly [sessionContextProfile]?: ContextProfile;
+      }
+    )[sessionContextProfile];
     this.#model = dependencies.model;
     this.#tools = dependencies.tools;
     this.#permissions = dependencies.permissions;
@@ -439,6 +536,9 @@ export class AgentSession {
         if (error instanceof ModelDriverError) {
           return await this.#settleModelRequestFailed(error);
         }
+        if (error instanceof ContextCompactionError) {
+          return await this.#settleContextCompactionFailed(error);
+        }
         throw error;
       }
     } catch (error) {
@@ -483,6 +583,20 @@ export class AgentSession {
     >(resume?.toolResults.map((entry) => [entry.call.id, entry]) ?? []);
     let modelTurns = (resume?.nextTurn ?? 1) - 1;
     let reportedTokens = resume?.reportedTokens ?? 0;
+    const ordinaryUsage = createMutableContextUsageTotals();
+    const compactionUsage = createMutableContextUsageTotals();
+    let continuingSameTurn = false;
+    let nextAttemptNumber = resume?.nextAttempt ?? 1;
+    let compactionCallsThisTurn = 0;
+    let reactiveRetryUsed = false;
+    let skipProactiveCompaction = false;
+    let activeProviderSample:
+      | { readonly inputTokens: number; readonly messageCount: number }
+      | undefined;
+
+    if (resume?.compactionUsageUnknown === true && limits?.maxTokens !== undefined) {
+      return this.#settleTokenUsageMissing();
+    }
 
     for (const pending of resume?.pendingToolCalls ?? []) {
       const terminal = await this.#dispatchToolCall({
@@ -500,18 +614,75 @@ export class AgentSession {
     }
 
     while (true) {
+      const retryingSameTurn = continuingSameTurn;
+      continuingSameTurn = false;
+      if (!retryingSameTurn) {
+        compactionCallsThisTurn = 0;
+        reactiveRetryUsed = false;
+      }
       if (signal.aborted) {
         return this.#settleCancelled();
       }
       if (limits?.maxTokens !== undefined && reportedTokens >= limits.maxTokens) {
         return this.#settleTokenLimitExceeded();
       }
-      if (limits?.maxTurns !== undefined && modelTurns >= limits.maxTurns) {
+      if (!retryingSameTurn && limits?.maxTurns !== undefined && modelTurns >= limits.maxTurns) {
         return this.#settleTurnLimitExceeded();
       }
-      modelTurns += 1;
-      const attemptNumber =
-        resume !== undefined && modelTurns === resume.nextTurn ? resume.nextAttempt : 1;
+      const activeEstimate =
+        this.#contextProfile === undefined
+          ? undefined
+          : activeProviderSample === undefined ||
+              activeProviderSample.messageCount > messages.length
+            ? estimateActiveContextTokens(messages, this.#contextProfile)
+            : activeProviderSample.inputTokens +
+              estimateActiveContextTokens(
+                messages.slice(activeProviderSample.messageCount),
+                this.#contextProfile,
+              );
+      if (
+        this.#contextProfile !== undefined &&
+        this.#durableContext !== undefined &&
+        !skipProactiveCompaction &&
+        activeEstimate !== undefined &&
+        activeEstimate >= this.#contextProfile.compactAtTokens
+      ) {
+        this.#publishContextUsage(ordinaryUsage, compactionUsage, {
+          source: "estimated",
+          tokens: activeEstimate,
+          throughSequence: this.#nextSequence - 1,
+        });
+        const compacted = await this.#compactContext(messages, signal, {
+          trigger: "automatic_threshold",
+          maximumAttempts: 2,
+        });
+        compactionCallsThisTurn += compacted.attemptCount;
+        messages.splice(0, messages.length, ...compacted.messages);
+        activeProviderSample = undefined;
+        compactionUsage.unknownCalls += compacted.unknownCalls;
+        if (compacted.usage !== undefined) {
+          addContextUsage(compactionUsage, compacted.usage);
+          reportedTokens += compacted.usage.inputTokens + compacted.usage.outputTokens;
+        }
+        if (compacted.unknownCalls > 0 && limits?.maxTokens !== undefined) {
+          return this.#settleTokenUsageMissing();
+        }
+        if (limits?.maxTokens !== undefined && reportedTokens >= limits.maxTokens) {
+          return this.#settleTokenLimitExceeded();
+        }
+        this.#publishContextUsage(ordinaryUsage, compactionUsage, {
+          source: "estimated",
+          tokens: estimateActiveContextTokens(messages, this.#contextProfile),
+          throughSequence: this.#nextSequence - 1,
+        });
+      }
+      skipProactiveCompaction = false;
+      if (!retryingSameTurn) {
+        modelTurns += 1;
+        nextAttemptNumber =
+          resume !== undefined && modelTurns === resume.nextTurn ? resume.nextAttempt : 1;
+      }
+      const attemptNumber = nextAttemptNumber;
       if (this.#durableContext !== undefined) {
         await this.#appendRecord({
           schemaVersion: 3,
@@ -559,143 +730,217 @@ export class AgentSession {
         | undefined;
       const assemblingCalls = new Map<string, ToolCall>();
       const completedCalls: ToolCall[] = [];
+      let streamError: unknown;
+      const requestMessageCount = messages.length;
 
-      for await (const event of this.#model.stream({
-        messages: [...messages],
-        tools: this.#tools?.definitions() ?? [],
-        signal,
-      })) {
-        if (signal.aborted) {
-          break;
-        }
-        switch (event.type) {
-          case "text_delta":
-            if (
-              this.#durableContext !== undefined &&
-              Buffer.byteLength(answer, "utf8") + Buffer.byteLength(event.text, "utf8") >
-                maximumReplayFieldBytes
-            ) {
-              replayEnvelopeTooLarge = true;
-              break;
-            }
-            answer += event.text;
-            await this.#emit({ type: "model_message_delta", text: event.text });
+      try {
+        for await (const event of this.#model.stream({
+          messages: [...messages],
+          tools: this.#tools?.definitions() ?? [],
+          signal,
+        })) {
+          if (signal.aborted) {
             break;
-          case "reasoning_delta":
-            if (
-              this.#durableContext !== undefined &&
-              Buffer.byteLength(reasoning, "utf8") + Buffer.byteLength(event.text, "utf8") >
-                maximumReplayFieldBytes
-            ) {
-              replayEnvelopeTooLarge = true;
-              break;
-            }
-            reasoning += event.text;
-            break;
-          case "tool_call_start":
-            if (
-              this.#durableContext !== undefined &&
-              assemblingCalls.size + completedCalls.length >= maximumReplayToolCalls
-            ) {
-              replayEnvelopeTooLarge = true;
-            } else if (assemblingCalls.has(event.id)) {
-              protocolError = "The model started the same tool call more than once.";
-            } else {
-              assemblingCalls.set(event.id, {
-                id: event.id,
-                name: event.name,
-                argumentsJson: "",
-              });
-            }
-            break;
-          case "tool_call_delta": {
-            const call = assemblingCalls.get(event.id);
-            if (call === undefined) {
-              protocolError = "The model sent arguments for a tool call that was not started.";
-            } else {
+          }
+          switch (event.type) {
+            case "text_delta":
               if (
                 this.#durableContext !== undefined &&
-                Buffer.byteLength(call.argumentsJson, "utf8") +
-                  Buffer.byteLength(event.json, "utf8") >
+                Buffer.byteLength(answer, "utf8") + Buffer.byteLength(event.text, "utf8") >
                   maximumReplayFieldBytes
               ) {
                 replayEnvelopeTooLarge = true;
                 break;
               }
-              assemblingCalls.set(event.id, {
-                ...call,
-                argumentsJson: call.argumentsJson + event.json,
-              });
-            }
-            break;
-          }
-          case "tool_call_end": {
-            const call = assemblingCalls.get(event.id);
-            if (call === undefined) {
-              protocolError = "The model ended a tool call that was not started.";
-            } else {
-              completedCalls.push(call);
-              assemblingCalls.delete(event.id);
-            }
-            break;
-          }
-          case "usage": {
-            const totalTokens = event.inputTokens + event.outputTokens;
-            const nextReportedTokens = reportedTokens + totalTokens;
-            if (
-              !isNonnegativeSafeInteger(event.inputTokens) ||
-              !isNonnegativeSafeInteger(event.outputTokens) ||
-              !areOptionalUsageDetailsValid(event) ||
-              !Number.isSafeInteger(totalTokens) ||
-              !Number.isSafeInteger(nextReportedTokens)
-            ) {
-              protocolError = "The model reported invalid token usage.";
+              answer += event.text;
+              await this.#emit({ type: "model_message_delta", text: event.text });
+              break;
+            case "reasoning_delta":
+              if (
+                this.#durableContext !== undefined &&
+                Buffer.byteLength(reasoning, "utf8") + Buffer.byteLength(event.text, "utf8") >
+                  maximumReplayFieldBytes
+              ) {
+                replayEnvelopeTooLarge = true;
+                break;
+              }
+              reasoning += event.text;
+              break;
+            case "tool_call_start":
+              if (
+                this.#durableContext !== undefined &&
+                assemblingCalls.size + completedCalls.length >= maximumReplayToolCalls
+              ) {
+                replayEnvelopeTooLarge = true;
+              } else if (assemblingCalls.has(event.id)) {
+                protocolError = "The model started the same tool call more than once.";
+              } else {
+                assemblingCalls.set(event.id, {
+                  id: event.id,
+                  name: event.name,
+                  argumentsJson: "",
+                });
+              }
+              break;
+            case "tool_call_delta": {
+              const call = assemblingCalls.get(event.id);
+              if (call === undefined) {
+                protocolError = "The model sent arguments for a tool call that was not started.";
+              } else {
+                if (
+                  this.#durableContext !== undefined &&
+                  Buffer.byteLength(call.argumentsJson, "utf8") +
+                    Buffer.byteLength(event.json, "utf8") >
+                    maximumReplayFieldBytes
+                ) {
+                  replayEnvelopeTooLarge = true;
+                  break;
+                }
+                assemblingCalls.set(event.id, {
+                  ...call,
+                  argumentsJson: call.argumentsJson + event.json,
+                });
+              }
               break;
             }
-            usageWasReported = true;
-            reportedTokens = nextReportedTokens;
-            responseUsage = {
-              inputTokens: event.inputTokens,
-              outputTokens: event.outputTokens,
-              ...(event.reasoningTokens === undefined
-                ? {}
-                : { reasoningTokens: event.reasoningTokens }),
-              ...(event.cachedInputTokens === undefined
-                ? {}
-                : { cachedInputTokens: event.cachedInputTokens }),
-              ...(event.cacheMissInputTokens === undefined
-                ? {}
-                : { cacheMissInputTokens: event.cacheMissInputTokens }),
-            };
-            await this.#emit({
-              type: "model_usage",
-              inputTokens: event.inputTokens,
-              outputTokens: event.outputTokens,
-              totalTokens,
-              ...(event.reasoningTokens === undefined
-                ? {}
-                : { reasoningTokens: event.reasoningTokens }),
-              ...(event.cachedInputTokens === undefined
-                ? {}
-                : { cachedInputTokens: event.cachedInputTokens }),
-              ...(event.cacheMissInputTokens === undefined
-                ? {}
-                : { cacheMissInputTokens: event.cacheMissInputTokens }),
-            });
+            case "tool_call_end": {
+              const call = assemblingCalls.get(event.id);
+              if (call === undefined) {
+                protocolError = "The model ended a tool call that was not started.";
+              } else {
+                completedCalls.push(call);
+                assemblingCalls.delete(event.id);
+              }
+              break;
+            }
+            case "usage": {
+              const totalTokens = event.inputTokens + event.outputTokens;
+              const nextReportedTokens = reportedTokens + totalTokens;
+              if (
+                !isNonnegativeSafeInteger(event.inputTokens) ||
+                !isNonnegativeSafeInteger(event.outputTokens) ||
+                !areOptionalUsageDetailsValid(event) ||
+                !Number.isSafeInteger(totalTokens) ||
+                !Number.isSafeInteger(nextReportedTokens)
+              ) {
+                protocolError = "The model reported invalid token usage.";
+                break;
+              }
+              usageWasReported = true;
+              reportedTokens = nextReportedTokens;
+              activeProviderSample = {
+                inputTokens: event.inputTokens,
+                messageCount: requestMessageCount,
+              };
+              addContextUsage(ordinaryUsage, event);
+              responseUsage = {
+                inputTokens: event.inputTokens,
+                outputTokens: event.outputTokens,
+                ...(event.reasoningTokens === undefined
+                  ? {}
+                  : { reasoningTokens: event.reasoningTokens }),
+                ...(event.cachedInputTokens === undefined
+                  ? {}
+                  : { cachedInputTokens: event.cachedInputTokens }),
+                ...(event.cacheMissInputTokens === undefined
+                  ? {}
+                  : { cacheMissInputTokens: event.cacheMissInputTokens }),
+              };
+              await this.#emit({
+                type: "model_usage",
+                inputTokens: event.inputTokens,
+                outputTokens: event.outputTokens,
+                totalTokens,
+                ...(event.reasoningTokens === undefined
+                  ? {}
+                  : { reasoningTokens: event.reasoningTokens }),
+                ...(event.cachedInputTokens === undefined
+                  ? {}
+                  : { cachedInputTokens: event.cachedInputTokens }),
+                ...(event.cacheMissInputTokens === undefined
+                  ? {}
+                  : { cacheMissInputTokens: event.cacheMissInputTokens }),
+              });
+              if (this.#contextProfile !== undefined) {
+                this.#publishContextUsage(ordinaryUsage, compactionUsage, {
+                  source: "provider_reported",
+                  tokens: event.inputTokens,
+                  throughSequence: this.#nextSequence - 1,
+                });
+              }
+              break;
+            }
+            case "finish":
+              finishReason = event.reason;
+              rawFinishReason = event.rawReason;
+              break;
+          }
+          if (signal.aborted || finishReason !== undefined || replayEnvelopeTooLarge) {
             break;
           }
-          case "finish":
-            finishReason = event.reason;
-            rawFinishReason = event.rawReason;
-            break;
         }
-        if (signal.aborted || finishReason !== undefined || replayEnvelopeTooLarge) {
-          break;
-        }
+      } catch (error) {
+        streamError = error;
       }
 
       if (signal.aborted) {
         return this.#settleCancelled();
+      }
+
+      if (streamError !== undefined) {
+        const contextProfile = this.#contextProfile;
+        const safeContextOverflow =
+          contextProfile !== undefined &&
+          this.#durableContext !== undefined &&
+          isContextLengthError(streamError) &&
+          answer.length === 0 &&
+          reasoning.length === 0 &&
+          completedCalls.length === 0 &&
+          assemblingCalls.size === 0;
+        if (safeContextOverflow) {
+          await this.#interruptProviderAttemptForContextOverflow();
+          const remainingCompactionCalls = 2 - compactionCallsThisTurn;
+          if (reactiveRetryUsed || remainingCompactionCalls <= 0) {
+            return this.#settleContextCompactionFailed(
+              new ContextCompactionError(
+                "context_window_unrecoverable",
+                "The provider still rejected the compacted context window.",
+              ),
+            );
+          }
+          const compacted = await this.#compactContext(messages, signal, {
+            trigger: "provider_overflow",
+            maximumAttempts: remainingCompactionCalls === 1 ? 1 : 2,
+          });
+          compactionCallsThisTurn += compacted.attemptCount;
+          messages.splice(0, messages.length, ...compacted.messages);
+          activeProviderSample = undefined;
+          compactionUsage.unknownCalls += compacted.unknownCalls;
+          if (compacted.usage !== undefined) {
+            addContextUsage(compactionUsage, compacted.usage);
+            reportedTokens += compacted.usage.inputTokens + compacted.usage.outputTokens;
+          }
+          if (compacted.unknownCalls > 0 && limits?.maxTokens !== undefined) {
+            return this.#settleTokenUsageMissing();
+          }
+          if (limits?.maxTokens !== undefined && reportedTokens >= limits.maxTokens) {
+            return this.#settleTokenLimitExceeded();
+          }
+          this.#publishContextUsage(ordinaryUsage, compactionUsage, {
+            source: "estimated",
+            tokens: estimateActiveContextTokens(messages, contextProfile),
+            throughSequence: this.#nextSequence - 1,
+          });
+          reactiveRetryUsed = true;
+          nextAttemptNumber = attemptNumber + 1;
+          continuingSameTurn = true;
+          skipProactiveCompaction = true;
+          continue;
+        }
+        if (streamError instanceof ModelDriverError) {
+          return this.#settleModelRequestFailed(streamError);
+        }
+        throw streamError;
       }
 
       if (replayEnvelopeTooLarge) {
@@ -784,6 +1029,7 @@ export class AgentSession {
         await this.#appendRecord(completedResponseRecord);
         this.#activeProviderAttempt = undefined;
       }
+      nextAttemptNumber = 1;
       await this.#emit({ type: "model_message_completed", text: answer });
       if (signal.aborted) {
         return this.#settleCancelled();
@@ -819,6 +1065,345 @@ export class AgentSession {
         }
       }
     }
+  }
+
+  async #compactContext(
+    messages: readonly ModelMessage[],
+    signal: AbortSignal,
+    options: {
+      readonly trigger: "automatic_threshold" | "provider_overflow";
+      readonly maximumAttempts: 1 | 2;
+    },
+  ): Promise<{
+    readonly messages: readonly ModelMessage[];
+    readonly attemptCount: number;
+    readonly unknownCalls: number;
+    readonly usage?: {
+      readonly inputTokens: number;
+      readonly outputTokens: number;
+      readonly reasoningTokens?: number;
+      readonly cachedInputTokens?: number;
+      readonly cacheMissInputTokens?: number;
+    };
+  }> {
+    const runId = this.#activeRunId;
+    const durableContext = this.#durableContext;
+    const contextProfile = this.#contextProfile;
+    if (runId === undefined || durableContext === undefined || contextProfile === undefined) {
+      throw new TypeError("Context compaction requires one active durable run and profile.");
+    }
+    const existingRecords = await this.#store.read();
+    const latestCommitted = existingRecords.findLast(
+      (record) =>
+        record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+    );
+    if (
+      this.#lastContextCheckpoint === undefined &&
+      latestCommitted?.schemaVersion === 3 &&
+      latestCommitted.record.type === "context_compaction_committed"
+    ) {
+      this.#contextWindowNumber = latestCommitted.record.windowNumber;
+      this.#lastContextCheckpoint = {
+        checkpointId: latestCommitted.record.checkpointId,
+        sequence: latestCommitted.sequence,
+      };
+    }
+    const latestInterrupted = existingRecords.findLast(
+      (record) =>
+        record.schemaVersion === 3 &&
+        record.record.type === "context_compaction_interrupted" &&
+        record.record.reason === "process_restart",
+    );
+    const interruptedRecord =
+      latestInterrupted?.schemaVersion === 3 &&
+      latestInterrupted.record.type === "context_compaction_interrupted" &&
+      (latestCommitted === undefined || latestInterrupted.sequence > latestCommitted.sequence)
+        ? latestInterrupted.record
+        : undefined;
+    const interruptedStart =
+      interruptedRecord === undefined
+        ? undefined
+        : existingRecords.findLast(
+            (record) =>
+              record.sequence < (latestInterrupted?.sequence ?? 0) &&
+              record.schemaVersion === 3 &&
+              record.record.type === "context_compaction_started" &&
+              record.record.attemptId === interruptedRecord.attemptId,
+          );
+    const interruptedStartRecord =
+      interruptedStart?.schemaVersion === 3 &&
+      interruptedStart.record.type === "context_compaction_started"
+        ? interruptedStart.record
+        : undefined;
+    const currentPrefixDigest =
+      interruptedStartRecord !== undefined
+        ? digestContextRecordPrefix(
+            existingRecords.filter(
+              (record) => record.sequence <= interruptedStartRecord.sourceThrough,
+            ),
+          )
+        : undefined;
+    const resumedStart =
+      interruptedStartRecord !== undefined &&
+      interruptedStartRecord.sourceDigest === currentPrefixDigest
+        ? interruptedStartRecord
+        : undefined;
+    const windowNumber = resumedStart?.windowNumber ?? this.#contextWindowNumber + 1;
+    const sourceThrough = resumedStart?.sourceThrough ?? this.#nextSequence - 1;
+    const sourceDigest =
+      resumedStart?.sourceDigest ??
+      digestContextRecordPrefix(
+        existingRecords.filter((record) => record.sequence <= sourceThrough),
+      );
+    const previousCheckpointSequence =
+      resumedStart?.previousCheckpointSequence ?? this.#lastContextCheckpoint?.sequence;
+    const firstAttemptNumber = (resumedStart?.attemptNumber ?? 0) + 1;
+    const lastAttemptNumber = Math.min(2, firstAttemptNumber + options.maximumAttempts - 1);
+    const accumulatedUsages: Array<
+      NonNullable<Awaited<ReturnType<typeof generateContextSummary>>["usage"]>
+    > = [];
+    let unknownCalls = 0;
+    let retryMessages: readonly ModelMessage[] | undefined;
+    for (
+      let attemptNumber = firstAttemptNumber;
+      attemptNumber <= lastAttemptNumber;
+      attemptNumber += 1
+    ) {
+      const attemptId = randomUUID();
+      await this.#appendRecord({
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "context_compaction_started",
+          recordVersion: 1,
+          runId,
+          attemptId,
+          attemptNumber,
+          windowNumber,
+          trigger: options.trigger,
+          sourceThrough,
+          ...(previousCheckpointSequence === undefined ? {} : { previousCheckpointSequence }),
+          targetIdentity: durableContext.targetIdentity,
+          contextProfile,
+          projectionVersion: 1,
+          sourceDigest,
+        },
+      });
+      this.#publish({
+        type: "context_compaction_started",
+        attemptId,
+        attemptNumber,
+        windowNumber,
+        trigger: options.trigger,
+      });
+      const records = await this.#store.read();
+      const evidence = mergeContextEvidence(
+        durableContext.inheritedEvidence,
+        reduceContextEvidence(records, runId, sourceThrough),
+      );
+      const { summaryMessages, retainedMessages } =
+        retryMessages === undefined
+          ? splitContextForCompaction(
+              messages,
+              attemptNumber === 1 ? contextProfile.retainedTargetTokens : 0,
+            )
+          : { summaryMessages: retryMessages, retainedMessages: [] };
+      let compacted: Awaited<ReturnType<typeof generateContextSummary>>;
+      try {
+        compacted = await generateContextSummary({
+          evidence,
+          messages: summaryMessages,
+          model: this.#model,
+          profile: contextProfile,
+          signal,
+        });
+      } catch (error) {
+        if (signal.aborted) {
+          const interruptionUsage =
+            error instanceof ContextCompactionInterruptedError ? error.usage : undefined;
+          await this.#appendRecord({
+            schemaVersion: 3,
+            sequence: this.#nextSequence,
+            record: {
+              type: "context_compaction_interrupted",
+              recordVersion: 1,
+              runId,
+              attemptId,
+              attemptNumber,
+              windowNumber,
+              trigger: options.trigger,
+              sourceThrough,
+              reason: "caller_cancelled",
+              usage: interruptionUsage ?? { status: "unknown" },
+            },
+          });
+          this.#publish({
+            type: "context_compaction_interrupted",
+            attemptId,
+            attemptNumber,
+            windowNumber,
+            reason: "caller_cancelled",
+            usage: interruptionUsage ?? { status: "unknown" },
+          });
+          throw new Error("The context compaction request was cancelled.");
+        }
+        const compactionError =
+          error instanceof ContextCompactionRequestError && error.cause instanceof ModelDriverError
+            ? new ContextCompactionError(
+                "context_compaction_failed",
+                "The context compaction model request failed.",
+                error.usage,
+                error.cause,
+              )
+            : error instanceof ModelDriverError
+              ? new ContextCompactionError(
+                  "context_compaction_failed",
+                  "The context compaction model request failed.",
+                  undefined,
+                  error,
+                )
+              : error;
+        if (!(compactionError instanceof ContextCompactionError)) {
+          throw compactionError;
+        }
+        const reason =
+          compactionError.code === "context_compaction_failed"
+            ? "model_request_failed"
+            : compactionError.code === "context_compaction_input_unrecoverable"
+              ? "input_unrecoverable"
+              : "summary_invalid";
+        await this.#appendRecord({
+          schemaVersion: 3,
+          sequence: this.#nextSequence,
+          record: {
+            type: "context_compaction_failed",
+            recordVersion: 1,
+            runId,
+            attemptId,
+            attemptNumber,
+            windowNumber,
+            trigger: options.trigger,
+            sourceThrough,
+            reason,
+            ...(compactionError.usage === undefined ? {} : { usage: compactionError.usage }),
+          },
+        });
+        this.#publish({
+          type: "context_compaction_failed",
+          attemptId,
+          attemptNumber,
+          windowNumber,
+          reason,
+        });
+        throw compactionError;
+      }
+      if (compacted.usage !== undefined) {
+        accumulatedUsages.push(compacted.usage);
+      } else {
+        unknownCalls += 1;
+      }
+      const replacementMessages = [...compacted.replacementMessages, ...retainedMessages];
+      const replacementTooLarge =
+        estimateActiveContextTokens(replacementMessages, contextProfile) >=
+        contextProfile.postCompactTargetTokens;
+      if (replacementTooLarge) {
+        const smallerRetryMessages = shrinkContextMessagesForRetry(replacementMessages);
+        const canRetryWithSmallerInput =
+          attemptNumber < lastAttemptNumber &&
+          estimateContextSummaryRequestTokens({
+            evidence,
+            messages: smallerRetryMessages,
+            profile: contextProfile,
+          }) <
+            estimateContextSummaryRequestTokens({
+              evidence,
+              messages: summaryMessages,
+              profile: contextProfile,
+            });
+        const reason = canRetryWithSmallerInput
+          ? "replacement_too_large"
+          : "context_window_unrecoverable";
+        await this.#appendRecord({
+          schemaVersion: 3,
+          sequence: this.#nextSequence,
+          record: {
+            type: "context_compaction_failed",
+            recordVersion: 1,
+            runId,
+            attemptId,
+            attemptNumber,
+            windowNumber,
+            trigger: options.trigger,
+            sourceThrough,
+            reason,
+            ...(compacted.usage === undefined ? {} : { usage: compacted.usage }),
+          },
+        });
+        this.#publish({
+          type: "context_compaction_failed",
+          attemptId,
+          attemptNumber,
+          windowNumber,
+          reason,
+        });
+        if (canRetryWithSmallerInput) {
+          retryMessages = smallerRetryMessages;
+          continue;
+        }
+        throw new ContextCompactionError(
+          "context_window_unrecoverable",
+          "The compacted context still exceeds the target boundary.",
+          compacted.usage,
+        );
+      }
+      const checkpointId = randomUUID();
+      const retainedFrom =
+        findRetainedFromSequence(records, runId, retainedMessages[0]) ?? sourceThrough + 1;
+      const committedSequence = this.#nextSequence;
+      await this.#appendRecord({
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "context_compaction_committed",
+          recordVersion: 1,
+          runId,
+          attemptId,
+          attemptNumber,
+          checkpointId,
+          windowNumber,
+          trigger: options.trigger,
+          sourceThrough,
+          retainedFrom,
+          ...(previousCheckpointSequence === undefined ? {} : { previousCheckpointSequence }),
+          targetIdentity: durableContext.targetIdentity,
+          contextProfile,
+          projectionVersion: 1,
+          sourceDigest,
+          replacementDigest: digestContextMessages(replacementMessages),
+          summary: compacted.summary,
+          evidence,
+          ...(compacted.usage === undefined ? {} : { usage: compacted.usage }),
+        },
+      });
+      this.#contextWindowNumber = windowNumber;
+      this.#lastContextCheckpoint = { checkpointId, sequence: committedSequence };
+      this.#publish({
+        type: "context_compaction_committed",
+        attemptId,
+        checkpointId,
+        windowNumber,
+        sourceThrough,
+        retainedFrom,
+      });
+      const usage = mergeContextCallUsages(accumulatedUsages);
+      return {
+        messages: replacementMessages,
+        attemptCount: attemptNumber,
+        unknownCalls,
+        ...(usage === undefined ? {} : { usage }),
+      };
+    }
+    throw new TypeError("Context compaction attempt accounting was exhausted.");
   }
 
   async #dispatchToolCall(options: {
@@ -1075,6 +1660,31 @@ export class AgentSession {
     return this.#settle(result);
   }
 
+  async #settleContextCompactionFailed(error: ContextCompactionError): Promise<RunResult> {
+    if (error.code === "context_compaction_failed") {
+      const providerError = error.cause instanceof ModelDriverError ? error.cause : undefined;
+      const result: RunResult = {
+        status: "failed",
+        error: {
+          code: error.code,
+          message: error.message,
+          category: providerError?.category ?? "unknown",
+          ...(providerError?.status === undefined ? {} : { status: providerError.status }),
+          ...(providerError?.providerCode === undefined
+            ? {}
+            : { providerCode: providerError.providerCode }),
+          ...(providerError?.requestId === undefined ? {} : { requestId: providerError.requestId }),
+        },
+      };
+      return this.#settle(result);
+    }
+    const result: RunResult = {
+      status: "failed",
+      error: { code: error.code, message: error.message },
+    };
+    return this.#settle(result);
+  }
+
   async #settle(result: RunResult, interrupted = false): Promise<RunResult> {
     if (this.#terminalResult !== undefined) {
       return this.#terminalResult;
@@ -1103,6 +1713,25 @@ export class AgentSession {
         attempt: attempt.attempt,
         reason: "run_terminal",
         result,
+      },
+    });
+    this.#activeProviderAttempt = undefined;
+  }
+
+  async #interruptProviderAttemptForContextOverflow(): Promise<void> {
+    const attempt = this.#activeProviderAttempt;
+    if (attempt === undefined) {
+      throw new TypeError("A context overflow requires one active provider attempt.");
+    }
+    await this.#appendRecord({
+      schemaVersion: 3,
+      sequence: this.#nextSequence,
+      record: {
+        type: "provider_attempt_interrupted",
+        runId: attempt.runId,
+        turn: attempt.turn,
+        attempt: attempt.attempt,
+        reason: "context_overflow",
       },
     });
     this.#activeProviderAttempt = undefined;
@@ -1198,6 +1827,25 @@ export class AgentSession {
     }
   }
 
+  #publish(event: RuntimeEvent): void {
+    for (const listener of this.#listeners) {
+      listener(event);
+    }
+  }
+
+  #publishContextUsage(
+    ordinary: MutableContextUsageTotals,
+    compaction: MutableContextUsageTotals,
+    active: ActiveContextUsage,
+  ): void {
+    this.#publish({
+      type: "context_usage",
+      ordinary: { ...ordinary },
+      compaction: { ...compaction },
+      active,
+    });
+  }
+
   async #appendRecord(record: SessionRecord): Promise<void> {
     try {
       await this.#store.append(record);
@@ -1226,6 +1874,122 @@ export class AgentSession {
 
 function isNonnegativeSafeInteger(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+type MutableContextUsageTotals = {
+  -readonly [Key in keyof ContextUsageTotals]: ContextUsageTotals[Key];
+};
+
+function createMutableContextUsageTotals(): MutableContextUsageTotals {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    cachedInputTokens: 0,
+    cacheMissInputTokens: 0,
+    unknownCalls: 0,
+  };
+}
+
+function addContextUsage(
+  totals: MutableContextUsageTotals,
+  usage: {
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly reasoningTokens?: number | undefined;
+    readonly cachedInputTokens?: number | undefined;
+    readonly cacheMissInputTokens?: number | undefined;
+  },
+): void {
+  totals.inputTokens += usage.inputTokens;
+  totals.outputTokens += usage.outputTokens;
+  totals.reasoningTokens += usage.reasoningTokens ?? 0;
+  totals.cachedInputTokens += usage.cachedInputTokens ?? 0;
+  totals.cacheMissInputTokens += usage.cacheMissInputTokens ?? 0;
+}
+
+function findRetainedFromSequence(
+  records: readonly SessionRecord[],
+  runId: string,
+  firstRetained: ModelMessage | undefined,
+): number | undefined {
+  if (firstRetained === undefined) {
+    return undefined;
+  }
+  for (const entry of records) {
+    if (entry.schemaVersion !== 3 || entry.sequence < 1) {
+      continue;
+    }
+    const record = entry.record;
+    if (
+      record.type === "logical_run_started" &&
+      record.runId === runId &&
+      firstRetained.role === "user" &&
+      record.userMessage === firstRetained.content
+    ) {
+      return entry.sequence;
+    }
+    if (record.type === "model_response_completed" && record.runId === runId) {
+      if (
+        firstRetained.role === "assistant" &&
+        record.response.text === firstRetained.content &&
+        JSON.stringify(record.response.toolCalls) === JSON.stringify(firstRetained.toolCalls)
+      ) {
+        return entry.sequence;
+      }
+      continue;
+    }
+    if (record.type !== "runtime_event" || record.runId !== runId) {
+      continue;
+    }
+    const event = record.event;
+    if (
+      firstRetained.role === "tool" &&
+      (event.type === "tool_completed" || event.type === "tool_failed") &&
+      event.callId === firstRetained.callId &&
+      event.name === firstRetained.name
+    ) {
+      return entry.sequence;
+    }
+  }
+  return undefined;
+}
+
+function mergeContextCallUsages(
+  usages: readonly {
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly reasoningTokens?: number;
+    readonly cachedInputTokens?: number;
+    readonly cacheMissInputTokens?: number;
+  }[],
+):
+  | {
+      readonly inputTokens: number;
+      readonly outputTokens: number;
+      readonly reasoningTokens?: number;
+      readonly cachedInputTokens?: number;
+      readonly cacheMissInputTokens?: number;
+    }
+  | undefined {
+  if (usages.length === 0) {
+    return undefined;
+  }
+  const totals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    cachedInputTokens: 0,
+    cacheMissInputTokens: 0,
+  };
+  for (const usage of usages) {
+    totals.inputTokens += usage.inputTokens;
+    totals.outputTokens += usage.outputTokens;
+    totals.reasoningTokens += usage.reasoningTokens ?? 0;
+    totals.cachedInputTokens += usage.cachedInputTokens ?? 0;
+    totals.cacheMissInputTokens += usage.cacheMissInputTokens ?? 0;
+  }
+  return totals;
 }
 
 const maximumReplayFieldBytes = 512 * 1024;
@@ -1258,4 +2022,13 @@ function areRunLimitsValid(limits: RunOptions["limits"]): boolean {
 
 function isPositiveSafeInteger(value: number): boolean {
   return Number.isSafeInteger(value) && value > 0;
+}
+
+function isContextLengthError(error: unknown): error is ModelDriverError {
+  return (
+    error instanceof ModelDriverError &&
+    error.category === "invalid_request" &&
+    (error.providerCode === "context_length_exceeded" ||
+      error.providerCode === "context_window_exceeded")
+  );
 }
