@@ -8,6 +8,7 @@ import { z } from "zod";
 import type { ArtifactReference, ModelResponseArtifactSource } from "./artifact-store.js";
 import type { ContextProfile } from "./context-profile.js";
 import type { ContextCallUsage, ContextEvidenceV1, ContextSummaryV1 } from "./durable-context.js";
+import { maximumInlineModelResponseFieldBytes } from "./durable-model-response-policy.js";
 import type { RunResult, RuntimeEvent } from "./index.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
@@ -660,7 +661,13 @@ const modelResponseArtifactReferenceSchema = z.strictObject({
   source: modelResponseArtifactSourceSchema,
 });
 const modelResponseFieldSchema = z.discriminatedUnion("storage", [
-  z.strictObject({ storage: z.literal("inline"), text: z.string().max(256 * 1024) }),
+  z.strictObject({
+    storage: z.literal("inline"),
+    text: z
+      .string()
+      .max(maximumInlineModelResponseFieldBytes)
+      .refine((text) => Buffer.byteLength(text, "utf8") <= maximumInlineModelResponseFieldBytes),
+  }),
   z.strictObject({
     storage: z.literal("artifact"),
     reference: modelResponseArtifactReferenceSchema,

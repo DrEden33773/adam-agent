@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -77,6 +77,7 @@ test("SessionLifecycle creates durable new-schema genesis for an exact project a
       lastSequence: 1,
     };
     expect({ created, inspected }).toEqual({ created: expected, inspected: expected });
+    await expect(stat(join(stateRoot, "artifacts"))).rejects.toMatchObject({ code: "ENOENT" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

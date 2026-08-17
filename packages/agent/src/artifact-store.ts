@@ -87,8 +87,12 @@ export async function createFileArtifactStore(options: {
           if (!isNodeError(error) || error.code !== "EEXIST") {
             throw error;
           }
-          const existingBytes = await readFile(targetPath);
-          if (!existingBytes.equals(bytes)) {
+          const existingBytes = await readFileArtifact({
+            root,
+            id,
+            maximumBytes: bytes.byteLength,
+          });
+          if (existingBytes === undefined || !Buffer.from(existingBytes).equals(bytes)) {
             throw new Error("The content-addressed artifact does not match its ID.");
           }
           await chmod(targetPath, 0o400);
@@ -104,26 +108,44 @@ export async function createFileArtifactStore(options: {
       };
     },
     async read(id, readOptions) {
-      const digest = parseArtifactId(id);
-      try {
-        const artifactPath = join(root, digest);
-        const bytes =
-          readOptions?.maximumBytes === undefined
-            ? await readFile(artifactPath)
-            : await readFileWithinLimit(artifactPath, readOptions.maximumBytes);
-        const actualDigest = createHash("sha256").update(bytes).digest("hex");
-        if (actualDigest !== digest) {
-          throw new Error("The content-addressed artifact does not match its ID.");
-        }
-        return bytes;
-      } catch (error) {
-        if (isNodeError(error) && error.code === "ENOENT") {
-          return undefined;
-        }
-        throw error;
-      }
+      return readFileArtifact({
+        root,
+        id,
+        ...(readOptions?.maximumBytes === undefined
+          ? {}
+          : { maximumBytes: readOptions.maximumBytes }),
+      });
     },
   };
+}
+
+export async function readFileArtifact(options: {
+  readonly root: string;
+  readonly id: string;
+  readonly maximumBytes?: number;
+}): Promise<Uint8Array | undefined> {
+  const root = resolve(options.root);
+  if (!root.startsWith("/")) {
+    throw new TypeError("The artifact root must resolve to an absolute path.");
+  }
+  const digest = parseArtifactId(options.id);
+  try {
+    const artifactPath = join(root, digest);
+    const bytes =
+      options.maximumBytes === undefined
+        ? await readFile(artifactPath)
+        : await readFileWithinLimit(artifactPath, options.maximumBytes);
+    const actualDigest = createHash("sha256").update(bytes).digest("hex");
+    if (actualDigest !== digest) {
+      throw new Error("The content-addressed artifact does not match its ID.");
+    }
+    return bytes;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 async function readFileWithinLimit(path: string, maximumBytes: number): Promise<Buffer> {

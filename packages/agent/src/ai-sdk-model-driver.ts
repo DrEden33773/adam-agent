@@ -7,11 +7,10 @@ import type {
   SharedV4ProviderOptions,
 } from "@ai-sdk/provider";
 import { APICallError } from "@ai-sdk/provider";
-
+import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
 import type { ModelDriver, ModelEvent, ModelRequest } from "./index.js";
 import { ModelDriverError } from "./model-driver-error.js";
 
-const maximumNormalizedContentBytes = 64 * 1024 * 1024;
 const maximumToolArgumentBytes = 2 * 1024 * 1024;
 const maximumToolCallCount = 128;
 const maximumToolCallIdBytes = 1_024;
@@ -212,7 +211,7 @@ function* mapStreamPart(
       normalization.contentBytes = addBytesWithinLimit(
         normalization.contentBytes,
         part.delta,
-        maximumNormalizedContentBytes,
+        maximumModelResponseContentBytes,
       );
       yield { type: "text_delta", text: part.delta };
       return;
@@ -220,7 +219,7 @@ function* mapStreamPart(
       normalization.contentBytes = addBytesWithinLimit(
         normalization.contentBytes,
         part.delta,
-        maximumNormalizedContentBytes,
+        maximumModelResponseContentBytes,
       );
       yield { type: "reasoning_delta", text: part.delta };
       return;

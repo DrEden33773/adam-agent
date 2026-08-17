@@ -16,6 +16,11 @@ import {
   shrinkContextMessagesForRetry,
   splitContextForCompaction,
 } from "./durable-context.js";
+import {
+  maximumInlineModelResponseFieldBytes,
+  maximumModelResponseContentBytes,
+  maximumReferencedModelResponseArtifactBytes,
+} from "./durable-model-response-policy.js";
 import { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
 import {
   type AgentSessionDurableContext,
@@ -480,13 +485,13 @@ export class AgentSession {
     this.#durableOutputLimits = {
       maximumInlineFieldBytes:
         configuredDurableOutputLimits?.maximumInlineFieldBytes ??
-        defaultMaximumInlineModelResponseFieldBytes,
+        maximumInlineModelResponseFieldBytes,
       maximumReferencedArtifactBytes:
         configuredDurableOutputLimits?.maximumReferencedArtifactBytes ??
-        defaultMaximumReferencedModelResponseArtifactBytes,
+        maximumReferencedModelResponseArtifactBytes,
       maximumResponseContentBytes:
         configuredDurableOutputLimits?.maximumResponseContentBytes ??
-        defaultMaximumModelResponseContentBytes,
+        maximumModelResponseContentBytes,
     };
     if (!Object.values(this.#durableOutputLimits).every((value) => isPositiveSafeInteger(value))) {
       throw new RangeError("Durable model-response limits must be positive safe integers.");
@@ -2341,9 +2346,6 @@ function mergeContextCallUsages(
 }
 
 const maximumReplayFieldBytes = 512 * 1024;
-const defaultMaximumInlineModelResponseFieldBytes = 256 * 1024;
-const defaultMaximumModelResponseContentBytes = 64 * 1024 * 1024;
-const defaultMaximumReferencedModelResponseArtifactBytes = 512 * 1024 * 1024;
 const maximumReplayToolCalls = 128;
 
 function samePermissionInput(left: PermissionPolicyInput, right: PermissionPolicyInput): boolean {

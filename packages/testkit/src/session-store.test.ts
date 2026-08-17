@@ -549,6 +549,69 @@ test("JSONL SessionStore rejects an oversized restored log before parsing record
   }
 });
 
+test("JSONL SessionStore rejects a restored overlong line below the physical log limit", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-overlong-session-record-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const store = await createJsonlSessionStore({
+    stateRoot,
+    workspaceRoot,
+    sessionId: "session-overlong-record",
+  });
+
+  try {
+    const storedPaths = await readdir(stateRoot, { recursive: true });
+    const sessionRelativePath = storedPaths.find((path) => path.endsWith(".jsonl"));
+    if (sessionRelativePath === undefined) {
+      throw new Error("The JSONL session file was not created.");
+    }
+    await writeFile(
+      join(stateRoot, sessionRelativePath),
+      `${"x".repeat(1024 * 1024 + 1)}\n`,
+      "utf8",
+    );
+
+    await expect(store.read()).rejects.toMatchObject({
+      name: "SessionStoreError",
+      code: "session_log_too_large",
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("separate parent and child JSONL files each receive their own physical log budget", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-independent-session-bounds-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const stores = await Promise.all(
+    ["parent-session", "child-session"].map((sessionId) =>
+      createJsonlSessionStore<SessionEventRecord>({ stateRoot, workspaceRoot, sessionId }),
+    ),
+  );
+  const text = "x".repeat(920 * 1024);
+
+  try {
+    for (const store of stores) {
+      for (let sequence = 1; sequence <= 18; sequence += 1) {
+        await store.append({
+          schemaVersion: 1,
+          runId,
+          sequence,
+          event: { type: "model_message_completed", text },
+        });
+      }
+    }
+
+    const restored = await Promise.all(stores.map((store) => store.read()));
+    expect(restored.map((records) => records.length)).toEqual([18, 18]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionStore adapters reject non-canonical records on append", async () => {
   const { testRoot, stores } = await createContractStores(
     "adam-agent-session-contract-",
@@ -622,6 +685,95 @@ test("SessionStore adapters reject an oversized canonical record before modifyin
         code: "session_log_too_large",
       });
       expect(await store.read(), name).toEqual([]);
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore measures the inline response threshold in UTF-8 bytes", async () => {
+  const { testRoot, stores } = await createContractStores<SessionRecord>(
+    "adam-agent-session-inline-response-bound-",
+    "session-inline-response-bound",
+  );
+  const oversizedInlineResponse = {
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "model_response_completed",
+      runId,
+      turn: 1,
+      attempt: 1,
+      targetIdentity: {
+        targetId: "fake.local",
+        vendor: "adam",
+        modelId: "fake-local",
+        route: "direct",
+        profileVersion: 1,
+        certification: "certified",
+      },
+      response: {
+        recordVersion: 2,
+        text: { storage: "inline", text: "界".repeat(90 * 1024) },
+        toolCalls: [],
+        toolIntents: [],
+        finishReason: "stop",
+      },
+    },
+  } as const;
+  expect(oversizedInlineResponse.record.response.text.text.length).toBeLessThan(256 * 1024);
+  expect(
+    Buffer.byteLength(oversizedInlineResponse.record.response.text.text, "utf8"),
+  ).toBeGreaterThan(256 * 1024);
+
+  try {
+    for (const [name, store] of stores) {
+      await expect(
+        store.append(oversizedInlineResponse as SessionRecord),
+        name,
+      ).rejects.toMatchObject({
+        name: "SessionStoreError",
+        code: "session_log_invalid",
+      });
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionStore measures the 1 MiB record ceiling before the terminating LF", async () => {
+  const { testRoot, stores } = await createContractStores(
+    "adam-agent-session-exact-record-bound-",
+    "session-exact-record-bound",
+  );
+  const emptyRecord: SessionEventRecord = {
+    schemaVersion: 1,
+    runId,
+    sequence: 1,
+    event: { type: "model_message_completed", text: "" },
+  };
+  const exactTextBytes = 1024 * 1024 - Buffer.byteLength(JSON.stringify(emptyRecord), "utf8");
+  const exactText = "x".repeat(exactTextBytes);
+  const exactRecord: SessionEventRecord = {
+    ...emptyRecord,
+    event: { type: "model_message_completed", text: exactText },
+  };
+  const oversizedRecord: SessionEventRecord = {
+    ...exactRecord,
+    sequence: 2,
+    event: { type: "model_message_completed", text: `${exactText}x` },
+  };
+  expect(Buffer.byteLength(JSON.stringify(exactRecord), "utf8")).toBe(1024 * 1024);
+  expect(Buffer.byteLength(JSON.stringify(oversizedRecord), "utf8")).toBe(1024 * 1024 + 1);
+
+  try {
+    for (const [name, store] of stores) {
+      await expect(store.append(exactRecord), name).resolves.toBeUndefined();
+      await expect(store.append(oversizedRecord), name).rejects.toMatchObject({
+        name: "SessionStoreError",
+        code: "session_log_too_large",
+      });
+      expect(await store.read(), name).toEqual([exactRecord]);
     }
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -759,17 +911,20 @@ test("JSONL SessionStore restores owner-only session directory permissions", asy
   }
 });
 
-async function createContractStores(prefix: string, sessionId: string) {
+async function createContractStores<RecordType extends SessionRecord = SessionEventRecord>(
+  prefix: string,
+  sessionId: string,
+) {
   const testRoot = await mkdtemp(join(tmpdir(), prefix));
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
   return {
     testRoot,
     stores: [
-      ["in-memory", createInMemorySessionStore()],
+      ["in-memory", createInMemorySessionStore<RecordType>()],
       [
         "JSONL",
-        await createJsonlSessionStore({
+        await createJsonlSessionStore<RecordType>({
           stateRoot: join(testRoot, "state"),
           workspaceRoot,
           sessionId,

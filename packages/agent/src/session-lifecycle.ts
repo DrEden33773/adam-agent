@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createFileArtifactStore } from "./artifact-store.js";
+import { createFileArtifactStore, readFileArtifact } from "./artifact-store.js";
 import { type ContextProfile, isContextProfileSupported } from "./context-profile.js";
 import {
   type ContextEvidenceV1,
@@ -13,6 +13,10 @@ import {
   mergeContextEvidence,
   reduceContextEvidence,
 } from "./durable-context.js";
+import {
+  maximumModelResponseContentBytes,
+  maximumReferencedModelResponseArtifactBytes,
+} from "./durable-model-response-policy.js";
 import {
   AgentSession,
   type ContextUsageTotals,
@@ -233,9 +237,10 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     }
   };
 
-  const inspectSession = async (input: {
-    readonly sessionId: string;
-  }): Promise<SessionSnapshot> => {
+  const inspectSession = async (
+    input: { readonly sessionId: string },
+    artifactCache = createArtifactMaterializationCache(),
+  ): Promise<SessionSnapshot> => {
     const records = await readJsonlSessionRecords({
       workspaceRoot: options.workspaceRoot,
       sessionId: input.sessionId,
@@ -267,21 +272,27 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     validateCurrentSessionHistory(first, records);
     await validateSessionLineage(options, first, new Set([input.sessionId]));
     await validateInheritedContextEvidence(options, first, records);
-    const artifactInspection = await inspectModelResponseArtifactLineage(options, first, records);
+    const artifactInspection = await inspectModelResponseArtifactLineage(
+      options,
+      first,
+      records,
+      artifactCache,
+    );
     const replayRecords =
       artifactInspection.degradation === undefined ? artifactInspection.records : records;
     const snapshot = snapshotFromRecords(first, replayRecords, artifactInspection);
     const inheritedContext =
       artifactInspection.degradation === undefined
-        ? await contextSnapshotFromLineage(options, first, replayRecords)
+        ? await contextSnapshotFromLineage(options, first, replayRecords, artifactCache)
         : undefined;
     return inheritedContext === undefined ? snapshot : { ...snapshot, context: inheritedContext };
   };
 
-  const resumeSession = async (input: {
-    readonly sessionId: string;
-  }): Promise<SessionResumeResult> => {
-    let snapshot = await inspectSession(input);
+  const resumeSession = async (
+    input: { readonly sessionId: string },
+    artifactCache = createArtifactMaterializationCache(),
+  ): Promise<SessionResumeResult> => {
+    let snapshot = await inspectSession(input, artifactCache);
     if (snapshot.schemaVersion === 3 && snapshot.degradation !== undefined) {
       return {
         status: "rejected",
@@ -295,7 +306,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     if (snapshot.schemaVersion === 3 && snapshot.status === "interrupted") {
       const restoredUserMessage = await appendMissingUserMessage(options, snapshot);
       if (restoredUserMessage) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (snapshot.schemaVersion !== 3) {
         throw new SessionLifecycleError("session_invalid");
@@ -305,42 +316,42 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
         snapshot,
       );
       if (interruptedCompaction) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (snapshot.schemaVersion !== 3) {
         throw new SessionLifecycleError("session_invalid");
       }
       const didNormalize = await appendDanglingAttemptInterruption(options, snapshot);
       if (didNormalize) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (
         snapshot.schemaVersion === 3 &&
         snapshot.status === "interrupted" &&
         (await settleRunTerminalIntent(options, snapshot))
       ) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (
         snapshot.schemaVersion === 3 &&
         snapshot.status === "interrupted" &&
         (await settleInterruptedCancellation(options, snapshot))
       ) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (
         snapshot.schemaVersion === 3 &&
         snapshot.status === "interrupted" &&
-        (await settleCompletedResponseTerminal(options, snapshot))
+        (await settleCompletedResponseTerminal(options, snapshot, artifactCache))
       ) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (
         snapshot.schemaVersion === 3 &&
         snapshot.status === "interrupted" &&
         (await settleIndeterminateToolEffects(options, snapshot))
       ) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
     }
     if (snapshot.schemaVersion === 3) {
@@ -413,10 +424,11 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
   return {
     async branch(input) {
       return withOwner(async () => {
+        const artifactCache = createArtifactMaterializationCache();
         if (!Number.isSafeInteger(input.atSequence) || input.atSequence <= 0) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
         }
-        let parent = await inspectSession({ sessionId: input.parentSessionId });
+        let parent = await inspectSession({ sessionId: input.parentSessionId }, artifactCache);
         if (parent.schemaVersion !== 3) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
         }
@@ -433,38 +445,43 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
         if (parent.status === "interrupted" && requestedCurrentTail) {
           const restoredUserMessage = await appendMissingUserMessage(options, parent);
           if (restoredUserMessage) {
-            parent = (await inspectSession({
-              sessionId: input.parentSessionId,
-            })) as CurrentSessionSnapshot;
+            parent = (await inspectSession(
+              { sessionId: input.parentSessionId },
+              artifactCache,
+            )) as CurrentSessionSnapshot;
           }
           const interruptedAttempt = await appendDanglingAttemptInterruption(options, parent);
           if (interruptedAttempt) {
-            parent = (await inspectSession({
-              sessionId: input.parentSessionId,
-            })) as CurrentSessionSnapshot;
+            parent = (await inspectSession(
+              { sessionId: input.parentSessionId },
+              artifactCache,
+            )) as CurrentSessionSnapshot;
           }
           const terminalIntent =
             parent.status === "interrupted" && (await settleRunTerminalIntent(options, parent));
           if (terminalIntent) {
-            parent = (await inspectSession({
-              sessionId: input.parentSessionId,
-            })) as CurrentSessionSnapshot;
+            parent = (await inspectSession(
+              { sessionId: input.parentSessionId },
+              artifactCache,
+            )) as CurrentSessionSnapshot;
           }
           const cancelledRun =
             parent.status === "interrupted" &&
             (await settleInterruptedCancellation(options, parent));
           if (cancelledRun) {
-            parent = (await inspectSession({
-              sessionId: input.parentSessionId,
-            })) as CurrentSessionSnapshot;
+            parent = (await inspectSession(
+              { sessionId: input.parentSessionId },
+              artifactCache,
+            )) as CurrentSessionSnapshot;
           }
           const indeterminateEffect =
             parent.status === "interrupted" &&
             (await settleIndeterminateToolEffects(options, parent));
           if (indeterminateEffect) {
-            parent = (await inspectSession({
-              sessionId: input.parentSessionId,
-            })) as CurrentSessionSnapshot;
+            parent = (await inspectSession(
+              { sessionId: input.parentSessionId },
+              artifactCache,
+            )) as CurrentSessionSnapshot;
           }
           if (
             restoredUserMessage ||
@@ -492,7 +509,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           throw new SessionLifecycleError("session_invalid");
         }
         validateCurrentSessionHistory(parentGenesis, parentPrefix);
-        await replayArtifactBytesFromLineage(options, parentGenesis, parentPrefix);
+        await replayArtifactBytesFromLineage(options, parentGenesis, parentPrefix, artifactCache);
         if (!isCompleteBranchBoundary(parentPrefix)) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
         }
@@ -545,7 +562,12 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           },
         };
         await store.append(genesis);
-        const context = await contextSnapshotFromLineage(options, parentGenesis, parentPrefix);
+        const context = await contextSnapshotFromLineage(
+          options,
+          parentGenesis,
+          parentPrefix,
+          artifactCache,
+        );
         return {
           ...snapshotFromGenesis(genesis, 1),
           ...(context === undefined ? {} : { context }),
@@ -577,7 +599,8 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     },
     async continue(input) {
       return withOwner(async () => {
-        const resumed = await resumeSession({ sessionId: input.sessionId });
+        const artifactCache = createArtifactMaterializationCache();
+        const resumed = await resumeSession({ sessionId: input.sessionId }, artifactCache);
         if (resumed.status === "rejected") {
           if (resumed.error.code === "model_target_incompatible") {
             throw new SessionLifecycleError("session_model_target_incompatible");
@@ -623,15 +646,17 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           first,
           records,
           { allowDegraded: false },
+          artifactCache,
         );
         const replayRecords = artifactInspection.records;
         const referencedModelResponseArtifactBytes = await replayArtifactBytesFromLineage(
           options,
           first,
           records,
+          artifactCache,
         );
         const [inheritedMessages, inheritedEvidence] = await Promise.all([
-          createBranchMessages(options, records),
+          createBranchMessages(options, records, artifactCache),
           createBranchEvidence(options, records),
         ]);
         const resumeState =
@@ -699,7 +724,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
               ...(runLimits === undefined ? {} : { limits: runLimits }),
             },
           );
-          const snapshot = await inspectSession({ sessionId: input.sessionId });
+          const snapshot = await inspectSession({ sessionId: input.sessionId }, artifactCache);
           if (snapshot.schemaVersion !== 3) {
             throw new SessionLifecycleError("session_invalid");
           }
@@ -1412,6 +1437,7 @@ async function contextSnapshotFromLineage(
   options: SessionLifecycleOptions,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
+  artifactCache: ModelResponseArtifactCache,
 ): Promise<SessionContextSnapshot | undefined> {
   const ownContext = contextSnapshotFromRecords(records);
   if (ownContext !== undefined || genesis.record.lineage === undefined) {
@@ -1423,13 +1449,20 @@ async function contextSnapshotFromLineage(
     parentGenesis,
     prefixRecords,
     { allowDegraded: false },
+    artifactCache,
   );
-  return contextSnapshotFromLineage(options, parentGenesis, artifactInspection.records);
+  return contextSnapshotFromLineage(
+    options,
+    parentGenesis,
+    artifactInspection.records,
+    artifactCache,
+  );
 }
 
 async function createBranchMessages(
   options: SessionLifecycleOptions,
   records: readonly SessionRecord[],
+  artifactCache: ModelResponseArtifactCache,
 ): Promise<ModelMessage[]> {
   const genesis = records[0];
   if (genesis === undefined || !isGenesisRecord(genesis)) {
@@ -1448,6 +1481,7 @@ async function createBranchMessages(
     parentGenesis,
     parentRecords,
     { allowDegraded: false },
+    artifactCache,
   );
   const projected = modelMessagesFromCompleteRecords(artifactInspection.records);
   if (
@@ -1458,7 +1492,7 @@ async function createBranchMessages(
   ) {
     return projected;
   }
-  return [...(await createBranchMessages(options, parentRecords)), ...projected];
+  return [...(await createBranchMessages(options, parentRecords, artifactCache)), ...projected];
 }
 
 async function createBranchEvidence(
@@ -2429,6 +2463,7 @@ async function settleInterruptedCancellation(
 async function settleCompletedResponseTerminal(
   options: SessionLifecycleOptions,
   snapshot: CurrentSessionSnapshot,
+  artifactCache: ModelResponseArtifactCache,
 ): Promise<boolean> {
   const records = await readJsonlSessionRecords({
     workspaceRoot: options.workspaceRoot,
@@ -2517,9 +2552,13 @@ async function settleCompletedResponseTerminal(
   if (genesis === undefined || !isGenesisRecord(genesis)) {
     throw new SessionLifecycleError("session_invalid");
   }
-  const artifactInspection = await materializeModelResponseArtifacts(options, genesis, records, {
-    allowDegraded: false,
-  });
+  const artifactInspection = await materializeModelResponseArtifacts(
+    options,
+    genesis,
+    records,
+    { allowDegraded: false },
+    artifactCache,
+  );
   const responseText =
     artifactInspection.contents.get(responseRecord.sequence)?.text ??
     inlineModelResponseField(responseRecord.record.response.text);
@@ -2956,14 +2995,29 @@ type ModelResponseArtifactInspection = {
   readonly records: readonly SessionRecord[];
 };
 
+type ResolvedModelResponseArtifact =
+  | { readonly byteCount: number; readonly text: string }
+  | undefined;
+
+type ModelResponseArtifactCache = Map<string, Promise<ResolvedModelResponseArtifact>>;
+
+function createArtifactMaterializationCache(): ModelResponseArtifactCache {
+  return new Map();
+}
+
 async function inspectModelResponseArtifactLineage(
   options: SessionLifecycleOptions,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
+  artifactCache: ModelResponseArtifactCache,
 ): Promise<ModelResponseArtifactInspection> {
-  const ownInspection = await materializeModelResponseArtifacts(options, genesis, records, {
-    allowDegraded: true,
-  });
+  const ownInspection = await materializeModelResponseArtifacts(
+    options,
+    genesis,
+    records,
+    { allowDegraded: true },
+    artifactCache,
+  );
   if (ownInspection.degradation !== undefined || genesis.record.lineage === undefined) {
     return ownInspection;
   }
@@ -2972,6 +3026,7 @@ async function inspectModelResponseArtifactLineage(
     options,
     parentGenesis,
     prefixRecords,
+    artifactCache,
   );
   if (inherited.degradation !== undefined) {
     return { ...ownInspection, degradation: inherited.degradation };
@@ -2980,7 +3035,7 @@ async function inspectModelResponseArtifactLineage(
     inherited.logicalReferencedBytes + ownInspection.logicalReferencedBytes;
   if (
     !Number.isSafeInteger(logicalReferencedBytes) ||
-    logicalReferencedBytes > defaultMaximumReferencedModelResponseArtifactBytes
+    logicalReferencedBytes > maximumReferencedModelResponseArtifactBytes
   ) {
     throw new SessionLifecycleError("session_invalid");
   }
@@ -2994,10 +3049,15 @@ async function replayArtifactBytesFromLineage(
   options: SessionLifecycleOptions,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
+  artifactCache: ModelResponseArtifactCache,
 ): Promise<number> {
-  const ownInspection = await materializeModelResponseArtifacts(options, genesis, records, {
-    allowDegraded: false,
-  });
+  const ownInspection = await materializeModelResponseArtifacts(
+    options,
+    genesis,
+    records,
+    { allowDegraded: false },
+    artifactCache,
+  );
   const inheritedBytes =
     genesis.record.lineage === undefined
       ? 0
@@ -3006,7 +3066,12 @@ async function replayArtifactBytesFromLineage(
             options,
             genesis,
           );
-          return replayArtifactBytesFromLineage(options, parentGenesis, prefixRecords);
+          return replayArtifactBytesFromLineage(
+            options,
+            parentGenesis,
+            prefixRecords,
+            artifactCache,
+          );
         })();
   const total = inheritedBytes + ownInspection.logicalReferencedBytes;
   const configuredMaximum = (
@@ -3015,7 +3080,7 @@ async function replayArtifactBytesFromLineage(
     }
   )[sessionDurableOutputLimits]?.maximumReferencedArtifactBytes;
   const maximumReferencedArtifactBytes =
-    configuredMaximum ?? defaultMaximumReferencedModelResponseArtifactBytes;
+    configuredMaximum ?? maximumReferencedModelResponseArtifactBytes;
   if (!Number.isSafeInteger(total) || total > maximumReferencedArtifactBytes) {
     throw new SessionLifecycleError("session_invalid");
   }
@@ -3027,10 +3092,9 @@ async function materializeModelResponseArtifacts(
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
   behavior: { readonly allowDegraded: boolean },
+  artifactCache: ModelResponseArtifactCache,
 ): Promise<ModelResponseArtifactInspection> {
-  const artifactStore = await createFileArtifactStore({
-    root: join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
-  });
+  const artifactRoot = join(effectiveSessionStateRoot(options.stateRoot), "artifacts");
   const contents = new Map<number, { readonly text: string; readonly reasoning?: string }>();
   const materialized: SessionRecord[] = [];
   let logicalReferencedBytes = 0;
@@ -3062,7 +3126,7 @@ async function materializeModelResponseArtifacts(
           : response.reasoning.reference.byteCount;
     if (
       !Number.isSafeInteger(declaredTextBytes + declaredReasoningBytes) ||
-      declaredTextBytes + declaredReasoningBytes > defaultMaximumModelResponseContentBytes
+      declaredTextBytes + declaredReasoningBytes > maximumModelResponseContentBytes
     ) {
       throw new SessionLifecycleError("session_invalid");
     }
@@ -3093,7 +3157,7 @@ async function materializeModelResponseArtifacts(
         },
       });
       if (
-        reference.byteCount > defaultMaximumModelResponseContentBytes ||
+        reference.byteCount > maximumModelResponseContentBytes ||
         source.field !== fieldKind ||
         source.projectId !== genesis.record.projectId ||
         source.sessionId !== genesis.record.sessionId ||
@@ -3104,29 +3168,39 @@ async function materializeModelResponseArtifacts(
       ) {
         return degradation("model_response_artifact_corrupt");
       }
-      let bytes: Uint8Array | undefined;
+      let resolvedArtifact: ResolvedModelResponseArtifact;
       try {
-        bytes = await artifactStore.read(reference.id, {
-          maximumBytes: defaultMaximumModelResponseContentBytes,
-        });
+        let pendingArtifact = artifactCache.get(reference.id);
+        if (pendingArtifact === undefined) {
+          pendingArtifact = readFileArtifact({
+            root: artifactRoot,
+            id: reference.id,
+            maximumBytes: maximumModelResponseContentBytes,
+          }).then((bytes) =>
+            bytes === undefined
+              ? undefined
+              : {
+                  byteCount: bytes.byteLength,
+                  text: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+                },
+          );
+          artifactCache.set(reference.id, pendingArtifact);
+        }
+        resolvedArtifact = await pendingArtifact;
       } catch {
         return degradation("model_response_artifact_corrupt");
       }
-      if (bytes === undefined) {
+      if (resolvedArtifact === undefined) {
         return degradation("model_response_artifact_missing");
       }
-      if (bytes.byteLength !== reference.byteCount) {
+      if (resolvedArtifact.byteCount !== reference.byteCount) {
         return degradation("model_response_artifact_corrupt");
       }
-      try {
-        return {
-          status: "ready",
-          text: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
-          referencedBytes: reference.byteCount,
-        };
-      } catch {
-        return degradation("model_response_artifact_corrupt");
-      }
+      return {
+        status: "ready",
+        text: resolvedArtifact.text,
+        referencedBytes: reference.byteCount,
+      };
     };
 
     const text = await resolveField(response.text, "text");
@@ -3147,7 +3221,7 @@ async function materializeModelResponseArtifacts(
       return { contents, degradation: reasoning.degradation, logicalReferencedBytes, records };
     }
     logicalReferencedBytes += text.referencedBytes + (reasoning?.referencedBytes ?? 0);
-    if (logicalReferencedBytes > defaultMaximumReferencedModelResponseArtifactBytes) {
+    if (logicalReferencedBytes > maximumReferencedModelResponseArtifactBytes) {
       throw new SessionLifecycleError("session_invalid");
     }
     const resolvedReasoning = reasoning?.text;
@@ -3191,9 +3265,6 @@ function inlineModelResponseField(field: string | SessionModelResponseField): st
   }
   throw new SessionLifecycleError("session_invalid");
 }
-
-const defaultMaximumModelResponseContentBytes = 64 * 1024 * 1024;
-const defaultMaximumReferencedModelResponseArtifactBytes = 512 * 1024 * 1024;
 
 function sessionLifecycleErrorMessage(code: SessionLifecycleError["code"]): string {
   switch (code) {
