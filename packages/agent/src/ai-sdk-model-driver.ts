@@ -96,6 +96,9 @@ export class AiSdkModelDriver implements ModelDriver {
       for await (const part of result.stream) {
         normalization.streamPartCount += 1;
         assertWithinLimit(normalization.streamPartCount, maximumStreamPartCount);
+        if (isIgnoredStructuralPart(part)) {
+          continue;
+        }
         const events = [...mapStreamPart(part, normalization)];
         if (part.type === "finish") {
           if (deadlineTimer !== undefined) {
@@ -133,6 +136,19 @@ export class AiSdkModelDriver implements ModelDriver {
       }
       request.signal.removeEventListener("abort", abortFromCaller);
     }
+  }
+}
+
+function isIgnoredStructuralPart(part: LanguageModelV4StreamPart): boolean {
+  switch (part.type) {
+    case "response-metadata":
+    case "text-start":
+    case "text-end":
+    case "reasoning-start":
+    case "reasoning-end":
+      return true;
+    default:
+      return false;
   }
 }
 
