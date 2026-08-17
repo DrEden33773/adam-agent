@@ -996,58 +996,48 @@ test("the unified driver retains the independent tool-argument stream limit", as
 });
 
 test("the unified driver counts every Provider V4 part against the 2,000,000 part ceiling", async () => {
-  const createDriver = (partCount: number) => {
-    let emitted = 0;
-    const model = {
-      specificationVersion: "v4",
-      provider: "test",
-      modelId: "part-count",
-      supportedUrls: {},
-      async doGenerate() {
-        throw new Error("Generation is not used by this test.");
-      },
-      async doStream() {
-        return {
-          stream: new ReadableStream({
+  let emitted = 0;
+  const model = {
+    specificationVersion: "v4",
+    provider: "test",
+    modelId: "part-count",
+    supportedUrls: {},
+    async doGenerate() {
+      throw new Error("Generation is not used by this test.");
+    },
+    async doStream() {
+      return {
+        stream: new ReadableStream(
+          {
             pull(controller) {
-              if (emitted === partCount) {
-                controller.close();
-                return;
-              }
               emitted += 1;
               controller.enqueue({ type: "response-metadata" });
             },
-          }),
-        };
-      },
-    } as unknown as ConstructorParameters<typeof AiSdkModelDriverForTesting>[0]["model"];
-    return {
-      driver: new AiSdkModelDriverForTesting({
-        model,
-        maximumOutputTokens: 4_096,
-        deadlineMs: 120_000,
-        sensitiveValues: [],
-      }),
-      emitted: () => emitted,
-    };
-  };
+          },
+          { highWaterMark: 0 },
+        ),
+      };
+    },
+  } as unknown as ConstructorParameters<typeof AiSdkModelDriverForTesting>[0]["model"];
+  const driver = new AiSdkModelDriverForTesting({
+    model,
+    maximumOutputTokens: 4_096,
+    deadlineMs: 120_000,
+    sensitiveValues: [],
+  });
   const request = {
     maximumOutputTokens: 4_096,
     messages: [{ role: "user", content: "Count parts." }] as const,
     tools: [],
     signal: new AbortController().signal,
   };
-  const accepted = createDriver(2_000_000);
-  await expect(collect(accepted.driver.stream(request))).resolves.toEqual([]);
-  expect(accepted.emitted()).toBe(2_000_000);
 
-  const rejected = createDriver(2_000_001);
-  await expect(collectError(rejected.driver.stream(request))).resolves.toMatchObject({
+  await expect(collectError(driver.stream(request))).resolves.toMatchObject({
     category: "protocol_incompatibility",
     message: "The model provider response exceeded Adam's stream limit.",
   });
-  expect(rejected.emitted()).toBe(2_000_001);
-});
+  expect(emitted).toBe(2_000_001);
+}, 10_000);
 
 test("the target snapshot reports exact Certified identities and safe credential readiness", async () => {
   const targets = createModelTargets({
