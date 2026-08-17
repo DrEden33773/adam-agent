@@ -4752,10 +4752,13 @@ async function createAgentSessionStore(storeKind: "in-memory" | "JSONL") {
 }
 
 function createTestSession(
-  dependencies: Omit<AgentSessionDependencies, "store"> & { readonly store?: SessionStore },
+  dependencies: Pick<AgentSessionDependencies, "model" | "permissions" | "tools"> & {
+    readonly store?: SessionStore;
+  },
 ): AgentSession {
   return new AgentSession({
     ...dependencies,
+    maximumOutputTokens: 4_096,
     store: dependencies.store ?? createInMemorySessionStore(),
   });
 }

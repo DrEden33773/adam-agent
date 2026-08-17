@@ -64,7 +64,7 @@ export class AiSdkModelDriver implements ModelDriver {
     try {
       const result = await this.#model.doStream({
         prompt: mapPrompt(request),
-        maxOutputTokens: this.#maximumOutputTokens,
+        maxOutputTokens: Math.min(request.maximumOutputTokens, this.#maximumOutputTokens),
         abortSignal: attemptController.signal,
         ...(this.#providerOptions === undefined ? {} : { providerOptions: this.#providerOptions }),
         ...(request.tools.length === 0

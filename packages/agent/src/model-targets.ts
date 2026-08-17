@@ -107,6 +107,7 @@ export function selectModelTargetId(
 export interface ModelTargets {
   resolve(input: {
     readonly targetId: string;
+    readonly targetIdentity?: ModelTargetIdentity | undefined;
     readonly allowExperimental: boolean;
     readonly signal: AbortSignal;
   }): Promise<{
@@ -116,6 +117,7 @@ export interface ModelTargets {
   }>;
   snapshot(input: {
     readonly discoverGateway?: boolean | undefined;
+    readonly includeHistoricalProfiles?: boolean | undefined;
     readonly signal: AbortSignal;
   }): Promise<ModelTargetSnapshot>;
 }
@@ -129,7 +131,7 @@ export type ModelTargetsOptions = {
   readonly fetch?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 };
 
-const directDeepSeekTargets: readonly ModelTargetIdentity[] = Object.freeze([
+const directDeepSeekV1Targets: readonly ModelTargetIdentity[] = Object.freeze([
   Object.freeze({
     targetId: "deepseek-v4-flash.direct",
     vendor: "deepseek",
@@ -147,13 +149,26 @@ const directDeepSeekTargets: readonly ModelTargetIdentity[] = Object.freeze([
     certification: "certified",
   }),
 ]);
+const currentDirectDeepSeekTargets = directDeepSeekV1Targets;
+const supportedDirectDeepSeekTargets = directDeepSeekV1Targets;
 
 const experimentalGatewayProviderId = "poolside";
-const directDeepSeekContextProfile: ContextProfile = Object.freeze({
+const directDeepSeekContextProfileV1: ContextProfile = Object.freeze({
   version: 1,
   contextWindowTokens: 1_000_000,
   maximumOutputTokens: 32_768,
   compactAtTokens: 800_000,
+  postCompactTargetTokens: 200_000,
+  retainedTargetTokens: 20_000,
+  estimatorVersion: 1,
+});
+export const preparedDirectDeepSeekV2ContextProfile: ContextProfile = Object.freeze({
+  version: 2,
+  contextWindowTokens: 1_000_000,
+  maximumOutputTokens: 384_000,
+  ordinaryOutputReserveTokens: 4_096,
+  compactionSummaryMaximumOutputTokens: 32_768,
+  compactAtTokens: 900_000,
   postCompactTargetTokens: 200_000,
   retainedTargetTokens: 20_000,
   estimatorVersion: 1,
@@ -185,11 +200,20 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
   }
   return {
     async resolve(input) {
+      const requestedIdentity = input.targetIdentity;
       const identity =
-        directDeepSeekTargets.find((candidate) => candidate.targetId === input.targetId) ??
-        (input.targetId === experimentalGatewayTarget.targetId
-          ? experimentalGatewayTarget
-          : undefined);
+        requestedIdentity !== undefined && requestedIdentity.targetId !== input.targetId
+          ? undefined
+          : requestedIdentity === undefined
+            ? (currentDirectDeepSeekTargets.find(
+                (candidate) => candidate.targetId === input.targetId,
+              ) ??
+              (input.targetId === experimentalGatewayTarget.targetId
+                ? experimentalGatewayTarget
+                : undefined))
+            : [...supportedDirectDeepSeekTargets, experimentalGatewayTarget].find((candidate) =>
+                sameModelTargetIdentity(candidate, requestedIdentity),
+              );
       if (identity === undefined) {
         throw new ModelTargetError(
           "target_not_found",
@@ -244,12 +268,13 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
           : { apiKey: options.environment.DEEPSEEK_API_KEY }),
         ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
       });
+      const contextProfile = directDeepSeekContextProfileFor(identity);
       return {
         identity,
-        contextProfile: directDeepSeekContextProfile,
+        contextProfile,
         driver: new AiSdkModelDriver({
           model: provider(identity.modelId),
-          maximumOutputTokens: 32_768,
+          maximumOutputTokens: contextProfile.maximumOutputTokens,
           deadlineMs,
           sensitiveValues:
             options.environment.DEEPSEEK_API_KEY === undefined
@@ -258,7 +283,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
         }),
       };
     },
-    async snapshot() {
+    async snapshot(input) {
       const status: ModelTargetReadiness["status"] = hasCredential(
         options.environment.DEEPSEEK_API_KEY,
       )
@@ -271,10 +296,13 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
         : "missing";
       return {
         targets: [
-          ...directDeepSeekTargets.map((identity) => ({
+          ...(input.includeHistoricalProfiles
+            ? supportedDirectDeepSeekTargets
+            : currentDirectDeepSeekTargets
+          ).map((identity) => ({
             identity,
             readiness: { status, credentialSource: "DEEPSEEK_API_KEY" },
-            contextProfile: directDeepSeekContextProfile,
+            contextProfile: directDeepSeekContextProfileFor(identity),
           })),
           {
             identity: experimentalGatewayTarget,
@@ -292,4 +320,29 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
 
 function hasCredential(value: string | undefined): boolean {
   return value !== undefined && value.trim().length > 0;
+}
+
+function directDeepSeekContextProfileFor(identity: ModelTargetIdentity): ContextProfile {
+  if (identity.profileVersion === 1) {
+    return directDeepSeekContextProfileV1;
+  }
+  if (identity.profileVersion === 2) {
+    return preparedDirectDeepSeekV2ContextProfile;
+  }
+  throw new RangeError("The Direct DeepSeek context profile is not supported.");
+}
+
+export function sameModelTargetIdentity(
+  left: ModelTargetIdentity,
+  right: ModelTargetIdentity,
+): boolean {
+  return (
+    left.targetId === right.targetId &&
+    left.vendor === right.vendor &&
+    left.modelId === right.modelId &&
+    left.route === right.route &&
+    left.upstreamProviderId === right.upstreamProviderId &&
+    left.profileVersion === right.profileVersion &&
+    left.certification === right.certification
+  );
 }

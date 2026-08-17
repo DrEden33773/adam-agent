@@ -115,7 +115,7 @@ export class OpenAICompatibleModelDriver implements ModelDriver {
         model: this.#model,
         stream: true,
         stream_options: { include_usage: true },
-        max_tokens: this.#maximumOutputTokens,
+        max_tokens: Math.min(request.maximumOutputTokens, this.#maximumOutputTokens),
         ...(tools.length === 0 ? {} : { tools }),
       },
       { signal: request.signal },

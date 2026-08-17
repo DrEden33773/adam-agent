@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 
 import { z } from "zod";
-import type { ContextProfile } from "./context-profile.js";
+import {
+  type ContextProfile,
+  resolveCompactionSummaryMaximumOutputTokens,
+} from "./context-profile.js";
 import type { ModelDriver, ModelMessage } from "./index.js";
 import { ModelDriverError } from "./model-driver-error.js";
 import type { SessionRecord } from "./session-store.js";
@@ -266,9 +269,9 @@ export async function generateContextSummary(input: {
   let usageInvalid = false;
   let invalid = false;
   const requestMessages = createContextSummaryRequestMessages(input);
+  const maximumOutputTokens = resolveCompactionSummaryMaximumOutputTokens(input.profile);
   if (
-    estimateActiveContextTokens(requestMessages, input.profile) +
-      input.profile.maximumOutputTokens >
+    estimateActiveContextTokens(requestMessages, input.profile) + maximumOutputTokens >
     input.profile.contextWindowTokens
   ) {
     throw new ContextCompactionError(
@@ -280,12 +283,13 @@ export async function generateContextSummary(input: {
     for await (const event of input.model.stream({
       messages: requestMessages,
       tools: [],
+      maximumOutputTokens,
       signal: input.signal,
     })) {
       if (event.type === "text_delta") {
         if (
           Buffer.byteLength(text, "utf8") + Buffer.byteLength(event.text, "utf8") >
-          Math.min(maximumSummaryBytes, input.profile.maximumOutputTokens * 8)
+          Math.min(maximumSummaryBytes, maximumOutputTokens * 8)
         ) {
           throw new ContextCompactionError(
             "context_compaction_invalid",
@@ -384,7 +388,8 @@ function createContextSummaryRequestMessages(input: {
       fitContextMessages(sourceMessages, maximumFittedToolResultBytes),
     );
     if (
-      estimateActiveContextTokens(request, input.profile) + input.profile.maximumOutputTokens <=
+      estimateActiveContextTokens(request, input.profile) +
+        resolveCompactionSummaryMaximumOutputTokens(input.profile) <=
       input.profile.contextWindowTokens
     ) {
       return request;

@@ -110,6 +110,7 @@ test("an approved shell command runs from the workspace root and persists its re
       ];
     });
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model,
       tools: createCodingToolRegistry({ workspaceRoot }),
       permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["execute"] }),
@@ -209,6 +210,7 @@ test("a non-zero shell exit is a completed result that the model can handle", as
       ];
     });
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model,
       tools: createCodingToolRegistry({ workspaceRoot }),
       permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
@@ -264,6 +266,7 @@ test("the shell receives an isolated HOME and does not inherit unrelated runtime
       ];
     });
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model,
       tools: createCodingToolRegistry({ workspaceRoot }),
       permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
@@ -330,6 +333,7 @@ test("a shell process that cannot start returns a typed failure", async () => {
     ];
   });
   const session = new AgentSession({
+    maximumOutputTokens: 4_096,
     model,
     tools: createCodingToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
@@ -391,6 +395,7 @@ test("a timed-out shell command cannot outlive the process-group termination gra
       ];
     });
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model,
       tools: createCodingToolRegistry({ workspaceRoot }),
       permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
@@ -436,6 +441,7 @@ test("timeout cleanup kills a detached descendant after the shell leader exits",
       ];
     });
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model,
       tools: createCodingToolRegistry({ workspaceRoot }),
       permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
@@ -482,6 +488,7 @@ test("the first timeout remains the shell outcome when caller cancellation races
       ];
     });
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model,
       tools: createCodingToolRegistry({ workspaceRoot }),
       permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
@@ -539,6 +546,7 @@ test("aborting an active shell command records interruption and removes its proc
       ];
     });
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model,
       tools: createCodingToolRegistry({ workspaceRoot }),
       permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
@@ -632,6 +640,7 @@ test("overflowing shell output is durably referenced before its bounded result i
       ];
     });
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model,
       tools: createCodingToolRegistry({ workspaceRoot, artifactStore }),
       permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
@@ -770,6 +779,7 @@ test("runtime-owned shell limits cap both the inline tail and durable artifact",
       ];
     });
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model,
       tools: createCodingToolRegistry({
         workspaceRoot,
@@ -874,6 +884,7 @@ test("an artifact write failure cannot publish a dangling completed shell result
       ];
     });
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model,
       tools: createCodingToolRegistry({ workspaceRoot, artifactStore }),
       permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),

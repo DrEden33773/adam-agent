@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { type ContextProfile, sessionContextProfile } from "./context-profile.js";
+import { type ContextProfile, resolveOrdinaryMaximumOutputTokens } from "./context-profile.js";
 import {
   type ContextCallUsage,
   ContextCompactionError,
@@ -181,6 +181,7 @@ export type ModelMessage =
 export type ModelRequest = {
   readonly messages: readonly ModelMessage[];
   readonly tools: readonly ModelToolDefinition[];
+  readonly maximumOutputTokens: number;
   readonly signal: AbortSignal;
 };
 
@@ -401,12 +402,24 @@ export type RuntimeEventListener = (event: RuntimeEvent) => void;
 
 class SessionPersistenceError extends Error {}
 
-export type AgentSessionDependencies = {
+type AgentSessionBaseDependencies = {
   readonly model: ModelDriver;
   readonly tools?: ToolRegistry;
   readonly permissions?: PermissionPolicy;
   readonly store: SessionStore;
 };
+
+export type AgentSessionDependencies = AgentSessionBaseDependencies &
+  (
+    | {
+        readonly contextProfile: ContextProfile;
+        readonly maximumOutputTokens?: never;
+      }
+    | {
+        readonly contextProfile?: never;
+        readonly maximumOutputTokens: number;
+      }
+  );
 
 export class AgentSession {
   readonly #listeners = new Set<RuntimeEventListener>();
@@ -415,6 +428,7 @@ export class AgentSession {
   readonly #permissions: PermissionPolicy | undefined;
   readonly #durableContext: AgentSessionDurableContext | undefined;
   readonly #contextProfile: ContextProfile | undefined;
+  readonly #maximumOutputTokens: number;
   readonly #store: SessionStore<SessionRecord>;
   #activeAbortController: AbortController | undefined;
   #activeProviderAttempt:
@@ -438,11 +452,13 @@ export class AgentSession {
         readonly [sessionDurableContext]?: AgentSessionDurableContext;
       }
     )[sessionDurableContext];
-    this.#contextProfile = (
-      dependencies as AgentSessionDependencies & {
-        readonly [sessionContextProfile]?: ContextProfile;
-      }
-    )[sessionContextProfile];
+    this.#contextProfile = dependencies.contextProfile;
+    const maximumOutputTokens =
+      dependencies.contextProfile?.maximumOutputTokens ?? dependencies.maximumOutputTokens;
+    if (maximumOutputTokens === undefined || !isPositiveSafeInteger(maximumOutputTokens)) {
+      throw new RangeError("The model output limit must be a positive safe integer.");
+    }
+    this.#maximumOutputTokens = maximumOutputTokens;
     this.#model = dependencies.model;
     this.#tools = dependencies.tools;
     this.#permissions = dependencies.permissions;
@@ -629,7 +645,7 @@ export class AgentSession {
       if (!retryingSameTurn && limits?.maxTurns !== undefined && modelTurns >= limits.maxTurns) {
         return this.#settleTurnLimitExceeded();
       }
-      const activeEstimate =
+      let activeEstimate =
         this.#contextProfile === undefined
           ? undefined
           : activeProviderSample === undefined ||
@@ -670,13 +686,29 @@ export class AgentSession {
         if (limits?.maxTokens !== undefined && reportedTokens >= limits.maxTokens) {
           return this.#settleTokenLimitExceeded();
         }
+        activeEstimate = estimateActiveContextTokens(messages, this.#contextProfile);
         this.#publishContextUsage(ordinaryUsage, compactionUsage, {
           source: "estimated",
-          tokens: estimateActiveContextTokens(messages, this.#contextProfile),
+          tokens: activeEstimate,
           throughSequence: this.#nextSequence - 1,
         });
       }
       skipProactiveCompaction = false;
+      const maximumOutputTokens =
+        this.#contextProfile === undefined
+          ? this.#maximumOutputTokens
+          : resolveOrdinaryMaximumOutputTokens(
+              this.#contextProfile,
+              activeEstimate ?? estimateActiveContextTokens(messages, this.#contextProfile),
+            );
+      if (!isPositiveSafeInteger(maximumOutputTokens)) {
+        return this.#settleContextCompactionFailed(
+          new ContextCompactionError(
+            "context_window_unrecoverable",
+            "The active context leaves no safe output capacity for this model request.",
+          ),
+        );
+      }
       if (!retryingSameTurn) {
         modelTurns += 1;
         nextAttemptNumber =
@@ -737,6 +769,7 @@ export class AgentSession {
         for await (const event of this.#model.stream({
           messages: [...messages],
           tools: this.#tools?.definitions() ?? [],
+          maximumOutputTokens,
           signal,
         })) {
           if (signal.aborted) {

@@ -615,6 +615,8 @@ const contextProfileSchema: z.ZodType<ContextProfile> = z.strictObject({
   version: z.number().int().positive(),
   contextWindowTokens: z.number().int().positive(),
   maximumOutputTokens: z.number().int().positive(),
+  ordinaryOutputReserveTokens: z.number().int().nonnegative().optional(),
+  compactionSummaryMaximumOutputTokens: z.number().int().positive().optional(),
   compactAtTokens: z.number().int().positive(),
   postCompactTargetTokens: z.number().int().positive(),
   retainedTargetTokens: z.number().int().nonnegative(),
