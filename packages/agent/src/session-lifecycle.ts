@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { createFileArtifactStore, readFileArtifact } from "./artifact-store.js";
 import { type ContextProfile, isContextProfileSupported } from "./context-profile.js";
 import {
   type ContextEvidenceV1,
@@ -10,6 +13,10 @@ import {
   mergeContextEvidence,
   reduceContextEvidence,
 } from "./durable-context.js";
+import {
+  maximumModelResponseContentBytes,
+  maximumReferencedModelResponseArtifactBytes,
+} from "./durable-model-response-policy.js";
 import {
   AgentSession,
   type ContextUsageTotals,
@@ -32,7 +39,9 @@ import {
 } from "./project-lifecycle-owner.js";
 import {
   type AgentSessionDurableContext,
+  type AgentSessionDurableOutputLimits,
   sessionDurableContext,
+  sessionDurableOutputLimits,
 } from "./session-durable-context.js";
 import {
   createJsonlSessionStore,
@@ -45,6 +54,7 @@ import {
   type SessionGenesisRecord,
   type SessionLogicalRunStartedRecord,
   type SessionModelResponseCompletedRecord,
+  type SessionModelResponseField,
   type SessionRecord,
   type SessionStore,
 } from "./session-store.js";
@@ -58,6 +68,12 @@ export type CurrentSessionSnapshot = {
   readonly status: "idle" | "interrupted" | "settled";
   readonly lastSequence: number;
   readonly context?: SessionContextSnapshot;
+  readonly degradation?: {
+    readonly code: "model_response_artifact_corrupt" | "model_response_artifact_missing";
+    readonly artifactId: string;
+    readonly field: "reasoning" | "text";
+    readonly responseSequence: number;
+  };
   readonly lineage?: {
     readonly parentSessionId: string;
     readonly parentEventPosition: number;
@@ -75,7 +91,7 @@ export type CurrentSessionSnapshot = {
     readonly lastCompletedResponse?: {
       readonly turn: number;
       readonly attempt: number;
-      readonly finishReason: "stop" | "tool_calls";
+      readonly finishReason: "length" | "stop" | "tool_calls";
     };
   };
 };
@@ -133,7 +149,8 @@ export type SessionResumeResult =
         readonly code:
           | "model_target_incompatible"
           | "model_target_unavailable"
-          | "non_resumable_legacy_session";
+          | "non_resumable_legacy_session"
+          | "session_replay_unavailable";
         readonly message: string;
       };
     };
@@ -220,9 +237,10 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     }
   };
 
-  const inspectSession = async (input: {
-    readonly sessionId: string;
-  }): Promise<SessionSnapshot> => {
+  const inspectSession = async (
+    input: { readonly sessionId: string },
+    artifactCache = createArtifactMaterializationCache(),
+  ): Promise<SessionSnapshot> => {
     const records = await readJsonlSessionRecords({
       workspaceRoot: options.workspaceRoot,
       sessionId: input.sessionId,
@@ -254,19 +272,41 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     validateCurrentSessionHistory(first, records);
     await validateSessionLineage(options, first, new Set([input.sessionId]));
     await validateInheritedContextEvidence(options, first, records);
-    const snapshot = snapshotFromRecords(first, records);
-    const inheritedContext = await contextSnapshotFromLineage(options, first, records);
+    const artifactInspection = await inspectModelResponseArtifactLineage(
+      options,
+      first,
+      records,
+      artifactCache,
+    );
+    const replayRecords =
+      artifactInspection.degradation === undefined ? artifactInspection.records : records;
+    const snapshot = snapshotFromRecords(first, replayRecords, artifactInspection);
+    const inheritedContext =
+      artifactInspection.degradation === undefined
+        ? await contextSnapshotFromLineage(options, first, replayRecords, artifactCache)
+        : undefined;
     return inheritedContext === undefined ? snapshot : { ...snapshot, context: inheritedContext };
   };
 
-  const resumeSession = async (input: {
-    readonly sessionId: string;
-  }): Promise<SessionResumeResult> => {
-    let snapshot = await inspectSession(input);
+  const resumeSession = async (
+    input: { readonly sessionId: string },
+    artifactCache = createArtifactMaterializationCache(),
+  ): Promise<SessionResumeResult> => {
+    let snapshot = await inspectSession(input, artifactCache);
+    if (snapshot.schemaVersion === 3 && snapshot.degradation !== undefined) {
+      return {
+        status: "rejected",
+        snapshot,
+        error: {
+          code: "session_replay_unavailable",
+          message: "Replay-authoritative model response content is unavailable.",
+        },
+      };
+    }
     if (snapshot.schemaVersion === 3 && snapshot.status === "interrupted") {
       const restoredUserMessage = await appendMissingUserMessage(options, snapshot);
       if (restoredUserMessage) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (snapshot.schemaVersion !== 3) {
         throw new SessionLifecycleError("session_invalid");
@@ -276,42 +316,42 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
         snapshot,
       );
       if (interruptedCompaction) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (snapshot.schemaVersion !== 3) {
         throw new SessionLifecycleError("session_invalid");
       }
       const didNormalize = await appendDanglingAttemptInterruption(options, snapshot);
       if (didNormalize) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (
         snapshot.schemaVersion === 3 &&
         snapshot.status === "interrupted" &&
         (await settleRunTerminalIntent(options, snapshot))
       ) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (
         snapshot.schemaVersion === 3 &&
         snapshot.status === "interrupted" &&
         (await settleInterruptedCancellation(options, snapshot))
       ) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (
         snapshot.schemaVersion === 3 &&
         snapshot.status === "interrupted" &&
-        (await settleCompletedResponseTerminal(options, snapshot))
+        (await settleCompletedResponseTerminal(options, snapshot, artifactCache))
       ) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
       if (
         snapshot.schemaVersion === 3 &&
         snapshot.status === "interrupted" &&
         (await settleIndeterminateToolEffects(options, snapshot))
       ) {
-        snapshot = await inspectSession(input);
+        snapshot = await inspectSession(input, artifactCache);
       }
     }
     if (snapshot.schemaVersion === 3) {
@@ -384,12 +424,16 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
   return {
     async branch(input) {
       return withOwner(async () => {
+        const artifactCache = createArtifactMaterializationCache();
         if (!Number.isSafeInteger(input.atSequence) || input.atSequence <= 0) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
         }
-        let parent = await inspectSession({ sessionId: input.parentSessionId });
+        let parent = await inspectSession({ sessionId: input.parentSessionId }, artifactCache);
         if (parent.schemaVersion !== 3) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
+        }
+        if (parent.degradation !== undefined) {
+          throw new SessionLifecycleError("session_invalid");
         }
         let parentRecords = await readJsonlSessionRecords({
           workspaceRoot: options.workspaceRoot,
@@ -401,38 +445,43 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
         if (parent.status === "interrupted" && requestedCurrentTail) {
           const restoredUserMessage = await appendMissingUserMessage(options, parent);
           if (restoredUserMessage) {
-            parent = (await inspectSession({
-              sessionId: input.parentSessionId,
-            })) as CurrentSessionSnapshot;
+            parent = (await inspectSession(
+              { sessionId: input.parentSessionId },
+              artifactCache,
+            )) as CurrentSessionSnapshot;
           }
           const interruptedAttempt = await appendDanglingAttemptInterruption(options, parent);
           if (interruptedAttempt) {
-            parent = (await inspectSession({
-              sessionId: input.parentSessionId,
-            })) as CurrentSessionSnapshot;
+            parent = (await inspectSession(
+              { sessionId: input.parentSessionId },
+              artifactCache,
+            )) as CurrentSessionSnapshot;
           }
           const terminalIntent =
             parent.status === "interrupted" && (await settleRunTerminalIntent(options, parent));
           if (terminalIntent) {
-            parent = (await inspectSession({
-              sessionId: input.parentSessionId,
-            })) as CurrentSessionSnapshot;
+            parent = (await inspectSession(
+              { sessionId: input.parentSessionId },
+              artifactCache,
+            )) as CurrentSessionSnapshot;
           }
           const cancelledRun =
             parent.status === "interrupted" &&
             (await settleInterruptedCancellation(options, parent));
           if (cancelledRun) {
-            parent = (await inspectSession({
-              sessionId: input.parentSessionId,
-            })) as CurrentSessionSnapshot;
+            parent = (await inspectSession(
+              { sessionId: input.parentSessionId },
+              artifactCache,
+            )) as CurrentSessionSnapshot;
           }
           const indeterminateEffect =
             parent.status === "interrupted" &&
             (await settleIndeterminateToolEffects(options, parent));
           if (indeterminateEffect) {
-            parent = (await inspectSession({
-              sessionId: input.parentSessionId,
-            })) as CurrentSessionSnapshot;
+            parent = (await inspectSession(
+              { sessionId: input.parentSessionId },
+              artifactCache,
+            )) as CurrentSessionSnapshot;
           }
           if (
             restoredUserMessage ||
@@ -460,6 +509,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           throw new SessionLifecycleError("session_invalid");
         }
         validateCurrentSessionHistory(parentGenesis, parentPrefix);
+        await replayArtifactBytesFromLineage(options, parentGenesis, parentPrefix, artifactCache);
         if (!isCompleteBranchBoundary(parentPrefix)) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
         }
@@ -512,7 +562,12 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           },
         };
         await store.append(genesis);
-        const context = await contextSnapshotFromLineage(options, parentGenesis, parentPrefix);
+        const context = await contextSnapshotFromLineage(
+          options,
+          parentGenesis,
+          parentPrefix,
+          artifactCache,
+        );
         return {
           ...snapshotFromGenesis(genesis, 1),
           ...(context === undefined ? {} : { context }),
@@ -544,7 +599,8 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     },
     async continue(input) {
       return withOwner(async () => {
-        const resumed = await resumeSession({ sessionId: input.sessionId });
+        const artifactCache = createArtifactMaterializationCache();
+        const resumed = await resumeSession({ sessionId: input.sessionId }, artifactCache);
         if (resumed.status === "rejected") {
           if (resumed.error.code === "model_target_incompatible") {
             throw new SessionLifecycleError("session_model_target_incompatible");
@@ -581,13 +637,31 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           sessionId: input.sessionId,
           ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
         });
+        const first = records[0];
+        if (first === undefined || !isGenesisRecord(first)) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const artifactInspection = await materializeModelResponseArtifacts(
+          options,
+          first,
+          records,
+          { allowDegraded: false },
+          artifactCache,
+        );
+        const replayRecords = artifactInspection.records;
+        const referencedModelResponseArtifactBytes = await replayArtifactBytesFromLineage(
+          options,
+          first,
+          records,
+          artifactCache,
+        );
         const [inheritedMessages, inheritedEvidence] = await Promise.all([
-          createBranchMessages(options, records),
+          createBranchMessages(options, records, artifactCache),
           createBranchEvidence(options, records),
         ]);
         const resumeState =
           resumed.snapshot.status === "interrupted"
-            ? createAgentResumeState(records, options, resumed.snapshot)
+            ? createAgentResumeState(replayRecords, options, resumed.snapshot)
             : undefined;
         const durableResumeState =
           resumeState === undefined
@@ -604,11 +678,22 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           sessionId: input.sessionId,
           ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
         });
+        const durableOutputLimits = (
+          options as SessionLifecycleOptions & {
+            readonly [sessionDurableOutputLimits]?: AgentSessionDurableOutputLimits;
+          }
+        )[sessionDurableOutputLimits];
         const sessionDependencies = {
+          artifactStore: await createFileArtifactStore({
+            root: join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
+          }),
           model: resolved.driver,
           store: store as unknown as SessionStore,
           [sessionDurableContext]: {
             nextSequence: resumed.snapshot.lastSequence + 1,
+            projectId: resumed.snapshot.projectId,
+            referencedModelResponseArtifactBytes,
+            sessionId: resumed.snapshot.sessionId,
             targetIdentity: resumed.snapshot.targetIdentity,
             ...(hasContextEvidence(inheritedEvidence) ? { inheritedEvidence } : {}),
             ...(resumeState !== undefined || inheritedMessages.length === 0
@@ -617,6 +702,9 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
             ...(durableResumeState === undefined ? {} : { resume: durableResumeState }),
           },
           contextProfile: resolved.contextProfile,
+          ...(durableOutputLimits === undefined
+            ? {}
+            : { [sessionDurableOutputLimits]: durableOutputLimits }),
           ...(options.tools === undefined ? {} : { tools: options.tools }),
           ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
         };
@@ -636,7 +724,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
               ...(runLimits === undefined ? {} : { limits: runLimits }),
             },
           );
-          const snapshot = await inspectSession({ sessionId: input.sessionId });
+          const snapshot = await inspectSession({ sessionId: input.sessionId }, artifactCache);
           if (snapshot.schemaVersion !== 3) {
             throw new SessionLifecycleError("session_invalid");
           }
@@ -695,6 +783,7 @@ type ValidatedAttemptState = {
   readonly attempt: number;
   readonly turn: number;
   response?: SessionModelResponseCompletedRecord["record"];
+  responseSequence?: number;
   status: "started" | "interrupted" | "completed";
 };
 
@@ -717,6 +806,7 @@ function validateCurrentSessionHistory(
   let sawSessionInterruption = false;
   let sawModelStart = false;
   let sawModelCompletion = false;
+  let publishedResponseSequence: number | undefined;
   let terminalIntent: RunResult | undefined;
   let lastContextTerminal:
     | SessionContextCompactionCommittedRecord["record"]
@@ -813,6 +903,7 @@ function validateCurrentSessionHistory(
       }
       attemptState.status = "completed";
       attemptState.response = record;
+      attemptState.responseSequence = entry.sequence;
       toolStates = new Map(
         record.response.toolCalls.map((call, index) => [
           call.id,
@@ -849,6 +940,37 @@ function validateCurrentSessionHistory(
       }
       continue;
     }
+    if (record.type === "model_response_published") {
+      if (
+        attemptState?.status !== "completed" ||
+        attemptState.responseSequence !== record.responseSequence ||
+        sawModelCompletion
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      publishedResponseSequence = record.responseSequence;
+      sawModelCompletion = true;
+      continue;
+    }
+    if (record.type === "run_settled") {
+      const finishReason = attemptState?.response?.response.finishReason;
+      const settlementMatchesResponse =
+        (record.status === "completed" && finishReason === "stop") ||
+        (record.status === "incomplete" &&
+          record.reason === "output_limit" &&
+          finishReason === "length");
+      if (
+        attemptState?.status !== "completed" ||
+        attemptState.responseSequence !== record.responseSequence ||
+        publishedResponseSequence !== record.responseSequence ||
+        !settlementMatchesResponse ||
+        !sawModelCompletion
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      sawSettlement = true;
+      continue;
+    }
     const event = record.event;
     if (event.type === "user_message") {
       if (
@@ -882,10 +1004,12 @@ function validateCurrentSessionHistory(
       continue;
     }
     if (event.type === "model_message_completed") {
+      const responseText = attemptState?.response?.response.text;
       if (
         terminalIntent !== undefined ||
         attemptState?.status !== "completed" ||
-        attemptState.response?.response.text !== event.text ||
+        responseText === undefined ||
+        inlineModelResponseField(responseText) !== event.text ||
         sawModelCompletion
       ) {
         throw new SessionLifecycleError("session_invalid");
@@ -913,7 +1037,12 @@ function validateCurrentSessionHistory(
         (event.result.status === "completed" &&
           (attemptState?.status !== "completed" ||
             attemptState.response?.response.finishReason !== "stop" ||
-            attemptState.response.response.text !== event.result.answer ||
+            inlineModelResponseField(attemptState.response.response.text) !== event.result.answer ||
+            !sawModelCompletion)) ||
+        (event.result.status === "incomplete" &&
+          (attemptState?.status !== "completed" ||
+            attemptState.response?.response.finishReason !== "length" ||
+            inlineModelResponseField(attemptState.response.response.text) !== event.result.answer ||
             !sawModelCompletion)) ||
         (event.result.status === "cancelled" && !sawSessionInterruption) ||
         (event.result.status === "failed" &&
@@ -1211,7 +1340,8 @@ function validateCompletedResponse(record: SessionModelResponseCompletedRecord["
   const { response } = record;
   if (
     response.toolCalls.length !== response.toolIntents.length ||
-    (response.finishReason === "stop" && response.toolCalls.length !== 0) ||
+    ((response.finishReason === "stop" || response.finishReason === "length") &&
+      response.toolCalls.length !== 0) ||
     (response.finishReason === "tool_calls" && response.toolCalls.length === 0)
   ) {
     throw new SessionLifecycleError("session_invalid");
@@ -1307,18 +1437,32 @@ async function contextSnapshotFromLineage(
   options: SessionLifecycleOptions,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
+  artifactCache: ModelResponseArtifactCache,
 ): Promise<SessionContextSnapshot | undefined> {
   const ownContext = contextSnapshotFromRecords(records);
   if (ownContext !== undefined || genesis.record.lineage === undefined) {
     return ownContext;
   }
   const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
-  return contextSnapshotFromLineage(options, parentGenesis, prefixRecords);
+  const artifactInspection = await materializeModelResponseArtifacts(
+    options,
+    parentGenesis,
+    prefixRecords,
+    { allowDegraded: false },
+    artifactCache,
+  );
+  return contextSnapshotFromLineage(
+    options,
+    parentGenesis,
+    artifactInspection.records,
+    artifactCache,
+  );
 }
 
 async function createBranchMessages(
   options: SessionLifecycleOptions,
   records: readonly SessionRecord[],
+  artifactCache: ModelResponseArtifactCache,
 ): Promise<ModelMessage[]> {
   const genesis = records[0];
   if (genesis === undefined || !isGenesisRecord(genesis)) {
@@ -1328,8 +1472,18 @@ async function createBranchMessages(
   if (lineage === undefined) {
     return [];
   }
-  const { prefixRecords: parentRecords } = await readValidatedLineagePrefix(options, genesis);
-  const projected = modelMessagesFromCompleteRecords(parentRecords);
+  const { parentGenesis, prefixRecords: parentRecords } = await readValidatedLineagePrefix(
+    options,
+    genesis,
+  );
+  const artifactInspection = await materializeModelResponseArtifacts(
+    options,
+    parentGenesis,
+    parentRecords,
+    { allowDegraded: false },
+    artifactCache,
+  );
+  const projected = modelMessagesFromCompleteRecords(artifactInspection.records);
   if (
     parentRecords.some(
       (record) =>
@@ -1338,7 +1492,7 @@ async function createBranchMessages(
   ) {
     return projected;
   }
-  return [...(await createBranchMessages(options, parentRecords)), ...projected];
+  return [...(await createBranchMessages(options, parentRecords, artifactCache)), ...projected];
 }
 
 async function createBranchEvidence(
@@ -1505,12 +1659,15 @@ function modelMessagesFromCanonicalRecords(
       continue;
     }
     const responseRecord = record.record;
+    const responseText = inlineModelResponseField(responseRecord.response.text);
+    const responseReasoning =
+      responseRecord.response.reasoning === undefined
+        ? undefined
+        : inlineModelResponseField(responseRecord.response.reasoning);
     messages.push({
       role: "assistant",
-      content: responseRecord.response.text,
-      ...(responseRecord.response.reasoning === undefined
-        ? {}
-        : { reasoning: responseRecord.response.reasoning }),
+      content: responseText,
+      ...(responseReasoning === undefined ? {} : { reasoning: responseReasoning }),
       toolCalls: responseRecord.response.toolCalls,
     });
     for (const call of responseRecord.response.toolCalls) {
@@ -1825,6 +1982,7 @@ function ordinaryContextUsageFromRecords(
 function snapshotFromRecords(
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
+  artifactInspection?: ModelResponseArtifactInspection,
 ): CurrentSessionSnapshot {
   if (records.some((record) => record.schemaVersion !== 3)) {
     throw new SessionLifecycleError("session_invalid");
@@ -1838,6 +1996,9 @@ function snapshotFromRecords(
     return {
       ...snapshotFromGenesis(genesis, records.length),
       ...(context === undefined ? {} : { context }),
+      ...(artifactInspection?.degradation === undefined
+        ? {}
+        : { degradation: artifactInspection.degradation }),
     };
   }
   const runId = latestRun.record.runId;
@@ -1849,6 +2010,9 @@ function snapshotFromRecords(
       record.record.type === "runtime_event" &&
       record.record.runId === runId &&
       record.record.event.type === "session_settled",
+  );
+  const linkedSettlement = currentRecords.findLast(
+    (record) => record.record.type === "run_settled" && record.record.runId === runId,
   );
   const lastAttemptStarted = currentRecords.findLast(
     (record) => record.record.type === "provider_attempt_started" && record.record.runId === runId,
@@ -1865,14 +2029,33 @@ function snapshotFromRecords(
     settlement?.record.type === "runtime_event" &&
     settlement.record.event.type === "session_settled"
       ? settlement.record.event.result
-      : undefined;
+      : linkedSettlement?.record.type === "run_settled"
+        ? artifactInspection?.contents.get(linkedSettlement.record.responseSequence) === undefined
+          ? undefined
+          : linkedSettlement.record.status === "completed"
+            ? {
+                status: "completed" as const,
+                answer: artifactInspection.contents.get(linkedSettlement.record.responseSequence)
+                  ?.text as string,
+              }
+            : {
+                status: "incomplete" as const,
+                reason: linkedSettlement.record.reason,
+                answer: artifactInspection.contents.get(linkedSettlement.record.responseSequence)
+                  ?.text as string,
+              }
+        : undefined;
+  const isSettled = settlement !== undefined || linkedSettlement !== undefined;
   return {
     ...snapshotFromGenesis(genesis, records.length),
     ...(context === undefined ? {} : { context }),
-    status: result === undefined ? "interrupted" : "settled",
+    ...(artifactInspection?.degradation === undefined
+      ? {}
+      : { degradation: artifactInspection.degradation }),
+    status: isSettled ? "settled" : "interrupted",
     run: {
       runId,
-      status: result === undefined ? "interrupted" : "settled",
+      status: isSettled ? "settled" : "interrupted",
       ...(result === undefined ? {} : { result }),
       ...(lastAttempt === undefined ? {} : { lastAttempt }),
       ...(lastResponse?.record.type !== "model_response_completed"
@@ -2280,6 +2463,7 @@ async function settleInterruptedCancellation(
 async function settleCompletedResponseTerminal(
   options: SessionLifecycleOptions,
   snapshot: CurrentSessionSnapshot,
+  artifactCache: ModelResponseArtifactCache,
 ): Promise<boolean> {
   const records = await readJsonlSessionRecords({
     workspaceRoot: options.workspaceRoot,
@@ -2295,9 +2479,10 @@ async function settleCompletedResponseTerminal(
   if (
     currentRecords.some(
       (record) =>
-        record.record.type === "runtime_event" &&
-        record.record.runId === runId &&
-        record.record.event.type === "session_settled",
+        (record.record.type === "runtime_event" &&
+          record.record.runId === runId &&
+          record.record.event.type === "session_settled") ||
+        (record.record.type === "run_settled" && record.record.runId === runId),
     )
   ) {
     return false;
@@ -2327,6 +2512,10 @@ async function settleCompletedResponseTerminal(
     responseRecord.record.response.finishReason === "stop" &&
     responseRecord.record.response.toolCalls.length === 0 &&
     responseRecord.record.response.toolIntents.length === 0;
+  const isOutputLimitResponse =
+    responseRecord.record.response.finishReason === "length" &&
+    responseRecord.record.response.toolCalls.length === 0 &&
+    responseRecord.record.response.toolIntents.length === 0;
   const hasUnsafeStartedEffect = responseRecord.record.response.toolCalls.some((call) => {
     const laterEvents = currentRecords.filter(
       (record) =>
@@ -2353,29 +2542,49 @@ async function settleCompletedResponseTerminal(
       started && !terminal && !isExactSafeReplay(options, snapshot, responseRecord.record, call)
     );
   });
-  if (!isStopResponse && hasUnsafeStartedEffect) {
+  if (!isStopResponse && !isOutputLimitResponse && hasUnsafeStartedEffect) {
     return false;
   }
-  if (!missingRequiredUsage && !exhaustedTokenBudget && !isStopResponse) {
+  if (!missingRequiredUsage && !exhaustedTokenBudget && !isStopResponse && !isOutputLimitResponse) {
     return false;
   }
-  const result: RunResult = missingRequiredUsage
-    ? {
-        status: "failed",
-        error: {
-          code: "token_usage_missing",
-          message: "The provider did not report token usage for an active token limit.",
-        },
-      }
-    : exhaustedTokenBudget
+  const genesis = records[0];
+  if (genesis === undefined || !isGenesisRecord(genesis)) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  const artifactInspection = await materializeModelResponseArtifacts(
+    options,
+    genesis,
+    records,
+    { allowDegraded: false },
+    artifactCache,
+  );
+  const responseText =
+    artifactInspection.contents.get(responseRecord.sequence)?.text ??
+    inlineModelResponseField(responseRecord.record.response.text);
+  const artifactBackedResponse =
+    responseRecord.record.response.recordVersion === 2 &&
+    (responseRecord.record.response.text.storage === "artifact" ||
+      responseRecord.record.response.reasoning?.storage === "artifact");
+  const result: RunResult = isOutputLimitResponse
+    ? { status: "incomplete", reason: "output_limit", answer: responseText }
+    : missingRequiredUsage
       ? {
           status: "failed",
           error: {
-            code: "token_limit_exceeded",
-            message: "The run reached its provider-reported token limit.",
+            code: "token_usage_missing",
+            message: "The provider did not report token usage for an active token limit.",
           },
         }
-      : { status: "completed", answer: responseRecord.record.response.text };
+      : exhaustedTokenBudget
+        ? {
+            status: "failed",
+            error: {
+              code: "token_limit_exceeded",
+              message: "The run reached its provider-reported token limit.",
+            },
+          }
+        : { status: "completed", answer: responseText };
   const store = await openJsonlSessionStore<SessionRecord>({
     workspaceRoot: options.workspaceRoot,
     sessionId: snapshot.sessionId,
@@ -2385,31 +2594,62 @@ async function settleCompletedResponseTerminal(
   const responseWasPublished = currentRecords.some(
     (record) =>
       record.sequence > responseRecord.sequence &&
-      record.record.type === "runtime_event" &&
-      record.record.runId === runId &&
-      record.record.event.type === "model_message_completed",
+      ((record.record.type === "runtime_event" &&
+        record.record.runId === runId &&
+        record.record.event.type === "model_message_completed") ||
+        (record.record.type === "model_response_published" &&
+          record.record.runId === runId &&
+          record.record.responseSequence === responseRecord.sequence)),
   );
   if (!responseWasPublished) {
-    await store.append({
-      schemaVersion: 3,
-      sequence: nextSequence,
-      record: {
-        type: "runtime_event",
-        runId,
-        event: { type: "model_message_completed", text: responseRecord.record.response.text },
-      },
-    });
+    const publicationRecord: SessionRecord = artifactBackedResponse
+      ? {
+          schemaVersion: 3,
+          sequence: nextSequence,
+          record: {
+            type: "model_response_published",
+            recordVersion: 1,
+            runId,
+            responseSequence: responseRecord.sequence,
+          },
+        }
+      : {
+          schemaVersion: 3,
+          sequence: nextSequence,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "model_message_completed", text: responseText },
+          },
+        };
+    await store.append(publicationRecord);
     nextSequence += 1;
   }
-  await store.append({
-    schemaVersion: 3,
-    sequence: nextSequence,
-    record: {
-      type: "runtime_event",
-      runId,
-      event: { type: "session_settled", result },
-    },
-  });
+  const settlementRecord: SessionRecord =
+    artifactBackedResponse && (result.status === "completed" || result.status === "incomplete")
+      ? {
+          schemaVersion: 3,
+          sequence: nextSequence,
+          record: {
+            type: "run_settled",
+            recordVersion: 1,
+            runId,
+            responseSequence: responseRecord.sequence,
+            ...(result.status === "completed"
+              ? { status: "completed" as const }
+              : { status: "incomplete" as const, reason: result.reason }),
+          },
+        }
+      : {
+          schemaVersion: 3,
+          sequence: nextSequence,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "session_settled", result },
+          },
+        };
+  await store.append(settlementRecord);
   return true;
 }
 
@@ -2584,10 +2824,13 @@ function createAgentResumeState(
       continue;
     }
     const { response } = responseRecord.record;
+    const responseText = inlineModelResponseField(response.text);
+    const responseReasoning =
+      response.reasoning === undefined ? undefined : inlineModelResponseField(response.reasoning);
     messages.push({
       role: "assistant",
-      content: response.text,
-      ...(response.reasoning === undefined ? {} : { reasoning: response.reasoning }),
+      content: responseText,
+      ...(responseReasoning === undefined ? {} : { reasoning: responseReasoning }),
       toolCalls: response.toolCalls,
     });
     for (const call of response.toolCalls) {
@@ -2741,6 +2984,286 @@ function reportedTokensForRun(
 async function canonicalProjectId(workspaceRoot: string): Promise<string> {
   const canonicalRoot = await realpath(workspaceRoot);
   return `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}`;
+}
+
+type ModelResponseArtifactDegradation = NonNullable<CurrentSessionSnapshot["degradation"]>;
+
+type ModelResponseArtifactInspection = {
+  readonly contents: ReadonlyMap<number, { readonly text: string; readonly reasoning?: string }>;
+  readonly degradation?: ModelResponseArtifactDegradation;
+  readonly logicalReferencedBytes: number;
+  readonly records: readonly SessionRecord[];
+};
+
+type ResolvedModelResponseArtifact =
+  | { readonly byteCount: number; readonly text: string }
+  | undefined;
+
+type ModelResponseArtifactCache = Map<string, Promise<ResolvedModelResponseArtifact>>;
+
+function createArtifactMaterializationCache(): ModelResponseArtifactCache {
+  return new Map();
+}
+
+async function inspectModelResponseArtifactLineage(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+  artifactCache: ModelResponseArtifactCache,
+): Promise<ModelResponseArtifactInspection> {
+  const ownInspection = await materializeModelResponseArtifacts(
+    options,
+    genesis,
+    records,
+    { allowDegraded: true },
+    artifactCache,
+  );
+  if (ownInspection.degradation !== undefined || genesis.record.lineage === undefined) {
+    return ownInspection;
+  }
+  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  const inherited = await inspectModelResponseArtifactLineage(
+    options,
+    parentGenesis,
+    prefixRecords,
+    artifactCache,
+  );
+  if (inherited.degradation !== undefined) {
+    return { ...ownInspection, degradation: inherited.degradation };
+  }
+  const logicalReferencedBytes =
+    inherited.logicalReferencedBytes + ownInspection.logicalReferencedBytes;
+  if (
+    !Number.isSafeInteger(logicalReferencedBytes) ||
+    logicalReferencedBytes > maximumReferencedModelResponseArtifactBytes
+  ) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return {
+    ...ownInspection,
+    logicalReferencedBytes,
+  };
+}
+
+async function replayArtifactBytesFromLineage(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+  artifactCache: ModelResponseArtifactCache,
+): Promise<number> {
+  const ownInspection = await materializeModelResponseArtifacts(
+    options,
+    genesis,
+    records,
+    { allowDegraded: false },
+    artifactCache,
+  );
+  const inheritedBytes =
+    genesis.record.lineage === undefined
+      ? 0
+      : await (async () => {
+          const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(
+            options,
+            genesis,
+          );
+          return replayArtifactBytesFromLineage(
+            options,
+            parentGenesis,
+            prefixRecords,
+            artifactCache,
+          );
+        })();
+  const total = inheritedBytes + ownInspection.logicalReferencedBytes;
+  const configuredMaximum = (
+    options as SessionLifecycleOptions & {
+      readonly [sessionDurableOutputLimits]?: AgentSessionDurableOutputLimits;
+    }
+  )[sessionDurableOutputLimits]?.maximumReferencedArtifactBytes;
+  const maximumReferencedArtifactBytes =
+    configuredMaximum ?? maximumReferencedModelResponseArtifactBytes;
+  if (!Number.isSafeInteger(total) || total > maximumReferencedArtifactBytes) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return total;
+}
+
+async function materializeModelResponseArtifacts(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+  behavior: { readonly allowDegraded: boolean },
+  artifactCache: ModelResponseArtifactCache,
+): Promise<ModelResponseArtifactInspection> {
+  const artifactRoot = join(effectiveSessionStateRoot(options.stateRoot), "artifacts");
+  const contents = new Map<number, { readonly text: string; readonly reasoning?: string }>();
+  const materialized: SessionRecord[] = [];
+  let logicalReferencedBytes = 0;
+
+  for (const entry of records) {
+    if (entry.schemaVersion !== 3 || entry.record.type !== "model_response_completed") {
+      materialized.push(entry);
+      continue;
+    }
+    const responseRecord = entry.record;
+    const { response } = responseRecord;
+    if (response.recordVersion !== 2) {
+      contents.set(entry.sequence, {
+        text: response.text,
+        ...(response.reasoning === undefined ? {} : { reasoning: response.reasoning }),
+      });
+      materialized.push(entry);
+      continue;
+    }
+    const declaredTextBytes =
+      response.text.storage === "inline"
+        ? Buffer.byteLength(response.text.text, "utf8")
+        : response.text.reference.byteCount;
+    const declaredReasoningBytes =
+      response.reasoning === undefined
+        ? 0
+        : response.reasoning.storage === "inline"
+          ? Buffer.byteLength(response.reasoning.text, "utf8")
+          : response.reasoning.reference.byteCount;
+    if (
+      !Number.isSafeInteger(declaredTextBytes + declaredReasoningBytes) ||
+      declaredTextBytes + declaredReasoningBytes > maximumModelResponseContentBytes
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const resolveField = async (
+      field: SessionModelResponseField,
+      fieldKind: "reasoning" | "text",
+    ): Promise<
+      | { readonly status: "ready"; readonly text: string; readonly referencedBytes: number }
+      | { readonly status: "degraded"; readonly degradation: ModelResponseArtifactDegradation }
+    > => {
+      if (field.storage === "inline") {
+        return { status: "ready", text: field.text, referencedBytes: 0 };
+      }
+      const { reference } = field;
+      const source = reference.source;
+      const degradation = (
+        code: ModelResponseArtifactDegradation["code"],
+      ): {
+        readonly status: "degraded";
+        readonly degradation: ModelResponseArtifactDegradation;
+      } => ({
+        status: "degraded",
+        degradation: {
+          code,
+          artifactId: reference.id,
+          field: fieldKind,
+          responseSequence: entry.sequence,
+        },
+      });
+      if (
+        reference.byteCount > maximumModelResponseContentBytes ||
+        source.field !== fieldKind ||
+        source.projectId !== genesis.record.projectId ||
+        source.sessionId !== genesis.record.sessionId ||
+        source.runId !== responseRecord.runId ||
+        source.turn !== responseRecord.turn ||
+        source.attempt !== responseRecord.attempt ||
+        !sameModelTargetIdentity(source.targetIdentity, responseRecord.targetIdentity)
+      ) {
+        return degradation("model_response_artifact_corrupt");
+      }
+      let resolvedArtifact: ResolvedModelResponseArtifact;
+      try {
+        let pendingArtifact = artifactCache.get(reference.id);
+        if (pendingArtifact === undefined) {
+          pendingArtifact = readFileArtifact({
+            root: artifactRoot,
+            id: reference.id,
+            maximumBytes: maximumModelResponseContentBytes,
+          }).then((bytes) =>
+            bytes === undefined
+              ? undefined
+              : {
+                  byteCount: bytes.byteLength,
+                  text: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+                },
+          );
+          artifactCache.set(reference.id, pendingArtifact);
+        }
+        resolvedArtifact = await pendingArtifact;
+      } catch {
+        return degradation("model_response_artifact_corrupt");
+      }
+      if (resolvedArtifact === undefined) {
+        return degradation("model_response_artifact_missing");
+      }
+      if (resolvedArtifact.byteCount !== reference.byteCount) {
+        return degradation("model_response_artifact_corrupt");
+      }
+      return {
+        status: "ready",
+        text: resolvedArtifact.text,
+        referencedBytes: reference.byteCount,
+      };
+    };
+
+    const text = await resolveField(response.text, "text");
+    if (text.status === "degraded") {
+      if (!behavior.allowDegraded) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return { contents, degradation: text.degradation, logicalReferencedBytes, records };
+    }
+    const reasoning =
+      response.reasoning === undefined
+        ? undefined
+        : await resolveField(response.reasoning, "reasoning");
+    if (reasoning?.status === "degraded") {
+      if (!behavior.allowDegraded) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return { contents, degradation: reasoning.degradation, logicalReferencedBytes, records };
+    }
+    logicalReferencedBytes += text.referencedBytes + (reasoning?.referencedBytes ?? 0);
+    if (logicalReferencedBytes > maximumReferencedModelResponseArtifactBytes) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const resolvedReasoning = reasoning?.text;
+    contents.set(entry.sequence, {
+      text: text.text,
+      ...(resolvedReasoning === undefined ? {} : { reasoning: resolvedReasoning }),
+    });
+    materialized.push({
+      ...entry,
+      record: {
+        ...entry.record,
+        response: {
+          ...response,
+          text: { storage: "inline", text: text.text },
+          ...(resolvedReasoning === undefined
+            ? { reasoning: undefined }
+            : { reasoning: { storage: "inline", text: resolvedReasoning } }),
+        },
+      },
+    } as SessionRecord);
+  }
+  return { contents, logicalReferencedBytes, records: materialized };
+}
+
+function effectiveSessionStateRoot(configured: string | undefined): string {
+  if (configured !== undefined) {
+    return configured;
+  }
+  const { XDG_STATE_HOME: xdgStateHome } = process.env;
+  return xdgStateHome === undefined || xdgStateHome.length === 0
+    ? join(homedir(), ".local", "state", "adam-agent")
+    : join(xdgStateHome, "adam-agent");
+}
+
+function inlineModelResponseField(field: string | SessionModelResponseField): string {
+  if (typeof field === "string") {
+    return field;
+  }
+  if (field.storage === "inline") {
+    return field.text;
+  }
+  throw new SessionLifecycleError("session_invalid");
 }
 
 function sessionLifecycleErrorMessage(code: SessionLifecycleError["code"]): string {

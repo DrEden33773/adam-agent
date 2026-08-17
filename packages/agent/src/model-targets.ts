@@ -149,8 +149,14 @@ const directDeepSeekV1Targets: readonly ModelTargetIdentity[] = Object.freeze([
     certification: "certified",
   }),
 ]);
-const currentDirectDeepSeekTargets = directDeepSeekV1Targets;
-const supportedDirectDeepSeekTargets = directDeepSeekV1Targets;
+const directDeepSeekV2Targets: readonly ModelTargetIdentity[] = Object.freeze(
+  directDeepSeekV1Targets.map((identity) => Object.freeze({ ...identity, profileVersion: 2 })),
+);
+const currentDirectDeepSeekTargets = directDeepSeekV2Targets;
+const supportedDirectDeepSeekTargets = Object.freeze([
+  ...directDeepSeekV2Targets,
+  ...directDeepSeekV1Targets,
+]);
 
 const experimentalGatewayProviderId = "poolside";
 const directDeepSeekContextProfileV1: ContextProfile = Object.freeze({

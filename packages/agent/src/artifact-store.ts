@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { chmod, link, mkdir, open, readFile, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
+import type { ModelTargetIdentity } from "./model-targets.js";
+
 export type ToolArtifactSource = {
   readonly type: "tool_output";
   readonly callId: string;
@@ -21,7 +23,23 @@ export type ExtensionArtifactSource = {
   readonly projectId: string;
 };
 
-export type ArtifactSource = ExtensionArtifactSource | ToolArtifactSource;
+export type ModelResponseArtifactSource = {
+  readonly type: "model_response";
+  readonly schemaVersion: 1;
+  readonly field: "text" | "reasoning";
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly runId: string;
+  readonly turn: number;
+  readonly attempt: number;
+  readonly targetIdentity: ModelTargetIdentity;
+  readonly provenance: "provider_model_response";
+};
+
+export type ArtifactSource =
+  | ExtensionArtifactSource
+  | ModelResponseArtifactSource
+  | ToolArtifactSource;
 
 export type ArtifactReference<TSource extends ArtifactSource = ArtifactSource> = {
   readonly id: string;
@@ -36,7 +54,7 @@ export type ArtifactStore = {
     readonly mediaType: string;
     readonly source: TSource;
   }): Promise<ArtifactReference<TSource>>;
-  read(id: string): Promise<Uint8Array | undefined>;
+  read(id: string, options?: { readonly maximumBytes?: number }): Promise<Uint8Array | undefined>;
 };
 
 export async function createFileArtifactStore(options: {
@@ -69,8 +87,12 @@ export async function createFileArtifactStore(options: {
           if (!isNodeError(error) || error.code !== "EEXIST") {
             throw error;
           }
-          const existingBytes = await readFile(targetPath);
-          if (!existingBytes.equals(bytes)) {
+          const existingBytes = await readFileArtifact({
+            root,
+            id,
+            maximumBytes: bytes.byteLength,
+          });
+          if (existingBytes === undefined || !Buffer.from(existingBytes).equals(bytes)) {
             throw new Error("The content-addressed artifact does not match its ID.");
           }
           await chmod(targetPath, 0o400);
@@ -85,23 +107,74 @@ export async function createFileArtifactStore(options: {
         source: input.source,
       };
     },
-    async read(id) {
-      const digest = parseArtifactId(id);
-      try {
-        const bytes = await readFile(join(root, digest));
-        const actualDigest = createHash("sha256").update(bytes).digest("hex");
-        if (actualDigest !== digest) {
-          throw new Error("The content-addressed artifact does not match its ID.");
-        }
-        return bytes;
-      } catch (error) {
-        if (isNodeError(error) && error.code === "ENOENT") {
-          return undefined;
-        }
-        throw error;
-      }
+    async read(id, readOptions) {
+      return readFileArtifact({
+        root,
+        id,
+        ...(readOptions?.maximumBytes === undefined
+          ? {}
+          : { maximumBytes: readOptions.maximumBytes }),
+      });
     },
   };
+}
+
+export async function readFileArtifact(options: {
+  readonly root: string;
+  readonly id: string;
+  readonly maximumBytes?: number;
+}): Promise<Uint8Array | undefined> {
+  const root = resolve(options.root);
+  if (!root.startsWith("/")) {
+    throw new TypeError("The artifact root must resolve to an absolute path.");
+  }
+  const digest = parseArtifactId(options.id);
+  try {
+    const artifactPath = join(root, digest);
+    const bytes =
+      options.maximumBytes === undefined
+        ? await readFile(artifactPath)
+        : await readFileWithinLimit(artifactPath, options.maximumBytes);
+    const actualDigest = createHash("sha256").update(bytes).digest("hex");
+    if (actualDigest !== digest) {
+      throw new Error("The content-addressed artifact does not match its ID.");
+    }
+    return bytes;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function readFileWithinLimit(path: string, maximumBytes: number): Promise<Buffer> {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
+    throw new RangeError("The artifact read limit must be a nonnegative safe integer.");
+  }
+  const file = await open(path, "r");
+  try {
+    const { size } = await file.stat();
+    if (!Number.isSafeInteger(size) || size > maximumBytes) {
+      throw new Error("The artifact exceeds its bounded read limit.");
+    }
+    const chunks: Buffer[] = [];
+    const readBuffer = Buffer.allocUnsafe(64 * 1024);
+    let totalBytes = 0;
+    while (true) {
+      const { bytesRead } = await file.read(readBuffer, 0, readBuffer.length, totalBytes);
+      if (bytesRead === 0) {
+        return Buffer.concat(chunks, totalBytes);
+      }
+      totalBytes += bytesRead;
+      if (totalBytes > maximumBytes) {
+        throw new Error("The artifact exceeds its bounded read limit.");
+      }
+      chunks.push(Buffer.from(readBuffer.subarray(0, bytesRead)));
+    }
+  } finally {
+    await file.close();
+  }
 }
 
 async function unlinkTemporary(path: string): Promise<void> {

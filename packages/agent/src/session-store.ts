@@ -5,8 +5,10 @@ import { join } from "node:path";
 
 import { valid } from "semver";
 import { z } from "zod";
+import type { ArtifactReference, ModelResponseArtifactSource } from "./artifact-store.js";
 import type { ContextProfile } from "./context-profile.js";
 import type { ContextCallUsage, ContextEvidenceV1, ContextSummaryV1 } from "./durable-context.js";
+import { maximumInlineModelResponseFieldBytes } from "./durable-model-response-policy.js";
 import type { RunResult, RuntimeEvent } from "./index.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
@@ -145,21 +147,68 @@ export type SessionModelResponseCompletedRecord = {
     readonly turn: number;
     readonly attempt: number;
     readonly targetIdentity: ModelTargetIdentity;
-    readonly response: {
+    readonly response: SessionModelResponse;
+  };
+};
+
+type SessionResponseUsage = {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningTokens?: number;
+  readonly cachedInputTokens?: number;
+  readonly cacheMissInputTokens?: number;
+};
+
+export type SessionModelResponseField =
+  | { readonly storage: "inline"; readonly text: string }
+  | {
+      readonly storage: "artifact";
+      readonly reference: ArtifactReference<ModelResponseArtifactSource>;
+    };
+
+export type SessionModelResponse =
+  | {
+      readonly recordVersion?: never;
       readonly text: string;
       readonly reasoning?: string;
       readonly toolCalls: readonly ToolCall[];
       readonly toolIntents: readonly SessionToolIntent[];
       readonly finishReason: "stop" | "tool_calls";
-      readonly usage?: {
-        readonly inputTokens: number;
-        readonly outputTokens: number;
-        readonly reasoningTokens?: number;
-        readonly cachedInputTokens?: number;
-        readonly cacheMissInputTokens?: number;
-      };
+      readonly usage?: SessionResponseUsage;
+    }
+  | {
+      readonly recordVersion: 2;
+      readonly text: SessionModelResponseField;
+      readonly reasoning?: SessionModelResponseField;
+      readonly toolCalls: readonly ToolCall[];
+      readonly toolIntents: readonly SessionToolIntent[];
+      readonly finishReason: "length" | "stop" | "tool_calls";
+      readonly usage?: SessionResponseUsage;
     };
+
+export type SessionModelResponsePublishedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "model_response_published";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly responseSequence: number;
   };
+};
+
+export type SessionRunSettledRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "run_settled";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly responseSequence: number;
+  } & (
+    | { readonly status: "completed"; readonly reason?: never }
+    | { readonly status: "incomplete"; readonly reason: "output_limit" }
+  );
 };
 
 export type SessionRuntimeEventRecord = {
@@ -263,6 +312,8 @@ export type SessionV3Record =
   | SessionProviderAttemptStartedRecord
   | SessionProviderAttemptInterruptedRecord
   | SessionModelResponseCompletedRecord
+  | SessionModelResponsePublishedRecord
+  | SessionRunSettledRecord
   | SessionContextCompactionStartedRecord
   | SessionContextCompactionCommittedRecord
   | SessionContextCompactionFailedRecord
@@ -302,6 +353,8 @@ const ordinaryRunErrorCodeSchema = z.enum([
   "model_protocol_invalid",
   "model_output_truncated",
   "model_content_filtered",
+  "model_response_artifact_quota_exceeded",
+  "model_response_too_large",
   "replay_envelope_too_large",
   "invalid_run_limits",
   "run_already_active",
@@ -344,6 +397,11 @@ const runFailureSchema: z.ZodType<RunFailure> = z.discriminatedUnion("code", [
 ]);
 const runResultSchema: z.ZodType<RunResult> = z.discriminatedUnion("status", [
   z.strictObject({ status: z.literal("completed"), answer: z.string() }),
+  z.strictObject({
+    status: z.literal("incomplete"),
+    reason: z.literal("output_limit"),
+    answer: z.string(),
+  }),
   z.strictObject({
     status: z.literal("cancelled"),
     error: z.strictObject({
@@ -584,6 +642,37 @@ const modelTargetIdentitySchema = z.strictObject({
   profileVersion: z.number().int().positive(),
   certification: z.enum(["certified", "experimental"]),
 }) as unknown as z.ZodType<ModelTargetIdentity>;
+const modelResponseArtifactSourceSchema = z.strictObject({
+  type: z.literal("model_response"),
+  schemaVersion: z.literal(1),
+  field: z.enum(["text", "reasoning"]),
+  projectId: z.string().min(1).max(256),
+  sessionId: z.string().min(1).max(128),
+  runId: z.uuid(),
+  turn: z.number().int().positive(),
+  attempt: z.number().int().positive(),
+  targetIdentity: modelTargetIdentitySchema,
+  provenance: z.literal("provider_model_response"),
+});
+const modelResponseArtifactReferenceSchema = z.strictObject({
+  id: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  mediaType: z.literal("text/plain; charset=utf-8"),
+  byteCount: z.number().int().positive(),
+  source: modelResponseArtifactSourceSchema,
+});
+const modelResponseFieldSchema = z.discriminatedUnion("storage", [
+  z.strictObject({
+    storage: z.literal("inline"),
+    text: z
+      .string()
+      .max(maximumInlineModelResponseFieldBytes)
+      .refine((text) => Buffer.byteLength(text, "utf8") <= maximumInlineModelResponseFieldBytes),
+  }),
+  z.strictObject({
+    storage: z.literal("artifact"),
+    reference: modelResponseArtifactReferenceSchema,
+  }),
+]);
 const sessionRunLimitsSchema = z.strictObject({
   maxTurns: z.number().int().positive().optional(),
   maxTokens: z.number().int().positive().optional(),
@@ -722,7 +811,7 @@ const contextEvidenceSchema: z.ZodType<ContextEvidenceV1> = z.strictObject({
     )
     .max(512),
 });
-const sessionV3RecordSchema = z.discriminatedUnion("type", [
+const sessionV3RecordSchema = z.union([
   z.strictObject({
     type: z.literal("session_genesis"),
     sessionId: z.uuid(),
@@ -763,18 +852,52 @@ const sessionV3RecordSchema = z.discriminatedUnion("type", [
     turn: z.number().int().positive(),
     attempt: z.number().int().positive(),
     targetIdentity: modelTargetIdentitySchema,
-    response: z.strictObject({
-      text: z.string().max(512 * 1024),
-      reasoning: z
-        .string()
-        .max(512 * 1024)
-        .optional(),
-      toolCalls: z.array(toolCallSchema).max(128),
-      toolIntents: z.array(sessionToolIntentSchema).max(128),
-      finishReason: z.enum(["stop", "tool_calls"]),
-      usage: responseUsageSchema.optional(),
-    }),
+    response: z.union([
+      z.strictObject({
+        text: z.string().max(512 * 1024),
+        reasoning: z
+          .string()
+          .max(512 * 1024)
+          .optional(),
+        toolCalls: z.array(toolCallSchema).max(128),
+        toolIntents: z.array(sessionToolIntentSchema).max(128),
+        finishReason: z.enum(["stop", "tool_calls"]),
+        usage: responseUsageSchema.optional(),
+      }),
+      z.strictObject({
+        recordVersion: z.literal(2),
+        text: modelResponseFieldSchema,
+        reasoning: modelResponseFieldSchema.optional(),
+        toolCalls: z.array(toolCallSchema).max(128),
+        toolIntents: z.array(sessionToolIntentSchema).max(128),
+        finishReason: z.enum(["length", "stop", "tool_calls"]),
+        usage: responseUsageSchema.optional(),
+      }),
+    ]),
   }),
+  z.strictObject({
+    type: z.literal("model_response_published"),
+    recordVersion: z.literal(1),
+    runId: z.uuid(),
+    responseSequence: z.number().int().positive(),
+  }),
+  z.union([
+    z.strictObject({
+      type: z.literal("run_settled"),
+      recordVersion: z.literal(1),
+      runId: z.uuid(),
+      responseSequence: z.number().int().positive(),
+      status: z.literal("completed"),
+    }),
+    z.strictObject({
+      type: z.literal("run_settled"),
+      recordVersion: z.literal(1),
+      runId: z.uuid(),
+      responseSequence: z.number().int().positive(),
+      status: z.literal("incomplete"),
+      reason: z.literal("output_limit"),
+    }),
+  ]),
   z.strictObject({
     type: z.literal("runtime_event"),
     runId: z.uuid(),
@@ -866,7 +989,7 @@ const sessionRecordSchema = z.union([
     record: sessionV3RecordSchema,
   }),
 ]) as unknown as z.ZodType<SessionRecord>;
-const maxSessionLogBytes = 8 * 1024 * 1024;
+const maxSessionLogBytes = 32 * 1024 * 1024;
 const maxSessionRecordBytes = 1024 * 1024;
 
 export function isSessionRecordWithinSizeLimit(record: SessionRecord): boolean {
@@ -945,21 +1068,11 @@ export async function openJsonlSessionStore<
 }): Promise<SessionStore<RecordType>> {
   validateSessionId(options.sessionId);
   const sessionPath = await resolveSessionPath(options);
-  const content = await readBoundedSessionLog(sessionPath);
-  if (content === undefined || content.length === 0 || !content.endsWith("\n")) {
+  const log = await readBoundedSessionLog(sessionPath);
+  if (log === undefined || log.records.length === 0) {
     throw new SessionStoreError();
   }
-  const records = validateRecordSequence(
-    content
-      .slice(0, -1)
-      .split("\n")
-      .map((line) => parseSessionRecord(line)),
-  );
-  return createJsonlStore<RecordType>(
-    sessionPath,
-    records.length + 1,
-    Buffer.byteLength(content, "utf8"),
-  );
+  return createJsonlStore<RecordType>(sessionPath, log.records.length + 1, log.storedBytes);
 }
 
 function createJsonlStore<RecordType extends SessionRecord>(
@@ -1001,22 +1114,8 @@ function createJsonlStore<RecordType extends SessionRecord>(
     },
     async read() {
       await appendQueue;
-      const content = await readBoundedSessionLog(sessionPath);
-      if (content === undefined) {
-        return [];
-      }
-      if (content.length === 0) {
-        return [];
-      }
-      if (!content.endsWith("\n")) {
-        throw new SessionStoreError();
-      }
-      const lines = content.slice(0, -1).split("\n");
-      if (lines.some((line) => Buffer.byteLength(line, "utf8") > maxSessionRecordBytes)) {
-        throw new SessionStoreError("session_log_too_large");
-      }
-      const records = lines.map((line) => parseSessionRecord(line));
-      return validateRecordSequence(records) as readonly RecordType[];
+      const log = await readBoundedSessionLog(sessionPath);
+      return (log?.records ?? []) as readonly RecordType[];
     },
   };
 }
@@ -1027,18 +1126,8 @@ export async function readJsonlSessionRecords(options: {
   readonly stateRoot?: string;
 }): Promise<readonly SessionRecord[]> {
   const sessionPath = await resolveSessionPath(options);
-  const content = await readBoundedSessionLog(sessionPath);
-  if (content === undefined || content.length === 0) {
-    return [];
-  }
-  if (!content.endsWith("\n")) {
-    throw new SessionStoreError();
-  }
-  const lines = content.slice(0, -1).split("\n");
-  if (lines.some((line) => Buffer.byteLength(line, "utf8") > maxSessionRecordBytes)) {
-    throw new SessionStoreError("session_log_too_large");
-  }
-  return validateRecordSequence(lines.map((line) => parseSessionRecord(line)));
+  const log = await readBoundedSessionLog(sessionPath);
+  return log?.records ?? [];
 }
 
 async function resolveSessionPath(options: {
@@ -1060,7 +1149,11 @@ function defaultStateRoot(): string {
     : join(xdgStateHome, "adam-agent");
 }
 
-async function readBoundedSessionLog(sessionPath: string): Promise<string | undefined> {
+async function readBoundedSessionLog(
+  sessionPath: string,
+): Promise<
+  { readonly records: readonly SessionRecord[]; readonly storedBytes: number } | undefined
+> {
   let file: FileHandle;
   try {
     file = await open(sessionPath, "r");
@@ -1076,19 +1169,64 @@ async function readBoundedSessionLog(sessionPath: string): Promise<string | unde
     if (!Number.isSafeInteger(size) || size > maxSessionLogBytes) {
       throw new SessionStoreError("session_log_too_large");
     }
-    const bytes = Buffer.alloc(size);
+    const records: SessionRecord[] = [];
+    const lineChunks: Buffer[] = [];
+    const readBuffer = Buffer.allocUnsafe(64 * 1024);
+    let lineBytes = 0;
     let offset = 0;
-    while (offset < bytes.length) {
-      const { bytesRead } = await file.read(bytes, offset, bytes.length - offset, offset);
+    while (true) {
+      const { bytesRead } = await file.read(readBuffer, 0, readBuffer.length, offset);
       if (bytesRead === 0) {
         break;
       }
+      if (offset + bytesRead > maxSessionLogBytes) {
+        throw new SessionStoreError("session_log_too_large");
+      }
+      let segmentStart = 0;
+      for (let index = 0; index < bytesRead; index += 1) {
+        if (readBuffer[index] !== 0x0a) {
+          continue;
+        }
+        const segment = readBuffer.subarray(segmentStart, index);
+        if (segment.length > 0) {
+          lineChunks.push(Buffer.from(segment));
+          lineBytes += segment.length;
+        }
+        if (lineBytes > maxSessionRecordBytes) {
+          throw new SessionStoreError("session_log_too_large");
+        }
+        records.push(parseSessionRecordBytes(Buffer.concat(lineChunks, lineBytes)));
+        lineChunks.length = 0;
+        lineBytes = 0;
+        segmentStart = index + 1;
+      }
+      const remainder = readBuffer.subarray(segmentStart, bytesRead);
+      if (remainder.length > 0) {
+        lineChunks.push(Buffer.from(remainder));
+        lineBytes += remainder.length;
+        if (lineBytes > maxSessionRecordBytes) {
+          throw new SessionStoreError("session_log_too_large");
+        }
+      }
       offset += bytesRead;
     }
-    return bytes.subarray(0, offset).toString("utf8");
+    if (lineBytes !== 0) {
+      throw new SessionStoreError();
+    }
+    return { records: validateRecordSequence(records), storedBytes: offset };
   } finally {
     await file.close();
   }
+}
+
+function parseSessionRecordBytes(bytes: Uint8Array): SessionRecord {
+  let line: string;
+  try {
+    line = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new SessionStoreError();
+  }
+  return parseSessionRecord(line);
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {

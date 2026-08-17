@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -746,6 +747,33 @@ test("a file artifact read rejects bytes that no longer match its content addres
     await expect(artifactStore.read(artifact.id)).rejects.toThrow(
       "The content-addressed artifact does not match its ID.",
     );
+  } finally {
+    await rm(artifactRoot, { recursive: true, force: true });
+  }
+});
+
+test("a file artifact write bounds collision validation by the candidate byte count", async () => {
+  const artifactRoot = await mkdtemp(join(tmpdir(), "adam-agent-artifact-collision-bound-"));
+  const artifactStore = await createFileArtifactStore({ root: artifactRoot });
+  const bytes = Buffer.from("candidate", "utf8");
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  await writeFile(join(artifactRoot, digest), "oversized collision", "utf8");
+
+  try {
+    await expect(
+      artifactStore.write({
+        bytes,
+        mediaType: "application/octet-stream",
+        source: {
+          type: "tool_output",
+          callId: "call-artifact-collision-bound",
+          toolName: "run_shell",
+          stream: "stdout",
+          totalBytes: bytes.byteLength,
+          truncated: false,
+        },
+      }),
+    ).rejects.toThrow("The artifact exceeds its bounded read limit.");
   } finally {
     await rm(artifactRoot, { recursive: true, force: true });
   }

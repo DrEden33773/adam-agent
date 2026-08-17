@@ -51,6 +51,7 @@ const longVerificationCommand =
   "trap '' TERM; printf started > started.txt; sleep 5; printf survived > survived.txt";
 const codingTaskPrompt = "Update the demo file and verify it";
 const multiFilePatchPrompt = "Apply the demo multi-file patch";
+const truncatedAnswerPrompt = "Return a deliberately truncated answer";
 const codingTaskVerificationCommand = 'test "$(cat demo.txt)" = after && printf verified';
 const fakeTargetIdentity: ModelTargetIdentity = {
   targetId: "fake.local",
@@ -73,6 +74,12 @@ const fakeModel = new FakeModelDriver((request) => {
   const prompt = request.messages.find((message) => message.role === "user")?.content ?? "";
   const latestMessage = request.messages.at(-1);
   if (latestMessage?.role === "user") {
+    if (prompt === truncatedAnswerPrompt) {
+      return [
+        { type: "text_delta", text: "Partial answer." },
+        { type: "finish", reason: "length" },
+      ];
+    }
     if (prompt === multiFilePatchPrompt) {
       return [
         { type: "tool_call_start", id: "edit-demo-multi-file", name: "edit_file" },
@@ -511,8 +518,11 @@ async function continueAndPresent(
   process.once("SIGINT", handleInterrupt);
   try {
     const continued = await lifecycle.continue({ ...input, signal: abortController.signal });
-    if (continued.result.status === "completed") {
+    if (continued.result.status === "completed" || continued.result.status === "incomplete") {
       writeText(1, `${continued.result.answer}\n`);
+      if (continued.result.status === "incomplete") {
+        process.exitCode = 1;
+      }
     } else {
       writeText(2, `${continued.result.error.message}\n`);
       process.exitCode = continued.result.status === "cancelled" && interrupted ? 130 : 1;

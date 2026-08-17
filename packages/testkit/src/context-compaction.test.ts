@@ -1,12 +1,14 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   AgentSession,
+  type ArtifactStore,
   createCodingToolRegistry,
   createFileArtifactStore,
   createInMemorySessionStore,
+  createJsonlSessionStore,
   createPermissionPolicy,
   createReadToolRegistry,
   createSessionLifecycle,
@@ -28,8 +30,12 @@ import {
   type SessionContextCompactionInterruptedRecord,
   type SessionRecord,
   sessionDurableContext,
+  sessionDurableOutputLimits,
 } from "@adam-agent/agent/internal-testing";
 import { expect, expectTypeOf, test } from "vitest";
+
+const { ADAM_AGENT_LARGE_OUTPUT_TESTS: largeOutputTests } = process.env;
+const largeOutputTest = test.skipIf(largeOutputTests !== "1");
 
 const targetIdentity = {
   targetId: "fake.local",
@@ -94,6 +100,1063 @@ test("AgentSession sends the v1 ordinary output budget with each model request",
   });
   expect(observedMaximumOutputTokens).toBe(100);
 });
+
+test("AgentSession persists an answer above 256 KiB by durable artifact before publishing it", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-model-response-artifact-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const sessionId = "model-response-artifact";
+  const projectId = "a".repeat(64);
+  const answer = "a".repeat(256 * 1024 + 1);
+  await mkdir(workspaceRoot);
+  const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+  const jsonlStore = await createJsonlSessionStore<SessionRecord>({
+    stateRoot,
+    workspaceRoot,
+    sessionId,
+  });
+  const durabilityOrder: string[] = [];
+  const store: SessionStore<SessionRecord> = {
+    async append(record) {
+      const candidate = record as unknown as {
+        readonly record?: {
+          readonly type?: string;
+          readonly response?: {
+            readonly text?: {
+              readonly storage?: string;
+              readonly reference?: { readonly id: string };
+            };
+          };
+        };
+      };
+      const reference = candidate.record?.response?.text?.reference;
+      if (candidate.record?.type === "model_response_completed" && reference !== undefined) {
+        durabilityOrder.push(
+          (await artifactStore.read(reference.id)) === undefined
+            ? "missing-before-reference"
+            : "artifact-before-reference",
+        );
+      }
+      await jsonlStore.append(record);
+      if (candidate.record?.type === "model_response_completed" && reference !== undefined) {
+        durabilityOrder.push("response-reference");
+      }
+    },
+    read: () => jsonlStore.read(),
+  };
+  const model: ModelDriver = {
+    async *stream() {
+      yield { type: "text_delta", text: answer };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    artifactStore,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    contextProfile,
+    [sessionDurableContext]: {
+      nextSequence: 1,
+      targetIdentity,
+      projectId,
+      sessionId,
+    },
+  };
+  const session = new AgentSession(dependencies);
+  const completedAnswers: string[] = [];
+  session.subscribe((event) => {
+    if (event.type === "model_message_completed") {
+      completedAnswers.push(event.text);
+    }
+  });
+
+  try {
+    await expect(session.run({ text: "Return the large answer." })).resolves.toEqual({
+      status: "completed",
+      answer,
+    });
+    const records = await jsonlStore.read();
+    const responseIndex = records.findIndex(
+      (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
+    );
+    const publicationIndex = records.findIndex(
+      (record) =>
+        record.schemaVersion === 3 &&
+        (record.record as { readonly type: string }).type === "model_response_published",
+    );
+    const responseRecord = records[responseIndex] as unknown as {
+      readonly record: {
+        readonly response: {
+          readonly recordVersion: number;
+          readonly text: {
+            readonly storage: string;
+            readonly reference: {
+              readonly id: string;
+              readonly byteCount: number;
+              readonly mediaType: string;
+              readonly source: {
+                readonly type: string;
+                readonly field: string;
+                readonly projectId: string;
+                readonly sessionId: string;
+              };
+            };
+          };
+        };
+      };
+    };
+    expect(responseRecord.record.response).toMatchObject({
+      recordVersion: 2,
+      text: {
+        storage: "artifact",
+        reference: {
+          id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+          byteCount: 256 * 1024 + 1,
+          mediaType: "text/plain; charset=utf-8",
+          source: {
+            type: "model_response",
+            field: "text",
+            projectId,
+            sessionId,
+          },
+        },
+      },
+    });
+    expect(await artifactStore.read(responseRecord.record.response.text.reference.id)).toEqual(
+      Buffer.from(answer),
+    );
+    expect(durabilityOrder).toEqual(["artifact-before-reference", "response-reference"]);
+    expect(responseIndex).toBeGreaterThanOrEqual(0);
+    expect(publicationIndex).toBeGreaterThan(responseIndex);
+    expect(JSON.stringify(records)).not.toContain(answer.slice(0, 4_096));
+    expect(completedAnswers).toEqual([answer]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession keeps an answer at the 256 KiB threshold inline", async () => {
+  const answer = "i".repeat(256 * 1024);
+  const store = createInMemorySessionStore<SessionRecord>();
+  const model: ModelDriver = {
+    async *stream() {
+      yield { type: "text_delta", text: answer };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    contextProfile,
+    [sessionDurableContext]: { nextSequence: 1, targetIdentity },
+  };
+
+  await expect(
+    new AgentSession(dependencies).run({ text: "Return the inline answer." }),
+  ).resolves.toEqual({ status: "completed", answer });
+  const response = (await store.read()).find(
+    (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
+  );
+  expect(response).toMatchObject({
+    record: { response: { text: answer } },
+  });
+});
+
+test("AgentSession spills every non-empty response field when JSON escaping crosses 1 MiB", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-model-response-group-spill-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const sessionId = "model-response-group-spill";
+  const projectId = "b".repeat(64);
+  const text = "\u0000".repeat(200 * 1024);
+  const reasoning = "\u0001".repeat(200 * 1024);
+  await mkdir(workspaceRoot);
+  const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+  const store = await createJsonlSessionStore<SessionRecord>({
+    stateRoot,
+    workspaceRoot,
+    sessionId,
+  });
+  const model: ModelDriver = {
+    async *stream() {
+      yield { type: "reasoning_delta", text: reasoning };
+      yield { type: "text_delta", text };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    artifactStore,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    contextProfile,
+    [sessionDurableContext]: {
+      nextSequence: 1,
+      targetIdentity,
+      projectId,
+      sessionId,
+    },
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(session.run({ text: "Return escaped fields." })).resolves.toEqual({
+      status: "completed",
+      answer: text,
+    });
+    const records = await store.read();
+    const responseRecord = records.find(
+      (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
+    ) as unknown as {
+      readonly record: {
+        readonly response: {
+          readonly recordVersion: number;
+          readonly text: { readonly storage: string; readonly reference: { readonly id: string } };
+          readonly reasoning: {
+            readonly storage: string;
+            readonly reference: { readonly id: string };
+          };
+        };
+      };
+    };
+    expect(responseRecord.record.response).toMatchObject({
+      recordVersion: 2,
+      text: { storage: "artifact" },
+      reasoning: { storage: "artifact" },
+    });
+    await expect(
+      artifactStore.read(responseRecord.record.response.text.reference.id),
+    ).resolves.toEqual(Buffer.from(text));
+    await expect(
+      artifactStore.read(responseRecord.record.response.reasoning.reference.id),
+    ).resolves.toEqual(Buffer.from(reasoning));
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession rejects text plus reasoning above the shared 64 MiB response envelope", async () => {
+  const boundaryChunk = "x".repeat(64 * 1024 * 1024);
+  const model: ModelDriver = {
+    async *stream() {
+      yield { type: "text_delta", text: boundaryChunk };
+      yield { type: "reasoning_delta", text: "y" };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const store: SessionStore = {
+    async append() {},
+    async read() {
+      return [];
+    },
+  };
+
+  const result = await new AgentSession({ model, store, contextProfile }).run({
+    text: "Cross the shared response limit.",
+  });
+  expect(result.status).toBe("failed");
+  if (result.status === "failed") {
+    expect(result.error.code).toBe("model_response_too_large");
+  }
+});
+
+test("AgentSession accepts separate text and reasoning at the shared 64 MiB boundary", async () => {
+  const text = "t".repeat(32 * 1024 * 1024);
+  const reasoning = "r".repeat(32 * 1024 * 1024);
+  const model: ModelDriver = {
+    async *stream() {
+      yield { type: "reasoning_delta", text: reasoning };
+      yield { type: "text_delta", text };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const store: SessionStore = {
+    async append() {},
+    async read() {
+      return [];
+    },
+  };
+
+  const result = await new AgentSession({ model, store, contextProfile }).run({
+    text: "Fill the shared response limit.",
+  });
+  expect(result.status).toBe("completed");
+  if (result.status === "completed") {
+    expect(Buffer.byteLength(result.answer, "utf8")).toBe(32 * 1024 * 1024);
+  }
+});
+
+test("AgentSession charges physically deduplicated artifacts against logical response quota", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-model-response-quota-"));
+  const artifactStore = await createFileArtifactStore({ root: join(testRoot, "artifacts") });
+  const store = createInMemorySessionStore<SessionRecord>();
+  let requestCount = 0;
+  const model: ModelDriver = {
+    async *stream() {
+      requestCount += 1;
+      yield { type: "text_delta", text: "same!" };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    artifactStore,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    contextProfile,
+    [sessionDurableContext]: {
+      nextSequence: 1,
+      targetIdentity,
+      projectId: "c".repeat(64),
+      sessionId: "logical-quota",
+    },
+    [sessionDurableOutputLimits]: {
+      maximumInlineFieldBytes: 4,
+      maximumReferencedArtifactBytes: 8,
+    },
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(session.run({ text: "First." })).resolves.toEqual({
+      status: "completed",
+      answer: "same!",
+    });
+    const second = await session.run({ text: "Second." });
+    expect(second).toMatchObject({
+      status: "failed",
+      error: { code: "model_response_artifact_quota_exceeded" },
+    });
+    expect(requestCount).toBe(2);
+    const references = (await store.read()).flatMap((record) => {
+      if (
+        record.schemaVersion !== 3 ||
+        record.record.type !== "model_response_completed" ||
+        record.record.response.recordVersion !== 2 ||
+        record.record.response.text.storage !== "artifact"
+      ) {
+        return [];
+      }
+      return [record.record.response.text.reference.id];
+    });
+    expect(references).toHaveLength(1);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle resolves artifact-backed responses across restart and branch replay", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-model-response-lifecycle-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const answer = "l".repeat(256 * 1024 + 1);
+  const lifecycleProfile: ContextProfile = {
+    ...contextProfile,
+    contextWindowTokens: 1_000_000,
+    compactAtTokens: 900_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+  };
+  const observedMessages: ModelRequest["messages"][] = [];
+  let requestCount = 0;
+  await mkdir(workspaceRoot);
+  const model: ModelDriver = {
+    async *stream(request) {
+      requestCount += 1;
+      observedMessages.push(request.messages);
+      yield {
+        type: "text_delta",
+        text: requestCount === 1 ? answer : "Child replayed the artifact-backed answer.",
+      };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile: lifecycleProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile: lifecycleProfile,
+          },
+        ],
+      };
+    },
+  };
+  const options = { modelTargets, stateRoot, workspaceRoot };
+
+  try {
+    const lifecycle = createSessionLifecycle(options);
+    const created = await lifecycle.create({ targetIdentity });
+    const parent = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Create an artifact-backed answer." },
+    });
+    expect(parent.result).toEqual({ status: "completed", answer });
+
+    const restarted = createSessionLifecycle(options);
+    await expect(restarted.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "settled",
+      run: { status: "settled", result: { status: "completed", answer } },
+    });
+    const child = await restarted.branch({
+      parentSessionId: created.sessionId,
+      atSequence: parent.snapshot.lastSequence,
+    });
+    const childContinuation = await restarted.continue({
+      sessionId: child.sessionId,
+      input: { text: "Continue from the branch." },
+    });
+    expect(childContinuation.result).toEqual({
+      status: "completed",
+      answer: "Child replayed the artifact-backed answer.",
+    });
+    expect(observedMessages[1]).toContainEqual({
+      role: "assistant",
+      content: answer,
+      toolCalls: [],
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test.each(["missing", "corrupt"] as const)(
+  "SessionLifecycle degrades inspection and blocks replay for a %s model-response artifact",
+  async (damage) => {
+    const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-model-response-${damage}-`));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const answer = "d".repeat(256 * 1024 + 1);
+    const lifecycleProfile: ContextProfile = {
+      ...contextProfile,
+      contextWindowTokens: 1_000_000,
+      compactAtTokens: 900_000,
+      postCompactTargetTokens: 200_000,
+      retainedTargetTokens: 20_000,
+    };
+    let requestCount = 0;
+    await mkdir(workspaceRoot);
+    const model: ModelDriver = {
+      async *stream() {
+        requestCount += 1;
+        yield { type: "text_delta", text: answer };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const modelTargets: ModelTargets = {
+      async resolve() {
+        return { identity: targetIdentity, driver: model, contextProfile: lifecycleProfile };
+      },
+      async snapshot() {
+        return {
+          targets: [
+            {
+              identity: targetIdentity,
+              readiness: { status: "available", credentialSource: "test" },
+              contextProfile: lifecycleProfile,
+            },
+          ],
+        };
+      },
+    };
+    const options = { modelTargets, stateRoot, workspaceRoot };
+
+    try {
+      const lifecycle = createSessionLifecycle(options);
+      const created = await lifecycle.create({ targetIdentity });
+      const completed = await lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Persist replay authority." },
+      });
+      const child = await lifecycle.branch({
+        parentSessionId: created.sessionId,
+        atSequence: completed.snapshot.lastSequence,
+      });
+      const store = await openJsonlSessionStore<SessionRecord>({
+        stateRoot,
+        workspaceRoot,
+        sessionId: created.sessionId,
+      });
+      const response = (await store.read()).find(
+        (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
+      );
+      if (
+        response?.schemaVersion !== 3 ||
+        response.record.type !== "model_response_completed" ||
+        response.record.response.recordVersion !== 2 ||
+        response.record.response.text.storage !== "artifact"
+      ) {
+        throw new Error("Expected an artifact-backed response fixture.");
+      }
+      const artifactId = response.record.response.text.reference.id;
+      const artifactPath = join(stateRoot, "artifacts", artifactId.slice("sha256:".length));
+      if (damage === "missing") {
+        await rm(artifactPath);
+      } else {
+        await chmod(artifactPath, 0o600);
+        await writeFile(artifactPath, "corrupt", "utf8");
+      }
+
+      const restarted = createSessionLifecycle(options);
+      await expect(restarted.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+        status: "settled",
+        degradation: {
+          code:
+            damage === "missing"
+              ? "model_response_artifact_missing"
+              : "model_response_artifact_corrupt",
+          artifactId,
+          field: "text",
+        },
+      });
+      await expect(restarted.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+        status: "rejected",
+        error: { code: "session_replay_unavailable" },
+      });
+      await expect(restarted.inspect({ sessionId: child.sessionId })).resolves.toMatchObject({
+        degradation: { artifactId },
+      });
+      await expect(restarted.resume({ sessionId: child.sessionId })).resolves.toMatchObject({
+        status: "rejected",
+        error: { code: "session_replay_unavailable" },
+      });
+      await expect(
+        restarted.branch({
+          parentSessionId: created.sessionId,
+          atSequence: completed.snapshot.lastSequence,
+        }),
+      ).rejects.toMatchObject({ code: "session_invalid" });
+      expect(requestCount).toBe(1);
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test("AgentSession fails closed when a model-response artifact cannot be written", async () => {
+  const answer = "w".repeat(256 * 1024 + 1);
+  const artifactStore: ArtifactStore = {
+    async write() {
+      throw new Error("injected artifact write failure");
+    },
+    async read() {
+      return undefined;
+    },
+  };
+  const store = createInMemorySessionStore<SessionRecord>();
+  const model: ModelDriver = {
+    async *stream() {
+      yield { type: "text_delta", text: answer };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    artifactStore,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    contextProfile,
+    [sessionDurableContext]: {
+      nextSequence: 1,
+      targetIdentity,
+      projectId: "e".repeat(64),
+      sessionId: "artifact-write-failure",
+    },
+  };
+
+  await expect(
+    new AgentSession(dependencies).run({ text: "Fail the artifact write." }),
+  ).resolves.toMatchObject({
+    status: "failed",
+    error: { code: "session_persistence_failed" },
+  });
+  expect(
+    (await store.read()).some(
+      (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
+    ),
+  ).toBe(false);
+});
+
+test("AgentSession permits an orphan only after artifact durability and before reference append", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-model-response-orphan-"));
+  const answer = "o".repeat(256 * 1024 + 1);
+  const realArtifactStore = await createFileArtifactStore({ root: join(testRoot, "artifacts") });
+  let writtenArtifactId: string | undefined;
+  const artifactStore: ArtifactStore = {
+    async write(input) {
+      const reference = await realArtifactStore.write(input);
+      writtenArtifactId = reference.id;
+      return reference;
+    },
+    read: (id, options) => realArtifactStore.read(id, options),
+  };
+  const innerStore = createInMemorySessionStore<SessionRecord>();
+  const store: SessionStore<SessionRecord> = {
+    async append(record) {
+      if (record.schemaVersion === 3 && record.record.type === "model_response_completed") {
+        throw new Error("injected crash before response reference");
+      }
+      await innerStore.append(record);
+    },
+    read: () => innerStore.read(),
+  };
+  const model: ModelDriver = {
+    async *stream() {
+      yield { type: "text_delta", text: answer };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    artifactStore,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    contextProfile,
+    [sessionDurableContext]: {
+      nextSequence: 1,
+      targetIdentity,
+      projectId: "f".repeat(64),
+      sessionId: "artifact-orphan",
+    },
+  };
+
+  try {
+    await expect(
+      new AgentSession(dependencies).run({ text: "Crash after artifact durability." }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "session_persistence_failed" },
+    });
+    expect(writtenArtifactId).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    await expect(realArtifactStore.read(writtenArtifactId as string)).resolves.toEqual(
+      Buffer.from(answer),
+    );
+    expect(
+      (await innerStore.read()).some(
+        (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
+      ),
+    ).toBe(false);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle completes bounded markers after a crash following the response reference", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-model-response-marker-recovery-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const answer = "m".repeat(256 * 1024 + 1);
+  let requestCount = 0;
+  await mkdir(workspaceRoot);
+  const model: ModelDriver = {
+    async *stream() {
+      requestCount += 1;
+      yield { type: "text_delta", text: answer };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const options = { modelTargets, stateRoot, workspaceRoot };
+
+  try {
+    const lifecycle = createSessionLifecycle(options);
+    const created = await lifecycle.create({ targetIdentity });
+    const jsonlStore = await openJsonlSessionStore<SessionRecord>({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    let injectedCrash = false;
+    const store: SessionStore<SessionRecord> = {
+      async append(record) {
+        if (
+          !injectedCrash &&
+          record.schemaVersion === 3 &&
+          record.record.type === "model_response_published"
+        ) {
+          injectedCrash = true;
+          throw new Error("injected crash after response reference");
+        }
+        await jsonlStore.append(record);
+      },
+      read: () => jsonlStore.read(),
+    };
+    const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+    const dependencies = {
+      model,
+      artifactStore,
+      store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+      contextProfile,
+      [sessionDurableContext]: {
+        nextSequence: 2,
+        targetIdentity,
+        projectId: created.projectId,
+        sessionId: created.sessionId,
+      },
+    };
+    await expect(
+      new AgentSession(dependencies).run({ text: "Crash before publication." }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "session_persistence_failed" },
+    });
+
+    const restarted = createSessionLifecycle(options);
+    await expect(restarted.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "ready",
+      snapshot: {
+        status: "settled",
+        run: { result: { status: "completed", answer } },
+      },
+    });
+    const records = await jsonlStore.read();
+    expect(records.slice(-2)).toMatchObject([
+      { record: { type: "model_response_published" } },
+      { record: { type: "run_settled", status: "completed" } },
+    ]);
+    expect(JSON.stringify(records)).not.toContain(answer.slice(0, 4_096));
+    expect(requestCount).toBe(1);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle charges inherited branch artifacts before accepting a child response", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-model-response-lineage-quota-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  let requestCount = 0;
+  await mkdir(workspaceRoot);
+  const model: ModelDriver = {
+    async *stream() {
+      requestCount += 1;
+      yield { type: "text_delta", text: "shared" };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const options = {
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionDurableOutputLimits]: {
+      maximumInlineFieldBytes: 4,
+      maximumReferencedArtifactBytes: 10,
+    },
+  };
+
+  try {
+    const lifecycle = createSessionLifecycle(options);
+    const created = await lifecycle.create({ targetIdentity });
+    const parent = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Parent response." },
+    });
+    const child = await lifecycle.branch({
+      parentSessionId: created.sessionId,
+      atSequence: parent.snapshot.lastSequence,
+    });
+    await expect(
+      lifecycle.continue({ sessionId: child.sessionId, input: { text: "Child response." } }),
+    ).resolves.toMatchObject({
+      result: {
+        status: "failed",
+        error: { code: "model_response_artifact_quota_exceeded" },
+      },
+    });
+    expect(requestCount).toBe(2);
+    const childStore = await openJsonlSessionStore<SessionRecord>({
+      stateRoot,
+      workspaceRoot,
+      sessionId: child.sessionId,
+    });
+    expect(
+      (await childStore.read()).some(
+        (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
+      ),
+    ).toBe(false);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession durably settles length output as incomplete without executing generated tools", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-model-output-limit-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const answer = "q".repeat(256 * 1024 + 1);
+  let requestCount = 0;
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "secret.txt"), "must not be read", "utf8");
+  const model: ModelDriver = {
+    async *stream() {
+      requestCount += 1;
+      yield { type: "text_delta", text: answer };
+      yield { type: "tool_call_start", id: "incomplete-read", name: "read_file" };
+      yield { type: "tool_call_delta", id: "incomplete-read", json: '{"path":"secret.txt"}' };
+      yield { type: "tool_call_end", id: "incomplete-read" };
+      yield { type: "finish", reason: "length" };
+    },
+  };
+  const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+  const store = await createJsonlSessionStore<SessionRecord>({
+    stateRoot,
+    workspaceRoot,
+    sessionId: "output-limit",
+  });
+  const dependencies = {
+    model,
+    artifactStore,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    contextProfile,
+    [sessionDurableContext]: {
+      nextSequence: 1,
+      targetIdentity,
+      projectId: "1".repeat(64),
+      sessionId: "output-limit",
+    },
+  };
+  const events: RuntimeEvent[] = [];
+  const session = new AgentSession(dependencies);
+  session.subscribe((event) => events.push(event));
+
+  try {
+    await expect(session.run({ text: "Reach the output limit." })).resolves.toEqual({
+      status: "incomplete",
+      reason: "output_limit",
+      answer,
+    });
+    expect(requestCount).toBe(1);
+    expect(events.some((event) => event.type.startsWith("tool_"))).toBe(false);
+    const records = await store.read();
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        record: expect.objectContaining({
+          type: "model_response_completed",
+          response: expect.objectContaining({
+            recordVersion: 2,
+            finishReason: "length",
+            text: expect.objectContaining({ storage: "artifact" }),
+            toolCalls: [],
+            toolIntents: [],
+          }),
+        }),
+      }),
+    );
+    expect(records.at(-1)).toMatchObject({
+      record: { type: "run_settled", status: "incomplete", reason: "output_limit" },
+    });
+    expect(JSON.stringify(records)).not.toContain(answer.slice(0, 4_096));
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle restores artifact-backed output-limit settlements as incomplete", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-output-limit-lifecycle-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const answer = "r".repeat(256 * 1024 + 1);
+  let requestCount = 0;
+  await mkdir(workspaceRoot);
+  const model: ModelDriver = {
+    async *stream() {
+      requestCount += 1;
+      yield { type: "text_delta", text: answer };
+      yield { type: "finish", reason: "length" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const options = { modelTargets, stateRoot, workspaceRoot };
+
+  try {
+    const lifecycle = createSessionLifecycle(options);
+    const created = await lifecycle.create({ targetIdentity });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Reach the output limit durably." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "incomplete", reason: "output_limit", answer },
+      snapshot: {
+        status: "settled",
+        run: {
+          result: { status: "incomplete", reason: "output_limit", answer },
+          lastCompletedResponse: { finishReason: "length" },
+        },
+      },
+    });
+
+    const restarted = createSessionLifecycle(options);
+    await expect(restarted.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "ready",
+      snapshot: {
+        status: "settled",
+        run: { result: { status: "incomplete", reason: "output_limit", answer } },
+      },
+    });
+    const store = await openJsonlSessionStore<SessionRecord>({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    const records = await store.read();
+    expect(records.at(-1)).toMatchObject({
+      record: { type: "run_settled", status: "incomplete", reason: "output_limit" },
+    });
+    expect(JSON.stringify(records)).not.toContain(answer.slice(0, 4_096));
+    expect(requestCount).toBe(1);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+largeOutputTest(
+  "SessionLifecycle replays and branches an approximately 46.875 MiB response",
+  async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-large-model-response-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const answerBytes = 49_152_000;
+    const answer = "L".repeat(answerBytes);
+    let requestCount = 0;
+    await mkdir(workspaceRoot);
+    const model: ModelDriver = {
+      async *stream() {
+        requestCount += 1;
+        yield { type: "text_delta", text: answer };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const modelTargets: ModelTargets = {
+      async resolve() {
+        return { identity: targetIdentity, driver: model, contextProfile };
+      },
+      async snapshot() {
+        return {
+          targets: [
+            {
+              identity: targetIdentity,
+              readiness: { status: "available", credentialSource: "test" },
+              contextProfile,
+            },
+          ],
+        };
+      },
+    };
+    const options = { modelTargets, stateRoot, workspaceRoot };
+
+    try {
+      const lifecycle = createSessionLifecycle(options);
+      const created = await lifecycle.create({ targetIdentity });
+      const completed = await lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Produce the synthetic large response." },
+      });
+      expect(completed.result.status).toBe("completed");
+      if (completed.result.status !== "completed") {
+        throw new Error("Expected the large synthetic response to complete.");
+      }
+      expect(completed.result.answer).toBe(answer);
+
+      const restarted = createSessionLifecycle(options);
+      const inspected = await restarted.inspect({ sessionId: created.sessionId });
+      if (inspected.schemaVersion !== 3) {
+        throw new Error("Expected a current session snapshot.");
+      }
+      expect(inspected.degradation).toBeUndefined();
+      expect(inspected.run?.result).toMatchObject({ status: "completed" });
+      if (inspected.run?.result?.status !== "completed") {
+        throw new Error("Expected inspection to materialize the large response.");
+      }
+      expect(inspected.run.result.answer).toBe(answer);
+      const resumed = await restarted.resume({ sessionId: created.sessionId });
+      expect(resumed).toMatchObject({ status: "ready", snapshot: { status: "settled" } });
+      if (resumed.status !== "ready" || resumed.snapshot.schemaVersion !== 3) {
+        throw new Error("Expected resume-capable current replay.");
+      }
+      expect(resumed.snapshot.degradation).toBeUndefined();
+      const child = await restarted.branch({
+        parentSessionId: created.sessionId,
+        atSequence: completed.snapshot.lastSequence,
+      });
+      await expect(restarted.inspect({ sessionId: child.sessionId })).resolves.toMatchObject({
+        status: "idle",
+        lineage: { parentSessionId: created.sessionId },
+      });
+
+      const store = await openJsonlSessionStore<SessionRecord>({
+        stateRoot,
+        workspaceRoot,
+        sessionId: created.sessionId,
+      });
+      const response = (await store.read()).find(
+        (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
+      );
+      if (
+        response?.schemaVersion !== 3 ||
+        response.record.type !== "model_response_completed" ||
+        response.record.response.recordVersion !== 2 ||
+        response.record.response.text.storage !== "artifact"
+      ) {
+        throw new Error("Expected a durable large-response artifact reference.");
+      }
+      expect(response.record.response.text.reference.byteCount).toBe(answerBytes);
+      expect(requestCount).toBe(1);
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
 
 test("AgentSession clamps the v2 ordinary output budget at the DeepSeek context boundary", async () => {
   const observedBudgets: number[] = [];

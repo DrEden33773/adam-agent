@@ -59,6 +59,30 @@ describe("one-shot CLI", () => {
     }
   });
 
+  test("prints a provider-truncated partial answer and exits unsuccessfully", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-output-limit-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    await mkdir(workspaceRoot);
+
+    try {
+      const result = await runCli({
+        cwd: workspaceRoot,
+        stateRoot: join(testRoot, "state"),
+        prompt: "Return a deliberately truncated answer",
+        stdin: "",
+      });
+
+      expect(result).toEqual({
+        stdout: "Partial answer.\n",
+        stderr: "",
+        exitCode: 1,
+        signal: null,
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
   test("fails with copy-pastable guidance when no model target is selected", async () => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-target-missing-"));
     const workspaceRoot = join(testRoot, "workspace");
