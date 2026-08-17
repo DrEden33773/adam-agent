@@ -2,6 +2,7 @@ import { createDeepSeek } from "@ai-sdk/deepseek";
 import { createGateway } from "@ai-sdk/gateway";
 
 import { AiSdkModelDriver } from "./ai-sdk-model-driver.js";
+import type { ContextProfile } from "./context-profile.js";
 import type { ModelDriver } from "./index.js";
 
 export type ModelTargetIdentity = {
@@ -23,6 +24,7 @@ export type ModelTargetSnapshot = {
   readonly targets: readonly {
     readonly identity: ModelTargetIdentity;
     readonly readiness: ModelTargetReadiness;
+    readonly contextProfile: ContextProfile;
   }[];
 };
 
@@ -107,7 +109,11 @@ export interface ModelTargets {
     readonly targetId: string;
     readonly allowExperimental: boolean;
     readonly signal: AbortSignal;
-  }): Promise<{ readonly identity: ModelTargetIdentity; readonly driver: ModelDriver }>;
+  }): Promise<{
+    readonly identity: ModelTargetIdentity;
+    readonly driver: ModelDriver;
+    readonly contextProfile: ContextProfile;
+  }>;
   snapshot(input: {
     readonly discoverGateway?: boolean | undefined;
     readonly signal: AbortSignal;
@@ -143,6 +149,24 @@ const directDeepSeekTargets: readonly ModelTargetIdentity[] = Object.freeze([
 ]);
 
 const experimentalGatewayProviderId = "poolside";
+const directDeepSeekContextProfile: ContextProfile = Object.freeze({
+  version: 1,
+  contextWindowTokens: 1_000_000,
+  maximumOutputTokens: 32_768,
+  compactAtTokens: 800_000,
+  postCompactTargetTokens: 200_000,
+  retainedTargetTokens: 20_000,
+  estimatorVersion: 1,
+});
+const experimentalGatewayContextProfile: ContextProfile = Object.freeze({
+  version: 1,
+  contextWindowTokens: 65_536,
+  maximumOutputTokens: 32_768,
+  compactAtTokens: 32_768,
+  postCompactTargetTokens: 24_576,
+  retainedTargetTokens: 8_192,
+  estimatorVersion: 1,
+});
 
 const experimentalGatewayTarget: ModelTargetIdentity = Object.freeze({
   targetId: "poolside-laguna-s-2.1-free.gateway",
@@ -193,6 +217,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
         });
         return {
           identity,
+          contextProfile: experimentalGatewayContextProfile,
           driver: new AiSdkModelDriver({
             model: provider(identity.modelId),
             maximumOutputTokens: 32_768,
@@ -221,6 +246,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
       });
       return {
         identity,
+        contextProfile: directDeepSeekContextProfile,
         driver: new AiSdkModelDriver({
           model: provider(identity.modelId),
           maximumOutputTokens: 32_768,
@@ -248,6 +274,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
           ...directDeepSeekTargets.map((identity) => ({
             identity,
             readiness: { status, credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile: directDeepSeekContextProfile,
           })),
           {
             identity: experimentalGatewayTarget,
@@ -255,6 +282,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
               status: gatewayStatus,
               credentialSource: "AI_GATEWAY_API_KEY",
             },
+            contextProfile: experimentalGatewayContextProfile,
           },
         ],
       };

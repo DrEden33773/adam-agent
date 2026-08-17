@@ -702,6 +702,15 @@ test("the target snapshot reports exact Certified identities and safe credential
           certification: "certified",
         },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+        contextProfile: {
+          version: 1,
+          contextWindowTokens: 1_000_000,
+          maximumOutputTokens: 32_768,
+          compactAtTokens: 800_000,
+          postCompactTargetTokens: 200_000,
+          retainedTargetTokens: 20_000,
+          estimatorVersion: 1,
+        },
       },
       {
         identity: {
@@ -713,6 +722,15 @@ test("the target snapshot reports exact Certified identities and safe credential
           certification: "certified",
         },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+        contextProfile: {
+          version: 1,
+          contextWindowTokens: 1_000_000,
+          maximumOutputTokens: 32_768,
+          compactAtTokens: 800_000,
+          postCompactTargetTokens: 200_000,
+          retainedTargetTokens: 20_000,
+          estimatorVersion: 1,
+        },
       },
       {
         identity: {
@@ -725,6 +743,15 @@ test("the target snapshot reports exact Certified identities and safe credential
           certification: "experimental",
         },
         readiness: { status: "missing", credentialSource: "AI_GATEWAY_API_KEY" },
+        contextProfile: {
+          version: 1,
+          contextWindowTokens: 65_536,
+          maximumOutputTokens: 32_768,
+          compactAtTokens: 32_768,
+          postCompactTargetTokens: 24_576,
+          retainedTargetTokens: 8_192,
+          estimatorVersion: 1,
+        },
       },
     ],
   });

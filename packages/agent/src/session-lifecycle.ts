@@ -1,8 +1,18 @@
 import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
-
+import { type ContextProfile, sessionContextProfile } from "./context-profile.js";
+import {
+  type ContextEvidenceV1,
+  createContextProjectionMessage,
+  digestContextMessages,
+  digestContextRecordPrefix,
+  estimateActiveContextTokens,
+  mergeContextEvidence,
+  reduceContextEvidence,
+} from "./durable-context.js";
 import {
   AgentSession,
+  type ContextUsageTotals,
   type ModelMessage,
   type PermissionDecisionCommand,
   type PermissionDecisionCommandResult,
@@ -24,6 +34,10 @@ import {
   createJsonlSessionStore,
   openJsonlSessionStore,
   readJsonlSessionRecords,
+  type SessionContextCompactionCommittedRecord,
+  type SessionContextCompactionFailedRecord,
+  type SessionContextCompactionInterruptedRecord,
+  type SessionContextCompactionStartedRecord,
   type SessionGenesisRecord,
   type SessionLogicalRunStartedRecord,
   type SessionModelResponseCompletedRecord,
@@ -39,6 +53,7 @@ export type CurrentSessionSnapshot = {
   readonly targetIdentity: ModelTargetIdentity;
   readonly status: "idle" | "interrupted" | "settled";
   readonly lastSequence: number;
+  readonly context?: SessionContextSnapshot;
   readonly lineage?: {
     readonly parentSessionId: string;
     readonly parentEventPosition: number;
@@ -59,6 +74,40 @@ export type CurrentSessionSnapshot = {
       readonly finishReason: "stop" | "tool_calls";
     };
   };
+};
+
+export type SessionContextSnapshot = {
+  readonly profile: ContextProfile;
+  readonly checkpoint?: {
+    readonly checkpointId: string;
+    readonly sequence: number;
+    readonly windowNumber: number;
+    readonly status: "committed";
+    readonly sourceThrough: number;
+    readonly retainedFrom: number;
+  };
+  readonly lastAttempt: {
+    readonly attemptId: string;
+    readonly attemptNumber: number;
+    readonly windowNumber: number;
+    readonly status: "started" | "committed" | "failed" | "interrupted";
+    readonly reason?: string;
+    readonly usage:
+      | { readonly status: "unknown" }
+      | {
+          readonly inputTokens: number;
+          readonly outputTokens: number;
+          readonly reasoningTokens?: number;
+          readonly cachedInputTokens?: number;
+          readonly cacheMissInputTokens?: number;
+        };
+  };
+  readonly ordinaryUsage: ContextUsageTotals;
+  readonly compactionUsage: ContextUsageTotals;
+  readonly active:
+    | { readonly source: "provider_reported"; readonly tokens: number }
+    | { readonly source: "estimated"; readonly tokens: number }
+    | { readonly source: "unknown" };
 };
 
 export type LegacySessionSnapshot = {
@@ -200,7 +249,10 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     }
     validateCurrentSessionHistory(first, records);
     await validateSessionLineage(options, first, new Set([input.sessionId]));
-    return snapshotFromRecords(first, records);
+    await validateInheritedContextEvidence(options, first, records);
+    const snapshot = snapshotFromRecords(first, records);
+    const inheritedContext = await contextSnapshotFromLineage(options, first, records);
+    return inheritedContext === undefined ? snapshot : { ...snapshot, context: inheritedContext };
   };
 
   const resumeSession = async (input: {
@@ -210,6 +262,16 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     if (snapshot.schemaVersion === 3 && snapshot.status === "interrupted") {
       const restoredUserMessage = await appendMissingUserMessage(options, snapshot);
       if (restoredUserMessage) {
+        snapshot = await inspectSession(input);
+      }
+      if (snapshot.schemaVersion !== 3) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const interruptedCompaction = await appendDanglingContextCompactionInterruption(
+        options,
+        snapshot,
+      );
+      if (interruptedCompaction) {
         snapshot = await inspectSession(input);
       }
       if (snapshot.schemaVersion !== 3) {
@@ -282,6 +344,19 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           error: {
             code: "model_target_unavailable",
             message: `The exact recorded model target requires ${target.readiness.credentialSource}.`,
+          },
+        };
+      }
+      if (
+        snapshot.context !== undefined &&
+        JSON.stringify(target.contextProfile) !== JSON.stringify(snapshot.context.profile)
+      ) {
+        return {
+          status: "rejected",
+          snapshot,
+          error: {
+            code: "model_target_incompatible",
+            message: "The exact recorded context profile is not supported by this runtime.",
           },
         };
       }
@@ -428,7 +503,11 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           },
         };
         await store.append(genesis);
-        return snapshotFromGenesis(genesis, 1);
+        const context = await contextSnapshotFromLineage(options, parentGenesis, parentPrefix);
+        return {
+          ...snapshotFromGenesis(genesis, 1),
+          ...(context === undefined ? {} : { context }),
+        };
       });
     },
     async create(input) {
@@ -479,7 +558,10 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           sessionId: input.sessionId,
           ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
         });
-        const inheritedMessages = await createBranchMessages(options, records);
+        const [inheritedMessages, inheritedEvidence] = await Promise.all([
+          createBranchMessages(options, records),
+          createBranchEvidence(options, records),
+        ]);
         const resumeState =
           resumed.snapshot.status === "interrupted"
             ? createAgentResumeState(records, options, resumed.snapshot)
@@ -505,11 +587,13 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           [sessionDurableContext]: {
             nextSequence: resumed.snapshot.lastSequence + 1,
             targetIdentity: resumed.snapshot.targetIdentity,
+            ...(hasContextEvidence(inheritedEvidence) ? { inheritedEvidence } : {}),
             ...(resumeState !== undefined || inheritedMessages.length === 0
               ? {}
               : { initialMessages: inheritedMessages }),
             ...(durableResumeState === undefined ? {} : { resume: durableResumeState }),
           },
+          [sessionContextProfile]: resolved.contextProfile,
           ...(options.tools === undefined ? {} : { tools: options.tools }),
           ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
         };
@@ -611,6 +695,11 @@ function validateCurrentSessionHistory(
   let sawModelStart = false;
   let sawModelCompletion = false;
   let terminalIntent: RunResult | undefined;
+  let lastContextTerminal:
+    | SessionContextCompactionCommittedRecord["record"]
+    | SessionContextCompactionFailedRecord["record"]
+    | SessionContextCompactionInterruptedRecord["record"]
+    | undefined;
   let lastUsage: Extract<RuntimeEvent, { readonly type: "model_usage" }> | undefined;
   let toolStates = new Map<string, ValidatedToolState>();
 
@@ -674,7 +763,8 @@ function validateCurrentSessionHistory(
     if (record.type === "provider_attempt_interrupted") {
       if (
         !isMatchingStartedAttempt(attemptState, record) ||
-        (record.reason === "process_restart" && record.result !== undefined) ||
+        ((record.reason === "process_restart" || record.reason === "context_overflow") &&
+          record.result !== undefined) ||
         (record.reason === "run_terminal" && record.result === undefined)
       ) {
         throw new SessionLifecycleError("session_invalid");
@@ -712,6 +802,28 @@ function validateCurrentSessionHistory(
           },
         ]),
       );
+      continue;
+    }
+    if (
+      record.type === "context_compaction_started" ||
+      record.type === "context_compaction_committed" ||
+      record.type === "context_compaction_failed" ||
+      record.type === "context_compaction_interrupted"
+    ) {
+      if (
+        record.type === "context_compaction_started" &&
+        (!sawUserMessage ||
+          terminalIntent !== undefined ||
+          attemptState?.status === "started" ||
+          (attemptState?.status === "completed" &&
+            (attemptState.response?.response.finishReason !== "tool_calls" ||
+              [...toolStates.values()].some((state) => !state.terminal))))
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      if (record.type !== "context_compaction_started") {
+        lastContextTerminal = record;
+      }
       continue;
     }
     const event = record.event;
@@ -782,7 +894,8 @@ function validateCurrentSessionHistory(
             !sawModelCompletion)) ||
         (event.result.status === "cancelled" && !sawSessionInterruption) ||
         (event.result.status === "failed" &&
-          (attemptState === undefined ||
+          ((attemptState === undefined &&
+            !isContextTerminalFailure(event.result, lastContextTerminal)) ||
             event.result.error.code === "invalid_run_limits" ||
             event.result.error.code === "run_already_active" ||
             event.result.error.code === "session_persistence_failed" ||
@@ -857,6 +970,223 @@ function validateCurrentSessionHistory(
     }
     throw new SessionLifecycleError("session_invalid");
   }
+  validateContextCompactionHistory(genesis, currentRecords);
+}
+
+function isContextTerminalFailure(
+  result: Extract<RunResult, { readonly status: "failed" }>,
+  terminal:
+    | SessionContextCompactionCommittedRecord["record"]
+    | SessionContextCompactionFailedRecord["record"]
+    | SessionContextCompactionInterruptedRecord["record"]
+    | undefined,
+): boolean {
+  if (terminal?.type === "context_compaction_committed") {
+    return (
+      result.error.code === "token_limit_exceeded" || result.error.code === "token_usage_missing"
+    );
+  }
+  if (terminal?.type !== "context_compaction_failed") {
+    return false;
+  }
+  const expectedCode =
+    terminal.reason === "model_request_failed"
+      ? "context_compaction_failed"
+      : terminal.reason === "summary_invalid"
+        ? "context_compaction_invalid"
+        : terminal.reason === "input_unrecoverable"
+          ? "context_compaction_input_unrecoverable"
+          : terminal.reason === "context_window_unrecoverable"
+            ? "context_window_unrecoverable"
+            : undefined;
+  return result.error.code === expectedCode;
+}
+
+function validateContextCompactionHistory(
+  genesis: SessionGenesisRecord,
+  records: readonly Extract<SessionRecord, { readonly schemaVersion: 3 }>[],
+): void {
+  const starts = new Map<
+    string,
+    {
+      readonly entry: SessionContextCompactionStartedRecord;
+      terminal: boolean;
+    }
+  >();
+  const boundaryAttempts = new Map<string, number>();
+  const boundaryRetryAllowed = new Map<string, boolean>();
+  const committedBoundaries = new Set<string>();
+  const checkpointIds = new Set<string>();
+  let latestCheckpointSequence: number | undefined;
+  let latestWindowNumber = 0;
+  for (const entry of records) {
+    const record = entry.record;
+    const openStart = [...starts.values()].find((start) => !start.terminal);
+    if (
+      openStart !== undefined &&
+      !(
+        (record.type === "context_compaction_committed" ||
+          record.type === "context_compaction_failed" ||
+          record.type === "context_compaction_interrupted") &&
+        record.attemptId === openStart.entry.record.attemptId
+      )
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    if (record.type === "context_compaction_started") {
+      if (
+        !sameTargetIdentity(record.targetIdentity, genesis.record.targetIdentity) ||
+        record.sourceThrough >= entry.sequence ||
+        !isContextProfileValid(record.contextProfile) ||
+        record.previousCheckpointSequence !== latestCheckpointSequence ||
+        record.windowNumber !== latestWindowNumber + 1 ||
+        digestContextRecordPrefix(
+          records.filter((candidate) => candidate.sequence <= record.sourceThrough),
+        ) !== record.sourceDigest
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const boundary = `${record.runId}:${record.windowNumber}:${record.sourceThrough}:${record.sourceDigest}`;
+      const expectedAttempt = (boundaryAttempts.get(boundary) ?? 0) + 1;
+      if (
+        record.attemptNumber !== expectedAttempt ||
+        record.attemptNumber > 2 ||
+        (record.attemptNumber === 1 && record.sourceThrough !== entry.sequence - 1) ||
+        (expectedAttempt > 1 && boundaryRetryAllowed.get(boundary) !== true) ||
+        starts.has(record.attemptId) ||
+        committedBoundaries.has(boundary)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      boundaryAttempts.set(boundary, expectedAttempt);
+      boundaryRetryAllowed.set(boundary, false);
+      starts.set(record.attemptId, {
+        entry: entry as SessionContextCompactionStartedRecord,
+        terminal: false,
+      });
+      continue;
+    }
+    if (
+      record.type !== "context_compaction_committed" &&
+      record.type !== "context_compaction_failed" &&
+      record.type !== "context_compaction_interrupted"
+    ) {
+      continue;
+    }
+    const started = starts.get(record.attemptId);
+    if (
+      started === undefined ||
+      started.terminal ||
+      !sameContextAttempt(started.entry.record, record)
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    started.terminal = true;
+    if (record.type !== "context_compaction_committed") {
+      const boundary = `${record.runId}:${record.windowNumber}:${record.sourceThrough}:${started.entry.record.sourceDigest}`;
+      boundaryRetryAllowed.set(
+        boundary,
+        (record.type === "context_compaction_failed" &&
+          record.reason === "replacement_too_large") ||
+          (record.type === "context_compaction_interrupted" && record.reason === "process_restart"),
+      );
+      continue;
+    }
+    const boundary = `${record.runId}:${record.windowNumber}:${record.sourceThrough}:${started.entry.record.sourceDigest}`;
+    if (
+      committedBoundaries.has(boundary) ||
+      checkpointIds.has(record.checkpointId) ||
+      record.retainedFrom < 1 ||
+      record.retainedFrom > record.sourceThrough + 1 ||
+      record.previousCheckpointSequence !== latestCheckpointSequence ||
+      record.sourceDigest !== started.entry.record.sourceDigest ||
+      !sameTargetIdentity(record.targetIdentity, genesis.record.targetIdentity) ||
+      JSON.stringify(record.contextProfile) !== JSON.stringify(started.entry.record.contextProfile)
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const retainedRecords = records.filter(
+      (candidate) =>
+        candidate.sequence >= record.retainedFrom && candidate.sequence <= record.sourceThrough,
+    );
+    const replacement = [
+      createContextProjectionMessage(record.summary, record.evidence),
+      ...modelMessagesFromCanonicalRecords(retainedRecords),
+    ];
+    if (
+      !isContextEvidenceValid(record.evidence, records, record.runId, record.sourceThrough) ||
+      digestContextMessages(replacement) !== record.replacementDigest
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    committedBoundaries.add(boundary);
+    checkpointIds.add(record.checkpointId);
+    latestCheckpointSequence = entry.sequence;
+    latestWindowNumber = record.windowNumber;
+  }
+  const dangling = [...starts.values()].filter((start) => !start.terminal);
+  if (
+    dangling.length > 1 ||
+    (dangling.length === 1 && dangling[0]?.entry.sequence !== records.at(-1)?.sequence)
+  ) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+}
+
+function isContextEvidenceValid(
+  evidence: SessionContextCompactionCommittedRecord["record"]["evidence"],
+  records: readonly Extract<SessionRecord, { readonly schemaVersion: 3 }>[],
+  runId: string,
+  sourceThrough: number,
+): boolean {
+  const localEvidence: ContextEvidenceV1 = {
+    schemaVersion: 1,
+    modifiedFiles: evidence.modifiedFiles.filter((entry) => entry.sessionId === undefined),
+    permissions: evidence.permissions.filter((entry) => entry.sessionId === undefined),
+    toolResults: evidence.toolResults.filter((entry) => entry.sessionId === undefined),
+    failures: evidence.failures.filter((entry) => entry.sessionId === undefined),
+  };
+  return (
+    JSON.stringify(localEvidence) ===
+    JSON.stringify(reduceContextEvidence(records, runId, sourceThrough))
+  );
+}
+
+function sameContextAttempt(
+  started: SessionContextCompactionStartedRecord["record"],
+  terminal:
+    | SessionContextCompactionCommittedRecord["record"]
+    | SessionContextCompactionFailedRecord["record"]
+    | SessionContextCompactionInterruptedRecord["record"],
+): boolean {
+  return (
+    terminal.runId === started.runId &&
+    terminal.attemptId === started.attemptId &&
+    terminal.attemptNumber === started.attemptNumber &&
+    terminal.windowNumber === started.windowNumber &&
+    terminal.trigger === started.trigger &&
+    terminal.sourceThrough === started.sourceThrough
+  );
+}
+
+function isContextProfileValid(profile: ContextProfile): boolean {
+  return (
+    Number.isSafeInteger(profile.version) &&
+    profile.version > 0 &&
+    Number.isSafeInteger(profile.contextWindowTokens) &&
+    Number.isSafeInteger(profile.maximumOutputTokens) &&
+    Number.isSafeInteger(profile.compactAtTokens) &&
+    Number.isSafeInteger(profile.postCompactTargetTokens) &&
+    Number.isSafeInteger(profile.retainedTargetTokens) &&
+    profile.maximumOutputTokens > 0 &&
+    profile.postCompactTargetTokens > 0 &&
+    profile.retainedTargetTokens >= 0 &&
+    profile.retainedTargetTokens <= profile.postCompactTargetTokens &&
+    profile.postCompactTargetTokens < profile.compactAtTokens &&
+    profile.compactAtTokens < profile.contextWindowTokens &&
+    profile.maximumOutputTokens < profile.contextWindowTokens &&
+    profile.estimatorVersion === 1
+  );
 }
 
 function isMatchingStartedAttempt(
@@ -937,12 +1267,46 @@ async function validateSessionLineage(
   if (visited.has(lineage.parentSessionId)) {
     throw new SessionLifecycleError("session_invalid");
   }
-  const { parentGenesis } = await readValidatedLineagePrefix(options, genesis);
+  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  await validateInheritedContextEvidence(options, parentGenesis, prefixRecords);
   await validateSessionLineage(
     options,
     parentGenesis,
     new Set([...visited, lineage.parentSessionId]),
   );
+}
+
+async function validateInheritedContextEvidence(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<void> {
+  const expected = await createBranchEvidence(options, records);
+  for (const entry of records) {
+    if (entry.schemaVersion !== 3 || entry.record.type !== "context_compaction_committed") {
+      continue;
+    }
+    const actual = inheritedContextEvidence(entry.record.evidence);
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+  }
+  if (genesis.record.lineage === undefined && hasContextEvidence(expected)) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+}
+
+async function contextSnapshotFromLineage(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<SessionContextSnapshot | undefined> {
+  const ownContext = contextSnapshotFromRecords(records);
+  if (ownContext !== undefined || genesis.record.lineage === undefined) {
+    return ownContext;
+  }
+  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  return contextSnapshotFromLineage(options, parentGenesis, prefixRecords);
 }
 
 async function createBranchMessages(
@@ -958,10 +1322,75 @@ async function createBranchMessages(
     return [];
   }
   const { prefixRecords: parentRecords } = await readValidatedLineagePrefix(options, genesis);
-  return [
-    ...(await createBranchMessages(options, parentRecords)),
-    ...modelMessagesFromCompleteRecords(parentRecords),
-  ];
+  const projected = modelMessagesFromCompleteRecords(parentRecords);
+  if (
+    parentRecords.some(
+      (record) =>
+        record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+    )
+  ) {
+    return projected;
+  }
+  return [...(await createBranchMessages(options, parentRecords)), ...projected];
+}
+
+async function createBranchEvidence(
+  options: SessionLifecycleOptions,
+  records: readonly SessionRecord[],
+): Promise<ContextEvidenceV1> {
+  const genesis = records[0];
+  if (genesis === undefined || !isGenesisRecord(genesis)) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  if (genesis.record.lineage === undefined) {
+    return emptyContextEvidence();
+  }
+  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  const inherited = await createBranchEvidence(options, prefixRecords);
+  const run = prefixRecords.findLast(
+    (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
+  );
+  if (run?.schemaVersion !== 3 || run.record.type !== "logical_run_started") {
+    return inherited;
+  }
+  return mergeContextEvidence(
+    inherited,
+    reduceContextEvidence(
+      prefixRecords,
+      run.record.runId,
+      prefixRecords.at(-1)?.sequence ?? 1,
+      parentGenesis.record.sessionId,
+    ),
+  );
+}
+
+function inheritedContextEvidence(evidence: ContextEvidenceV1): ContextEvidenceV1 {
+  return {
+    schemaVersion: 1,
+    modifiedFiles: evidence.modifiedFiles.filter((entry) => entry.sessionId !== undefined),
+    permissions: evidence.permissions.filter((entry) => entry.sessionId !== undefined),
+    toolResults: evidence.toolResults.filter((entry) => entry.sessionId !== undefined),
+    failures: evidence.failures.filter((entry) => entry.sessionId !== undefined),
+  };
+}
+
+function emptyContextEvidence(): ContextEvidenceV1 {
+  return {
+    schemaVersion: 1,
+    modifiedFiles: [],
+    permissions: [],
+    toolResults: [],
+    failures: [],
+  };
+}
+
+function hasContextEvidence(evidence: ContextEvidenceV1): boolean {
+  return (
+    evidence.modifiedFiles.length > 0 ||
+    evidence.permissions.length > 0 ||
+    evidence.toolResults.length > 0 ||
+    evidence.failures.length > 0
+  );
 }
 
 async function modelResponseTargetsFromBranchContext(
@@ -1031,6 +1460,34 @@ function modelMessagesFromCompleteRecords(records: readonly SessionRecord[]): Mo
   if (currentRecords.length !== records.length) {
     throw new SessionLifecycleError("session_invalid");
   }
+  const checkpoint = currentRecords.findLast(
+    (record) => record.record.type === "context_compaction_committed",
+  );
+  if (checkpoint?.record.type === "context_compaction_committed") {
+    const checkpointRecord = checkpoint.record;
+    const retainedRecords = currentRecords.filter(
+      (record) =>
+        record.sequence >= checkpointRecord.retainedFrom &&
+        record.sequence <= checkpointRecord.sourceThrough,
+    );
+    const replacement = [
+      createContextProjectionMessage(checkpointRecord.summary, checkpointRecord.evidence),
+      ...modelMessagesFromCanonicalRecords(retainedRecords),
+    ];
+    if (digestContextMessages(replacement) !== checkpointRecord.replacementDigest) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const laterRecords = currentRecords.filter(
+      (record) => record.sequence > (checkpoint?.sequence ?? Number.MAX_SAFE_INTEGER),
+    );
+    return [...replacement, ...modelMessagesFromCanonicalRecords(laterRecords)];
+  }
+  return modelMessagesFromCanonicalRecords(currentRecords);
+}
+
+function modelMessagesFromCanonicalRecords(
+  currentRecords: readonly Extract<SessionRecord, { readonly schemaVersion: 3 }>[],
+): ModelMessage[] {
   const messages: ModelMessage[] = [];
   for (const record of currentRecords) {
     if (record.record.type === "logical_run_started") {
@@ -1164,6 +1621,212 @@ function snapshotFromGenesis(
   };
 }
 
+function contextSnapshotFromRecords(
+  records: readonly SessionRecord[],
+): SessionContextSnapshot | undefined {
+  const currentRecords = records.filter((record) => record.schemaVersion === 3);
+  const checkpoint = currentRecords.findLast(
+    (record) => record.record.type === "context_compaction_committed",
+  );
+  const started = currentRecords.findLast(
+    (record) => record.record.type === "context_compaction_started",
+  );
+  const checkpointRecord =
+    checkpoint?.record.type === "context_compaction_committed" ? checkpoint.record : undefined;
+  const startedRecord =
+    started?.record.type === "context_compaction_started" ? started.record : undefined;
+  if (checkpointRecord === undefined && startedRecord === undefined) {
+    return undefined;
+  }
+  const compactionUsage: ContextUsageTotals = currentRecords.reduce<ContextUsageTotals>(
+    (totals, entry) => {
+      if (
+        entry.record.type !== "context_compaction_committed" &&
+        entry.record.type !== "context_compaction_failed" &&
+        entry.record.type !== "context_compaction_interrupted"
+      ) {
+        return totals;
+      }
+      const usage = entry.record.usage;
+      if (usage === undefined) {
+        return incrementUnknownContextUsage(totals);
+      }
+      if ("status" in usage) {
+        return incrementUnknownContextUsage(totals);
+      }
+      return {
+        inputTokens: totals.inputTokens + usage.inputTokens,
+        outputTokens: totals.outputTokens + usage.outputTokens,
+        reasoningTokens: totals.reasoningTokens + (usage.reasoningTokens ?? 0),
+        cachedInputTokens: totals.cachedInputTokens + (usage.cachedInputTokens ?? 0),
+        cacheMissInputTokens: totals.cacheMissInputTokens + (usage.cacheMissInputTokens ?? 0),
+        unknownCalls: totals.unknownCalls,
+      };
+    },
+    {
+      inputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      cachedInputTokens: 0,
+      cacheMissInputTokens: 0,
+      unknownCalls: 0,
+    },
+  );
+  const ordinaryUsage = ordinaryContextUsageFromRecords(currentRecords);
+  const lastTerminal =
+    startedRecord === undefined
+      ? undefined
+      : currentRecords.findLast(
+          (record) =>
+            record.sequence > (started?.sequence ?? 0) &&
+            (record.record.type === "context_compaction_committed" ||
+              record.record.type === "context_compaction_failed" ||
+              record.record.type === "context_compaction_interrupted") &&
+            record.record.attemptId === startedRecord.attemptId,
+        );
+  const terminalRecord =
+    lastTerminal?.record.type === "context_compaction_committed" ||
+    lastTerminal?.record.type === "context_compaction_failed" ||
+    lastTerminal?.record.type === "context_compaction_interrupted"
+      ? lastTerminal.record
+      : undefined;
+  const lastAttemptUsage =
+    terminalRecord?.usage === undefined ? ({ status: "unknown" } as const) : terminalRecord.usage;
+  const lastAttemptStatus =
+    terminalRecord?.type === "context_compaction_committed"
+      ? ("committed" as const)
+      : terminalRecord?.type === "context_compaction_failed"
+        ? ("failed" as const)
+        : terminalRecord?.type === "context_compaction_interrupted"
+          ? ("interrupted" as const)
+          : ("started" as const);
+  const latestResponse = currentRecords.findLast(
+    (record) =>
+      record.sequence > (checkpoint?.sequence ?? Number.MAX_SAFE_INTEGER) &&
+      record.record.type === "model_response_completed",
+  );
+  const active =
+    latestResponse?.record.type === "model_response_completed" &&
+    latestResponse.record.response.usage !== undefined
+      ? {
+          source: "provider_reported" as const,
+          tokens: latestResponse.record.response.usage.inputTokens,
+        }
+      : checkpointRecord !== undefined
+        ? {
+            source: "estimated" as const,
+            tokens: estimateActiveContextTokens(
+              [
+                createContextProjectionMessage(checkpointRecord.summary, checkpointRecord.evidence),
+                ...modelMessagesFromCanonicalRecords(
+                  currentRecords.filter(
+                    (record) =>
+                      record.sequence >= checkpointRecord.retainedFrom &&
+                      record.sequence <= checkpointRecord.sourceThrough,
+                  ),
+                ),
+              ],
+              checkpointRecord.contextProfile,
+            ),
+          }
+        : { source: "unknown" as const };
+  return {
+    profile:
+      startedRecord?.contextProfile ??
+      (checkpointRecord as NonNullable<typeof checkpointRecord>).contextProfile,
+    ...(checkpointRecord === undefined || checkpoint === undefined
+      ? {}
+      : {
+          checkpoint: {
+            checkpointId: checkpointRecord.checkpointId,
+            sequence: checkpoint.sequence,
+            windowNumber: checkpointRecord.windowNumber,
+            status: "committed" as const,
+            sourceThrough: checkpointRecord.sourceThrough,
+            retainedFrom: checkpointRecord.retainedFrom,
+          },
+        }),
+    lastAttempt: {
+      attemptId:
+        startedRecord?.attemptId ??
+        (checkpointRecord as NonNullable<typeof checkpointRecord>).attemptId,
+      attemptNumber:
+        startedRecord?.attemptNumber ??
+        (checkpointRecord as NonNullable<typeof checkpointRecord>).attemptNumber,
+      windowNumber:
+        startedRecord?.windowNumber ??
+        (checkpointRecord as NonNullable<typeof checkpointRecord>).windowNumber,
+      status: lastAttemptStatus,
+      ...(terminalRecord?.type === "context_compaction_failed" ||
+      terminalRecord?.type === "context_compaction_interrupted"
+        ? { reason: terminalRecord.reason }
+        : {}),
+      usage: lastAttemptUsage,
+    },
+    ordinaryUsage,
+    compactionUsage,
+    active,
+  };
+}
+
+function incrementUnknownContextUsage(totals: ContextUsageTotals): ContextUsageTotals {
+  return {
+    inputTokens: totals.inputTokens,
+    outputTokens: totals.outputTokens,
+    reasoningTokens: totals.reasoningTokens,
+    cachedInputTokens: totals.cachedInputTokens,
+    cacheMissInputTokens: totals.cacheMissInputTokens,
+    unknownCalls: totals.unknownCalls + 1,
+  };
+}
+
+function ordinaryContextUsageFromRecords(
+  records: readonly Extract<SessionRecord, { readonly schemaVersion: 3 }>[],
+): ContextUsageTotals {
+  let totals: ContextUsageTotals = {
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    cachedInputTokens: 0,
+    cacheMissInputTokens: 0,
+    unknownCalls: 0,
+  };
+  let attemptStarted = false;
+  let usageSeen = false;
+  for (const entry of records) {
+    const record = entry.record;
+    if (record.type === "provider_attempt_started") {
+      attemptStarted = true;
+      usageSeen = false;
+      continue;
+    }
+    if (record.type === "runtime_event" && record.event.type === "model_usage" && attemptStarted) {
+      usageSeen = true;
+      totals = {
+        inputTokens: totals.inputTokens + record.event.inputTokens,
+        outputTokens: totals.outputTokens + record.event.outputTokens,
+        reasoningTokens: totals.reasoningTokens + (record.event.reasoningTokens ?? 0),
+        cachedInputTokens: totals.cachedInputTokens + (record.event.cachedInputTokens ?? 0),
+        cacheMissInputTokens:
+          totals.cacheMissInputTokens + (record.event.cacheMissInputTokens ?? 0),
+        unknownCalls: totals.unknownCalls,
+      };
+      continue;
+    }
+    if (
+      attemptStarted &&
+      (record.type === "model_response_completed" || record.type === "provider_attempt_interrupted")
+    ) {
+      if (!usageSeen) {
+        totals = incrementUnknownContextUsage(totals);
+      }
+      attemptStarted = false;
+      usageSeen = false;
+    }
+  }
+  return totals;
+}
+
 function snapshotFromRecords(
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
@@ -1172,11 +1835,15 @@ function snapshotFromRecords(
     throw new SessionLifecycleError("session_invalid");
   }
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
+  const context = contextSnapshotFromRecords(records);
   const latestRun = currentRecords.findLast(
     (record) => record.record.type === "logical_run_started",
   );
   if (latestRun === undefined || latestRun.record.type !== "logical_run_started") {
-    return snapshotFromGenesis(genesis, records.length);
+    return {
+      ...snapshotFromGenesis(genesis, records.length),
+      ...(context === undefined ? {} : { context }),
+    };
   }
   const runId = latestRun.record.runId;
   const lastResponse = currentRecords.findLast(
@@ -1206,6 +1873,7 @@ function snapshotFromRecords(
       : undefined;
   return {
     ...snapshotFromGenesis(genesis, records.length),
+    ...(context === undefined ? {} : { context }),
     status: result === undefined ? "interrupted" : "settled",
     run: {
       runId,
@@ -1265,6 +1933,58 @@ async function appendDanglingAttemptInterruption(
       turn: attempt.record.turn,
       attempt: attempt.record.attempt,
       reason: "process_restart",
+    },
+  });
+  return true;
+}
+
+async function appendDanglingContextCompactionInterruption(
+  options: SessionLifecycleOptions,
+  snapshot: CurrentSessionSnapshot,
+): Promise<boolean> {
+  const records = await readJsonlSessionRecords({
+    workspaceRoot: options.workspaceRoot,
+    sessionId: snapshot.sessionId,
+    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+  });
+  const started = records.findLast(
+    (record) => record.schemaVersion === 3 && record.record.type === "context_compaction_started",
+  );
+  if (started?.schemaVersion !== 3 || started.record.type !== "context_compaction_started") {
+    return false;
+  }
+  const startedRecord = started.record;
+  const hasTerminal = records.some(
+    (record) =>
+      record.sequence > started.sequence &&
+      record.schemaVersion === 3 &&
+      (record.record.type === "context_compaction_committed" ||
+        record.record.type === "context_compaction_failed" ||
+        record.record.type === "context_compaction_interrupted") &&
+      record.record.attemptId === startedRecord.attemptId,
+  );
+  if (hasTerminal) {
+    return false;
+  }
+  const store = await openJsonlSessionStore<SessionRecord>({
+    workspaceRoot: options.workspaceRoot,
+    sessionId: snapshot.sessionId,
+    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+  });
+  await store.append({
+    schemaVersion: 3,
+    sequence: records.length + 1,
+    record: {
+      type: "context_compaction_interrupted",
+      recordVersion: 1,
+      runId: startedRecord.runId,
+      attemptId: startedRecord.attemptId,
+      attemptNumber: startedRecord.attemptNumber,
+      windowNumber: startedRecord.windowNumber,
+      trigger: startedRecord.trigger,
+      sourceThrough: startedRecord.sourceThrough,
+      reason: "process_restart",
+      usage: { status: "unknown" },
     },
   });
   return true;
@@ -1838,9 +2558,19 @@ function createAgentResumeState(
         : lastAttemptRecord === undefined
           ? 1
           : 0;
-  const messages: NonNullable<AgentSessionDurableContext["resume"]>["messages"][number][] = [
-    { role: "user", content: run.record.userMessage },
-  ];
+  const contextCheckpoint = currentRecords.findLast(
+    (record) => record.record.type === "context_compaction_committed",
+  );
+  const contextCheckpointRecord =
+    contextCheckpoint?.record.type === "context_compaction_committed"
+      ? contextCheckpoint.record
+      : undefined;
+  const messages: NonNullable<AgentSessionDurableContext["resume"]>["messages"][number][] =
+    contextCheckpointRecord !== undefined
+      ? modelMessagesFromCompleteRecords(
+          currentRecords.filter((record) => record.sequence <= (contextCheckpoint?.sequence ?? 0)),
+        )
+      : [{ role: "user", content: run.record.userMessage }];
   const toolResults: Array<
     NonNullable<AgentSessionDurableContext["resume"]>["toolResults"][number]
   > = [];
@@ -1852,7 +2582,9 @@ function createAgentResumeState(
     if (
       responseRecord.record.type !== "model_response_completed" ||
       responseRecord.record.runId !== runId ||
-      responseRecord.record.turn >= boundaryTurn
+      responseRecord.record.turn >= boundaryTurn ||
+      (contextCheckpointRecord !== undefined &&
+        responseRecord.sequence <= contextCheckpointRecord.sourceThrough)
     ) {
       continue;
     }
@@ -1960,6 +2692,14 @@ function createAgentResumeState(
           ? interruptedAttempt.record.attempt + 1
           : 1,
       reportedTokens,
+      compactionUsageUnknown: currentRecords.some(
+        (record) =>
+          (record.record.type === "context_compaction_committed" ||
+            record.record.type === "context_compaction_failed" ||
+            record.record.type === "context_compaction_interrupted") &&
+          record.record.runId === runId &&
+          (record.record.usage === undefined || "status" in record.record.usage),
+      ),
       toolResults,
       pendingToolCalls,
     },
@@ -1983,10 +2723,24 @@ function reportedTokensForRun(
         : sum,
     0,
   );
-  if (!Number.isSafeInteger(total) || total < 0) {
+  const compactionTotal = records.reduce((sum, record) => {
+    if (
+      record.record.type !== "context_compaction_committed" &&
+      record.record.type !== "context_compaction_failed" &&
+      record.record.type !== "context_compaction_interrupted"
+    ) {
+      return sum;
+    }
+    const usage = record.record.usage;
+    return usage === undefined || "status" in usage
+      ? sum
+      : sum + usage.inputTokens + usage.outputTokens;
+  }, 0);
+  const combined = total + compactionTotal;
+  if (!Number.isSafeInteger(combined) || combined < 0) {
     throw new SessionLifecycleError("session_invalid");
   }
-  return total;
+  return combined;
 }
 
 async function canonicalProjectId(workspaceRoot: string): Promise<string> {

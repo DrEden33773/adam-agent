@@ -1,0 +1,2458 @@
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  AgentSession,
+  createCodingToolRegistry,
+  createFileArtifactStore,
+  createInMemorySessionStore,
+  createPermissionPolicy,
+  createReadToolRegistry,
+  createSessionLifecycle,
+  type ModelDriver,
+  ModelDriverError,
+  type ModelRequest,
+  type ModelTargets,
+  type RuntimeEvent,
+  type SessionStore,
+} from "@adam-agent/agent";
+import {
+  type ContextProfile,
+  digestContextRecordPrefix,
+  openJsonlSessionStore,
+  type SessionContextCompactionCommittedRecord,
+  type SessionContextCompactionFailedRecord,
+  type SessionContextCompactionInterruptedRecord,
+  type SessionRecord,
+  sessionContextProfile,
+  sessionDurableContext,
+} from "@adam-agent/agent/internal-testing";
+import { expect, test } from "vitest";
+
+const targetIdentity = {
+  targetId: "fake.local",
+  vendor: "adam",
+  modelId: "fake",
+  route: "direct",
+  profileVersion: 1,
+  certification: "certified",
+} as const;
+
+const contextProfile: ContextProfile = {
+  version: 1,
+  contextWindowTokens: 20_000,
+  maximumOutputTokens: 100,
+  compactAtTokens: 500,
+  postCompactTargetTokens: 400,
+  retainedTargetTokens: 100,
+  estimatorVersion: 1,
+};
+
+test("AgentSession durably compacts before the next ordinary provider call", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-compaction-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, "context.txt"),
+    "durable context detail ".repeat(160),
+    "utf8",
+  );
+
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "10000000-0000-4000-8000-000000000001",
+      projectId: `sha256:${"0".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+
+  const requests: Array<{
+    readonly messages: ModelRequest["messages"];
+    readonly tools: ModelRequest["tools"];
+    readonly records: readonly SessionRecord[];
+  }> = [];
+  let ordinaryCall = 0;
+  const summary = JSON.stringify({
+    schemaVersion: 1,
+    objective: "Use the repository context and finish the requested task.",
+    constraints: ["Keep durable history authoritative."],
+    progress: ["The context file was read."],
+    unresolvedQuestions: [],
+    failures: [],
+    remainingVerification: ["Return the final answer."],
+    nextSafeAction: "Continue with the compacted context.",
+  });
+  const model: ModelDriver = {
+    async *stream(request) {
+      requests.push({
+        messages: request.messages,
+        tools: request.tools,
+        records: await store.read(),
+      });
+      if (request.tools.length === 0) {
+        yield { type: "text_delta", text: summary };
+        yield { type: "usage", inputTokens: 560, outputTokens: 40 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall === 1) {
+        yield { type: "usage", inputTokens: 20, outputTokens: 8 };
+        yield { type: "tool_call_start", id: "read-context", name: "read_file" };
+        yield {
+          type: "tool_call_delta",
+          id: "read-context",
+          json: '{"path":"context.txt"}',
+        };
+        yield { type: "tool_call_end", id: "read-context" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      expect(
+        request.messages.some(
+          (message) => message.role === "developer" && message.content.includes("<context-summary"),
+        ),
+      ).toBe(true);
+      yield { type: "text_delta", text: "Compaction preserved the task." };
+      yield { type: "usage", inputTokens: 90, outputTokens: 12 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: {
+      nextSequence: 2,
+      targetIdentity,
+    },
+    [sessionContextProfile]: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+  const events: RuntimeEvent[] = [];
+  session.subscribe((event) => events.push(event));
+
+  try {
+    const result = await session.run(
+      { text: "Read context.txt and finish the task." },
+      { limits: { maxTurns: 2 } },
+    );
+    expect({ result, records: await store.read() }).toMatchObject({
+      result: {
+        status: "completed",
+        answer: "Compaction preserved the task.",
+      },
+    });
+
+    expect(requests).toHaveLength(3);
+    expect(requests[1]?.tools).toEqual([]);
+    expect(requests[1]?.records.at(-1)).toMatchObject({
+      record: { type: "context_compaction_started", attemptNumber: 1 },
+    });
+    const secondOrdinaryRecords = requests[2]?.records ?? [];
+    const committedIndex = secondOrdinaryRecords.findIndex(
+      (record) =>
+        record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+    );
+    const nextProviderIndex = secondOrdinaryRecords.findIndex(
+      (record, index) =>
+        index > committedIndex &&
+        record.schemaVersion === 3 &&
+        record.record.type === "provider_attempt_started",
+    );
+    expect({ committedIndex, nextProviderIndex }).toEqual({
+      committedIndex: expect.any(Number),
+      nextProviderIndex: expect.any(Number),
+    });
+    expect(committedIndex).toBeGreaterThanOrEqual(0);
+    expect(nextProviderIndex).toBeGreaterThan(committedIndex);
+    expect(events.filter((event) => event.type.startsWith("context_compaction_"))).toEqual([
+      expect.objectContaining({ type: "context_compaction_started", attemptNumber: 1 }),
+      expect.objectContaining({ type: "context_compaction_committed", windowNumber: 1 }),
+    ]);
+    expect(events.filter((event) => event.type === "context_usage")).toEqual([
+      {
+        type: "context_usage",
+        ordinary: {
+          inputTokens: 20,
+          outputTokens: 8,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheMissInputTokens: 0,
+          unknownCalls: 0,
+        },
+        compaction: {
+          inputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheMissInputTokens: 0,
+          unknownCalls: 0,
+        },
+        active: expect.objectContaining({ source: "provider_reported", tokens: 20 }),
+      },
+      {
+        type: "context_usage",
+        ordinary: {
+          inputTokens: 20,
+          outputTokens: 8,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheMissInputTokens: 0,
+          unknownCalls: 0,
+        },
+        compaction: {
+          inputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheMissInputTokens: 0,
+          unknownCalls: 0,
+        },
+        active: expect.objectContaining({ source: "estimated", tokens: expect.any(Number) }),
+      },
+      {
+        type: "context_usage",
+        ordinary: {
+          inputTokens: 20,
+          outputTokens: 8,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheMissInputTokens: 0,
+          unknownCalls: 0,
+        },
+        compaction: {
+          inputTokens: 560,
+          outputTokens: 40,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheMissInputTokens: 0,
+          unknownCalls: 0,
+        },
+        active: expect.objectContaining({ source: "estimated", tokens: expect.any(Number) }),
+      },
+      {
+        type: "context_usage",
+        ordinary: {
+          inputTokens: 110,
+          outputTokens: 20,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheMissInputTokens: 0,
+          unknownCalls: 0,
+        },
+        compaction: {
+          inputTokens: 560,
+          outputTokens: 40,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheMissInputTokens: 0,
+          unknownCalls: 0,
+        },
+        active: expect.objectContaining({ source: "provider_reported", tokens: 90 }),
+      },
+    ]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession fails before the model when protected compaction input cannot fit", async () => {
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "11000000-0000-4000-8000-000000000011",
+      projectId: `sha256:${"e".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const tinyProfile: ContextProfile = {
+    version: 1,
+    contextWindowTokens: 200,
+    maximumOutputTokens: 50,
+    compactAtTokens: 120,
+    postCompactTargetTokens: 80,
+    retainedTargetTokens: 0,
+    estimatorVersion: 1,
+  };
+  let modelCalls = 0;
+  const model: ModelDriver = {
+    async *stream() {
+      modelCalls += 1;
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: tinyProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  await expect(
+    session.run({ text: `Preserve this required constraint: ${"x".repeat(4_000)}` }),
+  ).resolves.toEqual({
+    status: "failed",
+    error: {
+      code: "context_compaction_input_unrecoverable",
+      message: "The protected context cannot fit in one compaction request.",
+    },
+  });
+  expect(modelCalls).toBe(0);
+  expect(
+    (await store.read()).filter(
+      (record) => record.schemaVersion === 3 && record.record.type === "context_compaction_failed",
+    ),
+  ).toMatchObject([{ record: { attemptNumber: 1, reason: "input_unrecoverable" } }]);
+});
+
+test("SessionLifecycle keeps a pre-provider compaction failure inspectable", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-pre-provider-failure-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const tinyProfile: ContextProfile = {
+    version: 1,
+    contextWindowTokens: 500,
+    maximumOutputTokens: 100,
+    compactAtTokens: 100,
+    postCompactTargetTokens: 80,
+    retainedTargetTokens: 0,
+    estimatorVersion: 1,
+  };
+  let modelCalls = 0;
+  const model: ModelDriver = {
+    async *stream() {
+      modelCalls += 1;
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile: tinyProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile: tinyProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: `Preserve this required constraint: ${"x".repeat(4_000)}` },
+    });
+    expect(continued).toMatchObject({
+      result: { status: "failed", error: { code: "context_compaction_input_unrecoverable" } },
+      snapshot: {
+        status: "settled",
+        context: { lastAttempt: { status: "failed", reason: "input_unrecoverable" } },
+      },
+    });
+    await expect(
+      createSessionLifecycle({ stateRoot, workspaceRoot }).inspect({
+        sessionId: created.sessionId,
+      }),
+    ).resolves.toEqual(continued.snapshot);
+    expect(modelCalls).toBe(0);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession continues without a token limit while compaction usage stays unknown", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-unknown-usage-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "12000000-0000-4000-8000-000000000012",
+      projectId: `sha256:${"f".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  let compactionCall = 0;
+  let ordinaryCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCall += 1;
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Continue with unknown compaction usage.",
+            constraints: [],
+            progress: [],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: [],
+            nextSafeAction: "Make the ordinary call.",
+          }),
+        };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      yield { type: "text_delta", text: "Unknown usage remained explicit." };
+      yield { type: "usage", inputTokens: 80, outputTokens: 10 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+  const events: RuntimeEvent[] = [];
+  session.subscribe((event) => events.push(event));
+
+  try {
+    await expect(
+      session.run({ text: `Preserve this long request. ${"context ".repeat(400)}` }),
+    ).resolves.toEqual({
+      status: "completed",
+      answer: "Unknown usage remained explicit.",
+    });
+    expect({ compactionCall, ordinaryCall }).toEqual({ compactionCall: 1, ordinaryCall: 1 });
+    expect(events.filter((event) => event.type === "context_usage")).toContainEqual(
+      expect.objectContaining({
+        compaction: expect.objectContaining({ unknownCalls: 1 }),
+        active: {
+          source: "estimated",
+          tokens: expect.any(Number),
+          throughSequence: expect.any(Number),
+        },
+      }),
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession fails closed before resumed work when prior compaction usage is unknown under maxTokens", async () => {
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "13000000-0000-4000-8000-000000000013",
+      projectId: `sha256:${"e".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  let modelCalls = 0;
+  const model: ModelDriver = {
+    async *stream() {
+      modelCalls += 1;
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    [sessionDurableContext]: {
+      nextSequence: 2,
+      targetIdentity,
+      resume: {
+        runId: "14000000-0000-4000-8000-000000000014",
+        messages: [{ role: "user", content: "Resume only with trustworthy accounting." }],
+        nextTurn: 1,
+        nextAttempt: 2,
+        reportedTokens: 0,
+        compactionUsageUnknown: true,
+        toolResults: [],
+        pendingToolCalls: [],
+      },
+    },
+    [sessionContextProfile]: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  await expect(
+    session.run(
+      { text: "Resume only with trustworthy accounting." },
+      { limits: { maxTokens: 1_000 } },
+    ),
+  ).resolves.toEqual({
+    status: "failed",
+    error: {
+      code: "token_usage_missing",
+      message: "The provider did not report token usage for an active token limit.",
+    },
+  });
+  expect(modelCalls).toBe(0);
+});
+
+test("AgentSession never uses a compacted projection when checkpoint persistence fails", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-persistence-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "context.txt"), "large result ".repeat(240), "utf8");
+
+  const durableStore = createInMemorySessionStore<SessionRecord>();
+  await durableStore.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "20000000-0000-4000-8000-000000000002",
+      projectId: `sha256:${"1".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const failingStore: SessionStore<SessionRecord> = {
+    async append(record) {
+      if (record.schemaVersion === 3 && record.record.type === "context_compaction_committed") {
+        throw new Error("checkpoint append failed");
+      }
+      await durableStore.append(record);
+    },
+    read: () => durableStore.read(),
+  };
+  const requests: ModelRequest[] = [];
+  let ordinaryCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      requests.push(request);
+      if (request.tools.length === 0) {
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Preserve the task.",
+            constraints: [],
+            progress: ["Read the context file."],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: [],
+            nextSafeAction: "Continue.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 520, outputTokens: 20 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall > 1) {
+        throw new Error("An ordinary call must not run after the checkpoint append failure.");
+      }
+      yield { type: "usage", inputTokens: 20, outputTokens: 8 };
+      yield { type: "tool_call_start", id: "read-before-failure", name: "read_file" };
+      yield {
+        type: "tool_call_delta",
+        id: "read-before-failure",
+        json: '{"path":"context.txt"}',
+      };
+      yield { type: "tool_call_end", id: "read-before-failure" };
+      yield { type: "finish", reason: "tool_calls" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: failingStore as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+  const events: RuntimeEvent[] = [];
+  session.subscribe((event) => events.push(event));
+
+  try {
+    await expect(session.run({ text: "Read context.txt before compaction." })).resolves.toEqual({
+      status: "failed",
+      error: {
+        code: "session_persistence_failed",
+        message: "The session event could not be persisted.",
+      },
+    });
+    expect(requests).toHaveLength(2);
+    expect(events.filter((event) => event.type.startsWith("context_compaction_"))).toEqual([
+      expect.objectContaining({ type: "context_compaction_started" }),
+    ]);
+    expect(
+      (await durableStore.read()).some(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+      ),
+    ).toBe(false);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession charges compaction usage before another ordinary provider call", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-budget-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "context.txt"), "budgeted context ".repeat(220), "utf8");
+
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "30000000-0000-4000-8000-000000000003",
+      projectId: `sha256:${"2".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const requests: ModelRequest[] = [];
+  const model: ModelDriver = {
+    async *stream(request) {
+      requests.push(request);
+      if (request.tools.length === 0) {
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Respect the run budget.",
+            constraints: [],
+            progress: [],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: [],
+            nextSafeAction: "Stop before another ordinary call.",
+          }),
+        };
+        yield {
+          type: "usage",
+          inputTokens: 70,
+          outputTokens: 20,
+          reasoningTokens: 10,
+          cachedInputTokens: 25,
+          cacheMissInputTokens: 45,
+        };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      if (requests.filter((candidate) => candidate.tools.length > 0).length > 1) {
+        throw new Error("The token budget must stop before another ordinary call.");
+      }
+      yield {
+        type: "usage",
+        inputTokens: 20,
+        outputTokens: 8,
+        reasoningTokens: 3,
+        cachedInputTokens: 5,
+        cacheMissInputTokens: 15,
+      };
+      yield { type: "tool_call_start", id: "read-budget", name: "read_file" };
+      yield { type: "tool_call_delta", id: "read-budget", json: '{"path":"context.txt"}' };
+      yield { type: "tool_call_end", id: "read-budget" };
+      yield { type: "finish", reason: "tool_calls" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(
+      session.run(
+        { text: "Read context.txt without exceeding the token budget." },
+        { limits: { maxTokens: 100, maxTurns: 2 } },
+      ),
+    ).resolves.toEqual({
+      status: "failed",
+      error: {
+        code: "token_limit_exceeded",
+        message: "The run reached its provider-reported token limit.",
+      },
+    });
+    expect(requests).toHaveLength(2);
+    expect(
+      (await store.read()).find(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+      ),
+    ).toMatchObject({
+      record: {
+        usage: {
+          inputTokens: 70,
+          outputTokens: 20,
+          reasoningTokens: 10,
+          cachedInputTokens: 25,
+          cacheMissInputTokens: 45,
+        },
+      },
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession fits bulky tool output while preserving canonical write evidence", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-evidence-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, "context.txt"),
+    `${"bulky evidence line\n".repeat(500)}VERY_LATE_CONTEXT_TAIL`,
+    "utf8",
+  );
+
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "40000000-0000-4000-8000-000000000004",
+      projectId: `sha256:${"3".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  let ordinaryCall = 0;
+  let fittedSummaryInput = "";
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        const summaryInput = request.messages.at(-1);
+        fittedSummaryInput = summaryInput?.role === "user" ? summaryInput.content : "";
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Continue the coding task.",
+            constraints: [],
+            progress: ["Some repository work completed."],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: [],
+            nextSafeAction: "Inspect canonical evidence and continue.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 600, outputTokens: 30 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall === 1) {
+        yield { type: "usage", inputTokens: 30, outputTokens: 12 };
+        yield { type: "tool_call_start", id: "read-evidence", name: "read_file" };
+        yield {
+          type: "tool_call_delta",
+          id: "read-evidence",
+          json: '{"path":"context.txt"}',
+        };
+        yield { type: "tool_call_end", id: "read-evidence" };
+        yield { type: "tool_call_start", id: "write-evidence", name: "write_file" };
+        yield {
+          type: "tool_call_delta",
+          id: "write-evidence",
+          json: '{"path":"output.txt","content":"preserved output\\n"}',
+        };
+        yield { type: "tool_call_end", id: "write-evidence" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      const summaryMessage = request.messages.find(
+        (message) => message.role === "developer" && message.content.includes("<context-summary"),
+      );
+      expect(summaryMessage).toMatchObject({ role: "developer" });
+      if (summaryMessage?.role !== "developer") {
+        throw new Error("The compacted projection did not contain a summary message.");
+      }
+      expect(summaryMessage.content).toContain("<context-evidence");
+      expect(summaryMessage.content).toContain("output.txt");
+      expect(summaryMessage.content).toContain('"decision":"allow"');
+      expect(summaryMessage.content).toContain('"callId":"write-evidence"');
+      yield { type: "text_delta", text: "Canonical evidence survived compaction." };
+      yield { type: "usage", inputTokens: 120, outputTokens: 15 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createCodingToolRegistry({ workspaceRoot, stateRoot: join(testRoot, "state") }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(
+      session.run({ text: "Read context.txt, write output.txt, and continue safely." }),
+    ).resolves.toEqual({
+      status: "completed",
+      answer: "Canonical evidence survived compaction.",
+    });
+    expect(fittedSummaryInput).not.toContain("VERY_LATE_CONTEXT_TAIL");
+    expect(fittedSummaryInput).toContain('"truncated":true');
+    expect(fittedSummaryInput).toContain('"digest":"sha256:');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession reconsiders a complete retained tool turn during repeated compaction", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-repeat-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "first.txt"), "first retained fact ".repeat(20), "utf8");
+  await writeFile(join(workspaceRoot, "second.txt"), "second retained fact ".repeat(20), "utf8");
+
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "50000000-0000-4000-8000-000000000005",
+      projectId: `sha256:${"4".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const repeatedProfile: ContextProfile = {
+    ...contextProfile,
+    contextWindowTokens: 20_000,
+    maximumOutputTokens: 100,
+    compactAtTokens: 500,
+    postCompactTargetTokens: 450,
+    retainedTargetTokens: 300,
+  };
+  let ordinaryCall = 0;
+  let compactionCall = 0;
+  let secondCompactionInput = "";
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCall += 1;
+        const inputMessage = request.messages.at(-1);
+        if (compactionCall === 2 && inputMessage?.role === "user") {
+          secondCompactionInput = inputMessage.content;
+        }
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: `Repeated context window ${compactionCall}.`,
+            constraints: [],
+            progress: [`Compaction ${compactionCall} completed.`],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: [],
+            nextSafeAction: "Continue the repeated tool run.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 140, outputTokens: 20 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall <= 2) {
+        const suffix = ordinaryCall === 1 ? "first" : "second";
+        yield { type: "usage", inputTokens: 450, outputTokens: 10 };
+        yield { type: "tool_call_start", id: `read-${suffix}`, name: "read_file" };
+        yield {
+          type: "tool_call_delta",
+          id: `read-${suffix}`,
+          json: `{"path":"${suffix}.txt"}`,
+        };
+        yield { type: "tool_call_end", id: `read-${suffix}` };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      const toolMessages = request.messages.filter((message) => message.role === "tool");
+      expect(toolMessages.map((message) => message.callId)).toContain("read-second");
+      for (const toolMessage of toolMessages) {
+        const assistantIndex = request.messages.findIndex(
+          (message) =>
+            message.role === "assistant" &&
+            message.toolCalls.some((call) => call.id === toolMessage.callId),
+        );
+        expect(assistantIndex).toBeGreaterThanOrEqual(0);
+      }
+      yield { type: "text_delta", text: "Repeated compaction preserved complete turns." };
+      yield { type: "usage", inputTokens: 80, outputTokens: 10 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: repeatedProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(
+      session.run({
+        text: `Read both files across repeated compaction. ${"Preserve the older objective. ".repeat(60)}`,
+      }),
+    ).resolves.toEqual({
+      status: "completed",
+      answer: "Repeated compaction preserved complete turns.",
+    });
+    expect(compactionCall).toBe(2);
+    expect(secondCompactionInput).toContain("read-first");
+    const checkpoints = (await store.read()).filter(
+      (record) =>
+        record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+    ) as readonly SessionContextCompactionCommittedRecord[];
+    expect(checkpoints).toHaveLength(2);
+    expect(checkpoints.map((record) => record.record)).toMatchObject([
+      { type: "context_compaction_committed", windowNumber: 1 },
+      {
+        type: "context_compaction_committed",
+        windowNumber: 2,
+        previousCheckpointSequence: expect.any(Number),
+      },
+    ]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession preserves edit, shell-artifact, and failure evidence through compaction", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-tool-evidence-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "fruit.txt"), "apple\n", "utf8");
+
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "60000000-0000-4000-8000-000000000006",
+      projectId: `sha256:${"5".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const evidenceProfile: ContextProfile = {
+    ...contextProfile,
+    compactAtTokens: 600,
+    postCompactTargetTokens: 550,
+    retainedTargetTokens: 80,
+  };
+  let ordinaryCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Preserve completed and failed tool evidence.",
+            constraints: [],
+            progress: [],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: [],
+            nextSafeAction: "Continue after inspecting canonical evidence.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 260, outputTokens: 25 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall === 1) {
+        yield { type: "usage", inputTokens: 550, outputTokens: 20 };
+        yield { type: "tool_call_start", id: "edit-evidence", name: "edit_file" };
+        yield {
+          type: "tool_call_delta",
+          id: "edit-evidence",
+          json: JSON.stringify({
+            operations: [
+              {
+                kind: "update",
+                path: "fruit.txt",
+                edits: [{ oldText: "apple", newText: "pear" }],
+              },
+            ],
+          }),
+        };
+        yield { type: "tool_call_end", id: "edit-evidence" };
+        yield { type: "tool_call_start", id: "shell-evidence", name: "run_shell" };
+        yield {
+          type: "tool_call_delta",
+          id: "shell-evidence",
+          json: JSON.stringify({ command: `printf '${"0123456789".repeat(40)}'` }),
+        };
+        yield { type: "tool_call_end", id: "shell-evidence" };
+        yield { type: "tool_call_start", id: "read-failure", name: "read_file" };
+        yield {
+          type: "tool_call_delta",
+          id: "read-failure",
+          json: '{"path":"missing.txt"}',
+        };
+        yield { type: "tool_call_end", id: "read-failure" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      const summaryMessage = request.messages.find(
+        (message) => message.role === "developer" && message.content.includes("<context-evidence"),
+      );
+      expect(summaryMessage?.role).toBe("developer");
+      if (summaryMessage?.role === "developer") {
+        expect(summaryMessage.content).toContain("fruit.txt");
+        expect(summaryMessage.content).toContain("shell-evidence");
+        expect(summaryMessage.content).toContain("not_found");
+        expect(summaryMessage.content).toContain("sha256:");
+      }
+      yield { type: "text_delta", text: "All protected tool evidence was available." };
+      yield { type: "usage", inputTokens: 110, outputTokens: 12 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createCodingToolRegistry({
+      workspaceRoot,
+      stateRoot,
+      artifactStore,
+      shellLimits: {
+        timeoutMs: 10_000,
+        terminationGraceMs: 100,
+        maximumInlineBytesPerStream: 32,
+        maximumArtifactBytesPerStream: 4 * 1024,
+      },
+    }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write", "execute"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: evidenceProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(
+      session.run({
+        text: `Edit fruit.txt, run the bounded shell, and read missing.txt. ${"Keep evidence. ".repeat(80)}`,
+      }),
+    ).resolves.toEqual({
+      status: "completed",
+      answer: "All protected tool evidence was available.",
+    });
+    const checkpoint = (await store.read()).find(
+      (record) =>
+        record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+    ) as SessionContextCompactionCommittedRecord | undefined;
+    expect(checkpoint?.record).toMatchObject({
+      type: "context_compaction_committed",
+      evidence: {
+        modifiedFiles: [expect.objectContaining({ path: "fruit.txt", callId: "edit-evidence" })],
+        toolResults: expect.arrayContaining([
+          expect.objectContaining({ callId: "shell-evidence", artifactIds: [expect.any(String)] }),
+        ]),
+        failures: [expect.objectContaining({ callId: "read-failure", code: "not_found" })],
+      },
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession retries one valid but oversized compaction candidate before one commit", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-retry-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "large-turn.txt"), "retained turn data ".repeat(28), "utf8");
+
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "70000000-0000-4000-8000-000000000007",
+      projectId: `sha256:${"6".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const retryProfile: ContextProfile = {
+    ...contextProfile,
+    contextWindowTokens: 20_000,
+    maximumOutputTokens: 60,
+    compactAtTokens: 400,
+    postCompactTargetTokens: 250,
+    retainedTargetTokens: 300,
+  };
+  let ordinaryCall = 0;
+  let compactionCall = 0;
+  const compactionInputBytes: number[] = [];
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCall += 1;
+        compactionInputBytes.push(Buffer.byteLength(JSON.stringify(request.messages), "utf8"));
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Finish after bounded compaction retry.",
+            constraints: [],
+            progress: [],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: [],
+            nextSafeAction: "Continue with the fitting candidate.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 210, outputTokens: 20 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall === 1) {
+        yield { type: "usage", inputTokens: 350, outputTokens: 10 };
+        yield { type: "tool_call_start", id: "read-large-turn", name: "read_file" };
+        yield {
+          type: "tool_call_delta",
+          id: "read-large-turn",
+          json: '{"path":"large-turn.txt"}',
+        };
+        yield { type: "tool_call_end", id: "read-large-turn" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "The second candidate fit." };
+      yield { type: "usage", inputTokens: 80, outputTokens: 8 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: retryProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(
+      session.run({
+        text: `Read large-turn.txt and finish. ${"Older objective detail. ".repeat(60)}`,
+      }),
+    ).resolves.toEqual({ status: "completed", answer: "The second candidate fit." });
+    expect(compactionCall).toBe(2);
+    expect(compactionInputBytes[1]).toBeLessThan(compactionInputBytes[0] ?? 0);
+    const records = await store.read();
+    const starts = records.filter(
+      (record) => record.schemaVersion === 3 && record.record.type === "context_compaction_started",
+    );
+    const failures = records.filter(
+      (record) => record.schemaVersion === 3 && record.record.type === "context_compaction_failed",
+    ) as readonly SessionContextCompactionFailedRecord[];
+    const commits = records.filter(
+      (record) =>
+        record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+    ) as readonly SessionContextCompactionCommittedRecord[];
+    expect(
+      starts.map((record) => (record.schemaVersion === 3 ? record.record : undefined)),
+    ).toMatchObject([
+      { type: "context_compaction_started", attemptNumber: 1, windowNumber: 1 },
+      { type: "context_compaction_started", attemptNumber: 2, windowNumber: 1 },
+    ]);
+    expect(failures.map((record) => record.record)).toMatchObject([
+      {
+        type: "context_compaction_failed",
+        attemptNumber: 1,
+        reason: "replacement_too_large",
+      },
+    ]);
+    expect(commits.map((record) => record.record)).toMatchObject([
+      { type: "context_compaction_committed", attemptNumber: 2, windowNumber: 1 },
+    ]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession preserves unknown usage across a successful compaction retry under maxTokens", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-retry-unknown-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "large-turn.txt"), "retained turn data ".repeat(28), "utf8");
+
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "71000000-0000-4000-8000-000000000071",
+      projectId: `sha256:${"1".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const retryProfile: ContextProfile = {
+    ...contextProfile,
+    contextWindowTokens: 20_000,
+    maximumOutputTokens: 60,
+    compactAtTokens: 400,
+    postCompactTargetTokens: 250,
+    retainedTargetTokens: 300,
+  };
+  let ordinaryCall = 0;
+  let compactionCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCall += 1;
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Stop when any retry usage is unknown.",
+            constraints: [],
+            progress: [],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: [],
+            nextSafeAction: "Honor fail-closed token accounting.",
+          }),
+        };
+        if (compactionCall === 2) {
+          yield { type: "usage", inputTokens: 210, outputTokens: 20 };
+        }
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall > 1) {
+        yield { type: "text_delta", text: "This ordinary call should have been blocked." };
+        yield { type: "usage", inputTokens: 80, outputTokens: 8 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "usage", inputTokens: 350, outputTokens: 10 };
+      yield { type: "tool_call_start", id: "read-retry-unknown", name: "read_file" };
+      yield {
+        type: "tool_call_delta",
+        id: "read-retry-unknown",
+        json: '{"path":"large-turn.txt"}',
+      };
+      yield { type: "tool_call_end", id: "read-retry-unknown" };
+      yield { type: "finish", reason: "tool_calls" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: retryProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    const result = await session.run(
+      { text: `Read large-turn.txt and finish. ${"Older objective detail. ".repeat(60)}` },
+      { limits: { maxTokens: 10_000 } },
+    );
+    const commits = (await store.read()).filter(
+      (record) =>
+        record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+    );
+    expect({ result, compactionCall, ordinaryCall, commits }).toMatchObject({
+      result: {
+        status: "failed",
+        error: {
+          code: "token_usage_missing",
+          message: "The provider did not report token usage for an active token limit.",
+        },
+      },
+      compactionCall: 2,
+      ordinaryCall: 1,
+      commits: [expect.any(Object)],
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession rejects malformed compaction output without retry or an ordinary call", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-invalid-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, "context.txt"),
+    "invalid summary source ".repeat(180),
+    "utf8",
+  );
+
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "80000000-0000-4000-8000-000000000008",
+      projectId: `sha256:${"7".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  let ordinaryCall = 0;
+  let compactionCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCall += 1;
+        yield { type: "text_delta", text: '{"schemaVersion":1,"objective":42}' };
+        yield { type: "usage", inputTokens: 520, outputTokens: 12 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall > 1) {
+        throw new Error("Malformed compaction must stop before another ordinary call.");
+      }
+      yield { type: "usage", inputTokens: 30, outputTokens: 10 };
+      yield { type: "tool_call_start", id: "read-invalid-summary", name: "read_file" };
+      yield {
+        type: "tool_call_delta",
+        id: "read-invalid-summary",
+        json: '{"path":"context.txt"}',
+      };
+      yield { type: "tool_call_end", id: "read-invalid-summary" };
+      yield { type: "finish", reason: "tool_calls" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(
+      session.run({ text: "Read context.txt before malformed compaction." }),
+    ).resolves.toEqual({
+      status: "failed",
+      error: {
+        code: "context_compaction_invalid",
+        message: "The context compaction response did not match the required schema.",
+      },
+    });
+    expect(compactionCall).toBe(1);
+    expect(ordinaryCall).toBe(1);
+    const records = await store.read();
+    expect(
+      records.filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "context_compaction_failed",
+      ),
+    ).toMatchObject([
+      {
+        record: {
+          type: "context_compaction_failed",
+          attemptNumber: 1,
+          reason: "summary_invalid",
+          usage: { inputTokens: 520, outputTokens: 12 },
+        },
+      },
+    ]);
+    expect(
+      records.some(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+      ),
+    ).toBe(false);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession records one compaction authentication failure without retry", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-provider-failure-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, "context.txt"),
+    "provider failure context ".repeat(180),
+    "utf8",
+  );
+
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "90000000-0000-4000-8000-000000000009",
+      projectId: `sha256:${"8".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  let ordinaryCall = 0;
+  let compactionCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCall += 1;
+        yield { type: "usage", inputTokens: 500, outputTokens: 7 };
+        throw new ModelDriverError(
+          "authentication",
+          "The compaction provider rejected authentication.",
+          {
+            cause: new Error("authentication failed"),
+            status: 401,
+            providerCode: "invalid_api_key",
+            requestId: "request-compaction-failed",
+          },
+        );
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall > 1) {
+        throw new Error("Provider compaction failure must stop the ordinary loop.");
+      }
+      yield { type: "usage", inputTokens: 30, outputTokens: 10 };
+      yield { type: "tool_call_start", id: "read-provider-failure", name: "read_file" };
+      yield {
+        type: "tool_call_delta",
+        id: "read-provider-failure",
+        json: '{"path":"context.txt"}',
+      };
+      yield { type: "tool_call_end", id: "read-provider-failure" };
+      yield { type: "finish", reason: "tool_calls" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(
+      session.run({ text: "Read context.txt before provider failure." }),
+    ).resolves.toEqual({
+      status: "failed",
+      error: {
+        code: "context_compaction_failed",
+        message: "The context compaction model request failed.",
+        category: "authentication",
+        status: 401,
+        providerCode: "invalid_api_key",
+        requestId: "request-compaction-failed",
+      },
+    });
+    expect(compactionCall).toBe(1);
+    expect(ordinaryCall).toBe(1);
+    expect(
+      (await store.read()).filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "context_compaction_failed",
+      ),
+    ).toMatchObject([
+      {
+        record: {
+          type: "context_compaction_failed",
+          attemptNumber: 1,
+          reason: "model_request_failed",
+          usage: { inputTokens: 500, outputTokens: 7 },
+        },
+      },
+    ]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession records one compaction deadline failure without retry", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-deadline-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "91000000-0000-4000-8000-000000000091",
+      projectId: `sha256:${"8".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  let ordinaryCall = 0;
+  let compactionCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCall += 1;
+        throw new ModelDriverError("timeout", "The compaction request exceeded its deadline.", {
+          cause: new Error("deadline exceeded"),
+          providerCode: "deadline_exceeded",
+          requestId: "request-compaction-timeout",
+        });
+      }
+      ordinaryCall += 1;
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(
+      session.run({ text: `Preserve the deadline context. ${"deadline ".repeat(400)}` }),
+    ).resolves.toEqual({
+      status: "failed",
+      error: {
+        code: "context_compaction_failed",
+        message: "The context compaction model request failed.",
+        category: "timeout",
+        providerCode: "deadline_exceeded",
+        requestId: "request-compaction-timeout",
+      },
+    });
+    expect({ ordinaryCall, compactionCall }).toEqual({ ordinaryCall: 0, compactionCall: 1 });
+    expect(
+      (await store.read()).filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "context_compaction_started",
+      ),
+    ).toHaveLength(1);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession cancels one active compaction and records an interrupted attempt", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-cancel-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "context.txt"), "cancel context ".repeat(260), "utf8");
+
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "a0000000-0000-4000-8000-00000000000a",
+      projectId: `sha256:${"9".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  let ordinaryCall = 0;
+  let compactionCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCall += 1;
+        yield { type: "usage", inputTokens: 500, outputTokens: 7 };
+        await new Promise<void>((resolve) => {
+          if (request.signal.aborted) {
+            resolve();
+            return;
+          }
+          request.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return;
+      }
+      ordinaryCall += 1;
+      yield { type: "usage", inputTokens: 30, outputTokens: 10 };
+      yield { type: "tool_call_start", id: "read-before-cancel", name: "read_file" };
+      yield {
+        type: "tool_call_delta",
+        id: "read-before-cancel",
+        json: '{"path":"context.txt"}',
+      };
+      yield { type: "tool_call_end", id: "read-before-cancel" };
+      yield { type: "finish", reason: "tool_calls" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    markStarted = resolve;
+  });
+  session.subscribe((event) => {
+    if (event.type === "context_compaction_started") {
+      markStarted?.();
+    }
+  });
+
+  try {
+    const resultPromise = session.run({ text: "Read context.txt before cancellation." });
+    await started;
+    session.abort();
+    await expect(resultPromise).resolves.toEqual({
+      status: "cancelled",
+      error: { code: "session_cancelled", message: "The session was cancelled." },
+    });
+    expect({ ordinaryCall, compactionCall }).toEqual({ ordinaryCall: 1, compactionCall: 1 });
+    const interruptions = (await store.read()).filter(
+      (record) =>
+        record.schemaVersion === 3 && record.record.type === "context_compaction_interrupted",
+    ) as readonly SessionContextCompactionInterruptedRecord[];
+    expect(interruptions.map((record) => record.record)).toMatchObject([
+      {
+        type: "context_compaction_interrupted",
+        attemptNumber: 1,
+        reason: "caller_cancelled",
+        usage: { inputTokens: 500, outputTokens: 7 },
+      },
+    ]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession reactively compacts one pre-response context overflow without duplicating effects", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-overflow-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "context.txt"), "small durable fact\n", "utf8");
+
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "b0000000-0000-4000-8000-00000000000b",
+      projectId: `sha256:${"a".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const overflowProfile: ContextProfile = {
+    ...contextProfile,
+    contextWindowTokens: 2_000,
+    maximumOutputTokens: 200,
+    compactAtTokens: 1_500,
+    postCompactTargetTokens: 1_000,
+    retainedTargetTokens: 100,
+  };
+  let ordinaryCall = 0;
+  let compactionCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCall += 1;
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Recover the overflowing turn.",
+            constraints: [],
+            progress: ["The read effect completed once."],
+            unresolvedQuestions: [],
+            failures: ["The ordinary context overflowed before a response."],
+            remainingVerification: [],
+            nextSafeAction: "Retry the same ordinary turn once.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 180, outputTokens: 25 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall === 1) {
+        yield { type: "usage", inputTokens: 30, outputTokens: 10 };
+        yield { type: "tool_call_start", id: "read-once", name: "read_file" };
+        yield { type: "tool_call_delta", id: "read-once", json: '{"path":"context.txt"}' };
+        yield { type: "tool_call_end", id: "read-once" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      if (ordinaryCall === 2) {
+        throw new ModelDriverError("invalid_request", "The provider rejected the context length.", {
+          cause: new Error("context length exceeded"),
+          status: 400,
+          providerCode: "context_length_exceeded",
+          requestId: "overflow-attempt",
+        });
+      }
+      expect(
+        request.messages.some(
+          (message) => message.role === "developer" && message.content.includes("<context-summary"),
+        ),
+      ).toBe(true);
+      yield { type: "text_delta", text: "Reactive compaction recovered the turn." };
+      yield { type: "usage", inputTokens: 90, outputTokens: 12 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: overflowProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(
+      session.run({ text: "Read context.txt and recover one overflow." }),
+    ).resolves.toEqual({
+      status: "completed",
+      answer: "Reactive compaction recovered the turn.",
+    });
+    expect({ ordinaryCall, compactionCall }).toEqual({ ordinaryCall: 3, compactionCall: 1 });
+    const records = await store.read();
+    expect(
+      records.filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "provider_attempt_interrupted",
+      ),
+    ).toMatchObject([
+      {
+        record: {
+          type: "provider_attempt_interrupted",
+          turn: 2,
+          attempt: 1,
+          reason: "context_overflow",
+        },
+      },
+    ]);
+    expect(
+      records.filter(
+        (record) => record.schemaVersion === 3 && record.record.type === "provider_attempt_started",
+      ),
+    ).toMatchObject([
+      { record: { turn: 1, attempt: 1 } },
+      { record: { turn: 2, attempt: 1 } },
+      { record: { turn: 2, attempt: 2 } },
+    ]);
+    expect(
+      records.filter(
+        (record) =>
+          record.schemaVersion === 3 &&
+          record.record.type === "runtime_event" &&
+          record.record.event.type === "tool_started",
+      ),
+    ).toHaveLength(1);
+    expect(
+      records.filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+      ),
+    ).toMatchObject([{ record: { trigger: "provider_overflow", windowNumber: 1 } }]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession stops after the one reactive ordinary retry also overflows", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-overflow-stop-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "b1000000-0000-4000-8000-00000000000b",
+      projectId: `sha256:${"d".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const overflowProfile: ContextProfile = {
+    ...contextProfile,
+    contextWindowTokens: 2_000,
+    maximumOutputTokens: 200,
+    compactAtTokens: 1_500,
+    postCompactTargetTokens: 1_000,
+  };
+  let ordinaryCall = 0;
+  let compactionCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCall += 1;
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Try one reactive recovery.",
+            constraints: [],
+            progress: [],
+            unresolvedQuestions: [],
+            failures: ["The provider overflowed."],
+            remainingVerification: [],
+            nextSafeAction: "Retry once.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 100, outputTokens: 15 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      throw new ModelDriverError("invalid_request", "The context is still too long.", {
+        cause: new Error("context length exceeded"),
+        status: 400,
+        providerCode: "context_length_exceeded",
+        requestId: `overflow-${ordinaryCall}`,
+      });
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: overflowProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(session.run({ text: "Stop after one reactive retry." })).resolves.toEqual({
+      status: "failed",
+      error: {
+        code: "context_window_unrecoverable",
+        message: "The provider still rejected the compacted context window.",
+      },
+    });
+    expect({ ordinaryCall, compactionCall }).toEqual({ ordinaryCall: 2, compactionCall: 1 });
+    expect(
+      (await store.read()).filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "provider_attempt_interrupted",
+      ),
+    ).toMatchObject([
+      { record: { turn: 1, attempt: 1, reason: "context_overflow" } },
+      { record: { turn: 1, attempt: 2, reason: "context_overflow" } },
+    ]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession never retries a context overflow after ordinary output has begun", async () => {
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "b2000000-0000-4000-8000-00000000000b",
+      projectId: `sha256:${"b".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  let ordinaryCall = 0;
+  let compactionCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.messages[0]?.role === "system") {
+        compactionCall += 1;
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      yield { type: "text_delta", text: "Partial ordinary output." };
+      throw new ModelDriverError("invalid_request", "The provider rejected the context length.", {
+        cause: new Error("context length exceeded after output"),
+        status: 400,
+        providerCode: "context_length_exceeded",
+        requestId: "overflow-after-output",
+      });
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    [sessionDurableContext]: { nextSequence: 2, targetIdentity },
+    [sessionContextProfile]: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  await expect(session.run({ text: "Do not retry after partial output." })).resolves.toEqual({
+    status: "failed",
+    error: {
+      code: "model_request_failed",
+      message: "The provider rejected the context length.",
+      category: "invalid_request",
+      status: 400,
+      providerCode: "context_length_exceeded",
+      requestId: "overflow-after-output",
+    },
+  });
+  expect({ ordinaryCall, compactionCall }).toEqual({ ordinaryCall: 1, compactionCall: 0 });
+  expect(
+    (await store.read()).filter(
+      (record) => record.schemaVersion === 3 && record.record.type === "context_compaction_started",
+    ),
+  ).toHaveLength(0);
+});
+
+test("SessionLifecycle restarts and branches from one committed context checkpoint", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-lifecycle-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "context.txt"), "lifecycle context ".repeat(220), "utf8");
+
+  let ordinaryCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Continue from the durable lifecycle checkpoint.",
+            constraints: [],
+            progress: ["The parent read context.txt."],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: [],
+            nextSafeAction: "Complete the parent or child request.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 560, outputTokens: 25 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall === 1) {
+        yield { type: "usage", inputTokens: 30, outputTokens: 10 };
+        yield { type: "tool_call_start", id: "read-lifecycle", name: "read_file" };
+        yield {
+          type: "tool_call_delta",
+          id: "read-lifecycle",
+          json: '{"path":"context.txt"}',
+        };
+        yield { type: "tool_call_end", id: "read-lifecycle" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      if (ordinaryCall === 2) {
+        yield { type: "text_delta", text: "Parent completed after compaction." };
+        yield { type: "usage", inputTokens: 100, outputTokens: 10 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      expect(
+        request.messages.some(
+          (message) => message.role === "developer" && message.content.includes("<context-summary"),
+        ),
+      ).toBe(true);
+      expect(JSON.stringify(request.messages)).not.toContain("lifecycle context lifecycle context");
+      yield { type: "text_delta", text: "Child continued from the checkpoint." };
+      yield { type: "usage", inputTokens: 80, outputTokens: 10 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycleOptions = {
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+  };
+  const lifecycle = createSessionLifecycle(lifecycleOptions);
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const parent = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Read context.txt and complete the parent task." },
+    });
+    expect(parent.result).toEqual({
+      status: "completed",
+      answer: "Parent completed after compaction.",
+    });
+    expect(parent.snapshot).toMatchObject({
+      context: {
+        checkpoint: { windowNumber: 1, status: "committed" },
+        ordinaryUsage: { inputTokens: 130, outputTokens: 20, unknownCalls: 0 },
+        compactionUsage: { inputTokens: 560, outputTokens: 25, unknownCalls: 0 },
+      },
+    });
+    expect(JSON.stringify(parent.snapshot)).not.toContain(
+      "Continue from the durable lifecycle checkpoint",
+    );
+
+    const parentStore = await openJsonlSessionStore({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    const checkpoint = (await parentStore.read()).find(
+      (record) =>
+        record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+    ) as SessionContextCompactionCommittedRecord | undefined;
+    expect(checkpoint).toBeDefined();
+    const child = await lifecycle.branch({
+      parentSessionId: created.sessionId,
+      atSequence: checkpoint?.sequence ?? 0,
+    });
+    expect(child).toMatchObject({
+      lineage: { parentSessionId: created.sessionId, parentEventPosition: checkpoint?.sequence },
+      context: { checkpoint: { windowNumber: 1, status: "committed" } },
+    });
+
+    const restarted = createSessionLifecycle(lifecycleOptions);
+    await expect(restarted.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "ready",
+      snapshot: { context: { checkpoint: { windowNumber: 1, status: "committed" } } },
+    });
+    let incompatibleDriverWasCalled = false;
+    const incompatibleProfile: ContextProfile = {
+      ...contextProfile,
+      version: 2,
+      compactAtTokens: contextProfile.compactAtTokens - 1,
+    };
+    const incompatibleTargets: ModelTargets = {
+      async resolve() {
+        incompatibleDriverWasCalled = true;
+        return { identity: targetIdentity, driver: model, contextProfile: incompatibleProfile };
+      },
+      async snapshot() {
+        return {
+          targets: [
+            {
+              identity: targetIdentity,
+              readiness: { status: "available", credentialSource: "test" },
+              contextProfile: incompatibleProfile,
+            },
+          ],
+        };
+      },
+    };
+    await expect(
+      createSessionLifecycle({ ...lifecycleOptions, modelTargets: incompatibleTargets }).resume({
+        sessionId: created.sessionId,
+      }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      error: { code: "model_target_incompatible" },
+    });
+    expect(incompatibleDriverWasCalled).toBe(false);
+    await expect(
+      restarted.continue({ sessionId: child.sessionId, input: { text: "Continue the child." } }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Child continued from the checkpoint." },
+    });
+
+    const parentRecordsBeforeBranches = await parentStore.read();
+    const beforeCheckpointChild = await restarted.branch({
+      parentSessionId: created.sessionId,
+      atSequence: checkpoint?.record.sourceThrough ?? 0,
+    });
+    const beforeCheckpointContinuation = await restarted.continue({
+      sessionId: beforeCheckpointChild.sessionId,
+      input: { text: "Continue and compact the child from before the checkpoint." },
+    });
+    expect(beforeCheckpointContinuation).toMatchObject({
+      result: { status: "completed", answer: "Child continued from the checkpoint." },
+      snapshot: { context: { checkpoint: { windowNumber: 1, status: "committed" } } },
+    });
+    const beforeCheckpointChildStore = await openJsonlSessionStore({
+      stateRoot,
+      workspaceRoot,
+      sessionId: beforeCheckpointChild.sessionId,
+    });
+    expect(
+      (await beforeCheckpointChildStore.read()).find(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+      ),
+    ).toMatchObject({
+      record: {
+        evidence: {
+          permissions: [
+            expect.objectContaining({
+              sessionId: created.sessionId,
+              callId: "read-lifecycle",
+              decision: "allow",
+            }),
+          ],
+          toolResults: [
+            expect.objectContaining({
+              sessionId: created.sessionId,
+              callId: "read-lifecycle",
+              status: "completed",
+            }),
+          ],
+        },
+      },
+    });
+
+    const afterCheckpointChild = await restarted.branch({
+      parentSessionId: created.sessionId,
+      atSequence: parent.snapshot.lastSequence,
+    });
+    const afterCheckpointContinuation = await restarted.continue({
+      sessionId: afterCheckpointChild.sessionId,
+      input: { text: "Continue the child from after the checkpoint." },
+    });
+    expect(afterCheckpointContinuation).toMatchObject({
+      result: { status: "completed", answer: "Child continued from the checkpoint." },
+    });
+    const grandchild = await restarted.branch({
+      parentSessionId: afterCheckpointChild.sessionId,
+      atSequence: afterCheckpointContinuation.snapshot.lastSequence,
+    });
+    expect(grandchild).toMatchObject({
+      lineage: { parentSessionId: afterCheckpointChild.sessionId },
+      context: { checkpoint: { windowNumber: 1, status: "committed" } },
+    });
+    expect(await parentStore.read()).toEqual(parentRecordsBeforeBranches);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle reports then normalizes a dangling compaction attempt after restart", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-dangling-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "context.txt"), "dangling context ".repeat(220), "utf8");
+
+  let ordinaryCall = 0;
+  let compactionCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCall += 1;
+        if (compactionCall === 1) {
+          throw new Error("simulated process loss during compaction");
+        }
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Continue after the interrupted compaction.",
+            constraints: [],
+            progress: ["The prior attempt was normalized."],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: [],
+            nextSafeAction: "Complete the ordinary turn.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 500, outputTokens: 20 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall > 1) {
+        yield { type: "text_delta", text: "Cold continuation completed." };
+        yield { type: "usage", inputTokens: 80, outputTokens: 10 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "usage", inputTokens: 30, outputTokens: 10 };
+      yield { type: "tool_call_start", id: "read-before-loss", name: "read_file" };
+      yield { type: "tool_call_delta", id: "read-before-loss", json: '{"path":"context.txt"}' };
+      yield { type: "tool_call_end", id: "read-before-loss" };
+      yield { type: "finish", reason: "tool_calls" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const options = {
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+  };
+  const lifecycle = createSessionLifecycle(options);
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Read context.txt before the process disappears." },
+      }),
+    ).rejects.toThrow("simulated process loss during compaction");
+
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "interrupted",
+      context: {
+        lastAttempt: { attemptNumber: 1, status: "started", usage: { status: "unknown" } },
+      },
+    });
+    const restarted = createSessionLifecycle(options);
+    await expect(restarted.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "ready",
+      snapshot: {
+        status: "interrupted",
+        context: {
+          lastAttempt: {
+            attemptNumber: 1,
+            status: "interrupted",
+            reason: "process_restart",
+            usage: { status: "unknown" },
+          },
+        },
+      },
+    });
+    await expect(restarted.continue({ sessionId: created.sessionId })).resolves.toMatchObject({
+      result: { status: "completed", answer: "Cold continuation completed." },
+      snapshot: {
+        context: {
+          checkpoint: { status: "committed", windowNumber: 1 },
+          lastAttempt: { status: "committed", attemptNumber: 2 },
+        },
+      },
+    });
+    const records = await openJsonlSessionStore({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    expect(
+      (await records.read()).filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "context_compaction_interrupted",
+      ),
+    ).toMatchObject([
+      {
+        record: {
+          type: "context_compaction_interrupted",
+          reason: "process_restart",
+          usage: { status: "unknown" },
+        },
+      },
+    ]);
+    expect(
+      (await records.read()).filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "context_compaction_started",
+      ),
+    ).toMatchObject([
+      { record: { attemptNumber: 1, windowNumber: 1 } },
+      { record: { attemptNumber: 2, windowNumber: 1 } },
+    ]);
+    expect({ ordinaryCall, compactionCall }).toEqual({ ordinaryCall: 2, compactionCall: 2 });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a committed checkpoint whose replacement digest is invalid", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-invalid-digest-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const store = await openJsonlSessionStore<SessionRecord>({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    const runId = "c0000000-0000-4000-8000-00000000000c";
+    const attemptId = "d0000000-0000-4000-8000-00000000000d";
+    const checkpointId = "e0000000-0000-4000-8000-00000000000e";
+    const summary = {
+      schemaVersion: 1,
+      objective: "Reject an invalid replacement digest.",
+      constraints: [],
+      progress: [],
+      unresolvedQuestions: [],
+      failures: [],
+      remainingVerification: [],
+      nextSafeAction: "Do not dispatch a model or effect.",
+    } as const;
+    const sourceDigest = digestContextRecordPrefix([
+      {
+        schemaVersion: 3,
+        sequence: 1,
+        record: {
+          type: "session_genesis",
+          sessionId: created.sessionId,
+          projectId: created.projectId,
+          targetIdentity,
+        },
+      },
+      {
+        schemaVersion: 3,
+        sequence: 2,
+        record: { type: "logical_run_started", runId, userMessage: "Validate the checkpoint." },
+      },
+      {
+        schemaVersion: 3,
+        sequence: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "user_message", text: "Validate the checkpoint." },
+        },
+      },
+    ]);
+    const evidence = {
+      schemaVersion: 1,
+      modifiedFiles: [],
+      permissions: [],
+      toolResults: [],
+      failures: [],
+    } as const;
+    const records: SessionRecord[] = [
+      {
+        schemaVersion: 3,
+        sequence: 2,
+        record: { type: "logical_run_started", runId, userMessage: "Validate the checkpoint." },
+      },
+      {
+        schemaVersion: 3,
+        sequence: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "user_message", text: "Validate the checkpoint." },
+        },
+      },
+      {
+        schemaVersion: 3,
+        sequence: 4,
+        record: {
+          type: "context_compaction_started",
+          recordVersion: 1,
+          runId,
+          attemptId,
+          attemptNumber: 1,
+          windowNumber: 1,
+          trigger: "automatic_threshold",
+          sourceThrough: 3,
+          targetIdentity,
+          contextProfile,
+          projectionVersion: 1,
+          sourceDigest,
+        },
+      },
+      {
+        schemaVersion: 3,
+        sequence: 5,
+        record: {
+          type: "context_compaction_committed",
+          recordVersion: 1,
+          runId,
+          attemptId,
+          attemptNumber: 1,
+          checkpointId,
+          windowNumber: 1,
+          trigger: "automatic_threshold",
+          sourceThrough: 3,
+          retainedFrom: 4,
+          targetIdentity,
+          contextProfile,
+          projectionVersion: 1,
+          sourceDigest,
+          replacementDigest: `sha256:${"0".repeat(64)}`,
+          summary,
+          evidence,
+          usage: { inputTokens: 20, outputTokens: 5 },
+        },
+      },
+    ];
+    for (const record of records) {
+      await store.append(record);
+    }
+
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
