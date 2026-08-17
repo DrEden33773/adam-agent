@@ -1,6 +1,10 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
+import {
+  type AgentSessionDurableContext,
+  sessionDurableContext,
+} from "./session-durable-context.js";
 
 export {
   type ArtifactReference,
@@ -67,7 +71,13 @@ export {
   OperationStoreError,
 } from "./operation-store.js";
 
-import type { CanonicalRuntimeEvent, SessionStore } from "./session-store.js";
+import {
+  type CanonicalRuntimeEvent,
+  isSessionRecordWithinSizeLimit,
+  type SessionRecord,
+  type SessionStore,
+  type SessionToolIntent,
+} from "./session-store.js";
 import type {
   ModelToolDefinition,
   PermissionPolicy,
@@ -79,6 +89,18 @@ import type {
   ToolResult,
 } from "./tool-runtime.js";
 
+export {
+  type CurrentSessionSnapshot,
+  createSessionLifecycle,
+  type LegacySessionSnapshot,
+  type SessionCommand,
+  type SessionContinueResult,
+  type SessionLifecycle,
+  SessionLifecycleError,
+  type SessionLifecycleOptions,
+  type SessionResumeResult,
+  type SessionSnapshot,
+} from "./session-lifecycle.js";
 export {
   type CanonicalRuntimeEvent,
   createInMemorySessionStore,
@@ -103,6 +125,7 @@ export {
   type ToolCall,
   type ToolEffect,
   type ToolRegistry,
+  type ToolReplayClass,
   type ToolResult,
 } from "./tool-runtime.js";
 
@@ -192,9 +215,11 @@ export type RunResult =
               | "model_protocol_invalid"
               | "model_output_truncated"
               | "model_content_filtered"
+              | "replay_envelope_too_large"
               | "invalid_run_limits"
               | "run_already_active"
               | "session_persistence_failed"
+              | "tool_effect_indeterminate"
               | "turn_limit_exceeded"
               | "token_limit_exceeded"
               | "token_usage_missing";
@@ -296,8 +321,12 @@ export class AgentSession {
   readonly #model: ModelDriver;
   readonly #tools: ToolRegistry | undefined;
   readonly #permissions: PermissionPolicy | undefined;
-  readonly #store: SessionStore;
+  readonly #durableContext: AgentSessionDurableContext | undefined;
+  readonly #store: SessionStore<SessionRecord>;
   #activeAbortController: AbortController | undefined;
+  #activeProviderAttempt:
+    | { readonly runId: string; readonly turn: number; readonly attempt: number }
+    | undefined;
   #activeRunId: string | undefined;
   #nextSequence = 1;
   #terminalResult: RunResult | undefined;
@@ -309,10 +338,16 @@ export class AgentSession {
     | undefined;
 
   constructor(dependencies: AgentSessionDependencies) {
+    this.#durableContext = (
+      dependencies as AgentSessionDependencies & {
+        readonly [sessionDurableContext]?: AgentSessionDurableContext;
+      }
+    )[sessionDurableContext];
     this.#model = dependencies.model;
     this.#tools = dependencies.tools;
     this.#permissions = dependencies.permissions;
-    this.#store = dependencies.store;
+    this.#store = dependencies.store as unknown as SessionStore<SessionRecord>;
+    this.#nextSequence = this.#durableContext?.nextSequence ?? 1;
   }
 
   subscribe(listener: RuntimeEventListener): () => void {
@@ -370,7 +405,7 @@ export class AgentSession {
       };
     }
     this.#terminalResult = undefined;
-    this.#activeRunId = randomUUID();
+    this.#activeRunId = this.#durableContext?.resume?.runId ?? randomUUID();
     const abortController = new AbortController();
     const abortFromCaller = () => abortController.abort(options.signal?.reason);
     if (options.signal?.aborted === true) {
@@ -381,6 +416,18 @@ export class AgentSession {
     this.#activeAbortController = abortController;
     try {
       try {
+        if (this.#durableContext !== undefined && this.#durableContext.resume === undefined) {
+          await this.#appendRecord({
+            schemaVersion: 3,
+            sequence: this.#nextSequence,
+            record: {
+              type: "logical_run_started",
+              runId: this.#activeRunId,
+              userMessage: input.text,
+              ...(options.limits === undefined ? {} : { limits: options.limits }),
+            },
+          });
+        }
         return await this.#run(input, abortController.signal, options.limits);
       } catch (error) {
         if (abortController.signal.aborted && this.#terminalResult === undefined) {
@@ -416,26 +463,70 @@ export class AgentSession {
     signal: AbortSignal,
     limits: RunOptions["limits"],
   ): Promise<RunResult> {
-    await this.#emit({ type: "user_message", text: input.text });
-    if (signal.aborted) {
-      return this.#settleCancelled();
+    const resume = this.#durableContext?.resume;
+    if (resume === undefined) {
+      await this.#emit({ type: "user_message", text: input.text });
+      if (signal.aborted) {
+        return this.#settleCancelled();
+      }
     }
-    const messages: ModelMessage[] = [{ role: "user", content: input.text }];
+    const messages: ModelMessage[] =
+      resume === undefined
+        ? [...(this.#durableContext?.initialMessages ?? []), { role: "user", content: input.text }]
+        : resume.messages.map((message) => ({ ...message }));
     const toolResultsById = new Map<
       string,
       { readonly call: ToolCall; readonly result: ToolResult }
-    >();
-    let modelTurns = 0;
-    let reportedTokens = 0;
+    >(resume?.toolResults.map((entry) => [entry.call.id, entry]) ?? []);
+    let modelTurns = (resume?.nextTurn ?? 1) - 1;
+    let reportedTokens = resume?.reportedTokens ?? 0;
+
+    for (const pending of resume?.pendingToolCalls ?? []) {
+      const terminal = await this.#dispatchToolCall({
+        call: pending.call,
+        emitRequested: !pending.requested,
+        emitStarted: !pending.started,
+        messages,
+        reusablePermission: pending.reusablePermission,
+        signal,
+        toolResultsById,
+      });
+      if (terminal !== undefined) {
+        return terminal;
+      }
+    }
 
     while (true) {
       if (signal.aborted) {
         return this.#settleCancelled();
       }
+      if (limits?.maxTokens !== undefined && reportedTokens >= limits.maxTokens) {
+        return this.#settleTokenLimitExceeded();
+      }
       if (limits?.maxTurns !== undefined && modelTurns >= limits.maxTurns) {
         return this.#settleTurnLimitExceeded();
       }
       modelTurns += 1;
+      const attemptNumber =
+        resume !== undefined && modelTurns === resume.nextTurn ? resume.nextAttempt : 1;
+      if (this.#durableContext !== undefined) {
+        await this.#appendRecord({
+          schemaVersion: 3,
+          sequence: this.#nextSequence,
+          record: {
+            type: "provider_attempt_started",
+            runId: this.#activeRunId as string,
+            turn: modelTurns,
+            attempt: attemptNumber,
+            targetIdentity: this.#durableContext.targetIdentity,
+          },
+        });
+        this.#activeProviderAttempt = {
+          runId: this.#activeRunId as string,
+          turn: modelTurns,
+          attempt: attemptNumber,
+        };
+      }
       await this.#emit({ type: "model_message_started" });
       if (signal.aborted) {
         return this.#settleCancelled();
@@ -452,7 +543,17 @@ export class AgentSession {
         | undefined;
       let rawFinishReason: string | undefined;
       let protocolError: string | undefined;
+      let replayEnvelopeTooLarge = false;
       let usageWasReported = false;
+      let responseUsage:
+        | {
+            readonly inputTokens: number;
+            readonly outputTokens: number;
+            readonly reasoningTokens?: number;
+            readonly cachedInputTokens?: number;
+            readonly cacheMissInputTokens?: number;
+          }
+        | undefined;
       const assemblingCalls = new Map<string, ToolCall>();
       const completedCalls: ToolCall[] = [];
 
@@ -466,14 +567,35 @@ export class AgentSession {
         }
         switch (event.type) {
           case "text_delta":
+            if (
+              this.#durableContext !== undefined &&
+              Buffer.byteLength(answer, "utf8") + Buffer.byteLength(event.text, "utf8") >
+                maximumReplayFieldBytes
+            ) {
+              replayEnvelopeTooLarge = true;
+              break;
+            }
             answer += event.text;
             await this.#emit({ type: "model_message_delta", text: event.text });
             break;
           case "reasoning_delta":
+            if (
+              this.#durableContext !== undefined &&
+              Buffer.byteLength(reasoning, "utf8") + Buffer.byteLength(event.text, "utf8") >
+                maximumReplayFieldBytes
+            ) {
+              replayEnvelopeTooLarge = true;
+              break;
+            }
             reasoning += event.text;
             break;
           case "tool_call_start":
-            if (assemblingCalls.has(event.id)) {
+            if (
+              this.#durableContext !== undefined &&
+              assemblingCalls.size + completedCalls.length >= maximumReplayToolCalls
+            ) {
+              replayEnvelopeTooLarge = true;
+            } else if (assemblingCalls.has(event.id)) {
               protocolError = "The model started the same tool call more than once.";
             } else {
               assemblingCalls.set(event.id, {
@@ -488,6 +610,15 @@ export class AgentSession {
             if (call === undefined) {
               protocolError = "The model sent arguments for a tool call that was not started.";
             } else {
+              if (
+                this.#durableContext !== undefined &&
+                Buffer.byteLength(call.argumentsJson, "utf8") +
+                  Buffer.byteLength(event.json, "utf8") >
+                  maximumReplayFieldBytes
+              ) {
+                replayEnvelopeTooLarge = true;
+                break;
+              }
               assemblingCalls.set(event.id, {
                 ...call,
                 argumentsJson: call.argumentsJson + event.json,
@@ -520,6 +651,19 @@ export class AgentSession {
             }
             usageWasReported = true;
             reportedTokens = nextReportedTokens;
+            responseUsage = {
+              inputTokens: event.inputTokens,
+              outputTokens: event.outputTokens,
+              ...(event.reasoningTokens === undefined
+                ? {}
+                : { reasoningTokens: event.reasoningTokens }),
+              ...(event.cachedInputTokens === undefined
+                ? {}
+                : { cachedInputTokens: event.cachedInputTokens }),
+              ...(event.cacheMissInputTokens === undefined
+                ? {}
+                : { cacheMissInputTokens: event.cacheMissInputTokens }),
+            };
             await this.#emit({
               type: "model_usage",
               inputTokens: event.inputTokens,
@@ -542,13 +686,17 @@ export class AgentSession {
             rawFinishReason = event.rawReason;
             break;
         }
-        if (signal.aborted || finishReason !== undefined) {
+        if (signal.aborted || finishReason !== undefined || replayEnvelopeTooLarge) {
           break;
         }
       }
 
       if (signal.aborted) {
         return this.#settleCancelled();
+      }
+
+      if (replayEnvelopeTooLarge) {
+        return this.#settleReplayEnvelopeTooLarge();
       }
 
       if (finishReason === undefined) {
@@ -572,16 +720,6 @@ export class AgentSession {
         return this.#settleUnknownFinish(rawFinishReason);
       }
 
-      await this.#emit({ type: "model_message_completed", text: answer });
-      if (signal.aborted) {
-        return this.#settleCancelled();
-      }
-      if (limits?.maxTokens !== undefined && !usageWasReported) {
-        return this.#settleTokenUsageMissing();
-      }
-      if (limits?.maxTokens !== undefined && reportedTokens >= limits.maxTokens) {
-        return this.#settleTokenLimitExceeded();
-      }
       if (finishReason === "stop") {
         if (completedCalls.length > 0 || assemblingCalls.size > 0) {
           return this.#settleProtocolInvalid(
@@ -590,15 +728,9 @@ export class AgentSession {
               : "The model stopped with an incomplete tool request.",
           );
         }
-        const result: RunResult = { status: "completed", answer };
-        return this.#settle(result);
-      }
-
-      if (assemblingCalls.size > 0) {
+      } else if (assemblingCalls.size > 0) {
         return this.#settleProtocolInvalid("The model finished with an incomplete tool request.");
-      }
-
-      if (completedCalls.length === 0) {
+      } else if (completedCalls.length === 0) {
         const result: RunResult = {
           status: "failed",
           error: {
@@ -621,6 +753,48 @@ export class AgentSession {
         }
         uniqueCalls.set(call.id, call);
       }
+      const toolIntents = completedCalls.map((call) => this.#createToolIntent(call));
+
+      if (this.#durableContext !== undefined) {
+        const completedResponseRecord: SessionRecord = {
+          schemaVersion: 3,
+          sequence: this.#nextSequence,
+          record: {
+            type: "model_response_completed",
+            runId: this.#activeRunId as string,
+            turn: modelTurns,
+            attempt: attemptNumber,
+            targetIdentity: this.#durableContext.targetIdentity,
+            response: {
+              text: answer,
+              ...(reasoning.length === 0 ? {} : { reasoning }),
+              toolCalls: completedCalls,
+              toolIntents,
+              finishReason,
+              ...(responseUsage === undefined ? {} : { usage: responseUsage }),
+            },
+          },
+        };
+        if (!isSessionRecordWithinSizeLimit(completedResponseRecord)) {
+          return this.#settleReplayEnvelopeTooLarge();
+        }
+        await this.#appendRecord(completedResponseRecord);
+        this.#activeProviderAttempt = undefined;
+      }
+      await this.#emit({ type: "model_message_completed", text: answer });
+      if (signal.aborted) {
+        return this.#settleCancelled();
+      }
+      if (limits?.maxTokens !== undefined && !usageWasReported) {
+        return this.#settleTokenUsageMissing();
+      }
+      if (limits?.maxTokens !== undefined && reportedTokens >= limits.maxTokens) {
+        return this.#settleTokenLimitExceeded();
+      }
+      if (finishReason === "stop") {
+        const result: RunResult = { status: "completed", answer };
+        return this.#settle(result);
+      }
 
       messages.push({
         role: "assistant",
@@ -629,116 +803,137 @@ export class AgentSession {
         toolCalls: completedCalls,
       });
       for (const call of uniqueCalls.values()) {
-        if (signal.aborted) {
-          return this.#settleCancelled();
+        const terminal = await this.#dispatchToolCall({
+          call,
+          emitRequested: true,
+          emitStarted: true,
+          messages,
+          signal,
+          toolResultsById,
+        });
+        if (terminal !== undefined) {
+          return terminal;
         }
-        await this.#emit({ type: "tool_requested", callId: call.id, name: call.name });
-        if (signal.aborted) {
-          return this.#settleCancelled();
-        }
-        const recordedCall = toolResultsById.get(call.id);
-        if (recordedCall !== undefined) {
-          if (
-            recordedCall.call.name !== call.name ||
-            recordedCall.call.argumentsJson !== call.argumentsJson
-          ) {
-            return this.#settleProtocolInvalid(
-              "The model reused a tool call ID with different input.",
-            );
-          }
-          await this.#appendToolResult(messages, call, recordedCall.result);
-          continue;
-        }
-        const adapter = this.#tools?.resolve(call.name);
-        if (adapter === undefined) {
-          const result: ToolResult = {
-            status: "failed",
-            error: {
-              code: "unknown_tool",
-              message: `Unknown tool: ${call.name}`,
-            },
-          };
-          toolResultsById.set(call.id, { call, result });
-          await this.#appendToolResult(messages, call, result);
-          continue;
-        }
-        const preparedCall = adapter.prepare(call.argumentsJson);
-        if (preparedCall.status === "failed") {
-          toolResultsById.set(call.id, { call, result: preparedCall });
-          await this.#appendToolResult(messages, call, preparedCall);
-          continue;
-        }
-        const permissionInput: PermissionPolicyInput = {
-          callId: call.id,
-          name: call.name,
-          effect: adapter.effect,
-          scope: "call",
-          subject: preparedCall.permissionSubject,
-        };
-        const policyDecision = this.#permissions?.decide(permissionInput) ?? "deny";
-        if (signal.aborted) {
-          return this.#settleCancelled();
-        }
-        let decision: "allow" | "deny";
-        if (policyDecision === "ask") {
-          const runId = this.#activeRunId;
-          if (runId === undefined) {
-            throw new Error("Cannot request permission without an active run ID.");
-          }
-          const requestId = `${runId}:${call.id}`;
-          const pendingDecision = this.#createPendingPermissionDecision(requestId, signal);
-          try {
-            await this.#emit({
-              type: "tool_permission_requested",
-              requestId,
-              ...permissionInput,
-            });
-            const userDecision = await pendingDecision.promise;
-            if (userDecision === undefined) {
-              return this.#settleCancelled();
-            }
-            decision = userDecision;
-            await this.#emit({
-              type: "tool_permission_decided",
-              requestId,
-              decision,
-              ...permissionInput,
-            });
-          } finally {
-            pendingDecision.cancel();
-          }
-        } else {
-          decision = policyDecision;
-          await this.#emit({
-            type: "tool_permission_decided",
-            decision,
-            ...permissionInput,
-          });
-        }
-        if (signal.aborted) {
-          return this.#settleCancelled();
-        }
-        if (decision !== "allow") {
-          const result: ToolResult = {
-            status: "failed",
-            error: {
-              code: "permission_denied",
-              message: `Permission denied for tool: ${call.name}`,
-            },
-          };
-          toolResultsById.set(call.id, { call, result });
-          await this.#appendToolResult(messages, call, result);
-          continue;
-        }
-        await this.#emit({ type: "tool_started", callId: call.id, name: call.name });
-        if (signal.aborted) {
-          return this.#settleCancelled();
-        }
-        const result = await preparedCall.execute({ signal, callId: call.id, toolName: call.name });
-        toolResultsById.set(call.id, { call, result });
-        await this.#appendToolResult(messages, call, result);
       }
     }
+  }
+
+  async #dispatchToolCall(options: {
+    readonly call: ToolCall;
+    readonly emitRequested: boolean;
+    readonly emitStarted: boolean;
+    readonly messages: ModelMessage[];
+    readonly reusablePermission?: PermissionPolicyInput | undefined;
+    readonly signal: AbortSignal;
+    readonly toolResultsById: Map<string, { readonly call: ToolCall; readonly result: ToolResult }>;
+  }): Promise<RunResult | undefined> {
+    const { call, messages, signal, toolResultsById } = options;
+    if (signal.aborted) {
+      return this.#settleCancelled();
+    }
+    if (options.emitRequested) {
+      await this.#emit({ type: "tool_requested", callId: call.id, name: call.name });
+    }
+    if (signal.aborted) {
+      return this.#settleCancelled();
+    }
+    const recordedCall = toolResultsById.get(call.id);
+    if (recordedCall !== undefined) {
+      if (
+        recordedCall.call.name !== call.name ||
+        recordedCall.call.argumentsJson !== call.argumentsJson
+      ) {
+        return this.#settleProtocolInvalid("The model reused a tool call ID with different input.");
+      }
+      await this.#appendToolResult(messages, call, recordedCall.result);
+      return undefined;
+    }
+    const adapter = this.#tools?.resolve(call.name);
+    if (adapter === undefined) {
+      const result: ToolResult = {
+        status: "failed",
+        error: { code: "unknown_tool", message: `Unknown tool: ${call.name}` },
+      };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    const preparedCall = adapter.prepare(call.argumentsJson);
+    if (preparedCall.status === "failed") {
+      toolResultsById.set(call.id, { call, result: preparedCall });
+      await this.#appendToolResult(messages, call, preparedCall);
+      return undefined;
+    }
+    const permissionInput: PermissionPolicyInput = {
+      callId: call.id,
+      name: call.name,
+      effect: adapter.effect,
+      scope: "call",
+      subject: preparedCall.permissionSubject,
+    };
+    const policyDecision = this.#permissions?.decide(permissionInput) ?? "deny";
+    if (signal.aborted) {
+      return this.#settleCancelled();
+    }
+    let decision: "allow" | "deny";
+    if (
+      options.reusablePermission !== undefined &&
+      policyDecision !== "deny" &&
+      samePermissionInput(options.reusablePermission, permissionInput)
+    ) {
+      decision = "allow";
+    } else if (policyDecision === "ask") {
+      const runId = this.#activeRunId;
+      if (runId === undefined) {
+        throw new Error("Cannot request permission without an active run ID.");
+      }
+      const requestId = `${runId}:${call.id}`;
+      const pendingDecision = this.#createPendingPermissionDecision(requestId, signal);
+      try {
+        await this.#emit({ type: "tool_permission_requested", requestId, ...permissionInput });
+        const userDecision = await pendingDecision.promise;
+        if (userDecision === undefined) {
+          return this.#settleCancelled();
+        }
+        decision = userDecision;
+        await this.#emit({
+          type: "tool_permission_decided",
+          requestId,
+          decision,
+          ...permissionInput,
+        });
+      } finally {
+        pendingDecision.cancel();
+      }
+    } else {
+      decision = policyDecision;
+      await this.#emit({ type: "tool_permission_decided", decision, ...permissionInput });
+    }
+    if (signal.aborted) {
+      return this.#settleCancelled();
+    }
+    if (decision !== "allow") {
+      const result: ToolResult = {
+        status: "failed",
+        error: {
+          code: "permission_denied",
+          message: `Permission denied for tool: ${call.name}`,
+        },
+      };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    if (options.emitStarted) {
+      await this.#emit({ type: "tool_started", callId: call.id, name: call.name });
+    }
+    if (signal.aborted) {
+      return this.#settleCancelled();
+    }
+    const result = await preparedCall.execute({ signal, callId: call.id, toolName: call.name });
+    toolResultsById.set(call.id, { call, result });
+    await this.#appendToolResult(messages, call, result);
+    return undefined;
   }
 
   async #settleIncompleteStream(): Promise<RunResult> {
@@ -747,6 +942,17 @@ export class AgentSession {
       error: {
         code: "model_stream_incomplete",
         message: "The model stream ended without a finish event.",
+      },
+    };
+    return this.#settle(result);
+  }
+
+  async #settleReplayEnvelopeTooLarge(): Promise<RunResult> {
+    const result: RunResult = {
+      status: "failed",
+      error: {
+        code: "replay_envelope_too_large",
+        message: "The complete model response exceeds the durable replay envelope limit.",
       },
     };
     return this.#settle(result);
@@ -871,11 +1077,32 @@ export class AgentSession {
       return this.#terminalResult;
     }
     this.#terminalResult = result;
+    await this.#interruptActiveProviderAttempt(result);
     if (interrupted) {
       await this.#emit({ type: "session_interrupted", reason: "cancelled" });
     }
     await this.#emit({ type: "session_settled", result });
     return result;
+  }
+
+  async #interruptActiveProviderAttempt(result: RunResult): Promise<void> {
+    const attempt = this.#activeProviderAttempt;
+    if (attempt === undefined) {
+      return;
+    }
+    await this.#appendRecord({
+      schemaVersion: 3,
+      sequence: this.#nextSequence,
+      record: {
+        type: "provider_attempt_interrupted",
+        runId: attempt.runId,
+        turn: attempt.turn,
+        attempt: attempt.attempt,
+        reason: "run_terminal",
+        result,
+      },
+    });
+    this.#activeProviderAttempt = undefined;
   }
 
   async #appendToolResult(
@@ -945,25 +1172,70 @@ export class AgentSession {
         throw new Error("Cannot persist a session event without an active run ID.");
       }
       try {
-        await this.#store.append({
-          schemaVersion: 2,
-          runId,
-          sequence: this.#nextSequence,
-          event: canonicalEvent,
-        });
+        await this.#appendRecord(
+          this.#durableContext === undefined
+            ? {
+                schemaVersion: 2,
+                runId,
+                sequence: this.#nextSequence,
+                event: canonicalEvent,
+              }
+            : {
+                schemaVersion: 3,
+                sequence: this.#nextSequence,
+                record: { type: "runtime_event", runId, event: canonicalEvent },
+              },
+        );
       } catch {
         throw new SessionPersistenceError();
       }
-      this.#nextSequence += 1;
     }
     for (const listener of this.#listeners) {
       listener(event);
     }
   }
+
+  async #appendRecord(record: SessionRecord): Promise<void> {
+    try {
+      await this.#store.append(record);
+    } catch {
+      throw new SessionPersistenceError();
+    }
+    this.#nextSequence += 1;
+  }
+
+  #createToolIntent(call: ToolCall): SessionToolIntent {
+    const adapter = this.#tools?.resolve(call.name);
+    return {
+      callId: call.id,
+      name: call.name,
+      argumentsDigest: `sha256:${createHash("sha256").update(call.argumentsJson).digest("hex")}`,
+      ...(adapter === undefined
+        ? {}
+        : {
+            effect: adapter.effect,
+            definitionDigest: adapter.definitionDigest,
+          }),
+      replay: adapter?.replay ?? "never",
+    };
+  }
 }
 
 function isNonnegativeSafeInteger(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
+}
+
+const maximumReplayFieldBytes = 512 * 1024;
+const maximumReplayToolCalls = 128;
+
+function samePermissionInput(left: PermissionPolicyInput, right: PermissionPolicyInput): boolean {
+  return (
+    left.callId === right.callId &&
+    left.name === right.name &&
+    left.effect === right.effect &&
+    left.scope === right.scope &&
+    JSON.stringify(left.subject) === JSON.stringify(right.subject)
+  );
 }
 
 function areOptionalUsageDetailsValid(
