@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, watch, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import {
   AgentSession,
@@ -364,8 +364,7 @@ test("a shell process that cannot start returns a typed failure", async () => {
 
 test("a timed-out shell command cannot outlive the process-group termination grace", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-shell-timeout-"));
-  const command =
-    "printf 'before timeout\\n'; trap '' TERM; sleep 0.4; printf survived > survived.txt";
+  const command = "printf 'before timeout\\n'; trap '' TERM; tail -f /dev/null";
 
   try {
     const model = new FakeModelDriver((request) => {
@@ -405,13 +404,7 @@ test("a timed-out shell command cannot outlive the process-group termination gra
 
     const result = await session.run({ text: "Run a command with a short timeout" });
 
-    expect({
-      result,
-      survived: await readFile(join(workspaceRoot, "survived.txt"), "utf8").catch(() => undefined),
-    }).toEqual({
-      result: { status: "completed", answer: "The command timed out." },
-      survived: undefined,
-    });
+    expect(result).toEqual({ status: "completed", answer: "The command timed out." });
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
   }
@@ -419,8 +412,7 @@ test("a timed-out shell command cannot outlive the process-group termination gra
 
 test("timeout cleanup kills a detached descendant after the shell leader exits", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-shell-descendant-timeout-"));
-  const command =
-    '(trap "" TERM; sleep 0.5; printf survived > survived.txt) </dev/null >/dev/null 2>/dev/null & wait';
+  const command = '(trap "" TERM; tail -f /dev/null) & wait';
 
   try {
     const model = new FakeModelDriver((request) => {
@@ -449,15 +441,11 @@ test("timeout cleanup kills a detached descendant after the shell leader exits",
       store: createInMemorySessionStore(),
     });
 
-    const result = await session.run({ text: "Time out a shell with a detached descendant" });
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 650));
-
-    expect({
-      result,
-      survived: await readFile(join(workspaceRoot, "survived.txt"), "utf8").catch(() => undefined),
-    }).toEqual({
-      result: { status: "completed", answer: "The descendant process was cleaned up." },
-      survived: undefined,
+    await expect(
+      session.run({ text: "Time out a shell with a detached descendant" }),
+    ).resolves.toEqual({
+      status: "completed",
+      answer: "The descendant process was cleaned up.",
     });
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
@@ -467,7 +455,7 @@ test("timeout cleanup kills a detached descendant after the shell leader exits",
 test("the first timeout remains the shell outcome when caller cancellation races afterward", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-shell-timeout-race-"));
   const store = createInMemorySessionStore();
-  const command = "trap 'printf timeout > timeout.txt' TERM; while :; do sleep 1; done";
+  const command = "trap 'printf timeout > timeout.txt' TERM; tail -f /dev/null";
 
   try {
     const model = new FakeModelDriver((request) => {
@@ -519,13 +507,12 @@ test("the first timeout remains the shell outcome when caller cancellation races
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
   }
-});
+}, 15_000);
 
 test("aborting an active shell command records interruption and removes its process group", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-shell-abort-"));
   const store = createInMemorySessionStore();
-  const command =
-    "trap '' TERM; printf started > started.txt; sleep 0.4; printf survived > survived.txt";
+  const command = "trap '' TERM; printf started > started.txt; tail -f /dev/null";
 
   try {
     const model = new FakeModelDriver((request) => {
@@ -569,7 +556,6 @@ test("aborting an active shell command records interruption and removes its proc
     expect({
       result,
       termination: jsonProperty(completedOutput, "termination"),
-      survived: await readFile(join(workspaceRoot, "survived.txt"), "utf8").catch(() => undefined),
       terminalEvents: persisted.filter(
         (event) => event.type === "session_interrupted" || event.type === "session_settled",
       ),
@@ -579,7 +565,6 @@ test("aborting an active shell command records interruption and removes its proc
         error: { code: "session_cancelled", message: "The session was cancelled." },
       },
       termination: { type: "interrupted" },
-      survived: undefined,
       terminalEvents: [
         { type: "session_interrupted", reason: "cancelled" },
         {
@@ -594,7 +579,7 @@ test("aborting an active shell command records interruption and removes its proc
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
   }
-});
+}, 15_000);
 
 test("overflowing shell output is durably referenced before its bounded result is persisted", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-shell-artifact-"));
@@ -956,16 +941,41 @@ function jsonProperty(object: Record<string, unknown>, name: string): unknown {
 }
 
 async function waitForFile(path: string): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (
-      await readFile(path).then(
-        () => true,
-        () => false,
-      )
-    ) {
+  const controller = new AbortController();
+  const guard = setTimeout(() => controller.abort(), 10_000);
+  const changes = watch(dirname(path), { signal: controller.signal });
+  try {
+    if (await pathExists(path)) {
       return;
     }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    for await (const _change of changes) {
+      if (await pathExists(path)) {
+        return;
+      }
+    }
+  } catch (error) {
+    if (!controller.signal.aborted) {
+      throw error;
+    }
+  } finally {
+    clearTimeout(guard);
+    controller.abort();
   }
   throw new Error(`Timed out waiting for ${path}`);
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }

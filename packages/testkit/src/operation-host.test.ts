@@ -9,7 +9,7 @@ import {
   createJsonlOperationStore,
   type OperationStore,
 } from "@adam-agent/agent";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 
 test("ExtensionHost starts one durable operation and reuses it for the same idempotent input", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-host-"));
@@ -518,9 +518,16 @@ test("ExtensionHost settles a progress persistence failure without waiting for t
 });
 
 test("ExtensionHost reports recovery-required when terminal persistence fails", async () => {
+  vi.useFakeTimers();
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-terminal-persistence-"));
   const workspaceRoot = join(testRoot, "workspace");
   const packageRoot = join(testRoot, "extension");
+  const executeEnteredKey = `__adamOperationTerminalExecute${Date.now()}${Math.random()}`;
+  let signalExecuteEntered = (): void => undefined;
+  const executeEntered = new Promise<void>((resolve) => {
+    signalExecuteEntered = resolve;
+  });
+  (globalThis as Record<string, unknown>)[executeEnteredKey] = signalExecuteEntered;
   const durableStore = createInMemoryOperationStore();
   const store: OperationStore = {
     append(record) {
@@ -535,7 +542,10 @@ test("ExtensionHost reports recovery-required when terminal persistence fails", 
 
   try {
     await mkdir(workspaceRoot);
-    await writeOperationExtension(packageRoot, "await new Promise(() => {});");
+    await writeOperationExtension(
+      packageRoot,
+      `globalThis[${JSON.stringify(executeEnteredKey)}](); await new Promise(() => {});`,
+    );
     const host = createExtensionHost({
       capabilities: [],
       extensions: [
@@ -559,6 +569,8 @@ test("ExtensionHost reports recovery-required when terminal persistence fails", 
       idempotencyKey: "review-terminal-persistence-1",
       input: { revision: "recovery" },
     });
+    await executeEntered;
+    await vi.advanceTimersByTimeAsync(1);
     const records = [];
     for await (const record of host.operations.events({ operationId: started.operationId })) {
       records.push(record);
@@ -570,6 +582,8 @@ test("ExtensionHost reports recovery-required when terminal persistence fails", 
       status: "recovery_required",
     });
   } finally {
+    vi.useRealTimers();
+    delete (globalThis as Record<string, unknown>)[executeEnteredKey];
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -1358,11 +1372,21 @@ test.each([
 );
 
 test("ExtensionHost bounds an uncooperative reconciliation hook", async () => {
+  vi.useFakeTimers();
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-deadline-"));
   const workspaceRoot = join(testRoot, "workspace");
   const packageRoot = join(testRoot, "extension");
   const controlKey = `__adamOperationRecoveryDeadline${Date.now()}${Math.random()}`;
-  const control = { executeCalls: 0, hangReconcile: true, reconcileCalls: 0 };
+  let signalReconcileEntered = (): void => undefined;
+  const reconcileEntered = new Promise<void>((resolve) => {
+    signalReconcileEntered = resolve;
+  });
+  const control = {
+    executeCalls: 0,
+    hangReconcile: true,
+    reconcileCalls: 0,
+    reconcileEntered: signalReconcileEntered,
+  };
   (globalThis as Record<string, unknown>)[controlKey] = control;
 
   try {
@@ -1416,19 +1440,24 @@ test("ExtensionHost bounds an uncooperative reconciliation hook", async () => {
     });
     await recoveredHost.loadConfiguredExtensions();
 
-    await expect(recoveredHost.operations.recover(started.operationId)).rejects.toMatchObject({
+    const recovery = recoveredHost.operations.recover(started.operationId);
+    const recoveryExpectation = expect(recovery).rejects.toMatchObject({
       code: "operation_reconciliation_failed",
       name: "OperationHostError",
     });
+    await reconcileEntered;
+    await vi.advanceTimersByTimeAsync(10);
+    await recoveryExpectation;
     expect(control).toMatchObject({ executeCalls: 1, reconcileCalls: 1 });
     expect(
       (await durableStore.read(started.operationId)).map((record) => record.event.type),
     ).toEqual(["operation_started", "operation_reconciliation_started"]);
   } finally {
+    vi.useRealTimers();
     delete (globalThis as Record<string, unknown>)[controlKey];
     await rm(testRoot, { recursive: true, force: true });
   }
-}, 1_000);
+});
 
 test("ExtensionHost rereads a durable recovery terminal after an ambiguous append failure", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-ambiguous-"));
@@ -2012,15 +2041,23 @@ test("ExtensionHost persists one idempotent cancel request and one cancelled ter
 });
 
 test("ExtensionHost enforces a caller-tightened deadline as one failed terminal fact", async () => {
+  vi.useFakeTimers();
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-deadline-"));
   const workspaceRoot = join(testRoot, "workspace");
   const packageRoot = join(testRoot, "extension");
+  const executeEnteredKey = `__adamOperationDeadlineExecute${Date.now()}${Math.random()}`;
+  let signalExecuteEntered = (): void => undefined;
+  const executeEntered = new Promise<void>((resolve) => {
+    signalExecuteEntered = resolve;
+  });
+  (globalThis as Record<string, unknown>)[executeEnteredKey] = signalExecuteEntered;
 
   try {
     await mkdir(workspaceRoot);
     await writeOperationExtension(
       packageRoot,
-      `if (!context.signal.aborted) {
+      `globalThis[${JSON.stringify(executeEnteredKey)}]();
+      if (!context.signal.aborted) {
         await new Promise((resolve) => context.signal.addEventListener("abort", resolve, { once: true }));
       }
       return { accepted: true, revision: input.revision };`,
@@ -2048,6 +2085,8 @@ test("ExtensionHost enforces a caller-tightened deadline as one failed terminal 
       idempotencyKey: "review-deadline-1",
       input: { revision: "mno345" },
     });
+    await executeEntered;
+    await vi.advanceTimersByTimeAsync(1);
     const records = [];
     for await (const record of host.operations.events({ operationId: started.operationId })) {
       records.push(record);
@@ -2061,6 +2100,8 @@ test("ExtensionHost enforces a caller-tightened deadline as one failed terminal 
       },
     });
   } finally {
+    vi.useRealTimers();
+    delete (globalThis as Record<string, unknown>)[executeEnteredKey];
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -2492,13 +2533,23 @@ test("ExtensionHost disables new work but reports a non-settling active operatio
 });
 
 test("ExtensionHost retains a deadline-failed extension while its handler is still running", async () => {
+  vi.useFakeTimers();
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-disable-deadline-"));
   const workspaceRoot = join(testRoot, "workspace");
   const packageRoot = join(testRoot, "extension");
+  const executeEnteredKey = `__adamOperationDisableExecute${Date.now()}${Math.random()}`;
+  let signalExecuteEntered = (): void => undefined;
+  const executeEntered = new Promise<void>((resolve) => {
+    signalExecuteEntered = resolve;
+  });
+  (globalThis as Record<string, unknown>)[executeEnteredKey] = signalExecuteEntered;
 
   try {
     await mkdir(workspaceRoot);
-    await writeOperationExtension(packageRoot, "await new Promise(() => {});");
+    await writeOperationExtension(
+      packageRoot,
+      `globalThis[${JSON.stringify(executeEnteredKey)}](); await new Promise(() => {});`,
+    );
     const host = createExtensionHost({
       capabilities: [],
       extensions: [
@@ -2523,11 +2574,15 @@ test("ExtensionHost retains a deadline-failed extension while its handler is sti
       idempotencyKey: "review-disable-deadline-1",
       input: { revision: "deadline-pending" },
     });
+    await executeEntered;
+    await vi.advanceTimersByTimeAsync(1);
     for await (const _record of host.operations.events({ operationId: started.operationId })) {
       // The durable deadline terminal fact is the synchronization point.
     }
 
-    await expect(host.disableExtension("fixture.extension")).resolves.toMatchObject({
+    vi.useRealTimers();
+    const disabling = host.disableExtension("fixture.extension");
+    await expect(disabling).resolves.toMatchObject({
       extensionId: "fixture.extension",
       status: "disabled_with_pending_operations",
     });
@@ -2536,6 +2591,8 @@ test("ExtensionHost retains a deadline-failed extension while its handler is sti
       status: "failed",
     });
   } finally {
+    vi.useRealTimers();
+    delete (globalThis as Record<string, unknown>)[executeEnteredKey];
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -3100,6 +3157,7 @@ async function writeGrantSensitiveRecoveryExtension(
     reconcile(input) {
       const control = globalThis[${JSON.stringify(controlKey)}];
       control.reconcileCalls += 1;
+      control.reconcileEntered?.();
       if (control.hangReconcile === true) {
         return new Promise(() => {});
       }

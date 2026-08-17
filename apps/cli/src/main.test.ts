@@ -1,8 +1,18 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  open,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  watch,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -462,23 +472,17 @@ describe("one-shot CLI", () => {
         stdinPath: join(testRoot, "stdin"),
       });
 
-      expect({
-        ...result,
-        survived: await readFile(join(workspaceRoot, "survived.txt"), "utf8").catch(
-          () => undefined,
-        ),
-      }).toEqual({
+      expect(result).toEqual({
         stdout: "",
         stderr:
-          'Allow run_shell at ".": "trap \'\' TERM; printf started > started.txt; sleep 5; printf survived > survived.txt" [y/N] The session was cancelled.\n',
+          'Allow run_shell at ".": "trap \'\' TERM; printf started > started.txt; tail -f /dev/null" [y/N] The session was cancelled.\n',
         exitCode: 130,
         signal: null,
-        survived: undefined,
       });
     } finally {
       await rm(testRoot, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("edits, verifies, and persists one approved coding task", async () => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-coding-task-"));
@@ -1201,16 +1205,41 @@ function cliEnvironment(
 }
 
 async function waitForFile(path: string): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (
-      await readFile(path).then(
-        () => true,
-        () => false,
-      )
-    ) {
+  const controller = new AbortController();
+  const guard = setTimeout(() => controller.abort(), 10_000);
+  const changes = watch(dirname(path), { signal: controller.signal });
+  try {
+    if (await pathExists(path)) {
       return;
     }
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+    for await (const _change of changes) {
+      if (await pathExists(path)) {
+        return;
+      }
+    }
+  } catch (error) {
+    if (!controller.signal.aborted) {
+      throw error;
+    }
+  } finally {
+    clearTimeout(guard);
+    controller.abort();
   }
   throw new Error(`Timed out waiting for ${path}`);
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await stat(path);
+    return true;
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
 }

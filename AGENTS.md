@@ -67,6 +67,8 @@ Build a lightweight, inspectable local coding agent. Make the core coding path r
 - Before writing a behavior test, name the public interface and observable result under test. Work one failing behavior test and the minimum implementation to pass it at a time.
 - Do not pre-write a horizontal test suite, test private internals, or mock Adam-owned modules. Fake external providers, clocks, processes, filesystems, MCP servers, and Web sources only at their real seams.
 - Test through module interfaces and observable runtime events rather than private implementation state.
+- Synchronize concurrent and process tests on causal observables such as events, IPC, filesystem notifications, stream output, or child closure. Never use polling intervals, arbitrary sleeps, elapsed-time assertions, or wait-then-assert-absence as success criteria; timeouts are failure and cleanup guards only.
+- Test deadline and backoff policy with a fake clock. Use real time only when timer or OS-process integration is itself under test and no causal fake-clock seam exists; block fixtures on events or open streams instead of finite sleeps.
 - Use deterministic provider streams for tool ordering, rejection, cancellation, malformed output, compaction, and retry tests.
 - Add real-process tests for shell cancellation, MCP lifecycle, path confinement, and signal handling when the corresponding adapters exist.
 - Add PTY or real-terminal coverage for resize, bracketed paste, wide-character input, permission prompts, interrupt, and cleanup when the interactive terminal exists.
