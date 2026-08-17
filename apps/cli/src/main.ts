@@ -47,8 +47,7 @@ const verificationCommand = "printf cli-verified";
 const promptEscapingPrompt = "Run the prompt escaping command";
 const promptEscapingCommand = "printf first\n\u001b[31m\u202ecommand\u009b\u2028forged";
 const longVerificationPrompt = "Run the long repository verification command";
-const longVerificationCommand =
-  "trap '' TERM; printf started > started.txt; sleep 5; printf survived > survived.txt";
+const longVerificationCommand = "trap '' TERM; printf started > started.txt; tail -f /dev/null";
 const codingTaskPrompt = "Update the demo file and verify it";
 const multiFilePatchPrompt = "Apply the demo multi-file patch";
 const truncatedAnswerPrompt = "Return a deliberately truncated answer";

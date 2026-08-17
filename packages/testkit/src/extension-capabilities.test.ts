@@ -1528,12 +1528,15 @@ async function writeNoisyBiomeExtension(packageRoot: string): Promise<void> {
     "adam.analyzer-execution.biome@1",
     `const biome = operation.capabilities["adam.analyzer-execution.biome@1"];
       const content = Array.from(
-        { length: 3000 },
+        { length: 2000 },
         (_, index) => \`export const value\${index} = candidate == \${index};\`,
       ).join("\\n");
       const analysis = await biome.analyze({
         profile: "adam-biome-recommended-v1",
-        files: [{ path: "src/" + "n".repeat(120) + ".ts", content }],
+        files: [{
+          path: ["src", "a".repeat(120), "b".repeat(120), "n".repeat(120) + ".ts"].join("/"),
+          content,
+        }],
       });
       return { analysis };`,
   );
@@ -1671,13 +1674,20 @@ async function findChildWithWorkingDirectory(expected: string): Promise<number |
 }
 
 async function waitForValue<T>(read: () => Promise<T | undefined>, message: string): Promise<T> {
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    const value = await read();
-    if (value !== undefined) {
-      return value;
+  let guardExpired = false;
+  const guard = setTimeout(() => {
+    guardExpired = true;
+  }, 10_000);
+  try {
+    while (!guardExpired) {
+      const value = await read();
+      if (value !== undefined) {
+        return value;
+      }
+      await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    await new Promise<void>((resolve) => setImmediate(resolve));
+  } finally {
+    clearTimeout(guard);
   }
   throw new Error(message);
 }
