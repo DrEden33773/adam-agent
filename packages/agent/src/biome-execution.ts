@@ -136,7 +136,12 @@ async function runBiomeProcess(options: {
     let stderrBytes = 0;
     let failure: Error | undefined;
     let closed = false;
-    const terminate = () => signalProcessGroup(child.pid, "SIGKILL");
+    const terminate = () => {
+      signalProcessGroup(child.pid, "SIGKILL");
+      if (!child.killed) {
+        child.kill("SIGKILL");
+      }
+    };
     const fail = (error: Error) => {
       failure ??= error;
       terminate();
