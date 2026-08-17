@@ -56,6 +56,7 @@ export {
 export {
   createInMemoryOperationStore,
   createJsonlOperationStore,
+  type OperationArtifactPublishedEvent,
   type OperationCancellationReason,
   type OperationCancelledEvent,
   type OperationCancelRequestedEvent,
@@ -65,7 +66,9 @@ export {
   type OperationFailedEvent,
   type OperationFailure,
   type OperationIdempotencyScope,
+  type OperationInspectionRequiredEvent,
   type OperationProgressEvent,
+  type OperationReconciliationStartedEvent,
   type OperationStartedEvent,
   type OperationStore,
   OperationStoreError,

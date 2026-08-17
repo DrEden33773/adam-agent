@@ -5,7 +5,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 import type {
+  ExtensionArtifactSummary,
   ExtensionJsonValue,
+  ExtensionOperationArtifactPublishedEvent,
   ExtensionOperationCancellationReason,
   ExtensionOperationCancelledEvent,
   ExtensionOperationCancelRequestedEvent,
@@ -13,7 +15,9 @@ import type {
   ExtensionOperationEvent,
   ExtensionOperationFailedEvent,
   ExtensionOperationFailure,
+  ExtensionOperationInspectionRequiredEvent,
   ExtensionOperationProgressEvent,
+  ExtensionOperationReconciliationStartedEvent,
   ExtensionOperationStartedEvent,
 } from "@adam-agent/extension-api";
 import {
@@ -28,11 +32,14 @@ import {
   EXTENSION_OPERATION_PROGRESS_MAX_BYTES,
   EXTENSION_OPERATION_PROGRESS_MAX_RECORDS,
   EXTENSION_OPERATION_PROGRESS_RECORD_MAX_BYTES,
+  EXTENSION_RECORD_MAX_BYTES,
 } from "@adam-agent/extension-api";
 import { valid } from "semver";
 import { z } from "zod";
 
 export type OperationStartedEvent = ExtensionOperationStartedEvent;
+
+export type LegacyOperationStartedEvent = Omit<ExtensionOperationStartedEvent, "definitionDigest">;
 
 export type OperationIdempotencyScope = {
   readonly contributionId: string;
@@ -43,6 +50,8 @@ export type OperationIdempotencyScope = {
 };
 
 export type OperationProgressEvent = ExtensionOperationProgressEvent;
+
+export type OperationArtifactPublishedEvent = ExtensionOperationArtifactPublishedEvent;
 
 export type OperationCancellationReason = ExtensionOperationCancellationReason;
 
@@ -56,20 +65,48 @@ export type OperationFailure = ExtensionOperationFailure;
 
 export type OperationFailedEvent = ExtensionOperationFailedEvent;
 
+export type OperationInspectionRequiredEvent = ExtensionOperationInspectionRequiredEvent;
+
+export type OperationReconciliationStartedEvent = ExtensionOperationReconciliationStartedEvent;
+
 export type OperationEvent = ExtensionOperationEvent;
 
+type LegacyOperationEvent =
+  | LegacyOperationStartedEvent
+  | OperationProgressEvent
+  | OperationCancelRequestedEvent
+  | OperationCompletedEvent
+  | OperationCancelledEvent
+  | OperationFailedEvent;
+
+type StoredOperationEvent = LegacyOperationEvent | OperationEvent;
+
 type OperationTerminalEvent = Extract<
-  OperationEvent,
-  { readonly type: "operation_cancelled" | "operation_completed" | "operation_failed" }
+  StoredOperationEvent,
+  {
+    readonly type:
+      | "operation_cancelled"
+      | "operation_completed"
+      | "operation_failed"
+      | "operation_inspection_required";
+  }
 >;
 
-export type OperationEventRecord = {
-  readonly schemaVersion: 1;
+type OperationEventRecordBase = {
   readonly operationId: string;
   readonly sequence: number;
   readonly recordedAt: string;
-  readonly event: OperationEvent;
 };
+
+export type OperationEventRecord =
+  | (OperationEventRecordBase & {
+      readonly schemaVersion: 1;
+      readonly event: LegacyOperationEvent;
+    })
+  | (OperationEventRecordBase & {
+      readonly schemaVersion: 2;
+      readonly event: OperationEvent;
+    });
 
 export interface OperationStore {
   readonly projectId?: string;
@@ -106,7 +143,7 @@ const canonicalTimestampSchema = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u)
   .refine(isCanonicalTimestamp);
-const operationStartedEventSchema = z.strictObject({
+const legacyOperationStartedEventSchema = z.strictObject({
   type: z.literal("operation_started"),
   contributionId: z.string().min(1).max(256),
   deadlineAt: canonicalTimestampSchema,
@@ -120,6 +157,15 @@ const operationStartedEventSchema = z.strictObject({
   input: z.json(),
   inputDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+});
+const operationStartedEventSchema = legacyOperationStartedEventSchema.extend({
+  definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+});
+const operationReconciliationStartedEventSchema = z.strictObject({
+  type: z.literal("operation_reconciliation_started"),
+  attemptId: z.uuid(),
+  attemptNumber: z.number().int().positive(),
+  definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
 });
 const operationProgressEventSchema = z.strictObject({
   type: z.literal("operation_progress"),
@@ -149,6 +195,24 @@ const artifactSummarySchema = z.strictObject({
     projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   }),
 });
+const operationArtifactPublishedEventSchema = z.strictObject({
+  type: z.literal("operation_artifact_published"),
+  artifact: artifactSummarySchema,
+});
+const recordSummarySchema = z.strictObject({
+  byteCount: z.number().int().nonnegative().max(EXTENSION_RECORD_MAX_BYTES),
+  contract: z.strictObject({
+    id: z.string().min(1).max(256),
+    version: z.number().int().positive(),
+  }),
+  digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  key: z.string().min(1).max(512),
+  provenance: artifactSummarySchema.shape.provenance,
+});
+const operationEvidenceReferenceSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("artifact"), artifact: artifactSummarySchema }),
+  z.strictObject({ type: z.literal("record"), record: recordSummarySchema }),
+]);
 const terminalArtifactsSchema = z
   .array(artifactSummarySchema)
   .min(1)
@@ -190,13 +254,18 @@ const operationFailedEventSchema = z.strictObject({
     message: z.string().min(1).max(512),
   }),
 });
-const operationEventRecordSchema: z.ZodType<OperationEventRecord> = z.strictObject({
+const operationInspectionRequiredEventSchema = z.strictObject({
+  type: z.literal("operation_inspection_required"),
+  evidence: z.array(operationEvidenceReferenceSchema).max(16).optional(),
+  message: z.string().min(1).max(512),
+});
+const legacyOperationEventRecordSchema = z.strictObject({
   schemaVersion: z.literal(1),
   operationId: z.uuid(),
   sequence: z.number().int().positive(),
   recordedAt: canonicalTimestampSchema,
   event: z.discriminatedUnion("type", [
-    operationStartedEventSchema,
+    legacyOperationStartedEventSchema,
     operationProgressEventSchema,
     operationCancelRequestedEventSchema,
     operationCompletedEventSchema,
@@ -204,6 +273,26 @@ const operationEventRecordSchema: z.ZodType<OperationEventRecord> = z.strictObje
     operationFailedEventSchema,
   ]),
 });
+const operationEventRecordSchema: z.ZodType<OperationEventRecord> = z.union([
+  legacyOperationEventRecordSchema,
+  z.strictObject({
+    schemaVersion: z.literal(2),
+    operationId: z.uuid(),
+    sequence: z.number().int().positive(),
+    recordedAt: canonicalTimestampSchema,
+    event: z.discriminatedUnion("type", [
+      operationStartedEventSchema,
+      operationArtifactPublishedEventSchema,
+      operationReconciliationStartedEventSchema,
+      operationProgressEventSchema,
+      operationCancelRequestedEventSchema,
+      operationCompletedEventSchema,
+      operationCancelledEventSchema,
+      operationFailedEventSchema,
+      operationInspectionRequiredEventSchema,
+    ]),
+  }),
+]);
 const operationIdempotencyScopeSchema: z.ZodType<OperationIdempotencyScope> = z.strictObject({
   contributionId: z.string().min(1).max(256),
   extensionId: z.string().min(1).max(256),
@@ -543,6 +632,26 @@ function validateNextRecord(
   if (history.length > 0 && candidate.event.type === "operation_started") {
     throw new OperationStoreError();
   }
+  if (candidate.event.type === "operation_reconciliation_started") {
+    const attemptId = candidate.event.attemptId;
+    const started = history[0];
+    const attempts = history.filter(
+      (record) => record.event.type === "operation_reconciliation_started",
+    );
+    if (
+      started?.schemaVersion !== 2 ||
+      started.event.type !== "operation_started" ||
+      candidate.event.attemptNumber !== attempts.length + 1 ||
+      candidate.event.definitionDigest !== started.event.definitionDigest ||
+      attempts.some(
+        (record) =>
+          record.event.type === "operation_reconciliation_started" &&
+          record.event.attemptId === attemptId,
+      )
+    ) {
+      throw new OperationStoreError();
+    }
+  }
   if (history.some((record) => isTerminalEvent(record.event))) {
     throw new OperationStoreError();
   }
@@ -563,20 +672,58 @@ function validateNextRecord(
       throw new OperationStoreError();
     }
   }
-  if (isTerminalEvent(candidate.event) && candidate.event.artifacts !== undefined) {
+  if (
+    isTerminalEvent(candidate.event) &&
+    "artifacts" in candidate.event &&
+    candidate.event.artifacts !== undefined
+  ) {
+    const startedRecord = history[0];
+    const started = startedRecord?.event;
+    if (startedRecord === undefined || started?.type !== "operation_started") {
+      throw new OperationStoreError();
+    }
+    for (const artifact of candidate.event.artifacts) {
+      assertArtifactScope(artifact, candidate.operationId, started);
+      if (startedRecord.schemaVersion === 2) {
+        assertArtifactWasPublished(history, artifact);
+      }
+    }
+  }
+  if (candidate.event.type === "operation_artifact_published") {
+    const started = history[0]?.event;
+    const publishedArtifacts = history.filter(
+      (record) => record.event.type === "operation_artifact_published",
+    );
+    const aggregateBytes = publishedArtifacts.reduce(
+      (total, record) =>
+        record.event.type === "operation_artifact_published"
+          ? total + record.event.artifact.byteCount
+          : total,
+      candidate.event.artifact.byteCount,
+    );
+    if (
+      started?.type !== "operation_started" ||
+      history.some((record) => record.event.type === "operation_reconciliation_started") ||
+      publishedArtifacts.length + 1 > EXTENSION_ARTIFACT_MAX_COUNT ||
+      aggregateBytes > EXTENSION_ARTIFACT_MAX_AGGREGATE_BYTES
+    ) {
+      throw new OperationStoreError();
+    }
+    assertArtifactScope(candidate.event.artifact, candidate.operationId, started);
+  }
+  if (
+    candidate.event.type === "operation_inspection_required" &&
+    candidate.event.evidence !== undefined
+  ) {
     const started = history[0]?.event;
     if (started?.type !== "operation_started") {
       throw new OperationStoreError();
     }
-    for (const artifact of candidate.event.artifacts) {
-      if (
-        artifact.provenance.operationId !== candidate.operationId ||
-        artifact.provenance.projectId !== started.projectId ||
-        artifact.provenance.extensionId !== started.extensionId ||
-        artifact.provenance.extensionVersion !== started.extensionVersion ||
-        artifact.provenance.contributionId !== started.contributionId
-      ) {
-        throw new OperationStoreError();
+    for (const reference of candidate.event.evidence) {
+      const summary = reference.type === "artifact" ? reference.artifact : reference.record;
+      assertEvidenceProvenance(summary.provenance, candidate.operationId, started);
+      if (reference.type === "artifact") {
+        assertArtifactWasPublished(history, reference.artifact);
       }
     }
   }
@@ -601,7 +748,72 @@ function validateNextRecord(
   }
 }
 
-function assertEventPayloadBounds(event: OperationEvent): void {
+function assertArtifactScope(
+  artifact: { readonly provenance: ExtensionArtifactSummaryProvenance },
+  operationId: string,
+  started: LegacyOperationStartedEvent | OperationStartedEvent,
+): void {
+  assertEvidenceProvenance(artifact.provenance, operationId, started);
+}
+
+type ExtensionArtifactSummaryProvenance = {
+  readonly contributionId: string;
+  readonly extensionId: string;
+  readonly extensionVersion: string;
+  readonly operationId: string;
+  readonly projectId: string;
+};
+
+function assertEvidenceProvenance(
+  provenance: ExtensionArtifactSummaryProvenance,
+  operationId: string,
+  started: LegacyOperationStartedEvent | OperationStartedEvent,
+): void {
+  if (
+    provenance.operationId !== operationId ||
+    provenance.projectId !== started.projectId ||
+    provenance.extensionId !== started.extensionId ||
+    provenance.extensionVersion !== started.extensionVersion ||
+    provenance.contributionId !== started.contributionId
+  ) {
+    throw new OperationStoreError();
+  }
+}
+
+function assertArtifactWasPublished(
+  history: readonly OperationEventRecord[],
+  artifact: ExtensionArtifactSummary,
+): void {
+  if (
+    !history.some(
+      (record) =>
+        record.event.type === "operation_artifact_published" &&
+        artifactSummariesEqual(record.event.artifact, artifact),
+    )
+  ) {
+    throw new OperationStoreError();
+  }
+}
+
+function artifactSummariesEqual(
+  left: ExtensionArtifactSummary,
+  right: ExtensionArtifactSummary,
+): boolean {
+  return (
+    left.byteCount === right.byteCount &&
+    left.contract.id === right.contract.id &&
+    left.contract.version === right.contract.version &&
+    left.id === right.id &&
+    left.mediaType === right.mediaType &&
+    left.provenance.contributionId === right.provenance.contributionId &&
+    left.provenance.extensionId === right.provenance.extensionId &&
+    left.provenance.extensionVersion === right.provenance.extensionVersion &&
+    left.provenance.operationId === right.provenance.operationId &&
+    left.provenance.projectId === right.provenance.projectId
+  );
+}
+
+function assertEventPayloadBounds(event: StoredOperationEvent): void {
   if (event.type === "operation_started") {
     assertJsonBounds(
       event.input,
@@ -703,11 +915,12 @@ function canonicalizeJson(value: ExtensionJsonValue): ExtensionJsonValue {
   return value;
 }
 
-function isTerminalEvent(event: OperationEvent): event is OperationTerminalEvent {
+function isTerminalEvent(event: StoredOperationEvent): event is OperationTerminalEvent {
   return (
     event.type === "operation_cancelled" ||
     event.type === "operation_completed" ||
-    event.type === "operation_failed"
+    event.type === "operation_failed" ||
+    event.type === "operation_inspection_required"
   );
 }
 

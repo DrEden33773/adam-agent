@@ -62,6 +62,152 @@ test("OperationStore adapters append and read a versioned start record", async (
   }
 });
 
+test("OperationStore adapters reject a non-contiguous reconciliation attempt", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-attempt-sequence-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const definitionDigest = `sha256:${"a".repeat(64)}`;
+  const start: OperationEventRecord = {
+    schemaVersion: 2,
+    operationId,
+    sequence: 1,
+    recordedAt: "2026-08-17T08:00:00.000Z",
+    event: {
+      type: "operation_started",
+      contributionId: "fixture.review",
+      deadlineAt: "2026-08-17T08:01:00.000Z",
+      definitionDigest,
+      extensionId: "fixture.extension",
+      extensionVersion: "2.0.0",
+      idempotencyKey: "review-attempt-1",
+      input: { revision: "abc123" },
+      inputDigest: canonicalInputDigest,
+      projectId: projectIdForWorkspace(workspaceRoot),
+    },
+  };
+  const firstAttempt: OperationEventRecord = {
+    schemaVersion: 2,
+    operationId,
+    sequence: 2,
+    recordedAt: "2026-08-17T08:00:01.000Z",
+    event: {
+      type: "operation_reconciliation_started",
+      attemptId: "123e4567-e89b-42d3-a456-426614174001",
+      attemptNumber: 1,
+      definitionDigest,
+    },
+  };
+  const skippedAttempt: OperationEventRecord = {
+    schemaVersion: 2,
+    operationId,
+    sequence: 3,
+    recordedAt: "2026-08-17T08:00:02.000Z",
+    event: {
+      type: "operation_reconciliation_started",
+      attemptId: "123e4567-e89b-42d3-a456-426614174002",
+      attemptNumber: 3,
+      definitionDigest,
+    },
+  };
+
+  try {
+    await mkdir(workspaceRoot);
+    const stores = [
+      ["in-memory", createInMemoryOperationStore()],
+      ["JSONL", await createJsonlOperationStore({ stateRoot, workspaceRoot })],
+    ] as const;
+    for (const [name, store] of stores) {
+      await store.append(start);
+      await store.append(firstAttempt);
+      await expect(store.append(skippedAttempt), name).rejects.toMatchObject({
+        code: "operation_log_invalid",
+        name: "OperationStoreError",
+      });
+      expect(await store.read(operationId), name).toEqual([start, firstAttempt]);
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("OperationStore adapters reject artifact publication after reconciliation begins", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-artifact-after-attempt-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const definitionDigest = `sha256:${"b".repeat(64)}`;
+  const start: OperationEventRecord = {
+    schemaVersion: 2,
+    operationId,
+    sequence: 1,
+    recordedAt: "2026-08-17T08:00:00.000Z",
+    event: {
+      type: "operation_started",
+      contributionId: "fixture.review",
+      deadlineAt: "2026-08-17T08:01:00.000Z",
+      definitionDigest,
+      extensionId: "fixture.extension",
+      extensionVersion: "2.0.0",
+      idempotencyKey: "review-artifact-attempt-1",
+      input: { revision: "abc123" },
+      inputDigest: canonicalInputDigest,
+      projectId: projectIdForWorkspace(workspaceRoot),
+    },
+  };
+  const attempt: OperationEventRecord = {
+    schemaVersion: 2,
+    operationId,
+    sequence: 2,
+    recordedAt: "2026-08-17T08:00:01.000Z",
+    event: {
+      type: "operation_reconciliation_started",
+      attemptId: "123e4567-e89b-42d3-a456-426614174011",
+      attemptNumber: 1,
+      definitionDigest,
+    },
+  };
+  const lateArtifact: OperationEventRecord = {
+    schemaVersion: 2,
+    operationId,
+    sequence: 3,
+    recordedAt: "2026-08-17T08:00:02.000Z",
+    event: {
+      type: "operation_artifact_published",
+      artifact: {
+        byteCount: 1,
+        contract: { id: "fixture.report", version: 1 },
+        id: `sha256:${"c".repeat(64)}`,
+        mediaType: "application/json",
+        provenance: {
+          contributionId: "fixture.review",
+          extensionId: "fixture.extension",
+          extensionVersion: "2.0.0",
+          operationId,
+          projectId: projectIdForWorkspace(workspaceRoot),
+        },
+      },
+    },
+  };
+
+  try {
+    await mkdir(workspaceRoot);
+    const stores = [
+      ["in-memory", createInMemoryOperationStore()],
+      ["JSONL", await createJsonlOperationStore({ stateRoot, workspaceRoot })],
+    ] as const;
+    for (const [name, store] of stores) {
+      await store.append(start);
+      await store.append(attempt);
+      await expect(store.append(lateArtifact), name).rejects.toMatchObject({
+        code: "operation_log_invalid",
+        name: "OperationStoreError",
+      });
+      expect(await store.read(operationId), name).toEqual([start, attempt]);
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("OperationStore adapters preserve progress after its durable start", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-progress-"));
   const workspaceRoot = join(testRoot, "workspace");

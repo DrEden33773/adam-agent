@@ -44,7 +44,7 @@ test("the extension API release verifier accepts its exact tagged checkout", asy
   const commit = await currentCommit();
   await expect(
     verifyRelease({
-      GITHUB_REF_NAME: "extension-api-v0.1.0",
+      GITHUB_REF_NAME: "extension-api-v0.2.0",
       GITHUB_REF_TYPE: "tag",
       GITHUB_SHA: commit,
     }),
@@ -54,14 +54,14 @@ test("the extension API release verifier accepts its exact tagged checkout", asy
 test.each([
   {
     environment: {
-      GITHUB_REF_NAME: "extension-api-v0.1.0",
+      GITHUB_REF_NAME: "extension-api-v0.2.0",
       GITHUB_REF_TYPE: "branch",
     },
     name: "a branch ref",
   },
   {
     environment: {
-      GITHUB_REF_NAME: "extension-api-v0.1.1",
+      GITHUB_REF_NAME: "extension-api-v0.2.1",
       GITHUB_REF_TYPE: "tag",
     },
     name: "a different version tag",
@@ -70,14 +70,14 @@ test.each([
   await expect(
     verifyRelease({ ...environment, GITHUB_SHA: await currentCommit() }),
   ).rejects.toMatchObject({
-    stderr: expect.stringContaining("Release must run from the exact tag extension-api-v0.1.0."),
+    stderr: expect.stringContaining("Release must run from the exact tag extension-api-v0.2.0."),
   });
 });
 
 test("the extension API release verifier rejects a tag at another commit", async () => {
   await expect(
     verifyRelease({
-      GITHUB_REF_NAME: "extension-api-v0.1.0",
+      GITHUB_REF_NAME: "extension-api-v0.2.0",
       GITHUB_REF_TYPE: "tag",
       GITHUB_SHA: "0000000000000000000000000000000000000000",
     }),

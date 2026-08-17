@@ -1,7 +1,7 @@
 import { valid, validRange } from "semver";
 import { z } from "zod";
 
-export const EXTENSION_API_VERSION = "0.1.0";
+export const EXTENSION_API_VERSION = "0.2.0";
 export const EXTENSION_BIOME_CAPABILITY_ID = "adam.analyzer-execution.biome@1";
 export const EXTENSION_BIOME_MAX_FILES = 100;
 export const EXTENSION_BIOME_MAX_FILE_BYTES = 1024 * 1024;
@@ -51,6 +51,7 @@ const operationContributionSchema = z.strictObject({
   input: contractReferenceSchema,
   output: contractReferenceSchema,
   progress: contractReferenceSchema,
+  recovery: z.strictObject({ version: z.literal(1) }).optional(),
 });
 
 const extensionPackageManifestSchema = z
@@ -125,6 +126,10 @@ export type ExtensionOperationRegistration = {
   readonly output: ExtensionContractCodec;
   readonly progress: ExtensionContractCodec;
   execute(input: unknown, context: ExtensionOperationContext): Promise<unknown> | unknown;
+  reconcile?(
+    input: unknown,
+    context: ExtensionOperationReconciliationContext,
+  ): Promise<ExtensionOperationReconciliationResult> | ExtensionOperationReconciliationResult;
 };
 
 export type ExtensionOperationBudgetSnapshot = {
@@ -232,6 +237,42 @@ export type ExtensionOperationContext = {
   progress(value: unknown): Promise<void>;
 };
 
+export type ExtensionOperationEvidenceReference =
+  | { readonly type: "artifact"; readonly artifact: ExtensionArtifactSummary }
+  | { readonly type: "record"; readonly record: ExtensionRecordSummary };
+
+export type ExtensionOperationReconciliationContext = {
+  readonly deadlineAt: string;
+  readonly evidence: {
+    readonly artifacts: {
+      read(artifact: ExtensionArtifactSummary): Promise<Uint8Array | undefined>;
+    };
+    readonly records: {
+      get(key: string): Promise<ExtensionRecord | undefined>;
+    };
+  };
+  readonly operationId: string;
+  readonly provenance: ExtensionOperationProvenance;
+  readonly signal: AbortSignal;
+};
+
+export type ExtensionOperationReconciliationResult =
+  | {
+      readonly artifacts?: readonly ExtensionArtifactSummary[] | undefined;
+      readonly output: unknown;
+      readonly status: "completed";
+    }
+  | {
+      readonly artifacts?: readonly ExtensionArtifactSummary[] | undefined;
+      readonly error: ExtensionOperationFailure;
+      readonly status: "failed";
+    }
+  | {
+      readonly evidence?: readonly ExtensionOperationEvidenceReference[] | undefined;
+      readonly message: string;
+      readonly status: "inspection_required";
+    };
+
 export type ExtensionIdentity = {
   readonly id: string;
   readonly packageName: string;
@@ -250,6 +291,7 @@ export type ExtensionOperationStartedEvent = {
   readonly type: "operation_started";
   readonly contributionId: string;
   readonly deadlineAt: string;
+  readonly definitionDigest: string;
   readonly extensionId: string;
   readonly extensionVersion: string;
   readonly idempotencyKey: string;
@@ -258,9 +300,21 @@ export type ExtensionOperationStartedEvent = {
   readonly projectId: string;
 };
 
+export type ExtensionOperationReconciliationStartedEvent = {
+  readonly type: "operation_reconciliation_started";
+  readonly attemptId: string;
+  readonly attemptNumber: number;
+  readonly definitionDigest: string;
+};
+
 export type ExtensionOperationProgressEvent = {
   readonly type: "operation_progress";
   readonly value: ExtensionJsonValue;
+};
+
+export type ExtensionOperationArtifactPublishedEvent = {
+  readonly type: "operation_artifact_published";
+  readonly artifact: ExtensionArtifactSummary;
 };
 
 export type ExtensionOperationCancellationReason = "caller" | "extension_disabled";
@@ -306,12 +360,21 @@ export type ExtensionOperationFailedEvent = {
   readonly error: ExtensionOperationFailure;
 };
 
+export type ExtensionOperationInspectionRequiredEvent = {
+  readonly type: "operation_inspection_required";
+  readonly evidence?: readonly ExtensionOperationEvidenceReference[] | undefined;
+  readonly message: string;
+};
+
 export type ExtensionOperationEvent =
+  | ExtensionOperationArtifactPublishedEvent
   | ExtensionOperationCancelRequestedEvent
   | ExtensionOperationCancelledEvent
   | ExtensionOperationCompletedEvent
   | ExtensionOperationFailedEvent
+  | ExtensionOperationInspectionRequiredEvent
   | ExtensionOperationProgressEvent
+  | ExtensionOperationReconciliationStartedEvent
   | ExtensionOperationStartedEvent;
 
 export type ExtensionActivationCapability = {

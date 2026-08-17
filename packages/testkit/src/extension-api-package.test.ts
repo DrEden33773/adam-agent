@@ -102,6 +102,7 @@ test("the packed extension API imports with only its public runtime shape", asyn
       "EXTENSION_RECORD_NAMESPACE_MAX_BYTES",
       "parseExtensionPackageManifest",
     ]);
+    expect(Reflect.get(imported, "EXTENSION_API_VERSION")).toBe("0.2.0");
     const manifest = JSON.parse(await readFile(join(installedPackage, "package.json"), "utf8"));
     expect(manifest).toMatchObject({
       engines: { node: ">=24.0.0 <25" },
@@ -112,7 +113,7 @@ test("the packed extension API imports with only its public runtime shape", asyn
         type: "git",
         url: "git+https://github.com/DrEden33773/adam-agent.git",
       },
-      version: "0.1.0",
+      version: "0.2.0",
     });
     expect(manifest.publishConfig).toEqual({ access: "public", provenance: true });
   } finally {

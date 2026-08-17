@@ -1,6 +1,6 @@
 {
   "name": "@adam-agent/extension-api",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Versioned public contracts for trusted Adam Agent extensions.",
   "type": "module",
   "repository": {
