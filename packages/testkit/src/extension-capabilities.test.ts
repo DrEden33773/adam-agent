@@ -134,6 +134,7 @@ test("ExtensionHost makes artifact bytes durable before publishing their operati
     releaseHandler();
     await expect(recordsPromise).resolves.toMatchObject([
       { event: { type: "operation_started" } },
+      { event: { artifact: summary, type: "operation_artifact_published" } },
       { event: { output: { artifact: summary }, type: "operation_completed" } },
     ]);
   } finally {
@@ -292,6 +293,7 @@ test("ExtensionHost denies a late artifact result while retaining its cancelled 
     expect(events).toMatchObject([
       { event: { type: "operation_started" } },
       { event: { reason: "caller", type: "operation_cancel_requested" } },
+      { event: { type: "operation_artifact_published" } },
       {
         event: {
           artifacts: [
@@ -357,6 +359,7 @@ test("ExtensionHost retains a published artifact reference when the handler late
 
     expect(events).toMatchObject([
       { event: { type: "operation_started" } },
+      { event: { type: "operation_artifact_published" } },
       {
         event: {
           artifacts: [
@@ -1190,18 +1193,20 @@ async function expectCaughtArtifactLimitFailure(
       input: null,
     });
 
-    await expect(collectOperationEvents(host, started.operationId)).resolves.toMatchObject([
-      { event: { type: "operation_started" } },
-      {
-        event: {
-          error: {
-            code: "operation_capability_limit_exceeded",
-            message: "The operation exceeded an artifact capability limit.",
-          },
-          type: "operation_failed",
+    const events = await collectOperationEvents(host, started.operationId);
+    expect(events[0]).toMatchObject({ event: { type: "operation_started" } });
+    expect(
+      events.slice(1, -1).every((record) => record.event.type === "operation_artifact_published"),
+    ).toBe(true);
+    expect(events.at(-1)).toMatchObject({
+      event: {
+        error: {
+          code: "operation_capability_limit_exceeded",
+          message: "The operation exceeded an artifact capability limit.",
         },
+        type: "operation_failed",
       },
-    ]);
+    });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -1593,7 +1598,7 @@ async function writeCapabilityExtensionPackage(
       type: "module",
       adamAgent: {
         id: "fixture.extension",
-        apiVersion: "^0.1.0",
+        apiVersion: "^0.2.0",
         runtime: { entry: "./runtime.js" },
         capabilities: {
           required,

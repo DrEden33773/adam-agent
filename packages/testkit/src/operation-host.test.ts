@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import {
   createExtensionHost,
+  createFileArtifactStore,
   createInMemoryOperationStore,
   createJsonlOperationStore,
   type OperationStore,
@@ -60,6 +61,7 @@ test("ExtensionHost starts one durable operation and reuses it for the same idem
         type: "operation_started",
         contributionId: "fixture.review",
         deadlineAt: expect.any(String),
+        definitionDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
         extensionId: "fixture.extension",
         extensionVersion: "1.0.0",
         idempotencyKey: "review-request-1",
@@ -568,6 +570,962 @@ test("ExtensionHost reports recovery-required when terminal persistence fails", 
       status: "recovery_required",
     });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost recovers completed immutable evidence without rerunning execute", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-reconcile-completed-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+  const durableStore = await createJsonlOperationStore({ stateRoot, workspaceRoot });
+  let rejectOriginalTerminal = true;
+  const interruptedStore: OperationStore = {
+    append(record) {
+      if (rejectOriginalTerminal && record.event.type === "operation_completed") {
+        rejectOriginalTerminal = false;
+        return Promise.reject(new Error("injected original terminal persistence failure"));
+      }
+      return durableStore.append(record);
+    },
+    findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    read: (operationId) => durableStore.read(operationId),
+  };
+  const controlKey = `__adamOperationRecovery${Date.now()}${Math.random()}`;
+  const control = { executeCalls: 0, reconcileCalls: 0 };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+
+  try {
+    await writeRecoverableOperationExtension(packageRoot, controlKey);
+    const configuredExtension = {
+      enabled: true,
+      extensionId: "fixture.extension",
+      grants: [
+        { id: "adam.artifact.publish@1", version: "^1.0.0" },
+        { id: "adam.storage.records@1", version: "^1.0.0" },
+      ],
+      packageName: "@fixture/recoverable-extension",
+      packageRoot,
+      packageVersion: "2.0.0",
+    } as const;
+    const capabilities = [
+      { id: "adam.artifact.publish@1", version: "1.0.0" },
+      { id: "adam.storage.records@1", version: "1.0.0" },
+    ] as const;
+    const firstHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: interruptedStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await expect(firstHost.loadConfiguredExtensions()).resolves.toMatchObject({
+      extensions: [{ diagnostics: [], extensionId: "fixture.extension", status: "active" }],
+    });
+    const started = await firstHost.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-reconcile-completed-1",
+      input: { revision: "recovered" },
+    });
+    for await (const _record of firstHost.operations.events({
+      operationId: started.operationId,
+    })) {
+      // The interrupted durable stream is the synchronization point.
+    }
+    await expect(firstHost.operations.query(started.operationId)).resolves.toMatchObject({
+      error: { code: "operation_recovery_required" },
+      status: "recovery_required",
+    });
+
+    const reopenedStore = await createJsonlOperationStore({ stateRoot, workspaceRoot });
+    const recoveredHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: reopenedStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await expect(recoveredHost.loadConfiguredExtensions()).resolves.toMatchObject({
+      extensions: [{ diagnostics: [], extensionId: "fixture.extension", status: "active" }],
+    });
+    const recovered = await recoveredHost.operations.recover(started.operationId);
+
+    expect(recovered).toMatchObject({
+      artifacts: [
+        {
+          contract: { id: "fixture.complete-report", version: 1 },
+          id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        },
+      ],
+      operationId: started.operationId,
+      output: { accepted: true, revision: "recovered" },
+      status: "completed",
+    });
+    expect(control).toEqual({ executeCalls: 1, reconcileCalls: 1 });
+    expect(
+      (await reopenedStore.read(started.operationId)).map((record) => record.event.type),
+    ).toEqual([
+      "operation_started",
+      "operation_artifact_published",
+      "operation_reconciliation_started",
+      "operation_completed",
+    ]);
+
+    rejectOriginalTerminal = true;
+    const unresolved = await firstHost.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-reconcile-ambiguous-2",
+      input: { revision: "missing-terminal" },
+    });
+    for await (const _record of firstHost.operations.events({
+      operationId: unresolved.operationId,
+    })) {
+      // The second interrupted durable stream is the synchronization point.
+    }
+    const missingTerminalStore: OperationStore = {
+      append(record) {
+        if (record.event.type === "operation_completed") {
+          return Promise.reject(new Error("injected missing terminal append failure"));
+        }
+        return durableStore.append(record);
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    const missingTerminalHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: missingTerminalStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await missingTerminalHost.loadConfiguredExtensions();
+    await expect(
+      missingTerminalHost.operations.recover(unresolved.operationId),
+    ).resolves.toMatchObject({ status: "recovery_required" });
+    expect(control).toEqual({ executeCalls: 2, reconcileCalls: 2 });
+    expect(
+      (await durableStore.read(unresolved.operationId)).map((record) => record.event.type),
+    ).toEqual([
+      "operation_started",
+      "operation_artifact_published",
+      "operation_reconciliation_started",
+    ]);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  {
+    expected: {
+      error: { code: "extension_execution_failed", message: "Evidence proves failure." },
+      status: "failed",
+    },
+    outcome: "failed",
+    terminalType: "operation_failed",
+  },
+  {
+    expected: { message: "Evidence is incomplete.", status: "inspection_required" },
+    outcome: "inspection",
+    terminalType: "operation_inspection_required",
+  },
+] as const)("ExtensionHost persists and reuses a reconciled $outcome terminal", async (fixture) => {
+  await expectStableReconciliationOutcome(fixture);
+});
+
+test("ExtensionHost rejects an invalid declared recovery handler before publication", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-handler-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeInvalidRecoveryHandlerExtension(packageRoot);
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/invalid-recovery-extension",
+          packageRoot,
+          packageVersion: "2.0.0",
+        },
+      ],
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+
+    await expect(host.loadConfiguredExtensions()).resolves.toMatchObject({
+      extensions: [
+        {
+          diagnostics: [{ code: "contribution_handler_invalid", contributionId: "fixture.review" }],
+          extensionId: "fixture.extension",
+          status: "rejected",
+        },
+      ],
+    });
+    expect(host.listContributions()).toEqual([]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  { manifestRecovery: true, registrationRecovery: false },
+  { manifestRecovery: false, registrationRecovery: true },
+] as const)(
+  "ExtensionHost rejects a recovery declaration mismatch before publication",
+  async (fixture) => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-declaration-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const packageRoot = join(testRoot, "extension");
+    try {
+      await mkdir(workspaceRoot);
+      await writeRecoveryDeclarationMismatchExtension(packageRoot, fixture);
+      const host = createExtensionHost({
+        capabilities: [],
+        extensions: [
+          {
+            enabled: true,
+            extensionId: "fixture.extension",
+            grants: [],
+            packageName: "@fixture/recovery-declaration-extension",
+            packageRoot,
+            packageVersion: "2.0.0",
+          },
+        ],
+        operationStore: createInMemoryOperationStore(),
+        projectRoot: workspaceRoot,
+      });
+      await expect(host.loadConfiguredExtensions()).resolves.toMatchObject({
+        extensions: [
+          {
+            diagnostics: [
+              { code: "contribution_handler_invalid", contributionId: "fixture.review" },
+            ],
+            status: "rejected",
+          },
+        ],
+      });
+      expect(host.listContributions()).toEqual([]);
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test("ExtensionHost rejects inspection evidence from another operation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-evidence-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const stateRoot = join(testRoot, "state");
+  const controlKey = `__adamOperationRecoveryEvidence${Date.now()}${Math.random()}`;
+  const control = { executeCalls: 0, forgeInspectionEvidence: true, reconcileCalls: 0 };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+
+  try {
+    await mkdir(workspaceRoot);
+    const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+    const durableStore = createInMemoryOperationStore();
+    let rejectOriginalTerminal = true;
+    const interruptedStore: OperationStore = {
+      append(record) {
+        if (rejectOriginalTerminal && record.event.type === "operation_completed") {
+          rejectOriginalTerminal = false;
+          return Promise.reject(new Error("injected original terminal persistence failure"));
+        }
+        return durableStore.append(record);
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    await writeRecoverableOperationExtension(packageRoot, controlKey);
+    const configuredExtension = {
+      enabled: true,
+      extensionId: "fixture.extension",
+      grants: [
+        { id: "adam.artifact.publish@1", version: "^1.0.0" },
+        { id: "adam.storage.records@1", version: "^1.0.0" },
+      ],
+      packageName: "@fixture/recoverable-extension",
+      packageRoot,
+      packageVersion: "2.0.0",
+    } as const;
+    const capabilities = [
+      { id: "adam.artifact.publish@1", version: "1.0.0" },
+      { id: "adam.storage.records@1", version: "1.0.0" },
+    ] as const;
+    const firstHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: interruptedStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await firstHost.loadConfiguredExtensions();
+    const started = await firstHost.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-reconcile-evidence-1",
+      input: { revision: "forged-evidence" },
+    });
+    for await (const _record of firstHost.operations.events({
+      operationId: started.operationId,
+    })) {
+      // The interrupted durable stream is the synchronization point.
+    }
+
+    const recoveredHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: durableStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await recoveredHost.loadConfiguredExtensions();
+
+    await expect(recoveredHost.operations.recover(started.operationId)).rejects.toMatchObject({
+      code: "operation_input_invalid",
+      name: "OperationHostError",
+    });
+    expect(control).toMatchObject({ executeCalls: 1, reconcileCalls: 1 });
+    expect(
+      (await durableStore.read(started.operationId)).map((record) => record.event.type),
+    ).toEqual([
+      "operation_started",
+      "operation_artifact_published",
+      "operation_reconciliation_started",
+    ]);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost rejects an artifact relabeled from another operation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-artifact-scope-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const stateRoot = join(testRoot, "state");
+  const controlKey = `__adamOperationRecoveryArtifactScope${Date.now()}${Math.random()}`;
+  const control: {
+    executeCalls: number;
+    foreignArtifact?: unknown;
+    reconcileCalls: number;
+  } = { executeCalls: 0, reconcileCalls: 0 };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+
+  try {
+    await mkdir(workspaceRoot);
+    const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+    const durableStore = createInMemoryOperationStore();
+    let rejectNextTerminal = false;
+    const faultStore: OperationStore = {
+      append(record) {
+        if (rejectNextTerminal && record.event.type === "operation_completed") {
+          rejectNextTerminal = false;
+          return Promise.reject(new Error("injected original terminal persistence failure"));
+        }
+        return durableStore.append(record);
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    await writeRecoverableOperationExtension(packageRoot, controlKey);
+    const host = createExtensionHost({
+      artifactStore,
+      capabilities: [
+        { id: "adam.artifact.publish@1", version: "1.0.0" },
+        { id: "adam.storage.records@1", version: "1.0.0" },
+      ],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [
+            { id: "adam.artifact.publish@1", version: "^1.0.0" },
+            { id: "adam.storage.records@1", version: "^1.0.0" },
+          ],
+          packageName: "@fixture/recoverable-extension",
+          packageRoot,
+          packageVersion: "2.0.0",
+        },
+      ],
+      operationStore: faultStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await host.loadConfiguredExtensions();
+    const first = await host.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-artifact-source-1",
+      input: { revision: "foreign-source" },
+    });
+    for await (const _record of host.operations.events({ operationId: first.operationId })) {
+      // The first terminal fact is the synchronization point.
+    }
+    const firstSnapshot = await host.operations.query(first.operationId);
+    if (firstSnapshot.status !== "completed" || firstSnapshot.artifacts?.[0] === undefined) {
+      throw new Error("Expected the source operation to publish an artifact.");
+    }
+    control.foreignArtifact = firstSnapshot.artifacts[0];
+    rejectNextTerminal = true;
+    const second = await host.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-artifact-source-2",
+      input: { revision: "current-operation" },
+    });
+    for await (const _record of host.operations.events({ operationId: second.operationId })) {
+      // The interrupted durable stream is the synchronization point.
+    }
+
+    await expect(host.operations.recover(second.operationId)).rejects.toMatchObject({
+      code: "operation_input_invalid",
+      name: "OperationHostError",
+    });
+    expect(control).toMatchObject({ executeCalls: 2, reconcileCalls: 1 });
+    expect(
+      (await durableStore.read(second.operationId)).some(
+        (record) => record.event.type === "operation_completed",
+      ),
+    ).toBe(false);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost keeps proven completion after a durable cold cancel request", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-cancel-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const stateRoot = join(testRoot, "state");
+  const controlKey = `__adamOperationRecoveryCancel${Date.now()}${Math.random()}`;
+  const control = { executeCalls: 0, reconcileCalls: 0 };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+
+  try {
+    await mkdir(workspaceRoot);
+    const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+    const durableStore = createInMemoryOperationStore();
+    let rejectOriginalTerminal = true;
+    const interruptedStore: OperationStore = {
+      append(record) {
+        if (rejectOriginalTerminal && record.event.type === "operation_completed") {
+          rejectOriginalTerminal = false;
+          return Promise.reject(new Error("injected original terminal persistence failure"));
+        }
+        return durableStore.append(record);
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    await writeRecoverableOperationExtension(packageRoot, controlKey);
+    const configuredExtension = {
+      enabled: true,
+      extensionId: "fixture.extension",
+      grants: [
+        { id: "adam.artifact.publish@1", version: "^1.0.0" },
+        { id: "adam.storage.records@1", version: "^1.0.0" },
+      ],
+      packageName: "@fixture/recoverable-extension",
+      packageRoot,
+      packageVersion: "2.0.0",
+    } as const;
+    const capabilities = [
+      { id: "adam.artifact.publish@1", version: "1.0.0" },
+      { id: "adam.storage.records@1", version: "1.0.0" },
+    ] as const;
+    const firstHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: interruptedStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await firstHost.loadConfiguredExtensions();
+    const started = await firstHost.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-reconcile-cancel-1",
+      input: { revision: "cancelled-after-effect" },
+    });
+    for await (const _record of firstHost.operations.events({
+      operationId: started.operationId,
+    })) {
+      // The interrupted durable stream is the synchronization point.
+    }
+
+    const recoveredHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: durableStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await recoveredHost.loadConfiguredExtensions();
+    await expect(recoveredHost.operations.cancel(started.operationId)).resolves.toMatchObject({
+      status: "recovery_required",
+    });
+    await expect(recoveredHost.operations.recover(started.operationId)).resolves.toMatchObject({
+      output: { accepted: true, revision: "cancelled-after-effect" },
+      status: "completed",
+    });
+
+    expect(control).toEqual({ executeCalls: 1, reconcileCalls: 1 });
+    expect(
+      (await durableStore.read(started.operationId)).map((record) => record.event.type),
+    ).toEqual([
+      "operation_started",
+      "operation_artifact_published",
+      "operation_cancel_requested",
+      "operation_reconciliation_started",
+      "operation_completed",
+    ]);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost shares one in-flight reconciliation for duplicate recovery calls", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-deduplicate-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const stateRoot = join(testRoot, "state");
+  const controlKey = `__adamOperationRecoveryDeduplicate${Date.now()}${Math.random()}`;
+  const control = { executeCalls: 0, reconcileCalls: 0 };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+
+  try {
+    await mkdir(workspaceRoot);
+    const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+    const durableStore = createInMemoryOperationStore();
+    let rejectOriginalTerminal = true;
+    const interruptedStore: OperationStore = {
+      append(record) {
+        if (rejectOriginalTerminal && record.event.type === "operation_completed") {
+          rejectOriginalTerminal = false;
+          return Promise.reject(new Error("injected original terminal persistence failure"));
+        }
+        return durableStore.append(record);
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    await writeRecoverableOperationExtension(packageRoot, controlKey);
+    const configuredExtension = {
+      enabled: true,
+      extensionId: "fixture.extension",
+      grants: [
+        { id: "adam.artifact.publish@1", version: "^1.0.0" },
+        { id: "adam.storage.records@1", version: "^1.0.0" },
+      ],
+      packageName: "@fixture/recoverable-extension",
+      packageRoot,
+      packageVersion: "2.0.0",
+    } as const;
+    const capabilities = [
+      { id: "adam.artifact.publish@1", version: "1.0.0" },
+      { id: "adam.storage.records@1", version: "1.0.0" },
+    ] as const;
+    const firstHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: interruptedStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await firstHost.loadConfiguredExtensions();
+    const started = await firstHost.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-reconcile-deduplicate-1",
+      input: { revision: "deduplicate" },
+    });
+    for await (const _record of firstHost.operations.events({
+      operationId: started.operationId,
+    })) {
+      // The interrupted durable stream is the synchronization point.
+    }
+
+    const recoveredHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: durableStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await recoveredHost.loadConfiguredExtensions();
+    const [first, second] = await Promise.all([
+      recoveredHost.operations.recover(started.operationId),
+      recoveredHost.operations.recover(started.operationId),
+    ]);
+
+    expect(first).toMatchObject({ status: "completed" });
+    expect(second).toEqual(first);
+    expect(control).toEqual({ executeCalls: 1, reconcileCalls: 1 });
+    expect(
+      (await durableStore.read(started.operationId)).map((record) => record.event.type),
+    ).toEqual([
+      "operation_started",
+      "operation_artifact_published",
+      "operation_reconciliation_started",
+      "operation_completed",
+    ]);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost does not reconcile an operation that is still active in the same Host", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-active-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const stateRoot = join(testRoot, "state");
+  const controlKey = `__adamOperationRecoveryActive${Date.now()}${Math.random()}`;
+  let signalEvidenceDurable = () => {};
+  const evidenceDurable = new Promise<void>((resolve) => {
+    signalEvidenceDurable = resolve;
+  });
+  let releaseExecute = () => {};
+  const executeRelease = new Promise<void>((resolve) => {
+    releaseExecute = resolve;
+  });
+  const control = {
+    executeCalls: 0,
+    onEvidenceDurable: signalEvidenceDurable,
+    reconcileCalls: 0,
+    releaseExecute: executeRelease,
+  };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+
+  try {
+    await mkdir(workspaceRoot);
+    const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+    await writeRecoverableOperationExtension(packageRoot, controlKey);
+    const host = createExtensionHost({
+      artifactStore,
+      capabilities: [
+        { id: "adam.artifact.publish@1", version: "1.0.0" },
+        { id: "adam.storage.records@1", version: "1.0.0" },
+      ],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [
+            { id: "adam.artifact.publish@1", version: "^1.0.0" },
+            { id: "adam.storage.records@1", version: "^1.0.0" },
+          ],
+          packageName: "@fixture/recoverable-extension",
+          packageRoot,
+          packageVersion: "2.0.0",
+        },
+      ],
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await host.loadConfiguredExtensions();
+    const started = await host.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-reconcile-active-1",
+      input: { revision: "still-active" },
+    });
+    await evidenceDurable;
+
+    await expect(host.operations.recover(started.operationId)).resolves.toMatchObject({
+      status: "running",
+    });
+    expect(control).toMatchObject({ executeCalls: 1, reconcileCalls: 0 });
+
+    releaseExecute();
+    for await (const _record of host.operations.events({ operationId: started.operationId })) {
+      // The real terminal event and owner release are the synchronization point.
+    }
+  } finally {
+    releaseExecute();
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost rejects recovery after the exact capability grant changes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-grant-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamOperationRecoveryGrant${Date.now()}${Math.random()}`;
+  const control = { executeCalls: 0, reconcileCalls: 0 };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeGrantSensitiveRecoveryExtension(packageRoot, controlKey);
+    const durableStore = createInMemoryOperationStore();
+    let rejectOriginalTerminal = true;
+    const interruptedStore: OperationStore = {
+      append(record) {
+        if (rejectOriginalTerminal && record.event.type === "operation_completed") {
+          rejectOriginalTerminal = false;
+          return Promise.reject(new Error("injected original terminal persistence failure"));
+        }
+        return durableStore.append(record);
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    const configuredExtension = (grantVersion: string) => ({
+      enabled: true,
+      extensionId: "fixture.extension",
+      grants: [{ id: "fixture.capability@1", version: grantVersion }],
+      packageName: "@fixture/grant-recovery-extension",
+      packageRoot,
+      packageVersion: "2.0.0",
+    });
+    const capabilities = [{ id: "fixture.capability@1", version: "1.0.0" }] as const;
+    const firstHost = createExtensionHost({
+      capabilities,
+      extensions: [configuredExtension("^1.0.0")],
+      operationStore: interruptedStore,
+      projectRoot: workspaceRoot,
+    });
+    await firstHost.loadConfiguredExtensions();
+    const started = await firstHost.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-reconcile-grant-1",
+      input: { revision: "grant-change" },
+    });
+    for await (const _record of firstHost.operations.events({
+      operationId: started.operationId,
+    })) {
+      // The interrupted durable stream is the synchronization point.
+    }
+
+    const changedHost = createExtensionHost({
+      capabilities,
+      extensions: [configuredExtension(">=1.0.0 <2.0.0")],
+      operationStore: durableStore,
+      projectRoot: workspaceRoot,
+    });
+    await changedHost.loadConfiguredExtensions();
+
+    await expect(changedHost.operations.recover(started.operationId)).rejects.toMatchObject({
+      code: "operation_contribution_unavailable",
+      name: "OperationHostError",
+    });
+    expect(control).toEqual({ executeCalls: 1, reconcileCalls: 0 });
+    expect(
+      (await durableStore.read(started.operationId)).map((record) => record.event.type),
+    ).toEqual(["operation_started"]);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  { expectedCode: "operation_input_invalid", mode: "rejectInput", reconcileCalls: 0 },
+  { expectedCode: "operation_input_invalid", mode: "rejectOutput", reconcileCalls: 1 },
+  { expectedStatus: "recovery_required", mode: "rejectFailure", reconcileCalls: 1 },
+] as const)("ExtensionHost fails closed for a recovery $mode mismatch", async (fixture) => {
+  await expectRecoveryValidationMismatch(fixture);
+});
+
+test.each([
+  { expectedCode: "operation_store_project_mismatch", mode: "project" },
+  { expectedCode: "operation_contribution_unavailable", mode: "version" },
+] as const)(
+  "ExtensionHost rejects a recovery $mode identity mismatch before the hook",
+  async (fixture) => {
+    await expectRecoveryIdentityMismatch(fixture);
+  },
+);
+
+test("ExtensionHost bounds an uncooperative reconciliation hook", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-deadline-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamOperationRecoveryDeadline${Date.now()}${Math.random()}`;
+  const control = { executeCalls: 0, hangReconcile: true, reconcileCalls: 0 };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeGrantSensitiveRecoveryExtension(packageRoot, controlKey);
+    const durableStore = createInMemoryOperationStore();
+    let rejectOriginalTerminal = true;
+    const interruptedStore: OperationStore = {
+      append(record) {
+        if (rejectOriginalTerminal && record.event.type === "operation_completed") {
+          rejectOriginalTerminal = false;
+          return Promise.reject(new Error("injected original terminal persistence failure"));
+        }
+        return durableStore.append(record);
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    const configuredExtension = {
+      enabled: true,
+      extensionId: "fixture.extension",
+      grants: [{ id: "fixture.capability@1", version: "^1.0.0" }],
+      packageName: "@fixture/grant-recovery-extension",
+      packageRoot,
+      packageVersion: "2.0.0",
+    } as const;
+    const capabilities = [{ id: "fixture.capability@1", version: "1.0.0" }] as const;
+    const firstHost = createExtensionHost({
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: interruptedStore,
+      projectRoot: workspaceRoot,
+    });
+    await firstHost.loadConfiguredExtensions();
+    const started = await firstHost.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-reconcile-deadline-1",
+      input: { revision: "deadline" },
+    });
+    for await (const _record of firstHost.operations.events({
+      operationId: started.operationId,
+    })) {
+      // The interrupted durable stream is the synchronization point.
+    }
+    const recoveredHost = createExtensionHost({
+      capabilities,
+      extensions: [configuredExtension],
+      operationDeadlineMs: 10,
+      operationStore: durableStore,
+      projectRoot: workspaceRoot,
+    });
+    await recoveredHost.loadConfiguredExtensions();
+
+    await expect(recoveredHost.operations.recover(started.operationId)).rejects.toMatchObject({
+      code: "operation_reconciliation_failed",
+      name: "OperationHostError",
+    });
+    expect(control).toMatchObject({ executeCalls: 1, reconcileCalls: 1 });
+    expect(
+      (await durableStore.read(started.operationId)).map((record) => record.event.type),
+    ).toEqual(["operation_started", "operation_reconciliation_started"]);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+}, 1_000);
+
+test("ExtensionHost rereads a durable recovery terminal after an ambiguous append failure", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-recovery-ambiguous-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const stateRoot = join(testRoot, "state");
+  const controlKey = `__adamOperationRecoveryAmbiguous${Date.now()}${Math.random()}`;
+  const control = { executeCalls: 0, reconcileCalls: 0 };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+
+  try {
+    await mkdir(workspaceRoot);
+    const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+    const durableStore = createInMemoryOperationStore();
+    let rejectOriginalTerminal = true;
+    const interruptedStore: OperationStore = {
+      append(record) {
+        if (rejectOriginalTerminal && record.event.type === "operation_completed") {
+          rejectOriginalTerminal = false;
+          return Promise.reject(new Error("injected original terminal persistence failure"));
+        }
+        return durableStore.append(record);
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    await writeRecoverableOperationExtension(packageRoot, controlKey);
+    const configuredExtension = {
+      enabled: true,
+      extensionId: "fixture.extension",
+      grants: [
+        { id: "adam.artifact.publish@1", version: "^1.0.0" },
+        { id: "adam.storage.records@1", version: "^1.0.0" },
+      ],
+      packageName: "@fixture/recoverable-extension",
+      packageRoot,
+      packageVersion: "2.0.0",
+    } as const;
+    const capabilities = [
+      { id: "adam.artifact.publish@1", version: "1.0.0" },
+      { id: "adam.storage.records@1", version: "1.0.0" },
+    ] as const;
+    const firstHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: interruptedStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await firstHost.loadConfiguredExtensions();
+    const started = await firstHost.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-reconcile-ambiguous-1",
+      input: { revision: "ambiguous-terminal" },
+    });
+    for await (const _record of firstHost.operations.events({
+      operationId: started.operationId,
+    })) {
+      // The interrupted durable stream is the synchronization point.
+    }
+
+    const ambiguousStore: OperationStore = {
+      async append(record) {
+        await durableStore.append(record);
+        if (record.event.type === "operation_completed") {
+          throw new Error("injected ambiguous terminal append failure");
+        }
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    const recoveredHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configuredExtension],
+      operationStore: ambiguousStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await recoveredHost.loadConfiguredExtensions();
+
+    await expect(recoveredHost.operations.recover(started.operationId)).resolves.toMatchObject({
+      output: { accepted: true, revision: "ambiguous-terminal" },
+      status: "completed",
+    });
+    expect(control).toEqual({ executeCalls: 1, reconcileCalls: 1 });
+    expect(
+      (await durableStore.read(started.operationId)).map((record) => record.event.type),
+    ).toEqual([
+      "operation_started",
+      "operation_artifact_published",
+      "operation_reconciliation_started",
+      "operation_completed",
+    ]);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -1282,6 +2240,10 @@ test("ExtensionHost reports a reopened nonterminal operation as recovery-require
     await mkdir(workspaceRoot);
     await writeOperationExtension(packageRoot, "await new Promise(() => {});");
     const firstStore = await createJsonlOperationStore({ stateRoot, workspaceRoot });
+    const deterministicOwner = {
+      acquire: async () => ({ release: async () => {} }),
+      run: <T>(operation: () => Promise<T>) => operation(),
+    };
     const firstHost = createExtensionHost({
       capabilities: [],
       extensions: [
@@ -1295,6 +2257,7 @@ test("ExtensionHost reports a reopened nonterminal operation as recovery-require
         },
       ],
       operationStore: firstStore,
+      projectLifecycleOwner: deterministicOwner,
       projectRoot: workspaceRoot,
       stateRoot,
     });
@@ -1319,6 +2282,7 @@ test("ExtensionHost reports a reopened nonterminal operation as recovery-require
         },
       ],
       operationStore: reopenedStore,
+      projectLifecycleOwner: deterministicOwner,
       projectRoot: workspaceRoot,
       stateRoot,
     });
@@ -1345,6 +2309,74 @@ test("ExtensionHost reports a reopened nonterminal operation as recovery-require
     expect(repeated.operationId).toBe(started.operationId);
     expect(replayed).toEqual(before);
     expect(await reopenedStore.read(started.operationId)).toEqual(before);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost settles a legacy nonterminal operation as stable inspection-required", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-legacy-inspection-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const stateRoot = join(testRoot, "state");
+  const legacyOperationId = "123e4567-e89b-42d3-a456-426614174099";
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(packageRoot);
+    const store = await createJsonlOperationStore({ stateRoot, workspaceRoot });
+    if (store.projectId === undefined) {
+      throw new Error("Expected a project-scoped JSONL OperationStore.");
+    }
+    await store.append({
+      schemaVersion: 1,
+      operationId: legacyOperationId,
+      sequence: 1,
+      recordedAt: "2026-08-17T08:00:00.000Z",
+      event: {
+        type: "operation_started",
+        contributionId: "fixture.review",
+        deadlineAt: "2026-08-17T08:01:00.000Z",
+        extensionId: "fixture.extension",
+        extensionVersion: "1.0.0",
+        idempotencyKey: "legacy-recovery-1",
+        input: { revision: "legacy" },
+        inputDigest: "sha256:f572421550ce5cbc9e541e1ff5ac77350797099b31eb30c56d23134b973902c0",
+        projectId: store.projectId,
+      },
+    });
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationStore: store,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await host.loadConfiguredExtensions();
+
+    const first = await host.operations.recover(legacyOperationId);
+    const beforeRepeat = await store.read(legacyOperationId);
+    const repeated = await host.operations.recover(legacyOperationId);
+
+    expect(first).toMatchObject({
+      message: "Legacy operation identity cannot be reconciled safely.",
+      status: "inspection_required",
+    });
+    expect(repeated).toEqual(first);
+    expect(await store.read(legacyOperationId)).toEqual(beforeRepeat);
+    expect(beforeRepeat.map((record) => record.event.type)).toEqual([
+      "operation_started",
+      "operation_inspection_required",
+    ]);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -1598,7 +2630,7 @@ async function writeOperationExtension(
       type: "module",
       adamAgent: {
         id: "fixture.extension",
-        apiVersion: "^0.1.0",
+        apiVersion: "^0.2.0",
         runtime: { entry: "./runtime.js" },
         capabilities: { required: [], optional: [] },
         contributions: [
@@ -1641,4 +2673,608 @@ async function writeOperationExtension(
 `,
     "utf8",
   );
+}
+
+async function writeRecoverableOperationExtension(
+  packageRoot: string,
+  controlKey: string,
+): Promise<void> {
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/recoverable-extension",
+      version: "2.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.extension",
+        apiVersion: "^0.2.0",
+        runtime: { entry: "./runtime.js" },
+        capabilities: {
+          required: [
+            { id: "adam.artifact.publish@1", version: "^1.0.0" },
+            { id: "adam.storage.records@1", version: "^1.0.0" },
+          ],
+          optional: [],
+        },
+        contributions: [
+          {
+            kind: "operation",
+            id: "fixture.review",
+            input: { id: "fixture.input", version: 1 },
+            output: { id: "fixture.output", version: 1 },
+            progress: { id: "fixture.progress", version: 1 },
+            recovery: { version: 1 },
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({
+    id,
+    version: 1,
+    decode(value) { return { ok: true, value }; },
+    encode(value) {
+      const control = globalThis[${JSON.stringify(controlKey)}];
+      if (id === "fixture.output" && control.rejectOutput === true) {
+        return { ok: false, issues: [{ code: "invalid_output", path: "" }] };
+      }
+      return { ok: true, value };
+    },
+  });
+  context.registerOperation({
+    id: "fixture.review",
+    input: codec("fixture.input"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    async execute(input, operation) {
+      const control = globalThis[${JSON.stringify(controlKey)}];
+      control.executeCalls += 1;
+      const output = { accepted: true, revision: input.revision };
+      const artifact = await operation.capabilities["adam.artifact.publish@1"].publish({
+        bytes: new TextEncoder().encode(JSON.stringify(output)),
+        contract: { id: "fixture.complete-report", version: 1 },
+        mediaType: "application/json",
+      });
+      await operation.capabilities["adam.storage.records@1"].create({
+        key: \`operations/\${operation.operationId}\`,
+        contract: { id: "fixture.review-aggregate", version: 1 },
+        value: { artifact, output, status: "completed" },
+      });
+      control.onEvidenceDurable?.();
+      if (control.releaseExecute !== undefined) {
+        await control.releaseExecute;
+      }
+      return output;
+    },
+    async reconcile(_input, operation) {
+      const control = globalThis[${JSON.stringify(controlKey)}];
+      control.reconcileCalls += 1;
+      const record = await operation.evidence.records.get(
+        \`operations/\${operation.operationId}\`,
+      );
+      if (record === undefined || record.value.status !== "completed") {
+        return { status: "inspection_required", message: "Completion evidence is missing." };
+      }
+      if (control.forgeInspectionEvidence === true) {
+        return {
+          status: "inspection_required",
+          message: "Foreign evidence must not become terminal truth.",
+          evidence: [
+            {
+              type: "record",
+              record: {
+                byteCount: record.byteCount,
+                contract: record.contract,
+                digest: record.digest,
+                key: record.key,
+                provenance: {
+                  ...record.provenance,
+                  operationId: "00000000-0000-4000-8000-000000000000",
+                },
+              },
+            },
+          ],
+        };
+      }
+      if (control.foreignArtifact !== undefined) {
+        return {
+          status: "completed",
+          output: record.value.output,
+          artifacts: [
+            {
+              ...control.foreignArtifact,
+              provenance: {
+                ...control.foreignArtifact.provenance,
+                contributionId: operation.provenance.contributionId,
+                extensionId: operation.provenance.extensionId,
+                extensionVersion: operation.provenance.extensionVersion,
+                operationId: operation.operationId,
+                projectId: operation.provenance.projectId,
+              },
+            },
+          ],
+        };
+      }
+      if (control.recoveryOutcome === "failed") {
+        return {
+          status: "failed",
+          error: { code: "extension_execution_failed", message: "Evidence proves failure." },
+          artifacts: [record.value.artifact],
+        };
+      }
+      if (control.recoveryOutcome === "inspection") {
+        return {
+          status: "inspection_required",
+          message: "Evidence is incomplete.",
+          evidence: [
+            {
+              type: "record",
+              record: {
+                byteCount: record.byteCount,
+                contract: record.contract,
+                digest: record.digest,
+                key: record.key,
+                provenance: record.provenance,
+              },
+            },
+          ],
+        };
+      }
+      const bytes = await operation.evidence.artifacts.read(record.value.artifact);
+      if (bytes === undefined) {
+        return { status: "inspection_required", message: "Completion artifact is missing." };
+      }
+      return {
+        status: "completed",
+        output: JSON.parse(new TextDecoder().decode(bytes)),
+        artifacts: [record.value.artifact],
+      };
+    },
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function expectStableReconciliationOutcome(fixture: {
+  readonly expected: Record<string, unknown>;
+  readonly outcome: "failed" | "inspection";
+  readonly terminalType: "operation_failed" | "operation_inspection_required";
+}): Promise<void> {
+  const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-operation-${fixture.outcome}-`));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const stateRoot = join(testRoot, "state");
+  const controlKey = `__adamOperationRecoveryOutcome${Date.now()}${Math.random()}`;
+  const control = { executeCalls: 0, reconcileCalls: 0, recoveryOutcome: fixture.outcome };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+  try {
+    await mkdir(workspaceRoot);
+    const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+    const durableStore = createInMemoryOperationStore();
+    let rejectOriginalTerminal = true;
+    const interruptedStore: OperationStore = {
+      append(record) {
+        if (rejectOriginalTerminal && record.event.type === "operation_completed") {
+          rejectOriginalTerminal = false;
+          return Promise.reject(new Error("injected original terminal persistence failure"));
+        }
+        return durableStore.append(record);
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    await writeRecoverableOperationExtension(packageRoot, controlKey);
+    const configured = {
+      enabled: true,
+      extensionId: "fixture.extension",
+      grants: [
+        { id: "adam.artifact.publish@1", version: "^1.0.0" },
+        { id: "adam.storage.records@1", version: "^1.0.0" },
+      ],
+      packageName: "@fixture/recoverable-extension",
+      packageRoot,
+      packageVersion: "2.0.0",
+    } as const;
+    const capabilities = [
+      { id: "adam.artifact.publish@1", version: "1.0.0" },
+      { id: "adam.storage.records@1", version: "1.0.0" },
+    ] as const;
+    const firstHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configured],
+      operationStore: interruptedStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await firstHost.loadConfiguredExtensions();
+    const started = await firstHost.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: `review-reconcile-${fixture.outcome}-1`,
+      input: { revision: fixture.outcome },
+    });
+    for await (const _record of firstHost.operations.events({ operationId: started.operationId })) {
+      // The interrupted durable stream is the synchronization point.
+    }
+    const recoveredHost = createExtensionHost({
+      artifactStore,
+      capabilities,
+      extensions: [configured],
+      operationStore: durableStore,
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await recoveredHost.loadConfiguredExtensions();
+    await expect(recoveredHost.operations.cancel(started.operationId)).resolves.toMatchObject({
+      status: "recovery_required",
+    });
+    const recovered = await recoveredHost.operations.recover(started.operationId);
+    const beforeRepeat = await durableStore.read(started.operationId);
+    const repeated = await recoveredHost.operations.recover(started.operationId);
+
+    expect(recovered).toMatchObject(fixture.expected);
+    expect(repeated).toEqual(recovered);
+    expect(control).toMatchObject({ executeCalls: 1, reconcileCalls: 1 });
+    expect(beforeRepeat.at(-1)?.event.type).toBe(fixture.terminalType);
+    expect(await durableStore.read(started.operationId)).toEqual(beforeRepeat);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+}
+
+async function writeInvalidRecoveryHandlerExtension(packageRoot: string): Promise<void> {
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/invalid-recovery-extension",
+      version: "2.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.extension",
+        apiVersion: "^0.2.0",
+        runtime: { entry: "./runtime.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [
+          {
+            kind: "operation",
+            id: "fixture.review",
+            input: { id: "fixture.input", version: 1 },
+            output: { id: "fixture.output", version: 1 },
+            progress: { id: "fixture.progress", version: 1 },
+            recovery: { version: 1 },
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({
+    id,
+    version: 1,
+    decode(value) { return { ok: true, value }; },
+    encode(value) { return { ok: true, value }; },
+  });
+  context.registerOperation({
+    id: "fixture.review",
+    input: codec("fixture.input"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    execute(input) { return input; },
+    reconcile: "invalid",
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function writeRecoveryDeclarationMismatchExtension(
+  packageRoot: string,
+  fixture: { readonly manifestRecovery: boolean; readonly registrationRecovery: boolean },
+): Promise<void> {
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/recovery-declaration-extension",
+      version: "2.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.extension",
+        apiVersion: "^0.2.0",
+        runtime: { entry: "./runtime.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [
+          {
+            kind: "operation",
+            id: "fixture.review",
+            input: { id: "fixture.input", version: 1 },
+            output: { id: "fixture.output", version: 1 },
+            progress: { id: "fixture.progress", version: 1 },
+            ...(fixture.manifestRecovery ? { recovery: { version: 1 } } : {}),
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({
+    id,
+    version: 1,
+    decode(value) { return { ok: true, value }; },
+    encode(value) { return { ok: true, value }; },
+  });
+  context.registerOperation({
+    id: "fixture.review",
+    input: codec("fixture.input"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    execute(input) { return input; },
+    ${fixture.registrationRecovery ? 'reconcile(input) { return { status: "completed", output: input }; },' : ""}
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function writeGrantSensitiveRecoveryExtension(
+  packageRoot: string,
+  controlKey: string,
+  packageVersion = "2.0.0",
+): Promise<void> {
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/grant-recovery-extension",
+      version: packageVersion,
+      type: "module",
+      adamAgent: {
+        id: "fixture.extension",
+        apiVersion: "^0.2.0",
+        runtime: { entry: "./runtime.js" },
+        capabilities: {
+          required: [{ id: "fixture.capability@1", version: "^1.0.0" }],
+          optional: [],
+        },
+        contributions: [
+          {
+            kind: "operation",
+            id: "fixture.review",
+            input: { id: "fixture.input", version: 1 },
+            output: { id: "fixture.output", version: 1 },
+            progress: { id: "fixture.progress", version: 1 },
+            recovery: { version: 1 },
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({
+    id,
+    version: 1,
+    decode(value) {
+      const control = globalThis[${JSON.stringify(controlKey)}];
+      if (id === "fixture.input" && control.rejectInput === true) {
+        return { ok: false, issues: [{ code: "invalid_input", path: "" }] };
+      }
+      return { ok: true, value };
+    },
+    encode(value) {
+      const control = globalThis[${JSON.stringify(controlKey)}];
+      if (id === "fixture.output" && control.rejectOutput === true) {
+        return { ok: false, issues: [{ code: "invalid_output", path: "" }] };
+      }
+      return { ok: true, value };
+    },
+  });
+  context.registerOperation({
+    id: "fixture.review",
+    input: codec("fixture.input"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    execute(input) {
+      globalThis[${JSON.stringify(controlKey)}].executeCalls += 1;
+      return { accepted: true, revision: input.revision };
+    },
+    reconcile(input) {
+      const control = globalThis[${JSON.stringify(controlKey)}];
+      control.reconcileCalls += 1;
+      if (control.hangReconcile === true) {
+        return new Promise(() => {});
+      }
+      if (control.rejectFailure === true) {
+        return { status: "failed", error: { code: "invalid_failure", message: "invalid" } };
+      }
+      return { status: "completed", output: { accepted: true, revision: input.revision } };
+    },
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function expectRecoveryValidationMismatch(fixture: {
+  readonly expectedCode?: "operation_input_invalid";
+  readonly expectedStatus?: "recovery_required";
+  readonly mode: "rejectFailure" | "rejectInput" | "rejectOutput";
+  readonly reconcileCalls: number;
+}): Promise<void> {
+  const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-operation-${fixture.mode}-`));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamOperationRecoveryValidation${Date.now()}${Math.random()}`;
+  const control: Record<string, unknown> = { executeCalls: 0, reconcileCalls: 0 };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+  try {
+    await mkdir(workspaceRoot);
+    await writeGrantSensitiveRecoveryExtension(packageRoot, controlKey);
+    const durableStore = createInMemoryOperationStore();
+    let rejectOriginalTerminal = true;
+    const interruptedStore: OperationStore = {
+      append(record) {
+        if (rejectOriginalTerminal && record.event.type === "operation_completed") {
+          rejectOriginalTerminal = false;
+          return Promise.reject(new Error("injected original terminal persistence failure"));
+        }
+        return durableStore.append(record);
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    const configured = {
+      enabled: true,
+      extensionId: "fixture.extension",
+      grants: [{ id: "fixture.capability@1", version: "^1.0.0" }],
+      packageName: "@fixture/grant-recovery-extension",
+      packageRoot,
+      packageVersion: "2.0.0",
+    } as const;
+    const capabilities = [{ id: "fixture.capability@1", version: "1.0.0" }] as const;
+    const firstHost = createExtensionHost({
+      capabilities,
+      extensions: [configured],
+      operationStore: interruptedStore,
+      projectRoot: workspaceRoot,
+    });
+    await firstHost.loadConfiguredExtensions();
+    const started = await firstHost.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: `review-reconcile-${fixture.mode}-1`,
+      input: { revision: fixture.mode },
+    });
+    for await (const _record of firstHost.operations.events({ operationId: started.operationId })) {
+      // The interrupted durable stream is the synchronization point.
+    }
+    control[fixture.mode] = true;
+    const recoveredHost = createExtensionHost({
+      capabilities,
+      extensions: [configured],
+      operationStore: durableStore,
+      projectRoot: workspaceRoot,
+    });
+    await recoveredHost.loadConfiguredExtensions();
+    if (fixture.expectedCode !== undefined) {
+      await expect(recoveredHost.operations.recover(started.operationId)).rejects.toMatchObject({
+        code: fixture.expectedCode,
+        name: "OperationHostError",
+      });
+    } else {
+      await expect(recoveredHost.operations.recover(started.operationId)).resolves.toMatchObject({
+        status: fixture.expectedStatus,
+      });
+    }
+    expect(control).toMatchObject({ executeCalls: 1, reconcileCalls: fixture.reconcileCalls });
+    expect(
+      (await durableStore.read(started.operationId)).some((record) =>
+        ["operation_completed", "operation_failed", "operation_inspection_required"].includes(
+          record.event.type,
+        ),
+      ),
+    ).toBe(false);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+}
+
+async function expectRecoveryIdentityMismatch(fixture: {
+  readonly expectedCode: "operation_contribution_unavailable" | "operation_store_project_mismatch";
+  readonly mode: "project" | "version";
+}): Promise<void> {
+  const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-operation-${fixture.mode}-mismatch-`));
+  const firstWorkspaceRoot = join(testRoot, "workspace-a");
+  const secondWorkspaceRoot = join(testRoot, "workspace-b");
+  const firstPackageRoot = join(testRoot, "extension-a");
+  const secondPackageRoot = join(testRoot, "extension-b");
+  const controlKey = `__adamOperationRecoveryIdentity${Date.now()}${Math.random()}`;
+  const control = { executeCalls: 0, reconcileCalls: 0 };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+  try {
+    await mkdir(firstWorkspaceRoot);
+    await mkdir(secondWorkspaceRoot);
+    await writeGrantSensitiveRecoveryExtension(firstPackageRoot, controlKey);
+    const durableStore = createInMemoryOperationStore();
+    let rejectOriginalTerminal = true;
+    const interruptedStore: OperationStore = {
+      append(record) {
+        if (rejectOriginalTerminal && record.event.type === "operation_completed") {
+          rejectOriginalTerminal = false;
+          return Promise.reject(new Error("injected original terminal persistence failure"));
+        }
+        return durableStore.append(record);
+      },
+      findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      read: (operationId) => durableStore.read(operationId),
+    };
+    const capability = { id: "fixture.capability@1", version: "1.0.0" } as const;
+    const configured = (packageRoot: string, packageVersion: string) => ({
+      enabled: true,
+      extensionId: "fixture.extension",
+      grants: [{ id: "fixture.capability@1", version: "^1.0.0" }],
+      packageName: "@fixture/grant-recovery-extension",
+      packageRoot,
+      packageVersion,
+    });
+    const firstHost = createExtensionHost({
+      capabilities: [capability],
+      extensions: [configured(firstPackageRoot, "2.0.0")],
+      operationStore: interruptedStore,
+      projectRoot: firstWorkspaceRoot,
+    });
+    await firstHost.loadConfiguredExtensions();
+    const started = await firstHost.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: `review-reconcile-${fixture.mode}-mismatch-1`,
+      input: { revision: fixture.mode },
+    });
+    for await (const _record of firstHost.operations.events({ operationId: started.operationId })) {
+      // The interrupted durable stream is the synchronization point.
+    }
+    if (fixture.mode === "version") {
+      await writeGrantSensitiveRecoveryExtension(secondPackageRoot, controlKey, "2.0.1");
+    }
+    const recoveredHost = createExtensionHost({
+      capabilities: [capability],
+      extensions: [
+        configured(
+          fixture.mode === "version" ? secondPackageRoot : firstPackageRoot,
+          fixture.mode === "version" ? "2.0.1" : "2.0.0",
+        ),
+      ],
+      operationStore: durableStore,
+      projectRoot: fixture.mode === "project" ? secondWorkspaceRoot : firstWorkspaceRoot,
+    });
+    await recoveredHost.loadConfiguredExtensions();
+
+    await expect(recoveredHost.operations.recover(started.operationId)).rejects.toMatchObject({
+      code: fixture.expectedCode,
+      name: "OperationHostError",
+    });
+    expect(control).toEqual({ executeCalls: 1, reconcileCalls: 0 });
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
 }

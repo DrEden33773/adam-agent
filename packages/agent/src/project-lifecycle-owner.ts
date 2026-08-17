@@ -19,16 +19,23 @@ export class ProjectLifecycleOwnerError extends Error {
 }
 
 export type ProjectLifecycleOwner = {
+  acquire(): Promise<ProjectLifecycleOwnerLease>;
   run<T>(operation: () => Promise<T>): Promise<T>;
+};
+
+export type ProjectLifecycleOwnerLease = {
+  release(): Promise<void>;
 };
 
 export function createProjectLifecycleOwner(options: {
   readonly workspaceRoot: string;
   readonly stateRoot?: string;
 }): ProjectLifecycleOwner {
+  const acquire = () => acquireProjectLifecycleOwner(options);
   return {
+    acquire,
     async run(operation) {
-      const handle = await acquireProjectLifecycleOwner(options);
+      const handle = await acquire();
       try {
         return await operation();
       } finally {
@@ -38,14 +45,10 @@ export function createProjectLifecycleOwner(options: {
   };
 }
 
-type ProjectLifecycleOwnerHandle = {
-  release(): Promise<void>;
-};
-
 async function acquireProjectLifecycleOwner(options: {
   readonly workspaceRoot: string;
   readonly stateRoot?: string;
-}): Promise<ProjectLifecycleOwnerHandle> {
+}): Promise<ProjectLifecycleOwnerLease> {
   const canonicalRoot = await realpath(options.workspaceRoot);
   const projectKey = createHash("sha256").update(canonicalRoot).digest("hex");
   const projectDirectory = join(options.stateRoot ?? defaultStateRoot(), "projects", projectKey);

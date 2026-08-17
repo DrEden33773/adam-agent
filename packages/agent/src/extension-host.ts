@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
 import { dirname, extname, isAbsolute, relative, resolve } from "node:path";
@@ -34,6 +35,11 @@ import {
   type RegisteredOperation,
 } from "./operation-host.js";
 import type { OperationStore } from "./operation-store.js";
+import {
+  createProjectLifecycleOwner,
+  type ProjectLifecycleOwner,
+  ProjectLifecycleOwnerError,
+} from "./project-lifecycle-owner.js";
 import type { PermissionPolicy } from "./tool-runtime.js";
 
 export type ExtensionCapabilityAvailability = {
@@ -65,6 +71,7 @@ export type ExtensionHostOptions = {
   readonly operationDisableGraceMs?: number;
   readonly operationStore?: OperationStore;
   readonly permissions?: PermissionPolicy;
+  readonly projectLifecycleOwner?: ProjectLifecycleOwner;
   readonly projectRoot?: string;
   readonly stateRoot?: string;
 };
@@ -202,16 +209,21 @@ export interface ExtensionHost {
 }
 
 export class ExtensionHostError extends Error {
-  readonly code: "extension_configuration_invalid" | "extension_state_persistence_failed";
+  readonly code:
+    | "extension_configuration_invalid"
+    | "extension_state_persistence_failed"
+    | "project_in_use"
+    | "project_owner_unavailable";
 
-  constructor(
-    code: "extension_configuration_invalid" | "extension_state_persistence_failed",
-    options?: { readonly cause: unknown },
-  ) {
+  constructor(code: ExtensionHostError["code"], options?: { readonly cause: unknown }) {
     super(
       code === "extension_configuration_invalid"
         ? "The extension Host configuration is invalid."
-        : "The extension lifecycle state could not be persisted.",
+        : code === "extension_state_persistence_failed"
+          ? "The extension lifecycle state could not be persisted."
+          : code === "project_in_use"
+            ? "Another process owns lifecycle mutations for this canonical project."
+            : "The OS-backed project lifecycle owner is unavailable.",
       options,
     );
     this.name = "ExtensionHostError";
@@ -267,6 +279,17 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
   const lifecycleStore = createExtensionLifecycleStore(options.stateRoot);
   const recordStore = createExtensionRecordStore(options.stateRoot);
   const lifecycleCommandQueues = new Map<string, Promise<void>>();
+  const projectLifecycleOwner: ProjectLifecycleOwner =
+    options.projectLifecycleOwner ??
+    (options.operationStore?.projectId === undefined
+      ? {
+          acquire: async () => ({ release: async () => {} }),
+          run: (operation) => operation(),
+        }
+      : createProjectLifecycleOwner({
+          workspaceRoot: options.projectRoot ?? process.cwd(),
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        }));
   const operationHost: OperationHostControl = createOperationHost({
     ...(options.artifactStore === undefined ? {} : { artifactStore: options.artifactStore }),
     ...(options.operationDeadlineMs === undefined
@@ -274,6 +297,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       : { defaultDeadlineMs: options.operationDeadlineMs }),
     ...(options.biomeExecution === undefined ? {} : { biomeExecution: options.biomeExecution }),
     projectRoot: options.projectRoot ?? process.cwd(),
+    lifecycleOwner: projectLifecycleOwner,
     ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
     recordStore,
     resolveOperation: (contributionId) => registeredOperations.get(contributionId),
@@ -364,380 +388,409 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       if (loadInFlight !== undefined) {
         return loadInFlight;
       }
-      const operation = (async () => {
-        const availableCapabilities = new Map(
-          options.capabilities.map((capability) => [capability.id, capability]),
-        );
-        const extensions: ExtensionStateSnapshot[] = [];
-        for (const configured of options.extensions) {
-          const loadedSnapshot = loadedSnapshots.get(configured.extensionId);
-          if (loadedSnapshot !== undefined) {
-            extensions.push(loadedSnapshot);
-            continue;
-          }
-          if (!configured.enabled) {
-            extensions.push(disabledSnapshot(configured));
-            continue;
-          }
-          let persistedEnabled: boolean | undefined;
-          try {
-            persistedEnabled = await lifecycleStore.read(configured);
-          } catch {
-            extensions.push({
-              diagnostics: [{ code: "extension_state_unavailable" }],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
+      const operation = projectLifecycleOwner
+        .run(async () => {
+          const availableCapabilities = new Map(
+            options.capabilities.map((capability) => [capability.id, capability]),
+          );
+          const extensions: ExtensionStateSnapshot[] = [];
+          for (const configured of options.extensions) {
+            const loadedSnapshot = loadedSnapshots.get(configured.extensionId);
+            if (loadedSnapshot !== undefined) {
+              extensions.push(loadedSnapshot);
+              continue;
+            }
+            if (!configured.enabled) {
+              extensions.push(disabledSnapshot(configured));
+              continue;
+            }
+            let persistedEnabled: boolean | undefined;
+            try {
+              persistedEnabled = await lifecycleStore.read(configured);
+            } catch {
+              extensions.push({
+                diagnostics: [{ code: "extension_state_unavailable" }],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            if (persistedEnabled === false) {
+              extensions.push(disabledSnapshot(configured));
+              continue;
+            }
+            let packageRoot: string;
+            try {
+              packageRoot = await realpath(configured.packageRoot);
+            } catch {
+              extensions.push({
+                diagnostics: [{ code: "package_unavailable" }],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            let manifest: ExtensionPackageManifest;
+            try {
+              const packageJson: unknown = JSON.parse(await readPackageManifest(packageRoot));
+              manifest = parseExtensionPackageManifest(packageJson);
+            } catch {
+              extensions.push({
+                diagnostics: [{ code: "manifest_invalid" }],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const identityMismatch = findIdentityMismatch(configured, manifest);
+            if (identityMismatch !== undefined) {
+              extensions.push({
+                diagnostics: [identityMismatch],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            if (!satisfies(EXTENSION_API_VERSION, manifest.adamAgent.apiVersion)) {
+              extensions.push({
+                diagnostics: [
+                  {
+                    code: "extension_api_incompatible",
+                    hostVersion: EXTENSION_API_VERSION,
+                    requestedVersion: manifest.adamAgent.apiVersion,
+                  },
+                ],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const invalidGrant = configured.grants.find(
+              (grant) =>
+                !isSingleMajorGrantRange(grant.version) ||
+                ![
+                  ...manifest.adamAgent.capabilities.required,
+                  ...manifest.adamAgent.capabilities.optional,
+                ].some((capability) => capability.id === grant.id),
+            );
+            if (invalidGrant !== undefined) {
+              extensions.push({
+                diagnostics: [
+                  {
+                    capabilityId: invalidGrant.id,
+                    code: "capability_grant_invalid",
+                  },
+                ],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const missing = manifest.adamAgent.capabilities.required.find(
+              (capability) => !availableCapabilities.has(capability.id),
+            );
+            if (missing !== undefined) {
+              extensions.push({
+                diagnostics: [
+                  {
+                    capabilityId: missing.id,
+                    code: "required_capability_unavailable",
+                    requestedVersion: missing.version,
+                  },
+                ],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const incompatible = manifest.adamAgent.capabilities.required.find((capability) => {
+              const available = availableCapabilities.get(capability.id);
+              return available !== undefined && !satisfies(available.version, capability.version);
             });
-            continue;
-          }
-          if (persistedEnabled === false) {
-            extensions.push(disabledSnapshot(configured));
-            continue;
-          }
-          let packageRoot: string;
-          try {
-            packageRoot = await realpath(configured.packageRoot);
-          } catch {
-            extensions.push({
-              diagnostics: [{ code: "package_unavailable" }],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
+            if (incompatible !== undefined) {
+              const available = availableCapabilities.get(incompatible.id);
+              if (available === undefined) {
+                throw new Error("The required capability disappeared during negotiation.");
+              }
+              extensions.push({
+                diagnostics: [
+                  {
+                    availableVersion: available.version,
+                    capabilityId: incompatible.id,
+                    code: "required_capability_incompatible",
+                    requestedVersion: incompatible.version,
+                  },
+                ],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const ungranted = manifest.adamAgent.capabilities.required.find((capability) => {
+              const available = availableCapabilities.get(capability.id);
+              return !configured.grants.some(
+                (grant) =>
+                  grant.id === capability.id &&
+                  available !== undefined &&
+                  satisfies(available.version, grant.version),
+              );
             });
-            continue;
-          }
-          let manifest: ExtensionPackageManifest;
-          try {
-            const packageJson: unknown = JSON.parse(await readPackageManifest(packageRoot));
-            manifest = parseExtensionPackageManifest(packageJson);
-          } catch {
-            extensions.push({
-              diagnostics: [{ code: "manifest_invalid" }],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
-            });
-            continue;
-          }
-          const identityMismatch = findIdentityMismatch(configured, manifest);
-          if (identityMismatch !== undefined) {
-            extensions.push({
-              diagnostics: [identityMismatch],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
-            });
-            continue;
-          }
-          if (!satisfies(EXTENSION_API_VERSION, manifest.adamAgent.apiVersion)) {
-            extensions.push({
-              diagnostics: [
-                {
-                  code: "extension_api_incompatible",
+            if (ungranted !== undefined) {
+              extensions.push({
+                diagnostics: [
+                  {
+                    capabilityId: ungranted.id,
+                    code: "required_capability_ungranted",
+                    requestedVersion: ungranted.version,
+                  },
+                ],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const optionalDiagnostics: ExtensionActivationDiagnostic[] =
+              manifest.adamAgent.capabilities.optional
+                .filter((capability) => !availableCapabilities.has(capability.id))
+                .map((capability) => ({
+                  capabilityId: capability.id,
+                  code: "optional_capability_unavailable",
+                  requestedVersion: capability.version,
+                }));
+            for (const capability of manifest.adamAgent.capabilities.optional) {
+              const available = availableCapabilities.get(capability.id);
+              if (available !== undefined && !satisfies(available.version, capability.version)) {
+                optionalDiagnostics.push({
+                  availableVersion: available.version,
+                  capabilityId: capability.id,
+                  code: "optional_capability_incompatible",
+                  requestedVersion: capability.version,
+                });
+              }
+              if (
+                available !== undefined &&
+                satisfies(available.version, capability.version) &&
+                !configured.grants.some(
+                  (grant) =>
+                    grant.id === capability.id && satisfies(available.version, grant.version),
+                )
+              ) {
+                optionalDiagnostics.push({
+                  capabilityId: capability.id,
+                  code: "optional_capability_ungranted",
+                  requestedVersion: capability.version,
+                });
+              }
+            }
+            let configuration: ExtensionJsonValue;
+            try {
+              configuration = prepareConfiguration(configured.configuration ?? null);
+            } catch {
+              extensions.push({
+                diagnostics: [{ code: "configuration_invalid" }],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const registrations: unknown[] = [];
+            const activationContext: ExtensionActivationContext = Object.freeze({
+              compatibility: deepFreeze({
+                api: {
                   hostVersion: EXTENSION_API_VERSION,
                   requestedVersion: manifest.adamAgent.apiVersion,
                 },
-              ],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
-            });
-            continue;
-          }
-          const invalidGrant = configured.grants.find(
-            (grant) =>
-              !isSingleMajorGrantRange(grant.version) ||
-              ![
-                ...manifest.adamAgent.capabilities.required,
-                ...manifest.adamAgent.capabilities.optional,
-              ].some((capability) => capability.id === grant.id),
-          );
-          if (invalidGrant !== undefined) {
-            extensions.push({
-              diagnostics: [
-                {
-                  capabilityId: invalidGrant.id,
-                  code: "capability_grant_invalid",
+                capabilities: {
+                  optional: negotiateCapabilities(
+                    manifest.adamAgent.capabilities.optional,
+                    availableCapabilities,
+                    configured.grants,
+                  ),
+                  required: negotiateCapabilities(
+                    manifest.adamAgent.capabilities.required,
+                    availableCapabilities,
+                    configured.grants,
+                  ),
                 },
-              ],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
+              }),
+              configuration,
+              diagnostics: deepFreeze(optionalDiagnostics.map((diagnostic) => ({ ...diagnostic }))),
+              extension: Object.freeze({
+                id: configured.extensionId,
+                packageName: configured.packageName,
+                version: configured.packageVersion,
+              }),
+              registerOperation(registration: ExtensionOperationRegistration) {
+                registrations.push(registration);
+              },
             });
-            continue;
-          }
-          const missing = manifest.adamAgent.capabilities.required.find(
-            (capability) => !availableCapabilities.has(capability.id),
-          );
-          if (missing !== undefined) {
-            extensions.push({
-              diagnostics: [
-                {
-                  capabilityId: missing.id,
-                  code: "required_capability_unavailable",
-                  requestedVersion: missing.version,
-                },
-              ],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
-            });
-            continue;
-          }
-          const incompatible = manifest.adamAgent.capabilities.required.find((capability) => {
-            const available = availableCapabilities.get(capability.id);
-            return available !== undefined && !satisfies(available.version, capability.version);
-          });
-          if (incompatible !== undefined) {
-            const available = availableCapabilities.get(incompatible.id);
-            if (available === undefined) {
-              throw new Error("The required capability disappeared during negotiation.");
-            }
-            extensions.push({
-              diagnostics: [
-                {
-                  availableVersion: available.version,
-                  capabilityId: incompatible.id,
-                  code: "required_capability_incompatible",
-                  requestedVersion: incompatible.version,
-                },
-              ],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
-            });
-            continue;
-          }
-          const ungranted = manifest.adamAgent.capabilities.required.find((capability) => {
-            const available = availableCapabilities.get(capability.id);
-            return !configured.grants.some(
-              (grant) =>
-                grant.id === capability.id &&
-                available !== undefined &&
-                satisfies(available.version, grant.version),
-            );
-          });
-          if (ungranted !== undefined) {
-            extensions.push({
-              diagnostics: [
-                {
-                  capabilityId: ungranted.id,
-                  code: "required_capability_ungranted",
-                  requestedVersion: ungranted.version,
-                },
-              ],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
-            });
-            continue;
-          }
-          const optionalDiagnostics: ExtensionActivationDiagnostic[] =
-            manifest.adamAgent.capabilities.optional
-              .filter((capability) => !availableCapabilities.has(capability.id))
-              .map((capability) => ({
-                capabilityId: capability.id,
-                code: "optional_capability_unavailable",
-                requestedVersion: capability.version,
-              }));
-          for (const capability of manifest.adamAgent.capabilities.optional) {
-            const available = availableCapabilities.get(capability.id);
-            if (available !== undefined && !satisfies(available.version, capability.version)) {
-              optionalDiagnostics.push({
-                availableVersion: available.version,
-                capabilityId: capability.id,
-                code: "optional_capability_incompatible",
-                requestedVersion: capability.version,
+            let deactivate:
+              | ((context: ExtensionDeactivationContext) => Promise<void> | void)
+              | undefined;
+            let entryPath: string;
+            try {
+              entryPath = await resolveConfinedEntry(packageRoot, manifest.adamAgent.runtime.entry);
+              await assertEsmRuntimeEntry(packageRoot, entryPath);
+            } catch {
+              extensions.push({
+                diagnostics: [{ code: "runtime_entry_invalid" }],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
               });
+              continue;
             }
-            if (
-              available !== undefined &&
-              satisfies(available.version, capability.version) &&
-              !configured.grants.some(
-                (grant) =>
-                  grant.id === capability.id && satisfies(available.version, grant.version),
+            try {
+              const runtime: unknown = await import(pathToFileURL(entryPath).href);
+              if (!isExtensionRuntime(runtime)) {
+                throw new TypeError("The extension runtime must export an activate function.");
+              }
+              deactivate = runtime.deactivate;
+              await activateWithDeadline(runtime.activate, activationContext);
+            } catch (error) {
+              extensions.push({
+                diagnostics: [
+                  {
+                    code:
+                      error instanceof ExtensionActivationTimeoutError
+                        ? "activation_timed_out"
+                        : "activation_failed",
+                  },
+                ],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const disabledDuringActivation = loadedSnapshots.get(configured.extensionId);
+            if (disabledDuringActivation?.status === "disabled") {
+              const snapshot = disabledSnapshot(
+                configured,
+                await deactivateRuntime(configured, deactivate),
+              );
+              loadedSnapshots.set(configured.extensionId, snapshot);
+              extensions.push(snapshot);
+              continue;
+            }
+            const registrationMatch = matchOperationRegistrations(
+              configured.extensionId,
+              manifest.adamAgent.contributions,
+              registrations,
+            );
+            if (!registrationMatch.ok) {
+              const deactivationDiagnostics = await deactivateRuntime(configured, deactivate);
+              extensions.push({
+                diagnostics: [registrationMatch.diagnostic, ...deactivationDiagnostics],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const existingContribution = registrationMatch.contributions.find((candidate) =>
+              publishedContributions.some((published) => published.id === candidate.id),
+            );
+            if (existingContribution !== undefined) {
+              const deactivationDiagnostics = await deactivateRuntime(configured, deactivate);
+              extensions.push({
+                diagnostics: [
+                  {
+                    code: "contribution_collision",
+                    contributionId: existingContribution.id,
+                  },
+                  ...deactivationDiagnostics,
+                ],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            publishedContributions.push(...registrationMatch.contributions);
+            const capabilityIds = [
+              ...activationContext.compatibility.capabilities.required,
+              ...activationContext.compatibility.capabilities.optional,
+            ]
+              .filter(
+                (capability) => capability.granted && capability.availableVersion !== undefined,
               )
-            ) {
-              optionalDiagnostics.push({
-                capabilityId: capability.id,
-                code: "optional_capability_ungranted",
-                requestedVersion: capability.version,
+              .map((capability) => capability.id);
+            for (const registration of registrationMatch.registrations) {
+              const declaration = registrationMatch.contributions.find(
+                (candidate) => candidate.id === registration.id,
+              );
+              if (declaration === undefined) {
+                throw new TypeError("The operation declaration is unavailable.");
+              }
+              registeredOperations.set(registration.id, {
+                capabilityIds,
+                contributionId: registration.id,
+                definitionDigest: digestOperationDefinition({
+                  capabilityIds,
+                  capabilityVersions: capabilityIds.map((id) => ({
+                    id,
+                    version: availableCapabilities.get(id)?.version ?? "unavailable",
+                  })),
+                  configuration,
+                  contribution: declaration,
+                  extensionId: configured.extensionId,
+                  extensionVersion: configured.packageVersion,
+                  grants: configured.grants,
+                  packageName: configured.packageName,
+                  packageRoot,
+                }),
+                diagnostics: optionalDiagnostics,
+                extensionId: configured.extensionId,
+                extensionVersion: configured.packageVersion,
+                registration,
               });
             }
-          }
-          let configuration: ExtensionJsonValue;
-          try {
-            configuration = prepareConfiguration(configured.configuration ?? null);
-          } catch {
+            activeExtensions.set(configured.extensionId, { deactivate });
+            await operationHost.enableExtensionOperations(configured.extensionId);
             extensions.push({
-              diagnostics: [{ code: "configuration_invalid" }],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
-            });
-            continue;
-          }
-          const registrations: unknown[] = [];
-          const activationContext: ExtensionActivationContext = Object.freeze({
-            compatibility: deepFreeze({
-              api: {
-                hostVersion: EXTENSION_API_VERSION,
-                requestedVersion: manifest.adamAgent.apiVersion,
-              },
-              capabilities: {
-                optional: negotiateCapabilities(
-                  manifest.adamAgent.capabilities.optional,
-                  availableCapabilities,
-                  configured.grants,
-                ),
-                required: negotiateCapabilities(
-                  manifest.adamAgent.capabilities.required,
-                  availableCapabilities,
-                  configured.grants,
-                ),
-              },
-            }),
-            configuration,
-            diagnostics: deepFreeze(optionalDiagnostics.map((diagnostic) => ({ ...diagnostic }))),
-            extension: Object.freeze({
-              id: configured.extensionId,
-              packageName: configured.packageName,
-              version: configured.packageVersion,
-            }),
-            registerOperation(registration: ExtensionOperationRegistration) {
-              registrations.push(registration);
-            },
-          });
-          let deactivate:
-            | ((context: ExtensionDeactivationContext) => Promise<void> | void)
-            | undefined;
-          let entryPath: string;
-          try {
-            entryPath = await resolveConfinedEntry(packageRoot, manifest.adamAgent.runtime.entry);
-            await assertEsmRuntimeEntry(packageRoot, entryPath);
-          } catch {
-            extensions.push({
-              diagnostics: [{ code: "runtime_entry_invalid" }],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
-            });
-            continue;
-          }
-          try {
-            const runtime: unknown = await import(pathToFileURL(entryPath).href);
-            if (!isExtensionRuntime(runtime)) {
-              throw new TypeError("The extension runtime must export an activate function.");
-            }
-            deactivate = runtime.deactivate;
-            await activateWithDeadline(runtime.activate, activationContext);
-          } catch (error) {
-            extensions.push({
-              diagnostics: [
-                {
-                  code:
-                    error instanceof ExtensionActivationTimeoutError
-                      ? "activation_timed_out"
-                      : "activation_failed",
-                },
-              ],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
-            });
-            continue;
-          }
-          const disabledDuringActivation = loadedSnapshots.get(configured.extensionId);
-          if (disabledDuringActivation?.status === "disabled") {
-            const snapshot = disabledSnapshot(
-              configured,
-              await deactivateRuntime(configured, deactivate),
-            );
-            loadedSnapshots.set(configured.extensionId, snapshot);
-            extensions.push(snapshot);
-            continue;
-          }
-          const registrationMatch = matchOperationRegistrations(
-            configured.extensionId,
-            manifest.adamAgent.contributions,
-            registrations,
-          );
-          if (!registrationMatch.ok) {
-            const deactivationDiagnostics = await deactivateRuntime(configured, deactivate);
-            extensions.push({
-              diagnostics: [registrationMatch.diagnostic, ...deactivationDiagnostics],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
-            });
-            continue;
-          }
-          const existingContribution = registrationMatch.contributions.find((candidate) =>
-            publishedContributions.some((published) => published.id === candidate.id),
-          );
-          if (existingContribution !== undefined) {
-            const deactivationDiagnostics = await deactivateRuntime(configured, deactivate);
-            extensions.push({
-              diagnostics: [
-                {
-                  code: "contribution_collision",
-                  contributionId: existingContribution.id,
-                },
-                ...deactivationDiagnostics,
-              ],
-              extensionId: configured.extensionId,
-              packageName: configured.packageName,
-              packageVersion: configured.packageVersion,
-              status: "rejected",
-            });
-            continue;
-          }
-          publishedContributions.push(...registrationMatch.contributions);
-          const capabilityIds = [
-            ...activationContext.compatibility.capabilities.required,
-            ...activationContext.compatibility.capabilities.optional,
-          ]
-            .filter((capability) => capability.granted && capability.availableVersion !== undefined)
-            .map((capability) => capability.id);
-          for (const registration of registrationMatch.registrations) {
-            registeredOperations.set(registration.id, {
-              capabilityIds,
-              contributionId: registration.id,
               diagnostics: optionalDiagnostics,
               extensionId: configured.extensionId,
-              extensionVersion: configured.packageVersion,
-              registration,
+              packageName: configured.packageName,
+              packageVersion: configured.packageVersion,
+              status: "active",
             });
           }
-          activeExtensions.set(configured.extensionId, { deactivate });
-          await operationHost.enableExtensionOperations(configured.extensionId);
-          extensions.push({
-            diagnostics: optionalDiagnostics,
-            extensionId: configured.extensionId,
-            packageName: configured.packageName,
-            packageVersion: configured.packageVersion,
-            status: "active",
-          });
-        }
-        for (const extension of extensions) {
-          loadedSnapshots.set(extension.extensionId, extension);
-        }
-        return { extensions };
-      })();
+          for (const extension of extensions) {
+            loadedSnapshots.set(extension.extensionId, extension);
+          }
+          return { extensions };
+        })
+        .catch((error: unknown) => {
+          if (error instanceof ProjectLifecycleOwnerError) {
+            throw new ExtensionHostError(error.code, { cause: error });
+          }
+          throw error;
+        });
       loadInFlight = operation;
       const clearInFlight = () => {
         if (loadInFlight === operation) {
@@ -1089,6 +1142,18 @@ function matchOperationRegistrationsUnchecked(
         },
       };
     }
+    if (
+      (declaration.recovery === undefined && registration.reconcile !== undefined) ||
+      (declaration.recovery !== undefined && typeof registration.reconcile !== "function")
+    ) {
+      return {
+        ok: false,
+        diagnostic: {
+          code: "contribution_handler_invalid",
+          contributionId: declaration.id,
+        },
+      };
+    }
     const invalidCodec = findInvalidCodec(registration);
     if (invalidCodec !== undefined) {
       return {
@@ -1139,6 +1204,7 @@ type OperationRegistrationCandidate = {
   readonly input: ExtensionContractCodecCandidate;
   readonly output: ExtensionContractCodecCandidate;
   readonly progress: ExtensionContractCodecCandidate;
+  readonly reconcile?: unknown;
 };
 
 type ExtensionContractCodecCandidate = ExtensionContractReference & {
@@ -1160,6 +1226,57 @@ function isOperationRegistrationCandidate(value: unknown): value is OperationReg
     isContractCodecCandidate(value.progress) &&
     "execute" in value
   );
+}
+
+function digestOperationDefinition(input: {
+  readonly capabilityIds: readonly string[];
+  readonly capabilityVersions: readonly { readonly id: string; readonly version: string }[];
+  readonly configuration: ExtensionJsonValue;
+  readonly contribution: ExtensionContributionSummary;
+  readonly extensionId: string;
+  readonly extensionVersion: string;
+  readonly grants: readonly ExtensionCapabilityGrant[];
+  readonly packageName: string;
+  readonly packageRoot: string;
+}): string {
+  const canonical = canonicalizeDefinitionValue({
+    capabilityIds: [...input.capabilityIds].sort(),
+    capabilityVersions: [...input.capabilityVersions].sort((left, right) =>
+      left.id.localeCompare(right.id),
+    ),
+    configuration: input.configuration,
+    contribution: {
+      kind: input.contribution.kind,
+      id: input.contribution.id,
+      input: input.contribution.input,
+      output: input.contribution.output,
+      progress: input.contribution.progress,
+      ...(input.contribution.recovery === undefined
+        ? {}
+        : { recovery: input.contribution.recovery }),
+    },
+    extensionId: input.extensionId,
+    extensionVersion: input.extensionVersion,
+    grants: [...input.grants].sort((left, right) => left.id.localeCompare(right.id)),
+    packageName: input.packageName,
+    packageRoot: input.packageRoot,
+  });
+  return `sha256:${createHash("sha256").update(JSON.stringify(canonical)).digest("hex")}`;
+}
+
+function canonicalizeDefinitionValue(value: ExtensionJsonValue): ExtensionJsonValue {
+  if (Array.isArray(value)) {
+    return value.map(canonicalizeDefinitionValue);
+  }
+  if (value !== null && typeof value === "object") {
+    const record = value as { readonly [key: string]: ExtensionJsonValue };
+    return Object.fromEntries(
+      Object.keys(record)
+        .sort()
+        .map((key) => [key, canonicalizeDefinitionValue(record[key] as ExtensionJsonValue)]),
+    );
+  }
+  return value;
 }
 
 function isContractCodecCandidate(value: unknown): value is ExtensionContractCodecCandidate {

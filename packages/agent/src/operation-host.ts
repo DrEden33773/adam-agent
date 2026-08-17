@@ -10,6 +10,9 @@ import type {
   ExtensionOperationBudgetSnapshot,
   ExtensionOperationCapabilities,
   ExtensionOperationContext,
+  ExtensionOperationEvidenceReference,
+  ExtensionOperationReconciliationContext,
+  ExtensionOperationReconciliationResult,
   ExtensionOperationRegistration,
   ExtensionRecord,
   ExtensionRecordList,
@@ -55,11 +58,16 @@ import {
   type OperationStore,
   OperationStoreError,
 } from "./operation-store.js";
+import {
+  type ProjectLifecycleOwner,
+  ProjectLifecycleOwnerError,
+} from "./project-lifecycle-owner.js";
 import type { PermissionPolicy } from "./tool-runtime.js";
 
 export type RegisteredOperation = {
   readonly capabilityIds: readonly string[];
   readonly contributionId: string;
+  readonly definitionDigest: string;
   readonly diagnostics: readonly ExtensionActivationDiagnostic[];
   readonly extensionId: string;
   readonly extensionVersion: string;
@@ -106,6 +114,11 @@ export type OperationSnapshot =
       readonly reason: OperationCancellationReason;
     })
   | (OperationSnapshotBase & {
+      readonly status: "inspection_required";
+      readonly evidence?: readonly ExtensionOperationEvidenceReference[];
+      readonly message: string;
+    })
+  | (OperationSnapshotBase & {
       readonly status: "recovery_required";
       readonly error: {
         readonly code: "operation_recovery_required";
@@ -120,6 +133,7 @@ export interface OperationHost {
     readonly operationId: string;
   }): AsyncIterable<OperationEventRecord>;
   query(operationId: string): Promise<OperationSnapshot>;
+  recover(operationId: string): Promise<OperationSnapshot>;
   start(options: OperationStartOptions): Promise<OperationReference>;
 }
 
@@ -138,7 +152,10 @@ export class OperationHostError extends Error {
     | "operation_not_found"
     | "operation_persistence_failed"
     | "operation_project_unavailable"
-    | "operation_store_project_mismatch";
+    | "operation_reconciliation_failed"
+    | "operation_store_project_mismatch"
+    | "project_in_use"
+    | "project_owner_unavailable";
 
   constructor(code: OperationHostError["code"], options?: { readonly cause?: unknown }) {
     super(operationHostErrorMessage(code), options);
@@ -155,6 +172,8 @@ type ActiveOperation = {
   artifactCount: number;
   capabilityCalls: number;
   readonly operationId: string;
+  ownerDidSettle: boolean;
+  readonly ownerSettled: Promise<void>;
   readonly projectId: string;
   readonly registered: RegisteredOperation;
   appendQueue: Promise<void>;
@@ -171,6 +190,7 @@ type ActiveOperation = {
   recordCreates: number;
   readonly settled: Promise<void>;
   readonly signalHandlerSettled: () => void;
+  readonly signalOwnerSettled: () => void;
   readonly signalSettled: () => void;
   settling: boolean;
   terminalDidSettle: boolean;
@@ -182,10 +202,22 @@ type OperationTerminalEvent = Extract<
   { readonly type: "operation_cancelled" | "operation_completed" | "operation_failed" }
 >;
 
+type DurableOperationTerminalEvent = Extract<
+  OperationEventRecord["event"],
+  {
+    readonly type:
+      | "operation_cancelled"
+      | "operation_completed"
+      | "operation_failed"
+      | "operation_inspection_required";
+  }
+>;
+
 export function createOperationHost(options: {
   readonly artifactStore?: ArtifactStore;
   readonly biomeExecution?: BiomeExecutionAdapter;
   readonly defaultDeadlineMs?: number;
+  readonly lifecycleOwner: ProjectLifecycleOwner;
   readonly projectRoot: string;
   readonly permissions?: PermissionPolicy;
   readonly recordStore?: ExtensionRecordStore;
@@ -199,6 +231,7 @@ export function createOperationHost(options: {
   const disabledExtensions = new Set<string>();
   const extensionAdmissionQueues = new Map<string, Promise<void>>();
   const listeners = new Map<string, Set<() => void>>();
+  const recoveryInFlight = new Map<string, Promise<OperationSnapshot>>();
 
   function notifyOperationListeners(operationId: string): void {
     for (const listener of listeners.get(operationId) ?? []) {
@@ -276,93 +309,128 @@ export function createOperationHost(options: {
             return { operationId: existing.operationId };
           }
           const decodedInput = decodeInput(registered.registration, normalizedInput.value);
-
-          const operationId = randomUUID();
-          const now = Date.now();
-          const recordedAt = new Date(now).toISOString();
-          const deadlineAt = new Date(now + deadlineMs).toISOString();
-          const startedEvent: OperationStartedEvent = {
-            type: "operation_started",
-            contributionId: registered.contributionId,
-            deadlineAt,
-            extensionId: registered.extensionId,
-            extensionVersion: registered.extensionVersion,
-            idempotencyKey: scope.idempotencyKey,
-            input: normalizedInput.value,
-            inputDigest: normalizedInput.digest,
-            projectId,
-          };
-          try {
-            await appendAndPublish({
-              schemaVersion: 1,
-              operationId,
-              sequence: 1,
-              recordedAt,
-              event: startedEvent,
-            });
-          } catch (error) {
-            if (
-              error instanceof OperationStoreError &&
-              error.code === "operation_idempotency_conflict"
-            ) {
-              const raced = await store.findByIdempotency(scope);
-              if (raced?.event.type === "operation_started") {
-                if (raced.event.inputDigest !== normalizedInput.digest) {
-                  throw new OperationHostError("operation_idempotency_conflict");
-                }
-                return { operationId: raced.operationId };
-              }
+          const lifecycleLease = await options.lifecycleOwner.acquire().catch((error: unknown) => {
+            if (error instanceof ProjectLifecycleOwnerError) {
+              throw new OperationHostError(error.code, { cause: error });
             }
             throw error;
+          });
+          let lifecycleLeaseTransferred = false;
+          try {
+            const raced = await store.findByIdempotency(scope);
+            if (raced?.event.type === "operation_started") {
+              if (raced.event.inputDigest !== normalizedInput.digest) {
+                throw new OperationHostError("operation_idempotency_conflict");
+              }
+              return { operationId: raced.operationId };
+            }
+            const operationId = randomUUID();
+            const now = Date.now();
+            const recordedAt = new Date(now).toISOString();
+            const deadlineAt = new Date(now + deadlineMs).toISOString();
+            const startedEvent: OperationStartedEvent = {
+              type: "operation_started",
+              contributionId: registered.contributionId,
+              deadlineAt,
+              definitionDigest: registered.definitionDigest,
+              extensionId: registered.extensionId,
+              extensionVersion: registered.extensionVersion,
+              idempotencyKey: scope.idempotencyKey,
+              input: normalizedInput.value,
+              inputDigest: normalizedInput.digest,
+              projectId,
+            };
+            try {
+              await appendAndPublish({
+                schemaVersion: 2,
+                operationId,
+                sequence: 1,
+                recordedAt,
+                event: startedEvent,
+              });
+            } catch (error) {
+              if (
+                error instanceof OperationStoreError &&
+                error.code === "operation_idempotency_conflict"
+              ) {
+                const raced = await store.findByIdempotency(scope);
+                if (raced?.event.type === "operation_started") {
+                  if (raced.event.inputDigest !== normalizedInput.digest) {
+                    throw new OperationHostError("operation_idempotency_conflict");
+                  }
+                  return { operationId: raced.operationId };
+                }
+              }
+              throw error;
+            }
+            let signalSettled = () => {};
+            const settled = new Promise<void>((resolve) => {
+              signalSettled = resolve;
+            });
+            let signalHandlerSettled = () => {};
+            const handlerSettled = new Promise<void>((resolve) => {
+              signalHandlerSettled = resolve;
+            });
+            let signalOwnerSettled = () => {};
+            const ownerSettled = new Promise<void>((resolve) => {
+              signalOwnerSettled = resolve;
+            });
+            const active: ActiveOperation = {
+              abortController: new AbortController(),
+              artifactBytes: 0,
+              artifacts: [],
+              artifactCount: 0,
+              capabilityCalls: 0,
+              appendQueue: Promise.resolve(),
+              deadlineAt,
+              handlerDidSettle: false,
+              handlerSettled,
+              inputBytes: normalizedInput.byteLength,
+              nextSequence: 2,
+              operationId,
+              ownerDidSettle: false,
+              ownerSettled,
+              projectId,
+              progressBytes: 0,
+              progressRecords: 0,
+              recordBytes: 0,
+              recordCreates: 0,
+              registered,
+              settled,
+              signalHandlerSettled,
+              signalOwnerSettled,
+              signalSettled,
+              settling: false,
+              terminalDidSettle: false,
+              terminalPersistenceFailed: false,
+            };
+            activeOperations.set(operationId, active);
+            lifecycleLeaseTransferred = true;
+            queueMicrotask(() => {
+              void executeOperation(
+                active,
+                decodedInput,
+                appendAndPublish,
+                activeOperations,
+                options.artifactStore,
+                options.biomeExecution,
+                options.permissions,
+                options.recordStore,
+              )
+                .catch(() => undefined)
+                .finally(async () => {
+                  await lifecycleLease.release();
+                  active.ownerDidSettle = true;
+                  active.signalOwnerSettled();
+                  releaseActiveOperation(active, activeOperations);
+                });
+            });
+            return { operationId };
+          } finally {
+            if (!lifecycleLeaseTransferred) {
+              await lifecycleLease.release();
+            }
           }
-          let signalSettled = () => {};
-          const settled = new Promise<void>((resolve) => {
-            signalSettled = resolve;
-          });
-          let signalHandlerSettled = () => {};
-          const handlerSettled = new Promise<void>((resolve) => {
-            signalHandlerSettled = resolve;
-          });
-          const active: ActiveOperation = {
-            abortController: new AbortController(),
-            artifactBytes: 0,
-            artifacts: [],
-            artifactCount: 0,
-            capabilityCalls: 0,
-            appendQueue: Promise.resolve(),
-            deadlineAt,
-            handlerDidSettle: false,
-            handlerSettled,
-            inputBytes: normalizedInput.byteLength,
-            nextSequence: 2,
-            operationId,
-            projectId,
-            progressBytes: 0,
-            progressRecords: 0,
-            recordBytes: 0,
-            recordCreates: 0,
-            registered,
-            settled,
-            signalHandlerSettled,
-            signalSettled,
-            settling: false,
-            terminalDidSettle: false,
-            terminalPersistenceFailed: false,
-          };
-          activeOperations.set(operationId, active);
-          queueMicrotask(() => {
-            void executeOperation(
-              active,
-              decodedInput,
-              appendAndPublish,
-              activeOperations,
-              options.artifactStore,
-              options.biomeExecution,
-              options.permissions,
-              options.recordStore,
-            ).catch(() => undefined);
-          });
-          return { operationId };
         },
       );
     },
@@ -374,6 +442,130 @@ export function createOperationHost(options: {
       }
       const active = activeOperations.get(operationId);
       return createSnapshot(records, active !== undefined && !active.terminalPersistenceFailed);
+    },
+
+    async recover(operationId) {
+      const currentRecovery = recoveryInFlight.get(operationId);
+      if (currentRecovery !== undefined) {
+        return currentRecovery;
+      }
+      const recovery = options.lifecycleOwner
+        .run(async () => {
+          const records = await store.read(operationId);
+          if (records.length === 0) {
+            throw new OperationHostError("operation_not_found");
+          }
+          const existing = createSnapshot(
+            records,
+            isDurablyActive(activeOperations.get(operationId)),
+          );
+          if (existing.status !== "recovery_required") {
+            return existing;
+          }
+          const started = records[0];
+          if (started?.event.type !== "operation_started") {
+            throw new OperationHostError("operation_persistence_failed");
+          }
+          projectIdPromise ??= createProjectId(options.projectRoot);
+          const projectId = await projectIdPromise;
+          if (
+            started.event.projectId !== projectId ||
+            (store.projectId !== undefined && store.projectId !== projectId)
+          ) {
+            throw new OperationHostError("operation_store_project_mismatch");
+          }
+          if (started.schemaVersion !== 2) {
+            await appendAndPublish({
+              schemaVersion: 2,
+              operationId,
+              sequence: records.length + 1,
+              recordedAt: new Date().toISOString(),
+              event: {
+                type: "operation_inspection_required",
+                message: "Legacy operation identity cannot be reconciled safely.",
+              },
+            });
+            return host.query(operationId);
+          }
+          const registered = options.resolveOperation(started.event.contributionId);
+          if (
+            registered === undefined ||
+            registered.extensionId !== started.event.extensionId ||
+            registered.extensionVersion !== started.event.extensionVersion ||
+            registered.definitionDigest !== started.event.definitionDigest ||
+            typeof registered.registration.reconcile !== "function"
+          ) {
+            throw new OperationHostError("operation_contribution_unavailable");
+          }
+          const decodedInput = decodeInput(registered.registration, started.event.input);
+          const attemptNumber =
+            records.filter((record) => record.event.type === "operation_reconciliation_started")
+              .length + 1;
+          const attemptRecord: OperationEventRecord = {
+            schemaVersion: 2,
+            operationId,
+            sequence: records.length + 1,
+            recordedAt: new Date().toISOString(),
+            event: {
+              type: "operation_reconciliation_started",
+              attemptId: randomUUID(),
+              attemptNumber,
+              definitionDigest: registered.definitionDigest,
+            },
+          };
+          await appendAndPublish(attemptRecord);
+          const result = await reconcileOperation({
+            artifactStore: options.artifactStore,
+            configuredDeadlineMs,
+            decodedInput,
+            operationId,
+            operationRecords: records,
+            projectId,
+            recordStore: options.recordStore,
+            registered,
+          });
+          let terminal: Awaited<ReturnType<typeof createReconciliationTerminal>>;
+          try {
+            terminal = await createReconciliationTerminal(result, {
+              artifactStore: options.artifactStore,
+              operationId,
+              operationRecords: records,
+              projectId,
+              recordStore: options.recordStore,
+              registered,
+            });
+          } catch (error) {
+            if (error instanceof OperationHostError) {
+              throw error;
+            }
+            throw new OperationHostError("operation_input_invalid", { cause: error });
+          }
+          try {
+            await appendAndPublish({
+              schemaVersion: 2,
+              operationId,
+              sequence: attemptRecord.sequence + 1,
+              recordedAt: new Date().toISOString(),
+              event: terminal,
+            });
+          } catch {
+            const durableRecords = await store.read(operationId);
+            return createSnapshot(durableRecords, false);
+          }
+          return host.query(operationId);
+        })
+        .catch((error: unknown) => {
+          if (error instanceof ProjectLifecycleOwnerError) {
+            throw new OperationHostError(error.code, { cause: error });
+          }
+          throw error;
+        });
+      recoveryInFlight.set(operationId, recovery);
+      void recovery.then(
+        () => recoveryInFlight.delete(operationId),
+        () => recoveryInFlight.delete(operationId),
+      );
+      return recovery;
     },
 
     events({ afterSequence = 0, operationId }) {
@@ -389,13 +581,41 @@ export function createOperationHost(options: {
         snapshot.status === "completed" ||
         snapshot.status === "failed" ||
         snapshot.status === "cancelled" ||
-        snapshot.status === "recovery_required"
+        snapshot.status === "inspection_required"
       ) {
         return snapshot;
       }
       const active = activeOperations.get(operationId);
       if (active === undefined) {
-        return host.query(operationId);
+        return options.lifecycleOwner
+          .run(async () => {
+            const records = await store.read(operationId);
+            const current = createSnapshot(records, false);
+            if (
+              current.status === "completed" ||
+              current.status === "failed" ||
+              current.status === "cancelled" ||
+              current.status === "inspection_required"
+            ) {
+              return current;
+            }
+            if (!records.some((record) => record.event.type === "operation_cancel_requested")) {
+              await appendAndPublish({
+                schemaVersion: 2,
+                operationId,
+                sequence: records.length + 1,
+                recordedAt: new Date().toISOString(),
+                event: { type: "operation_cancel_requested", reason: "caller" },
+              });
+            }
+            return host.query(operationId);
+          })
+          .catch((error: unknown) => {
+            if (error instanceof ProjectLifecycleOwnerError) {
+              throw new OperationHostError(error.code, { cause: error });
+            }
+            throw error;
+          });
       }
       await requestCancellation(active, "caller", appendAndPublish);
       return host.query(operationId);
@@ -471,11 +691,12 @@ function createOperationCapabilities(
   biomeExecution: BiomeExecutionAdapter | undefined,
   permissions: PermissionPolicy | undefined,
   recordStore: ExtensionRecordStore | undefined,
+  appendAndPublish: (record: OperationEventRecord) => Promise<void>,
 ): ExtensionOperationCapabilities {
   const artifactCapability =
     artifactStore !== undefined &&
     active.registered.capabilityIds.includes(EXTENSION_ARTIFACT_CAPABILITY_ID)
-      ? createArtifactCapability(active, artifactStore)
+      ? createArtifactCapability(active, artifactStore, appendAndPublish)
       : undefined;
   const recordCapability =
     recordStore !== undefined &&
@@ -499,7 +720,11 @@ function createOperationCapabilities(
   });
 }
 
-function createArtifactCapability(active: ActiveOperation, artifactStore: ArtifactStore) {
+function createArtifactCapability(
+  active: ActiveOperation,
+  artifactStore: ArtifactStore,
+  appendAndPublish: (record: OperationEventRecord) => Promise<void>,
+) {
   return Object.freeze({
     async publish(input: {
       readonly bytes: Uint8Array;
@@ -569,6 +794,23 @@ function createArtifactCapability(active: ActiveOperation, artifactStore: Artifa
         mediaType: artifact.mediaType,
         provenance,
       });
+      const append = active.appendQueue.then(async () => {
+        await appendAndPublish({
+          schemaVersion: 2,
+          operationId: active.operationId,
+          sequence: active.nextSequence,
+          recordedAt: new Date().toISOString(),
+          event: { type: "operation_artifact_published", artifact: summary },
+        });
+        active.nextSequence += 1;
+      });
+      active.appendQueue = append.catch(() => undefined);
+      try {
+        await append;
+      } catch {
+        markArtifactPersistenceFailed(active);
+        throw new OperationCapabilityPersistenceError();
+      }
       active.artifacts.push(summary);
       assertCapabilityActive(active);
       return summary;
@@ -890,6 +1132,380 @@ function createRecordCapability(active: ActiveOperation, recordStore: ExtensionR
   });
 }
 
+async function reconcileOperation(options: {
+  readonly artifactStore: ArtifactStore | undefined;
+  readonly configuredDeadlineMs: number;
+  readonly decodedInput: unknown;
+  readonly operationId: string;
+  readonly operationRecords: readonly OperationEventRecord[];
+  readonly projectId: string;
+  readonly recordStore: ExtensionRecordStore | undefined;
+  readonly registered: RegisteredOperation;
+}): Promise<ExtensionOperationReconciliationResult> {
+  const reconcile = options.registered.registration.reconcile;
+  if (reconcile === undefined) {
+    throw new OperationHostError("operation_contribution_unavailable");
+  }
+  const abortController = new AbortController();
+  const deadlineAt = new Date(Date.now() + options.configuredDeadlineMs).toISOString();
+  let rejectDeadline = (_error: OperationHostError) => {};
+  const deadlineExceeded = new Promise<never>((_resolve, reject) => {
+    rejectDeadline = reject;
+  });
+  const deadline = setTimeout(() => {
+    const error = new OperationHostError("operation_reconciliation_failed");
+    abortController.abort(error);
+    rejectDeadline(error);
+  }, options.configuredDeadlineMs);
+  deadline.unref();
+  const provenance = Object.freeze({
+    contributionId: options.registered.contributionId,
+    extensionId: options.registered.extensionId,
+    extensionVersion: options.registered.extensionVersion,
+    projectId: options.projectId,
+  });
+  const context: ExtensionOperationReconciliationContext = Object.freeze({
+    deadlineAt,
+    evidence: Object.freeze({
+      artifacts: Object.freeze({
+        async read(artifact: ExtensionArtifactSummary): Promise<Uint8Array | undefined> {
+          if (abortController.signal.aborted) {
+            throw new Error("The operation reconciliation no longer accepts evidence reads.");
+          }
+          await assertRecoveryArtifact(artifact, {
+            artifactStore: options.artifactStore,
+            operationId: options.operationId,
+            operationRecords: options.operationRecords,
+            provenance,
+          });
+          const bytes = await options.artifactStore?.read(artifact.id);
+          return bytes === undefined ? undefined : Uint8Array.from(bytes);
+        },
+      }),
+      records: Object.freeze({
+        async get(key: string): Promise<ExtensionRecord | undefined> {
+          if (abortController.signal.aborted) {
+            throw new Error("The operation reconciliation no longer accepts evidence reads.");
+          }
+          assertRecordKey(key);
+          const record = await options.recordStore?.get(
+            {
+              extensionId: options.registered.extensionId,
+              extensionVersion: options.registered.extensionVersion,
+              projectId: options.projectId,
+            },
+            key,
+          );
+          if (record === undefined) {
+            return undefined;
+          }
+          if (!provenanceMatchesOperation(record.provenance, options.operationId, provenance)) {
+            throw new OperationHostError("operation_input_invalid");
+          }
+          return Object.freeze(record);
+        },
+      }),
+    }),
+    operationId: options.operationId,
+    provenance,
+    signal: abortController.signal,
+  });
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => reconcile(options.decodedInput, context)),
+      deadlineExceeded,
+    ]);
+  } catch (error) {
+    if (error instanceof OperationHostError && error.code === "operation_reconciliation_failed") {
+      throw error;
+    }
+    throw new OperationHostError("operation_reconciliation_failed", { cause: error });
+  } finally {
+    clearTimeout(deadline);
+  }
+}
+
+async function createReconciliationTerminal(
+  result: ExtensionOperationReconciliationResult,
+  options: {
+    readonly artifactStore: ArtifactStore | undefined;
+    readonly operationId: string;
+    readonly operationRecords: readonly OperationEventRecord[];
+    readonly projectId: string;
+    readonly recordStore: ExtensionRecordStore | undefined;
+    readonly registered: RegisteredOperation;
+  },
+): Promise<
+  OperationTerminalEvent | Extract<OperationEvent, { type: "operation_inspection_required" }>
+> {
+  if (!isPlainRecord(result) || typeof result.status !== "string") {
+    throw new OperationHostError("operation_input_invalid");
+  }
+  if (result.status === "completed") {
+    const artifacts = await validateRecoveryArtifacts(result.artifacts, options);
+    return {
+      type: "operation_completed",
+      ...(artifacts === undefined ? {} : { artifacts }),
+      output: encodeOutput(options.registered.registration, result.output),
+    };
+  }
+  if (result.status === "failed") {
+    const artifacts = await validateRecoveryArtifacts(result.artifacts, options);
+    return {
+      type: "operation_failed",
+      ...(artifacts === undefined ? {} : { artifacts }),
+      error: result.error,
+    };
+  }
+  if (result.status === "inspection_required") {
+    if (
+      typeof result.message !== "string" ||
+      result.message.length === 0 ||
+      result.message.length > 512
+    ) {
+      throw new OperationHostError("operation_input_invalid");
+    }
+    const evidence = await validateInspectionEvidence(result.evidence, options);
+    return {
+      type: "operation_inspection_required",
+      ...(evidence === undefined ? {} : { evidence }),
+      message: result.message,
+    };
+  }
+  throw new OperationHostError("operation_input_invalid");
+}
+
+async function validateInspectionEvidence(
+  evidence: readonly ExtensionOperationEvidenceReference[] | undefined,
+  options: {
+    readonly artifactStore: ArtifactStore | undefined;
+    readonly operationId: string;
+    readonly operationRecords: readonly OperationEventRecord[];
+    readonly projectId: string;
+    readonly recordStore: ExtensionRecordStore | undefined;
+    readonly registered: RegisteredOperation;
+  },
+): Promise<readonly ExtensionOperationEvidenceReference[] | undefined> {
+  if (evidence === undefined) {
+    return undefined;
+  }
+  if (evidence.length > 16) {
+    throw new OperationHostError("operation_input_invalid");
+  }
+  const provenance = {
+    contributionId: options.registered.contributionId,
+    extensionId: options.registered.extensionId,
+    extensionVersion: options.registered.extensionVersion,
+    projectId: options.projectId,
+  };
+  for (const reference of evidence) {
+    if (reference.type === "artifact") {
+      await assertRecoveryArtifact(reference.artifact, {
+        artifactStore: options.artifactStore,
+        operationId: options.operationId,
+        operationRecords: options.operationRecords,
+        provenance,
+      });
+      continue;
+    }
+    if (reference.type !== "record") {
+      throw new OperationHostError("operation_input_invalid");
+    }
+    await assertRecoveryRecord(reference.record, {
+      operationId: options.operationId,
+      provenance,
+      recordStore: options.recordStore,
+    });
+  }
+  return Object.freeze(evidence.map((reference) => Object.freeze(reference)));
+}
+
+async function assertRecoveryRecord(
+  summary: ExtensionRecordSummary,
+  options: {
+    readonly operationId: string;
+    readonly provenance: {
+      readonly contributionId: string;
+      readonly extensionId: string;
+      readonly extensionVersion: string;
+      readonly projectId: string;
+    };
+    readonly recordStore: ExtensionRecordStore | undefined;
+  },
+): Promise<void> {
+  if (
+    !isPlainRecord(summary) ||
+    !Number.isSafeInteger(summary.byteCount) ||
+    summary.byteCount < 0 ||
+    summary.byteCount > EXTENSION_RECORD_MAX_BYTES ||
+    typeof summary.digest !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(summary.digest) ||
+    typeof summary.key !== "string" ||
+    !isPlainRecord(summary.contract) ||
+    typeof summary.contract.id !== "string" ||
+    summary.contract.id.length === 0 ||
+    summary.contract.id.length > 256 ||
+    !Number.isSafeInteger(summary.contract.version) ||
+    summary.contract.version <= 0 ||
+    !provenanceMatchesOperation(summary.provenance, options.operationId, options.provenance)
+  ) {
+    throw new OperationHostError("operation_input_invalid");
+  }
+  assertRecordKey(summary.key);
+  const record = await options.recordStore?.get(
+    {
+      extensionId: options.provenance.extensionId,
+      extensionVersion: options.provenance.extensionVersion,
+      projectId: options.provenance.projectId,
+    },
+    summary.key,
+  );
+  if (
+    record === undefined ||
+    record.byteCount !== summary.byteCount ||
+    record.digest !== summary.digest ||
+    record.contract.id !== summary.contract.id ||
+    record.contract.version !== summary.contract.version ||
+    !provenanceMatchesOperation(record.provenance, options.operationId, options.provenance)
+  ) {
+    throw new OperationHostError("operation_input_invalid");
+  }
+}
+
+async function validateRecoveryArtifacts(
+  artifacts: readonly ExtensionArtifactSummary[] | undefined,
+  options: {
+    readonly artifactStore: ArtifactStore | undefined;
+    readonly operationId: string;
+    readonly operationRecords: readonly OperationEventRecord[];
+    readonly projectId: string;
+    readonly registered: RegisteredOperation;
+  },
+): Promise<readonly ExtensionArtifactSummary[] | undefined> {
+  if (artifacts === undefined) {
+    return undefined;
+  }
+  if (artifacts.length === 0 || artifacts.length > EXTENSION_ARTIFACT_MAX_COUNT) {
+    throw new OperationHostError("operation_input_invalid");
+  }
+  const provenance = {
+    contributionId: options.registered.contributionId,
+    extensionId: options.registered.extensionId,
+    extensionVersion: options.registered.extensionVersion,
+    projectId: options.projectId,
+  };
+  let aggregateBytes = 0;
+  for (const artifact of artifacts) {
+    await assertRecoveryArtifact(artifact, {
+      artifactStore: options.artifactStore,
+      operationId: options.operationId,
+      operationRecords: options.operationRecords,
+      provenance,
+    });
+    aggregateBytes += artifact.byteCount;
+    if (aggregateBytes > EXTENSION_ARTIFACT_MAX_AGGREGATE_BYTES) {
+      throw new OperationHostError("operation_input_too_large");
+    }
+  }
+  return Object.freeze(artifacts.map((artifact) => Object.freeze(artifact)));
+}
+
+async function assertRecoveryArtifact(
+  artifact: ExtensionArtifactSummary,
+  options: {
+    readonly artifactStore: ArtifactStore | undefined;
+    readonly operationId: string;
+    readonly operationRecords: readonly OperationEventRecord[];
+    readonly provenance: {
+      readonly contributionId: string;
+      readonly extensionId: string;
+      readonly extensionVersion: string;
+      readonly projectId: string;
+    };
+  },
+): Promise<void> {
+  if (
+    !isPlainRecord(artifact) ||
+    typeof artifact.id !== "string" ||
+    !/^sha256:[0-9a-f]{64}$/u.test(artifact.id) ||
+    typeof artifact.mediaType !== "string" ||
+    artifact.mediaType.length === 0 ||
+    artifact.mediaType.length > 256 ||
+    !Number.isSafeInteger(artifact.byteCount) ||
+    artifact.byteCount < 0 ||
+    artifact.byteCount > EXTENSION_ARTIFACT_MAX_BYTES ||
+    !isPlainRecord(artifact.contract) ||
+    typeof artifact.contract.id !== "string" ||
+    artifact.contract.id.length === 0 ||
+    artifact.contract.id.length > 256 ||
+    !Number.isSafeInteger(artifact.contract.version) ||
+    artifact.contract.version <= 0 ||
+    !provenanceMatchesOperation(artifact.provenance, options.operationId, options.provenance)
+  ) {
+    throw new OperationHostError("operation_input_invalid");
+  }
+  if (
+    !options.operationRecords.some(
+      (record) =>
+        record.event.type === "operation_artifact_published" &&
+        artifactSummariesEqual(record.event.artifact, artifact),
+    )
+  ) {
+    throw new OperationHostError("operation_input_invalid");
+  }
+  const bytes = await options.artifactStore?.read(artifact.id);
+  if (bytes === undefined || bytes.byteLength !== artifact.byteCount) {
+    throw new OperationHostError("operation_input_invalid");
+  }
+}
+
+function artifactSummariesEqual(
+  left: ExtensionArtifactSummary,
+  right: ExtensionArtifactSummary,
+): boolean {
+  return (
+    left.byteCount === right.byteCount &&
+    left.contract.id === right.contract.id &&
+    left.contract.version === right.contract.version &&
+    left.id === right.id &&
+    left.mediaType === right.mediaType &&
+    left.provenance.contributionId === right.provenance.contributionId &&
+    left.provenance.extensionId === right.provenance.extensionId &&
+    left.provenance.extensionVersion === right.provenance.extensionVersion &&
+    left.provenance.operationId === right.provenance.operationId &&
+    left.provenance.projectId === right.provenance.projectId
+  );
+}
+
+function provenanceMatchesOperation(
+  candidate: unknown,
+  operationId: string,
+  expected: {
+    readonly contributionId: string;
+    readonly extensionId: string;
+    readonly extensionVersion: string;
+    readonly projectId: string;
+  },
+): boolean {
+  if (!isPlainRecord(candidate)) {
+    return false;
+  }
+  const {
+    operationId: candidateOperationId,
+    contributionId,
+    extensionId,
+    extensionVersion,
+    projectId,
+  } = candidate;
+  return (
+    candidateOperationId === operationId &&
+    contributionId === expected.contributionId &&
+    extensionId === expected.extensionId &&
+    extensionVersion === expected.extensionVersion &&
+    projectId === expected.projectId
+  );
+}
+
 async function executeOperation(
   active: ActiveOperation,
   input: unknown,
@@ -927,6 +1543,7 @@ async function executeOperation(
       biomeExecution,
       permissions,
       recordStore,
+      appendAndPublish,
     ),
     deadlineAt: active.deadlineAt,
     diagnostics: Object.freeze(
@@ -969,7 +1586,7 @@ async function executeOperation(
       active.progressRecords += 1;
       const append = active.appendQueue.then(async () => {
         await appendAndPublish({
-          schemaVersion: 1,
+          schemaVersion: 2,
           operationId: active.operationId,
           sequence: active.nextSequence,
           recordedAt: new Date().toISOString(),
@@ -1077,7 +1694,7 @@ async function requestCancellation(
   active.cancelReason = reason;
   const request = active.appendQueue.then(async () => {
     await appendAndPublish({
-      schemaVersion: 1,
+      schemaVersion: 2,
       operationId: active.operationId,
       sequence: active.nextSequence,
       recordedAt: new Date().toISOString(),
@@ -1126,7 +1743,7 @@ async function settleTerminal(
   try {
     await active.appendQueue;
     await appendAndPublish({
-      schemaVersion: 1,
+      schemaVersion: 2,
       operationId: active.operationId,
       sequence: active.nextSequence,
       recordedAt: new Date().toISOString(),
@@ -1160,7 +1777,7 @@ function releaseActiveOperation(
   active: ActiveOperation,
   activeOperations: Map<string, ActiveOperation>,
 ): void {
-  if (active.handlerDidSettle && active.terminalDidSettle) {
+  if (active.handlerDidSettle && active.ownerDidSettle && active.terminalDidSettle) {
     activeOperations.delete(active.operationId);
   }
 }
@@ -1295,6 +1912,7 @@ async function* streamEvents(
   try {
     while (true) {
       notified = false;
+      const active = activeOperations.get(operationId);
       const records = await store.read(operationId);
       if (records.length === 0) {
         throw new OperationHostError("operation_not_found");
@@ -1306,6 +1924,9 @@ async function* streamEvents(
         }
       }
       if (records.some((record) => isTerminal(record.event))) {
+        if (active?.handlerDidSettle === true) {
+          await active.ownerSettled;
+        }
         return;
       }
       if (!isDurablyActive(activeOperations.get(operationId))) {
@@ -1381,6 +2002,14 @@ function createSnapshot(
       ...(terminal.artifacts === undefined ? {} : { artifacts: terminal.artifacts }),
       reason: terminal.reason,
       status: "cancelled",
+    };
+  }
+  if (terminal?.type === "operation_inspection_required") {
+    return {
+      ...base,
+      ...(terminal.evidence === undefined ? {} : { evidence: terminal.evidence }),
+      message: terminal.message,
+      status: "inspection_required",
     };
   }
   if (!isActive) {
@@ -1579,11 +2208,12 @@ async function createProjectId(projectRoot: string): Promise<string> {
   }
 }
 
-function isTerminal(event: OperationEvent): event is OperationTerminalEvent {
+function isTerminal(event: OperationEventRecord["event"]): event is DurableOperationTerminalEvent {
   return (
     event.type === "operation_cancelled" ||
     event.type === "operation_completed" ||
-    event.type === "operation_failed"
+    event.type === "operation_failed" ||
+    event.type === "operation_inspection_required"
   );
 }
 
@@ -1605,7 +2235,13 @@ function operationHostErrorMessage(code: OperationHostError["code"]): string {
       return "The operation state could not be persisted.";
     case "operation_project_unavailable":
       return "The operation project root is unavailable.";
+    case "operation_reconciliation_failed":
+      return "The operation reconciliation failed safely.";
     case "operation_store_project_mismatch":
       return "The operation store belongs to another project.";
+    case "project_in_use":
+      return "Another process owns lifecycle mutations for this canonical project.";
+    case "project_owner_unavailable":
+      return "The OS-backed project lifecycle owner is unavailable.";
   }
 }

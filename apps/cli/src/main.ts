@@ -6,16 +6,21 @@ import { join } from "node:path";
 
 import {
   type ArtifactStore,
+  createBiomeExecutionAdapter,
   createCodingToolRegistry,
+  createExtensionHost,
   createFileArtifactStore,
+  createJsonlOperationStore,
   createModelTargets,
   createPermissionPolicy,
   createSessionLifecycle,
+  ExtensionHostError,
   type JsonValue,
   type ModelMessage,
   ModelTargetError,
   type ModelTargetIdentity,
   type ModelTargets,
+  OperationHostError,
   type PermissionDecisionCommand,
   type PermissionDecisionCommandResult,
   type RuntimeEvent,
@@ -24,9 +29,15 @@ import {
   selectModelTargetId,
 } from "@adam-agent/agent";
 import { FakeModelDriver } from "@adam-agent/testkit";
+import {
+  CliExtensionConfigurationError,
+  loadCliExtensionConfiguration,
+} from "./extension-config.js";
 
-loadProjectEnvironment();
 const command = parseCliCommand(process.argv.slice(2));
+if (command.type !== "recover_operation") {
+  loadProjectEnvironment();
+}
 const workspaceRoot = process.cwd();
 const { ADAM_AGENT_STATE_ROOT: configuredStateRoot } = process.env;
 const stateRoot = configuredStateRoot ?? join(homedir(), ".local", "state", "adam-agent");
@@ -344,6 +355,7 @@ function writeText(fileDescriptor: number, text: string): void {
 
 type CliCommand =
   | { readonly type: "prompt"; readonly prompt: string }
+  | { readonly type: "recover_operation"; readonly operationId: string }
   | { readonly type: "resume"; readonly sessionId: string; readonly continue: boolean }
   | {
       readonly type: "branch";
@@ -353,8 +365,31 @@ type CliCommand =
     };
 
 async function runCliCommand(activeCommand: CliCommand): Promise<void> {
-  const modelTargets = createCliModelTargets();
   try {
+    if (activeCommand.type === "recover_operation") {
+      const extensions = await loadCliExtensionConfiguration(process.env);
+      const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+      const operationStore = await createJsonlOperationStore({ stateRoot, workspaceRoot });
+      const host = createExtensionHost({
+        artifactStore,
+        biomeExecution: createBiomeExecutionAdapter(),
+        capabilities: [
+          { id: "adam.analyzer-execution.biome@1", version: "1.0.0" },
+          { id: "adam.artifact.publish@1", version: "1.0.0" },
+          { id: "adam.storage.records@1", version: "1.0.0" },
+        ],
+        extensions,
+        operationStore,
+        permissions: createPermissionPolicy({ allowedEffects: [] }),
+        projectRoot: workspaceRoot,
+        stateRoot,
+      });
+      await host.loadConfiguredExtensions();
+      const recovered = await host.operations.recover(activeCommand.operationId);
+      writeText(1, `${JSON.stringify(recovered)}\n`);
+      return;
+    }
+    const modelTargets = createCliModelTargets();
     if (activeCommand.type === "resume" && !activeCommand.continue) {
       const lifecycle = await createRunLifecycle(modelTargets);
       const resumed = await lifecycle.resume({ sessionId: activeCommand.sessionId });
@@ -395,7 +430,13 @@ async function runCliCommand(activeCommand: CliCommand): Promise<void> {
     }
     await continueAndPresent(lifecycle, { sessionId: activeCommand.sessionId });
   } catch (error) {
-    if (error instanceof ModelTargetError || error instanceof SessionLifecycleError) {
+    if (
+      error instanceof CliExtensionConfigurationError ||
+      error instanceof ExtensionHostError ||
+      error instanceof ModelTargetError ||
+      error instanceof OperationHostError ||
+      error instanceof SessionLifecycleError
+    ) {
       writeText(2, `${error.message}\n`);
       process.exitCode = 1;
       return;
@@ -499,6 +540,19 @@ function createCliModelTargets(): ModelTargets {
 }
 
 function parseCliCommand(arguments_: readonly string[]): CliCommand {
+  if (arguments_[0] === "--recover-operation") {
+    const operationId = arguments_[1];
+    if (
+      operationId === undefined ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
+        operationId,
+      ) ||
+      arguments_.length !== 2
+    ) {
+      return failConfiguration("Usage: adam-agent --recover-operation <operation-id>");
+    }
+    return { type: "recover_operation", operationId };
+  }
   if (arguments_[0] === "--resume") {
     const sessionId = arguments_[1];
     const tail = arguments_.slice(2);
