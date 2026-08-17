@@ -36,6 +36,7 @@ describe("OpenAICompatibleModelDriver", () => {
 
     const events = await collect(
       driver.stream({
+        maximumOutputTokens: 4_096,
         messages: [{ role: "user", content: "Introduce yourself" }],
         tools: [],
         signal: new AbortController().signal,
@@ -74,6 +75,7 @@ describe("OpenAICompatibleModelDriver", () => {
   test("settles explicitly when DeepSeek reaches its output limit", async () => {
     const store = createInMemorySessionStore();
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model: new OpenAICompatibleModelDriver({
         profile: "deepseek",
         apiKey: "test-deepseek-key",
@@ -116,6 +118,7 @@ describe("OpenAICompatibleModelDriver", () => {
   test("settles explicitly when DeepSeek filters the response", async () => {
     const store = createInMemorySessionStore();
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model: new OpenAICompatibleModelDriver({
         profile: "deepseek",
         apiKey: "test-deepseek-key",
@@ -145,6 +148,7 @@ describe("OpenAICompatibleModelDriver", () => {
   test("settles explicitly when DeepSeek reports insufficient system resources", async () => {
     const store = createInMemorySessionStore();
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model: new OpenAICompatibleModelDriver({
         profile: "deepseek",
         apiKey: "test-deepseek-key",
@@ -176,6 +180,7 @@ describe("OpenAICompatibleModelDriver", () => {
   test("settles explicitly and retains an unknown provider finish reason", async () => {
     const store = createInMemorySessionStore();
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model: new OpenAICompatibleModelDriver({
         profile: "deepseek",
         apiKey: "test-deepseek-key",
@@ -207,6 +212,7 @@ describe("OpenAICompatibleModelDriver", () => {
     const rawReason = "x".repeat(200);
     const store = createInMemorySessionStore();
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model: new OpenAICompatibleModelDriver({
         profile: "deepseek",
         apiKey: "test-key",
@@ -244,6 +250,7 @@ describe("OpenAICompatibleModelDriver", () => {
 
   test("rejects invalid detailed usage as a model protocol failure", async () => {
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model: new OpenAICompatibleModelDriver({
         profile: "deepseek",
         apiKey: "test-key",
@@ -300,6 +307,7 @@ describe("OpenAICompatibleModelDriver", () => {
     try {
       await collect(
         driver.stream({
+          maximumOutputTokens: 4_096,
           messages: [{ role: "user", content: "Hello" }],
           tools: [],
           signal: new AbortController().signal,
@@ -322,6 +330,7 @@ describe("OpenAICompatibleModelDriver", () => {
   test("persists only bounded Adam metadata for a provider failure", async () => {
     const store = createInMemorySessionStore();
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model: new OpenAICompatibleModelDriver({
         profile: "deepseek",
         apiKey: "never-persist-this-test-key",
@@ -622,6 +631,7 @@ describe("OpenAICompatibleModelDriver", () => {
   test("settles a truncated provider stream without completing partial text", async () => {
     const store = createInMemorySessionStore();
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model: new OpenAICompatibleModelDriver({
         profile: "deepseek",
         apiKey: "test-key",
@@ -681,6 +691,7 @@ describe("OpenAICompatibleModelDriver", () => {
     const caller = new AbortController();
     const store = createInMemorySessionStore();
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model: new OpenAICompatibleModelDriver({
         profile: "deepseek",
         apiKey: "test-key",
@@ -753,6 +764,7 @@ describe("OpenAICompatibleModelDriver", () => {
       resolveDelta = resolve;
     });
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model: new OpenAICompatibleModelDriver({
         profile: "deepseek",
         apiKey: "test-key",
@@ -847,6 +859,7 @@ describe("OpenAICompatibleModelDriver", () => {
 
     await collect(
       driver.stream({
+        maximumOutputTokens: 4_096,
         messages: [
           { role: "system", content: "Follow the platform rules." },
           { role: "developer", content: "Work only inside the repository." },
@@ -954,6 +967,7 @@ describe("OpenAICompatibleModelDriver", () => {
 
     await collect(
       driver.stream({
+        maximumOutputTokens: 4_096,
         messages: [
           { role: "user", content: "Read the README." },
           {
@@ -999,6 +1013,7 @@ describe("OpenAICompatibleModelDriver", () => {
 
     const events = await collect(
       driver.stream({
+        maximumOutputTokens: 4_096,
         messages: [{ role: "user", content: "Read the README and print the directory." }],
         tools: [],
         signal: new AbortController().signal,
@@ -1057,6 +1072,7 @@ describe("OpenAICompatibleModelDriver", () => {
 
     const events = await collect(
       driver.stream({
+        maximumOutputTokens: 4_096,
         messages: [{ role: "user", content: "Apply the patch" }],
         tools: [],
         signal: new AbortController().signal,
@@ -1126,6 +1142,7 @@ describe("OpenAICompatibleModelDriver", () => {
     try {
       await writeFile(join(workspaceRoot, "README.md"), "# Adam Agent\n", "utf8");
       const session = new AgentSession({
+        maximumOutputTokens: 4_096,
         model: new OpenAICompatibleModelDriver({
           profile: "deepseek",
           apiKey: "test-key",
@@ -1195,6 +1212,7 @@ describe("OpenAICompatibleModelDriver", () => {
         },
       });
       const session = new AgentSession({
+        maximumOutputTokens: 4_096,
         model: driver,
         store,
         tools: createReadToolRegistry({ workspaceRoot }),
@@ -1273,6 +1291,7 @@ async function captureDriverError(
   try {
     await collect(
       driver.stream({
+        maximumOutputTokens: 4_096,
         messages: [{ role: "user", content: "Hello" }],
         tools: [],
         signal,

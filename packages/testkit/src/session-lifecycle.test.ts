@@ -21,7 +21,11 @@ import {
   type RuntimeEvent,
   SessionLifecycleError,
 } from "@adam-agent/agent";
-import { openJsonlSessionStore, type SessionRecord } from "@adam-agent/agent/internal-testing";
+import {
+  openJsonlSessionStore,
+  preparedDirectDeepSeekV2ContextProfile,
+  type SessionRecord,
+} from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { FakeModelDriver } from "./index.js";
 
@@ -73,6 +77,137 @@ test("SessionLifecycle creates durable new-schema genesis for an exact project a
       lastSequence: 1,
     };
     expect({ created, inspected }).toEqual({ created: expected, inspected: expected });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle restores an uncompacted v1 session after the current target advances", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-historical-v1-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const created = await createSessionLifecycle({ stateRoot, workspaceRoot }).create({
+    targetIdentity,
+  });
+  const v2Identity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 2 };
+  const observedBudgets: Array<number | undefined> = [];
+  let v2DriverCalls = 0;
+  const v1Driver = new FakeModelDriver((request) => {
+    observedBudgets.push(request.maximumOutputTokens);
+    return [
+      { type: "text_delta", text: "Historical v1 restored." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const upgradedTargets: ModelTargets = {
+    async resolve(input) {
+      const exactIdentity = (
+        input as typeof input & { readonly targetIdentity?: ModelTargetIdentity }
+      ).targetIdentity;
+      if (exactIdentity?.profileVersion === 1) {
+        return { identity: targetIdentity, driver: v1Driver, contextProfile: testContextProfile };
+      }
+      v2DriverCalls += 1;
+      return {
+        identity: v2Identity,
+        driver: new FakeModelDriver([]),
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+      };
+    },
+    async snapshot(input) {
+      const includeHistoricalProfiles = (
+        input as typeof input & { readonly includeHistoricalProfiles?: boolean }
+      ).includeHistoricalProfiles;
+      const current = {
+        identity: v2Identity,
+        readiness: { status: "available" as const, credentialSource: "test" },
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+      };
+      const historical = {
+        identity: targetIdentity,
+        readiness: { status: "available" as const, credentialSource: "test" },
+        contextProfile: testContextProfile,
+      };
+      return { targets: includeHistoricalProfiles ? [current, historical] : [current] };
+    },
+  };
+
+  try {
+    const continued = await createSessionLifecycle({
+      modelTargets: upgradedTargets,
+      stateRoot,
+      workspaceRoot,
+    }).continue({
+      sessionId: created.sessionId,
+      input: { text: "Continue with the historical profile." },
+    });
+
+    expect({ result: continued.result, observedBudgets, v2DriverCalls }).toEqual({
+      result: { status: "completed", answer: "Historical v1 restored." },
+      observedBudgets: [32_768],
+      v2DriverCalls: 0,
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects an unsupported historical profile before model resolution", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-unsupported-profile-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const unsupportedIdentity: ModelTargetIdentity = {
+    ...targetIdentity,
+    profileVersion: 99,
+  };
+  const unsupportedProfile: ContextProfile = {
+    ...testContextProfile,
+    version: 99,
+  };
+  let resolveCalls = 0;
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      resolveCalls += 1;
+      return {
+        identity: unsupportedIdentity,
+        driver: new FakeModelDriver([]),
+        contextProfile: unsupportedProfile,
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: unsupportedIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile: unsupportedProfile,
+          },
+        ],
+      };
+    },
+  };
+
+  try {
+    const created = await createSessionLifecycle({ stateRoot, workspaceRoot }).create({
+      targetIdentity: unsupportedIdentity,
+    });
+    await expect(
+      createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot }).resume({
+        sessionId: created.sessionId,
+      }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      error: { code: "model_target_incompatible" },
+    });
+    await expect(
+      createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot }).continue({
+        sessionId: created.sessionId,
+        input: { text: "This request must not reach the model." },
+      }),
+    ).rejects.toMatchObject({ code: "session_model_target_incompatible" });
+    expect(resolveCalls).toBe(0);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

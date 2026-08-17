@@ -1,7 +1,8 @@
 /** Tests only. This internal fault-injection surface has no compatibility promise. */
 
-export { type ContextProfile, sessionContextProfile } from "./context-profile.js";
+export type { ContextProfile } from "./context-profile.js";
 export { digestContextRecordPrefix } from "./durable-context.js";
+export { preparedDirectDeepSeekV2ContextProfile } from "./model-targets.js";
 export type { PatchFileSystem } from "./patch-transaction.js";
 export { sessionDurableContext } from "./session-durable-context.js";
 export {

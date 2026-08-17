@@ -37,6 +37,7 @@ for (const targetId of ["deepseek-v4-flash.direct", "deepseek-v4-pro.direct"] as
         signal: new AbortController().signal,
       });
       const session = new AgentSession({
+        maximumOutputTokens: 4_096,
         model: driver,
         store: createInMemorySessionStore(),
       });
@@ -60,6 +61,7 @@ liveTest(
   "completes one answer-only DeepSeek turn",
   async () => {
     const session = new AgentSession({
+      maximumOutputTokens: 4_096,
       model: createLiveDriver(liveApiKey),
       store: createInMemorySessionStore(),
     });
@@ -82,6 +84,7 @@ liveTest(
     try {
       await writeFile(join(workspaceRoot, "README.md"), "# Nebula Orchard\n", "utf8");
       const session = new AgentSession({
+        maximumOutputTokens: 4_096,
         model: createLiveDriver(liveApiKey),
         store: createInMemorySessionStore(),
         tools: createReadToolRegistry({ workspaceRoot }),
@@ -249,6 +252,7 @@ function createLivePatchSession(options: {
   readonly events: RuntimeEvent[];
 }): AgentSession {
   const session = new AgentSession({
+    maximumOutputTokens: 4_096,
     model: createLiveDriver(options.liveApiKey),
     store: createInMemorySessionStore(),
     tools: createCodingToolRegistry({

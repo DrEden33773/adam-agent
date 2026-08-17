@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
-import { type ContextProfile, sessionContextProfile } from "./context-profile.js";
+import { type ContextProfile, isContextProfileSupported } from "./context-profile.js";
 import {
   type ContextEvidenceV1,
   createContextProjectionMessage,
@@ -21,7 +21,11 @@ import {
   type RuntimeEvent,
   type RuntimeEventListener,
 } from "./index.js";
-import type { ModelTargetIdentity, ModelTargets } from "./model-targets.js";
+import {
+  type ModelTargetIdentity,
+  type ModelTargets,
+  sameModelTargetIdentity,
+} from "./model-targets.js";
 import {
   createProjectLifecycleOwner,
   ProjectLifecycleOwnerError,
@@ -322,12 +326,17 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
         };
       }
       const targetSnapshot = await options.modelTargets.snapshot({
+        includeHistoricalProfiles: true,
         signal: new AbortController().signal,
       });
-      const target = targetSnapshot.targets.find(
-        (candidate) => candidate.identity.targetId === snapshot.targetIdentity.targetId,
+      const target = targetSnapshot.targets.find((candidate) =>
+        sameModelTargetIdentity(candidate.identity, snapshot.targetIdentity),
       );
-      if (target === undefined || !sameTargetIdentity(target.identity, snapshot.targetIdentity)) {
+      if (
+        target === undefined ||
+        target.contextProfile.version !== snapshot.targetIdentity.profileVersion ||
+        !isContextProfileSupported(target.contextProfile)
+      ) {
         return {
           status: "rejected",
           snapshot,
@@ -536,7 +545,16 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     async continue(input) {
       return withOwner(async () => {
         const resumed = await resumeSession({ sessionId: input.sessionId });
-        if (resumed.status !== "ready" || resumed.snapshot.status === "settled") {
+        if (resumed.status === "rejected") {
+          if (resumed.error.code === "model_target_incompatible") {
+            throw new SessionLifecycleError("session_model_target_incompatible");
+          }
+          if (resumed.error.code === "model_target_unavailable") {
+            throw new SessionLifecycleError("session_model_target_unavailable");
+          }
+          throw new SessionLifecycleError("session_invalid");
+        }
+        if (resumed.snapshot.status === "settled") {
           throw new SessionLifecycleError("session_invalid");
         }
         if (resumed.snapshot.status === "interrupted" && input.input !== undefined) {
@@ -547,10 +565,15 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
         }
         const resolved = await options.modelTargets.resolve({
           targetId: resumed.snapshot.targetIdentity.targetId,
+          targetIdentity: resumed.snapshot.targetIdentity,
           allowExperimental: resumed.snapshot.targetIdentity.certification === "experimental",
           signal: input.signal ?? new AbortController().signal,
         });
-        if (!sameTargetIdentity(resolved.identity, resumed.snapshot.targetIdentity)) {
+        if (
+          !sameModelTargetIdentity(resolved.identity, resumed.snapshot.targetIdentity) ||
+          resolved.contextProfile.version !== resumed.snapshot.targetIdentity.profileVersion ||
+          !isContextProfileSupported(resolved.contextProfile)
+        ) {
           throw new SessionLifecycleError("session_model_target_incompatible");
         }
         const records = await readJsonlSessionRecords({
@@ -593,7 +616,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
               : { initialMessages: inheritedMessages }),
             ...(durableResumeState === undefined ? {} : { resume: durableResumeState }),
           },
-          [sessionContextProfile]: resolved.contextProfile,
+          contextProfile: resolved.contextProfile,
           ...(options.tools === undefined ? {} : { tools: options.tools }),
           ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
         };
@@ -725,7 +748,7 @@ function validateCurrentSessionHistory(
       if (
         terminalIntent !== undefined ||
         !sawUserMessage ||
-        !sameTargetIdentity(record.targetIdentity, genesis.record.targetIdentity)
+        !sameModelTargetIdentity(record.targetIdentity, genesis.record.targetIdentity)
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
@@ -780,7 +803,7 @@ function validateCurrentSessionHistory(
         terminalIntent !== undefined ||
         !isMatchingStartedAttempt(attemptState, record) ||
         !sawModelStart ||
-        !sameTargetIdentity(record.targetIdentity, genesis.record.targetIdentity)
+        !sameModelTargetIdentity(record.targetIdentity, genesis.record.targetIdentity)
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
@@ -1035,7 +1058,7 @@ function validateContextCompactionHistory(
     }
     if (record.type === "context_compaction_started") {
       if (
-        !sameTargetIdentity(record.targetIdentity, genesis.record.targetIdentity) ||
+        !sameModelTargetIdentity(record.targetIdentity, genesis.record.targetIdentity) ||
         record.sourceThrough >= entry.sequence ||
         !isContextProfileValid(record.contextProfile) ||
         record.previousCheckpointSequence !== latestCheckpointSequence ||
@@ -1100,7 +1123,7 @@ function validateContextCompactionHistory(
       record.retainedFrom > record.sourceThrough + 1 ||
       record.previousCheckpointSequence !== latestCheckpointSequence ||
       record.sourceDigest !== started.entry.record.sourceDigest ||
-      !sameTargetIdentity(record.targetIdentity, genesis.record.targetIdentity) ||
+      !sameModelTargetIdentity(record.targetIdentity, genesis.record.targetIdentity) ||
       JSON.stringify(record.contextProfile) !== JSON.stringify(started.entry.record.contextProfile)
     ) {
       throw new SessionLifecycleError("session_invalid");
@@ -1170,23 +1193,7 @@ function sameContextAttempt(
 }
 
 function isContextProfileValid(profile: ContextProfile): boolean {
-  return (
-    Number.isSafeInteger(profile.version) &&
-    profile.version > 0 &&
-    Number.isSafeInteger(profile.contextWindowTokens) &&
-    Number.isSafeInteger(profile.maximumOutputTokens) &&
-    Number.isSafeInteger(profile.compactAtTokens) &&
-    Number.isSafeInteger(profile.postCompactTargetTokens) &&
-    Number.isSafeInteger(profile.retainedTargetTokens) &&
-    profile.maximumOutputTokens > 0 &&
-    profile.postCompactTargetTokens > 0 &&
-    profile.retainedTargetTokens >= 0 &&
-    profile.retainedTargetTokens <= profile.postCompactTargetTokens &&
-    profile.postCompactTargetTokens < profile.compactAtTokens &&
-    profile.compactAtTokens < profile.contextWindowTokens &&
-    profile.maximumOutputTokens < profile.contextWindowTokens &&
-    profile.estimatorVersion === 1
-  );
+  return isContextProfileSupported(profile);
 }
 
 function isMatchingStartedAttempt(
@@ -1579,18 +1586,6 @@ function isCompleteBranchBoundary(records: readonly SessionRecord[]): boolean {
         candidate.record.event.callId === call.id &&
         candidate.record.event.name === call.name,
     ),
-  );
-}
-
-function sameTargetIdentity(left: ModelTargetIdentity, right: ModelTargetIdentity): boolean {
-  return (
-    left.targetId === right.targetId &&
-    left.vendor === right.vendor &&
-    left.modelId === right.modelId &&
-    left.route === right.route &&
-    left.upstreamProviderId === right.upstreamProviderId &&
-    left.profileVersion === right.profileVersion &&
-    left.certification === right.certification
   );
 }
 
@@ -2312,7 +2307,7 @@ async function settleCompletedResponseTerminal(
   );
   if (
     responseRecord?.record.type !== "model_response_completed" ||
-    !sameTargetIdentity(responseRecord.record.targetIdentity, snapshot.targetIdentity)
+    !sameModelTargetIdentity(responseRecord.record.targetIdentity, snapshot.targetIdentity)
   ) {
     return false;
   }
@@ -2458,7 +2453,7 @@ function isExactToolIntent(
 ): boolean {
   if (
     responseRecord.type !== "model_response_completed" ||
-    !sameTargetIdentity(responseRecord.targetIdentity, snapshot.targetIdentity)
+    !sameModelTargetIdentity(responseRecord.targetIdentity, snapshot.targetIdentity)
   ) {
     return false;
   }

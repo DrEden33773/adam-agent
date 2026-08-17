@@ -42,6 +42,7 @@ test("an exact Direct DeepSeek target returns a public answer-only model driver"
     resolved.driver.stream({
       messages: [{ role: "user", content: "Introduce yourself" }],
       tools: [],
+      maximumOutputTokens: 12_345,
       signal: new AbortController().signal,
     }),
   );
@@ -61,6 +62,7 @@ test("an exact Direct DeepSeek target returns a public answer-only model driver"
         body: expect.objectContaining({
           model: "deepseek-v4-flash",
           messages: [{ role: "user", content: "Introduce yourself" }],
+          max_tokens: 12_345,
           stream: true,
         }),
       },
@@ -90,6 +92,7 @@ test("the unified driver preserves DeepSeek reasoning and cache usage details", 
 
   const events = await collect(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Answer" }],
       tools: [],
       signal: new AbortController().signal,
@@ -128,6 +131,7 @@ test.each([
 
   const events = await collect(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Answer" }],
       tools: [],
       signal: new AbortController().signal,
@@ -154,6 +158,7 @@ test("the unified driver preserves reasoning and fragmented tool calls for Adam 
 
   const events = await collect(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Read the project name" }],
       tools: [
         {
@@ -200,6 +205,7 @@ test("the unified driver preserves multiple interleaved non-reasoning tool calls
 
   const events = await collect(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Read two files" }],
       tools: [readFileDefinition],
       signal: new AbortController().signal,
@@ -248,6 +254,7 @@ test.each(["deepseek-v4-flash", "deepseek-v4-pro"] as const)(
     const request = () => ({
       messages: [{ role: "user" as const, content: "Read the project name" }],
       tools: [readFileDefinition],
+      maximumOutputTokens: 4_096,
       signal: new AbortController().signal,
     });
 
@@ -280,6 +287,7 @@ test("AgentSession keeps tool execution and replay state while using the unified
   });
   const store = createInMemorySessionStore();
   const session = new AgentSession({
+    maximumOutputTokens: 32_768,
     model: driver,
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
@@ -301,6 +309,9 @@ test("AgentSession keeps tool execution and replay state while using the unified
       name: "read_file",
       output: { path: "README.md", content: "# Adam Agent\n", truncated: false },
     });
+    expect(requests.map((request) => (request as { max_tokens?: number }).max_tokens)).toEqual([
+      32_768, 32_768,
+    ]);
     expect(requests[1]).toEqual(
       expect.objectContaining({
         messages: expect.arrayContaining([
@@ -343,6 +354,7 @@ test("the V4 profile lowers developer instructions and backfills empty reasoning
 
   await collect(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [
         { role: "system", content: "Follow the platform rules." },
         { role: "developer", content: "Work only inside the repository." },
@@ -424,6 +436,7 @@ test("the unified driver classifies DeepSeek HTTP 402 without retaining credenti
 
   const error = await collectError(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Answer" }],
       tools: [],
       signal: new AbortController().signal,
@@ -462,6 +475,7 @@ test("the unified driver classifies documented DeepSeek HTTP 422 as an invalid r
 
   const error = await collectError(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Answer" }],
       tools: [],
       signal: new AbortController().signal,
@@ -503,6 +517,7 @@ test("the unified driver preserves caller cancellation while a provider request 
 
   const errorPromise = collectError(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Answer" }],
       tools: [],
       signal: controller.signal,
@@ -546,6 +561,7 @@ test("the unified driver owns one deadline across the complete provider stream",
 
     const errorPromise = collectError(
       driver.stream({
+        maximumOutputTokens: 4_096,
         messages: [{ role: "user", content: "Answer" }],
         tools: [],
         signal: new AbortController().signal,
@@ -589,6 +605,7 @@ test("the unified driver makes one external attempt when DeepSeek returns a retr
 
   const error = await collectError(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Answer" }],
       tools: [],
       signal: new AbortController().signal,
@@ -630,6 +647,7 @@ test("the unified driver rejects normalized text beyond Adam's stream limit", as
 
   const error = await collectError(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Answer" }],
       tools: [],
       signal: new AbortController().signal,
@@ -668,6 +686,7 @@ test.each([
 
   const error = await collectError(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Answer" }],
       tools: [readFileDefinition],
       signal: new AbortController().signal,
@@ -759,6 +778,58 @@ test("the target snapshot reports exact Certified identities and safe credential
   expect(snapshot.targets.every(({ identity }) => Object.isFrozen(identity))).toBe(true);
 });
 
+test("the prepared Direct DeepSeek v2 profile is not selectable before B5.5b", async () => {
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+  });
+  const resolution = targets.resolve({
+    targetId: "deepseek-v4-flash.direct",
+    targetIdentity: {
+      targetId: "deepseek-v4-flash.direct",
+      vendor: "deepseek",
+      modelId: "deepseek-v4-flash",
+      route: "direct",
+      profileVersion: 2,
+      certification: "certified",
+    },
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+
+  await expect(resolution).rejects.toMatchObject({ code: "target_not_found" });
+  await expect(
+    targets.snapshot({ includeHistoricalProfiles: true, signal: new AbortController().signal }),
+  ).resolves.toMatchObject({
+    targets: [
+      { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 1 } },
+      { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 1 } },
+      { identity: { targetId: "poolside-laguna-s-2.1-free.gateway", profileVersion: 1 } },
+    ],
+  });
+});
+
+test("historical target resolution rejects a conflicting target ID and exact identity", async () => {
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+  });
+
+  await expect(
+    targets.resolve({
+      targetId: "deepseek-v4-pro.direct",
+      targetIdentity: {
+        targetId: "deepseek-v4-flash.direct",
+        vendor: "deepseek",
+        modelId: "deepseek-v4-flash",
+        route: "direct",
+        profileVersion: 1,
+        certification: "certified",
+      },
+      allowExperimental: false,
+      signal: new AbortController().signal,
+    }),
+  ).rejects.toMatchObject({ code: "target_not_found" });
+});
+
 test("model targets reject an invalid shared provider deadline", () => {
   expect(() =>
     createModelTargets({
@@ -838,6 +909,7 @@ test("the Experimental Gateway target pins one upstream in the public V4 request
 
   const events = await collect(
     driver.stream({
+      maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Introduce yourself" }],
       tools: [],
       signal: new AbortController().signal,

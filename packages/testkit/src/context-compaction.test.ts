@@ -14,6 +14,7 @@ import {
   ModelDriverError,
   type ModelRequest,
   type ModelTargets,
+  OpenAICompatibleModelDriver,
   type RuntimeEvent,
   type SessionStore,
 } from "@adam-agent/agent";
@@ -21,14 +22,14 @@ import {
   type ContextProfile,
   digestContextRecordPrefix,
   openJsonlSessionStore,
+  preparedDirectDeepSeekV2ContextProfile,
   type SessionContextCompactionCommittedRecord,
   type SessionContextCompactionFailedRecord,
   type SessionContextCompactionInterruptedRecord,
   type SessionRecord,
-  sessionContextProfile,
   sessionDurableContext,
 } from "@adam-agent/agent/internal-testing";
-import { expect, test } from "vitest";
+import { expect, expectTypeOf, test } from "vitest";
 
 const targetIdentity = {
   targetId: "fake.local",
@@ -48,6 +49,417 @@ const contextProfile: ContextProfile = {
   retainedTargetTokens: 100,
   estimatorVersion: 1,
 };
+
+test("ModelRequest requires an explicit per-call output budget", () => {
+  expectTypeOf<ModelRequest["maximumOutputTokens"]>().toEqualTypeOf<number>();
+});
+
+function deepSeekTextStream(text: string): string {
+  const delta = JSON.stringify({
+    id: "budget-fixture",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "deepseek-v4-flash",
+    choices: [{ index: 0, delta: { content: text }, finish_reason: null }],
+  });
+  const finish = JSON.stringify({
+    id: "budget-fixture",
+    object: "chat.completion.chunk",
+    created: 1,
+    model: "deepseek-v4-flash",
+    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+  });
+  return `data: ${delta}\n\ndata: ${finish}\n\ndata: [DONE]\n\n`;
+}
+
+test("AgentSession sends the v1 ordinary output budget with each model request", async () => {
+  let observedMaximumOutputTokens: number | undefined;
+  const model: ModelDriver = {
+    async *stream(request) {
+      observedMaximumOutputTokens = request.maximumOutputTokens;
+      yield { type: "text_delta", text: "Budget observed." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: createInMemorySessionStore(),
+    contextProfile: contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  await expect(session.run({ text: "Use the active model profile." })).resolves.toEqual({
+    status: "completed",
+    answer: "Budget observed.",
+  });
+  expect(observedMaximumOutputTokens).toBe(100);
+});
+
+test("AgentSession clamps the v2 ordinary output budget at the DeepSeek context boundary", async () => {
+  const observedBudgets: number[] = [];
+  const observedInputProjections: number[] = [];
+
+  for (const contentBytes of [2_447_555, 2_447_559]) {
+    const model: ModelDriver = {
+      async *stream(request) {
+        observedInputProjections.push(
+          Math.ceil(Buffer.byteLength(JSON.stringify(request.messages), "utf8") / 4),
+        );
+        if (request.maximumOutputTokens !== undefined) {
+          observedBudgets.push(request.maximumOutputTokens);
+        }
+        yield { type: "text_delta", text: "Boundary observed." };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const dependencies = {
+      model,
+      store: createInMemorySessionStore(),
+      [sessionDurableContext]: {
+        nextSequence: 1,
+        targetIdentity,
+        initialMessages: [{ role: "system" as const, content: "x".repeat(contentBytes) }],
+      },
+      contextProfile: preparedDirectDeepSeekV2ContextProfile,
+    };
+
+    await new AgentSession(dependencies).run({ text: "" });
+  }
+
+  expect(observedInputProjections).toEqual([611_904, 611_905]);
+  expect(observedBudgets).toEqual([384_000, 383_999]);
+});
+
+test("Direct DeepSeek payload receives the exact small, boundary, and summary budgets", async () => {
+  const requests: Array<{ readonly maximumOutputTokens: number; readonly isSummary: boolean }> = [];
+  const summary = JSON.stringify({
+    schemaVersion: 1,
+    objective: "Preserve the active task.",
+    constraints: [],
+    progress: [],
+    unresolvedQuestions: [],
+    failures: [],
+    remainingVerification: [],
+    nextSafeAction: "Continue with the compacted projection.",
+  });
+  const driver = new OpenAICompatibleModelDriver({
+    profile: "deepseek",
+    apiKey: "test-deepseek-key",
+    baseURL: "https://api.deepseek.com",
+    model: "deepseek-v4-flash",
+    maximumOutputTokens: 384_000,
+    fetch: async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as {
+        readonly max_tokens: number;
+        readonly messages: readonly { readonly content?: unknown }[];
+      };
+      const isSummary = body.messages.some(
+        (message) =>
+          typeof message.content === "string" && message.content.startsWith("Compact this"),
+      );
+      requests.push({ maximumOutputTokens: body.max_tokens, isSummary });
+      return new Response(deepSeekTextStream(isSummary ? summary : "Budget observed."), {
+        headers: { "content-type": "text/event-stream" },
+        status: 200,
+      });
+    },
+  });
+
+  await new AgentSession({
+    model: driver,
+    store: createInMemorySessionStore(),
+    contextProfile: preparedDirectDeepSeekV2ContextProfile,
+  }).run({ text: "Use the small-context maximum." });
+
+  for (const contentBytes of [2_447_555, 2_447_559]) {
+    const dependencies = {
+      model: driver,
+      store: createInMemorySessionStore(),
+      contextProfile: preparedDirectDeepSeekV2ContextProfile,
+      [sessionDurableContext]: {
+        nextSequence: 1,
+        targetIdentity: { ...targetIdentity, profileVersion: 2 },
+        initialMessages: [{ role: "system", content: "x".repeat(contentBytes) }],
+      },
+    };
+    await new AgentSession(dependencies).run({ text: "" });
+  }
+
+  const compactionProfile: ContextProfile = {
+    ...preparedDirectDeepSeekV2ContextProfile,
+    compactAtTokens: 500,
+    postCompactTargetTokens: 400,
+    retainedTargetTokens: 0,
+  };
+  const compactionDependencies = {
+    model: driver,
+    store: createInMemorySessionStore<SessionRecord>() as unknown as ConstructorParameters<
+      typeof AgentSession
+    >[0]["store"],
+    contextProfile: compactionProfile,
+    [sessionDurableContext]: {
+      nextSequence: 1,
+      targetIdentity: { ...targetIdentity, profileVersion: 2 },
+      initialMessages: [{ role: "system", content: "large active context ".repeat(120) }],
+    },
+  };
+  await new AgentSession(compactionDependencies).run({ text: "Finish after compaction." });
+
+  expect(requests.slice(0, 3)).toEqual([
+    { maximumOutputTokens: 384_000, isSummary: false },
+    { maximumOutputTokens: 384_000, isSummary: false },
+    { maximumOutputTokens: 383_999, isSummary: false },
+  ]);
+  expect(requests.filter((request) => request.isSummary)).toEqual([
+    { maximumOutputTokens: 32_768, isSummary: true },
+  ]);
+});
+
+test("AgentSession keeps the v2 compaction summary budget separate from ordinary output", async () => {
+  const summary = JSON.stringify({
+    schemaVersion: 1,
+    objective: "Preserve the active task.",
+    constraints: [],
+    progress: [],
+    unresolvedQuestions: [],
+    failures: [],
+    remainingVerification: [],
+    nextSafeAction: "Continue with the compacted projection.",
+  });
+  const v2Profile: ContextProfile = {
+    version: 2,
+    contextWindowTokens: 1_000_000,
+    maximumOutputTokens: 384_000,
+    ordinaryOutputReserveTokens: 4_096,
+    compactionSummaryMaximumOutputTokens: 32_768,
+    compactAtTokens: 500,
+    postCompactTargetTokens: 400,
+    retainedTargetTokens: 0,
+    estimatorVersion: 1,
+  };
+  const observedBudgets: Array<number | undefined> = [];
+  const model: ModelDriver = {
+    async *stream(request) {
+      observedBudgets.push(request.maximumOutputTokens);
+      if (
+        request.messages.some(
+          (message) => message.role === "system" && message.content.startsWith("Compact this"),
+        )
+      ) {
+        yield { type: "text_delta", text: summary };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "text_delta", text: "Separate budgets observed." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const store = createInMemorySessionStore<SessionRecord>();
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    [sessionDurableContext]: {
+      nextSequence: 1,
+      targetIdentity: { ...targetIdentity, profileVersion: 2 },
+      initialMessages: [{ role: "system" as const, content: "large active context ".repeat(120) }],
+    },
+    contextProfile: v2Profile,
+  };
+
+  await expect(new AgentSession(dependencies).run({ text: "Finish the task." })).resolves.toEqual({
+    status: "completed",
+    answer: "Separate budgets observed.",
+  });
+  expect(observedBudgets).toEqual([32_768, 384_000]);
+});
+
+test("AgentSession fails closed before sending a non-positive output budget", async () => {
+  let modelCalls = 0;
+  const model: ModelDriver = {
+    async *stream() {
+      modelCalls += 1;
+      yield { type: "text_delta", text: "This request must not be sent." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const noRoomProfile: ContextProfile = {
+    version: 2,
+    contextWindowTokens: 100,
+    maximumOutputTokens: 80,
+    ordinaryOutputReserveTokens: 10,
+    compactionSummaryMaximumOutputTokens: 20,
+    compactAtTokens: 90,
+    postCompactTargetTokens: 50,
+    retainedTargetTokens: 10,
+    estimatorVersion: 1,
+  };
+  const dependencies = {
+    model,
+    store: createInMemorySessionStore(),
+    contextProfile: noRoomProfile,
+  };
+
+  await expect(new AgentSession(dependencies).run({ text: "x".repeat(330) })).resolves.toEqual({
+    status: "failed",
+    error: {
+      code: "context_window_unrecoverable",
+      message: "The active context leaves no safe output capacity for this model request.",
+    },
+  });
+  expect(modelCalls).toBe(0);
+});
+
+test("AgentSession uses the latest provider input sample for the next v2 output budget", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-output-sample-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "README.md"), "# Adam\n", "utf8");
+  const observedBudgets: Array<number | undefined> = [];
+  let call = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      observedBudgets.push(request.maximumOutputTokens);
+      call += 1;
+      if (call === 1) {
+        yield { type: "usage", inputTokens: 611_832, outputTokens: 1 };
+        yield { type: "tool_call_start", id: "read-budget", name: "read_file" };
+        yield {
+          type: "tool_call_delta",
+          id: "read-budget",
+          json: '{"path":"README.md"}',
+        };
+        yield { type: "tool_call_end", id: "read-budget" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Provider sample preserved." };
+      yield { type: "usage", inputTokens: 611_905, outputTokens: 2 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: createInMemorySessionStore(),
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    contextProfile: preparedDirectDeepSeekV2ContextProfile,
+  };
+
+  try {
+    await expect(new AgentSession(dependencies).run({ text: "Read README.md." })).resolves.toEqual({
+      status: "completed",
+      answer: "Provider sample preserved.",
+    });
+    expect(observedBudgets).toEqual([384_000, 383_999]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession applies the prepared DeepSeek v2 compaction thresholds", async () => {
+  const olderAssistant = {
+    role: "assistant" as const,
+    content: "o".repeat(8_000),
+    toolCalls: [],
+  };
+  const recentUser = { role: "user" as const, content: "r".repeat(75_000) };
+  const currentUser = { role: "user" as const, content: "" };
+  const emptySystem = { role: "system" as const, content: "" };
+  const fixedBytes = Buffer.byteLength(
+    JSON.stringify([emptySystem, olderAssistant, recentUser, currentUser]),
+    "utf8",
+  );
+  const initialMessages = [
+    { ...emptySystem, content: "x".repeat(3_600_000 - fixedBytes) },
+    olderAssistant,
+    recentUser,
+  ];
+  expect(
+    Math.ceil(Buffer.byteLength(JSON.stringify([...initialMessages, currentUser]), "utf8") / 4),
+  ).toBe(900_000);
+
+  const summary = JSON.stringify({
+    schemaVersion: 1,
+    objective: "Preserve the exact v2 threshold fixture.",
+    constraints: [],
+    progress: [],
+    unresolvedQuestions: [],
+    failures: [],
+    remainingVerification: [],
+    nextSafeAction: "Continue after compaction.",
+  });
+  const requests: ModelRequest[] = [];
+  const model: ModelDriver = {
+    async *stream(request) {
+      requests.push(request);
+      if (
+        request.messages.some(
+          (message) => message.role === "system" && message.content.startsWith("Compact this"),
+        )
+      ) {
+        yield { type: "text_delta", text: summary };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "text_delta", text: "Prepared thresholds observed." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const store = createInMemorySessionStore<SessionRecord>();
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    [sessionDurableContext]: {
+      nextSequence: 1,
+      targetIdentity: { ...targetIdentity, profileVersion: 2 },
+      initialMessages,
+    },
+    contextProfile: preparedDirectDeepSeekV2ContextProfile,
+  };
+
+  await expect(new AgentSession(dependencies).run({ text: "" })).resolves.toEqual({
+    status: "completed",
+    answer: "Prepared thresholds observed.",
+  });
+  expect(preparedDirectDeepSeekV2ContextProfile).toMatchObject({
+    compactAtTokens: 900_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+  });
+  expect(requests.map((request) => request.maximumOutputTokens)).toEqual([32_768, 384_000]);
+  const ordinaryRequest = requests[1];
+  expect(ordinaryRequest).toBeDefined();
+  expect(
+    Math.ceil(Buffer.byteLength(JSON.stringify(ordinaryRequest?.messages), "utf8") / 4),
+  ).toBeLessThan(200_000);
+  expect(ordinaryRequest?.messages).toContainEqual(recentUser);
+  expect(ordinaryRequest?.messages).not.toContainEqual(olderAssistant);
+});
+
+test("the aggregate run token limit does not replace the v2 per-call output budget", async () => {
+  const observedBudgets: Array<number | undefined> = [];
+  const model: ModelDriver = {
+    async *stream(request) {
+      observedBudgets.push(request.maximumOutputTokens);
+      yield { type: "text_delta", text: "The budgets remain distinct." };
+      yield { type: "usage", inputTokens: 2, outputTokens: 2 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: createInMemorySessionStore(),
+    contextProfile: preparedDirectDeepSeekV2ContextProfile,
+  };
+
+  await expect(
+    new AgentSession(dependencies).run(
+      { text: "Keep the request and run budgets separate." },
+      { limits: { maxTokens: 10 } },
+    ),
+  ).resolves.toEqual({ status: "completed", answer: "The budgets remain distinct." });
+  expect(observedBudgets).toEqual([384_000]);
+});
 
 test("AgentSession durably compacts before the next ordinary provider call", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-compaction-"));
@@ -132,7 +544,7 @@ test("AgentSession durably compacts before the next ordinary provider call", asy
       nextSequence: 2,
       targetIdentity,
     },
-    [sessionContextProfile]: contextProfile,
+    contextProfile: contextProfile,
   };
   const session = new AgentSession(dependencies);
   const events: RuntimeEvent[] = [];
@@ -295,7 +707,7 @@ test("AgentSession fails before the model when protected compaction input cannot
     model,
     store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: tinyProfile,
+    contextProfile: tinyProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -428,7 +840,7 @@ test("AgentSession continues without a token limit while compaction usage stays 
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: contextProfile,
+    contextProfile: contextProfile,
   };
   const session = new AgentSession(dependencies);
   const events: RuntimeEvent[] = [];
@@ -493,7 +905,7 @@ test("AgentSession fails closed before resumed work when prior compaction usage 
         pendingToolCalls: [],
       },
     },
-    [sessionContextProfile]: contextProfile,
+    contextProfile: contextProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -582,7 +994,7 @@ test("AgentSession never uses a compacted projection when checkpoint persistence
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: contextProfile,
+    contextProfile: contextProfile,
   };
   const session = new AgentSession(dependencies);
   const events: RuntimeEvent[] = [];
@@ -680,7 +1092,7 @@ test("AgentSession charges compaction usage before another ordinary provider cal
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: contextProfile,
+    contextProfile: contextProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -806,7 +1218,7 @@ test("AgentSession fits bulky tool output while preserving canonical write evide
     tools: createCodingToolRegistry({ workspaceRoot, stateRoot: join(testRoot, "state") }),
     permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: contextProfile,
+    contextProfile: contextProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -914,7 +1326,7 @@ test("AgentSession reconsiders a complete retained tool turn during repeated com
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: repeatedProfile,
+    contextProfile: repeatedProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -1059,7 +1471,7 @@ test("AgentSession preserves edit, shell-artifact, and failure evidence through 
     }),
     permissions: createPermissionPolicy({ allowedEffects: ["read", "write", "execute"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: evidenceProfile,
+    contextProfile: evidenceProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -1165,7 +1577,7 @@ test("AgentSession retries one valid but oversized compaction candidate before o
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: retryProfile,
+    contextProfile: retryProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -1283,7 +1695,7 @@ test("AgentSession preserves unknown usage across a successful compaction retry 
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: retryProfile,
+    contextProfile: retryProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -1366,7 +1778,7 @@ test("AgentSession rejects malformed compaction output without retry or an ordin
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: contextProfile,
+    contextProfile: contextProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -1469,7 +1881,7 @@ test("AgentSession records one compaction authentication failure without retry",
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: contextProfile,
+    contextProfile: contextProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -1546,7 +1958,7 @@ test("AgentSession records one compaction deadline failure without retry", async
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: contextProfile,
+    contextProfile: contextProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -1626,7 +2038,7 @@ test("AgentSession cancels one active compaction and records an interrupted atte
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: contextProfile,
+    contextProfile: contextProfile,
   };
   const session = new AgentSession(dependencies);
   let markStarted: (() => void) | undefined;
@@ -1746,7 +2158,7 @@ test("AgentSession reactively compacts one pre-response context overflow without
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: overflowProfile,
+    contextProfile: overflowProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -1862,7 +2274,7 @@ test("AgentSession stops after the one reactive ordinary retry also overflows", 
     tools: createReadToolRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: overflowProfile,
+    contextProfile: overflowProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -1924,7 +2336,7 @@ test("AgentSession never retries a context overflow after ordinary output has be
     model,
     store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
     [sessionDurableContext]: { nextSequence: 2, targetIdentity },
-    [sessionContextProfile]: contextProfile,
+    contextProfile: contextProfile,
   };
   const session = new AgentSession(dependencies);
 
@@ -2075,6 +2487,46 @@ test("SessionLifecycle restarts and branches from one committed context checkpoi
       status: "ready",
       snapshot: { context: { checkpoint: { windowNumber: 1, status: "committed" } } },
     });
+    const recordsBeforeV2Snapshot = await parentStore.read();
+    const currentV2Identity = { ...targetIdentity, profileVersion: 2 } as const;
+    const upgradedTargets: ModelTargets = {
+      async resolve(input) {
+        return input.targetIdentity?.profileVersion === 1
+          ? { identity: targetIdentity, driver: model, contextProfile }
+          : {
+              identity: currentV2Identity,
+              driver: model,
+              contextProfile: preparedDirectDeepSeekV2ContextProfile,
+            };
+      },
+      async snapshot(input) {
+        const current = {
+          identity: currentV2Identity,
+          readiness: { status: "available" as const, credentialSource: "test" },
+          contextProfile: preparedDirectDeepSeekV2ContextProfile,
+        };
+        const historical = {
+          identity: targetIdentity,
+          readiness: { status: "available" as const, credentialSource: "test" },
+          contextProfile,
+        };
+        return {
+          targets: input.includeHistoricalProfiles ? [current, historical] : [current],
+        };
+      },
+    };
+    await expect(
+      createSessionLifecycle({ ...lifecycleOptions, modelTargets: upgradedTargets }).resume({
+        sessionId: created.sessionId,
+      }),
+    ).resolves.toMatchObject({
+      status: "ready",
+      snapshot: {
+        targetIdentity,
+        context: { profile: contextProfile, checkpoint: { windowNumber: 1 } },
+      },
+    });
+    expect(await parentStore.read()).toEqual(recordsBeforeV2Snapshot);
     let incompatibleDriverWasCalled = false;
     const incompatibleProfile: ContextProfile = {
       ...contextProfile,
