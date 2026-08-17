@@ -7,7 +7,8 @@ import { valid } from "semver";
 import { z } from "zod";
 import type { RunResult, RuntimeEvent } from "./index.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
-import type { PermissionSubject } from "./tool-runtime.js";
+import type { ModelTargetIdentity } from "./model-targets.js";
+import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from "./tool-runtime.js";
 
 export type CanonicalRuntimeEvent = Exclude<RuntimeEvent, { readonly type: "model_message_delta" }>;
 
@@ -67,9 +68,120 @@ export type SessionEventRecord =
       readonly event: CanonicalRuntimeEvent;
     };
 
-export interface SessionStore {
-  append(record: SessionEventRecord): Promise<void>;
-  read(): Promise<readonly SessionEventRecord[]>;
+export type SessionGenesisRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "session_genesis";
+    readonly sessionId: string;
+    readonly projectId: string;
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly lineage?: {
+      readonly parentSessionId: string;
+      readonly parentEventPosition: number;
+      readonly prefixDigest: string;
+    };
+  };
+};
+
+export type SessionLogicalRunStartedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "logical_run_started";
+    readonly runId: string;
+    readonly userMessage: string;
+    readonly limits?: {
+      readonly maxTurns?: number;
+      readonly maxTokens?: number;
+    };
+  };
+};
+
+export type SessionProviderAttemptStartedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "provider_attempt_started";
+    readonly runId: string;
+    readonly turn: number;
+    readonly attempt: number;
+    readonly targetIdentity: ModelTargetIdentity;
+  };
+};
+
+export type SessionProviderAttemptInterruptedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "provider_attempt_interrupted";
+    readonly runId: string;
+    readonly turn: number;
+    readonly attempt: number;
+  } & (
+    | { readonly reason: "process_restart"; readonly result?: never }
+    | { readonly reason: "run_terminal"; readonly result: RunResult }
+  );
+};
+
+export type SessionToolIntent = {
+  readonly callId: string;
+  readonly name: string;
+  readonly argumentsDigest: string;
+  readonly effect?: ToolEffect | undefined;
+  readonly definitionDigest?: string | undefined;
+  readonly replay: ToolReplayClass;
+};
+
+export type SessionModelResponseCompletedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "model_response_completed";
+    readonly runId: string;
+    readonly turn: number;
+    readonly attempt: number;
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly response: {
+      readonly text: string;
+      readonly reasoning?: string;
+      readonly toolCalls: readonly ToolCall[];
+      readonly toolIntents: readonly SessionToolIntent[];
+      readonly finishReason: "stop" | "tool_calls";
+      readonly usage?: {
+        readonly inputTokens: number;
+        readonly outputTokens: number;
+        readonly reasoningTokens?: number;
+        readonly cachedInputTokens?: number;
+        readonly cacheMissInputTokens?: number;
+      };
+    };
+  };
+};
+
+export type SessionRuntimeEventRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "runtime_event";
+    readonly runId: string;
+    readonly event: CanonicalRuntimeEvent;
+  };
+};
+
+export type SessionV3Record =
+  | SessionGenesisRecord
+  | SessionLogicalRunStartedRecord
+  | SessionProviderAttemptStartedRecord
+  | SessionProviderAttemptInterruptedRecord
+  | SessionModelResponseCompletedRecord
+  | SessionRuntimeEventRecord;
+
+export type SessionRecord = SessionEventRecord | SessionV3Record;
+
+export interface SessionStore<RecordType extends SessionRecord = SessionEventRecord> {
+  append(record: RecordType): Promise<void>;
+  read(): Promise<readonly RecordType[]>;
 }
 
 export class SessionStoreError extends Error {
@@ -98,9 +210,11 @@ const ordinaryRunErrorCodeSchema = z.enum([
   "model_protocol_invalid",
   "model_output_truncated",
   "model_content_filtered",
+  "replay_envelope_too_large",
   "invalid_run_limits",
   "run_already_active",
   "session_persistence_failed",
+  "tool_effect_indeterminate",
   "turn_limit_exceeded",
   "token_limit_exceeded",
   "token_usage_missing",
@@ -176,6 +290,7 @@ const v2ToolErrorSchema = z.discriminatedUnion("code", [
       "path_conflict",
       "artifact_store_failed",
       "shell_start_failed",
+      "tool_effect_indeterminate",
       "tool_io_failed",
     ]),
     message: z.string(),
@@ -357,28 +472,131 @@ const v2CanonicalRuntimeEventSchema = createCanonicalRuntimeEventSchema({
   permissionSubject: v2PermissionSubjectSchema,
   toolError: v2ToolErrorSchema,
 });
-const sessionEventRecordSchema: z.ZodType<SessionEventRecord> = z.discriminatedUnion(
-  "schemaVersion",
-  [
-    z.strictObject({
-      schemaVersion: z.literal(1),
-      runId: z.uuid(),
-      sequence: z.number().int().positive(),
-      event: v1CanonicalRuntimeEventSchema,
+const modelTargetIdentitySchema = z.strictObject({
+  targetId: z.string().min(1).max(256),
+  vendor: z.string().min(1).max(128),
+  modelId: z.string().min(1).max(256),
+  route: z.enum(["direct", "vercel-ai-gateway"]),
+  upstreamProviderId: z.string().min(1).max(128).optional(),
+  profileVersion: z.number().int().positive(),
+  certification: z.enum(["certified", "experimental"]),
+}) as unknown as z.ZodType<ModelTargetIdentity>;
+const sessionRunLimitsSchema = z.strictObject({
+  maxTurns: z.number().int().positive().optional(),
+  maxTokens: z.number().int().positive().optional(),
+});
+const toolCallSchema: z.ZodType<ToolCall> = z.strictObject({
+  id: z.string().min(1).max(256),
+  name: z.string().min(1).max(256),
+  argumentsJson: z.string().max(512 * 1024),
+});
+const sessionToolIntentSchema: z.ZodType<SessionToolIntent> = z.strictObject({
+  callId: z.string().min(1).max(256),
+  name: z.string().min(1).max(256),
+  argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  effect: z.enum(["read", "write", "execute", "network", "delegate", "administrative"]).optional(),
+  definitionDigest: z
+    .string()
+    .regex(/^sha256:[0-9a-f]{64}$/u)
+    .optional(),
+  replay: z.enum(["safe", "never"]),
+});
+const responseUsageSchema = z.strictObject({
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  reasoningTokens: z.number().int().nonnegative().optional(),
+  cachedInputTokens: z.number().int().nonnegative().optional(),
+  cacheMissInputTokens: z.number().int().nonnegative().optional(),
+});
+const sessionV3RecordSchema = z.discriminatedUnion("type", [
+  z.strictObject({
+    type: z.literal("session_genesis"),
+    sessionId: z.uuid(),
+    projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    targetIdentity: modelTargetIdentitySchema,
+    lineage: z
+      .strictObject({
+        parentSessionId: z.uuid(),
+        parentEventPosition: z.number().int().positive(),
+        prefixDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+      })
+      .optional(),
+  }),
+  z.strictObject({
+    type: z.literal("logical_run_started"),
+    runId: z.uuid(),
+    userMessage: z.string().max(512 * 1024),
+    limits: sessionRunLimitsSchema.optional(),
+  }),
+  z.strictObject({
+    type: z.literal("provider_attempt_started"),
+    runId: z.uuid(),
+    turn: z.number().int().positive(),
+    attempt: z.number().int().positive(),
+    targetIdentity: modelTargetIdentitySchema,
+  }),
+  z.strictObject({
+    type: z.literal("provider_attempt_interrupted"),
+    runId: z.uuid(),
+    turn: z.number().int().positive(),
+    attempt: z.number().int().positive(),
+    reason: z.enum(["process_restart", "run_terminal"]),
+    result: runResultSchema.optional(),
+  }),
+  z.strictObject({
+    type: z.literal("model_response_completed"),
+    runId: z.uuid(),
+    turn: z.number().int().positive(),
+    attempt: z.number().int().positive(),
+    targetIdentity: modelTargetIdentitySchema,
+    response: z.strictObject({
+      text: z.string().max(512 * 1024),
+      reasoning: z
+        .string()
+        .max(512 * 1024)
+        .optional(),
+      toolCalls: z.array(toolCallSchema).max(128),
+      toolIntents: z.array(sessionToolIntentSchema).max(128),
+      finishReason: z.enum(["stop", "tool_calls"]),
+      usage: responseUsageSchema.optional(),
     }),
-    z.strictObject({
-      schemaVersion: z.literal(2),
-      runId: z.uuid(),
-      sequence: z.number().int().positive(),
-      event: v2CanonicalRuntimeEventSchema,
-    }),
-  ],
-);
+  }),
+  z.strictObject({
+    type: z.literal("runtime_event"),
+    runId: z.uuid(),
+    event: v2CanonicalRuntimeEventSchema,
+  }),
+]);
+const sessionRecordSchema = z.union([
+  z.strictObject({
+    schemaVersion: z.literal(1),
+    runId: z.uuid(),
+    sequence: z.number().int().positive(),
+    event: v1CanonicalRuntimeEventSchema,
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(2),
+    runId: z.uuid(),
+    sequence: z.number().int().positive(),
+    event: v2CanonicalRuntimeEventSchema,
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(3),
+    sequence: z.number().int().positive(),
+    record: sessionV3RecordSchema,
+  }),
+]) as unknown as z.ZodType<SessionRecord>;
 const maxSessionLogBytes = 8 * 1024 * 1024;
 const maxSessionRecordBytes = 1024 * 1024;
 
-export function createInMemorySessionStore(): SessionStore {
-  const records: SessionEventRecord[] = [];
+export function isSessionRecordWithinSizeLimit(record: SessionRecord): boolean {
+  return Buffer.byteLength(JSON.stringify(record), "utf8") <= maxSessionRecordBytes;
+}
+
+export function createInMemorySessionStore<
+  RecordType extends SessionRecord = SessionEventRecord,
+>(): SessionStore<RecordType> {
+  const records: RecordType[] = [];
   let nextSequence = 1;
   let storedBytes = 0;
   return {
@@ -391,24 +609,24 @@ export function createInMemorySessionStore(): SessionStore {
       if (storedBytes + storedByteLength > maxSessionLogBytes) {
         throw new SessionStoreError("session_log_too_large");
       }
-      records.push(validatedRecord);
+      records.push(validatedRecord as RecordType);
       nextSequence += 1;
       storedBytes += storedByteLength;
     },
     async read() {
-      return validateRecordSequence([...records]);
+      return validateRecordSequence([...records]) as readonly RecordType[];
     },
   };
 }
 
-export async function createJsonlSessionStore(options: {
+export async function createJsonlSessionStore<
+  RecordType extends SessionRecord = SessionEventRecord,
+>(options: {
   readonly workspaceRoot: string;
   readonly sessionId: string;
   readonly stateRoot?: string;
-}): Promise<SessionStore> {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(options.sessionId)) {
-    throw new TypeError("The session ID must be a safe filename segment.");
-  }
+}): Promise<SessionStore<RecordType>> {
+  validateSessionId(options.sessionId);
 
   const canonicalWorkspaceRoot = await realpath(options.workspaceRoot);
   const projectId = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex");
@@ -435,8 +653,42 @@ export async function createJsonlSessionStore(options: {
     }
     throw error;
   }
-  let nextSequence = 1;
-  let storedBytes = 0;
+  return createJsonlStore(sessionPath, 1, 0);
+}
+
+export async function openJsonlSessionStore<
+  RecordType extends SessionRecord = SessionRecord,
+>(options: {
+  readonly workspaceRoot: string;
+  readonly sessionId: string;
+  readonly stateRoot?: string;
+}): Promise<SessionStore<RecordType>> {
+  validateSessionId(options.sessionId);
+  const sessionPath = await resolveSessionPath(options);
+  const content = await readBoundedSessionLog(sessionPath);
+  if (content === undefined || content.length === 0 || !content.endsWith("\n")) {
+    throw new SessionStoreError();
+  }
+  const records = validateRecordSequence(
+    content
+      .slice(0, -1)
+      .split("\n")
+      .map((line) => parseSessionRecord(line)),
+  );
+  return createJsonlStore<RecordType>(
+    sessionPath,
+    records.length + 1,
+    Buffer.byteLength(content, "utf8"),
+  );
+}
+
+function createJsonlStore<RecordType extends SessionRecord>(
+  sessionPath: string,
+  initialNextSequence: number,
+  initialStoredBytes: number,
+): SessionStore<RecordType> {
+  let nextSequence = initialNextSequence;
+  let storedBytes = initialStoredBytes;
   let appendQueue = Promise.resolve();
 
   return {
@@ -483,10 +735,42 @@ export async function createJsonlSessionStore(options: {
       if (lines.some((line) => Buffer.byteLength(line, "utf8") > maxSessionRecordBytes)) {
         throw new SessionStoreError("session_log_too_large");
       }
-      const records = lines.map((line) => parseSessionEventRecord(line));
-      return validateRecordSequence(records);
+      const records = lines.map((line) => parseSessionRecord(line));
+      return validateRecordSequence(records) as readonly RecordType[];
     },
   };
+}
+
+export async function readJsonlSessionRecords(options: {
+  readonly workspaceRoot: string;
+  readonly sessionId: string;
+  readonly stateRoot?: string;
+}): Promise<readonly SessionRecord[]> {
+  const sessionPath = await resolveSessionPath(options);
+  const content = await readBoundedSessionLog(sessionPath);
+  if (content === undefined || content.length === 0) {
+    return [];
+  }
+  if (!content.endsWith("\n")) {
+    throw new SessionStoreError();
+  }
+  const lines = content.slice(0, -1).split("\n");
+  if (lines.some((line) => Buffer.byteLength(line, "utf8") > maxSessionRecordBytes)) {
+    throw new SessionStoreError("session_log_too_large");
+  }
+  return validateRecordSequence(lines.map((line) => parseSessionRecord(line)));
+}
+
+async function resolveSessionPath(options: {
+  readonly workspaceRoot: string;
+  readonly sessionId: string;
+  readonly stateRoot?: string;
+}): Promise<string> {
+  validateSessionId(options.sessionId);
+  const canonicalWorkspaceRoot = await realpath(options.workspaceRoot);
+  const projectId = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex");
+  const stateRoot = options.stateRoot ?? defaultStateRoot();
+  return join(stateRoot, "projects", projectId, "sessions", `${options.sessionId}.jsonl`);
 }
 
 function defaultStateRoot(): string {
@@ -531,18 +815,18 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
 }
 
-function parseSessionEventRecord(line: string): SessionEventRecord {
+function parseSessionRecord(line: string): SessionRecord {
   let parsed: unknown;
   try {
     parsed = JSON.parse(line);
   } catch {
     throw new SessionStoreError();
   }
-  return validateSessionEventRecord(parsed);
+  return validateSessionRecord(parsed);
 }
 
-function validateSessionEventRecord(value: unknown): SessionEventRecord {
-  const result = sessionEventRecordSchema.safeParse(value);
+function validateSessionRecord(value: unknown): SessionRecord {
+  const result = sessionRecordSchema.safeParse(value);
   if (!result.success) {
     throw new SessionStoreError();
   }
@@ -550,23 +834,27 @@ function validateSessionEventRecord(value: unknown): SessionEventRecord {
 }
 
 function validateBoundedSessionEventRecord(value: unknown): {
-  readonly record: SessionEventRecord;
+  readonly record: SessionRecord;
   readonly serialized: string;
   readonly storedByteLength: number;
 } {
-  const record = validateSessionEventRecord(value);
+  const record = validateSessionRecord(value);
   const serialized = JSON.stringify(record);
-  if (Buffer.byteLength(serialized, "utf8") > maxSessionRecordBytes) {
+  if (!isSessionRecordWithinSizeLimit(record)) {
     throw new SessionStoreError("session_log_too_large");
   }
   return { record, serialized, storedByteLength: Buffer.byteLength(serialized, "utf8") + 1 };
 }
 
-function validateRecordSequence(
-  records: readonly SessionEventRecord[],
-): readonly SessionEventRecord[] {
+function validateRecordSequence(records: readonly SessionRecord[]): readonly SessionRecord[] {
   if (records.some((record, index) => record.sequence !== index + 1)) {
     throw new SessionStoreError();
   }
   return records;
+}
+
+function validateSessionId(sessionId: string): void {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/u.test(sessionId)) {
+    throw new TypeError("The session ID must be a safe filename segment.");
+  }
 }

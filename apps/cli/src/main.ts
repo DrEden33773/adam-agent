@@ -1,28 +1,32 @@
 #!/usr/bin/env node
 
-import { randomUUID } from "node:crypto";
 import { writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
 import {
-  AgentSession,
+  type ArtifactStore,
   createCodingToolRegistry,
   createFileArtifactStore,
-  createJsonlSessionStore,
   createModelTargets,
   createPermissionPolicy,
+  createSessionLifecycle,
   type JsonValue,
-  type ModelDriver,
   type ModelMessage,
   ModelTargetError,
+  type ModelTargetIdentity,
+  type ModelTargets,
+  type PermissionDecisionCommand,
+  type PermissionDecisionCommandResult,
   type RuntimeEvent,
+  type SessionLifecycle,
+  SessionLifecycleError,
   selectModelTargetId,
 } from "@adam-agent/agent";
 import { FakeModelDriver } from "@adam-agent/testkit";
 
 loadProjectEnvironment();
-const prompt = process.argv.slice(2).join(" ");
+const command = parseCliCommand(process.argv.slice(2));
 const workspaceRoot = process.cwd();
 const { ADAM_AGENT_STATE_ROOT: configuredStateRoot } = process.env;
 const stateRoot = configuredStateRoot ?? join(homedir(), ".local", "state", "adam-agent");
@@ -36,7 +40,16 @@ const longVerificationCommand =
 const codingTaskPrompt = "Update the demo file and verify it";
 const multiFilePatchPrompt = "Apply the demo multi-file patch";
 const codingTaskVerificationCommand = 'test "$(cat demo.txt)" = after && printf verified';
+const fakeTargetIdentity: ModelTargetIdentity = {
+  targetId: "fake.local",
+  vendor: "adam",
+  modelId: "fake-local",
+  route: "direct",
+  profileVersion: 1,
+  certification: "certified",
+};
 const fakeModel = new FakeModelDriver((request) => {
+  const prompt = request.messages.find((message) => message.role === "user")?.content ?? "";
   const latestMessage = request.messages.at(-1);
   if (latestMessage?.role === "user") {
     if (prompt === multiFilePatchPrompt) {
@@ -146,24 +159,8 @@ const fakeModel = new FakeModelDriver((request) => {
     { type: "finish", reason: "stop" },
   ];
 });
-const model: ModelDriver = await selectModel();
-const store = await createJsonlSessionStore({
-  stateRoot,
-  workspaceRoot,
-  sessionId: randomUUID(),
-});
-const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
-const session = new AgentSession({
-  model,
-  store,
-  tools: createCodingToolRegistry({ workspaceRoot, stateRoot, artifactStore }),
-  permissions: createPermissionPolicy({
-    allowedEffects: ["read"],
-    askedEffects: ["write", "execute"],
-  }),
-});
 async function answerPermissionRequest(
-  activeSession: AgentSession,
+  activeSession: PermissionDecisionTarget,
   event: Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>,
   input: PermissionLineReader,
 ): Promise<void> {
@@ -174,6 +171,10 @@ async function answerPermissionRequest(
     decision: answer === "y" ? "allow" : "deny",
   });
 }
+
+type PermissionDecisionTarget = {
+  decidePermission(command: PermissionDecisionCommand): PermissionDecisionCommandResult;
+};
 
 class PermissionLineReader {
   readonly #input: NodeJS.ReadStream;
@@ -235,37 +236,7 @@ class PermissionLineReader {
   };
 }
 
-const permissionInput = new PermissionLineReader(process.stdin);
-const pendingPermissionHandlers = new Set<Promise<void>>();
-session.subscribe((event) => {
-  if (event.type !== "tool_permission_requested") {
-    return;
-  }
-  const handler = answerPermissionRequest(session, event, permissionInput);
-  pendingPermissionHandlers.add(handler);
-  void handler.then(
-    () => pendingPermissionHandlers.delete(handler),
-    () => pendingPermissionHandlers.delete(handler),
-  );
-});
-let interrupted = false;
-const handleInterrupt = () => {
-  interrupted = true;
-  session.abort();
-};
-process.once("SIGINT", handleInterrupt);
-
-const result = await session.run({ text: prompt }, { limits: { maxTurns: 8 } });
-permissionInput.close();
-await Promise.allSettled(pendingPermissionHandlers);
-process.removeListener("SIGINT", handleInterrupt);
-
-if (result.status === "completed") {
-  writeText(1, `${result.answer}\n`);
-} else {
-  writeText(2, `${result.error.message}\n`);
-  process.exitCode = result.status === "cancelled" && interrupted ? 130 : 1;
-}
+await runCliCommand(command);
 
 function formatPermissionPrompt(
   event: Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>,
@@ -371,34 +342,208 @@ function writeText(fileDescriptor: number, text: string): void {
   writeSync(fileDescriptor, text);
 }
 
-async function selectModel(): Promise<ModelDriver> {
-  let targetId: string;
+type CliCommand =
+  | { readonly type: "prompt"; readonly prompt: string }
+  | { readonly type: "resume"; readonly sessionId: string; readonly continue: boolean }
+  | {
+      readonly type: "branch";
+      readonly parentSessionId: string;
+      readonly atSequence: number;
+      readonly targetId?: string;
+    };
+
+async function runCliCommand(activeCommand: CliCommand): Promise<void> {
+  const modelTargets = createCliModelTargets();
   try {
-    targetId = selectModelTargetId(process.env);
-  } catch (error) {
-    if (error instanceof ModelTargetError) {
-      return failConfiguration(error.message);
+    if (activeCommand.type === "resume" && !activeCommand.continue) {
+      const lifecycle = await createRunLifecycle(modelTargets);
+      const resumed = await lifecycle.resume({ sessionId: activeCommand.sessionId });
+      if (resumed.status === "rejected") {
+        writeText(2, `${resumed.error.message}\n`);
+        process.exitCode = 1;
+        return;
+      }
+      writeText(1, `${JSON.stringify(resumed.snapshot)}\n`);
+      return;
     }
-    throw error;
-  }
-  if (targetId === "fake.local") {
-    return fakeModel;
-  }
-  const targets = createModelTargets({ environment: process.env });
-  try {
-    return (
-      await targets.resolve({
+    if (activeCommand.type === "branch") {
+      const lifecycle = await createRunLifecycle(modelTargets);
+      const snapshot = await lifecycle.branch({
+        parentSessionId: activeCommand.parentSessionId,
+        atSequence: activeCommand.atSequence,
+        ...(activeCommand.targetId === undefined ? {} : { targetId: activeCommand.targetId }),
+      });
+      writeText(1, `${JSON.stringify(snapshot)}\n`);
+      return;
+    }
+
+    const lifecycle = await createRunLifecycle(modelTargets);
+    if (activeCommand.type === "prompt") {
+      const targetId = selectModelTargetId(process.env);
+      const resolved = await modelTargets.resolve({
         targetId,
         allowExperimental: false,
         signal: new AbortController().signal,
-      })
-    ).driver;
+      });
+      const created = await lifecycle.create({ targetIdentity: resolved.identity });
+      await continueAndPresent(lifecycle, {
+        sessionId: created.sessionId,
+        input: { text: activeCommand.prompt },
+        limits: { maxTurns: 8 },
+      });
+      return;
+    }
+    await continueAndPresent(lifecycle, { sessionId: activeCommand.sessionId });
   } catch (error) {
-    if (error instanceof ModelTargetError) {
-      return failConfiguration(error.message);
+    if (error instanceof ModelTargetError || error instanceof SessionLifecycleError) {
+      writeText(2, `${error.message}\n`);
+      process.exitCode = 1;
+      return;
     }
     throw error;
   }
+}
+
+async function createRunLifecycle(modelTargets: ModelTargets): Promise<SessionLifecycle> {
+  const artifactStore = createLazyFileArtifactStore(join(stateRoot, "artifacts"));
+  return createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    tools: createCodingToolRegistry({ workspaceRoot, stateRoot, artifactStore }),
+    permissions: createPermissionPolicy({
+      allowedEffects: ["read"],
+      askedEffects: ["write", "execute"],
+    }),
+  });
+}
+
+function createLazyFileArtifactStore(root: string): ArtifactStore {
+  let store: Promise<ArtifactStore> | undefined;
+  const resolveStore = () => {
+    store ??= createFileArtifactStore({ root });
+    return store;
+  };
+  return {
+    async write(input) {
+      return (await resolveStore()).write(input);
+    },
+    async read(id) {
+      return (await resolveStore()).read(id);
+    },
+  };
+}
+
+async function continueAndPresent(
+  lifecycle: SessionLifecycle,
+  input: Parameters<SessionLifecycle["continue"]>[0],
+): Promise<void> {
+  const permissionInput = new PermissionLineReader(process.stdin);
+  const pendingPermissionHandlers = new Set<Promise<void>>();
+  const unsubscribe = lifecycle.subscribe((event) => {
+    if (event.type !== "tool_permission_requested") {
+      return;
+    }
+    const handler = answerPermissionRequest(lifecycle, event, permissionInput);
+    pendingPermissionHandlers.add(handler);
+    void handler.then(
+      () => pendingPermissionHandlers.delete(handler),
+      () => pendingPermissionHandlers.delete(handler),
+    );
+  });
+  let interrupted = false;
+  const abortController = new AbortController();
+  const handleInterrupt = () => {
+    interrupted = true;
+    abortController.abort();
+  };
+  process.once("SIGINT", handleInterrupt);
+  try {
+    const continued = await lifecycle.continue({ ...input, signal: abortController.signal });
+    if (continued.result.status === "completed") {
+      writeText(1, `${continued.result.answer}\n`);
+    } else {
+      writeText(2, `${continued.result.error.message}\n`);
+      process.exitCode = continued.result.status === "cancelled" && interrupted ? 130 : 1;
+    }
+  } finally {
+    permissionInput.close();
+    await Promise.allSettled(pendingPermissionHandlers);
+    process.removeListener("SIGINT", handleInterrupt);
+    unsubscribe();
+  }
+}
+
+function createCliModelTargets(): ModelTargets {
+  const configured = createModelTargets({ environment: process.env });
+  return {
+    async resolve(input) {
+      if (input.targetId === fakeTargetIdentity.targetId) {
+        return { identity: fakeTargetIdentity, driver: fakeModel };
+      }
+      return configured.resolve(input);
+    },
+    async snapshot(input) {
+      const snapshot = await configured.snapshot(input);
+      return {
+        targets: [
+          ...snapshot.targets,
+          {
+            identity: fakeTargetIdentity,
+            readiness: { status: "available", credentialSource: "built-in test fixture" },
+          },
+        ],
+      };
+    },
+  };
+}
+
+function parseCliCommand(arguments_: readonly string[]): CliCommand {
+  if (arguments_[0] === "--resume") {
+    const sessionId = arguments_[1];
+    const tail = arguments_.slice(2);
+    if (
+      sessionId === undefined ||
+      sessionId.length === 0 ||
+      (tail.length !== 0 && !(tail.length === 1 && tail[0] === "--continue"))
+    ) {
+      return failConfiguration("Usage: adam-agent --resume <session-id> [--continue]");
+    }
+    return { type: "resume", sessionId, continue: tail[0] === "--continue" };
+  }
+  if (arguments_[0] === "--branch") {
+    const parentSessionId = arguments_[1];
+    const atFlag = arguments_[2];
+    const atValue = arguments_[3];
+    const atSequence = Number(atValue);
+    const optionalTail = arguments_.slice(4);
+    const validTargetTail =
+      optionalTail.length === 0 ||
+      (optionalTail.length === 2 &&
+        optionalTail[0] === "--target" &&
+        optionalTail[1] !== undefined &&
+        optionalTail[1].length > 0);
+    if (
+      parentSessionId === undefined ||
+      parentSessionId.length === 0 ||
+      atFlag !== "--at" ||
+      !Number.isSafeInteger(atSequence) ||
+      atSequence <= 0 ||
+      !validTargetTail
+    ) {
+      return failConfiguration(
+        "Usage: adam-agent --branch <parent-session-id> --at <event-position> [--target <target-id>]",
+      );
+    }
+    const targetId = optionalTail[1];
+    return {
+      type: "branch",
+      parentSessionId,
+      atSequence,
+      ...(targetId === undefined ? {} : { targetId }),
+    };
+  }
+  return { type: "prompt", prompt: arguments_.join(" ") };
 }
 
 function failConfiguration(message: string): never {

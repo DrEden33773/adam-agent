@@ -46,6 +46,8 @@ export type ToolCall = {
   readonly argumentsJson: string;
 };
 
+export type ToolReplayClass = "safe" | "never";
+
 export type ToolResult =
   | { readonly status: "completed"; readonly output: JsonValue }
   | {
@@ -67,6 +69,7 @@ export type ToolResult =
               | "path_conflict"
               | "artifact_store_failed"
               | "shell_start_failed"
+              | "tool_effect_indeterminate"
               | "tool_io_failed";
             readonly message: string;
           }
@@ -84,14 +87,50 @@ export type ToolResult =
           };
     };
 
-type ToolAdapter = {
+export type ToolAdapter = {
   readonly definition: ModelToolDefinition;
+  readonly definitionDigest: string;
   readonly outputSchema: z.ZodType<JsonValue>;
   readonly effect: ToolEffect;
+  readonly replay: ToolReplayClass;
   readonly cancellation: "unsupported" | "abort_signal";
   readonly maximumResult: ToolMaximumResultPolicy;
   prepare(argumentsJson: string): PreparedToolCall | FailedToolResult;
 };
+
+function identifyToolAdapter(
+  adapter: Omit<ToolAdapter, "definitionDigest" | "replay">,
+  replay: ToolReplayClass,
+): ToolAdapter {
+  return {
+    ...adapter,
+    replay,
+    definitionDigest: `sha256:${createHash("sha256")
+      .update(
+        canonicalJson({
+          version: 1,
+          definition: adapter.definition,
+          effect: adapter.effect,
+          replay,
+        }),
+      )
+      .digest("hex")}`,
+  };
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
+  }
+  return `{${Object.entries(value)
+    .filter(([, entry]) => entry !== undefined)
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
+    .join(",")}}`;
+}
 
 type ToolMaximumResultPolicy = {
   readonly maximumBytes?: number;
@@ -310,45 +349,51 @@ const runShellOutputSchema = z.strictObject({
 
 export function createReadToolRegistry(options: { readonly workspaceRoot: string }): ToolRegistry {
   const workspaceRoot = resolve(options.workspaceRoot);
-  const readFileAdapter: ToolAdapter = {
-    definition: {
-      name: "read_file",
-      description: "Read a UTF-8 text file inside the workspace.",
-      inputSchema: z.toJSONSchema(readFileInputSchema),
+  const readFileAdapter = identifyToolAdapter(
+    {
+      definition: {
+        name: "read_file",
+        description: "Read a UTF-8 text file inside the workspace.",
+        inputSchema: z.toJSONSchema(readFileInputSchema),
+      },
+      outputSchema: readFileOutputSchema,
+      effect: "read",
+      cancellation: "unsupported",
+      maximumResult: readFileMaximumResult,
+      prepare(argumentsJson) {
+        const parsedArguments = parseInput(readFileInputSchema, argumentsJson);
+        if (!parsedArguments.success) {
+          return invalidToolInput();
+        }
+        const permissionSubject = preparePermissionSubject(
+          workspaceRoot,
+          parsedArguments.data.path,
+          "file",
+        );
+        if ("status" in permissionSubject) {
+          return permissionSubject;
+        }
+        return {
+          status: "ready",
+          permissionSubject,
+          async execute() {
+            return executeSafely(readFileOutputSchema, async () => {
+              const targetPath = await resolveConfinedPath(
+                workspaceRoot,
+                parsedArguments.data.path,
+              );
+              const { content, truncated } = await readTextFileBounded(
+                targetPath,
+                readFileMaximumResult.maximumBytes,
+              );
+              return { path: parsedArguments.data.path, content, truncated };
+            });
+          },
+        };
+      },
     },
-    outputSchema: readFileOutputSchema,
-    effect: "read",
-    cancellation: "unsupported",
-    maximumResult: readFileMaximumResult,
-    prepare(argumentsJson) {
-      const parsedArguments = parseInput(readFileInputSchema, argumentsJson);
-      if (!parsedArguments.success) {
-        return invalidToolInput();
-      }
-      const permissionSubject = preparePermissionSubject(
-        workspaceRoot,
-        parsedArguments.data.path,
-        "file",
-      );
-      if ("status" in permissionSubject) {
-        return permissionSubject;
-      }
-      return {
-        status: "ready",
-        permissionSubject,
-        async execute() {
-          return executeSafely(readFileOutputSchema, async () => {
-            const targetPath = await resolveConfinedPath(workspaceRoot, parsedArguments.data.path);
-            const { content, truncated } = await readTextFileBounded(
-              targetPath,
-              readFileMaximumResult.maximumBytes,
-            );
-            return { path: parsedArguments.data.path, content, truncated };
-          });
-        },
-      };
-    },
-  };
+    "safe",
+  );
   const adapters = new Map([[readFileAdapter.definition.name, readFileAdapter]]);
 
   return {
@@ -376,125 +421,131 @@ function createMutationToolRegistryInternal(options: {
   const workspaceRoot = resolve(options.workspaceRoot);
   const stateRoot = resolve(options.stateRoot ?? defaultStateRoot());
   const mutationCoordinator = createMutationCoordinator();
-  const writeFileAdapter: ToolAdapter = {
-    definition: {
-      name: "write_file",
-      description:
-        "Create one new UTF-8 text file inside the workspace, including missing parents. Use edit_file for existing-file or multi-file work.",
-      inputSchema: z.toJSONSchema(writeFileInputSchema),
-    },
-    outputSchema: writeFileOutputSchema,
-    effect: "write",
-    cancellation: "unsupported",
-    maximumResult: {},
-    prepare(argumentsJson) {
-      const parsedArguments = parseInput(writeFileInputSchema, argumentsJson);
-      if (!parsedArguments.success) {
-        return invalidToolInput();
-      }
-      const permissionSubject = preparePermissionSubject(
-        workspaceRoot,
-        parsedArguments.data.path,
-        "file",
-      );
-      if ("status" in permissionSubject) {
-        return permissionSubject;
-      }
-      return {
-        status: "ready",
-        permissionSubject,
-        async execute() {
-          return executeSafely(writeFileOutputSchema, async () => {
-            const target = await openConfinedMutationTarget(
-              workspaceRoot,
-              parsedArguments.data.path,
-              true,
-            );
-            try {
-              await rejectEscapingExistingTarget(target);
-              const file = await open(
-                target.path,
-                constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-                0o666,
+  const writeFileAdapter = identifyToolAdapter(
+    {
+      definition: {
+        name: "write_file",
+        description:
+          "Create one new UTF-8 text file inside the workspace, including missing parents. Use edit_file for existing-file or multi-file work.",
+        inputSchema: z.toJSONSchema(writeFileInputSchema),
+      },
+      outputSchema: writeFileOutputSchema,
+      effect: "write",
+      cancellation: "unsupported",
+      maximumResult: {},
+      prepare(argumentsJson) {
+        const parsedArguments = parseInput(writeFileInputSchema, argumentsJson);
+        if (!parsedArguments.success) {
+          return invalidToolInput();
+        }
+        const permissionSubject = preparePermissionSubject(
+          workspaceRoot,
+          parsedArguments.data.path,
+          "file",
+        );
+        if ("status" in permissionSubject) {
+          return permissionSubject;
+        }
+        return {
+          status: "ready",
+          permissionSubject,
+          async execute() {
+            return executeSafely(writeFileOutputSchema, async () => {
+              const target = await openConfinedMutationTarget(
+                workspaceRoot,
+                parsedArguments.data.path,
+                true,
               );
               try {
-                await file.writeFile(parsedArguments.data.content, "utf8");
+                await rejectEscapingExistingTarget(target);
+                const file = await open(
+                  target.path,
+                  constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+                  0o666,
+                );
+                try {
+                  await file.writeFile(parsedArguments.data.content, "utf8");
+                } finally {
+                  await file.close();
+                }
               } finally {
-                await file.close();
+                await target.parent.close();
               }
-            } finally {
-              await target.parent.close();
-            }
-            return {
-              path: parsedArguments.data.path,
-              bytesWritten: Buffer.byteLength(parsedArguments.data.content, "utf8"),
-            };
-          });
-        },
-      };
+              return {
+                path: parsedArguments.data.path,
+                bytesWritten: Buffer.byteLength(parsedArguments.data.content, "utf8"),
+              };
+            });
+          },
+        };
+      },
     },
-  };
+    "never",
+  );
   const patchTransaction = createPatchTransaction({
     workspaceRoot,
     recoveryStore: createPatchRecoveryStore({ root: join(stateRoot, "patch-recovery") }),
     ...(options.patchFileSystem === undefined ? {} : { fileSystem: options.patchFileSystem }),
   });
-  const editFileAdapter: ToolAdapter = {
-    definition: {
-      name: "edit_file",
-      description:
-        "Apply one structured patch across workspace text files. Use it for existing-file edits or multi-file create, update, delete, and move work.",
-      inputSchema: z.toJSONSchema(editFileInputSchema),
-    },
-    outputSchema: editFileOutputSchema,
-    effect: "write",
-    cancellation: "unsupported",
-    maximumResult: {},
-    prepare(argumentsJson) {
-      if (Buffer.byteLength(argumentsJson, "utf8") > maximumRawEditArgumentsBytes) {
-        return invalidToolInput();
-      }
-      const parsedArguments = parseInput(editFileInputSchema, argumentsJson);
-      if (!parsedArguments.success) {
-        return invalidToolInput();
-      }
-      const normalized = normalizePatchOperations(workspaceRoot, parsedArguments.data.operations);
-      if ("status" in normalized) {
-        return normalized;
-      }
-      const normalizedArguments = JSON.stringify({ operations: normalized.operations });
-      if (Buffer.byteLength(normalizedArguments, "utf8") > maximumEditArgumentsBytes) {
-        return invalidToolInput();
-      }
-      const canonical = JSON.stringify({ version: 1, operations: normalized.operations });
-      const digest = `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
-      return {
-        status: "ready",
-        permissionSubject: {
-          type: "patch",
-          version: 1,
-          operations: normalized.operations.map((operation) => {
-            switch (operation.kind) {
-              case "create":
-              case "delete":
-              case "update":
-                return { kind: operation.kind, path: operation.path };
-              case "move":
-                return { kind: operation.kind, from: operation.from, to: operation.to };
-            }
-            return assertNever(operation);
-          }),
-          digest,
-        },
-        async execute() {
-          return executeSafely(editFileOutputSchema, async () => ({
+  const editFileAdapter = identifyToolAdapter(
+    {
+      definition: {
+        name: "edit_file",
+        description:
+          "Apply one structured patch across workspace text files. Use it for existing-file edits or multi-file create, update, delete, and move work.",
+        inputSchema: z.toJSONSchema(editFileInputSchema),
+      },
+      outputSchema: editFileOutputSchema,
+      effect: "write",
+      cancellation: "unsupported",
+      maximumResult: {},
+      prepare(argumentsJson) {
+        if (Buffer.byteLength(argumentsJson, "utf8") > maximumRawEditArgumentsBytes) {
+          return invalidToolInput();
+        }
+        const parsedArguments = parseInput(editFileInputSchema, argumentsJson);
+        if (!parsedArguments.success) {
+          return invalidToolInput();
+        }
+        const normalized = normalizePatchOperations(workspaceRoot, parsedArguments.data.operations);
+        if ("status" in normalized) {
+          return normalized;
+        }
+        const normalizedArguments = JSON.stringify({ operations: normalized.operations });
+        if (Buffer.byteLength(normalizedArguments, "utf8") > maximumEditArgumentsBytes) {
+          return invalidToolInput();
+        }
+        const canonical = JSON.stringify({ version: 1, operations: normalized.operations });
+        const digest = `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+        return {
+          status: "ready",
+          permissionSubject: {
+            type: "patch",
+            version: 1,
+            operations: normalized.operations.map((operation) => {
+              switch (operation.kind) {
+                case "create":
+                case "delete":
+                case "update":
+                  return { kind: operation.kind, path: operation.path };
+                case "move":
+                  return { kind: operation.kind, from: operation.from, to: operation.to };
+              }
+              return assertNever(operation);
+            }),
             digest,
-            ...(await patchTransaction.execute({ digest, operations: normalized.operations })),
-          }));
-        },
-      };
+          },
+          async execute() {
+            return executeSafely(editFileOutputSchema, async () => ({
+              digest,
+              ...(await patchTransaction.execute({ digest, operations: normalized.operations })),
+            }));
+          },
+        };
+      },
     },
-  };
+    "never",
+  );
   const coordinatedAdapters = coordinateWriteAdapters(
     [writeFileAdapter, editFileAdapter],
     mutationCoordinator,
@@ -578,46 +629,49 @@ function createCodingToolRegistryInternal(options: {
     ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
     ...(options.patchFileSystem === undefined ? {} : { patchFileSystem: options.patchFileSystem }),
   });
-  const shellAdapter: ToolAdapter = {
-    definition: {
-      name: "run_shell",
-      description:
-        "Run one approved command from the workspace root with /bin/sh -c. The process has no OS sandbox or network isolation.",
-      inputSchema: z.toJSONSchema(runShellInputSchema),
+  const shellAdapter = identifyToolAdapter(
+    {
+      definition: {
+        name: "run_shell",
+        description:
+          "Run one approved command from the workspace root with /bin/sh -c. The process has no OS sandbox or network isolation.",
+        inputSchema: z.toJSONSchema(runShellInputSchema),
+      },
+      outputSchema: runShellOutputSchema,
+      effect: "execute",
+      cancellation: "abort_signal",
+      maximumResult: { maximumBytes: 2 * shellLimits.maximumInlineBytesPerStream },
+      prepare(argumentsJson) {
+        const parsedArguments = parseInput(runShellInputSchema, argumentsJson);
+        if (!parsedArguments.success) {
+          return invalidToolInput();
+        }
+        return {
+          status: "ready",
+          permissionSubject: {
+            type: "command",
+            command: parsedArguments.data.command,
+            cwd: ".",
+          },
+          async execute(context) {
+            return executeSafely(runShellOutputSchema, () =>
+              runShellCommand({
+                workspaceRoot,
+                command: parsedArguments.data.command,
+                timeoutMs: parsedArguments.data.timeoutMs ?? shellLimits.timeoutMs,
+                signal: context.signal,
+                callId: context.callId,
+                toolName: context.toolName,
+                artifactStore: options.artifactStore,
+                limits: shellLimits,
+              }),
+            );
+          },
+        };
+      },
     },
-    outputSchema: runShellOutputSchema,
-    effect: "execute",
-    cancellation: "abort_signal",
-    maximumResult: { maximumBytes: 2 * shellLimits.maximumInlineBytesPerStream },
-    prepare(argumentsJson) {
-      const parsedArguments = parseInput(runShellInputSchema, argumentsJson);
-      if (!parsedArguments.success) {
-        return invalidToolInput();
-      }
-      return {
-        status: "ready",
-        permissionSubject: {
-          type: "command",
-          command: parsedArguments.data.command,
-          cwd: ".",
-        },
-        async execute(context) {
-          return executeSafely(runShellOutputSchema, () =>
-            runShellCommand({
-              workspaceRoot,
-              command: parsedArguments.data.command,
-              timeoutMs: parsedArguments.data.timeoutMs ?? shellLimits.timeoutMs,
-              signal: context.signal,
-              callId: context.callId,
-              toolName: context.toolName,
-              artifactStore: options.artifactStore,
-              limits: shellLimits,
-            }),
-          );
-        },
-      };
-    },
-  };
+    "never",
+  );
   const adapters = [
     requireAdapter(readTools, "read_file"),
     requireAdapter(mutationTools, "write_file"),

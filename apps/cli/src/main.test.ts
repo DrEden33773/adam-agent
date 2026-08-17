@@ -1,12 +1,27 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import {
+  createReadToolRegistry,
+  createSessionLifecycle,
+  type ModelTargetIdentity,
+} from "@adam-agent/agent";
+import { openJsonlSessionStore, type SessionRecord } from "@adam-agent/agent/internal-testing";
 import { describe, expect, test } from "vitest";
 
 const cliPath = fileURLToPath(new URL("../dist/main.js", import.meta.url));
+const fakeTargetIdentity: ModelTargetIdentity = {
+  targetId: "fake.local",
+  vendor: "adam",
+  modelId: "fake-local",
+  route: "direct",
+  profileVersion: 1,
+  certification: "certified",
+};
 
 describe("one-shot CLI", () => {
   test("answers a repository question through one read-only tool turn", async () => {
@@ -282,6 +297,7 @@ describe("one-shot CLI", () => {
   headers: { "content-type": "application/json", "x-request-id": "cli-auth-1" },
   status: 401,
 });
+
 `,
       "utf8",
     );
@@ -518,6 +534,393 @@ describe("one-shot CLI", () => {
   });
 });
 
+describe("session lifecycle CLI", () => {
+  test("hydrates an existing exact-target session without model, effect, or durable mutation", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-resume-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(workspaceRoot);
+
+    try {
+      await writeFile(join(workspaceRoot, "README.md"), "# Resume\n\nDurable session.\n", "utf8");
+      const original = await runCli({
+        cwd: workspaceRoot,
+        stateRoot,
+        prompt: "What is durable?",
+        stdin: "",
+      });
+      expect(original.exitCode).toBe(0);
+      const sessionPath = await onlySessionPath(stateRoot);
+      const sessionId = sessionPath
+        .split("/")
+        .at(-1)
+        ?.replace(/\.jsonl$/u, "");
+      if (sessionId === undefined) {
+        throw new Error("Expected a session ID.");
+      }
+      const beforeResume = await readFile(sessionPath, "utf8");
+
+      const resumed = await runCliArguments({
+        args: ["--resume", sessionId],
+        cwd: workspaceRoot,
+        stateRoot,
+      });
+
+      expect({
+        resumed,
+        snapshot: JSON.parse(resumed.stdout),
+        durableUnchanged: (await readFile(sessionPath, "utf8")) === beforeResume,
+      }).toEqual({
+        resumed: {
+          stdout: expect.any(String),
+          stderr: "",
+          exitCode: 0,
+          signal: null,
+        },
+        snapshot: expect.objectContaining({
+          schemaVersion: 3,
+          sessionId,
+          status: "settled",
+          targetIdentity: expect.objectContaining({ targetId: "fake.local" }),
+        }),
+        durableUnchanged: true,
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("hydrates a started safe read without misclassifying it when the CLI rebuilds tools", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-resume-safe-read-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(workspaceRoot);
+    await writeFile(join(workspaceRoot, "README.md"), "# Safe CLI hydrate\n", "utf8");
+
+    try {
+      const created = await createSessionLifecycle({ stateRoot, workspaceRoot }).create({
+        targetIdentity: fakeTargetIdentity,
+      });
+      const readTool = createReadToolRegistry({ workspaceRoot }).resolve("read_file");
+      if (readTool === undefined) {
+        throw new Error("Expected the read_file tool.");
+      }
+      const runId = "123e4567-e89b-42d3-a456-426614175010";
+      const call = {
+        id: "safe-cli-read",
+        name: "read_file",
+        argumentsJson: '{"path":"README.md"}',
+      } as const;
+      const store = await openJsonlSessionStore<SessionRecord>({
+        stateRoot,
+        workspaceRoot,
+        sessionId: created.sessionId,
+      });
+      const records: readonly Omit<
+        Extract<SessionRecord, { readonly schemaVersion: 3 }>,
+        "sequence"
+      >[] = [
+        {
+          schemaVersion: 3,
+          record: { type: "logical_run_started", runId, userMessage: "Read safely" },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "user_message", text: "Read safely" },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "provider_attempt_started",
+            runId,
+            turn: 1,
+            attempt: 1,
+            targetIdentity: fakeTargetIdentity,
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "model_message_started" },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "model_response_completed",
+            runId,
+            turn: 1,
+            attempt: 1,
+            targetIdentity: fakeTargetIdentity,
+            response: {
+              text: "",
+              toolCalls: [call],
+              toolIntents: [
+                {
+                  callId: call.id,
+                  name: call.name,
+                  argumentsDigest: `sha256:${createHash("sha256")
+                    .update(call.argumentsJson)
+                    .digest("hex")}`,
+                  effect: "read",
+                  definitionDigest: readTool.definitionDigest,
+                  replay: "safe",
+                },
+              ],
+              finishReason: "tool_calls",
+            },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "model_message_completed", text: "" },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "tool_requested", callId: call.id, name: call.name },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: {
+              type: "tool_permission_decided",
+              callId: call.id,
+              name: call.name,
+              decision: "allow",
+              effect: "read",
+              scope: "call",
+              subject: { type: "file", path: "README.md" },
+            },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "tool_started", callId: call.id, name: call.name },
+          },
+        },
+      ];
+      for (const [index, record] of records.entries()) {
+        await store.append({ ...record, sequence: index + 2 } as SessionRecord);
+      }
+      const beforeResume = await readFile(await onlySessionPath(stateRoot), "utf8");
+
+      const resumed = await runCliArguments({
+        args: ["--resume", created.sessionId],
+        cwd: workspaceRoot,
+        stateRoot,
+      });
+
+      expect({
+        resumed: JSON.parse(resumed.stdout),
+        stderr: resumed.stderr,
+        exitCode: resumed.exitCode,
+        signal: resumed.signal,
+        durableUnchanged:
+          (await readFile(await onlySessionPath(stateRoot), "utf8")) === beforeResume,
+      }).toEqual({
+        resumed: expect.objectContaining({ sessionId: created.sessionId, status: "interrupted" }),
+        stderr: "",
+        exitCode: 0,
+        signal: null,
+        durableUnchanged: true,
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("continues an interrupted logical run in a new attempt without duplicating its user message", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-continue-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(workspaceRoot);
+    await writeFile(join(workspaceRoot, "README.md"), "# Continue\n\nCold continuation.\n", "utf8");
+
+    try {
+      const created = await createSessionLifecycle({ stateRoot, workspaceRoot }).create({
+        targetIdentity: fakeTargetIdentity,
+      });
+      const runId = "123e4567-e89b-42d3-a456-426614175000";
+      const store = await openJsonlSessionStore<SessionRecord>({
+        stateRoot,
+        workspaceRoot,
+        sessionId: created.sessionId,
+      });
+      await store.append({
+        schemaVersion: 3,
+        sequence: 2,
+        record: {
+          type: "logical_run_started",
+          runId,
+          userMessage: "What should continue?",
+          limits: { maxTurns: 4 },
+        },
+      });
+      await store.append({
+        schemaVersion: 3,
+        sequence: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "user_message", text: "What should continue?" },
+        },
+      });
+      await store.append({
+        schemaVersion: 3,
+        sequence: 4,
+        record: {
+          type: "provider_attempt_started",
+          runId,
+          turn: 1,
+          attempt: 1,
+          targetIdentity: fakeTargetIdentity,
+        },
+      });
+      await store.append({
+        schemaVersion: 3,
+        sequence: 5,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "model_message_started" },
+        },
+      });
+
+      const continued = await runCliArguments({
+        args: ["--resume", created.sessionId, "--continue"],
+        cwd: workspaceRoot,
+        stateRoot,
+      });
+      const records = (await readFile(await onlySessionPath(stateRoot), "utf8"))
+        .trimEnd()
+        .split("\n")
+        .map((line) => JSON.parse(line) as SessionRecord);
+
+      expect({
+        continued,
+        userMessages: records.filter(
+          (record) =>
+            record.schemaVersion === 3 &&
+            record.record.type === "runtime_event" &&
+            record.record.event.type === "user_message",
+        ).length,
+        attempts: records.flatMap((record) =>
+          record.schemaVersion === 3 && record.record.type === "provider_attempt_started"
+            ? [{ turn: record.record.turn, attempt: record.record.attempt }]
+            : [],
+        ),
+      }).toEqual({
+        continued: {
+          stdout: "Cold continuation.\n",
+          stderr: "",
+          exitCode: 0,
+          signal: null,
+        },
+        userMessages: 1,
+        attempts: [
+          { turn: 1, attempt: 1 },
+          { turn: 1, attempt: 2 },
+          { turn: 2, attempt: 1 },
+        ],
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("branches an immutable complete parent boundary into an independently hydratable child", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-branch-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(workspaceRoot);
+    await writeFile(join(workspaceRoot, "README.md"), "# Branch\n\nImmutable parent.\n", "utf8");
+
+    try {
+      const original = await runCli({
+        cwd: workspaceRoot,
+        stateRoot,
+        prompt: "What is immutable?",
+        stdin: "",
+      });
+      expect(original.exitCode).toBe(0);
+      const parentPath = await onlySessionPath(stateRoot);
+      const parentSessionId = parentPath
+        .split("/")
+        .at(-1)
+        ?.replace(/\.jsonl$/u, "");
+      if (parentSessionId === undefined) {
+        throw new Error("Expected a parent session ID.");
+      }
+      const parentBefore = await readFile(parentPath, "utf8");
+      const atSequence = parentBefore.trimEnd().split("\n").length;
+
+      const branched = await runCliArguments({
+        args: ["--branch", parentSessionId, "--at", String(atSequence), "--target", "fake.local"],
+        cwd: workspaceRoot,
+        stateRoot,
+      });
+      const child = JSON.parse(branched.stdout) as {
+        readonly sessionId: string;
+        readonly lineage: unknown;
+      };
+      const hydratedChild = await runCliArguments({
+        args: ["--resume", child.sessionId],
+        cwd: workspaceRoot,
+        stateRoot,
+      });
+
+      expect({
+        branched,
+        child,
+        hydratedChild: JSON.parse(hydratedChild.stdout),
+        parentUnchanged: (await readFile(parentPath, "utf8")) === parentBefore,
+      }).toEqual({
+        branched: {
+          stdout: expect.any(String),
+          stderr: "",
+          exitCode: 0,
+          signal: null,
+        },
+        child: expect.objectContaining({
+          sessionId: expect.not.stringMatching(new RegExp(`^${parentSessionId}$`, "u")),
+          lineage: {
+            parentSessionId,
+            parentEventPosition: atSequence,
+            prefixDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+          },
+        }),
+        hydratedChild: expect.objectContaining({
+          sessionId: child.sessionId,
+          status: "idle",
+          targetIdentity: expect.objectContaining({ targetId: "fake.local" }),
+        }),
+        parentUnchanged: true,
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 type StoredEventSummary = {
   readonly type: string;
   readonly name?: string;
@@ -538,7 +941,61 @@ async function readOnlySessionEvents(stateRoot: string): Promise<readonly Stored
   return (await readFile(join(sessionsDirectory, sessionFile), "utf8"))
     .trimEnd()
     .split("\n")
-    .map((line) => (JSON.parse(line) as { readonly event: StoredEventSummary }).event);
+    .flatMap((line) => {
+      const record = JSON.parse(line) as SessionRecord;
+      if (record.schemaVersion === 1 || record.schemaVersion === 2) {
+        return [record.event];
+      }
+      return record.record.type === "runtime_event" ? [record.record.event] : [];
+    });
+}
+
+async function onlySessionPath(stateRoot: string): Promise<string> {
+  const projectIds = await readdir(join(stateRoot, "projects"));
+  const projectId = projectIds.at(0);
+  if (projectIds.length !== 1 || projectId === undefined) {
+    throw new Error("Expected one persisted project.");
+  }
+  const sessionsDirectory = join(stateRoot, "projects", projectId, "sessions");
+  const sessionFiles = await readdir(sessionsDirectory);
+  const sessionFile = sessionFiles.at(0);
+  if (sessionFiles.length !== 1 || sessionFile === undefined) {
+    throw new Error("Expected one persisted session.");
+  }
+  return join(sessionsDirectory, sessionFile);
+}
+
+async function runCliArguments(options: {
+  readonly args: readonly string[];
+  readonly cwd: string;
+  readonly stateRoot: string;
+}): Promise<{
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
+}> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(process.execPath, [cliPath, ...options.args], {
+      cwd: options.cwd,
+      env: cliEnvironment(options.stateRoot),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", rejectPromise);
+    child.once("close", (exitCode, signal) => {
+      resolvePromise({ stdout, stderr, exitCode, signal });
+    });
+  });
 }
 
 async function interruptCliDuringShell(options: {
