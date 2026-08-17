@@ -1528,12 +1528,12 @@ async function writeNoisyBiomeExtension(packageRoot: string): Promise<void> {
     "adam.analyzer-execution.biome@1",
     `const biome = operation.capabilities["adam.analyzer-execution.biome@1"];
       const content = Array.from(
-        { length: 4500 },
+        { length: 3000 },
         (_, index) => \`export const value\${index} = candidate == \${index};\`,
       ).join("\\n");
       const analysis = await biome.analyze({
         profile: "adam-biome-recommended-v1",
-        files: [{ path: "src/noisy.ts", content }],
+        files: [{ path: "src/" + "n".repeat(120) + ".ts", content }],
       });
       return { analysis };`,
   );
