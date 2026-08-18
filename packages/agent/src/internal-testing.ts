@@ -1,6 +1,10 @@
 /** Tests only. This internal fault-injection surface has no compatibility promise. */
 
 export { AiSdkModelDriver as AiSdkModelDriverForTesting } from "./ai-sdk-model-driver.js";
+export {
+  createObservedBiomeExecutionAdapter,
+  type ObservedBiomeProcess,
+} from "./biome-execution.js";
 export type { ContextProfile } from "./context-profile.js";
 export { digestContextRecordPrefix } from "./durable-context.js";
 export { preparedDirectDeepSeekV2ContextProfile } from "./model-targets.js";

@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,6 +10,10 @@ import {
   createInMemoryOperationStore,
   createPermissionPolicy,
 } from "@adam-agent/agent";
+import {
+  createObservedBiomeExecutionAdapter,
+  type ObservedBiomeProcess,
+} from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
 test.each(["adam.artifact.publish@1", "adam.analyzer-execution.biome@1"])(
@@ -958,7 +962,10 @@ test("ExtensionHost closes the real Biome process and removes its snapshot on ca
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-extension-biome-cancel-"));
   const workspaceRoot = join(testRoot, "workspace");
   const packageRoot = join(testRoot, "extension");
-  const existingTemporaryRoots = new Set(await listBiomeTemporaryRoots());
+  let observeProcessStart: ((process: ObservedBiomeProcess) => void) | undefined;
+  const processStarted = new Promise<ObservedBiomeProcess>((resolve) => {
+    observeProcessStart = resolve;
+  });
   let host: ReturnType<typeof createExtensionHost> | undefined;
   let operationId: string | undefined;
   let eventsPromise: ReturnType<typeof collectOperationEvents> | undefined;
@@ -967,7 +974,9 @@ test("ExtensionHost closes the real Biome process and removes its snapshot on ca
     await mkdir(workspaceRoot);
     await writeLongRunningBiomeExtension(packageRoot);
     host = createExtensionHost({
-      biomeExecution: createBiomeExecutionAdapter(),
+      biomeExecution: createObservedBiomeExecutionAdapter((process) => {
+        observeProcessStart?.(process);
+      }),
       capabilities: [{ id: "adam.analyzer-execution.biome@1", version: "1.0.0" }],
       extensions: [
         {
@@ -992,16 +1001,7 @@ test("ExtensionHost closes the real Biome process and removes its snapshot on ca
     });
     operationId = started.operationId;
     eventsPromise = collectOperationEvents(host, operationId);
-    const snapshotRoot = await waitForValue(async () => {
-      const created = (await listBiomeTemporaryRoots()).find(
-        (path) => !existingTemporaryRoots.has(path),
-      );
-      return created;
-    }, "Biome did not create its temporary snapshot.");
-    const childPid = await waitForValue(
-      () => findChildWithWorkingDirectory(join(snapshotRoot, "snapshot")),
-      "Biome did not start a real child process.",
-    );
+    const observedProcess = await processStarted;
 
     await host.operations.cancel(started.operationId);
     const events = await eventsPromise;
@@ -1011,8 +1011,8 @@ test("ExtensionHost closes the real Biome process and removes its snapshot on ca
       { event: { reason: "caller", type: "operation_cancel_requested" } },
       { event: { reason: "caller", type: "operation_cancelled" } },
     ]);
-    await expect(stat(`/proc/${childPid}`)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(stat(snapshotRoot)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(`/proc/${observedProcess.pid}`)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(stat(observedProcess.temporaryRoot)).rejects.toMatchObject({ code: "ENOENT" });
   } finally {
     if (host !== undefined && operationId !== undefined) {
       await host.operations.cancel(operationId).catch(() => undefined);
@@ -1642,52 +1642,4 @@ async function writeCapabilityExtensionPackage(
 `,
     "utf8",
   );
-}
-
-async function listBiomeTemporaryRoots(): Promise<string[]> {
-  return (await readdir(tmpdir()))
-    .filter((entry) => entry.startsWith("adam-agent-biome-"))
-    .map((entry) => join(tmpdir(), entry));
-}
-
-async function findChildWithWorkingDirectory(expected: string): Promise<number | undefined> {
-  let children: string;
-  try {
-    children = await readFile(`/proc/${process.pid}/task/${process.pid}/children`, "utf8");
-  } catch {
-    return undefined;
-  }
-  for (const value of children.trim().split(/\s+/u)) {
-    if (value.length === 0) {
-      continue;
-    }
-    const pid = Number(value);
-    try {
-      if ((await readlink(`/proc/${pid}/cwd`)) === expected) {
-        return pid;
-      }
-    } catch {
-      // The process may settle between reading the child list and its cwd.
-    }
-  }
-  return undefined;
-}
-
-async function waitForValue<T>(read: () => Promise<T | undefined>, message: string): Promise<T> {
-  let guardExpired = false;
-  const guard = setTimeout(() => {
-    guardExpired = true;
-  }, 10_000);
-  try {
-    while (!guardExpired) {
-      const value = await read();
-      if (value !== undefined) {
-        return value;
-      }
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-  } finally {
-    clearTimeout(guard);
-  }
-  throw new Error(message);
 }

@@ -8,6 +8,7 @@ import { promisify } from "node:util";
 import { expect, test } from "vitest";
 
 const execFileAsync = promisify(execFile);
+const PACK_PROCESS_TIMEOUT_MS = 20_000;
 
 test("the packed extension API imports with only its public runtime shape", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-extension-api-pack-"));
@@ -35,6 +36,7 @@ test("the packed extension API imports with only its public runtime shape", asyn
     await execFileAsync("npm", ["pack", packageRoot, "--pack-destination", testRoot], {
       encoding: "utf8",
       env: environment,
+      timeout: PACK_PROCESS_TIMEOUT_MS,
     });
     const tarballs = (await readdir(testRoot)).filter((entry) => entry.endsWith(".tgz"));
     expect(tarballs).toHaveLength(1);
@@ -47,7 +49,7 @@ test("the packed extension API imports with only its public runtime shape", asyn
     await execFileAsync(
       "tar",
       ["-xzf", join(testRoot, tarball), "-C", installedPackage, "--strip-components=1"],
-      { env: environment },
+      { env: environment, timeout: PACK_PROCESS_TIMEOUT_MS },
     );
     expect(await listRelativeFiles(installedPackage)).toEqual([
       "LICENSE",
