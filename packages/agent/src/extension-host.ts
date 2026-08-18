@@ -26,7 +26,10 @@ import {
 import { minVersion, satisfies, subset, valid, validRange } from "semver";
 import type { ArtifactStore } from "./artifact-store.js";
 import type { BiomeExecutionAdapter } from "./biome-execution.js";
-import { createExtensionLifecycleStore } from "./extension-lifecycle-store.js";
+import {
+  createExtensionLifecycleStore,
+  type ExtensionLifecycleTruth,
+} from "./extension-lifecycle-store.js";
 import { createExtensionRecordStore } from "./extension-record-store.js";
 import {
   createOperationHost,
@@ -208,6 +211,84 @@ export interface ExtensionHost {
   loadConfiguredExtensions(): Promise<ExtensionHostSnapshot>;
 }
 
+export type InternalExtensionSkillSource = {
+  readonly extensionId: string;
+  readonly packageName: string;
+  readonly packageVersion: string;
+  readonly packageRoot: string;
+  readonly lifecycleRevision: number;
+  readonly lifecycleDigest: `sha256:${string}`;
+};
+
+type InternalExtensionSkillAuthority = {
+  readonly lifecycleCommandQueues: Map<string, Promise<void>>;
+  readonly sources: ReadonlyMap<string, InternalExtensionSkillSource>;
+};
+
+const extensionSkillAuthorities = new WeakMap<ExtensionHost, InternalExtensionSkillAuthority>();
+
+export async function loadInternalExtensionSkillSources(
+  host: ExtensionHost,
+): Promise<readonly InternalExtensionSkillSource[]> {
+  await host.loadConfiguredExtensions();
+  const authority = extensionSkillAuthorities.get(host);
+  if (authority === undefined) {
+    throw new TypeError("The Extension Host does not expose Adam's internal Skill authority.");
+  }
+  return [...authority.sources.values()].sort((left, right) =>
+    Buffer.from(left.extensionId).compare(Buffer.from(right.extensionId)),
+  );
+}
+
+export function isInternalExtensionSkillSourceCurrent(
+  host: ExtensionHost,
+  source: Pick<
+    InternalExtensionSkillSource,
+    "extensionId" | "packageName" | "packageVersion" | "lifecycleRevision" | "lifecycleDigest"
+  >,
+): boolean {
+  const current = extensionSkillAuthorities.get(host)?.sources.get(source.extensionId);
+  return (
+    current !== undefined &&
+    current.packageName === source.packageName &&
+    current.packageVersion === source.packageVersion &&
+    current.lifecycleRevision === source.lifecycleRevision &&
+    current.lifecycleDigest === source.lifecycleDigest
+  );
+}
+
+export async function withInternalExtensionSkillSourcesCurrent<T>(
+  host: ExtensionHost,
+  sources: readonly Pick<
+    InternalExtensionSkillSource,
+    "extensionId" | "packageName" | "packageVersion" | "lifecycleRevision" | "lifecycleDigest"
+  >[],
+  operation: () => Promise<T>,
+): Promise<{ readonly status: "current"; readonly value: T } | { readonly status: "stale" }> {
+  const authority = extensionSkillAuthorities.get(host);
+  if (authority === undefined) {
+    throw new TypeError("The Extension Host does not expose Adam's internal Skill authority.");
+  }
+  const extensionIds = [...new Set(sources.map((source) => source.extensionId))].sort(
+    (left, right) => Buffer.from(left).compare(Buffer.from(right)),
+  );
+  const acquire = async (
+    index: number,
+  ): Promise<{ readonly status: "current"; readonly value: T } | { readonly status: "stale" }> => {
+    const extensionId = extensionIds[index];
+    if (extensionId !== undefined) {
+      return enqueueLifecycleCommand(authority.lifecycleCommandQueues, extensionId, () =>
+        acquire(index + 1),
+      );
+    }
+    if (!sources.every((source) => isInternalExtensionSkillSourceCurrent(host, source))) {
+      return { status: "stale" };
+    }
+    return { status: "current", value: await operation() };
+  };
+  return acquire(0);
+}
+
 export class ExtensionHostError extends Error {
   readonly code:
     | "extension_configuration_invalid"
@@ -279,6 +360,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
   const lifecycleStore = createExtensionLifecycleStore(options.stateRoot);
   const recordStore = createExtensionRecordStore(options.stateRoot);
   const lifecycleCommandQueues = new Map<string, Promise<void>>();
+  const extensionSkillSources = new Map<string, InternalExtensionSkillSource>();
   const projectLifecycleOwner: ProjectLifecycleOwner =
     options.projectLifecycleOwner ??
     (options.operationStore?.projectId === undefined
@@ -304,7 +386,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
     ...(options.operationStore === undefined ? {} : { store: options.operationStore }),
   });
   let loadInFlight: Promise<ExtensionHostSnapshot> | undefined;
-  return {
+  const host: ExtensionHost = {
     operations: operationHost,
     disableExtension(extensionId) {
       return enqueueLifecycleCommand(lifecycleCommandQueues, extensionId, async () => {
@@ -319,6 +401,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
         } catch (error) {
           throw new ExtensionHostError("extension_state_persistence_failed", { cause: error });
         }
+        extensionSkillSources.delete(extensionId);
         for (let index = publishedContributions.length - 1; index >= 0; index -= 1) {
           if (publishedContributions[index]?.extensionId === extensionId) {
             registeredOperations.delete(publishedContributions[index]?.id ?? "");
@@ -404,9 +487,9 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
               extensions.push(disabledSnapshot(configured));
               continue;
             }
-            let persistedEnabled: boolean | undefined;
+            let lifecycleTruth: ExtensionLifecycleTruth;
             try {
-              persistedEnabled = await lifecycleStore.read(configured);
+              lifecycleTruth = await lifecycleStore.readState(configured);
             } catch {
               extensions.push({
                 diagnostics: [{ code: "extension_state_unavailable" }],
@@ -417,7 +500,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
               });
               continue;
             }
-            if (persistedEnabled === false) {
+            if (lifecycleTruth.enabled === false) {
               extensions.push(disabledSnapshot(configured));
               continue;
             }
@@ -772,6 +855,14 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
             }
             activeExtensions.set(configured.extensionId, { deactivate });
             await operationHost.enableExtensionOperations(configured.extensionId);
+            extensionSkillSources.set(configured.extensionId, {
+              extensionId: configured.extensionId,
+              packageName: configured.packageName,
+              packageVersion: configured.packageVersion,
+              packageRoot,
+              lifecycleRevision: lifecycleTruth.revision,
+              lifecycleDigest: lifecycleTruth.digest,
+            });
             extensions.push({
               diagnostics: optionalDiagnostics,
               extensionId: configured.extensionId,
@@ -801,6 +892,11 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       return operation;
     },
   };
+  extensionSkillAuthorities.set(host, {
+    lifecycleCommandQueues,
+    sources: extensionSkillSources,
+  });
+  return host;
 }
 
 function enqueueLifecycleCommand<T>(

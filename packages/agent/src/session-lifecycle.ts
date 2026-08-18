@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { createFileArtifactStore, readFileArtifact } from "./artifact-store.js";
+import { type ArtifactStore, createFileArtifactStore, readFileArtifact } from "./artifact-store.js";
 import { type ContextProfile, isContextProfileSupported } from "./context-profile.js";
 import {
   type ContextEvidenceV1,
@@ -18,6 +18,11 @@ import {
   maximumReferencedModelResponseArtifactBytes,
 } from "./durable-model-response-policy.js";
 import {
+  type ExtensionHost,
+  loadInternalExtensionSkillSources,
+  withInternalExtensionSkillSourcesCurrent,
+} from "./extension-host.js";
+import {
   AgentSession,
   type ContextUsageTotals,
   type ModelMessage,
@@ -27,6 +32,7 @@ import {
   type RunResult,
   type RuntimeEvent,
   type RuntimeEventListener,
+  type UserInput,
 } from "./index.js";
 import {
   type ModelTargetIdentity,
@@ -39,15 +45,17 @@ import {
 } from "./project-lifecycle-owner.js";
 import {
   assemblePromptMessagesV1,
-  createPromptContextV1,
+  createPromptContextV2,
   digestPromptRequestV1,
   isPromptContextCompatible,
   isPromptContextRecordCompatible,
   isPromptContextRecordValid,
   type PromptContextRecordV1,
+  type PromptContextRecordV2,
   type PromptContextSnapshot,
   promptContextSnapshot,
   replacePromptRepositoryV1,
+  replacePromptSkillsV2,
 } from "./prompt-assembly.js";
 import {
   loadInitialRepositoryInstructions,
@@ -73,9 +81,24 @@ import {
   type SessionModelResponseCompletedRecord,
   type SessionModelResponseField,
   type SessionRecord,
+  type SessionSkillActivationBatchCommittedRecord,
   type SessionStore,
 } from "./session-store.js";
-import type { PermissionPolicy, ToolRegistry } from "./tool-runtime.js";
+import {
+  createInitialSkillContextV1,
+  type ExtensionSkillSourceV1,
+  isSkillContextRecordV1Valid,
+  reconcileExtensionSkillContextV1,
+  reloadSkillContextV1,
+  type SkillContextRecordV1,
+  type SkillContextSnapshot,
+  skillContextSnapshot,
+} from "./skills.js";
+import {
+  createCodingToolRegistry,
+  type PermissionPolicy,
+  type ToolRegistry,
+} from "./tool-runtime.js";
 
 export type CurrentSessionSnapshot = {
   readonly schemaVersion: 3;
@@ -85,6 +108,7 @@ export type CurrentSessionSnapshot = {
   readonly status: "idle" | "interrupted" | "settled";
   readonly lastSequence: number;
   readonly promptContext?: PromptContextSnapshot;
+  readonly skillContext?: SkillContextSnapshot;
   readonly context?: SessionContextSnapshot;
   readonly degradation?: {
     readonly code: "model_response_artifact_corrupt" | "model_response_artifact_missing";
@@ -175,6 +199,7 @@ export type SessionResumeResult =
     };
 
 export type SessionLifecycleOptions = {
+  readonly extensionHost?: ExtensionHost;
   readonly modelTargets?: ModelTargets;
   readonly permissions?: PermissionPolicy;
   readonly workspaceRoot: string;
@@ -201,13 +226,24 @@ export type RepositoryInstructionsReloadResult =
       };
     };
 
+export type SkillsReloadResult =
+  | { readonly status: "reloaded" | "unchanged"; readonly snapshot: CurrentSessionSnapshot }
+  | {
+      readonly status: "rejected";
+      readonly snapshot: CurrentSessionSnapshot;
+      readonly error: {
+        readonly code: "skill_catalog_unavailable" | "skill_reload_not_idle";
+        readonly message: string;
+      };
+    };
+
 export type SessionCommand =
   | { readonly type: "create"; readonly targetIdentity: ModelTargetIdentity }
   | { readonly type: "resume"; readonly sessionId: string }
   | {
       readonly type: "continue";
       readonly sessionId: string;
-      readonly input?: { readonly text: string };
+      readonly input?: UserInput;
       readonly limits?: RunOptions["limits"];
       readonly signal?: AbortSignal;
     }
@@ -217,7 +253,8 @@ export type SessionCommand =
       readonly atSequence: number;
       readonly targetId?: string;
     }
-  | { readonly type: "reload_repository_instructions"; readonly sessionId: string };
+  | { readonly type: "reload_repository_instructions"; readonly sessionId: string }
+  | { readonly type: "reload_skills"; readonly sessionId: string };
 
 export interface SessionLifecycle {
   branch(input: {
@@ -227,7 +264,7 @@ export interface SessionLifecycle {
   }): Promise<CurrentSessionSnapshot>;
   continue(input: {
     readonly sessionId: string;
-    readonly input?: { readonly text: string };
+    readonly input?: UserInput;
     readonly limits?: RunOptions["limits"];
     readonly signal?: AbortSignal;
   }): Promise<SessionContinueResult>;
@@ -237,6 +274,7 @@ export interface SessionLifecycle {
   reloadRepositoryInstructions(input: {
     readonly sessionId: string;
   }): Promise<RepositoryInstructionsReloadResult>;
+  reloadSkills(input: { readonly sessionId: string }): Promise<SkillsReloadResult>;
   resume(input: { readonly sessionId: string }): Promise<SessionResumeResult>;
   subscribe(listener: RuntimeEventListener): () => void;
 }
@@ -259,7 +297,18 @@ export class SessionLifecycleError extends Error {
   }
 }
 
-export function createSessionLifecycle(options: SessionLifecycleOptions): SessionLifecycle {
+export function createSessionLifecycle(providedOptions: SessionLifecycleOptions): SessionLifecycle {
+  const options: SessionLifecycleOptions = {
+    ...providedOptions,
+    tools:
+      providedOptions.tools ??
+      createCodingToolRegistry({
+        workspaceRoot: providedOptions.workspaceRoot,
+        ...(providedOptions.stateRoot === undefined
+          ? {}
+          : { stateRoot: providedOptions.stateRoot }),
+      }),
+  };
   const listeners = new Set<RuntimeEventListener>();
   let activeSession: AgentSession | undefined;
   const owner = createProjectLifecycleOwner(options);
@@ -308,6 +357,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     }
     validateCurrentSessionHistory(first, records);
     await validateSessionLineage(options, first, new Set([input.sessionId]));
+    await skillResourceBytesFromLineage(options, first, records);
     await validateInheritedContextEvidence(options, first, records);
     const artifactInspection = await inspectModelResponseArtifactLineage(
       options,
@@ -582,6 +632,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           throw new SessionLifecycleError("session_branch_boundary_invalid");
         }
         const parentPromptContext = promptContextRecordFromRecords(parentGenesis, parentPrefix);
+        const parentSkillContext = skillContextRecordFromRecords(parentGenesis, parentPrefix);
         let targetIdentity = parent.targetIdentity;
         if (input.targetId !== undefined) {
           if (options.modelTargets === undefined) {
@@ -624,6 +675,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
             projectId: parent.projectId,
             targetIdentity,
             ...(parentPromptContext === undefined ? {} : { promptContext: parentPromptContext }),
+            ...(parentSkillContext === undefined ? {} : { skillContext: parentSkillContext }),
             lineage: {
               parentSessionId: input.parentSessionId,
               parentEventPosition,
@@ -632,16 +684,55 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           },
         };
         await store.append(genesis);
-        const context = await contextSnapshotFromLineage(
-          options,
-          parentGenesis,
-          parentPrefix,
-          artifactCache,
-        );
-        return {
-          ...snapshotFromGenesis(genesis, 1),
-          ...(context === undefined ? {} : { context }),
-        };
+        const extensionSources = await resolveExtensionSkillSources(options);
+        if (parentPromptContext?.recordVersion === 2 && parentSkillContext !== undefined) {
+          const reconciled = reconcileExtensionSkillContextV1({
+            context: parentSkillContext,
+            currentSources: extensionSources,
+          });
+          if (reconciled.context !== parentSkillContext) {
+            const nextPromptContext = replacePromptSkillsV2(
+              parentPromptContext,
+              reconciled.context,
+            );
+            let nextSequence = 2;
+            await store.append({
+              schemaVersion: 3,
+              sequence: nextSequence,
+              record: {
+                type: "skill_catalog_committed",
+                recordVersion: 1,
+                previousRevision: parentSkillContext.registry.revision,
+                previousRegistryDigest: parentSkillContext.registry.digest,
+                skillContext: reconciled.context,
+                assemblyIdentityDigest: nextPromptContext.assemblyIdentityDigest,
+                reason: "extension_reconciliation",
+              },
+            });
+            nextSequence += 1;
+            for (const revocation of reconciled.revoked) {
+              await store.append({
+                schemaVersion: 3,
+                sequence: nextSequence,
+                record: {
+                  type: "skill_revoked",
+                  recordVersion: 1,
+                  catalogRevision: reconciled.context.catalog.revision,
+                  activationIndex: revocation.activationIndex,
+                  qualifiedId: revocation.qualifiedId,
+                  reason: revocation.reason,
+                  sourceEpoch: revocation.sourceEpoch,
+                },
+              });
+              nextSequence += 1;
+            }
+          }
+        }
+        const snapshot = await inspectSession({ sessionId }, artifactCache);
+        if (snapshot.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        return snapshot;
       });
     },
     async create(input) {
@@ -656,6 +747,22 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           sessionId,
           ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
         });
+        const skillBudgetContext = await resolveSkillBudgetContext(options, input.targetIdentity);
+        const extensionSources = await resolveExtensionSkillSources(options);
+        const skillContext = await createInitialSkillContextV1({
+          artifactStore: createLazyArtifactStore(
+            join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
+          ),
+          ...skillBudgetContext,
+          projectId,
+          sessionId,
+          userHome: homedir(),
+          workspaceRoot: options.workspaceRoot,
+          extensionSources,
+        });
+        if (options.tools === undefined) {
+          throw new SessionLifecycleError("session_invalid");
+        }
         const genesis: SessionGenesisRecord = {
           schemaVersion: 3,
           sequence: 1,
@@ -664,7 +771,8 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
             sessionId,
             projectId,
             targetIdentity: input.targetIdentity,
-            promptContext: createPromptContextV1(options.tools, repository),
+            promptContext: createPromptContextV2(options.tools, repository, skillContext),
+            skillContext,
           },
         };
         await store.append(genesis);
@@ -722,13 +830,78 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           { allowDegraded: false },
           artifactCache,
         );
-        const replayRecords = artifactInspection.records;
-        const activePromptContext = promptContextRecordFromRecords(first, replayRecords);
+        const replayRecords = [...artifactInspection.records];
+        let activePromptContext = promptContextRecordFromRecords(first, replayRecords);
+        let activeSkillContext = skillContextRecordFromRecords(first, replayRecords);
+        const extensionSources = await resolveExtensionSkillSources(options);
+        if (activePromptContext?.recordVersion === 2 && activeSkillContext !== undefined) {
+          const reconciled = reconcileExtensionSkillContextV1({
+            context: activeSkillContext,
+            currentSources: extensionSources,
+          });
+          if (reconciled.context !== activeSkillContext) {
+            const nextPromptContext = replacePromptSkillsV2(
+              activePromptContext,
+              reconciled.context,
+            );
+            const reconciliationStore = await openJsonlSessionStore<SessionRecord>({
+              workspaceRoot: options.workspaceRoot,
+              sessionId: input.sessionId,
+              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+            });
+            let nextSequence = (records.at(-1)?.sequence ?? 0) + 1;
+            const catalogRecord: SessionRecord = {
+              schemaVersion: 3,
+              sequence: nextSequence,
+              record: {
+                type: "skill_catalog_committed",
+                recordVersion: 1,
+                previousRevision: activeSkillContext.registry.revision,
+                previousRegistryDigest: activeSkillContext.registry.digest,
+                skillContext: reconciled.context,
+                assemblyIdentityDigest: nextPromptContext.assemblyIdentityDigest,
+                reason: "extension_reconciliation",
+              },
+            };
+            await reconciliationStore.append(catalogRecord);
+            replayRecords.push(catalogRecord);
+            nextSequence += 1;
+            for (const revocation of reconciled.revoked) {
+              const revocationRecord: SessionRecord = {
+                schemaVersion: 3,
+                sequence: nextSequence,
+                record: {
+                  type: "skill_revoked",
+                  recordVersion: 1,
+                  catalogRevision: reconciled.context.catalog.revision,
+                  activationIndex: revocation.activationIndex,
+                  qualifiedId: revocation.qualifiedId,
+                  reason: revocation.reason,
+                  sourceEpoch: revocation.sourceEpoch,
+                },
+              };
+              await reconciliationStore.append(revocationRecord);
+              replayRecords.push(revocationRecord);
+              nextSequence += 1;
+            }
+            activePromptContext = nextPromptContext;
+            activeSkillContext = reconciled.context;
+          }
+        }
+        const activeSkillContents = await materializeActiveSkillContents(
+          options,
+          activeSkillContext,
+        );
         const referencedModelResponseArtifactBytes = await replayArtifactBytesFromLineage(
           options,
           first,
           records,
           artifactCache,
+        );
+        const skillResourceLineageBytes = await skillResourceBytesFromLineage(
+          options,
+          first,
+          replayRecords,
         );
         const [inheritedMessages, inheritedEvidence] = await Promise.all([
           createBranchMessages(options, records, artifactCache),
@@ -766,15 +939,46 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           store: store as unknown as SessionStore,
           [sessionDurableContext]: {
             ...(inheritedMessages.length === 0 ? {} : { hasInheritedMessages: true }),
-            nextSequence: resumed.snapshot.lastSequence + 1,
+            nextSequence: (replayRecords.at(-1)?.sequence ?? resumed.snapshot.lastSequence) + 1,
             projectId: resumed.snapshot.projectId,
             referencedModelResponseArtifactBytes,
+            skillResourceLineageBytes,
+            ...(resumeState === undefined
+              ? {}
+              : {
+                  skillResourceRunBytes: skillResourceBytesForRun(
+                    replayRecords,
+                    resumeState.agentState.runId,
+                  ),
+                }),
             ...(activePromptContext === undefined
               ? {}
               : { repositoryWorkspaceRoot: options.workspaceRoot }),
             sessionId: resumed.snapshot.sessionId,
             targetIdentity: resumed.snapshot.targetIdentity,
             ...(activePromptContext === undefined ? {} : { promptContext: activePromptContext }),
+            ...(activeSkillContext === undefined ? {} : { skillContext: activeSkillContext }),
+            ...(extensionSources.length === 0 ? {} : { extensionSkillSources: extensionSources }),
+            ...(options.extensionHost === undefined
+              ? {}
+              : {
+                  withCurrentExtensionSkillSources: <T>(
+                    sources: readonly ExtensionSkillSourceV1[],
+                    operation: () => Promise<T>,
+                  ) =>
+                    withInternalExtensionSkillSourcesCurrent(
+                      options.extensionHost as ExtensionHost,
+                      sources.map((source) => ({
+                        extensionId: source.locator.extensionId,
+                        packageName: source.locator.packageName,
+                        packageVersion: source.locator.packageVersion,
+                        lifecycleRevision: source.lifecycleRevision,
+                        lifecycleDigest: source.lifecycleDigest,
+                      })),
+                      operation,
+                    ),
+                }),
+            ...(activeSkillContents.size === 0 ? {} : { activeSkillContents }),
             ...(hasContextEvidence(inheritedEvidence) ? { inheritedEvidence } : {}),
             ...(resumeState !== undefined || inheritedMessages.length === 0
               ? {}
@@ -923,6 +1127,114 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
         return { status: "reloaded", snapshot };
       });
     },
+    async reloadSkills(input) {
+      if (activeSession !== undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return withOwner(async () => {
+        const inspected = await inspectSession({ sessionId: input.sessionId });
+        if (inspected.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        if (
+          inspected.status !== "idle" ||
+          inspected.promptContext?.profileVersion !== 2 ||
+          inspected.skillContext === undefined
+        ) {
+          return {
+            status: "rejected",
+            snapshot: inspected,
+            error: {
+              code: "skill_reload_not_idle",
+              message: "Agent Skills can be reloaded only in a clean idle session.",
+            },
+          };
+        }
+        const records = await readJsonlSessionRecords({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        const genesis = records[0];
+        if (genesis === undefined || !isGenesisRecord(genesis)) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const promptContext = promptContextRecordFromRecords(genesis, records);
+        const skillContext = skillContextRecordFromRecords(genesis, records);
+        if (promptContext?.recordVersion !== 2 || skillContext === undefined) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        let nextSkillContext: SkillContextRecordV1;
+        try {
+          nextSkillContext = await reloadSkillContextV1({
+            artifactStore: createLazyArtifactStore(
+              join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
+            ),
+            context: skillContext,
+            projectId: inspected.projectId,
+            sessionId: inspected.sessionId,
+            userHome: homedir(),
+            workspaceRoot: options.workspaceRoot,
+            extensionSources: await resolveExtensionSkillSources(options),
+          });
+        } catch {
+          const store = await openJsonlSessionStore<SessionRecord>({
+            workspaceRoot: options.workspaceRoot,
+            sessionId: input.sessionId,
+            ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+          });
+          await store.append({
+            schemaVersion: 3,
+            sequence: records.length + 1,
+            record: {
+              type: "skill_catalog_failed",
+              recordVersion: 1,
+              activeRevision: skillContext.registry.revision,
+              activeRegistryDigest: skillContext.registry.digest,
+              error: { code: "skill_catalog_unavailable" },
+            },
+          });
+          const snapshot = await inspectSession({ sessionId: input.sessionId });
+          if (snapshot.schemaVersion !== 3) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          return {
+            status: "rejected",
+            snapshot,
+            error: {
+              code: "skill_catalog_unavailable",
+              message: "Agent Skills could not be reloaded safely.",
+            },
+          };
+        }
+        if (nextSkillContext === skillContext) {
+          return { status: "unchanged", snapshot: inspected };
+        }
+        const nextPromptContext = replacePromptSkillsV2(promptContext, nextSkillContext);
+        const store = await openJsonlSessionStore<SessionRecord>({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        await store.append({
+          schemaVersion: 3,
+          sequence: records.length + 1,
+          record: {
+            type: "skill_catalog_committed",
+            recordVersion: 1,
+            previousRevision: skillContext.registry.revision,
+            previousRegistryDigest: skillContext.registry.digest,
+            skillContext: nextSkillContext,
+            assemblyIdentityDigest: nextPromptContext.assemblyIdentityDigest,
+          },
+        });
+        const snapshot = await inspectSession({ sessionId: input.sessionId });
+        if (snapshot.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        return { status: "reloaded", snapshot };
+      });
+    },
     async resume(input) {
       return withOwner(() => resumeSession(input));
     },
@@ -971,6 +1283,10 @@ function validateCurrentSessionHistory(
     genesis.sequence !== 1 ||
     records[0] !== genesis ||
     records.some((record) => record.schemaVersion !== 3) ||
+    (genesis.record.promptContext?.recordVersion === 2) !==
+      (genesis.record.skillContext !== undefined) ||
+    (genesis.record.skillContext !== undefined &&
+      !isSkillContextRecordV1Valid(genesis.record.skillContext)) ||
     (genesis.record.promptContext !== undefined &&
       (!isPromptContextRecordValid(genesis.record.promptContext) ||
         (genesis.record.lineage === undefined &&
@@ -1000,6 +1316,20 @@ function validateCurrentSessionHistory(
   let lastUsage: Extract<RuntimeEvent, { readonly type: "model_usage" }> | undefined;
   let toolStates = new Map<string, ValidatedToolState>();
   let activePromptContext = genesis.record.promptContext;
+  let activeSkillContext = genesis.record.skillContext;
+  const skillPermissions = new Map<
+    string,
+    {
+      readonly qualifiedId: string;
+      readonly permissionRequestId?: string;
+      decision?: "allow" | "deny";
+      committed: boolean;
+    }
+  >();
+  const committedSkillResourceReads = new Set<string>();
+  const publishedSkillActivations = new Set<number>();
+  const publishedSkillRevocations = new Set<number>();
+  let skillResourceRunBytes = 0;
   const activatableRepositoryRevisions = new Map<number, ValidatedToolState>();
   const publishedRepositoryRevisions = new Set<number>();
 
@@ -1012,7 +1342,14 @@ function validateCurrentSessionHistory(
       throw new SessionLifecycleError("session_invalid");
     }
     if (record.type === "logical_run_started") {
-      if (run !== undefined || attemptState !== undefined || sawUserMessage) {
+      if (
+        run !== undefined ||
+        attemptState !== undefined ||
+        sawUserMessage ||
+        record.skills?.some(
+          (selection, index) => selection.requestId !== `${record.runId}:skill:${index + 1}`,
+        )
+      ) {
         throw new SessionLifecycleError("session_invalid");
       }
       run = record;
@@ -1026,7 +1363,10 @@ function validateCurrentSessionHistory(
         record.previousRevision !== activePromptContext.repository.revision ||
         record.previousEffectiveDigest !== activePromptContext.repository.effectiveDigest ||
         record.repository.revision !== activePromptContext.repository.revision + 1 ||
-        record.repository.sources.some((source) => source.loadReason !== expectedLoadReason)
+        record.repository.sources.some(
+          (source: PromptContextRecordV1["repository"]["sources"][number]) =>
+            source.loadReason !== expectedLoadReason,
+        )
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
@@ -1105,6 +1445,268 @@ function validateCurrentSessionHistory(
       }
       continue;
     }
+    if (record.type === "path_context_committed") {
+      const toolState = toolStates.get(record.trigger.callId);
+      if (
+        run === undefined ||
+        record.trigger.runId !== run.runId ||
+        activePromptContext?.recordVersion !== 2 ||
+        activeSkillContext === undefined ||
+        record.previousRepositoryRevision !== activePromptContext.repository.revision ||
+        record.previousRepositoryDigest !== activePromptContext.repository.effectiveDigest ||
+        record.repository.revision !== activePromptContext.repository.revision + 1 ||
+        record.previousSkillRevision !== activeSkillContext.registry.revision ||
+        record.previousSkillRegistryDigest !== activeSkillContext.registry.digest ||
+        !isSkillContextRecordV1Valid(record.skillContext) ||
+        !isSkillContextPathSuccessor(activeSkillContext, record.skillContext) ||
+        toolState === undefined ||
+        toolState.call.name !== record.trigger.name ||
+        record.trigger.argumentsDigest !==
+          `sha256:${createHash("sha256").update(toolState.call.argumentsJson, "utf8").digest("hex")}` ||
+        !toolState.requested ||
+        toolState.started ||
+        toolState.terminal ||
+        toolState.decision !== undefined ||
+        toolState.permissionRequestId !== undefined
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      let nextPromptContext = replacePromptRepositoryV1(
+        activePromptContext,
+        record.repository,
+      ) as PromptContextRecordV2;
+      nextPromptContext = replacePromptSkillsV2(nextPromptContext, record.skillContext);
+      if (
+        nextPromptContext.assemblyIdentityDigest !== record.assemblyIdentityDigest ||
+        !isPromptContextRecordValid(nextPromptContext)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      toolState.repositoryDisposition = record.trigger.disposition;
+      toolState.repositoryRevision = record.repository.revision;
+      activatableRepositoryRevisions.set(record.repository.revision, toolState);
+      activeSkillContext = record.skillContext;
+      activePromptContext = nextPromptContext;
+      continue;
+    }
+    if (record.type === "path_context_failed") {
+      const toolState = toolStates.get(record.trigger.callId);
+      if (
+        run === undefined ||
+        record.trigger.runId !== run.runId ||
+        activePromptContext?.recordVersion !== 2 ||
+        activeSkillContext === undefined ||
+        record.activeRepositoryRevision !== activePromptContext.repository.revision ||
+        record.activeRepositoryDigest !== activePromptContext.repository.effectiveDigest ||
+        record.activeSkillRevision !== activeSkillContext.registry.revision ||
+        record.activeSkillRegistryDigest !== activeSkillContext.registry.digest ||
+        toolState === undefined ||
+        toolState.call.name !== record.trigger.name ||
+        record.trigger.argumentsDigest !==
+          `sha256:${createHash("sha256").update(toolState.call.argumentsJson, "utf8").digest("hex")}` ||
+        !toolState.requested ||
+        toolState.started ||
+        toolState.terminal ||
+        toolState.decision !== undefined ||
+        toolState.permissionRequestId !== undefined ||
+        toolState.repositoryDisposition !== undefined
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      toolState.repositoryDisposition = "unavailable";
+      continue;
+    }
+    if (record.type === "skill_catalog_committed") {
+      if (
+        (record.reason === undefined
+          ? run !== undefined
+          : record.reason !== "extension_reconciliation" || attemptState?.status === "started") ||
+        activePromptContext?.recordVersion !== 2 ||
+        activeSkillContext === undefined ||
+        record.previousRevision !== activeSkillContext.registry.revision ||
+        record.previousRegistryDigest !== activeSkillContext.registry.digest ||
+        !isSkillContextRecordV1Valid(record.skillContext) ||
+        !isSkillContextCatalogSuccessor(activeSkillContext, record.skillContext)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const nextPromptContext = replacePromptSkillsV2(activePromptContext, record.skillContext);
+      if (
+        nextPromptContext.assemblyIdentityDigest !== record.assemblyIdentityDigest ||
+        !isPromptContextRecordValid(nextPromptContext)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      activeSkillContext = record.skillContext;
+      activePromptContext = nextPromptContext;
+      continue;
+    }
+    if (record.type === "skill_catalog_failed") {
+      if (
+        run !== undefined ||
+        activeSkillContext === undefined ||
+        record.activeRevision !== activeSkillContext.registry.revision ||
+        record.activeRegistryDigest !== activeSkillContext.registry.digest
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      continue;
+    }
+    if (record.type === "skill_revoked") {
+      const revocation = activeSkillContext?.revocations.find(
+        (entry) => entry.activationIndex === record.activationIndex,
+      );
+      if (
+        run !== undefined ||
+        activeSkillContext === undefined ||
+        record.catalogRevision !== activeSkillContext.catalog.revision ||
+        revocation === undefined ||
+        revocation.qualifiedId !== record.qualifiedId ||
+        revocation.reason !== record.reason ||
+        JSON.stringify(revocation.sourceEpoch) !== JSON.stringify(record.sourceEpoch) ||
+        publishedSkillRevocations.has(record.activationIndex)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      publishedSkillRevocations.add(record.activationIndex);
+      continue;
+    }
+    if (record.type === "skill_activation_batch_committed") {
+      const previousSkillContext = activeSkillContext;
+      if (
+        run === undefined ||
+        record.runId !== run.runId ||
+        !sawUserMessage ||
+        (attemptState !== undefined &&
+          (attemptState.status !== "completed" ||
+            attemptState.response?.response.finishReason !== "tool_calls")) ||
+        activePromptContext?.recordVersion !== 2 ||
+        previousSkillContext === undefined ||
+        record.previousActivationDigest !== previousSkillContext.activationDigest ||
+        !isSkillContextRecordV1Valid(record.skillContext) ||
+        !isSkillActivationBatchValid(previousSkillContext, record.skillContext, record, run)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const nextPromptContext = replacePromptSkillsV2(activePromptContext, record.skillContext);
+      const newActivations = record.skillContext.active.slice(previousSkillContext.active.length);
+      if (
+        nextPromptContext.assemblyIdentityDigest !== record.assemblyIdentityDigest ||
+        !isPromptContextRecordValid(nextPromptContext) ||
+        newActivations.some((activation) => {
+          const permission = skillPermissions.get(activation.requestId);
+          const modelTool = toolStates.get(activation.requestId);
+          let modelQualifiedId: string | undefined;
+          try {
+            const parsed =
+              modelTool?.call.name === "activate_skill"
+                ? (JSON.parse(modelTool.call.argumentsJson) as { qualifiedId?: unknown })
+                : undefined;
+            modelQualifiedId =
+              typeof parsed?.qualifiedId === "string" ? parsed.qualifiedId : undefined;
+          } catch {
+            modelQualifiedId = undefined;
+          }
+          const validExplicitPermission =
+            permission !== undefined &&
+            permission.qualifiedId === activation.qualifiedId &&
+            permission.decision === "allow" &&
+            !permission.committed;
+          const validModelTool =
+            modelTool !== undefined &&
+            modelQualifiedId === activation.qualifiedId &&
+            modelTool.requested &&
+            modelTool.started &&
+            !modelTool.terminal &&
+            modelTool.decision === "allow";
+          return !validExplicitPermission && !validModelTool;
+        })
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      for (const activation of newActivations) {
+        for (const permission of skillPermissions.values()) {
+          if (permission.qualifiedId === activation.qualifiedId) {
+            permission.committed = true;
+          }
+        }
+      }
+      activeSkillContext = record.skillContext;
+      activePromptContext = nextPromptContext;
+      continue;
+    }
+    if (record.type === "skill_activated") {
+      const activation = activeSkillContext?.active.find(
+        (entry) => entry.activationIndex === record.activationIndex,
+      );
+      if (
+        run === undefined ||
+        record.runId !== run.runId ||
+        activation === undefined ||
+        activation.qualifiedId !== record.qualifiedId ||
+        activation.catalogRevision !== record.catalogRevision ||
+        activation.reason !== record.reason ||
+        activation.skillMdDigest !== record.skillMdDigest ||
+        activation.manifest.digest !== record.manifestDigest ||
+        publishedSkillActivations.has(record.activationIndex)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      publishedSkillActivations.add(record.activationIndex);
+      continue;
+    }
+    if (record.type === "skill_resource_read_committed") {
+      const toolState = toolStates.get(record.callId);
+      const activation = activeSkillContext?.active.find(
+        (entry) => entry.qualifiedId === record.qualifiedId,
+      );
+      let argumentsValue:
+        | { qualifiedId?: unknown; path?: unknown; offset?: unknown; maxByteCount?: unknown }
+        | undefined;
+      try {
+        argumentsValue = JSON.parse(toolState?.call.argumentsJson ?? "") as typeof argumentsValue;
+      } catch {
+        argumentsValue = undefined;
+      }
+      const requestedOffset =
+        typeof argumentsValue?.offset === "number" ? argumentsValue.offset : 0;
+      const requestedMaximum =
+        typeof argumentsValue?.maxByteCount === "number" ? argumentsValue.maxByteCount : 65_536;
+      if (
+        run === undefined ||
+        record.runId !== run.runId ||
+        attemptState?.status !== "completed" ||
+        attemptState.response?.response.finishReason !== "tool_calls" ||
+        toolState?.call.name !== "read_skill_resource" ||
+        !toolState.requested ||
+        !toolState.started ||
+        toolState.terminal ||
+        toolState.decision !== "allow" ||
+        committedSkillResourceReads.has(record.callId) ||
+        argumentsValue?.qualifiedId !== record.qualifiedId ||
+        argumentsValue.path !== record.path ||
+        requestedOffset !== record.offset ||
+        record.byteCount > requestedMaximum ||
+        activation === undefined ||
+        activation.activationIndex !== record.activationIndex ||
+        activation.catalogRevision !== record.catalogRevision ||
+        activation.manifest.revision !== record.manifestRevision ||
+        !activation.manifest.entries.some((entry) => entry.path === record.path) ||
+        record.offset + record.byteCount > record.totalByteCount ||
+        record.eof !== (record.offset + record.byteCount === record.totalByteCount) ||
+        Buffer.byteLength(record.content, "utf8") !== record.byteCount ||
+        `sha256:${createHash("sha256").update(record.content, "utf8").digest("hex")}` !==
+          record.pageDigest
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      skillResourceRunBytes += record.byteCount;
+      if (!Number.isSafeInteger(skillResourceRunBytes) || skillResourceRunBytes > 1024 * 1024) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      committedSkillResourceReads.add(record.callId);
+      continue;
+    }
     if (run === undefined || record.runId !== run.runId) {
       throw new SessionLifecycleError("session_invalid");
     }
@@ -1112,6 +1714,9 @@ function validateCurrentSessionHistory(
       if (
         terminalIntent !== undefined ||
         !sawUserMessage ||
+        [...skillPermissions.values()].some(
+          (permission) => permission.decision === "allow" && !permission.committed,
+        ) ||
         !sameModelTargetIdentity(record.targetIdentity, genesis.record.targetIdentity) ||
         (activePromptContext === undefined
           ? record.promptProjection !== undefined
@@ -1307,6 +1912,70 @@ function validateCurrentSessionHistory(
       sawSessionInterruption = true;
       continue;
     }
+    if (
+      (event.type === "tool_permission_requested" || event.type === "tool_permission_decided") &&
+      event.name === "activate_skill" &&
+      attemptState === undefined
+    ) {
+      const subject = event.subject;
+      const candidate =
+        subject?.type === "skill" && subject.operation === "activate"
+          ? activeSkillContext?.registry.candidates.find(
+              (entry) => entry.qualifiedId === subject.qualifiedId,
+            )
+          : undefined;
+      if (
+        run === undefined ||
+        !sawUserMessage ||
+        attemptState !== undefined ||
+        event.effect !== "read" ||
+        event.scope !== "call" ||
+        candidate === undefined ||
+        !run.skills?.some(
+          (selection) =>
+            selection.requestId === event.callId &&
+            (selection.selection === candidate.qualifiedId ||
+              selection.selection === candidate.name),
+        )
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const existing = skillPermissions.get(event.callId);
+      if (event.type === "tool_permission_requested") {
+        if (existing !== undefined || event.requestId !== event.callId) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        skillPermissions.set(event.callId, {
+          qualifiedId: candidate.qualifiedId,
+          permissionRequestId: event.requestId,
+          committed: false,
+        });
+      } else {
+        if (event.decision !== "allow" && event.decision !== "deny") {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        if (existing === undefined) {
+          if (event.requestId !== undefined) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          skillPermissions.set(event.callId, {
+            qualifiedId: candidate.qualifiedId,
+            decision: event.decision,
+            committed: false,
+          });
+        } else {
+          if (
+            existing.decision !== undefined ||
+            existing.qualifiedId !== candidate.qualifiedId ||
+            event.requestId !== existing.permissionRequestId
+          ) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          existing.decision = event.decision;
+        }
+      }
+      continue;
+    }
     if (event.type === "repository_instructions_activated") {
       const toolState = activatableRepositoryRevisions.get(event.revision);
       if (
@@ -1348,6 +2017,7 @@ function validateCurrentSessionHistory(
         (event.result.status === "cancelled" && !sawSessionInterruption) ||
         (event.result.status === "failed" &&
           ((attemptState === undefined &&
+            event.result.error.code !== "skill_activation_failed" &&
             !isContextTerminalFailure(event.result, lastContextTerminal)) ||
             event.result.error.code === "invalid_run_limits" ||
             event.result.error.code === "run_already_active" ||
@@ -1388,11 +2058,20 @@ function validateCurrentSessionHistory(
         (event.type === "tool_requested" ||
           (state.repositoryDisposition === "unavailable"
             ? event.type !== "tool_failed" ||
-              event.error.code !== "repository_instructions_unavailable"
+              (event.error.code !== "repository_instructions_unavailable" &&
+                event.error.code !== "project_context_unavailable")
             : state.repositoryActivationPublished !== true ||
               (state.repositoryDisposition === "mutation_retry_required" &&
                 (event.type !== "tool_failed" ||
-                  event.error.code !== "repository_context_changed"))))
+                  (event.error.code !== "repository_context_changed" &&
+                    event.error.code !== "project_context_changed")))))
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      if (
+        state.call.name === "read_skill_resource" &&
+        event.type === "tool_completed" &&
+        !committedSkillResourceReads.has(event.callId)
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
@@ -1849,6 +2528,8 @@ async function validatePromptProjectionDigests(
     if (context === undefined) {
       throw new SessionLifecycleError("session_invalid");
     }
+    const skillContext = skillContextRecordFromRecords(genesis, prefix);
+    const activeSkillContents = await materializeActiveSkillContents(options, skillContext);
     const ownMessages = modelMessagesFromCompleteRecords(prefix);
     const transcript = prefix.some(
       (candidate) =>
@@ -1856,7 +2537,12 @@ async function validatePromptProjectionDigests(
     )
       ? ownMessages
       : [...inheritedMessages, ...ownMessages];
-    const messages = assemblePromptMessagesV1(transcript, context);
+    const messages = assemblePromptMessagesV1(
+      transcript,
+      context,
+      skillContext,
+      activeSkillContents,
+    );
     const tools = context.toolProfile.definitions.map(({ definition }) => definition);
     if (
       digestPromptRequestV1(messages, tools) !==
@@ -2087,9 +2773,12 @@ function isCompleteBranchBoundary(records: readonly SessionRecord[]): boolean {
         .slice(1)
         .every(
           (entry) =>
-            (entry.record.type === "repository_instructions_committed" ||
+            ((entry.record.type === "repository_instructions_committed" ||
               entry.record.type === "repository_instructions_failed") &&
-            entry.record.trigger === undefined,
+              entry.record.trigger === undefined) ||
+            entry.record.type === "skill_catalog_committed" ||
+            entry.record.type === "skill_catalog_failed" ||
+            entry.record.type === "skill_revoked",
         )
     );
   }
@@ -2155,6 +2844,9 @@ function snapshotFromGenesis(
     ...(genesis.record.promptContext === undefined
       ? {}
       : { promptContext: promptContextSnapshot(genesis.record.promptContext) }),
+    ...(genesis.record.skillContext === undefined
+      ? {}
+      : { skillContext: skillContextSnapshot(genesis.record.skillContext) }),
     ...(genesis.record.lineage === undefined ? {} : { lineage: genesis.record.lineage }),
   };
 }
@@ -2191,27 +2883,330 @@ function promptContextRecordFromRecords(
 ): SessionGenesisRecord["record"]["promptContext"] {
   let context = genesis.record.promptContext;
   for (const entry of records) {
-    if (entry.schemaVersion !== 3 || entry.record.type !== "repository_instructions_committed") {
+    if (entry.schemaVersion !== 3) {
+      continue;
+    }
+    if (entry.record.type === "repository_instructions_committed") {
+      if (
+        context === undefined ||
+        entry.record.previousRevision !== context.repository.revision ||
+        entry.record.previousEffectiveDigest !== context.repository.effectiveDigest ||
+        entry.record.repository.revision !== context.repository.revision + 1
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const next = replacePromptRepositoryV1(context, entry.record.repository);
+      if (
+        next.assemblyIdentityDigest !== entry.record.assemblyIdentityDigest ||
+        !isPromptContextRecordValid(next)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      context = next;
+      continue;
+    }
+    if (entry.record.type === "path_context_committed") {
+      if (
+        context?.recordVersion !== 2 ||
+        entry.record.previousRepositoryRevision !== context.repository.revision ||
+        entry.record.previousRepositoryDigest !== context.repository.effectiveDigest ||
+        entry.record.repository.revision !== context.repository.revision + 1
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      let next = replacePromptRepositoryV1(
+        context,
+        entry.record.repository,
+      ) as PromptContextRecordV2;
+      next = replacePromptSkillsV2(next, entry.record.skillContext);
+      if (
+        next.assemblyIdentityDigest !== entry.record.assemblyIdentityDigest ||
+        !isPromptContextRecordValid(next)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      context = next;
+      continue;
+    }
+    if (entry.record.type === "skill_activation_batch_committed") {
+      if (context?.recordVersion !== 2) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const next = replacePromptSkillsV2(context, entry.record.skillContext);
+      if (
+        next.assemblyIdentityDigest !== entry.record.assemblyIdentityDigest ||
+        !isPromptContextRecordValid(next)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      context = next;
+    }
+    if (entry.record.type === "skill_catalog_committed") {
+      if (context?.recordVersion !== 2) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const next = replacePromptSkillsV2(context, entry.record.skillContext);
+      if (
+        next.assemblyIdentityDigest !== entry.record.assemblyIdentityDigest ||
+        !isPromptContextRecordValid(next)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      context = next;
+    }
+  }
+  return context;
+}
+
+function skillContextRecordFromRecords(
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): SkillContextRecordV1 | undefined {
+  let context = genesis.record.skillContext;
+  for (const entry of records) {
+    if (
+      entry.schemaVersion !== 3 ||
+      (entry.record.type !== "skill_activation_batch_committed" &&
+        entry.record.type !== "skill_catalog_committed" &&
+        entry.record.type !== "path_context_committed")
+    ) {
+      continue;
+    }
+    if (entry.record.type === "skill_catalog_committed") {
+      if (
+        context === undefined ||
+        entry.record.previousRevision !== context.registry.revision ||
+        entry.record.previousRegistryDigest !== context.registry.digest ||
+        !isSkillContextRecordV1Valid(entry.record.skillContext) ||
+        !isSkillContextCatalogSuccessor(context, entry.record.skillContext)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      context = entry.record.skillContext;
+      continue;
+    }
+    if (entry.record.type === "path_context_committed") {
+      if (
+        context === undefined ||
+        entry.record.previousSkillRevision !== context.registry.revision ||
+        entry.record.previousSkillRegistryDigest !== context.registry.digest ||
+        !isSkillContextRecordV1Valid(entry.record.skillContext) ||
+        !isSkillContextPathSuccessor(context, entry.record.skillContext)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      context = entry.record.skillContext;
       continue;
     }
     if (
       context === undefined ||
-      entry.record.previousRevision !== context.repository.revision ||
-      entry.record.previousEffectiveDigest !== context.repository.effectiveDigest ||
-      entry.record.repository.revision !== context.repository.revision + 1
+      entry.record.previousActivationDigest !== context.activationDigest ||
+      !isSkillContextRecordV1Valid(entry.record.skillContext) ||
+      !isSkillActivationBatchTransitionValid(context, entry.record.skillContext, entry.record)
     ) {
       throw new SessionLifecycleError("session_invalid");
     }
-    const next = replacePromptRepositoryV1(context, entry.record.repository);
-    if (
-      next.assemblyIdentityDigest !== entry.record.assemblyIdentityDigest ||
-      !isPromptContextRecordValid(next)
-    ) {
-      throw new SessionLifecycleError("session_invalid");
-    }
-    context = next;
+    context = entry.record.skillContext;
   }
   return context;
+}
+
+function isSkillContextCatalogSuccessor(
+  previous: SkillContextRecordV1,
+  next: SkillContextRecordV1,
+): boolean {
+  return (
+    next.registry.revision === previous.registry.revision + 1 &&
+    next.catalog.revision === next.registry.revision &&
+    JSON.stringify(next.budget) === JSON.stringify(previous.budget) &&
+    JSON.stringify(next.activeProjectScopes) === JSON.stringify(previous.activeProjectScopes) &&
+    next.activationCounter === previous.activationCounter &&
+    JSON.stringify(next.active) ===
+      JSON.stringify(
+        previous.active.filter((activation) =>
+          next.active.some((entry) => entry.activationIndex === activation.activationIndex),
+        ),
+      ) &&
+    JSON.stringify(next.revocations.slice(0, previous.revocations.length)) ===
+      JSON.stringify(previous.revocations) &&
+    previous.active
+      .filter(
+        (activation) =>
+          !next.active.some((entry) => entry.activationIndex === activation.activationIndex),
+      )
+      .every((activation) =>
+        next.revocations
+          .slice(previous.revocations.length)
+          .some(
+            (revocation) =>
+              revocation.activationIndex === activation.activationIndex &&
+              revocation.qualifiedId === activation.qualifiedId &&
+              revocation.revokedAtRevision === next.registry.revision,
+          ),
+      )
+  );
+}
+
+function isSkillContextPathSuccessor(
+  previous: SkillContextRecordV1,
+  next: SkillContextRecordV1,
+): boolean {
+  return (
+    next.registry.revision === previous.registry.revision + 1 &&
+    next.catalog.revision === next.registry.revision &&
+    JSON.stringify(next.budget) === JSON.stringify(previous.budget) &&
+    JSON.stringify(next.active) === JSON.stringify(previous.active) &&
+    next.activationCounter === previous.activationCounter &&
+    JSON.stringify(next.revocations) === JSON.stringify(previous.revocations) &&
+    JSON.stringify(next.extensionSources) === JSON.stringify(previous.extensionSources) &&
+    previous.activeProjectScopes.every((scope) => next.activeProjectScopes.includes(scope)) &&
+    next.activeProjectScopes.length > previous.activeProjectScopes.length
+  );
+}
+
+function isSkillContextActivationSuccessor(
+  previous: SkillContextRecordV1,
+  next: SkillContextRecordV1,
+  runId: string,
+): boolean {
+  const staticPrevious = {
+    recordVersion: previous.recordVersion,
+    profileVersion: previous.profileVersion,
+    budget: previous.budget,
+    sourceRoots: previous.sourceRoots,
+    extensionSources: previous.extensionSources,
+    registry: previous.registry,
+    catalog: previous.catalog,
+    revocations: previous.revocations,
+  };
+  const staticNext = {
+    recordVersion: next.recordVersion,
+    profileVersion: next.profileVersion,
+    budget: next.budget,
+    sourceRoots: next.sourceRoots,
+    extensionSources: next.extensionSources,
+    registry: next.registry,
+    catalog: next.catalog,
+    revocations: next.revocations,
+  };
+  if (
+    JSON.stringify(staticPrevious) !== JSON.stringify(staticNext) ||
+    next.activationCounter <= previous.activationCounter ||
+    next.activationCounter - previous.activationCounter !==
+      next.active.length - previous.active.length ||
+    next.active.length <= previous.active.length ||
+    JSON.stringify(next.active.slice(0, previous.active.length)) !== JSON.stringify(previous.active)
+  ) {
+    return false;
+  }
+  const seen = new Set(previous.active.map((activation) => activation.qualifiedId));
+  return next.active.slice(previous.active.length).every((activation, offset) => {
+    const candidate = next.registry.candidates.find(
+      (entry) => entry.qualifiedId === activation.qualifiedId,
+    );
+    const valid =
+      activation.activationIndex === previous.activationCounter + offset + 1 &&
+      activation.catalogRevision === next.catalog.revision &&
+      activation.runId === runId &&
+      !seen.has(activation.qualifiedId) &&
+      candidate !== undefined &&
+      candidate.skillMdDigest === activation.skillMdDigest &&
+      candidate.byteCount === activation.byteCount &&
+      candidate.estimatedTokens === activation.estimatedTokens &&
+      JSON.stringify(candidate.artifact) === JSON.stringify(activation.artifact);
+    seen.add(activation.qualifiedId);
+    return valid;
+  });
+}
+
+function isSkillActivationBatchTransitionValid(
+  previous: SkillContextRecordV1,
+  next: SkillContextRecordV1,
+  record: SessionSkillActivationBatchCommittedRecord["record"],
+): boolean {
+  const newActivations = next.active.slice(previous.active.length);
+  const activatedOutcomes = record.outcomes.filter((outcome) => outcome.status === "activated");
+  const unchanged = JSON.stringify(previous) === JSON.stringify(next);
+  if (
+    (!unchanged && !isSkillContextActivationSuccessor(previous, next, record.runId)) ||
+    (unchanged && activatedOutcomes.length > 0) ||
+    activatedOutcomes.length !== newActivations.length ||
+    new Set(record.outcomes.map((outcome) => outcome.requestId)).size !== record.outcomes.length
+  ) {
+    return false;
+  }
+  let activatedOffset = 0;
+  return record.outcomes.every((outcome, outcomeIndex) => {
+    const activation = next.active.find(
+      (entry) => entry.activationIndex === outcome.activationIndex,
+    );
+    if (activation?.qualifiedId !== outcome.qualifiedId) {
+      return false;
+    }
+    if (outcome.status === "activated") {
+      const newActivation = newActivations[activatedOffset];
+      activatedOffset += 1;
+      return (
+        newActivation?.qualifiedId === outcome.qualifiedId &&
+        newActivation.requestId === outcome.requestId &&
+        newActivation.activationIndex === outcome.activationIndex
+      );
+    }
+    if (outcome.status === "already_active") {
+      return previous.active.some(
+        (entry) =>
+          entry.qualifiedId === outcome.qualifiedId &&
+          entry.activationIndex === outcome.activationIndex,
+      );
+    }
+    return record.outcomes
+      .slice(0, outcomeIndex)
+      .some((entry) => entry.qualifiedId === outcome.qualifiedId);
+  });
+}
+
+function isSkillActivationBatchValid(
+  previous: SkillContextRecordV1,
+  next: SkillContextRecordV1,
+  record: SessionSkillActivationBatchCommittedRecord["record"],
+  run: SessionLogicalRunStartedRecord["record"],
+): boolean {
+  if (!isSkillActivationBatchTransitionValid(previous, next, record)) {
+    return false;
+  }
+  const explicitSelections = run.skills ?? [];
+  const explicitRequestIds = new Set(explicitSelections.map((selection) => selection.requestId));
+  const isExplicitBatch = record.outcomes.some((outcome) =>
+    explicitRequestIds.has(outcome.requestId),
+  );
+  if (!isExplicitBatch) {
+    return record.outcomes.length === 1 && record.outcomes[0]?.status === "activated";
+  }
+  return (
+    record.outcomes.length === explicitSelections.length &&
+    record.outcomes.every(
+      (outcome, index) =>
+        outcome.requestId === explicitSelections[index]?.requestId &&
+        outcome.selection === explicitSelections[index]?.selection &&
+        resolvePersistedSkillSelection(previous, outcome.selection) === outcome.qualifiedId,
+    )
+  );
+}
+
+function resolvePersistedSkillSelection(
+  context: SkillContextRecordV1,
+  selection: string,
+): string | undefined {
+  const exact = context.registry.candidates.find(
+    (candidate) => candidate.qualifiedId === selection,
+  );
+  if (exact !== undefined) {
+    return exact.qualifiedId;
+  }
+  const shortMatches = context.registry.candidates.filter(
+    (candidate) => candidate.name === selection,
+  );
+  return shortMatches.length === 1 ? shortMatches[0]?.qualifiedId : undefined;
 }
 
 function contextSnapshotFromRecords(
@@ -2435,9 +3430,11 @@ function snapshotFromRecords(
   );
   if (latestRun === undefined || latestRun.record.type !== "logical_run_started") {
     const promptContext = promptContextSnapshotFromRecords(genesis, records);
+    const skillContext = skillContextRecordFromRecords(genesis, records);
     return {
       ...snapshotFromGenesis(genesis, records.length),
       ...(promptContext === undefined ? {} : { promptContext }),
+      ...(skillContext === undefined ? {} : { skillContext: skillContextSnapshot(skillContext) }),
       ...(context === undefined ? {} : { context }),
       ...(artifactInspection?.degradation === undefined
         ? {}
@@ -2490,9 +3487,11 @@ function snapshotFromRecords(
         : undefined;
   const isSettled = settlement !== undefined || linkedSettlement !== undefined;
   const promptContext = promptContextSnapshotFromRecords(genesis, records);
+  const skillContext = skillContextRecordFromRecords(genesis, records);
   return {
     ...snapshotFromGenesis(genesis, records.length),
     ...(promptContext === undefined ? {} : { promptContext }),
+    ...(skillContext === undefined ? {} : { skillContext: skillContextSnapshot(skillContext) }),
     ...(context === undefined ? {} : { context }),
     ...(artifactInspection?.degradation === undefined
       ? {}
@@ -3258,6 +4257,33 @@ function createAgentResumeState(
     NonNullable<AgentSessionDurableContext["resume"]>["pendingToolCalls"][number]
   > = [];
   const reportedTokens = reportedTokensForRun(currentRecords, runId);
+  const explicitSkillPermissions = currentRecords.flatMap((record) =>
+    record.record.type === "runtime_event" &&
+    record.record.runId === runId &&
+    record.record.event.type === "tool_permission_decided" &&
+    record.record.event.name === "activate_skill"
+      ? [
+          {
+            requestId: record.record.event.callId,
+            decision: record.record.event.decision,
+          },
+        ]
+      : [],
+  );
+  const explicitSkills = run.record.skills ?? [];
+  const explicitSkillBatchCommitted =
+    explicitSkills.length > 0 &&
+    currentRecords.some(
+      (record) =>
+        record.record.type === "skill_activation_batch_committed" &&
+        record.record.runId === runId &&
+        record.record.outcomes.length === explicitSkills.length &&
+        record.record.outcomes.every(
+          (outcome, index) =>
+            outcome.requestId === explicitSkills[index]?.requestId &&
+            outcome.selection === explicitSkills[index]?.selection,
+        ),
+    );
   for (const responseRecord of currentRecords) {
     if (
       responseRecord.record.type !== "model_response_completed" ||
@@ -3338,20 +4364,26 @@ function createAgentResumeState(
           (candidate) =>
             candidate.sequence > responseRecord.sequence &&
             (candidate.record.type === "repository_instructions_committed" ||
-              candidate.record.type === "repository_instructions_failed") &&
+              candidate.record.type === "repository_instructions_failed" ||
+              candidate.record.type === "path_context_committed" ||
+              candidate.record.type === "path_context_failed") &&
             candidate.record.trigger?.runId === runId &&
             candidate.record.trigger.callId === call.id &&
             candidate.record.trigger.name === call.name,
         );
         const repositoryTrigger =
           repositoryRecord?.record.type === "repository_instructions_committed" ||
-          repositoryRecord?.record.type === "repository_instructions_failed"
+          repositoryRecord?.record.type === "repository_instructions_failed" ||
+          repositoryRecord?.record.type === "path_context_committed" ||
+          repositoryRecord?.record.type === "path_context_failed"
             ? repositoryRecord.record.trigger
             : undefined;
         const committedRepository =
           repositoryRecord?.record.type === "repository_instructions_committed"
             ? repositoryRecord.record.repository
-            : undefined;
+            : repositoryRecord?.record.type === "path_context_committed"
+              ? repositoryRecord.record.repository
+              : undefined;
         const repositoryRecordSequence = repositoryRecord?.sequence;
         const repositoryActivation =
           committedRepository !== undefined && repositoryTrigger !== undefined
@@ -3382,6 +4414,36 @@ function createAgentResumeState(
                 subject: permissionEvent.subject,
               }
             : undefined;
+        const committedResource = currentRecords.find(
+          (candidate) =>
+            candidate.sequence > responseRecord.sequence &&
+            candidate.record.type === "skill_resource_read_committed" &&
+            candidate.record.runId === runId &&
+            candidate.record.callId === call.id,
+        );
+        const replayResult =
+          committedResource?.record.type === "skill_resource_read_committed"
+            ? {
+                status: "completed" as const,
+                output: {
+                  qualifiedId: committedResource.record.qualifiedId,
+                  activationIndex: committedResource.record.activationIndex,
+                  catalogRevision: committedResource.record.catalogRevision,
+                  manifestRevision: committedResource.record.manifestRevision,
+                  path: committedResource.record.path,
+                  offset: committedResource.record.offset,
+                  byteCount: committedResource.record.byteCount,
+                  totalByteCount: committedResource.record.totalByteCount,
+                  eof: committedResource.record.eof,
+                  fileDigest: committedResource.record.fileDigest,
+                  pageDigest: committedResource.record.pageDigest,
+                  content: committedResource.record.content,
+                  ...(committedResource.record.executionToken === undefined
+                    ? {}
+                    : { executionToken: committedResource.record.executionToken }),
+                },
+              }
+            : undefined;
         pendingToolCalls.push({
           call,
           requested,
@@ -3391,6 +4453,7 @@ function createAgentResumeState(
             ? {}
             : { repositoryDisposition: repositoryTrigger.disposition }),
           ...(reusablePermission === undefined ? {} : { reusablePermission }),
+          ...(replayResult === undefined ? {} : { replayResult }),
         });
         continue;
       }
@@ -3407,6 +4470,12 @@ function createAgentResumeState(
     limits: run.record.limits,
     agentState: {
       runId,
+      ...(explicitSkills.length === 0 || explicitSkillBatchCommitted
+        ? {}
+        : {
+            pendingExplicitSkills: explicitSkills,
+            ...(explicitSkillPermissions.length === 0 ? {} : { explicitSkillPermissions }),
+          }),
       messages,
       nextTurn: boundaryTurn,
       nextAttempt:
@@ -3465,9 +4534,97 @@ function reportedTokensForRun(
   return combined;
 }
 
+function skillResourceBytesForRun(records: readonly SessionRecord[], runId: string): number {
+  const total = records.reduce(
+    (sum, record) =>
+      record.schemaVersion === 3 &&
+      record.record.type === "skill_resource_read_committed" &&
+      record.record.runId === runId
+        ? sum + record.record.byteCount
+        : sum,
+    0,
+  );
+  if (!Number.isSafeInteger(total) || total < 0 || total > 1024 * 1024) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return total;
+}
+
+async function skillResourceBytesFromLineage(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<number> {
+  const ownBytes = records.reduce(
+    (sum, record) =>
+      record.schemaVersion === 3 && record.record.type === "skill_resource_read_committed"
+        ? sum + record.record.byteCount
+        : sum,
+    0,
+  );
+  const inheritedBytes =
+    genesis.record.lineage === undefined
+      ? 0
+      : await (async () => {
+          const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(
+            options,
+            genesis,
+          );
+          return skillResourceBytesFromLineage(options, parentGenesis, prefixRecords);
+        })();
+  const total = inheritedBytes + ownBytes;
+  if (!Number.isSafeInteger(total) || total < 0 || total > 8 * 1024 * 1024) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return total;
+}
+
 async function canonicalProjectId(workspaceRoot: string): Promise<string> {
   const canonicalRoot = await realpath(workspaceRoot);
   return `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}`;
+}
+
+async function resolveSkillBudgetContext(
+  options: SessionLifecycleOptions,
+  targetIdentity: ModelTargetIdentity,
+): Promise<{ readonly effectiveContextTokens: number; readonly estimatorVersion: 1 }> {
+  if (options.modelTargets !== undefined) {
+    const snapshot = await options.modelTargets.snapshot({
+      includeHistoricalProfiles: true,
+      signal: new AbortController().signal,
+    });
+    const target = snapshot.targets.find((candidate) =>
+      sameModelTargetIdentity(candidate.identity, targetIdentity),
+    );
+    if (target === undefined || target.contextProfile.estimatorVersion !== 1) {
+      throw new SessionLifecycleError("session_model_target_unavailable");
+    }
+    return {
+      effectiveContextTokens: target.contextProfile.contextWindowTokens,
+      estimatorVersion: target.contextProfile.estimatorVersion,
+    };
+  }
+  return { effectiveContextTokens: 1_000_000, estimatorVersion: 1 };
+}
+
+async function resolveExtensionSkillSources(
+  options: SessionLifecycleOptions,
+): Promise<readonly ExtensionSkillSourceV1[]> {
+  if (options.extensionHost === undefined) {
+    return [];
+  }
+  const sources = await loadInternalExtensionSkillSources(options.extensionHost);
+  return sources.map((source) => ({
+    locator: {
+      source: "extension",
+      extensionId: source.extensionId,
+      packageName: source.packageName,
+      packageVersion: source.packageVersion,
+    },
+    packageRoot: source.packageRoot,
+    lifecycleRevision: source.lifecycleRevision,
+    lifecycleDigest: source.lifecycleDigest,
+  }));
 }
 
 type ModelResponseArtifactDegradation = NonNullable<CurrentSessionSnapshot["degradation"]>;
@@ -3487,6 +4644,60 @@ type ModelResponseArtifactCache = Map<string, Promise<ResolvedModelResponseArtif
 
 function createArtifactMaterializationCache(): ModelResponseArtifactCache {
   return new Map();
+}
+
+function createLazyArtifactStore(root: string): ArtifactStore {
+  let store: Promise<ArtifactStore> | undefined;
+  const resolveStore = () => {
+    store ??= createFileArtifactStore({ root });
+    return store;
+  };
+  return {
+    async write(input) {
+      return (await resolveStore()).write(input);
+    },
+    async read(id, options) {
+      return (await resolveStore()).read(id, options);
+    },
+  };
+}
+
+async function materializeActiveSkillContents(
+  options: SessionLifecycleOptions,
+  context: SkillContextRecordV1 | undefined,
+): Promise<ReadonlyMap<string, string>> {
+  const contents = new Map<string, string>();
+  if (context === undefined) {
+    return contents;
+  }
+  const root = join(effectiveSessionStateRoot(options.stateRoot), "artifacts");
+  for (const activation of context.active) {
+    let bytes: Uint8Array | undefined;
+    try {
+      bytes = await readFileArtifact({
+        root,
+        id: activation.artifact.id,
+        maximumBytes: activation.byteCount,
+      });
+    } catch {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    if (
+      bytes === undefined ||
+      bytes.byteLength !== activation.byteCount ||
+      `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== activation.skillMdDigest
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    contents.set(activation.qualifiedId, content);
+  }
+  return contents;
 }
 
 async function inspectModelResponseArtifactLineage(

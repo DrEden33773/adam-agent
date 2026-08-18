@@ -38,7 +38,8 @@ Build a lightweight, inspectable local coding agent. Make the core coding path r
 
 ## Security and effects
 
-- Resolve every filesystem operation against the trusted workspace root and reject lexical traversal, symlink escape, and cross-project session reuse.
+- Resolve every ordinary filesystem-tool operation against the trusted workspace root and reject lexical traversal, symlink escape, and cross-project session reuse.
+- The internal Skills broker may read only the exact project, user, and extension Skill roots anchored by the durable session and validated extension control plane; those reads still reject lexical traversal and symlink escape and do not broaden ordinary filesystem-tool authority.
 - Classify tools as `read`, `write`, `execute`, `network`, `delegate`, or `administrative`; deny unknown tools until classified.
 - A child Agent receives the intersection of parent permissions, role restrictions, and spawn restrictions. Never use a bypass mode for child Agents or forked Skills.
 - Plan Mode uses a runtime allow-list and denies unknown, MCP, network, write, and execute effects unless a narrowly defined read-only adapter is explicitly classified.
@@ -52,7 +53,7 @@ Build a lightweight, inspectable local coding agent. Make the core coding path r
 - Scope sessions to a canonical project identity and require an explicit override to resume from another workspace.
 - Context compaction preserves unresolved intent, tool state, permissions, Plan/Todo/Goal state, and durable artifact references.
 - Implement Agent Skills as a metadata catalog, full `SKILL.md` activation, then on-demand supporting resources.
-- Parse frontmatter with a maintained YAML library, apply deterministic scope precedence, report collisions, and enforce a catalog token budget.
+- Parse frontmatter with a maintained YAML library, use deterministic structured Skill identities instead of implicit same-name scope precedence, report collisions, and enforce a catalog token budget.
 - Skill scripts and forked Skill sessions use normal permission and sandbox controls; Skill metadata cannot grant additional tools.
 
 ## TUI and Web

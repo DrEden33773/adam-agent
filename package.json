@@ -21,6 +21,7 @@
     "test": "tsc -b && vitest run",
     "test:large-output": "ADAM_AGENT_LARGE_OUTPUT_TESTS=1 tsc -b --pretty false && ADAM_AGENT_LARGE_OUTPUT_TESTS=1 vitest run packages/testkit/src/context-compaction.test.ts -t '46.875 MiB'",
     "test:live:deepseek": "node --env-file-if-exists=.env ./node_modules/vitest/vitest.mjs run packages/testkit/src/openai-compatible-model-driver.live.test.ts",
+    "test:live:skills": "node --env-file-if-exists=.env ./node_modules/vitest/vitest.mjs run packages/testkit/src/agent-skills.live.test.ts --reporter=verbose",
     "typecheck": "tsc -b --pretty false"
   },
   "devDependencies": {

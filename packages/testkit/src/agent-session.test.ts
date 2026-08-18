@@ -3018,7 +3018,14 @@ describe("AgentSession", () => {
         first: await readFile(firstPath, "utf8"),
         second: await readFile(secondPath, "utf8"),
       }).toEqual({
-        definitions: ["read_file", "write_file", "edit_file", "run_shell"],
+        definitions: [
+          "read_file",
+          "write_file",
+          "edit_file",
+          "run_shell",
+          "activate_skill",
+          "read_skill_resource",
+        ],
         commitOrder: ["first-started", "first-released", "write-completed"],
         results: [
           { status: "completed", answer: "Mutation settled." },

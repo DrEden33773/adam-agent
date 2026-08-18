@@ -13,20 +13,22 @@ import type { RunResult, RuntimeEvent } from "./index.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import {
+  type PromptContextRecord,
   type PromptContextRecordV1,
-  promptContextRecordV1Schema,
+  promptContextRecordSchema,
   type RepositoryInstructionFailureCode,
   repositoryInstructionFailureCodesV1,
   repositoryInstructionRevisionV1Schema,
   type Sha256Digest,
 } from "./prompt-assembly.js";
+import { type SkillContextRecordV1, skillContextRecordV1Schema } from "./skills.js";
 import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from "./tool-runtime.js";
 
 export type CanonicalRuntimeEvent = Exclude<RuntimeEvent, { readonly type: "model_message_delta" }>;
 
 type V1PermissionSubject = Exclude<
   PermissionSubject,
-  { readonly type: "extension_capability" | "patch" }
+  { readonly type: "extension_capability" | "patch" | "skill" }
 >;
 type V1ToolError = {
   readonly code:
@@ -88,7 +90,8 @@ export type SessionGenesisRecord = {
     readonly sessionId: string;
     readonly projectId: string;
     readonly targetIdentity: ModelTargetIdentity;
-    readonly promptContext?: PromptContextRecordV1;
+    readonly promptContext?: PromptContextRecord;
+    readonly skillContext?: SkillContextRecordV1;
     readonly lineage?: {
       readonly parentSessionId: string;
       readonly parentEventPosition: number;
@@ -104,10 +107,161 @@ export type SessionLogicalRunStartedRecord = {
     readonly type: "logical_run_started";
     readonly runId: string;
     readonly userMessage: string;
+    readonly skills?: readonly {
+      readonly selection: string;
+      readonly requestId: string;
+    }[];
     readonly limits?: {
       readonly maxTurns?: number;
       readonly maxTokens?: number;
     };
+  };
+};
+
+export type SessionSkillActivationBatchCommittedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "skill_activation_batch_committed";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly previousActivationDigest: Sha256Digest;
+    readonly skillContext: SkillContextRecordV1;
+    readonly assemblyIdentityDigest: Sha256Digest;
+    readonly outcomes: readonly {
+      readonly selection: string;
+      readonly requestId: string;
+      readonly qualifiedId: string;
+      readonly status: "activated" | "already_selected" | "already_active";
+      readonly activationIndex: number;
+    }[];
+  };
+};
+
+export type SessionSkillActivatedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "skill_activated";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly catalogRevision: number;
+    readonly activationIndex: number;
+    readonly qualifiedId: string;
+    readonly reason: "user_explicit" | "model_selected";
+    readonly skillMdDigest: Sha256Digest;
+    readonly manifestDigest: Sha256Digest;
+  };
+};
+
+export type SessionSkillCatalogCommittedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "skill_catalog_committed";
+    readonly recordVersion: 1;
+    readonly previousRevision: number;
+    readonly previousRegistryDigest: Sha256Digest;
+    readonly skillContext: SkillContextRecordV1;
+    readonly assemblyIdentityDigest: Sha256Digest;
+    readonly reason?: "extension_reconciliation";
+  };
+};
+
+export type SessionSkillCatalogFailedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "skill_catalog_failed";
+    readonly recordVersion: 1;
+    readonly activeRevision: number;
+    readonly activeRegistryDigest: Sha256Digest;
+    readonly error: { readonly code: "skill_catalog_unavailable" };
+  };
+};
+
+export type SessionSkillRevokedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "skill_revoked";
+    readonly recordVersion: 1;
+    readonly catalogRevision: number;
+    readonly activationIndex: number;
+    readonly qualifiedId: string;
+    readonly reason: "extension_disabled";
+    readonly sourceEpoch: {
+      readonly lifecycleRevision: number;
+      readonly lifecycleDigest: Sha256Digest;
+    };
+  };
+};
+
+export type SessionPathContextCommittedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "path_context_committed";
+    readonly recordVersion: 1;
+    readonly previousRepositoryRevision: number;
+    readonly previousRepositoryDigest: Sha256Digest;
+    readonly previousSkillRevision: number;
+    readonly previousSkillRegistryDigest: Sha256Digest;
+    readonly repository: PromptContextRecordV1["repository"];
+    readonly skillContext: SkillContextRecordV1;
+    readonly assemblyIdentityDigest: Sha256Digest;
+    readonly trigger: {
+      readonly runId: string;
+      readonly callId: string;
+      readonly name: "read_file" | "write_file" | "edit_file";
+      readonly argumentsDigest: Sha256Digest;
+      readonly disposition: "read_continue" | "mutation_retry_required";
+    };
+  };
+};
+
+export type SessionPathContextFailedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "path_context_failed";
+    readonly recordVersion: 1;
+    readonly activeRepositoryRevision: number;
+    readonly activeRepositoryDigest: Sha256Digest;
+    readonly activeSkillRevision: number;
+    readonly activeSkillRegistryDigest: Sha256Digest;
+    readonly error: { readonly code: "project_context_unavailable" };
+    readonly trigger: {
+      readonly runId: string;
+      readonly callId: string;
+      readonly name: "read_file" | "write_file" | "edit_file";
+      readonly argumentsDigest: Sha256Digest;
+      readonly disposition: "unavailable";
+    };
+  };
+};
+
+export type SessionSkillResourceReadCommittedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "skill_resource_read_committed";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly callId: string;
+    readonly qualifiedId: string;
+    readonly activationIndex: number;
+    readonly catalogRevision: number;
+    readonly manifestRevision: 1;
+    readonly path: string;
+    readonly offset: number;
+    readonly byteCount: number;
+    readonly totalByteCount: number;
+    readonly eof: boolean;
+    readonly fileDigest: Sha256Digest;
+    readonly pageDigest: Sha256Digest;
+    readonly content: string;
+    readonly executionToken?: string;
   };
 };
 
@@ -328,7 +482,7 @@ export type SessionRepositoryInstructionsCommittedRecord = {
     readonly recordVersion: 1;
     readonly previousRevision: number;
     readonly previousEffectiveDigest: Sha256Digest;
-    readonly repository: PromptContextRecordV1["repository"];
+    readonly repository: PromptContextRecord["repository"];
     readonly assemblyIdentityDigest: Sha256Digest;
     readonly trigger?: {
       readonly runId: string;
@@ -362,6 +516,14 @@ export type SessionRepositoryInstructionsFailedRecord = {
 export type SessionV3Record =
   | SessionGenesisRecord
   | SessionLogicalRunStartedRecord
+  | SessionSkillActivationBatchCommittedRecord
+  | SessionSkillActivatedRecord
+  | SessionSkillCatalogCommittedRecord
+  | SessionSkillCatalogFailedRecord
+  | SessionSkillRevokedRecord
+  | SessionPathContextCommittedRecord
+  | SessionPathContextFailedRecord
+  | SessionSkillResourceReadCommittedRecord
   | SessionProviderAttemptStartedRecord
   | SessionProviderAttemptInterruptedRecord
   | SessionModelResponseCompletedRecord
@@ -427,6 +589,17 @@ const runFailureSchema: z.ZodType<RunFailure> = z.discriminatedUnion("code", [
   z.strictObject({
     code: ordinaryRunErrorCodeSchema,
     message: z.string(),
+  }),
+  z.strictObject({
+    code: z.literal("skill_activation_failed"),
+    message: z.string(),
+    ambiguity: z
+      .strictObject({
+        selection: z.string().min(1).max(16_384),
+        candidates: z.array(z.string().min(1).max(16_384)).max(8),
+        omittedCount: z.number().int().nonnegative().max(248),
+      })
+      .optional(),
   }),
   z.strictObject({
     code: z.enum(["model_resource_exhausted", "model_finish_unknown"]),
@@ -506,6 +679,14 @@ const v2ToolErrorSchema = z.discriminatedUnion("code", [
       "path_conflict",
       "repository_context_changed",
       "repository_instructions_unavailable",
+      "project_context_changed",
+      "project_context_unavailable",
+      "skill_unavailable",
+      "skill_resource_unavailable",
+      "skill_resource_changed",
+      "unsupported_binary_resource",
+      "resource_page_too_small",
+      "skill_resource_quota_exceeded",
       "artifact_store_failed",
       "shell_start_failed",
       "tool_effect_indeterminate",
@@ -595,11 +776,22 @@ const extensionCapabilityPermissionSubjectSchema = z.strictObject({
     .refine((version) => valid(version) !== null),
   operationId: z.uuid(),
 });
+const skillPermissionSubjectSchema = z.strictObject({
+  type: z.literal("skill"),
+  operation: z.enum(["activate", "read_resource"]),
+  qualifiedId: z
+    .string()
+    .min(1)
+    .max(16_384)
+    .refine((value) => /^[\x20-\x7e]+$/u.test(value)),
+  path: z.string().min(1).max(4_096).optional(),
+});
 const v2PermissionSubjectSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("file"), path: z.string() }),
   z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
   extensionCapabilityPermissionSubjectSchema,
   patchPermissionSubjectSchema,
+  skillPermissionSubjectSchema,
   z.strictObject({
     type: z.literal("command"),
     command: z.string(),
@@ -880,7 +1072,8 @@ const sessionV3RecordSchema = z.union([
     sessionId: z.uuid(),
     projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
     targetIdentity: modelTargetIdentitySchema,
-    promptContext: promptContextRecordV1Schema.optional(),
+    promptContext: promptContextRecordSchema.optional(),
+    skillContext: skillContextRecordV1Schema.optional(),
     lineage: z
       .strictObject({
         parentSessionId: z.uuid(),
@@ -893,7 +1086,144 @@ const sessionV3RecordSchema = z.union([
     type: z.literal("logical_run_started"),
     runId: z.uuid(),
     userMessage: z.string().max(512 * 1024),
+    skills: z
+      .array(
+        z.strictObject({
+          selection: z
+            .string()
+            .min(1)
+            .max(16_384)
+            .refine((value) => /^[\x20-\x7e]+$/u.test(value)),
+          requestId: z.string().min(1).max(256),
+        }),
+      )
+      .max(8)
+      .optional(),
     limits: sessionRunLimitsSchema.optional(),
+  }),
+  z.strictObject({
+    type: z.literal("skill_activation_batch_committed"),
+    recordVersion: z.literal(1),
+    runId: z.uuid(),
+    previousActivationDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    skillContext: skillContextRecordV1Schema,
+    assemblyIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    outcomes: z
+      .array(
+        z.strictObject({
+          selection: z
+            .string()
+            .min(1)
+            .max(16_384)
+            .refine((value) => /^[\x20-\x7e]+$/u.test(value)),
+          requestId: z.string().min(1).max(512),
+          qualifiedId: z.string().min(1).max(16_384),
+          status: z.enum(["activated", "already_selected", "already_active"]),
+          activationIndex: z.number().int().positive().max(256),
+        }),
+      )
+      .min(1)
+      .max(8),
+  }),
+  z.strictObject({
+    type: z.literal("skill_activated"),
+    recordVersion: z.literal(1),
+    runId: z.uuid(),
+    catalogRevision: z.number().int().positive(),
+    activationIndex: z.number().int().positive().max(256),
+    qualifiedId: z.string().min(1).max(16_384),
+    reason: z.enum(["user_explicit", "model_selected"]),
+    skillMdDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    manifestDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  }),
+  z.strictObject({
+    type: z.literal("skill_catalog_committed"),
+    recordVersion: z.literal(1),
+    previousRevision: z.number().int().positive(),
+    previousRegistryDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    skillContext: skillContextRecordV1Schema,
+    assemblyIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    reason: z.literal("extension_reconciliation").optional(),
+  }),
+  z.strictObject({
+    type: z.literal("skill_catalog_failed"),
+    recordVersion: z.literal(1),
+    activeRevision: z.number().int().positive(),
+    activeRegistryDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    error: z.strictObject({ code: z.literal("skill_catalog_unavailable") }),
+  }),
+  z.strictObject({
+    type: z.literal("skill_revoked"),
+    recordVersion: z.literal(1),
+    catalogRevision: z.number().int().positive(),
+    activationIndex: z.number().int().positive().max(256),
+    qualifiedId: z.string().min(1).max(16_384),
+    reason: z.literal("extension_disabled"),
+    sourceEpoch: z.strictObject({
+      lifecycleRevision: z.number().int().nonnegative(),
+      lifecycleDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    }),
+  }),
+  z.strictObject({
+    type: z.literal("path_context_committed"),
+    recordVersion: z.literal(1),
+    previousRepositoryRevision: z.number().int().positive(),
+    previousRepositoryDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    previousSkillRevision: z.number().int().positive(),
+    previousSkillRegistryDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    repository: repositoryInstructionRevisionV1Schema,
+    skillContext: skillContextRecordV1Schema,
+    assemblyIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    trigger: z.strictObject({
+      runId: z.uuid(),
+      callId: z.string().min(1).max(256),
+      name: z.enum(["read_file", "write_file", "edit_file"]),
+      argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+      disposition: z.enum(["read_continue", "mutation_retry_required"]),
+    }),
+  }),
+  z.strictObject({
+    type: z.literal("path_context_failed"),
+    recordVersion: z.literal(1),
+    activeRepositoryRevision: z.number().int().positive(),
+    activeRepositoryDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    activeSkillRevision: z.number().int().positive(),
+    activeSkillRegistryDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    error: z.strictObject({ code: z.literal("project_context_unavailable") }),
+    trigger: z.strictObject({
+      runId: z.uuid(),
+      callId: z.string().min(1).max(256),
+      name: z.enum(["read_file", "write_file", "edit_file"]),
+      argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+      disposition: z.literal("unavailable"),
+    }),
+  }),
+  z.strictObject({
+    type: z.literal("skill_resource_read_committed"),
+    recordVersion: z.literal(1),
+    runId: z.uuid(),
+    callId: z.string().min(1).max(256),
+    qualifiedId: z.string().min(1).max(16_384),
+    activationIndex: z.number().int().positive().max(256),
+    catalogRevision: z.number().int().positive(),
+    manifestRevision: z.literal(1),
+    path: z.string().min(1).max(4_096),
+    offset: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(8 * 1024 * 1024),
+    byteCount: z.number().int().nonnegative().max(65_536),
+    totalByteCount: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(8 * 1024 * 1024),
+    eof: z.boolean(),
+    fileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    pageDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    content: z.string().max(65_536),
+    executionToken: z.string().max(16_384).optional(),
   }),
   z.strictObject({
     type: z.literal("provider_attempt_started"),

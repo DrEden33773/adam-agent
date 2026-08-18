@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { isDeepStrictEqual } from "node:util";
 import type { ArtifactStore, ModelResponseArtifactSource } from "./artifact-store.js";
 import { type ContextProfile, resolveOrdinaryMaximumOutputTokens } from "./context-profile.js";
@@ -30,8 +31,11 @@ import {
   digestPromptRequestV1,
   estimatePromptTokensV1,
   isPromptContextRecordCompatible,
+  type PromptContextRecord,
   type PromptContextRecordV1,
+  type PromptContextRecordV2,
   replacePromptRepositoryV1,
+  replacePromptSkillsV2,
 } from "./prompt-assembly.js";
 import {
   loadRepositoryInstructions,
@@ -43,6 +47,16 @@ import {
   sessionDurableContext,
   sessionDurableOutputLimits,
 } from "./session-durable-context.js";
+import {
+  activateSkillContextV1,
+  buildSkillResourceManifestV1,
+  type ExtensionSkillSourceV1,
+  extendSkillContextWithProjectScopesV1,
+  readSkillResourcePageV1,
+  type SkillContextRecordV1,
+  SkillResourceError,
+  SkillsError,
+} from "./skills.js";
 
 export {
   type ArtifactReference,
@@ -177,6 +191,7 @@ export {
 
 export type UserInput = {
   readonly text: string;
+  readonly skills?: readonly string[];
 };
 
 export type RunOptions = {
@@ -281,6 +296,17 @@ export type RunResult =
               | "context_compaction_invalid"
               | "context_window_unrecoverable";
             readonly message: string;
+          }
+        | {
+            readonly code: "skill_activation_failed";
+            readonly message: string;
+            readonly ambiguity?:
+              | {
+                  readonly selection: string;
+                  readonly candidates: readonly string[];
+                  readonly omittedCount: number;
+                }
+              | undefined;
           }
         | {
             readonly code: "model_resource_exhausted" | "model_finish_unknown";
@@ -467,7 +493,9 @@ export class AgentSession {
   readonly #model: ModelDriver;
   readonly #tools: ToolRegistry | undefined;
   readonly #permissions: PermissionPolicy | undefined;
-  #promptContext: PromptContextRecordV1 | undefined;
+  #promptContext: PromptContextRecord | undefined;
+  #skillContext: SkillContextRecordV1 | undefined;
+  readonly #activeSkillContents = new Map<string, string>();
   readonly #repositoryWorkspaceRoot: string | undefined;
   readonly #durableContext: AgentSessionDurableContext | undefined;
   readonly #durableOutputLimits: Required<AgentSessionDurableOutputLimits>;
@@ -488,6 +516,8 @@ export class AgentSession {
     | { readonly sequence: number; readonly artifactBacked: boolean }
     | undefined;
   #referencedModelResponseArtifactBytes: number;
+  #skillResourceRunBytes: number;
+  #skillResourceLineageBytes: number;
   #pendingPermission:
     | {
         readonly requestId: string;
@@ -523,6 +553,8 @@ export class AgentSession {
     }
     this.#referencedModelResponseArtifactBytes =
       this.#durableContext?.referencedModelResponseArtifactBytes ?? 0;
+    this.#skillResourceRunBytes = this.#durableContext?.skillResourceRunBytes ?? 0;
+    this.#skillResourceLineageBytes = this.#durableContext?.skillResourceLineageBytes ?? 0;
     this.#contextProfile = dependencies.contextProfile;
     const maximumOutputTokens =
       dependencies.contextProfile?.maximumOutputTokens ?? dependencies.maximumOutputTokens;
@@ -531,22 +563,40 @@ export class AgentSession {
     }
     this.#maximumOutputTokens = maximumOutputTokens;
     this.#model = dependencies.model;
-    const usesPromptProfileV1 =
-      this.#durableContext === undefined || this.#durableContext.promptContext !== undefined;
-    this.#tools = usesPromptProfileV1
-      ? captureToolRegistry(dependencies.tools)
-      : dependencies.tools;
+    const durablePromptContext = this.#durableContext?.promptContext;
+    const selectedToolNames =
+      durablePromptContext?.recordVersion === 2
+        ? undefined
+        : durablePromptContext?.recordVersion === 1
+          ? durablePromptContext.toolProfile.definitions.map((definition) => definition.name)
+          : ["read_file", "write_file", "edit_file", "run_shell"];
+    this.#tools =
+      this.#durableContext !== undefined && durablePromptContext === undefined
+        ? filterLiveToolRegistry(dependencies.tools, [
+            "read_file",
+            "write_file",
+            "edit_file",
+            "run_shell",
+          ])
+        : captureToolRegistry(dependencies.tools, selectedToolNames);
     this.#permissions = dependencies.permissions;
     this.#promptContext =
       this.#durableContext === undefined
         ? createPromptContextV1(this.#tools)
         : this.#durableContext.promptContext;
+    this.#skillContext = this.#durableContext?.skillContext;
+    for (const [qualifiedId, content] of this.#durableContext?.activeSkillContents ?? []) {
+      this.#activeSkillContents.set(qualifiedId, content);
+    }
     this.#repositoryWorkspaceRoot = this.#durableContext?.repositoryWorkspaceRoot;
     if (
       this.#promptContext !== undefined &&
       !isPromptContextRecordCompatible(this.#promptContext, this.#tools)
     ) {
       throw new TypeError("The exact recorded prompt and tool profile is not supported.");
+    }
+    if ((this.#promptContext?.recordVersion === 2) !== (this.#skillContext !== undefined)) {
+      throw new TypeError("The exact recorded Skill profile is not supported.");
     }
     this.#hasUncheckpointedInheritedMessages = this.#durableContext?.hasInheritedMessages === true;
     this.#store = dependencies.store as unknown as SessionStore<SessionRecord>;
@@ -598,6 +648,15 @@ export class AgentSession {
         },
       };
     }
+    if (!areSkillSelectionsValid(input.skills)) {
+      return {
+        status: "failed",
+        error: {
+          code: "skill_activation_failed",
+          message: "Explicit Skill selections must be a bounded list of nonempty ASCII handles.",
+        },
+      };
+    }
     if (this.#activeAbortController !== undefined) {
       return {
         status: "failed",
@@ -619,6 +678,10 @@ export class AgentSession {
     this.#activeAbortController = abortController;
     try {
       try {
+        const explicitSkills = (input.skills ?? []).map((selection, index) => ({
+          selection,
+          requestId: `${this.#activeRunId}:skill:${index + 1}`,
+        }));
         if (this.#durableContext !== undefined && this.#durableContext.resume === undefined) {
           await this.#appendRecord({
             schemaVersion: 3,
@@ -627,11 +690,12 @@ export class AgentSession {
               type: "logical_run_started",
               runId: this.#activeRunId,
               userMessage: input.text,
+              ...(explicitSkills.length === 0 ? {} : { skills: explicitSkills }),
               ...(options.limits === undefined ? {} : { limits: options.limits }),
             },
           });
         }
-        return await this.#run(input, abortController.signal, options.limits);
+        return await this.#run(input, abortController.signal, options.limits, explicitSkills);
       } catch (error) {
         if (abortController.signal.aborted && this.#terminalResult === undefined) {
           return await this.#settleCancelled();
@@ -668,12 +732,31 @@ export class AgentSession {
     input: UserInput,
     signal: AbortSignal,
     limits: RunOptions["limits"],
+    explicitSkills: readonly { readonly selection: string; readonly requestId: string }[],
   ): Promise<RunResult> {
     const resume = this.#durableContext?.resume;
     if (resume === undefined) {
       await this.#emit({ type: "user_message", text: input.text });
       if (signal.aborted) {
         return this.#settleCancelled();
+      }
+      const activationFailure = await this.#activateExplicitSkills(explicitSkills, signal);
+      if (activationFailure !== undefined) {
+        return this.#settle(activationFailure);
+      }
+    } else if ((resume.pendingExplicitSkills?.length ?? 0) > 0) {
+      const activationFailure = await this.#activateExplicitSkills(
+        resume.pendingExplicitSkills ?? [],
+        signal,
+        new Map(
+          (resume.explicitSkillPermissions ?? []).map((permission) => [
+            permission.requestId,
+            permission.decision,
+          ]),
+        ),
+      );
+      if (activationFailure !== undefined) {
+        return this.#settle(activationFailure);
       }
     }
     const messages: ModelMessage[] =
@@ -707,6 +790,12 @@ export class AgentSession {
     }
 
     for (const pending of resume?.pendingToolCalls ?? []) {
+      if (pending.replayResult !== undefined) {
+        toolResultsById.set(pending.call.id, {
+          call: pending.call,
+          result: pending.replayResult,
+        });
+      }
       const terminal = await this.#dispatchToolCall({
         call: pending.call,
         emitRequested: !pending.requested,
@@ -823,31 +912,47 @@ export class AgentSession {
       }
       const attemptNumber = nextAttemptNumber;
       if (this.#durableContext !== undefined) {
-        await this.#appendRecord({
-          schemaVersion: 3,
-          sequence: this.#nextSequence,
-          record: {
-            type: "provider_attempt_started",
+        const targetIdentity = this.#durableContext.targetIdentity;
+        const appendAttempt = async () => {
+          await this.#appendRecord({
+            schemaVersion: 3,
+            sequence: this.#nextSequence,
+            record: {
+              type: "provider_attempt_started",
+              runId: this.#activeRunId as string,
+              turn: modelTurns,
+              attempt: attemptNumber,
+              targetIdentity,
+              ...(this.#promptContext === undefined
+                ? {}
+                : {
+                    promptProjection: {
+                      version: 1 as const,
+                      assemblyIdentityDigest: this.#promptContext.assemblyIdentityDigest,
+                      requestProjectionDigest: digestPromptRequestV1(requestMessages, requestTools),
+                    },
+                  }),
+            },
+          });
+          this.#activeProviderAttempt = {
             runId: this.#activeRunId as string,
             turn: modelTurns,
             attempt: attemptNumber,
-            targetIdentity: this.#durableContext.targetIdentity,
-            ...(this.#promptContext === undefined
-              ? {}
-              : {
-                  promptProjection: {
-                    version: 1 as const,
-                    assemblyIdentityDigest: this.#promptContext.assemblyIdentityDigest,
-                    requestProjectionDigest: digestPromptRequestV1(requestMessages, requestTools),
-                  },
-                }),
-          },
-        });
-        this.#activeProviderAttempt = {
-          runId: this.#activeRunId as string,
-          turn: modelTurns,
-          attempt: attemptNumber,
+          };
         };
+        const attemptCommitted =
+          this.#skillContext === undefined
+            ? { status: "current" as const, value: await appendAttempt() }
+            : await this.#withCurrentExtensionSkills(
+                this.#skillContext,
+                this.#skillContext.active.map((activation) => activation.qualifiedId),
+                appendAttempt,
+              );
+        if (attemptCommitted.status === "stale") {
+          return this.#settle(
+            skillActivationFailure("An active extension Agent Skill became unavailable."),
+          );
+        }
       }
       await this.#emit({ type: "model_message_started" });
       if (signal.aborted) {
@@ -1259,7 +1364,12 @@ export class AgentSession {
   #assemblePromptMessages(transcript: readonly ModelMessage[]): readonly ModelMessage[] {
     return this.#promptContext === undefined
       ? [...transcript]
-      : assemblePromptMessagesV1(transcript, this.#promptContext);
+      : assemblePromptMessagesV1(
+          transcript,
+          this.#promptContext,
+          this.#skillContext,
+          this.#activeSkillContents,
+        );
   }
 
   #estimatePromptTokens(
@@ -1619,6 +1729,303 @@ export class AgentSession {
     throw new TypeError("Context compaction attempt accounting was exhausted.");
   }
 
+  #extensionSourcesForSkills(
+    context: SkillContextRecordV1,
+    qualifiedIds: readonly string[],
+  ): readonly ExtensionSkillSourceV1[] | undefined {
+    const sources: ExtensionSkillSourceV1[] = [];
+    for (const qualifiedId of qualifiedIds) {
+      const candidate = context.registry.candidates.find(
+        (entry) => entry.qualifiedId === qualifiedId,
+      );
+      if (candidate?.locator.source !== "extension") {
+        continue;
+      }
+      const locator = candidate.locator;
+      const source = this.#durableContext?.extensionSkillSources?.find(
+        (entry) =>
+          entry.locator.extensionId === locator.extensionId &&
+          entry.locator.packageName === locator.packageName &&
+          entry.locator.packageVersion === locator.packageVersion &&
+          entry.lifecycleRevision === candidate.sourceEpoch?.lifecycleRevision &&
+          entry.lifecycleDigest === candidate.sourceEpoch?.lifecycleDigest,
+      );
+      if (source === undefined) {
+        return undefined;
+      }
+      if (!sources.includes(source)) {
+        sources.push(source);
+      }
+    }
+    return sources;
+  }
+
+  async #withCurrentExtensionSkills<T>(
+    context: SkillContextRecordV1,
+    qualifiedIds: readonly string[],
+    operation: () => Promise<T>,
+  ): Promise<{ readonly status: "current"; readonly value: T } | { readonly status: "stale" }> {
+    const sources = this.#extensionSourcesForSkills(context, qualifiedIds);
+    if (sources === undefined) {
+      return { status: "stale" };
+    }
+    if (sources.length === 0) {
+      return { status: "current", value: await operation() };
+    }
+    const guard = this.#durableContext?.withCurrentExtensionSkillSources;
+    return guard === undefined ? { status: "stale" } : guard(sources, operation);
+  }
+
+  async #activateExplicitSkills(
+    selections: readonly { readonly selection: string; readonly requestId: string }[],
+    signal: AbortSignal,
+    reusablePermissions = new Map<string, "allow" | "deny">(),
+  ): Promise<Extract<RunResult, { readonly status: "failed" }> | undefined> {
+    if (selections.length === 0) {
+      return undefined;
+    }
+    const skillContext = this.#skillContext;
+    const promptContext = this.#promptContext;
+    const runId = this.#activeRunId;
+    if (skillContext === undefined || promptContext?.recordVersion !== 2 || runId === undefined) {
+      return skillActivationFailure("Agent Skills are unavailable in this session.");
+    }
+    const resolved: Array<{
+      readonly selection: string;
+      readonly qualifiedId: string;
+      readonly requestId: string;
+    }> = [];
+    const resolvedSelections: Array<{
+      readonly selection: string;
+      readonly qualifiedId: string;
+      readonly requestId: string;
+      readonly duplicate: boolean;
+    }> = [];
+    const seen = new Set<string>();
+    for (const [index, persistedSelection] of selections.entries()) {
+      const { selection, requestId } = persistedSelection;
+      if (requestId !== `${runId}:skill:${index + 1}`) {
+        return skillActivationFailure("Explicit Agent Skill selection identity is invalid.");
+      }
+      const exact = skillContext.registry.candidates.find(
+        (candidate) => candidate.qualifiedId === selection,
+      );
+      const shortMatches = skillContext.registry.candidates.filter(
+        (candidate) => candidate.name === selection,
+      );
+      if (exact === undefined && shortMatches.length > 1) {
+        const candidates = shortMatches.slice(0, 8).map((candidate) => candidate.qualifiedId);
+        return skillActivationFailure("The explicit Agent Skill name is ambiguous.", {
+          selection,
+          candidates,
+          omittedCount: shortMatches.length - candidates.length,
+        });
+      }
+      const candidate = exact ?? (shortMatches.length === 1 ? shortMatches[0] : undefined);
+      if (candidate === undefined) {
+        return skillActivationFailure("One explicit Agent Skill selection is unavailable.");
+      }
+      const duplicate = seen.has(candidate.qualifiedId);
+      resolvedSelections.push({
+        selection,
+        qualifiedId: candidate.qualifiedId,
+        requestId,
+        duplicate,
+      });
+      if (duplicate) {
+        continue;
+      }
+      seen.add(candidate.qualifiedId);
+      resolved.push({
+        selection,
+        qualifiedId: candidate.qualifiedId,
+        requestId,
+      });
+    }
+    let stagedContext = skillContext;
+    const stagedContents = new Map(this.#activeSkillContents);
+    for (const selection of resolved) {
+      if (stagedContext.active.some((entry) => entry.qualifiedId === selection.qualifiedId)) {
+        continue;
+      }
+      let activation: ReturnType<typeof activateSkillContextV1>;
+      try {
+        const candidate = stagedContext.registry.candidates.find(
+          (entry) => entry.qualifiedId === selection.qualifiedId,
+        );
+        if (candidate === undefined || this.#repositoryWorkspaceRoot === undefined) {
+          return skillActivationFailure("Explicit Agent Skill content is unavailable.");
+        }
+        const manifest = await buildSkillResourceManifestV1({
+          candidate,
+          workspaceRoot: this.#repositoryWorkspaceRoot,
+          userHome: homedir(),
+          userHomeDigest: stagedContext.userHomeDigest,
+          ...(this.#durableContext?.extensionSkillSources === undefined
+            ? {}
+            : { extensionSources: this.#durableContext.extensionSkillSources }),
+        });
+        activation = activateSkillContextV1({
+          context: stagedContext,
+          qualifiedId: selection.qualifiedId,
+          reason: "user_explicit",
+          runId,
+          requestId: selection.requestId,
+          manifest,
+        });
+      } catch (error) {
+        if (error instanceof SkillsError) {
+          return skillActivationFailure("Explicit Agent Skill activation exceeds its limits.");
+        }
+        throw error;
+      }
+      const bytes = await this.#artifactStore?.read(activation.activation.artifact.id, {
+        maximumBytes: activation.activation.byteCount,
+      });
+      if (
+        bytes === undefined ||
+        bytes.byteLength !== activation.activation.byteCount ||
+        `sha256:${createHash("sha256").update(bytes).digest("hex")}` !==
+          activation.activation.skillMdDigest
+      ) {
+        return skillActivationFailure("Explicit Agent Skill content is unavailable.");
+      }
+      let content: string;
+      try {
+        content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      } catch {
+        return skillActivationFailure("Explicit Agent Skill content is invalid.");
+      }
+      stagedContext = activation.context;
+      stagedContents.set(selection.qualifiedId, content);
+    }
+    const newActivationIds = new Set(
+      stagedContext.active
+        .slice(skillContext.active.length)
+        .map((activation) => activation.qualifiedId),
+    );
+    for (const selection of resolved) {
+      if (!newActivationIds.has(selection.qualifiedId)) {
+        continue;
+      }
+      const permissionInput: PermissionPolicyInput = {
+        callId: selection.requestId,
+        name: "activate_skill",
+        effect: "read",
+        scope: "call",
+        subject: {
+          type: "skill",
+          operation: "activate",
+          qualifiedId: selection.qualifiedId,
+        },
+      };
+      const policyDecision = this.#permissions?.decide(permissionInput) ?? "deny";
+      let decision: "allow" | "deny";
+      const reusableDecision = reusablePermissions.get(selection.requestId);
+      if (reusableDecision !== undefined && policyDecision !== "deny") {
+        decision = reusableDecision;
+      } else if (policyDecision === "ask") {
+        const pendingDecision = this.#createPendingPermissionDecision(selection.requestId, signal);
+        try {
+          await this.#emit({
+            type: "tool_permission_requested",
+            requestId: selection.requestId,
+            ...permissionInput,
+          });
+          const userDecision = await pendingDecision.promise;
+          if (userDecision === undefined) {
+            return skillActivationFailure("Explicit Agent Skill activation was cancelled.");
+          }
+          decision = userDecision;
+          await this.#emit({
+            type: "tool_permission_decided",
+            requestId: selection.requestId,
+            decision,
+            ...permissionInput,
+          });
+        } finally {
+          pendingDecision.cancel();
+        }
+      } else {
+        decision = policyDecision;
+        await this.#emit({ type: "tool_permission_decided", decision, ...permissionInput });
+      }
+      if (decision !== "allow") {
+        return skillActivationFailure("Explicit Agent Skill activation was denied.");
+      }
+    }
+    const outcomes = resolvedSelections.map((selection) => {
+      const activation = stagedContext.active.find(
+        (entry) => entry.qualifiedId === selection.qualifiedId,
+      );
+      if (activation === undefined) {
+        throw new SkillsError("skill_catalog_unavailable");
+      }
+      return {
+        selection: selection.selection,
+        requestId: selection.requestId,
+        qualifiedId: selection.qualifiedId,
+        status: selection.duplicate
+          ? ("already_selected" as const)
+          : skillContext.active.some((entry) => entry.qualifiedId === selection.qualifiedId)
+            ? ("already_active" as const)
+            : ("activated" as const),
+        activationIndex: activation.activationIndex,
+      };
+    });
+    const nextPromptContext = replacePromptSkillsV2(
+      promptContext as PromptContextRecordV2,
+      stagedContext,
+    );
+    const newActivations = stagedContext.active.slice(skillContext.active.length);
+    const committed = await this.#withCurrentExtensionSkills(
+      stagedContext,
+      stagedContext.active.map((activation) => activation.qualifiedId),
+      async () => {
+        await this.#appendRecord({
+          schemaVersion: 3,
+          sequence: this.#nextSequence,
+          record: {
+            type: "skill_activation_batch_committed",
+            recordVersion: 1,
+            runId,
+            previousActivationDigest: skillContext.activationDigest,
+            skillContext: stagedContext,
+            assemblyIdentityDigest: nextPromptContext.assemblyIdentityDigest,
+            outcomes,
+          },
+        });
+        for (const activation of newActivations) {
+          await this.#appendRecord({
+            schemaVersion: 3,
+            sequence: this.#nextSequence,
+            record: {
+              type: "skill_activated",
+              recordVersion: 1,
+              runId,
+              catalogRevision: activation.catalogRevision,
+              activationIndex: activation.activationIndex,
+              qualifiedId: activation.qualifiedId,
+              reason: activation.reason,
+              skillMdDigest: activation.skillMdDigest,
+              manifestDigest: activation.manifest.digest,
+            },
+          });
+        }
+      },
+    );
+    if (committed.status === "stale") {
+      return skillActivationFailure("Explicit Agent Skill content is unavailable.");
+    }
+    this.#skillContext = stagedContext;
+    this.#promptContext = nextPromptContext;
+    this.#activeSkillContents.clear();
+    for (const [qualifiedId, content] of stagedContents) {
+      this.#activeSkillContents.set(qualifiedId, content);
+    }
+    return undefined;
+  }
+
   async #dispatchToolCall(options: {
     readonly call: ToolCall;
     readonly emitRequested: boolean;
@@ -1650,21 +2057,29 @@ export class AgentSession {
       options.repositoryDisposition === "mutation_retry_required" ||
       options.repositoryDisposition === "unavailable"
     ) {
+      const combinedProjectContext = this.#promptContext?.recordVersion === 2;
       const result: Extract<ToolResult, { readonly status: "failed" }> =
         options.repositoryDisposition === "mutation_retry_required"
           ? {
               status: "failed",
               error: {
-                code: "repository_context_changed",
-                message:
-                  "Repository instructions changed; reconsider this mutation with a new call ID.",
+                code: combinedProjectContext
+                  ? "project_context_changed"
+                  : "repository_context_changed",
+                message: combinedProjectContext
+                  ? "Project path context changed; reconsider this mutation with a new call ID."
+                  : "Repository instructions changed; reconsider this mutation with a new call ID.",
               },
             }
           : {
               status: "failed",
               error: {
-                code: "repository_instructions_unavailable",
-                message: "Repository instructions for the requested path are unavailable.",
+                code: combinedProjectContext
+                  ? "project_context_unavailable"
+                  : "repository_instructions_unavailable",
+                message: combinedProjectContext
+                  ? "Project path context could not be loaded safely."
+                  : "Repository instructions for the requested path are unavailable.",
               },
             };
       toolResultsById.set(call.id, { call, result });
@@ -1702,6 +2117,25 @@ export class AgentSession {
     if (preparedCall.status === "failed") {
       toolResultsById.set(call.id, { call, result: preparedCall });
       await this.#appendToolResult(messages, call, preparedCall);
+      return undefined;
+    }
+    const preparedPermissionSubject = preparedCall.permissionSubject;
+    const visibleModelSkillSelection =
+      preparedPermissionSubject.type === "skill" &&
+      preparedPermissionSubject.operation === "activate" &&
+      this.#skillContext?.catalog.entries.some(
+        (entry) => entry.qualifiedId === preparedPermissionSubject.qualifiedId,
+      );
+    if (call.name === "activate_skill" && visibleModelSkillSelection !== true) {
+      const result: ToolResult = {
+        status: "failed",
+        error: {
+          code: "skill_unavailable",
+          message: "The requested Agent Skill is unavailable in the visible catalog.",
+        },
+      };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
       return undefined;
     }
     const repositoryPreflight = await this.#preflightRepositoryInstructions(
@@ -1779,10 +2213,323 @@ export class AgentSession {
     if (signal.aborted) {
       return this.#settleCancelled();
     }
-    const result = await preparedCall.execute({ signal, callId: call.id, toolName: call.name });
+    const result =
+      call.name === "activate_skill"
+        ? await this.#activateModelSelectedSkill(call)
+        : call.name === "read_skill_resource"
+          ? await this.#readSkillResource(call)
+          : await preparedCall.execute({ signal, callId: call.id, toolName: call.name });
     toolResultsById.set(call.id, { call, result });
     await this.#appendToolResult(messages, call, result);
     return undefined;
+  }
+
+  async #activateModelSelectedSkill(call: ToolCall): Promise<ToolResult> {
+    const skillContext = this.#skillContext;
+    const promptContext = this.#promptContext;
+    const runId = this.#activeRunId;
+    let qualifiedId: string | undefined;
+    try {
+      const parsed = JSON.parse(call.argumentsJson) as unknown;
+      if (
+        typeof parsed === "object" &&
+        parsed !== null &&
+        !Array.isArray(parsed) &&
+        Object.keys(parsed).length === 1 &&
+        typeof (parsed as { qualifiedId?: unknown }).qualifiedId === "string"
+      ) {
+        qualifiedId = (parsed as { qualifiedId: string }).qualifiedId;
+      }
+    } catch {
+      qualifiedId = undefined;
+    }
+    if (
+      qualifiedId === undefined ||
+      skillContext === undefined ||
+      promptContext?.recordVersion !== 2 ||
+      runId === undefined ||
+      !skillContext.catalog.entries.some((entry) => entry.qualifiedId === qualifiedId)
+    ) {
+      return {
+        status: "failed",
+        error: {
+          code: "skill_unavailable",
+          message: "The requested Agent Skill is unavailable in the visible catalog.",
+        },
+      };
+    }
+    const existing = skillContext.active.find((entry) => entry.qualifiedId === qualifiedId);
+    if (existing !== undefined) {
+      return {
+        status: "completed",
+        output: {
+          status: "already_active",
+          qualifiedId,
+          activationIndex: existing.activationIndex,
+        },
+      };
+    }
+    let activation: ReturnType<typeof activateSkillContextV1>;
+    try {
+      const candidate = skillContext.registry.candidates.find(
+        (entry) => entry.qualifiedId === qualifiedId,
+      );
+      if (candidate === undefined || this.#repositoryWorkspaceRoot === undefined) {
+        throw new SkillsError("skill_catalog_unavailable");
+      }
+      const manifest = await buildSkillResourceManifestV1({
+        candidate,
+        workspaceRoot: this.#repositoryWorkspaceRoot,
+        userHome: homedir(),
+        userHomeDigest: skillContext.userHomeDigest,
+        ...(this.#durableContext?.extensionSkillSources === undefined
+          ? {}
+          : { extensionSources: this.#durableContext.extensionSkillSources }),
+      });
+      activation = activateSkillContextV1({
+        context: skillContext,
+        qualifiedId,
+        reason: "model_selected",
+        runId,
+        requestId: call.id,
+        manifest,
+      });
+    } catch (error) {
+      if (error instanceof SkillsError) {
+        return {
+          status: "failed",
+          error: {
+            code: "skill_unavailable",
+            message: "The Agent Skill activation limits would be exceeded.",
+          },
+        };
+      }
+      throw error;
+    }
+    const bytes = await this.#artifactStore?.read(activation.activation.artifact.id, {
+      maximumBytes: activation.activation.byteCount,
+    });
+    if (
+      bytes === undefined ||
+      bytes.byteLength !== activation.activation.byteCount ||
+      `sha256:${createHash("sha256").update(bytes).digest("hex")}` !==
+        activation.activation.skillMdDigest
+    ) {
+      return {
+        status: "failed",
+        error: {
+          code: "skill_unavailable",
+          message: "The requested Agent Skill content is unavailable.",
+        },
+      };
+    }
+    let content: string;
+    try {
+      content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      return {
+        status: "failed",
+        error: {
+          code: "skill_unavailable",
+          message: "The requested Agent Skill content is invalid.",
+        },
+      };
+    }
+    const nextPromptContext = replacePromptSkillsV2(promptContext, activation.context);
+    const committed = await this.#withCurrentExtensionSkills(
+      activation.context,
+      activation.context.active.map((entry) => entry.qualifiedId),
+      async () => {
+        await this.#appendRecord({
+          schemaVersion: 3,
+          sequence: this.#nextSequence,
+          record: {
+            type: "skill_activation_batch_committed",
+            recordVersion: 1,
+            runId,
+            previousActivationDigest: skillContext.activationDigest,
+            skillContext: activation.context,
+            assemblyIdentityDigest: nextPromptContext.assemblyIdentityDigest,
+            outcomes: [
+              {
+                selection: qualifiedId,
+                requestId: call.id,
+                qualifiedId,
+                status: "activated",
+                activationIndex: activation.activation.activationIndex,
+              },
+            ],
+          },
+        });
+        await this.#appendRecord({
+          schemaVersion: 3,
+          sequence: this.#nextSequence,
+          record: {
+            type: "skill_activated",
+            recordVersion: 1,
+            runId,
+            catalogRevision: activation.activation.catalogRevision,
+            activationIndex: activation.activation.activationIndex,
+            qualifiedId: activation.activation.qualifiedId,
+            reason: activation.activation.reason,
+            skillMdDigest: activation.activation.skillMdDigest,
+            manifestDigest: activation.activation.manifest.digest,
+          },
+        });
+      },
+    );
+    if (committed.status === "stale") {
+      return {
+        status: "failed",
+        error: {
+          code: "skill_unavailable",
+          message: "The requested Agent Skill content is unavailable.",
+        },
+      };
+    }
+    this.#skillContext = activation.context;
+    this.#promptContext = nextPromptContext;
+    this.#activeSkillContents.set(qualifiedId, content);
+    return {
+      status: "completed",
+      output: {
+        status: "activated",
+        qualifiedId,
+        activationIndex: activation.activation.activationIndex,
+      },
+    };
+  }
+
+  async #readSkillResource(call: ToolCall): Promise<ToolResult> {
+    const context = this.#skillContext;
+    const runId = this.#activeRunId;
+    const workspaceRoot = this.#repositoryWorkspaceRoot;
+    let input:
+      | {
+          readonly qualifiedId: string;
+          readonly path: string;
+          readonly offset: number;
+          readonly maxByteCount: number;
+        }
+      | undefined;
+    try {
+      const parsed = JSON.parse(call.argumentsJson) as {
+        qualifiedId?: unknown;
+        path?: unknown;
+        offset?: unknown;
+        maxByteCount?: unknown;
+      };
+      if (
+        typeof parsed.qualifiedId === "string" &&
+        typeof parsed.path === "string" &&
+        (parsed.offset === undefined || Number.isSafeInteger(parsed.offset)) &&
+        (parsed.maxByteCount === undefined || Number.isSafeInteger(parsed.maxByteCount))
+      ) {
+        input = {
+          qualifiedId: parsed.qualifiedId,
+          path: parsed.path,
+          offset: (parsed.offset as number | undefined) ?? 0,
+          maxByteCount: (parsed.maxByteCount as number | undefined) ?? 65_536,
+        };
+      }
+    } catch {
+      input = undefined;
+    }
+    if (
+      context === undefined ||
+      runId === undefined ||
+      workspaceRoot === undefined ||
+      input === undefined
+    ) {
+      return skillResourceFailure(
+        "skill_resource_unavailable",
+        "The requested Agent Skill resource is unavailable in this session.",
+      );
+    }
+    let page: Awaited<ReturnType<typeof readSkillResourcePageV1>>;
+    try {
+      page = await readSkillResourcePageV1({
+        context,
+        qualifiedId: input.qualifiedId,
+        path: input.path,
+        offset: input.offset,
+        maxByteCount: input.maxByteCount,
+        workspaceRoot,
+        userHome: homedir(),
+        userHomeDigest: context.userHomeDigest,
+        ...(this.#durableContext?.extensionSkillSources === undefined
+          ? {}
+          : { extensionSources: this.#durableContext.extensionSkillSources }),
+      });
+    } catch (error) {
+      if (error instanceof SkillResourceError) {
+        return skillResourceFailure(error.code, error.message);
+      }
+      return skillResourceFailure(
+        "skill_resource_unavailable",
+        "The requested Agent Skill resource is unavailable in this session.",
+      );
+    }
+    if (
+      this.#skillResourceRunBytes + page.byteCount > 1024 * 1024 ||
+      this.#skillResourceLineageBytes + page.byteCount > 8 * 1024 * 1024
+    ) {
+      return skillResourceFailure(
+        "skill_resource_quota_exceeded",
+        "The Agent Skill resource quota for this run or session lineage would be exceeded.",
+      );
+    }
+    const committed = await this.#withCurrentExtensionSkills(context, [page.qualifiedId], () =>
+      this.#appendRecord({
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "skill_resource_read_committed",
+          recordVersion: 1,
+          runId,
+          callId: call.id,
+          qualifiedId: page.qualifiedId,
+          activationIndex: page.activationIndex,
+          catalogRevision: page.catalogRevision,
+          manifestRevision: page.manifestRevision,
+          path: page.path,
+          offset: page.offset,
+          byteCount: page.byteCount,
+          totalByteCount: page.totalByteCount,
+          eof: page.eof,
+          fileDigest: page.fileDigest,
+          pageDigest: page.pageDigest,
+          content: page.content,
+          ...(page.executionToken === undefined ? {} : { executionToken: page.executionToken }),
+        },
+      }),
+    );
+    if (committed.status === "stale") {
+      return skillResourceFailure(
+        "skill_resource_unavailable",
+        "The requested Agent Skill resource is unavailable in this session.",
+      );
+    }
+    this.#skillResourceRunBytes += page.byteCount;
+    this.#skillResourceLineageBytes += page.byteCount;
+    return {
+      status: "completed",
+      output: {
+        qualifiedId: page.qualifiedId,
+        activationIndex: page.activationIndex,
+        catalogRevision: page.catalogRevision,
+        manifestRevision: page.manifestRevision,
+        path: page.path,
+        offset: page.offset,
+        byteCount: page.byteCount,
+        totalByteCount: page.totalByteCount,
+        eof: page.eof,
+        fileDigest: page.fileDigest,
+        pageDigest: page.pageDigest,
+        content: page.content,
+        ...(page.executionToken === undefined ? {} : { executionToken: page.executionToken }),
+      },
+    };
   }
 
   async #preflightRepositoryInstructions(
@@ -1800,6 +2547,15 @@ export class AgentSession {
     }
     const requestedScopes = repositoryScopesFromPermissionSubject(subject);
     const activeScopes = new Set(context.repository.activeScopes);
+    if (context.recordVersion === 2 && this.#skillContext !== undefined) {
+      const activeSkillScopes = new Set(this.#skillContext.activeProjectScopes);
+      if (
+        requestedScopes.every((scope) => activeScopes.has(scope) && activeSkillScopes.has(scope))
+      ) {
+        return undefined;
+      }
+      return this.#preflightPathContextV2(call, requestedScopes);
+    }
     if (requestedScopes.every((scope) => activeScopes.has(scope))) {
       return undefined;
     }
@@ -1893,6 +2649,124 @@ export class AgentSession {
               "Repository instructions changed; reconsider this mutation with a new call ID.",
           },
         }
+      : undefined;
+  }
+
+  async #preflightPathContextV2(
+    call: ToolCall,
+    requestedScopes: readonly string[],
+  ): Promise<Extract<ToolResult, { readonly status: "failed" }> | undefined> {
+    const promptContext = this.#promptContext;
+    const skillContext = this.#skillContext;
+    const workspaceRoot = this.#repositoryWorkspaceRoot;
+    const runId = this.#activeRunId;
+    const projectId = this.#durableContext?.projectId;
+    const sessionId = this.#durableContext?.sessionId;
+    if (
+      promptContext?.recordVersion !== 2 ||
+      skillContext === undefined ||
+      workspaceRoot === undefined ||
+      runId === undefined ||
+      projectId === undefined ||
+      sessionId === undefined ||
+      this.#artifactStore === undefined
+    ) {
+      return skillResourceFailure(
+        "project_context_unavailable",
+        "Project path context is unavailable.",
+      );
+    }
+    const repositoryScopes = [
+      ...new Set([...promptContext.repository.activeScopes, ...requestedScopes]),
+    ];
+    let repository: PromptContextRecordV1["repository"];
+    let nextSkillContext: SkillContextRecordV1;
+    try {
+      repository = await loadRepositoryInstructions({
+        workspaceRoot,
+        activeScopes: repositoryScopes,
+        revision: promptContext.repository.revision + 1,
+        loadReason: "path_scope_activation",
+      });
+      nextSkillContext = await extendSkillContextWithProjectScopesV1({
+        artifactStore: this.#artifactStore,
+        context: skillContext,
+        projectId,
+        sessionId,
+        scopes: requestedScopes,
+        workspaceRoot,
+      });
+    } catch {
+      await this.#appendRecord({
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "path_context_failed",
+          recordVersion: 1,
+          activeRepositoryRevision: promptContext.repository.revision,
+          activeRepositoryDigest: promptContext.repository.effectiveDigest,
+          activeSkillRevision: skillContext.registry.revision,
+          activeSkillRegistryDigest: skillContext.registry.digest,
+          error: { code: "project_context_unavailable" },
+          trigger: {
+            runId,
+            callId: call.id,
+            name: call.name as "read_file" | "write_file" | "edit_file",
+            argumentsDigest: `sha256:${createHash("sha256")
+              .update(call.argumentsJson, "utf8")
+              .digest("hex")}`,
+            disposition: "unavailable",
+          },
+        },
+      });
+      return skillResourceFailure(
+        "project_context_unavailable",
+        "Project path context could not be loaded safely.",
+      );
+    }
+    let nextPromptContext = replacePromptRepositoryV1(
+      promptContext,
+      repository,
+    ) as PromptContextRecordV2;
+    nextPromptContext = replacePromptSkillsV2(nextPromptContext, nextSkillContext);
+    const mutation = call.name !== "read_file";
+    await this.#appendRecord({
+      schemaVersion: 3,
+      sequence: this.#nextSequence,
+      record: {
+        type: "path_context_committed",
+        recordVersion: 1,
+        previousRepositoryRevision: promptContext.repository.revision,
+        previousRepositoryDigest: promptContext.repository.effectiveDigest,
+        previousSkillRevision: skillContext.registry.revision,
+        previousSkillRegistryDigest: skillContext.registry.digest,
+        repository,
+        skillContext: nextSkillContext,
+        assemblyIdentityDigest: nextPromptContext.assemblyIdentityDigest,
+        trigger: {
+          runId,
+          callId: call.id,
+          name: call.name as "read_file" | "write_file" | "edit_file",
+          argumentsDigest: `sha256:${createHash("sha256")
+            .update(call.argumentsJson, "utf8")
+            .digest("hex")}`,
+          disposition: mutation ? "mutation_retry_required" : "read_continue",
+        },
+      },
+    });
+    this.#promptContext = nextPromptContext;
+    this.#skillContext = nextSkillContext;
+    await this.#emit({
+      type: "repository_instructions_activated",
+      revision: repository.revision,
+      effectiveDigest: repository.effectiveDigest,
+      reason: "path_scope_activation",
+    });
+    return mutation
+      ? skillResourceFailure(
+          "project_context_changed",
+          "Project path context changed; reconsider this mutation with a new call ID.",
+        )
       : undefined;
   }
 
@@ -2644,11 +3518,24 @@ function repositoryScopesFromPermissionSubject(subject: PermissionSubject): read
   });
 }
 
-function captureToolRegistry(tools: ToolRegistry | undefined): ToolRegistry | undefined {
+function captureToolRegistry(
+  tools: ToolRegistry | undefined,
+  selectedNames?: readonly string[],
+): ToolRegistry | undefined {
   if (tools === undefined) {
     return undefined;
   }
-  const definitions = tools.definitions().map((definition) => structuredClone(definition));
+  const availableDefinitions = new Map(
+    tools.definitions().map((definition) => [definition.name, definition] as const),
+  );
+  const definitions = (
+    selectedNames === undefined
+      ? [...availableDefinitions.values()]
+      : selectedNames.flatMap((name) => {
+          const definition = availableDefinitions.get(name);
+          return definition === undefined ? [] : [definition];
+        })
+  ).map((definition) => structuredClone(definition));
   const adapters = new Map(
     definitions.map((definition) => {
       const adapter = tools.resolve(definition.name);
@@ -2671,6 +3558,20 @@ function captureToolRegistry(tools: ToolRegistry | undefined): ToolRegistry | un
   };
 }
 
+function filterLiveToolRegistry(
+  tools: ToolRegistry | undefined,
+  selectedNames: readonly string[],
+): ToolRegistry | undefined {
+  if (tools === undefined) {
+    return undefined;
+  }
+  const selected = new Set(selectedNames);
+  return {
+    definitions: () => tools.definitions().filter((definition) => selected.has(definition.name)),
+    resolve: (name) => (selected.has(name) ? tools.resolve(name) : undefined),
+  };
+}
+
 function areOptionalUsageDetailsValid(
   usage: Extract<ModelEvent, { readonly type: "usage" }>,
 ): boolean {
@@ -2684,6 +3585,53 @@ function areRunLimitsValid(limits: RunOptions["limits"]): boolean {
     (limits?.maxTurns === undefined || isPositiveSafeInteger(limits.maxTurns)) &&
     (limits?.maxTokens === undefined || isPositiveSafeInteger(limits.maxTokens))
   );
+}
+
+function areSkillSelectionsValid(selections: UserInput["skills"]): boolean {
+  return (
+    selections === undefined ||
+    (Array.isArray(selections) &&
+      selections.length <= 8 &&
+      selections.every(
+        (selection) =>
+          typeof selection === "string" &&
+          selection.length > 0 &&
+          Buffer.byteLength(selection, "utf8") <= 16_384 &&
+          /^[\x20-\x7e]+$/u.test(selection),
+      ))
+  );
+}
+
+function skillActivationFailure(
+  message: string,
+  ambiguity?: {
+    readonly selection: string;
+    readonly candidates: readonly string[];
+    readonly omittedCount: number;
+  },
+): Extract<RunResult, { readonly status: "failed" }> {
+  return {
+    status: "failed",
+    error: {
+      code: "skill_activation_failed",
+      message,
+      ...(ambiguity === undefined ? {} : { ambiguity }),
+    },
+  };
+}
+
+function skillResourceFailure(
+  code:
+    | "resource_page_too_small"
+    | "project_context_changed"
+    | "project_context_unavailable"
+    | "skill_resource_changed"
+    | "skill_resource_quota_exceeded"
+    | "skill_resource_unavailable"
+    | "unsupported_binary_resource",
+  message: string,
+): Extract<ToolResult, { readonly status: "failed" }> {
+  return { status: "failed", error: { code, message } };
 }
 
 function isPositiveSafeInteger(value: number): boolean {
