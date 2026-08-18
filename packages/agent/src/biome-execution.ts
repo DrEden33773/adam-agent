@@ -30,10 +30,29 @@ export interface BiomeExecutionAdapter {
   execute(input: BiomeExecutionInput): Promise<BiomeExecutionOutput>;
 }
 
+/** Tests only. Observes the external process boundary without changing completion semantics. */
+export interface ObservedBiomeProcess {
+  readonly pid: number;
+  readonly temporaryRoot: string;
+}
+
 const biomeVersion = "2.5.8";
 const biomeExecutable = createRequire(import.meta.url).resolve("@biomejs/biome/bin/biome");
 
 export function createBiomeExecutionAdapter(): BiomeExecutionAdapter {
+  return createBiomeExecutionAdapterWithObserver();
+}
+
+/** Tests only. This internal causal-observation surface has no compatibility promise. */
+export function createObservedBiomeExecutionAdapter(
+  observeProcessStart: (process: ObservedBiomeProcess) => void,
+): BiomeExecutionAdapter {
+  return createBiomeExecutionAdapterWithObserver(observeProcessStart);
+}
+
+function createBiomeExecutionAdapterWithObserver(
+  observeProcessStart?: (process: ObservedBiomeProcess) => void,
+): BiomeExecutionAdapter {
   return {
     async execute(input) {
       if (input.profile !== EXTENSION_BIOME_PROFILE) {
@@ -64,8 +83,10 @@ export function createBiomeExecutionAdapter(): BiomeExecutionAdapter {
           configurationPath,
           deadlineAt: input.deadlineAt,
           isolatedHome,
+          observeProcessStart,
           signal: input.signal,
           snapshotRoot: filesRoot,
+          temporaryRoot: snapshotRoot,
         });
         return {
           analyzerVersion: biomeVersion,
@@ -93,8 +114,10 @@ async function runBiomeProcess(options: {
   readonly configurationPath: string;
   readonly deadlineAt: string;
   readonly isolatedHome: string;
+  readonly observeProcessStart?: ((process: ObservedBiomeProcess) => void) | undefined;
   readonly signal: AbortSignal;
   readonly snapshotRoot: string;
+  readonly temporaryRoot: string;
 }): Promise<{
   readonly exitCode: number;
   readonly stderr: Uint8Array;
@@ -191,6 +214,17 @@ async function runBiomeProcess(options: {
         stdout: Buffer.concat(stdout, stdoutBytes),
       });
     });
+    if (options.observeProcessStart !== undefined) {
+      if (child.pid === undefined) {
+        fail(new Error("The Biome process did not report a process ID."));
+      } else {
+        try {
+          options.observeProcessStart({ pid: child.pid, temporaryRoot: options.temporaryRoot });
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error("The Biome process observer failed."));
+        }
+      }
+    }
   });
 }
 

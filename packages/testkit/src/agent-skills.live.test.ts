@@ -23,6 +23,7 @@ const evaluationTest = test.skipIf(
   !evaluationEnabled || apiKey === undefined || apiKey.length === 0,
 );
 const targetId = configuredTarget ?? "deepseek-v4-flash.direct";
+const testEnvironment = process.env as NodeJS.ProcessEnv & { HOME?: string };
 
 test.skipIf(!evaluationEnabled)("requires DEEPSEEK_API_KEY for the Agent Skills evaluation", () => {
   expect(apiKey?.length ?? 0).toBeGreaterThan(0);
@@ -33,7 +34,7 @@ evaluationTest(
   async () => {
     const evaluationRoot = await mkdtemp(join(tmpdir(), "adam-agent-skills-eval-"));
     const isolatedHome = join(evaluationRoot, "home");
-    const originalHome = process.env["HOME"];
+    const originalHome = testEnvironment.HOME;
     const modelTargets = createModelTargets({
       environment: { DEEPSEEK_API_KEY: apiKey ?? "" },
       deadlineMs: 120_000,
@@ -49,7 +50,7 @@ evaluationTest(
 
     try {
       await mkdir(isolatedHome);
-      process.env["HOME"] = isolatedHome;
+      testEnvironment.HOME = isolatedHome;
       for (const [index, plan] of plans.entries()) {
         const workspaceRoot = join(evaluationRoot, `run-${String(index + 1).padStart(2, "0")}`);
         const stateRoot = join(workspaceRoot, ".state");
@@ -156,9 +157,9 @@ evaluationTest(
       process.stdout.write(`ADAM_AGENT_SKILLS_EVAL_REPORT ${JSON.stringify(report)}\n`);
     } finally {
       if (originalHome === undefined) {
-        delete process.env["HOME"];
+        delete testEnvironment.HOME;
       } else {
-        process.env["HOME"] = originalHome;
+        testEnvironment.HOME = originalHome;
       }
       await rm(evaluationRoot, { recursive: true, force: true });
     }

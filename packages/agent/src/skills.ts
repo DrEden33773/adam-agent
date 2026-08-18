@@ -1460,8 +1460,9 @@ function parseSkillMd(bytes: Uint8Array, directoryName: string): ParsedSkillMd {
   if (!isPlainRecord(value)) {
     return { success: false, code: "skill_frontmatter_invalid" };
   }
-  const name = value["name"];
-  const description = value["description"];
+  const frontmatter = value as RawSkillFrontmatter;
+  const name = frontmatter.name;
+  const description = frontmatter.description;
   if (typeof name !== "string" || !isPortableSkillName(name) || name !== directoryName) {
     return { success: false, code: "skill_name_invalid", field: "name" };
   }
@@ -1548,7 +1549,7 @@ function validateOptionalFields(value: Readonly<Record<string, unknown>>): strin
       return field;
     }
   }
-  const metadata = value["metadata"];
+  const metadata = (value as RawSkillFrontmatter).metadata;
   if (metadata === undefined) {
     return undefined;
   }
@@ -1566,6 +1567,12 @@ function validateOptionalFields(value: Readonly<Record<string, unknown>>): strin
     }
   }
   return Buffer.byteLength(canonicalJson(metadata), "utf8") > 16 * 1024 ? "metadata" : undefined;
+}
+
+interface RawSkillFrontmatter extends Readonly<Record<string, unknown>> {
+  readonly description?: unknown;
+  readonly metadata?: unknown;
+  readonly name?: unknown;
 }
 
 function quarantine(
