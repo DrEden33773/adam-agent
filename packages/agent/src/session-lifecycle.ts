@@ -38,6 +38,23 @@ import {
   ProjectLifecycleOwnerError,
 } from "./project-lifecycle-owner.js";
 import {
+  assemblePromptMessagesV1,
+  createPromptContextV1,
+  digestPromptRequestV1,
+  isPromptContextCompatible,
+  isPromptContextRecordCompatible,
+  isPromptContextRecordValid,
+  type PromptContextRecordV1,
+  type PromptContextSnapshot,
+  promptContextSnapshot,
+  replacePromptRepositoryV1,
+} from "./prompt-assembly.js";
+import {
+  loadInitialRepositoryInstructions,
+  loadRepositoryInstructions,
+  RepositoryInstructionsError,
+} from "./repository-instructions.js";
+import {
   type AgentSessionDurableContext,
   type AgentSessionDurableOutputLimits,
   sessionDurableContext,
@@ -67,6 +84,7 @@ export type CurrentSessionSnapshot = {
   readonly targetIdentity: ModelTargetIdentity;
   readonly status: "idle" | "interrupted" | "settled";
   readonly lastSequence: number;
+  readonly promptContext?: PromptContextSnapshot;
   readonly context?: SessionContextSnapshot;
   readonly degradation?: {
     readonly code: "model_response_artifact_corrupt" | "model_response_artifact_missing";
@@ -149,6 +167,7 @@ export type SessionResumeResult =
         readonly code:
           | "model_target_incompatible"
           | "model_target_unavailable"
+          | "prompt_profile_incompatible"
           | "non_resumable_legacy_session"
           | "session_replay_unavailable";
         readonly message: string;
@@ -168,6 +187,20 @@ export type SessionContinueResult = {
   readonly snapshot: CurrentSessionSnapshot;
 };
 
+export type RepositoryInstructionsReloadResult =
+  | {
+      readonly status: "reloaded" | "unchanged";
+      readonly snapshot: CurrentSessionSnapshot;
+    }
+  | {
+      readonly status: "rejected";
+      readonly snapshot: CurrentSessionSnapshot;
+      readonly error: {
+        readonly code: "repository_instructions_unavailable";
+        readonly message: string;
+      };
+    };
+
 export type SessionCommand =
   | { readonly type: "create"; readonly targetIdentity: ModelTargetIdentity }
   | { readonly type: "resume"; readonly sessionId: string }
@@ -183,7 +216,8 @@ export type SessionCommand =
       readonly parentSessionId: string;
       readonly atSequence: number;
       readonly targetId?: string;
-    };
+    }
+  | { readonly type: "reload_repository_instructions"; readonly sessionId: string };
 
 export interface SessionLifecycle {
   branch(input: {
@@ -200,6 +234,9 @@ export interface SessionLifecycle {
   create(input: { readonly targetIdentity: ModelTargetIdentity }): Promise<CurrentSessionSnapshot>;
   decidePermission(command: PermissionDecisionCommand): PermissionDecisionCommandResult;
   inspect(input: { readonly sessionId: string }): Promise<SessionSnapshot>;
+  reloadRepositoryInstructions(input: {
+    readonly sessionId: string;
+  }): Promise<RepositoryInstructionsReloadResult>;
   resume(input: { readonly sessionId: string }): Promise<SessionResumeResult>;
   subscribe(listener: RuntimeEventListener): () => void;
 }
@@ -278,6 +315,14 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
       records,
       artifactCache,
     );
+    if (artifactInspection.degradation === undefined) {
+      await validatePromptProjectionDigests(
+        options,
+        first,
+        artifactInspection.records,
+        artifactCache,
+      );
+    }
     const replayRecords =
       artifactInspection.degradation === undefined ? artifactInspection.records : records;
     const snapshot = snapshotFromRecords(first, replayRecords, artifactInspection);
@@ -355,6 +400,29 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
       }
     }
     if (snapshot.schemaVersion === 3) {
+      const promptRecords = await readJsonlSessionRecords({
+        workspaceRoot: options.workspaceRoot,
+        sessionId: input.sessionId,
+        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+      });
+      const promptGenesis = promptRecords[0];
+      if (
+        snapshot.promptContext !== undefined &&
+        (promptGenesis === undefined ||
+          !isGenesisRecord(promptGenesis) ||
+          promptGenesis.record.promptContext === undefined ||
+          !isPromptContextRecordCompatible(promptGenesis.record.promptContext, options.tools) ||
+          !isPromptContextCompatible(snapshot.promptContext, options.tools))
+      ) {
+        return {
+          status: "rejected",
+          snapshot,
+          error: {
+            code: "prompt_profile_incompatible",
+            message: "The exact recorded prompt and tool profile is not supported by this runtime.",
+          },
+        };
+      }
       if (options.modelTargets === undefined) {
         return {
           status: "rejected",
@@ -513,6 +581,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
         if (!isCompleteBranchBoundary(parentPrefix)) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
         }
+        const parentPromptContext = promptContextRecordFromRecords(parentGenesis, parentPrefix);
         let targetIdentity = parent.targetIdentity;
         if (input.targetId !== undefined) {
           if (options.modelTargets === undefined) {
@@ -554,6 +623,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
             sessionId,
             projectId: parent.projectId,
             targetIdentity,
+            ...(parentPromptContext === undefined ? {} : { promptContext: parentPromptContext }),
             lineage: {
               parentSessionId: input.parentSessionId,
               parentEventPosition,
@@ -578,6 +648,9 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
       return withOwner(async () => {
         const sessionId = randomUUID();
         const projectId = await canonicalProjectId(options.workspaceRoot);
+        const repository = await loadInitialRepositoryInstructions({
+          workspaceRoot: options.workspaceRoot,
+        });
         const store = await createJsonlSessionStore<SessionRecord>({
           workspaceRoot: options.workspaceRoot,
           sessionId,
@@ -591,6 +664,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
             sessionId,
             projectId,
             targetIdentity: input.targetIdentity,
+            promptContext: createPromptContextV1(options.tools, repository),
           },
         };
         await store.append(genesis);
@@ -649,6 +723,7 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           artifactCache,
         );
         const replayRecords = artifactInspection.records;
+        const activePromptContext = promptContextRecordFromRecords(first, replayRecords);
         const referencedModelResponseArtifactBytes = await replayArtifactBytesFromLineage(
           options,
           first,
@@ -690,11 +765,16 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
           model: resolved.driver,
           store: store as unknown as SessionStore,
           [sessionDurableContext]: {
+            ...(inheritedMessages.length === 0 ? {} : { hasInheritedMessages: true }),
             nextSequence: resumed.snapshot.lastSequence + 1,
             projectId: resumed.snapshot.projectId,
             referencedModelResponseArtifactBytes,
+            ...(activePromptContext === undefined
+              ? {}
+              : { repositoryWorkspaceRoot: options.workspaceRoot }),
             sessionId: resumed.snapshot.sessionId,
             targetIdentity: resumed.snapshot.targetIdentity,
+            ...(activePromptContext === undefined ? {} : { promptContext: activePromptContext }),
             ...(hasContextEvidence(inheritedEvidence) ? { inheritedEvidence } : {}),
             ...(resumeState !== undefined || inheritedMessages.length === 0
               ? {}
@@ -751,6 +831,98 @@ export function createSessionLifecycle(options: SessionLifecycleOptions): Sessio
     async inspect(input) {
       return inspectSession(input);
     },
+    async reloadRepositoryInstructions(input) {
+      if (activeSession !== undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return withOwner(async () => {
+        const inspected = await inspectSession({ sessionId: input.sessionId });
+        if (
+          inspected.schemaVersion !== 3 ||
+          inspected.status !== "idle" ||
+          inspected.promptContext === undefined
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const records = await readJsonlSessionRecords({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        const genesis = records[0];
+        if (genesis === undefined || !isGenesisRecord(genesis)) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const context = promptContextRecordFromRecords(genesis, records);
+        if (context === undefined) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const store = await openJsonlSessionStore<SessionRecord>({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        let repository: PromptContextRecordV1["repository"];
+        try {
+          repository = await loadRepositoryInstructions({
+            workspaceRoot: options.workspaceRoot,
+            activeScopes: context.repository.activeScopes,
+            revision: context.repository.revision + 1,
+            loadReason: "explicit_reload",
+          });
+        } catch (error) {
+          await store.append({
+            schemaVersion: 3,
+            sequence: records.length + 1,
+            record: {
+              type: "repository_instructions_failed",
+              recordVersion: 1,
+              activeRevision: context.repository.revision,
+              activeEffectiveDigest: context.repository.effectiveDigest,
+              error: {
+                code:
+                  error instanceof RepositoryInstructionsError
+                    ? error.code
+                    : "repository_instruction_unreadable",
+              },
+            },
+          });
+          const snapshot = await inspectSession({ sessionId: input.sessionId });
+          if (snapshot.schemaVersion !== 3) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          return {
+            status: "rejected",
+            snapshot,
+            error: {
+              code: "repository_instructions_unavailable",
+              message: "Repository instructions could not be reloaded safely.",
+            },
+          };
+        }
+        if (repository.effectiveDigest === context.repository.effectiveDigest) {
+          return { status: "unchanged", snapshot: inspected };
+        }
+        const nextContext = replacePromptRepositoryV1(context, repository);
+        await store.append({
+          schemaVersion: 3,
+          sequence: records.length + 1,
+          record: {
+            type: "repository_instructions_committed",
+            recordVersion: 1,
+            previousRevision: context.repository.revision,
+            previousEffectiveDigest: context.repository.effectiveDigest,
+            repository,
+            assemblyIdentityDigest: nextContext.assemblyIdentityDigest,
+          },
+        });
+        const snapshot = await inspectSession({ sessionId: input.sessionId });
+        if (snapshot.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        return { status: "reloaded", snapshot };
+      });
+    },
     async resume(input) {
       return withOwner(() => resumeSession(input));
     },
@@ -773,7 +945,11 @@ type ValidatedToolState = {
     readonly effect?: string | undefined;
   };
   decision?: "allow" | "deny";
+  permissionRequestId?: string;
   requested: boolean;
+  repositoryActivationPublished?: boolean;
+  repositoryDisposition?: "mutation_retry_required" | "read_continue" | "unavailable";
+  repositoryRevision?: number;
   started: boolean;
   terminal: boolean;
   terminalErrorCode?: string;
@@ -794,7 +970,15 @@ function validateCurrentSessionHistory(
   if (
     genesis.sequence !== 1 ||
     records[0] !== genesis ||
-    records.some((record) => record.schemaVersion !== 3)
+    records.some((record) => record.schemaVersion !== 3) ||
+    (genesis.record.promptContext !== undefined &&
+      (!isPromptContextRecordValid(genesis.record.promptContext) ||
+        (genesis.record.lineage === undefined &&
+          (genesis.record.promptContext.repository.revision !== 1 ||
+            JSON.stringify(genesis.record.promptContext.repository.activeScopes) !== '["."]' ||
+            genesis.record.promptContext.repository.sources.some(
+              (source) => source.scope !== "." || source.loadReason !== "root_eager",
+            )))))
   ) {
     throw new SessionLifecycleError("session_invalid");
   }
@@ -815,6 +999,9 @@ function validateCurrentSessionHistory(
     | undefined;
   let lastUsage: Extract<RuntimeEvent, { readonly type: "model_usage" }> | undefined;
   let toolStates = new Map<string, ValidatedToolState>();
+  let activePromptContext = genesis.record.promptContext;
+  const activatableRepositoryRevisions = new Map<number, ValidatedToolState>();
+  const publishedRepositoryRevisions = new Set<number>();
 
   for (const entry of currentRecords.slice(1)) {
     if (sawSettlement) {
@@ -831,6 +1018,93 @@ function validateCurrentSessionHistory(
       run = record;
       continue;
     }
+    if (record.type === "repository_instructions_committed") {
+      const expectedLoadReason =
+        record.trigger === undefined ? "explicit_reload" : "path_scope_activation";
+      if (
+        activePromptContext === undefined ||
+        record.previousRevision !== activePromptContext.repository.revision ||
+        record.previousEffectiveDigest !== activePromptContext.repository.effectiveDigest ||
+        record.repository.revision !== activePromptContext.repository.revision + 1 ||
+        record.repository.sources.some((source) => source.loadReason !== expectedLoadReason)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const nextPromptContext = replacePromptRepositoryV1(activePromptContext, record.repository);
+      if (
+        nextPromptContext.assemblyIdentityDigest !== record.assemblyIdentityDigest ||
+        !isPromptContextRecordValid(nextPromptContext)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      if (record.trigger === undefined) {
+        if (run !== undefined) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+      } else {
+        const toolState = toolStates.get(record.trigger.callId);
+        if (
+          run === undefined ||
+          record.trigger.runId !== run.runId ||
+          toolState === undefined ||
+          toolState.call.name !== record.trigger.name ||
+          record.trigger.argumentsDigest !==
+            `sha256:${createHash("sha256")
+              .update(toolState.call.argumentsJson, "utf8")
+              .digest("hex")}` ||
+          !toolState.requested ||
+          toolState.started ||
+          toolState.terminal ||
+          toolState.decision !== undefined ||
+          toolState.permissionRequestId !== undefined ||
+          toolState.repositoryDisposition !== undefined ||
+          (record.trigger.name === "read_file") !== (record.trigger.disposition === "read_continue")
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        toolState.repositoryDisposition = record.trigger.disposition;
+        toolState.repositoryRevision = record.repository.revision;
+        activatableRepositoryRevisions.set(record.repository.revision, toolState);
+      }
+      activePromptContext = nextPromptContext;
+      continue;
+    }
+    if (record.type === "repository_instructions_failed") {
+      if (
+        activePromptContext === undefined ||
+        record.activeRevision !== activePromptContext.repository.revision ||
+        record.activeEffectiveDigest !== activePromptContext.repository.effectiveDigest
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      if (record.trigger === undefined) {
+        if (run !== undefined) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+      } else {
+        const toolState = toolStates.get(record.trigger.callId);
+        if (
+          run === undefined ||
+          record.trigger.runId !== run.runId ||
+          toolState === undefined ||
+          toolState.call.name !== record.trigger.name ||
+          record.trigger.argumentsDigest !==
+            `sha256:${createHash("sha256")
+              .update(toolState.call.argumentsJson, "utf8")
+              .digest("hex")}` ||
+          !toolState.requested ||
+          toolState.started ||
+          toolState.terminal ||
+          toolState.decision !== undefined ||
+          toolState.permissionRequestId !== undefined ||
+          toolState.repositoryDisposition !== undefined
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        toolState.repositoryDisposition = "unavailable";
+      }
+      continue;
+    }
     if (run === undefined || record.runId !== run.runId) {
       throw new SessionLifecycleError("session_invalid");
     }
@@ -838,7 +1112,12 @@ function validateCurrentSessionHistory(
       if (
         terminalIntent !== undefined ||
         !sawUserMessage ||
-        !sameModelTargetIdentity(record.targetIdentity, genesis.record.targetIdentity)
+        !sameModelTargetIdentity(record.targetIdentity, genesis.record.targetIdentity) ||
+        (activePromptContext === undefined
+          ? record.promptProjection !== undefined
+          : record.promptProjection === undefined ||
+            record.promptProjection.assemblyIdentityDigest !==
+              activePromptContext.assemblyIdentityDigest)
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
@@ -1028,6 +1307,28 @@ function validateCurrentSessionHistory(
       sawSessionInterruption = true;
       continue;
     }
+    if (event.type === "repository_instructions_activated") {
+      const toolState = activatableRepositoryRevisions.get(event.revision);
+      if (
+        activePromptContext === undefined ||
+        event.revision !== activePromptContext.repository.revision ||
+        event.effectiveDigest !== activePromptContext.repository.effectiveDigest ||
+        toolState === undefined ||
+        toolState.repositoryDisposition === "unavailable" ||
+        toolState.repositoryRevision !== event.revision ||
+        toolState.repositoryActivationPublished === true ||
+        toolState.decision !== undefined ||
+        toolState.permissionRequestId !== undefined ||
+        toolState.started ||
+        toolState.terminal ||
+        publishedRepositoryRevisions.has(event.revision)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      toolState.repositoryActivationPublished = true;
+      publishedRepositoryRevisions.add(event.revision);
+      continue;
+    }
     if (event.type === "session_settled") {
       if (
         !sawUserMessage ||
@@ -1082,18 +1383,44 @@ function validateCurrentSessionHistory(
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
+      if (
+        state.repositoryDisposition !== undefined &&
+        (event.type === "tool_requested" ||
+          (state.repositoryDisposition === "unavailable"
+            ? event.type !== "tool_failed" ||
+              event.error.code !== "repository_instructions_unavailable"
+            : state.repositoryActivationPublished !== true ||
+              (state.repositoryDisposition === "mutation_retry_required" &&
+                (event.type !== "tool_failed" ||
+                  event.error.code !== "repository_context_changed"))))
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
       if (event.type === "tool_requested") {
         if (state.requested) {
           throw new SessionLifecycleError("session_invalid");
         }
         state.requested = true;
       } else if (event.type === "tool_permission_requested") {
-        if (!state.requested || state.started || state.decision !== undefined) {
+        if (
+          !state.requested ||
+          state.started ||
+          state.decision !== undefined ||
+          (state.permissionRequestId !== undefined && state.permissionRequestId !== event.requestId)
+        ) {
           throw new SessionLifecycleError("session_invalid");
         }
         validatePermissionEffect(state, event.effect);
+        state.permissionRequestId ??= event.requestId;
       } else if (event.type === "tool_permission_decided") {
-        if (!state.requested || state.started || state.decision !== undefined) {
+        if (
+          !state.requested ||
+          state.started ||
+          state.decision !== undefined ||
+          (state.permissionRequestId === undefined
+            ? event.requestId !== undefined
+            : event.requestId !== state.permissionRequestId)
+        ) {
           throw new SessionLifecycleError("session_invalid");
         }
         validatePermissionEffect(state, event.effect);
@@ -1405,6 +1732,10 @@ async function validateSessionLineage(
     throw new SessionLifecycleError("session_invalid");
   }
   const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  const expectedPromptContext = promptContextRecordFromRecords(parentGenesis, prefixRecords);
+  if (JSON.stringify(genesis.record.promptContext) !== JSON.stringify(expectedPromptContext)) {
+    throw new SessionLifecycleError("session_invalid");
+  }
   await validateInheritedContextEvidence(options, parentGenesis, prefixRecords);
   await validateSessionLineage(
     options,
@@ -1493,6 +1824,47 @@ async function createBranchMessages(
     return projected;
   }
   return [...(await createBranchMessages(options, parentRecords, artifactCache)), ...projected];
+}
+
+async function validatePromptProjectionDigests(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+  artifactCache: ModelResponseArtifactCache,
+): Promise<void> {
+  if (genesis.record.promptContext === undefined) {
+    return;
+  }
+  const inheritedMessages = await createBranchMessages(options, records, artifactCache);
+  for (const entry of records) {
+    if (
+      entry.schemaVersion !== 3 ||
+      entry.record.type !== "provider_attempt_started" ||
+      entry.record.promptProjection === undefined
+    ) {
+      continue;
+    }
+    const prefix = records.filter((candidate) => candidate.sequence < entry.sequence);
+    const context = promptContextRecordFromRecords(genesis, prefix);
+    if (context === undefined) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const ownMessages = modelMessagesFromCompleteRecords(prefix);
+    const transcript = prefix.some(
+      (candidate) =>
+        candidate.schemaVersion === 3 && candidate.record.type === "context_compaction_committed",
+    )
+      ? ownMessages
+      : [...inheritedMessages, ...ownMessages];
+    const messages = assemblePromptMessagesV1(transcript, context);
+    const tools = context.toolProfile.definitions.map(({ definition }) => definition);
+    if (
+      digestPromptRequestV1(messages, tools) !==
+      entry.record.promptProjection.requestProjectionDigest
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+  }
 }
 
 async function createBranchEvidence(
@@ -1708,7 +2080,18 @@ function isCompleteBranchBoundary(records: readonly SessionRecord[]): boolean {
   );
   if (latestRun === undefined) {
     const first = records[0];
-    return records.length === 1 && first !== undefined && isGenesisRecord(first);
+    return (
+      first !== undefined &&
+      isGenesisRecord(first) &&
+      currentRecords
+        .slice(1)
+        .every(
+          (entry) =>
+            (entry.record.type === "repository_instructions_committed" ||
+              entry.record.type === "repository_instructions_failed") &&
+            entry.record.trigger === undefined,
+        )
+    );
   }
   if (latestRun.record.type !== "logical_run_started") {
     return false;
@@ -1769,8 +2152,66 @@ function snapshotFromGenesis(
     targetIdentity: genesis.record.targetIdentity,
     status: "idle",
     lastSequence,
+    ...(genesis.record.promptContext === undefined
+      ? {}
+      : { promptContext: promptContextSnapshot(genesis.record.promptContext) }),
     ...(genesis.record.lineage === undefined ? {} : { lineage: genesis.record.lineage }),
   };
+}
+
+function promptContextSnapshotFromRecords(
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): PromptContextSnapshot | undefined {
+  const context = promptContextRecordFromRecords(genesis, records);
+  if (context === undefined) {
+    return undefined;
+  }
+  const snapshot = promptContextSnapshot(context);
+  const latestProjection = records.findLast(
+    (entry) =>
+      entry.schemaVersion === 3 &&
+      entry.record.type === "provider_attempt_started" &&
+      entry.record.promptProjection !== undefined,
+  );
+  return latestProjection?.schemaVersion === 3 &&
+    latestProjection.record.type === "provider_attempt_started" &&
+    latestProjection.record.promptProjection !== undefined
+    ? {
+        ...snapshot,
+        lastRequestProjectionDigest:
+          latestProjection.record.promptProjection.requestProjectionDigest,
+      }
+    : snapshot;
+}
+
+function promptContextRecordFromRecords(
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): SessionGenesisRecord["record"]["promptContext"] {
+  let context = genesis.record.promptContext;
+  for (const entry of records) {
+    if (entry.schemaVersion !== 3 || entry.record.type !== "repository_instructions_committed") {
+      continue;
+    }
+    if (
+      context === undefined ||
+      entry.record.previousRevision !== context.repository.revision ||
+      entry.record.previousEffectiveDigest !== context.repository.effectiveDigest ||
+      entry.record.repository.revision !== context.repository.revision + 1
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const next = replacePromptRepositoryV1(context, entry.record.repository);
+    if (
+      next.assemblyIdentityDigest !== entry.record.assemblyIdentityDigest ||
+      !isPromptContextRecordValid(next)
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    context = next;
+  }
+  return context;
 }
 
 function contextSnapshotFromRecords(
@@ -1993,8 +2434,10 @@ function snapshotFromRecords(
     (record) => record.record.type === "logical_run_started",
   );
   if (latestRun === undefined || latestRun.record.type !== "logical_run_started") {
+    const promptContext = promptContextSnapshotFromRecords(genesis, records);
     return {
       ...snapshotFromGenesis(genesis, records.length),
+      ...(promptContext === undefined ? {} : { promptContext }),
       ...(context === undefined ? {} : { context }),
       ...(artifactInspection?.degradation === undefined
         ? {}
@@ -2046,8 +2489,10 @@ function snapshotFromRecords(
               }
         : undefined;
   const isSettled = settlement !== undefined || linkedSettlement !== undefined;
+  const promptContext = promptContextSnapshotFromRecords(genesis, records);
   return {
     ...snapshotFromGenesis(genesis, records.length),
+    ...(promptContext === undefined ? {} : { promptContext }),
     ...(context === undefined ? {} : { context }),
     ...(artifactInspection?.degradation === undefined
       ? {}
@@ -2889,7 +3334,42 @@ function createAgentResumeState(
             ? permission.record.event
             : undefined;
         const exactIntent = isExactToolIntent(options, snapshot, responseRecord.record, call);
+        const repositoryRecord = currentRecords.findLast(
+          (candidate) =>
+            candidate.sequence > responseRecord.sequence &&
+            (candidate.record.type === "repository_instructions_committed" ||
+              candidate.record.type === "repository_instructions_failed") &&
+            candidate.record.trigger?.runId === runId &&
+            candidate.record.trigger.callId === call.id &&
+            candidate.record.trigger.name === call.name,
+        );
+        const repositoryTrigger =
+          repositoryRecord?.record.type === "repository_instructions_committed" ||
+          repositoryRecord?.record.type === "repository_instructions_failed"
+            ? repositoryRecord.record.trigger
+            : undefined;
+        const committedRepository =
+          repositoryRecord?.record.type === "repository_instructions_committed"
+            ? repositoryRecord.record.repository
+            : undefined;
+        const repositoryRecordSequence = repositoryRecord?.sequence;
+        const repositoryActivation =
+          committedRepository !== undefined && repositoryTrigger !== undefined
+            ? {
+                revision: committedRepository.revision,
+                effectiveDigest: committedRepository.effectiveDigest,
+                publishEvent: !currentRecords.some(
+                  (candidate) =>
+                    candidate.sequence > (repositoryRecordSequence ?? Number.MAX_SAFE_INTEGER) &&
+                    candidate.record.type === "runtime_event" &&
+                    candidate.record.runId === runId &&
+                    candidate.record.event.type === "repository_instructions_activated" &&
+                    candidate.record.event.revision === committedRepository.revision,
+                ),
+              }
+            : undefined;
         const reusablePermission =
+          repositoryTrigger === undefined &&
           exactIntent &&
           permissionEvent?.effect !== undefined &&
           permissionEvent.scope === "call" &&
@@ -2906,6 +3386,10 @@ function createAgentResumeState(
           call,
           requested,
           started,
+          ...(repositoryActivation === undefined ? {} : { repositoryActivation }),
+          ...(repositoryTrigger === undefined
+            ? {}
+            : { repositoryDisposition: repositoryTrigger.disposition }),
           ...(reusablePermission === undefined ? {} : { reusablePermission }),
         });
         continue;

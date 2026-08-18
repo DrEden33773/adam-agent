@@ -4,7 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { createSessionLifecycle, type ModelTargetIdentity } from "@adam-agent/agent";
+import {
+  createReadToolRegistry,
+  createSessionLifecycle,
+  type ModelTargetIdentity,
+} from "@adam-agent/agent";
 import {
   openJsonlSessionStore,
   type SessionContextCompactionCommittedRecord,
@@ -152,6 +156,56 @@ test("real process restart uses a committed checkpoint without duplicating it", 
         record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
     ) as readonly SessionContextCompactionCommittedRecord[];
     expect(commits).toHaveLength(1);
+  } finally {
+    first.kill("SIGKILL");
+    await harness.cleanup();
+  }
+}, 20_000);
+
+test("real process restart preserves a pre-effect repository activation without rereading disk", async () => {
+  const harness = await createProcessHarness("adam-agent-repository-activation-process-");
+  await mkdir(join(harness.workspaceRoot, "nested"), { recursive: true });
+  await writeFile(join(harness.workspaceRoot, "nested", "AGENTS.md"), "Process nested rule.\n");
+  await writeFile(join(harness.workspaceRoot, "nested", "fact.txt"), "process nested fact\n");
+  const first = spawnFixture(harness, "repository-activation-hang");
+
+  try {
+    await expect(waitForMessage(first, "repository-activation-committed")).resolves.toMatchObject({
+      revision: 2,
+    });
+    first.kill("SIGKILL");
+    await waitForClose(first);
+    await rm(join(harness.workspaceRoot, "nested", "AGENTS.md"));
+
+    const second = spawnFixture(harness, "repository-activation-continue");
+    const [observed, completed] = await Promise.all([
+      waitForMessage(second, "repository-request-observed"),
+      waitForMessage(second, "context-continued"),
+    ]);
+    await waitForClose(second);
+    expect(observed).toMatchObject({ hasFrozenRule: true, hasReadResult: true });
+    expect(completed).toMatchObject({
+      continued: {
+        result: { status: "completed", answer: "Repository activation recovered." },
+        snapshot: { promptContext: { repository: { revision: 2 } } },
+      },
+    });
+    const records = await readRecords(harness);
+    expect(
+      records.filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "repository_instructions_committed",
+      ),
+    ).toHaveLength(1);
+    expect(
+      records.filter(
+        (record) =>
+          record.schemaVersion === 3 &&
+          record.record.type === "runtime_event" &&
+          record.record.event.type === "tool_completed" &&
+          record.record.event.callId === "read-process-context",
+      ),
+    ).toHaveLength(1);
   } finally {
     first.kill("SIGKILL");
     await harness.cleanup();
@@ -381,9 +435,11 @@ async function createProcessHarness(prefix: string): Promise<{
     `${"process context line\n".repeat(500)}PROCESS_RAW_CONTEXT_TAIL`,
     "utf8",
   );
-  const created = await createSessionLifecycle({ stateRoot, workspaceRoot }).create({
-    targetIdentity,
-  });
+  const created = await createSessionLifecycle({
+    stateRoot,
+    workspaceRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+  }).create({ targetIdentity });
   return {
     testRoot,
     stateRoot,

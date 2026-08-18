@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { ArtifactStore, ModelResponseArtifactSource } from "./artifact-store.js";
 import { type ContextProfile, resolveOrdinaryMaximumOutputTokens } from "./context-profile.js";
 import {
@@ -22,6 +23,20 @@ import {
   maximumReferencedModelResponseArtifactBytes,
 } from "./durable-model-response-policy.js";
 import { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
+import {
+  assemblePromptMessagesV1,
+  createPromptContextV1,
+  digestPromptMessagePrefixV1,
+  digestPromptRequestV1,
+  estimatePromptTokensV1,
+  isPromptContextRecordCompatible,
+  type PromptContextRecordV1,
+  replacePromptRepositoryV1,
+} from "./prompt-assembly.js";
+import {
+  loadRepositoryInstructions,
+  RepositoryInstructionsError,
+} from "./repository-instructions.js";
 import {
   type AgentSessionDurableContext,
   type AgentSessionDurableOutputLimits,
@@ -122,6 +137,7 @@ export {
   type CurrentSessionSnapshot,
   createSessionLifecycle,
   type LegacySessionSnapshot,
+  type RepositoryInstructionsReloadResult,
   type SessionCommand,
   type SessionContextSnapshot,
   type SessionContinueResult,
@@ -379,6 +395,12 @@ export type RuntimeEvent =
       readonly compaction: ContextUsageTotals;
       readonly active: ActiveContextUsage;
     }
+  | {
+      readonly type: "repository_instructions_activated";
+      readonly revision: number;
+      readonly effectiveDigest: `sha256:${string}`;
+      readonly reason: "path_scope_activation";
+    }
   | { readonly type: "tool_requested"; readonly callId: string; readonly name: string }
   | {
       readonly type: "tool_permission_requested";
@@ -445,6 +467,8 @@ export class AgentSession {
   readonly #model: ModelDriver;
   readonly #tools: ToolRegistry | undefined;
   readonly #permissions: PermissionPolicy | undefined;
+  #promptContext: PromptContextRecordV1 | undefined;
+  readonly #repositoryWorkspaceRoot: string | undefined;
   readonly #durableContext: AgentSessionDurableContext | undefined;
   readonly #durableOutputLimits: Required<AgentSessionDurableOutputLimits>;
   readonly #contextProfile: ContextProfile | undefined;
@@ -458,6 +482,7 @@ export class AgentSession {
   #nextSequence = 1;
   #contextWindowNumber = 0;
   #lastContextCheckpoint: { readonly checkpointId: string; readonly sequence: number } | undefined;
+  #hasUncheckpointedInheritedMessages: boolean;
   #terminalResult: RunResult | undefined;
   #latestDurableResponse:
     | { readonly sequence: number; readonly artifactBacked: boolean }
@@ -506,8 +531,24 @@ export class AgentSession {
     }
     this.#maximumOutputTokens = maximumOutputTokens;
     this.#model = dependencies.model;
-    this.#tools = dependencies.tools;
+    const usesPromptProfileV1 =
+      this.#durableContext === undefined || this.#durableContext.promptContext !== undefined;
+    this.#tools = usesPromptProfileV1
+      ? captureToolRegistry(dependencies.tools)
+      : dependencies.tools;
     this.#permissions = dependencies.permissions;
+    this.#promptContext =
+      this.#durableContext === undefined
+        ? createPromptContextV1(this.#tools)
+        : this.#durableContext.promptContext;
+    this.#repositoryWorkspaceRoot = this.#durableContext?.repositoryWorkspaceRoot;
+    if (
+      this.#promptContext !== undefined &&
+      !isPromptContextRecordCompatible(this.#promptContext, this.#tools)
+    ) {
+      throw new TypeError("The exact recorded prompt and tool profile is not supported.");
+    }
+    this.#hasUncheckpointedInheritedMessages = this.#durableContext?.hasInheritedMessages === true;
     this.#store = dependencies.store as unknown as SessionStore<SessionRecord>;
     this.#nextSequence = this.#durableContext?.nextSequence ?? 1;
   }
@@ -653,7 +694,12 @@ export class AgentSession {
     let reactiveRetryUsed = false;
     let skipProactiveCompaction = false;
     let activeProviderSample:
-      | { readonly inputTokens: number; readonly messageCount: number }
+      | {
+          readonly assemblyIdentity: string;
+          readonly inputTokens: number;
+          readonly messageCount: number;
+          readonly messagePrefixDigest: string;
+        }
       | undefined;
 
     if (resume?.compactionUsageUnknown === true && limits?.maxTokens !== undefined) {
@@ -666,6 +712,12 @@ export class AgentSession {
         emitRequested: !pending.requested,
         emitStarted: !pending.started,
         messages,
+        ...(pending.repositoryActivation === undefined
+          ? {}
+          : { repositoryActivation: pending.repositoryActivation }),
+        ...(pending.repositoryDisposition === undefined
+          ? {}
+          : { repositoryDisposition: pending.repositoryDisposition }),
         reusablePermission: pending.reusablePermission,
         signal,
         toolResultsById,
@@ -691,15 +743,23 @@ export class AgentSession {
       if (!retryingSameTurn && limits?.maxTurns !== undefined && modelTurns >= limits.maxTurns) {
         return this.#settleTurnLimitExceeded();
       }
+      let requestMessages = this.#assemblePromptMessages(messages);
+      const requestTools = this.#tools?.definitions() ?? [];
       let activeEstimate =
         this.#contextProfile === undefined
           ? undefined
           : activeProviderSample === undefined ||
-              activeProviderSample.messageCount > messages.length
-            ? estimateActiveContextTokens(messages, this.#contextProfile)
+              activeProviderSample.assemblyIdentity !==
+                (this.#promptContext?.assemblyIdentityDigest ?? "prompt-profile-v0") ||
+              activeProviderSample.messageCount > requestMessages.length ||
+              activeProviderSample.messagePrefixDigest !==
+                digestPromptMessagePrefixV1(
+                  requestMessages.slice(0, activeProviderSample.messageCount),
+                )
+            ? this.#estimatePromptTokens(requestMessages, requestTools)
             : activeProviderSample.inputTokens +
               estimateActiveContextTokens(
-                messages.slice(activeProviderSample.messageCount),
+                requestMessages.slice(activeProviderSample.messageCount),
                 this.#contextProfile,
               );
       if (
@@ -721,6 +781,7 @@ export class AgentSession {
         compactionCallsThisTurn += compacted.attemptCount;
         messages.splice(0, messages.length, ...compacted.messages);
         activeProviderSample = undefined;
+        requestMessages = this.#assemblePromptMessages(messages);
         compactionUsage.unknownCalls += compacted.unknownCalls;
         if (compacted.usage !== undefined) {
           addContextUsage(compactionUsage, compacted.usage);
@@ -732,7 +793,7 @@ export class AgentSession {
         if (limits?.maxTokens !== undefined && reportedTokens >= limits.maxTokens) {
           return this.#settleTokenLimitExceeded();
         }
-        activeEstimate = estimateActiveContextTokens(messages, this.#contextProfile);
+        activeEstimate = this.#estimatePromptTokens(requestMessages, requestTools);
         this.#publishContextUsage(ordinaryUsage, compactionUsage, {
           source: "estimated",
           tokens: activeEstimate,
@@ -745,7 +806,7 @@ export class AgentSession {
           ? this.#maximumOutputTokens
           : resolveOrdinaryMaximumOutputTokens(
               this.#contextProfile,
-              activeEstimate ?? estimateActiveContextTokens(messages, this.#contextProfile),
+              activeEstimate ?? this.#estimatePromptTokens(requestMessages, requestTools),
             );
       if (!isPositiveSafeInteger(maximumOutputTokens)) {
         return this.#settleContextCompactionFailed(
@@ -771,6 +832,15 @@ export class AgentSession {
             turn: modelTurns,
             attempt: attemptNumber,
             targetIdentity: this.#durableContext.targetIdentity,
+            ...(this.#promptContext === undefined
+              ? {}
+              : {
+                  promptProjection: {
+                    version: 1 as const,
+                    assemblyIdentityDigest: this.#promptContext.assemblyIdentityDigest,
+                    requestProjectionDigest: digestPromptRequestV1(requestMessages, requestTools),
+                  },
+                }),
           },
         });
         this.#activeProviderAttempt = {
@@ -812,12 +882,12 @@ export class AgentSession {
       const assemblingCalls = new Map<string, ToolCall>();
       const completedCalls: ToolCall[] = [];
       let streamError: unknown;
-      const requestMessageCount = messages.length;
+      const requestMessageCount = requestMessages.length;
 
       try {
         for await (const event of this.#model.stream({
-          messages: [...messages],
-          tools: this.#tools?.definitions() ?? [],
+          messages: requestMessages,
+          tools: requestTools,
           maximumOutputTokens,
           signal,
         })) {
@@ -916,8 +986,11 @@ export class AgentSession {
               usageWasReported = true;
               reportedTokens = nextReportedTokens;
               activeProviderSample = {
+                assemblyIdentity:
+                  this.#promptContext?.assemblyIdentityDigest ?? "prompt-profile-v0",
                 inputTokens: event.inputTokens,
                 messageCount: requestMessageCount,
+                messagePrefixDigest: digestPromptMessagePrefixV1(requestMessages),
               };
               addContextUsage(ordinaryUsage, event);
               responseUsage = {
@@ -1022,7 +1095,10 @@ export class AgentSession {
           }
           this.#publishContextUsage(ordinaryUsage, compactionUsage, {
             source: "estimated",
-            tokens: estimateActiveContextTokens(messages, contextProfile),
+            tokens: this.#estimatePromptTokens(
+              this.#assemblePromptMessages(messages),
+              requestTools,
+            ),
             throughSequence: this.#nextSequence - 1,
           });
           reactiveRetryUsed = true;
@@ -1180,6 +1256,25 @@ export class AgentSession {
     }
   }
 
+  #assemblePromptMessages(transcript: readonly ModelMessage[]): readonly ModelMessage[] {
+    return this.#promptContext === undefined
+      ? [...transcript]
+      : assemblePromptMessagesV1(transcript, this.#promptContext);
+  }
+
+  #estimatePromptTokens(
+    messages: readonly ModelMessage[],
+    tools: readonly ModelToolDefinition[],
+  ): number {
+    const profile = this.#contextProfile;
+    if (profile === undefined) {
+      throw new TypeError("Prompt token estimation requires a context profile.");
+    }
+    return this.#promptContext === undefined
+      ? estimateActiveContextTokens(messages, profile)
+      : estimatePromptTokensV1(messages, tools, profile);
+  }
+
   async #compactContext(
     messages: readonly ModelMessage[],
     signal: AbortSignal,
@@ -1318,7 +1413,9 @@ export class AgentSession {
         retryMessages === undefined
           ? splitContextForCompaction(
               messages,
-              attemptNumber === 1 ? contextProfile.retainedTargetTokens : 0,
+              attemptNumber === 1 && !this.#hasUncheckpointedInheritedMessages
+                ? contextProfile.retainedTargetTokens
+                : 0,
             )
           : { summaryMessages: retryMessages, retainedMessages: [] };
       let compacted: Awaited<ReturnType<typeof generateContextSummary>>;
@@ -1417,8 +1514,10 @@ export class AgentSession {
       }
       const replacementMessages = [...compacted.replacementMessages, ...retainedMessages];
       const replacementTooLarge =
-        estimateActiveContextTokens(replacementMessages, contextProfile) >=
-        contextProfile.postCompactTargetTokens;
+        this.#estimatePromptTokens(
+          this.#assemblePromptMessages(replacementMessages),
+          this.#tools?.definitions() ?? [],
+        ) >= contextProfile.postCompactTargetTokens;
       if (replacementTooLarge) {
         const smallerRetryMessages = shrinkContextMessagesForRetry(replacementMessages);
         const canRetryWithSmallerInput =
@@ -1500,6 +1599,7 @@ export class AgentSession {
       });
       this.#contextWindowNumber = windowNumber;
       this.#lastContextCheckpoint = { checkpointId, sequence: committedSequence };
+      this.#hasUncheckpointedInheritedMessages = false;
       this.#publish({
         type: "context_compaction_committed",
         attemptId,
@@ -1524,6 +1624,12 @@ export class AgentSession {
     readonly emitRequested: boolean;
     readonly emitStarted: boolean;
     readonly messages: ModelMessage[];
+    readonly repositoryActivation?: {
+      readonly revision: number;
+      readonly effectiveDigest: `sha256:${string}`;
+      readonly publishEvent: boolean;
+    };
+    readonly repositoryDisposition?: "mutation_retry_required" | "read_continue" | "unavailable";
     readonly reusablePermission?: PermissionPolicyInput | undefined;
     readonly signal: AbortSignal;
     readonly toolResultsById: Map<string, { readonly call: ToolCall; readonly result: ToolResult }>;
@@ -1531,6 +1637,39 @@ export class AgentSession {
     const { call, messages, signal, toolResultsById } = options;
     if (signal.aborted) {
       return this.#settleCancelled();
+    }
+    if (options.repositoryActivation?.publishEvent === true) {
+      await this.#emit({
+        type: "repository_instructions_activated",
+        revision: options.repositoryActivation.revision,
+        effectiveDigest: options.repositoryActivation.effectiveDigest,
+        reason: "path_scope_activation",
+      });
+    }
+    if (
+      options.repositoryDisposition === "mutation_retry_required" ||
+      options.repositoryDisposition === "unavailable"
+    ) {
+      const result: Extract<ToolResult, { readonly status: "failed" }> =
+        options.repositoryDisposition === "mutation_retry_required"
+          ? {
+              status: "failed",
+              error: {
+                code: "repository_context_changed",
+                message:
+                  "Repository instructions changed; reconsider this mutation with a new call ID.",
+              },
+            }
+          : {
+              status: "failed",
+              error: {
+                code: "repository_instructions_unavailable",
+                message: "Repository instructions for the requested path are unavailable.",
+              },
+            };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
     }
     if (options.emitRequested) {
       await this.#emit({ type: "tool_requested", callId: call.id, name: call.name });
@@ -1563,6 +1702,15 @@ export class AgentSession {
     if (preparedCall.status === "failed") {
       toolResultsById.set(call.id, { call, result: preparedCall });
       await this.#appendToolResult(messages, call, preparedCall);
+      return undefined;
+    }
+    const repositoryPreflight = await this.#preflightRepositoryInstructions(
+      call,
+      preparedCall.permissionSubject,
+    );
+    if (repositoryPreflight !== undefined) {
+      toolResultsById.set(call.id, { call, result: repositoryPreflight });
+      await this.#appendToolResult(messages, call, repositoryPreflight);
       return undefined;
     }
     const permissionInput: PermissionPolicyInput = {
@@ -1635,6 +1783,117 @@ export class AgentSession {
     toolResultsById.set(call.id, { call, result });
     await this.#appendToolResult(messages, call, result);
     return undefined;
+  }
+
+  async #preflightRepositoryInstructions(
+    call: ToolCall,
+    subject: PermissionSubject,
+  ): Promise<Extract<ToolResult, { readonly status: "failed" }> | undefined> {
+    const context = this.#promptContext;
+    const workspaceRoot = this.#repositoryWorkspaceRoot;
+    if (
+      context === undefined ||
+      workspaceRoot === undefined ||
+      (call.name !== "read_file" && call.name !== "write_file" && call.name !== "edit_file")
+    ) {
+      return undefined;
+    }
+    const requestedScopes = repositoryScopesFromPermissionSubject(subject);
+    const activeScopes = new Set(context.repository.activeScopes);
+    if (requestedScopes.every((scope) => activeScopes.has(scope))) {
+      return undefined;
+    }
+    const unionScopes = [...activeScopes, ...requestedScopes];
+    let repository: PromptContextRecordV1["repository"];
+    try {
+      repository = await loadRepositoryInstructions({
+        workspaceRoot,
+        activeScopes: unionScopes,
+        revision: context.repository.revision + 1,
+        loadReason: "path_scope_activation",
+      });
+    } catch (error) {
+      const runId = this.#activeRunId;
+      if (runId === undefined) {
+        throw new TypeError("Repository preflight failure requires one active run.");
+      }
+      await this.#appendRecord({
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "repository_instructions_failed",
+          recordVersion: 1,
+          activeRevision: context.repository.revision,
+          activeEffectiveDigest: context.repository.effectiveDigest,
+          error: {
+            code:
+              error instanceof RepositoryInstructionsError
+                ? error.code
+                : "repository_instruction_unreadable",
+          },
+          trigger: {
+            runId,
+            callId: call.id,
+            name: call.name,
+            argumentsDigest: `sha256:${createHash("sha256")
+              .update(call.argumentsJson, "utf8")
+              .digest("hex")}`,
+            disposition: "unavailable",
+          },
+        },
+      });
+      return {
+        status: "failed",
+        error: {
+          code: "repository_instructions_unavailable",
+          message: "Repository instructions for the requested path are unavailable.",
+        },
+      };
+    }
+    const nextContext = replacePromptRepositoryV1(context, repository);
+    const runId = this.#activeRunId;
+    if (runId === undefined) {
+      throw new TypeError("Repository activation requires one active run.");
+    }
+    const mutation = call.name !== "read_file";
+    await this.#appendRecord({
+      schemaVersion: 3,
+      sequence: this.#nextSequence,
+      record: {
+        type: "repository_instructions_committed",
+        recordVersion: 1,
+        previousRevision: context.repository.revision,
+        previousEffectiveDigest: context.repository.effectiveDigest,
+        repository,
+        assemblyIdentityDigest: nextContext.assemblyIdentityDigest,
+        trigger: {
+          runId,
+          callId: call.id,
+          name: call.name,
+          argumentsDigest: `sha256:${createHash("sha256")
+            .update(call.argumentsJson, "utf8")
+            .digest("hex")}`,
+          disposition: mutation ? "mutation_retry_required" : "read_continue",
+        },
+      },
+    });
+    this.#promptContext = nextContext;
+    await this.#emit({
+      type: "repository_instructions_activated",
+      revision: repository.revision,
+      effectiveDigest: repository.effectiveDigest,
+      reason: "path_scope_activation",
+    });
+    return mutation
+      ? {
+          status: "failed",
+          error: {
+            code: "repository_context_changed",
+            message:
+              "Repository instructions changed; reconsider this mutation with a new call ID.",
+          },
+        }
+      : undefined;
   }
 
   async #settleIncompleteStream(): Promise<RunResult> {
@@ -2356,6 +2615,60 @@ function samePermissionInput(left: PermissionPolicyInput, right: PermissionPolic
     left.scope === right.scope &&
     JSON.stringify(left.subject) === JSON.stringify(right.subject)
   );
+}
+
+function repositoryScopesFromPermissionSubject(subject: PermissionSubject): readonly string[] {
+  const paths: string[] = [];
+  if (subject.type === "file" || subject.type === "workspace_path") {
+    paths.push(subject.path);
+  } else if (subject.type === "patch") {
+    for (const operation of subject.operations) {
+      if (operation.kind === "move") {
+        paths.push(operation.from, operation.to);
+      } else {
+        paths.push(operation.path);
+      }
+    }
+  }
+  const scopes = new Set<string>(["."]);
+  for (const path of paths) {
+    const segments = path.split("/");
+    for (let length = 1; length < segments.length; length += 1) {
+      scopes.add(segments.slice(0, length).join("/"));
+    }
+  }
+  return [...scopes].sort((left, right) => {
+    const leftDepth = left === "." ? 0 : left.split("/").length;
+    const rightDepth = right === "." ? 0 : right.split("/").length;
+    return leftDepth - rightDepth || (left < right ? -1 : left > right ? 1 : 0);
+  });
+}
+
+function captureToolRegistry(tools: ToolRegistry | undefined): ToolRegistry | undefined {
+  if (tools === undefined) {
+    return undefined;
+  }
+  const definitions = tools.definitions().map((definition) => structuredClone(definition));
+  const adapters = new Map(
+    definitions.map((definition) => {
+      const adapter = tools.resolve(definition.name);
+      if (adapter === undefined || !isDeepStrictEqual(adapter.definition, definition)) {
+        throw new TypeError(`Tool definition cannot be resolved exactly: ${definition.name}`);
+      }
+      return [
+        definition.name,
+        {
+          ...adapter,
+          definition,
+          prepare: adapter.prepare.bind(adapter),
+        },
+      ] as const;
+    }),
+  );
+  return {
+    definitions: () => definitions,
+    resolve: (name) => adapters.get(name),
+  };
 }
 
 function areOptionalUsageDetailsValid(
