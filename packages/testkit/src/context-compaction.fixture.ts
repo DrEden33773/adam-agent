@@ -1,5 +1,6 @@
 import {
   type ContextProfile,
+  createCodingToolRegistry,
   createPermissionPolicy,
   createReadToolRegistry,
   createSessionLifecycle,
@@ -26,8 +27,8 @@ const contextProfile: ContextProfile = {
   version: 1,
   contextWindowTokens: 20_000,
   maximumOutputTokens: 100,
-  compactAtTokens: 700,
-  postCompactTargetTokens: 600,
+  compactAtTokens: 2_000,
+  postCompactTargetTokens: 1_600,
   retainedTargetTokens: 100,
   estimatorVersion: 1,
 };
@@ -61,6 +62,40 @@ const model: ModelDriver = {
       return;
     }
     ordinaryCall += 1;
+    if (mode === "skill-activation-hang" && ordinaryCall === 1) {
+      process.send?.({
+        type: "skill-request-observed-before-resource",
+        hasSkillBody: JSON.stringify(request.messages).includes("PROCESS_SKILL_BODY"),
+      });
+      yield {
+        type: "tool_call_start",
+        id: "read-process-skill-resource",
+        name: "read_skill_resource",
+      };
+      yield {
+        type: "tool_call_delta",
+        id: "read-process-skill-resource",
+        json: JSON.stringify({
+          qualifiedId: "skill:v1:project:.:process-skill",
+          path: "references/process.txt",
+          offset: 0,
+          maxByteCount: 256,
+        }),
+      };
+      yield { type: "tool_call_end", id: "read-process-skill-resource" };
+      yield { type: "finish", reason: "tool_calls" };
+      return;
+    }
+    if (mode === "skill-activation-hang" && ordinaryCall === 2) {
+      const serialized = JSON.stringify(request.messages);
+      process.send?.({
+        type: "skill-state-observed-before-crash",
+        hasSkillBody: serialized.includes("PROCESS_SKILL_BODY"),
+        hasResource: serialized.includes("PROCESS_SKILL_RESOURCE"),
+      });
+      await new Promise<void>(() => {});
+      return;
+    }
     if (
       (mode === "started-hang" ||
         mode === "started-hang-budget" ||
@@ -126,6 +161,16 @@ const model: ModelDriver = {
         hasReadResult: serialized.includes("process nested fact"),
       });
     }
+    if (mode === "skill-activation-continue" || mode === "skill-branch") {
+      process.send?.({
+        type:
+          mode === "skill-branch"
+            ? "skill-branch-request-observed"
+            : "skill-restart-request-observed",
+        hasSkillBody: serialized.includes("PROCESS_SKILL_BODY"),
+        hasResource: serialized.includes("PROCESS_SKILL_RESOURCE"),
+      });
+    }
     yield {
       type: "text_delta",
       text:
@@ -139,7 +184,11 @@ const model: ModelDriver = {
                 ? "Branch continued from the first checkpoint."
                 : mode === "repository-activation-continue"
                   ? "Repository activation recovered."
-                  : "Continued from committed checkpoint.",
+                  : mode === "skill-activation-continue"
+                    ? "Skill activation and resource recovered."
+                    : mode === "skill-branch"
+                      ? "Skill branch inherited frozen context."
+                      : "Continued from committed checkpoint.",
     };
     yield { type: "usage", inputTokens: 90, outputTokens: 10 };
     yield { type: "finish", reason: "stop" };
@@ -166,7 +215,9 @@ const lifecycle = createSessionLifecycle({
   modelTargets,
   stateRoot,
   workspaceRoot,
-  tools: createReadToolRegistry({ workspaceRoot }),
+  tools: mode.startsWith("skill-")
+    ? createCodingToolRegistry({ stateRoot, workspaceRoot })
+    : createReadToolRegistry({ workspaceRoot }),
   permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
 });
 if (mode === "committed-event-hang") {
@@ -213,6 +264,20 @@ if (mode === "inspect-only") {
     compactionCall,
     continued,
   });
+} else if (mode === "skill-branch") {
+  const atSequence = Number(requiredEnvironment("ADAM_AGENT_FIXTURE_AT_SEQUENCE"));
+  const child = await lifecycle.branch({ parentSessionId: sessionId, atSequence });
+  const continued = await lifecycle.continue({
+    sessionId: child.sessionId,
+    input: { text: "Continue from the frozen Skill branch." },
+  });
+  await sendAndDisconnect({
+    type: "skill-branched",
+    child,
+    ordinaryCall,
+    compactionCall,
+    continued,
+  });
 } else {
   const continued = await lifecycle.continue({
     sessionId,
@@ -220,9 +285,18 @@ if (mode === "inspect-only") {
     mode === "started-hang-budget" ||
     mode === "committed-event-hang" ||
     mode === "repository-activation-hang" ||
+    mode === "skill-activation-hang" ||
     mode === "reactive-complete" ||
     mode === "two-compactions-complete"
-      ? { input: { text: "Read context.txt and survive a real process restart." } }
+      ? {
+          input:
+            mode === "skill-activation-hang"
+              ? {
+                  text: "Activate the process Skill, read its reference, and survive restart.",
+                  skills: ["process-skill"],
+                }
+              : { text: "Read context.txt and survive a real process restart." },
+        }
       : {}),
     ...(mode === "started-hang-budget" ? { limits: { maxTokens: 10_000 } } : {}),
   });

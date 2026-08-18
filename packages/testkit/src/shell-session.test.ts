@@ -16,7 +16,7 @@ import { expect, test } from "vitest";
 
 import { FakeModelDriver } from "./index.js";
 
-test("the default coding registry exposes exactly the four approved tools", async () => {
+test("the default coding registry exposes the six prompt-v2 tools", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-coding-registry-"));
 
   try {
@@ -43,7 +43,14 @@ test("the default coding registry exposes exactly the four approved tools", asyn
       editFileRootProperties: Object.keys(editFileProperties ?? {}),
       editFileSchema: editFileDefinition?.inputSchema,
     }).toEqual({
-      definitions: ["read_file", "write_file", "edit_file", "run_shell"],
+      definitions: [
+        "read_file",
+        "write_file",
+        "edit_file",
+        "run_shell",
+        "activate_skill",
+        "read_skill_resource",
+      ],
       listFiles: undefined,
       searchText: undefined,
       writeFileDescription:

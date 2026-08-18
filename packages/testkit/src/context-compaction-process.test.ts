@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  createCodingToolRegistry,
   createReadToolRegistry,
   createSessionLifecycle,
   type ModelTargetIdentity,
@@ -193,8 +194,7 @@ test("real process restart preserves a pre-effect repository activation without 
     const records = await readRecords(harness);
     expect(
       records.filter(
-        (record) =>
-          record.schemaVersion === 3 && record.record.type === "repository_instructions_committed",
+        (record) => record.schemaVersion === 3 && record.record.type === "path_context_committed",
       ),
     ).toHaveLength(1);
     expect(
@@ -206,6 +206,108 @@ test("real process restart preserves a pre-effect repository activation without 
           record.record.event.callId === "read-process-context",
       ),
     ).toHaveLength(1);
+  } finally {
+    first.kill("SIGKILL");
+    await harness.cleanup();
+  }
+}, 20_000);
+
+test("real process restart and prefix branch replay frozen Skill activation and resource bytes without source access", async () => {
+  const harness = await createSkillProcessHarness();
+  const first = spawnFixture(harness, "skill-activation-hang");
+
+  try {
+    await expect(
+      waitForMessage(first, "skill-request-observed-before-resource"),
+    ).resolves.toMatchObject({
+      hasSkillBody: true,
+    });
+    await expect(waitForMessage(first, "skill-state-observed-before-crash")).resolves.toMatchObject(
+      {
+        hasSkillBody: true,
+        hasResource: true,
+      },
+    );
+    first.kill("SIGKILL");
+    await waitForClose(first);
+    await rm(join(harness.workspaceRoot, ".agents", "skills", "process-skill"), {
+      recursive: true,
+      force: true,
+    });
+
+    const second = spawnFixture(harness, "skill-activation-continue");
+    const [restartObserved, restarted] = await Promise.all([
+      waitForMessage(second, "skill-restart-request-observed"),
+      waitForMessage(second, "context-continued"),
+    ]);
+    await waitForClose(second);
+    expect(restartObserved).toMatchObject({ hasSkillBody: true, hasResource: true });
+    expect(restarted).toMatchObject({
+      ordinaryCall: 1,
+      continued: {
+        result: { status: "completed", answer: "Skill activation and resource recovered." },
+        snapshot: {
+          skillContext: {
+            active: [
+              {
+                qualifiedId: "skill:v1:project:.:process-skill",
+                reason: "user_explicit",
+              },
+            ],
+          },
+        },
+      },
+    });
+
+    const parentRecords = await readRecords(harness);
+    expect(
+      parentRecords.filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "skill_activation_batch_committed",
+      ),
+    ).toHaveLength(1);
+    expect(
+      parentRecords.filter(
+        (record) => record.schemaVersion === 3 && record.record.type === "skill_activated",
+      ),
+    ).toHaveLength(1);
+    expect(
+      parentRecords.filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "skill_resource_read_committed",
+      ),
+    ).toHaveLength(1);
+
+    const parentTail = parentRecords.at(-1)?.sequence;
+    expect(parentTail).toBeTypeOf("number");
+    const branchProcess = spawnFixture(harness, "skill-branch", {
+      ADAM_AGENT_FIXTURE_AT_SEQUENCE: String(parentTail),
+    });
+    const [branchObserved, branched] = await Promise.all([
+      waitForMessage(branchProcess, "skill-branch-request-observed"),
+      waitForMessage(branchProcess, "skill-branched"),
+    ]);
+    await waitForClose(branchProcess);
+    expect(branchObserved).toMatchObject({ hasSkillBody: true, hasResource: true });
+    expect(branched).toMatchObject({
+      ordinaryCall: 1,
+      continued: {
+        result: { status: "completed", answer: "Skill branch inherited frozen context." },
+      },
+    });
+
+    const inspector = spawnFixture(harness, "inspect-only");
+    const inspected = await waitForMessage(inspector, "context-inspected");
+    await waitForClose(inspector);
+    expect(inspected).toMatchObject({
+      inspected: {
+        skillContext: {
+          active: [{ qualifiedId: "skill:v1:project:.:process-skill" }],
+        },
+      },
+    });
+    expect(JSON.stringify(inspected)).not.toContain("PROCESS_SKILL_BODY");
+    expect(JSON.stringify(inspected)).not.toContain("PROCESS_SKILL_RESOURCE");
   } finally {
     first.kill("SIGKILL");
     await harness.cleanup();
@@ -439,6 +541,42 @@ async function createProcessHarness(prefix: string): Promise<{
     stateRoot,
     workspaceRoot,
     tools: createReadToolRegistry({ workspaceRoot }),
+  }).create({ targetIdentity });
+  return {
+    testRoot,
+    stateRoot,
+    workspaceRoot,
+    sessionId: created.sessionId,
+    cleanup: () => rm(testRoot, { recursive: true, force: true }),
+  };
+}
+
+async function createSkillProcessHarness(): Promise<{
+  readonly testRoot: string;
+  readonly stateRoot: string;
+  readonly workspaceRoot: string;
+  readonly sessionId: string;
+  readonly cleanup: () => Promise<void>;
+}> {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-skill-replay-process-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "process-skill");
+  await mkdir(join(skillDirectory, "references"), { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: process-skill\ndescription: Exercises frozen Skill restart evidence.\n---\nPROCESS_SKILL_BODY\n",
+    "utf8",
+  );
+  await writeFile(
+    join(skillDirectory, "references", "process.txt"),
+    "PROCESS_SKILL_RESOURCE\n",
+    "utf8",
+  );
+  const created = await createSessionLifecycle({
+    stateRoot,
+    workspaceRoot,
+    tools: createCodingToolRegistry({ stateRoot, workspaceRoot }),
   }).create({ targetIdentity });
   return {
     testRoot,

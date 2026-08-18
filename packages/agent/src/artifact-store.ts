@@ -36,9 +36,21 @@ export type ModelResponseArtifactSource = {
   readonly provenance: "provider_model_response";
 };
 
+export type SkillArtifactSource = {
+  readonly type: "skill";
+  readonly schemaVersion: 1;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly catalogRevision: number;
+  readonly qualifiedId: string;
+  readonly skillMdDigest: string;
+  readonly provenance: "skill_ingestion";
+};
+
 export type ArtifactSource =
   | ExtensionArtifactSource
   | ModelResponseArtifactSource
+  | SkillArtifactSource
   | ToolArtifactSource;
 
 export type ArtifactReference<TSource extends ArtifactSource = ArtifactSource> = {

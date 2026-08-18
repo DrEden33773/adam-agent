@@ -28,7 +28,14 @@ type ExtensionIdentity = {
 
 export type ExtensionLifecycleStore = {
   read(identity: ExtensionIdentity): Promise<boolean | undefined>;
+  readState(identity: ExtensionIdentity): Promise<ExtensionLifecycleTruth>;
   write(identity: ExtensionIdentity, enabled: boolean): Promise<void>;
+};
+
+export type ExtensionLifecycleTruth = {
+  readonly enabled: boolean | undefined;
+  readonly revision: number;
+  readonly digest: `sha256:${string}`;
 };
 
 const lifecycleOperationQueues = new Map<string, Promise<void>>();
@@ -37,7 +44,10 @@ export function createExtensionLifecycleStore(stateRoot?: string): ExtensionLife
   const directory = join(resolve(stateRoot ?? defaultStateRoot()), "extensions");
 
   return {
-    read(identity) {
+    async read(identity) {
+      return (await this.readState(identity)).enabled;
+    },
+    readState(identity) {
       return enqueueLifecycleOperation(directory, async () => {
         const path = lifecycleLogPath(directory, identity);
         let file: FileHandle;
@@ -45,7 +55,7 @@ export function createExtensionLifecycleStore(stateRoot?: string): ExtensionLife
           file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
         } catch (error) {
           if (isNodeError(error) && error.code === "ENOENT") {
-            return undefined;
+            return emptyLifecycleTruth();
           }
           throw error;
         }
@@ -136,7 +146,7 @@ async function readLifecycleTruth(
   file: FileHandle,
   identity: ExtensionIdentity,
   allowEmpty: boolean,
-): Promise<boolean | undefined> {
+): Promise<ExtensionLifecycleTruth> {
   const stats = await file.stat();
   if (!stats.isFile() || !Number.isSafeInteger(stats.size)) {
     throw new TypeError("The extension lifecycle log must be an ordinary file.");
@@ -155,7 +165,7 @@ async function readLifecycleTruth(
   }
   const content = buffer.subarray(0, offset).toString("utf8");
   if (allowEmpty && content.length === 0) {
-    return undefined;
+    return emptyLifecycleTruth();
   }
   if (content.length === 0 || !content.endsWith("\n")) {
     throw new TypeError("The extension lifecycle log is invalid.");
@@ -174,7 +184,19 @@ async function readLifecycleTruth(
   ) {
     throw new TypeError("The extension lifecycle log identity is invalid.");
   }
-  return records.at(-1)?.enabled;
+  return {
+    enabled: records.at(-1)?.enabled,
+    revision: records.length,
+    digest: `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`,
+  };
+}
+
+function emptyLifecycleTruth(): ExtensionLifecycleTruth {
+  return {
+    enabled: undefined,
+    revision: 0,
+    digest: `sha256:${createHash("sha256").update("", "utf8").digest("hex")}`,
+  };
 }
 
 function lifecycleLogPath(directory: string, identity: ExtensionIdentity): string {

@@ -1,7 +1,8 @@
 import type { ContextEvidenceV1 } from "./durable-context.js";
 import type { ModelMessage } from "./index.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
-import type { PromptContextRecordV1 } from "./prompt-assembly.js";
+import type { PromptContextRecord } from "./prompt-assembly.js";
+import type { ExtensionSkillSourceV1, SkillContextRecordV1 } from "./skills.js";
 import type { PermissionPolicyInput, ToolCall, ToolResult } from "./tool-runtime.js";
 
 export const sessionDurableContext = Symbol("adam-agent.session-durable-context");
@@ -19,13 +20,34 @@ export type AgentSessionDurableContext = {
   readonly initialMessages?: readonly ModelMessage[];
   readonly nextSequence: number;
   readonly projectId?: string;
-  readonly promptContext?: PromptContextRecordV1 | undefined;
+  readonly promptContext?: PromptContextRecord | undefined;
+  readonly skillContext?: SkillContextRecordV1 | undefined;
+  readonly activeSkillContents?: ReadonlyMap<string, string> | undefined;
+  readonly extensionSkillSources?: readonly ExtensionSkillSourceV1[] | undefined;
+  readonly withCurrentExtensionSkillSources?:
+    | (<T>(
+        sources: readonly ExtensionSkillSourceV1[],
+        operation: () => Promise<T>,
+      ) => Promise<
+        { readonly status: "current"; readonly value: T } | { readonly status: "stale" }
+      >)
+    | undefined;
   readonly referencedModelResponseArtifactBytes?: number;
   readonly repositoryWorkspaceRoot?: string;
+  readonly skillResourceLineageBytes?: number;
+  readonly skillResourceRunBytes?: number;
   readonly sessionId?: string;
   readonly targetIdentity: ModelTargetIdentity;
   readonly resume?: {
     readonly runId: string;
+    readonly pendingExplicitSkills?: readonly {
+      readonly selection: string;
+      readonly requestId: string;
+    }[];
+    readonly explicitSkillPermissions?: readonly {
+      readonly requestId: string;
+      readonly decision: "allow" | "deny";
+    }[];
     readonly messages: readonly ModelMessage[];
     readonly nextTurn: number;
     readonly nextAttempt: number;
@@ -46,6 +68,7 @@ export type AgentSessionDurableContext = {
         readonly publishEvent: boolean;
       };
       readonly reusablePermission?: PermissionPolicyInput | undefined;
+      readonly replayResult?: ToolResult | undefined;
     }[];
   };
 };

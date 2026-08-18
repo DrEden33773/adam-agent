@@ -284,6 +284,11 @@ function formatPermissionPrompt(
   if (event.subject.type === "extension_capability") {
     return `Allow ${event.subject.capabilityId} for extension ${quoteForTerminal(event.subject.extensionId)} operation ${quoteForTerminal(event.subject.operationId)} [y/N] `;
   }
+  if (event.subject.type === "skill") {
+    const resource =
+      event.subject.path === undefined ? "" : ` resource ${quoteForTerminal(event.subject.path)}`;
+    return `Allow ${event.name} for Agent Skill ${quoteForTerminal(event.subject.qualifiedId)}${resource} [y/N] `;
+  }
   return `Allow ${event.name} for ${quoteForTerminal(event.subject.path)} [y/N] `;
 }
 
@@ -370,7 +375,7 @@ function writeText(fileDescriptor: number, text: string): void {
 }
 
 type CliCommand =
-  | { readonly type: "prompt"; readonly prompt: string }
+  | { readonly type: "prompt"; readonly prompt: string; readonly skills?: readonly string[] }
   | { readonly type: "recover_operation"; readonly operationId: string }
   | { readonly type: "resume"; readonly sessionId: string; readonly continue: boolean }
   | {
@@ -439,7 +444,10 @@ async function runCliCommand(activeCommand: CliCommand): Promise<void> {
       const created = await lifecycle.create({ targetIdentity: resolved.identity });
       await continueAndPresent(lifecycle, {
         sessionId: created.sessionId,
-        input: { text: activeCommand.prompt },
+        input: {
+          text: activeCommand.prompt,
+          ...(activeCommand.skills === undefined ? {} : { skills: activeCommand.skills }),
+        },
         limits: { maxTurns: 8 },
       });
       return;
@@ -621,7 +629,31 @@ function parseCliCommand(arguments_: readonly string[]): CliCommand {
       ...(targetId === undefined ? {} : { targetId }),
     };
   }
-  return { type: "prompt", prompt: arguments_.join(" ") };
+  const skills: string[] = [];
+  let promptStart = 0;
+  while (arguments_[promptStart] === "--skill") {
+    const selection = arguments_[promptStart + 1];
+    if (selection === undefined || selection === "--skill") {
+      return failConfiguration("Usage: adam-agent [--skill <id-or-unique-short-name>]... <prompt>");
+    }
+    if (Buffer.byteLength(selection, "utf8") > 16_384 || !/^[\x20-\x7e]+$/u.test(selection)) {
+      return failConfiguration(
+        "Explicit Skill selections must be a bounded list of nonempty ASCII handles.",
+      );
+    }
+    skills.push(selection);
+    if (skills.length > 8) {
+      return failConfiguration(
+        "Explicit Skill selections must be a bounded list of nonempty ASCII handles.",
+      );
+    }
+    promptStart += 2;
+  }
+  return {
+    type: "prompt",
+    prompt: arguments_.slice(promptStart).join(" "),
+    ...(skills.length === 0 ? {} : { skills }),
+  };
 }
 
 function failConfiguration(message: string): never {

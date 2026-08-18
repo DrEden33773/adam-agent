@@ -55,6 +55,12 @@ const contextProfile: ContextProfile = {
   retainedTargetTokens: 100,
   estimatorVersion: 1,
 };
+const roomyContextProfile: ContextProfile = {
+  ...contextProfile,
+  compactAtTokens: 15_000,
+  postCompactTargetTokens: 10_000,
+  retainedTargetTokens: 1_000,
+};
 
 test("ModelRequest requires an explicit per-call output budget", () => {
   expectTypeOf<ModelRequest["maximumOutputTokens"]>().toEqualTypeOf<number>();
@@ -758,7 +764,7 @@ test("SessionLifecycle completes bounded markers after a crash following the res
   };
   const modelTargets: ModelTargets = {
     async resolve() {
-      return { identity: targetIdentity, driver: model, contextProfile };
+      return { identity: targetIdentity, driver: model, contextProfile: roomyContextProfile };
     },
     async snapshot() {
       return {
@@ -766,7 +772,7 @@ test("SessionLifecycle completes bounded markers after a crash following the res
           {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "test" },
-            contextProfile,
+            contextProfile: roomyContextProfile,
           },
         ],
       };
@@ -802,7 +808,8 @@ test("SessionLifecycle completes bounded markers after a crash following the res
     if (
       genesis?.schemaVersion !== 3 ||
       genesis.record.type !== "session_genesis" ||
-      genesis.record.promptContext === undefined
+      genesis.record.promptContext === undefined ||
+      genesis.record.skillContext === undefined
     ) {
       throw new Error("Expected a v1 prompt context in the crash fixture genesis.");
     }
@@ -810,12 +817,15 @@ test("SessionLifecycle completes bounded markers after a crash following the res
       model,
       artifactStore,
       store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
-      contextProfile,
+      tools: createCodingToolRegistry({ stateRoot, workspaceRoot }),
+      contextProfile: roomyContextProfile,
       [sessionDurableContext]: {
         nextSequence: 2,
         targetIdentity,
         projectId: created.projectId,
         promptContext: genesis.record.promptContext,
+        skillContext: genesis.record.skillContext,
+        repositoryWorkspaceRoot: workspaceRoot,
         sessionId: created.sessionId,
       },
     };
@@ -861,7 +871,7 @@ test("SessionLifecycle charges inherited branch artifacts before accepting a chi
   };
   const modelTargets: ModelTargets = {
     async resolve() {
-      return { identity: targetIdentity, driver: model, contextProfile };
+      return { identity: targetIdentity, driver: model, contextProfile: roomyContextProfile };
     },
     async snapshot() {
       return {
@@ -869,7 +879,7 @@ test("SessionLifecycle charges inherited branch artifacts before accepting a chi
           {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "test" },
-            contextProfile,
+            contextProfile: roomyContextProfile,
           },
         ],
       };
@@ -1010,7 +1020,7 @@ test("SessionLifecycle restores artifact-backed output-limit settlements as inco
   };
   const modelTargets: ModelTargets = {
     async resolve() {
-      return { identity: targetIdentity, driver: model, contextProfile };
+      return { identity: targetIdentity, driver: model, contextProfile: roomyContextProfile };
     },
     async snapshot() {
       return {
@@ -1018,7 +1028,7 @@ test("SessionLifecycle restores artifact-backed output-limit settlements as inco
           {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "test" },
-            contextProfile,
+            contextProfile: roomyContextProfile,
           },
         ],
       };
