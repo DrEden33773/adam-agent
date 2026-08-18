@@ -12,6 +12,14 @@ import { maximumInlineModelResponseFieldBytes } from "./durable-model-response-p
 import type { RunResult, RuntimeEvent } from "./index.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
+import {
+  type PromptContextRecordV1,
+  promptContextRecordV1Schema,
+  type RepositoryInstructionFailureCode,
+  repositoryInstructionFailureCodesV1,
+  repositoryInstructionRevisionV1Schema,
+  type Sha256Digest,
+} from "./prompt-assembly.js";
 import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from "./tool-runtime.js";
 
 export type CanonicalRuntimeEvent = Exclude<RuntimeEvent, { readonly type: "model_message_delta" }>;
@@ -80,6 +88,7 @@ export type SessionGenesisRecord = {
     readonly sessionId: string;
     readonly projectId: string;
     readonly targetIdentity: ModelTargetIdentity;
+    readonly promptContext?: PromptContextRecordV1;
     readonly lineage?: {
       readonly parentSessionId: string;
       readonly parentEventPosition: number;
@@ -111,6 +120,11 @@ export type SessionProviderAttemptStartedRecord = {
     readonly turn: number;
     readonly attempt: number;
     readonly targetIdentity: ModelTargetIdentity;
+    readonly promptProjection?: {
+      readonly version: 1;
+      readonly assemblyIdentityDigest: Sha256Digest;
+      readonly requestProjectionDigest: Sha256Digest;
+    };
   };
 };
 
@@ -306,6 +320,45 @@ export type SessionContextCompactionInterruptedRecord = {
   };
 };
 
+export type SessionRepositoryInstructionsCommittedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "repository_instructions_committed";
+    readonly recordVersion: 1;
+    readonly previousRevision: number;
+    readonly previousEffectiveDigest: Sha256Digest;
+    readonly repository: PromptContextRecordV1["repository"];
+    readonly assemblyIdentityDigest: Sha256Digest;
+    readonly trigger?: {
+      readonly runId: string;
+      readonly callId: string;
+      readonly name: "read_file" | "write_file" | "edit_file";
+      readonly argumentsDigest: Sha256Digest;
+      readonly disposition: "read_continue" | "mutation_retry_required";
+    };
+  };
+};
+
+export type SessionRepositoryInstructionsFailedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "repository_instructions_failed";
+    readonly recordVersion: 1;
+    readonly activeRevision: number;
+    readonly activeEffectiveDigest: Sha256Digest;
+    readonly error: { readonly code: RepositoryInstructionFailureCode };
+    readonly trigger?: {
+      readonly runId: string;
+      readonly callId: string;
+      readonly name: "read_file" | "write_file" | "edit_file";
+      readonly argumentsDigest: Sha256Digest;
+      readonly disposition: "unavailable";
+    };
+  };
+};
+
 export type SessionV3Record =
   | SessionGenesisRecord
   | SessionLogicalRunStartedRecord
@@ -318,6 +371,8 @@ export type SessionV3Record =
   | SessionContextCompactionCommittedRecord
   | SessionContextCompactionFailedRecord
   | SessionContextCompactionInterruptedRecord
+  | SessionRepositoryInstructionsCommittedRecord
+  | SessionRepositoryInstructionsFailedRecord
   | SessionRuntimeEventRecord;
 
 export type SessionRecord = SessionEventRecord | SessionV3Record;
@@ -449,6 +504,8 @@ const v2ToolErrorSchema = z.discriminatedUnion("code", [
       "no_match",
       "overlapping_edits",
       "path_conflict",
+      "repository_context_changed",
+      "repository_instructions_unavailable",
       "artifact_store_failed",
       "shell_start_failed",
       "tool_effect_indeterminate",
@@ -581,6 +638,12 @@ function createCanonicalRuntimeEventSchema(options: {
       type: z.literal("tool_requested"),
       callId: z.string(),
       name: z.string(),
+    }),
+    z.strictObject({
+      type: z.literal("repository_instructions_activated"),
+      revision: z.number().int().positive(),
+      effectiveDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+      reason: z.literal("path_scope_activation"),
     }),
     z.strictObject({
       type: z.literal("tool_permission_requested"),
@@ -817,6 +880,7 @@ const sessionV3RecordSchema = z.union([
     sessionId: z.uuid(),
     projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
     targetIdentity: modelTargetIdentitySchema,
+    promptContext: promptContextRecordV1Schema.optional(),
     lineage: z
       .strictObject({
         parentSessionId: z.uuid(),
@@ -837,6 +901,46 @@ const sessionV3RecordSchema = z.union([
     turn: z.number().int().positive(),
     attempt: z.number().int().positive(),
     targetIdentity: modelTargetIdentitySchema,
+    promptProjection: z
+      .strictObject({
+        version: z.literal(1),
+        assemblyIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+        requestProjectionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+      })
+      .optional(),
+  }),
+  z.strictObject({
+    type: z.literal("repository_instructions_committed"),
+    recordVersion: z.literal(1),
+    previousRevision: z.number().int().positive(),
+    previousEffectiveDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    repository: repositoryInstructionRevisionV1Schema,
+    assemblyIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    trigger: z
+      .strictObject({
+        runId: z.uuid(),
+        callId: z.string().min(1).max(256),
+        name: z.enum(["read_file", "write_file", "edit_file"]),
+        argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+        disposition: z.enum(["read_continue", "mutation_retry_required"]),
+      })
+      .optional(),
+  }),
+  z.strictObject({
+    type: z.literal("repository_instructions_failed"),
+    recordVersion: z.literal(1),
+    activeRevision: z.number().int().positive(),
+    activeEffectiveDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    error: z.strictObject({ code: z.enum(repositoryInstructionFailureCodesV1) }),
+    trigger: z
+      .strictObject({
+        runId: z.uuid(),
+        callId: z.string().min(1).max(256),
+        name: z.enum(["read_file", "write_file", "edit_file"]),
+        argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+        disposition: z.literal("unavailable"),
+      })
+      .optional(),
   }),
   z.strictObject({
     type: z.literal("provider_attempt_interrupted"),

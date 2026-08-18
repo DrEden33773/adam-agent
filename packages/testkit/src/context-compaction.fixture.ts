@@ -65,6 +65,7 @@ const model: ModelDriver = {
       (mode === "started-hang" ||
         mode === "started-hang-budget" ||
         mode === "committed-event-hang" ||
+        mode === "repository-activation-hang" ||
         mode === "two-compactions-complete") &&
       ordinaryCall === 1
     ) {
@@ -73,7 +74,10 @@ const model: ModelDriver = {
       yield {
         type: "tool_call_delta",
         id: "read-process-context",
-        json: '{"path":"context.txt"}',
+        json:
+          mode === "repository-activation-hang"
+            ? '{"path":"nested/fact.txt"}'
+            : '{"path":"context.txt"}',
       };
       yield { type: "tool_call_end", id: "read-process-context" };
       yield { type: "finish", reason: "tool_calls" };
@@ -115,6 +119,13 @@ const model: ModelDriver = {
         hasRawBulk: serialized.includes("PROCESS_RAW_CONTEXT_TAIL"),
       });
     }
+    if (mode === "repository-activation-continue") {
+      process.send?.({
+        type: "repository-request-observed",
+        hasFrozenRule: serialized.includes("Process nested rule."),
+        hasReadResult: serialized.includes("process nested fact"),
+      });
+    }
     yield {
       type: "text_delta",
       text:
@@ -126,7 +137,9 @@ const model: ModelDriver = {
               ? "Two process compactions completed."
               : mode === "branch-first-checkpoint"
                 ? "Branch continued from the first checkpoint."
-                : "Continued from committed checkpoint.",
+                : mode === "repository-activation-continue"
+                  ? "Repository activation recovered."
+                  : "Continued from committed checkpoint.",
     };
     yield { type: "usage", inputTokens: 90, outputTokens: 10 };
     yield { type: "finish", reason: "stop" };
@@ -160,6 +173,14 @@ if (mode === "committed-event-hang") {
   lifecycle.subscribe((event) => {
     if (event.type === "context_compaction_committed") {
       process.send?.({ type: "checkpoint-committed-before-swap" });
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+    }
+  });
+}
+if (mode === "repository-activation-hang") {
+  lifecycle.subscribe((event) => {
+    if (event.type === "repository_instructions_activated") {
+      process.send?.({ type: "repository-activation-committed", revision: event.revision });
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
     }
   });
@@ -198,6 +219,7 @@ if (mode === "inspect-only") {
     ...(mode === "started-hang" ||
     mode === "started-hang-budget" ||
     mode === "committed-event-hang" ||
+    mode === "repository-activation-hang" ||
     mode === "reactive-complete" ||
     mode === "two-compactions-complete"
       ? { input: { text: "Read context.txt and survive a real process restart." } }

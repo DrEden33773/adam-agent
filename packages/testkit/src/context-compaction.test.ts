@@ -798,6 +798,14 @@ test("SessionLifecycle completes bounded markers after a crash following the res
       read: () => jsonlStore.read(),
     };
     const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+    const genesis = (await jsonlStore.read())[0];
+    if (
+      genesis?.schemaVersion !== 3 ||
+      genesis.record.type !== "session_genesis" ||
+      genesis.record.promptContext === undefined
+    ) {
+      throw new Error("Expected a v1 prompt context in the crash fixture genesis.");
+    }
     const dependencies = {
       model,
       artifactStore,
@@ -807,6 +815,7 @@ test("SessionLifecycle completes bounded markers after a crash following the res
         nextSequence: 2,
         targetIdentity,
         projectId: created.projectId,
+        promptContext: genesis.record.promptContext,
         sessionId: created.sessionId,
       },
     };
@@ -3428,6 +3437,11 @@ test("SessionLifecycle restarts and branches from one committed context checkpoi
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
   await writeFile(join(workspaceRoot, "context.txt"), "lifecycle context ".repeat(220), "utf8");
+  const lifecycleContextProfile: ContextProfile = {
+    ...contextProfile,
+    compactAtTokens: 900,
+    postCompactTargetTokens: 700,
+  };
 
   let ordinaryCall = 0;
   const model: ModelDriver = {
@@ -3482,7 +3496,7 @@ test("SessionLifecycle restarts and branches from one committed context checkpoi
   };
   const modelTargets: ModelTargets = {
     async resolve() {
-      return { identity: targetIdentity, driver: model, contextProfile };
+      return { identity: targetIdentity, driver: model, contextProfile: lifecycleContextProfile };
     },
     async snapshot() {
       return {
@@ -3490,7 +3504,7 @@ test("SessionLifecycle restarts and branches from one committed context checkpoi
           {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "test" },
-            contextProfile,
+            contextProfile: lifecycleContextProfile,
           },
         ],
       };
@@ -3555,7 +3569,7 @@ test("SessionLifecycle restarts and branches from one committed context checkpoi
     const upgradedTargets: ModelTargets = {
       async resolve(input) {
         return input.targetIdentity?.profileVersion === 1
-          ? { identity: targetIdentity, driver: model, contextProfile }
+          ? { identity: targetIdentity, driver: model, contextProfile: lifecycleContextProfile }
           : {
               identity: currentV2Identity,
               driver: model,
@@ -3571,7 +3585,7 @@ test("SessionLifecycle restarts and branches from one committed context checkpoi
         const historical = {
           identity: targetIdentity,
           readiness: { status: "available" as const, credentialSource: "test" },
-          contextProfile,
+          contextProfile: lifecycleContextProfile,
         };
         return {
           targets: input.includeHistoricalProfiles ? [current, historical] : [current],
@@ -3586,15 +3600,15 @@ test("SessionLifecycle restarts and branches from one committed context checkpoi
       status: "ready",
       snapshot: {
         targetIdentity,
-        context: { profile: contextProfile, checkpoint: { windowNumber: 1 } },
+        context: { profile: lifecycleContextProfile, checkpoint: { windowNumber: 1 } },
       },
     });
     expect(await parentStore.read()).toEqual(recordsBeforeV2Snapshot);
     let incompatibleDriverWasCalled = false;
     const incompatibleProfile: ContextProfile = {
-      ...contextProfile,
+      ...lifecycleContextProfile,
       version: 2,
-      compactAtTokens: contextProfile.compactAtTokens - 1,
+      compactAtTokens: lifecycleContextProfile.compactAtTokens - 1,
     };
     const incompatibleTargets: ModelTargets = {
       async resolve() {
@@ -3676,6 +3690,9 @@ test("SessionLifecycle restarts and branches from one committed context checkpoi
       parentSessionId: created.sessionId,
       atSequence: parent.snapshot.lastSequence,
     });
+    await expect(
+      restarted.resume({ sessionId: afterCheckpointChild.sessionId }),
+    ).resolves.toMatchObject({ status: "ready" });
     const afterCheckpointContinuation = await restarted.continue({
       sessionId: afterCheckpointChild.sessionId,
       input: { text: "Continue the child from after the checkpoint." },
@@ -3706,6 +3723,11 @@ test("SessionLifecycle reports then normalizes a dangling compaction attempt aft
 
   let ordinaryCall = 0;
   let compactionCall = 0;
+  const danglingContextProfile = {
+    ...contextProfile,
+    compactAtTokens: 900,
+    postCompactTargetTokens: 700,
+  };
   const model: ModelDriver = {
     async *stream(request) {
       if (request.tools.length === 0) {
@@ -3746,7 +3768,7 @@ test("SessionLifecycle reports then normalizes a dangling compaction attempt aft
   };
   const modelTargets: ModelTargets = {
     async resolve() {
-      return { identity: targetIdentity, driver: model, contextProfile };
+      return { identity: targetIdentity, driver: model, contextProfile: danglingContextProfile };
     },
     async snapshot() {
       return {
@@ -3754,7 +3776,7 @@ test("SessionLifecycle reports then normalizes a dangling compaction attempt aft
           {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "test" },
-            contextProfile,
+            contextProfile: danglingContextProfile,
           },
         ],
       };

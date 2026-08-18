@@ -701,11 +701,12 @@ describe("AgentSession", () => {
 
   test("sends the user input to the model driver", async () => {
     const model = new FakeModelDriver((request) => {
-      const firstMessage = request.messages[0];
+      const directUserMessage = request.messages.findLast((message) => message.role === "user");
       return [
         {
           type: "text_delta",
-          text: firstMessage?.role === "user" ? firstMessage.content : "missing user input",
+          text:
+            directUserMessage?.role === "user" ? directUserMessage.content : "missing user input",
         },
         { type: "finish", reason: "stop" },
       ];

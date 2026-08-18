@@ -67,6 +67,8 @@ export type ToolResult =
               | "no_match"
               | "overlapping_edits"
               | "path_conflict"
+              | "repository_context_changed"
+              | "repository_instructions_unavailable"
               | "artifact_store_failed"
               | "shell_start_failed"
               | "tool_effect_indeterminate"
