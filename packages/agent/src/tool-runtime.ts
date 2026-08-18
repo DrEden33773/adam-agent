@@ -78,10 +78,30 @@ export type ToolResult =
               | "resource_page_too_small"
               | "skill_resource_quota_exceeded"
               | "artifact_store_failed"
+              | "mcp_protocol_error"
+              | "mcp_output_invalid"
+              | "mcp_output_unsupported"
+              | "mcp_result_too_large"
               | "shell_start_failed"
-              | "tool_effect_indeterminate"
               | "tool_io_failed";
             readonly message: string;
+          }
+        | {
+            readonly code: "tool_effect_indeterminate";
+            readonly reason:
+              | "mcp_request_timeout"
+              | "mcp_caller_cancelled"
+              | "mcp_connection_closed"
+              | "mcp_protocol_error"
+              | "process_restart";
+            readonly message: string;
+          }
+        | {
+            readonly code: "mcp_catalog_stale";
+            readonly message: string;
+            readonly generationId: string;
+            readonly serverId: string;
+            readonly catalogDigest: `sha256:${string}`;
           }
         | {
             readonly code: "patch_recovery_cleanup_failed";
@@ -155,6 +175,7 @@ type OrdinaryToolError = Exclude<
 type PreparedToolCall = {
   readonly status: "ready";
   readonly permissionSubject: PermissionSubject;
+  validateBeforeDispatch?(): FailedToolResult | undefined;
   execute(context: ToolExecutionContext): Promise<ToolResult>;
 };
 
@@ -165,9 +186,15 @@ type ToolExecutionContext = {
 };
 
 class ToolExecutionError extends Error {
-  readonly code: OrdinaryToolError["code"];
+  readonly code: Exclude<
+    OrdinaryToolError["code"],
+    "mcp_catalog_stale" | "tool_effect_indeterminate"
+  >;
 
-  constructor(code: OrdinaryToolError["code"], message: string) {
+  constructor(
+    code: Exclude<OrdinaryToolError["code"], "mcp_catalog_stale" | "tool_effect_indeterminate">,
+    message: string,
+  ) {
     super(message);
     this.code = code;
   }
@@ -210,6 +237,15 @@ export type PermissionSubject =
       readonly operation: "activate" | "read_resource";
       readonly qualifiedId: string;
       readonly path?: string | undefined;
+    }
+  | {
+      readonly type: "mcp_tool";
+      readonly serverId: string;
+      readonly originalName: string;
+      readonly qualifiedName: string;
+      readonly serverDefinitionDigest: `sha256:${string}`;
+      readonly definitionDigest: `sha256:${string}`;
+      readonly argumentsDigest: `sha256:${string}`;
     };
 
 export type PermissionPolicyInput = {

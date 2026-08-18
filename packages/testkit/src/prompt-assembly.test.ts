@@ -208,7 +208,7 @@ const expectedCodingTools = [
 ] as const;
 const expectedHistoricalCodingTools = expectedCodingTools.slice(0, 4);
 
-test("a newly created v2 session sends code-owned prompts before the current user request with the exact six-tool profile", async () => {
+test("a newly created v3 session sends code-owned prompts before the current user request with the exact six-tool profile", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-prompt-assembly-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -357,7 +357,7 @@ test.each([
   }
 });
 
-test("a new v2 session persists bounded prompt and Skill identity without exposing prompt content", async () => {
+test("a new v3 session persists bounded prompt and Skill identity without exposing prompt content", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-prompt-identity-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -368,8 +368,8 @@ test("a new v2 session persists bounded prompt and Skill identity without exposi
     tools: createCodingToolRegistry({ stateRoot, workspaceRoot }),
   };
   const expectedPromptContext = {
-    profileVersion: 2,
-    assemblyVersion: 2,
+    profileVersion: 3,
+    assemblyVersion: 3,
     base: {
       version: 1,
       digest: "sha256:e650f56f448da05ee6f1d75cb343c07ed77086e5bf267aaca97b93d50fb0fa5f",
@@ -445,7 +445,7 @@ test("a new v2 session persists bounded prompt and Skill identity without exposi
   }
 });
 
-test("v2 accounting compacts for the assembled messages and tools while keeping the summary call tool-free", async () => {
+test("v3 accounting compacts for the assembled messages and tools while keeping the summary call tool-free", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-prompt-accounting-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -1238,7 +1238,7 @@ test("a v1 provider attempt with a tampered request projection digest fails clos
   }
 });
 
-test("a v2 provider attempt persists only the safe exact request projection digest", async () => {
+test("a v3 provider attempt persists only the safe exact request projection digest", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-prompt-projection-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");

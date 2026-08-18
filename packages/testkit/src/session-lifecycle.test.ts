@@ -61,7 +61,7 @@ function promptProjectionFor(
   snapshot: {
     readonly promptContext?: {
       readonly assemblyIdentityDigest: `sha256:${string}`;
-      readonly profileVersion: 1 | 2;
+      readonly profileVersion: 1 | 2 | 3;
     };
   },
   transcript: string | readonly ModelMessage[],
@@ -84,7 +84,7 @@ function promptProjectionFor(
           version: 1,
           messages: [
             { role: "system", content: basePrompt },
-            ...(snapshot.promptContext?.profileVersion === 2
+            ...(snapshot.promptContext !== undefined && snapshot.promptContext.profileVersion !== 1
               ? [{ role: "developer" as const, content: skillUsagePrompt }]
               : []),
             ...(typeof transcript === "string"
@@ -92,7 +92,10 @@ function promptProjectionFor(
               : transcript),
           ],
           tools:
-            tools ?? (snapshot.promptContext?.profileVersion === 2 ? codingToolDefinitions : []),
+            tools ??
+            (snapshot.promptContext !== undefined && snapshot.promptContext.profileVersion !== 1
+              ? codingToolDefinitions
+              : []),
         }),
       )
       .digest("hex")}`,
@@ -176,7 +179,7 @@ test("SessionLifecycle creates durable new-schema genesis for an exact project a
   }
 });
 
-test("SessionLifecycle creates a prompt-v2 genesis with an empty bounded Skill snapshot and six tools", async () => {
+test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill snapshot and six tools", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-skills-genesis-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -204,8 +207,8 @@ test("SessionLifecycle creates a prompt-v2 genesis with an empty bounded Skill s
     for (const snapshot of [created, inspected]) {
       expect(snapshot).toMatchObject({
         promptContext: {
-          profileVersion: 2,
-          assemblyVersion: 2,
+          profileVersion: 3,
+          assemblyVersion: 3,
           toolProfile: {
             definitions: [
               { name: "read_file" },
@@ -2878,6 +2881,7 @@ test("SessionLifecycle settles a started unsafe tool effect as indeterminate wit
               status: "failed",
               error: {
                 code: "tool_effect_indeterminate",
+                reason: "process_restart",
                 message:
                   "The write_file effect started before restart and cannot be replayed safely.",
               },
@@ -3487,6 +3491,7 @@ test.each([
                 status: "failed",
                 error: {
                   code: "tool_effect_indeterminate",
+                  reason: "process_restart",
                   message: started
                     ? "The read_file effect started before restart and cannot be replayed safely."
                     : "The durable read_file request no longer matches the current tool definition and requires inspection.",
@@ -3831,6 +3836,7 @@ test("SessionLifecycle real-process restart marks a killed structured patch as i
               status: "failed",
               error: {
                 code: "tool_effect_indeterminate",
+                reason: "process_restart",
                 message:
                   "The edit_file effect started before restart and cannot be replayed safely.",
               },

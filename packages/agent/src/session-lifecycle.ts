@@ -2,6 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import { z } from "zod";
 import { type ArtifactStore, createFileArtifactStore, readFileArtifact } from "./artifact-store.js";
 import { type ContextProfile, isContextProfileSupported } from "./context-profile.js";
 import {
@@ -35,6 +37,30 @@ import {
   type UserInput,
 } from "./index.js";
 import {
+  createMcpRuntimeHost,
+  inspectMcpConfiguration,
+  isMcpToolProfileV1Valid,
+  type McpBeforeToolDispatchBarrier,
+  type McpBootstrapScheduler,
+  type McpCloseConfirmation,
+  McpConfigurationError,
+  type McpDiscoveryScheduler,
+  McpHostError,
+  type McpIdleScheduler,
+  type McpRequestScheduler,
+  type McpSessionSnapshot,
+  type McpToolProfileV1,
+  mcpBeforeToolDispatchBarrier,
+  mcpBootstrapScheduler,
+  mcpCloseConfirmation,
+  mcpDiscoveryScheduler,
+  mcpEffectiveBoundsV1,
+  mcpIdleScheduler,
+  mcpPackageManagerCliPath,
+  mcpPackageRegistryUrl,
+  mcpRequestScheduler,
+} from "./mcp-host.js";
+import {
   type ModelTargetIdentity,
   type ModelTargets,
   sameModelTargetIdentity,
@@ -45,13 +71,16 @@ import {
 } from "./project-lifecycle-owner.js";
 import {
   assemblePromptMessagesV1,
-  createPromptContextV2,
+  commitMcpToolProfileV3,
+  createPromptContextV3,
   digestPromptRequestV1,
+  hasSkillPromptContext,
   isPromptContextCompatible,
   isPromptContextRecordCompatible,
   isPromptContextRecordValid,
   type PromptContextRecordV1,
   type PromptContextRecordV2,
+  type PromptContextRecordV3,
   type PromptContextSnapshot,
   promptContextSnapshot,
   replacePromptRepositoryV1,
@@ -78,6 +107,12 @@ import {
   type SessionContextCompactionStartedRecord,
   type SessionGenesisRecord,
   type SessionLogicalRunStartedRecord,
+  type SessionMcpActivationSettledRecord,
+  type SessionMcpActivationStartedRecord,
+  type SessionMcpServerClosedRecord,
+  type SessionMcpServerDefinitionApprovedRecord,
+  type SessionMcpToolProfileCommittedRecord,
+  type SessionMcpWorkspaceConfirmedRecord,
   type SessionModelResponseCompletedRecord,
   type SessionModelResponseField,
   type SessionRecord,
@@ -97,8 +132,11 @@ import {
 import {
   createCodingToolRegistry,
   type PermissionPolicy,
+  type ToolEffect,
   type ToolRegistry,
 } from "./tool-runtime.js";
+
+export type { McpSessionSnapshot } from "./mcp-host.js";
 
 export type CurrentSessionSnapshot = {
   readonly schemaVersion: 3;
@@ -107,6 +145,7 @@ export type CurrentSessionSnapshot = {
   readonly targetIdentity: ModelTargetIdentity;
   readonly status: "idle" | "interrupted" | "settled";
   readonly lastSequence: number;
+  readonly mcp?: McpSessionSnapshot;
   readonly promptContext?: PromptContextSnapshot;
   readonly skillContext?: SkillContextSnapshot;
   readonly context?: SessionContextSnapshot;
@@ -198,6 +237,39 @@ export type SessionResumeResult =
       };
     };
 
+/** Tests only. Production activation settlement has no artificial publication barrier. */
+export const mcpActivationSettlementBarrier = Symbol(
+  "adam-agent.mcp-activation-settlement-barrier",
+);
+export const mcpCatalogStaleObservationBarrier = Symbol(
+  "adam-agent.mcp-catalog-stale-observation-barrier",
+);
+export const mcpCatalogStaleDurableBarrier = Symbol("adam-agent.mcp-catalog-stale-durable-barrier");
+
+export type McpActivationSettlementBarrier = {
+  beforeReadySettlement(input: {
+    readonly sessionId: string;
+    readonly generationId: string;
+  }): Promise<void>;
+};
+
+export type McpCatalogStaleObservationBarrier = {
+  observed(input: {
+    readonly sessionId: string;
+    readonly generationId: string;
+    readonly serverId: string;
+    readonly catalogDigest: `sha256:${string}`;
+  }): void;
+};
+export type McpCatalogStaleDurableBarrier = {
+  committed(input: {
+    readonly sessionId: string;
+    readonly generationId: string;
+    readonly serverId: string;
+    readonly catalogDigest: `sha256:${string}`;
+  }): void;
+};
+
 export type SessionLifecycleOptions = {
   readonly extensionHost?: ExtensionHost;
   readonly modelTargets?: ModelTargets;
@@ -205,6 +277,17 @@ export type SessionLifecycleOptions = {
   readonly workspaceRoot: string;
   readonly stateRoot?: string;
   readonly tools?: ToolRegistry;
+  readonly [mcpBootstrapScheduler]?: McpBootstrapScheduler;
+  readonly [mcpBeforeToolDispatchBarrier]?: McpBeforeToolDispatchBarrier;
+  readonly [mcpDiscoveryScheduler]?: McpDiscoveryScheduler;
+  readonly [mcpPackageManagerCliPath]?: string;
+  readonly [mcpIdleScheduler]?: McpIdleScheduler;
+  readonly [mcpPackageRegistryUrl]?: string;
+  readonly [mcpRequestScheduler]?: McpRequestScheduler;
+  readonly [mcpActivationSettlementBarrier]?: McpActivationSettlementBarrier;
+  readonly [mcpCatalogStaleObservationBarrier]?: McpCatalogStaleObservationBarrier;
+  readonly [mcpCatalogStaleDurableBarrier]?: McpCatalogStaleDurableBarrier;
+  readonly [mcpCloseConfirmation]?: McpCloseConfirmation;
 };
 
 export type SessionContinueResult = {
@@ -237,6 +320,61 @@ export type SkillsReloadResult =
       };
     };
 
+export type McpConfigurationCommand =
+  | {
+      readonly type: "confirm_workspace";
+      readonly sessionId: string;
+      readonly sourceDigest: `sha256:${string}`;
+    }
+  | {
+      readonly type: "approve_server";
+      readonly sessionId: string;
+      readonly serverId: string;
+      readonly definitionDigest: `sha256:${string}`;
+    }
+  | {
+      readonly type: "activate_servers";
+      readonly sessionId: string;
+      readonly servers: readonly {
+        readonly serverId: string;
+        readonly definitionDigest: `sha256:${string}`;
+      }[];
+    }
+  | {
+      readonly type: "retry_activation";
+      readonly sessionId: string;
+      readonly generationId: string;
+    }
+  | {
+      readonly type: "revalidate_catalog";
+      readonly sessionId: string;
+      readonly generationId: string;
+    }
+  | {
+      readonly type: "cancel_configuration";
+      readonly sessionId: string;
+      readonly generationId: string;
+    }
+  | {
+      readonly type: "commit_tool_profile";
+      readonly sessionId: string;
+      readonly generationId: string;
+      readonly selections: readonly {
+        readonly qualifiedName: string;
+        readonly definitionDigest: `sha256:${string}`;
+        readonly effect: ToolEffect;
+      }[];
+    };
+
+export type McpConfigurationResult = {
+  readonly status: "updated";
+  readonly snapshot: CurrentSessionSnapshot;
+};
+
+export type McpCloseResult = {
+  readonly status: "closed" | "mcp_shutdown_unconfirmed";
+};
+
 export type SessionCommand =
   | { readonly type: "create"; readonly targetIdentity: ModelTargetIdentity }
   | { readonly type: "resume"; readonly sessionId: string }
@@ -254,7 +392,8 @@ export type SessionCommand =
       readonly targetId?: string;
     }
   | { readonly type: "reload_repository_instructions"; readonly sessionId: string }
-  | { readonly type: "reload_skills"; readonly sessionId: string };
+  | { readonly type: "reload_skills"; readonly sessionId: string }
+  | McpConfigurationCommand;
 
 export interface SessionLifecycle {
   branch(input: {
@@ -262,12 +401,14 @@ export interface SessionLifecycle {
     readonly atSequence: number;
     readonly targetId?: string;
   }): Promise<CurrentSessionSnapshot>;
+  close(): Promise<McpCloseResult>;
   continue(input: {
     readonly sessionId: string;
     readonly input?: UserInput;
     readonly limits?: RunOptions["limits"];
     readonly signal?: AbortSignal;
   }): Promise<SessionContinueResult>;
+  configureMcp(command: McpConfigurationCommand): Promise<McpConfigurationResult>;
   create(input: { readonly targetIdentity: ModelTargetIdentity }): Promise<CurrentSessionSnapshot>;
   decidePermission(command: PermissionDecisionCommand): PermissionDecisionCommandResult;
   inspect(input: { readonly sessionId: string }): Promise<SessionSnapshot>;
@@ -287,6 +428,15 @@ export class SessionLifecycleError extends Error {
     | "session_model_target_unavailable"
     | "session_not_found"
     | "session_project_mismatch"
+    | "mcp_config_invalid"
+    | "mcp_bootstrap_failed"
+    | "mcp_catalog_invalid"
+    | "mcp_catalog_too_large"
+    | "mcp_initialize_failed"
+    | "mcp_start_failed"
+    | "mcp_startup_timeout"
+    | "mcp_activation_cancelled"
+    | "mcp_shutdown_unconfirmed"
     | "project_in_use"
     | "project_owner_unavailable";
 
@@ -296,6 +446,16 @@ export class SessionLifecycleError extends Error {
     this.code = code;
   }
 }
+
+const nodeMcpIdleScheduler: McpIdleScheduler = {
+  schedule(delayMilliseconds, task) {
+    const timer = setTimeout(() => {
+      void task().catch(() => undefined);
+    }, delayMilliseconds);
+    timer.unref();
+    return { cancel: () => clearTimeout(timer) };
+  },
+};
 
 export function createSessionLifecycle(providedOptions: SessionLifecycleOptions): SessionLifecycle {
   const options: SessionLifecycleOptions = {
@@ -311,8 +471,90 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   };
   const listeners = new Set<RuntimeEventListener>();
   let activeSession: AgentSession | undefined;
+  let activeSessionSettlement: Promise<void> | undefined;
+  let lifecycleClosing = false;
+  let lifecycleClosePromise: Promise<McpCloseResult> | undefined;
+  const pendingMcpCatalogDurability = new Map<string, Promise<void>>();
+  let scheduleMcpCatalogFlush = (_sessionId: string) => {};
   const owner = createProjectLifecycleOwner(options);
-  const withOwner = async <T>(operation: () => Promise<T>): Promise<T> => {
+  const pendingMcpCatalogChanges = new Map<
+    string,
+    {
+      readonly sessionId: string;
+      readonly generationId: string;
+      readonly serverId: string;
+      readonly catalogDigest: `sha256:${string}`;
+      readonly reason: "list_changed" | "server_closed";
+      readonly attempt?: number;
+      readonly closedServers?: readonly {
+        readonly serverId: string;
+        readonly definitionDigest: `sha256:${string}`;
+      }[];
+    }
+  >();
+  const mcpHost = createMcpRuntimeHost({
+    ...(options[mcpBeforeToolDispatchBarrier] === undefined
+      ? {}
+      : { beforeToolDispatch: options[mcpBeforeToolDispatchBarrier] }),
+    bootstrapScheduler: options[mcpBootstrapScheduler] ?? nodeMcpIdleScheduler,
+    closeConfirmation: options[mcpCloseConfirmation] ?? { confirm: async () => Promise.resolve() },
+    discoveryScheduler: options[mcpDiscoveryScheduler] ?? nodeMcpIdleScheduler,
+    onCatalogStale(change) {
+      disarmMcpIdle(change.sessionId);
+      options[mcpCatalogStaleObservationBarrier]?.observed(change);
+      pendingMcpCatalogChanges.set(
+        `${change.sessionId}:${change.generationId}:${change.serverId}:${change.catalogDigest}`,
+        change,
+      );
+      scheduleMcpCatalogFlush(change.sessionId);
+    },
+    packageRegistryUrl: options[mcpPackageRegistryUrl] ?? "https://registry.npmjs.org",
+    packageManagerCliPath: options[mcpPackageManagerCliPath],
+    requestScheduler: options[mcpRequestScheduler] ?? nodeMcpIdleScheduler,
+  });
+  const closePreparedMcpActivation = async (input: {
+    readonly sessionId: string;
+    readonly generationId: string;
+    readonly cause: unknown;
+  }): Promise<McpHostError> => {
+    try {
+      const closed = await mcpHost.closePreparedActivation(input);
+      return new McpHostError(
+        closed.status === "closed" ? "mcp_start_failed" : "mcp_shutdown_unconfirmed",
+        { cause: input.cause, closedServers: closed.servers },
+      );
+    } catch (closeError) {
+      return new McpHostError("mcp_shutdown_unconfirmed", {
+        cause: new AggregateError(
+          [input.cause, closeError],
+          "The prepared MCP activation could not be closed.",
+        ),
+      });
+    }
+  };
+  const activeMcpConfigurationOperations = new Map<string, Promise<void>>();
+  const idleScheduler = options[mcpIdleScheduler] ?? nodeMcpIdleScheduler;
+  const mcpIdleTimers = new Map<
+    string,
+    { readonly generationId: string; readonly cancel: () => void }
+  >();
+  const mcpIdleOperations = new Map<string, Promise<void>>();
+  const trackMcpConfigurationOperation = (
+    generationId: string,
+    operation: Promise<McpConfigurationResult>,
+  ) => {
+    const settlement = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    activeMcpConfigurationOperations.set(generationId, settlement);
+    void settlement.then(() => {
+      if (activeMcpConfigurationOperations.get(generationId) === settlement) {
+        activeMcpConfigurationOperations.delete(generationId);
+      }
+    });
+  };
+  const runWithOwner = async <T>(operation: () => Promise<T>): Promise<T> => {
     try {
       return await owner.run(operation);
     } catch (error) {
@@ -321,6 +563,206 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
       throw error;
     }
+  };
+  const withOwner = async <T>(operation: () => Promise<T>): Promise<T> => {
+    if (lifecycleClosing) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    return runWithOwner(operation);
+  };
+  const flushPendingMcpCatalogChanges = async (sessionId: string): Promise<void> => {
+    const changes = [...pendingMcpCatalogChanges.entries()]
+      .filter(([, change]) => change.sessionId === sessionId)
+      .sort(([, left], [, right]) =>
+        left.generationId === right.generationId
+          ? left.serverId < right.serverId
+            ? -1
+            : left.serverId > right.serverId
+              ? 1
+              : 0
+          : left.generationId < right.generationId
+            ? -1
+            : left.generationId > right.generationId
+              ? 1
+              : 0,
+      );
+    if (changes.length === 0) {
+      return;
+    }
+    const records = await readJsonlSessionRecords({
+      workspaceRoot: options.workspaceRoot,
+      sessionId,
+      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+    });
+    const store = await openJsonlSessionStore<SessionRecord>({
+      workspaceRoot: options.workspaceRoot,
+      sessionId,
+      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+    });
+    let nextSequence = (records.at(-1)?.sequence ?? 0) + 1;
+    for (const [key, change] of changes) {
+      const existingClosedServers = new Set(
+        records.flatMap((entry) =>
+          entry.schemaVersion === 3 &&
+          entry.record.type === "mcp_server_closed" &&
+          entry.record.generationId === change.generationId
+            ? [entry.record.serverId]
+            : [],
+        ),
+      );
+      if (change.attempt !== undefined) {
+        for (const server of change.closedServers ?? []) {
+          if (existingClosedServers.has(server.serverId)) {
+            continue;
+          }
+          await store.append({
+            schemaVersion: 3,
+            sequence: nextSequence,
+            record: {
+              type: "mcp_server_closed",
+              recordVersion: 1,
+              generationId: change.generationId,
+              attempt: change.attempt,
+              serverId: server.serverId,
+              definitionDigest: server.definitionDigest,
+              reason: "stale",
+            },
+          });
+          existingClosedServers.add(server.serverId);
+          nextSequence += 1;
+        }
+      }
+      const staleServers = mcpStaleCatalogServersFromRecords(
+        records,
+        change.generationId,
+        change.catalogDigest,
+      );
+      if (!staleServers.has(change.serverId)) {
+        await store.append({
+          schemaVersion: 3,
+          sequence: nextSequence,
+          record: {
+            type: "mcp_catalog_state_changed",
+            recordVersion: 1,
+            generationId: change.generationId,
+            serverId: change.serverId,
+            catalogDigest: change.catalogDigest,
+            status: "stale",
+            reason: change.reason,
+          },
+        });
+        nextSequence += 1;
+      }
+      try {
+        mcpHost.commitCatalogStale({
+          sessionId: change.sessionId,
+          generationId: change.generationId,
+          serverId: change.serverId,
+          catalogDigest: change.catalogDigest,
+        });
+      } catch (error) {
+        if (mcpHost.snapshot(change.sessionId) !== undefined) {
+          throw error;
+        }
+      }
+      options[mcpCatalogStaleDurableBarrier]?.committed(change);
+      pendingMcpCatalogChanges.delete(key);
+    }
+  };
+  scheduleMcpCatalogFlush = (sessionId) => {
+    if (pendingMcpCatalogDurability.has(sessionId)) {
+      return;
+    }
+    const runningSession = activeSessionSettlement;
+    const configurationOperations = [...activeMcpConfigurationOperations.values()];
+    const operation = (async () => {
+      await runningSession;
+      await Promise.allSettled(configurationOperations);
+      await runWithOwner(() => flushPendingMcpCatalogChanges(sessionId));
+    })();
+    pendingMcpCatalogDurability.set(sessionId, operation);
+    void operation
+      .catch(() => undefined)
+      .finally(() => {
+        if (pendingMcpCatalogDurability.get(sessionId) === operation) {
+          pendingMcpCatalogDurability.delete(sessionId);
+        }
+      });
+  };
+  const disarmMcpIdle = (sessionId: string) => {
+    const timer = mcpIdleTimers.get(sessionId);
+    timer?.cancel();
+    mcpIdleTimers.delete(sessionId);
+  };
+  const waitForMcpIdleOperation = async (sessionId: string) => {
+    await mcpIdleOperations.get(sessionId);
+  };
+  const closeIdleMcpGeneration = async (sessionId: string, generationId: string) => {
+    await withOwner(async () => {
+      const closed = await mcpHost.closeIdleSession({ sessionId, generationId });
+      const records = await readJsonlSessionRecords({
+        workspaceRoot: options.workspaceRoot,
+        sessionId,
+        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+      });
+      const store = await openJsonlSessionStore<SessionRecord>({
+        workspaceRoot: options.workspaceRoot,
+        sessionId,
+        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+      });
+      if (closed.status !== "closed") {
+        for (const [index, server] of closed.servers.entries()) {
+          await store.append({
+            schemaVersion: 3,
+            sequence: (records.at(-1)?.sequence ?? 0) + index + 1,
+            record: {
+              type: "mcp_catalog_state_changed",
+              recordVersion: 1,
+              generationId,
+              serverId: server.serverId,
+              catalogDigest: closed.catalogDigest,
+              status: "stale",
+              reason: "shutdown_unconfirmed",
+            },
+          });
+        }
+        return;
+      }
+      for (const [index, server] of closed.servers.entries()) {
+        await store.append({
+          schemaVersion: 3,
+          sequence: (records.at(-1)?.sequence ?? 0) + index + 1,
+          record: {
+            type: "mcp_server_closed",
+            recordVersion: 1,
+            generationId,
+            attempt: closed.attempt,
+            serverId: server.serverId,
+            definitionDigest: server.definitionDigest,
+            reason: "idle",
+          },
+        });
+      }
+    });
+  };
+  const armMcpIdle = (sessionId: string, generationId: string) => {
+    disarmMcpIdle(sessionId);
+    const scheduled = idleScheduler.schedule(mcpEffectiveBoundsV1.idleMilliseconds, async () => {
+      if (mcpIdleTimers.get(sessionId)?.generationId !== generationId) {
+        return;
+      }
+      mcpIdleTimers.delete(sessionId);
+      const operation = closeIdleMcpGeneration(sessionId, generationId);
+      mcpIdleOperations.set(sessionId, operation);
+      try {
+        await operation;
+      } finally {
+        if (mcpIdleOperations.get(sessionId) === operation) {
+          mcpIdleOperations.delete(sessionId);
+        }
+      }
+    });
+    mcpIdleTimers.set(sessionId, { generationId, cancel: scheduled.cancel });
   };
 
   const inspectSession = async (
@@ -357,6 +799,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     }
     validateCurrentSessionHistory(first, records);
     await validateSessionLineage(options, first, new Set([input.sessionId]));
+    await validateMcpAuthorityFromLineage(options, first, records);
     await skillResourceBytesFromLineage(options, first, records);
     await validateInheritedContextEvidence(options, first, records);
     const artifactInspection = await inspectModelResponseArtifactLineage(
@@ -380,7 +823,36 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       artifactInspection.degradation === undefined
         ? await contextSnapshotFromLineage(options, first, replayRecords, artifactCache)
         : undefined;
-    return inheritedContext === undefined ? snapshot : { ...snapshot, context: inheritedContext };
+    const [mcpWorkspaceConfirmation, mcpServerApprovals, mcpCommittedProfile, mcpCatalogState] =
+      await Promise.all([
+        mcpWorkspaceConfirmationFromLineage(options, first, records),
+        mcpServerApprovalsFromLineage(options, first, records),
+        mcpCommittedProfileFromLineage(options, first, records),
+        mcpCatalogStateFromLineage(options, first, records),
+      ]);
+    let mcp: McpSessionSnapshot | undefined;
+    try {
+      mcp = await inspectMcpConfiguration(
+        options.workspaceRoot,
+        mcpWorkspaceConfirmation?.sourceDigest,
+        mcpServerApprovals,
+        mcpHost.snapshot(input.sessionId),
+        mcpActivationFailureFromRecords(records),
+        mcpCommittedProfile,
+        mcpCatalogState,
+        mcpActivationFromRecords(records),
+      );
+    } catch (error) {
+      if (error instanceof McpConfigurationError) {
+        throw new SessionLifecycleError("mcp_config_invalid");
+      }
+      throw error;
+    }
+    return {
+      ...snapshot,
+      ...(inheritedContext === undefined ? {} : { context: inheritedContext }),
+      ...(mcp === undefined ? {} : { mcp }),
+    };
   };
 
   const resumeSession = async (
@@ -456,13 +928,31 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
       });
       const promptGenesis = promptRecords[0];
+      const activePromptContext =
+        promptGenesis !== undefined && isGenesisRecord(promptGenesis)
+          ? promptContextRecordFromRecords(promptGenesis, promptRecords)
+          : undefined;
+      let compatibleTools = options.tools;
+      if (activePromptContext?.recordVersion === 3 && activePromptContext.mcp !== undefined) {
+        const profile =
+          promptGenesis === undefined || !isGenesisRecord(promptGenesis)
+            ? undefined
+            : await mcpCommittedProfileFromLineage(options, promptGenesis, promptRecords);
+        if (profile === undefined || profile.digest !== activePromptContext.mcp.profileDigest) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        compatibleTools = combineToolRegistries(
+          options.tools,
+          mcpProfileDefinitionRegistry(profile),
+        );
+      }
       if (
         snapshot.promptContext !== undefined &&
         (promptGenesis === undefined ||
           !isGenesisRecord(promptGenesis) ||
-          promptGenesis.record.promptContext === undefined ||
-          !isPromptContextRecordCompatible(promptGenesis.record.promptContext, options.tools) ||
-          !isPromptContextCompatible(snapshot.promptContext, options.tools))
+          activePromptContext === undefined ||
+          !isPromptContextRecordCompatible(activePromptContext, compatibleTools) ||
+          !isPromptContextCompatible(snapshot.promptContext, compatibleTools))
       ) {
         return {
           status: "rejected",
@@ -627,6 +1117,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           throw new SessionLifecycleError("session_invalid");
         }
         validateCurrentSessionHistory(parentGenesis, parentPrefix);
+        await validateMcpAuthorityFromLineage(options, parentGenesis, parentPrefix);
         await replayArtifactBytesFromLineage(options, parentGenesis, parentPrefix, artifactCache);
         if (!isCompleteBranchBoundary(parentPrefix)) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
@@ -685,7 +1176,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         };
         await store.append(genesis);
         const extensionSources = await resolveExtensionSkillSources(options);
-        if (parentPromptContext?.recordVersion === 2 && parentSkillContext !== undefined) {
+        if (hasSkillPromptContext(parentPromptContext) && parentSkillContext !== undefined) {
           const reconciled = reconcileExtensionSkillContextV1({
             context: parentSkillContext,
             currentSources: extensionSources,
@@ -735,8 +1226,139 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         return snapshot;
       });
     },
+    async close() {
+      if (lifecycleClosePromise !== undefined) {
+        return lifecycleClosePromise;
+      }
+      lifecycleClosing = true;
+      const runningSession = activeSessionSettlement;
+      activeSession?.abort();
+      lifecycleClosePromise = (async (): Promise<McpCloseResult> => {
+        await runningSession;
+        await Promise.allSettled(pendingMcpCatalogDurability.values());
+        for (const timer of mcpIdleTimers.values()) {
+          timer.cancel();
+        }
+        mcpIdleTimers.clear();
+        await Promise.allSettled(mcpIdleOperations.values());
+        const hostResult = await mcpHost.close();
+        await Promise.allSettled(activeMcpConfigurationOperations.values());
+        let durable = true;
+        try {
+          await runWithOwner(async () => {
+            for (const closedSession of hostResult.closedSessions) {
+              await flushPendingMcpCatalogChanges(closedSession.sessionId);
+              const records = await readJsonlSessionRecords({
+                workspaceRoot: options.workspaceRoot,
+                sessionId: closedSession.sessionId,
+                ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+              });
+              const existing = new Set(
+                records.flatMap((entry) =>
+                  entry.schemaVersion === 3 &&
+                  entry.record.type === "mcp_server_closed" &&
+                  entry.record.generationId === closedSession.generationId
+                    ? [entry.record.serverId]
+                    : [],
+                ),
+              );
+              const missing = closedSession.servers.filter(
+                (server) => !existing.has(server.serverId),
+              );
+              if (missing.length === 0) {
+                continue;
+              }
+              const store = await openJsonlSessionStore<SessionRecord>({
+                workspaceRoot: options.workspaceRoot,
+                sessionId: closedSession.sessionId,
+                ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+              });
+              for (const [index, server] of missing.entries()) {
+                await store.append({
+                  schemaVersion: 3,
+                  sequence: (records.at(-1)?.sequence ?? 0) + index + 1,
+                  record: {
+                    type: "mcp_server_closed",
+                    recordVersion: 1,
+                    generationId: closedSession.generationId,
+                    attempt: closedSession.attempt,
+                    serverId: server.serverId,
+                    definitionDigest: server.definitionDigest,
+                    reason: "session_close",
+                  },
+                });
+              }
+            }
+            for (const unconfirmed of hostResult.unconfirmedSessions) {
+              if (unconfirmed.catalogDigest === undefined || unconfirmed.servers.length === 0) {
+                continue;
+              }
+              const records = await readJsonlSessionRecords({
+                workspaceRoot: options.workspaceRoot,
+                sessionId: unconfirmed.sessionId,
+                ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+              });
+              const existing = new Set(
+                records.flatMap((entry) =>
+                  entry.schemaVersion === 3 &&
+                  entry.record.type === "mcp_catalog_state_changed" &&
+                  entry.record.generationId === unconfirmed.generationId &&
+                  entry.record.reason === "shutdown_unconfirmed"
+                    ? [entry.record.serverId]
+                    : [],
+                ),
+              );
+              const missing = unconfirmed.servers.filter(
+                (server) => !existing.has(server.serverId),
+              );
+              if (missing.length === 0) {
+                continue;
+              }
+              const store = await openJsonlSessionStore<SessionRecord>({
+                workspaceRoot: options.workspaceRoot,
+                sessionId: unconfirmed.sessionId,
+                ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+              });
+              for (const [index, server] of missing.entries()) {
+                await store.append({
+                  schemaVersion: 3,
+                  sequence: (records.at(-1)?.sequence ?? 0) + index + 1,
+                  record: {
+                    type: "mcp_catalog_state_changed",
+                    recordVersion: 1,
+                    generationId: unconfirmed.generationId,
+                    serverId: server.serverId,
+                    catalogDigest: unconfirmed.catalogDigest,
+                    status: "stale",
+                    reason: "shutdown_unconfirmed",
+                  },
+                });
+              }
+            }
+          });
+        } catch {
+          durable = false;
+        }
+        return {
+          status:
+            hostResult.status === "closed" && durable
+              ? ("closed" as const)
+              : ("mcp_shutdown_unconfirmed" as const),
+        };
+      })();
+      return lifecycleClosePromise;
+    },
     async create(input) {
       return withOwner(async () => {
+        let mcp: McpSessionSnapshot | undefined;
+        try {
+          mcp = await inspectMcpConfiguration(options.workspaceRoot);
+        } catch (error) {
+          if (error instanceof McpConfigurationError) {
+            throw new SessionLifecycleError("mcp_config_invalid");
+          }
+          throw error;
+        }
         const sessionId = randomUUID();
         const projectId = await canonicalProjectId(options.workspaceRoot);
         const repository = await loadInitialRepositoryInstructions({
@@ -771,15 +1393,18 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             sessionId,
             projectId,
             targetIdentity: input.targetIdentity,
-            promptContext: createPromptContextV2(options.tools, repository, skillContext),
+            promptContext: createPromptContextV3(options.tools, repository, skillContext),
             skillContext,
           },
         };
         await store.append(genesis);
-        return snapshotFromGenesis(genesis, 1);
+        const snapshot = snapshotFromGenesis(genesis, 1);
+        return mcp === undefined ? snapshot : { ...snapshot, mcp };
       });
     },
     async continue(input) {
+      disarmMcpIdle(input.sessionId);
+      await waitForMcpIdleOperation(input.sessionId);
       return withOwner(async () => {
         const artifactCache = createArtifactMaterializationCache();
         const resumed = await resumeSession({ sessionId: input.sessionId }, artifactCache);
@@ -792,7 +1417,23 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           }
           throw new SessionLifecycleError("session_invalid");
         }
-        if (resumed.snapshot.status === "settled") {
+        if (resumed.snapshot.status === "settled" && input.input === undefined) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        if (resumed.snapshot.mcp?.status === "mcp_shutdown_unconfirmed") {
+          throw new SessionLifecycleError("mcp_shutdown_unconfirmed");
+        }
+        if (
+          (resumed.snapshot.status === "idle" || resumed.snapshot.status === "settled") &&
+          resumed.snapshot.mcp !== undefined &&
+          resumed.snapshot.mcp.status !== "workspace_confirmation_required" &&
+          resumed.snapshot.mcp.status !== "profile_committed" &&
+          resumed.snapshot.mcp.status !== "profile_reactivation_required" &&
+          !(
+            resumed.snapshot.mcp.status === "activation_required" &&
+            resumed.snapshot.mcp.activation?.status === "cancelled"
+          )
+        ) {
           throw new SessionLifecycleError("session_invalid");
         }
         if (resumed.snapshot.status === "interrupted" && input.input !== undefined) {
@@ -814,7 +1455,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ) {
           throw new SessionLifecycleError("session_model_target_incompatible");
         }
-        const records = await readJsonlSessionRecords({
+        let records = await readJsonlSessionRecords({
           workspaceRoot: options.workspaceRoot,
           sessionId: input.sessionId,
           ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
@@ -822,6 +1463,161 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         const first = records[0];
         if (first === undefined || !isGenesisRecord(first)) {
           throw new SessionLifecycleError("session_invalid");
+        }
+        const persistedPromptContext = promptContextRecordFromRecords(first, records);
+        let committedMcpProfile: McpToolProfileV1 | undefined;
+        if (
+          persistedPromptContext?.recordVersion === 3 &&
+          persistedPromptContext.mcp !== undefined
+        ) {
+          const profile = requireMcpCommittedProfile(
+            await mcpCommittedProfileFromLineage(options, first, records),
+            persistedPromptContext,
+          );
+          committedMcpProfile = profile;
+          if (mcpHost.snapshot(input.sessionId)?.profile?.digest !== profile.digest) {
+            const mcp = resumed.snapshot.mcp;
+            const selectedServers = profile.servers.map((profileServer) => {
+              const server = mcp?.servers.find(
+                (candidate) =>
+                  candidate.serverId === profileServer.serverId &&
+                  candidate.definitionDigest === profileServer.definitionDigest &&
+                  candidate.status === "approved",
+              );
+              if (server === undefined) {
+                throw new SessionLifecycleError("session_invalid");
+              }
+              return server;
+            });
+            const generationId = randomUUID();
+            const attempt =
+              records.reduce(
+                (maximum, entry) =>
+                  entry.schemaVersion === 3 && entry.record.type === "mcp_activation_started"
+                    ? Math.max(maximum, entry.record.attempt)
+                    : maximum,
+                0,
+              ) + 1;
+            const reactivationStore = await openJsonlSessionStore<SessionRecord>({
+              workspaceRoot: options.workspaceRoot,
+              sessionId: input.sessionId,
+              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+            });
+            const nextSequence = (records.at(-1)?.sequence ?? 0) + 1;
+            await reactivationStore.append({
+              schemaVersion: 3,
+              sequence: nextSequence,
+              record: {
+                type: "mcp_activation_started",
+                recordVersion: 1,
+                generationId,
+                attempt,
+                reason: "idle_reactivate",
+                servers: selectedServers.map((server) => ({
+                  serverId: server.serverId,
+                  definitionDigest: server.definitionDigest,
+                  startupEffects: server.startupEffects,
+                })),
+              },
+            });
+            let activationPrepared = false;
+            let readySettlementDurable = false;
+            try {
+              const live = await mcpHost.reactivateToolProfile({
+                sessionId: input.sessionId,
+                generationId,
+                attempt,
+                servers: selectedServers,
+                profile,
+              });
+              activationPrepared = true;
+              await options[mcpActivationSettlementBarrier]?.beforeReadySettlement({
+                sessionId: input.sessionId,
+                generationId,
+              });
+              await reactivationStore.append({
+                schemaVersion: 3,
+                sequence: nextSequence + 1,
+                record: {
+                  type: "mcp_activation_settled",
+                  recordVersion: 1,
+                  generationId,
+                  attempt,
+                  status: "ready",
+                  catalogDigest: live.catalog.digest,
+                  servers: live.settledServers,
+                },
+              });
+              readySettlementDurable = true;
+              mcpHost.commitActivation({
+                sessionId: input.sessionId,
+                generationId,
+                catalogDigest: live.catalog.digest,
+              });
+              await flushPendingMcpCatalogChanges(input.sessionId);
+            } catch (caughtError) {
+              if (readySettlementDurable && mcpHost.wasGenerationCancelled(generationId)) {
+                throw new SessionLifecycleError("mcp_activation_cancelled");
+              }
+              const error =
+                activationPrepared &&
+                !mcpHost.wasGenerationCancelled(generationId) &&
+                !(caughtError instanceof McpHostError)
+                  ? await closePreparedMcpActivation({
+                      sessionId: input.sessionId,
+                      generationId,
+                      cause: caughtError,
+                    })
+                  : caughtError;
+              const failure =
+                error instanceof McpHostError
+                  ? {
+                      code: error.code,
+                      ...(error.serverId === undefined ? {} : { serverId: error.serverId }),
+                    }
+                  : { code: "mcp_start_failed" as const };
+              const closedServers = error instanceof McpHostError ? error.closedServers : [];
+              for (const [index, server] of closedServers.entries()) {
+                await reactivationStore.append({
+                  schemaVersion: 3,
+                  sequence: nextSequence + index + 1,
+                  record: {
+                    type: "mcp_server_closed",
+                    recordVersion: 1,
+                    generationId,
+                    attempt,
+                    serverId: server.serverId,
+                    definitionDigest: server.definitionDigest,
+                    reason:
+                      failure.serverId === undefined
+                        ? "stale"
+                        : server.serverId === failure.serverId
+                          ? "failed"
+                          : "peer_failure",
+                  },
+                });
+              }
+              await reactivationStore.append({
+                schemaVersion: 3,
+                sequence: nextSequence + closedServers.length + 1,
+                record: {
+                  type: "mcp_activation_settled",
+                  recordVersion: 1,
+                  generationId,
+                  attempt,
+                  status: "failed",
+                  servers: [],
+                  error: failure,
+                },
+              });
+              throw new SessionLifecycleError(failure.code);
+            }
+            records = await readJsonlSessionRecords({
+              workspaceRoot: options.workspaceRoot,
+              sessionId: input.sessionId,
+              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+            });
+          }
         }
         const artifactInspection = await materializeModelResponseArtifacts(
           options,
@@ -834,7 +1630,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         let activePromptContext = promptContextRecordFromRecords(first, replayRecords);
         let activeSkillContext = skillContextRecordFromRecords(first, replayRecords);
         const extensionSources = await resolveExtensionSkillSources(options);
-        if (activePromptContext?.recordVersion === 2 && activeSkillContext !== undefined) {
+        if (hasSkillPromptContext(activePromptContext) && activeSkillContext !== undefined) {
           const reconciled = reconcileExtensionSkillContextV1({
             context: activeSkillContext,
             currentSources: extensionSources,
@@ -911,6 +1707,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           resumed.snapshot.status === "interrupted"
             ? createAgentResumeState(replayRecords, options, resumed.snapshot)
             : undefined;
+        const ownMessages =
+          resumeState === undefined ? modelMessagesFromCompleteRecords(replayRecords) : [];
+        const initialMessages = replayRecords.some(
+          (record) =>
+            record.schemaVersion === 3 && record.record.type === "context_compaction_committed",
+        )
+          ? ownMessages
+          : [...inheritedMessages, ...ownMessages];
         const durableResumeState =
           resumeState === undefined
             ? undefined
@@ -931,14 +1735,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             readonly [sessionDurableOutputLimits]?: AgentSessionDurableOutputLimits;
           }
         )[sessionDurableOutputLimits];
+        const artifactStore = await createFileArtifactStore({
+          root: join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
+        });
         const sessionDependencies = {
-          artifactStore: await createFileArtifactStore({
-            root: join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
-          }),
+          artifactStore,
           model: resolved.driver,
           store: store as unknown as SessionStore,
           [sessionDurableContext]: {
-            ...(inheritedMessages.length === 0 ? {} : { hasInheritedMessages: true }),
+            ...(initialMessages.length === 0 ? {} : { hasInheritedMessages: true }),
             nextSequence: (replayRecords.at(-1)?.sequence ?? resumed.snapshot.lastSequence) + 1,
             projectId: resumed.snapshot.projectId,
             referencedModelResponseArtifactBytes,
@@ -980,25 +1785,44 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                 }),
             ...(activeSkillContents.size === 0 ? {} : { activeSkillContents }),
             ...(hasContextEvidence(inheritedEvidence) ? { inheritedEvidence } : {}),
-            ...(resumeState !== undefined || inheritedMessages.length === 0
+            ...(resumeState !== undefined || initialMessages.length === 0
               ? {}
-              : { initialMessages: inheritedMessages }),
+              : { initialMessages }),
             ...(durableResumeState === undefined ? {} : { resume: durableResumeState }),
           },
           contextProfile: resolved.contextProfile,
           ...(durableOutputLimits === undefined
             ? {}
             : { [sessionDurableOutputLimits]: durableOutputLimits }),
-          ...(options.tools === undefined ? {} : { tools: options.tools }),
+          ...(options.tools === undefined
+            ? {}
+            : {
+                tools:
+                  activePromptContext?.recordVersion === 3 && activePromptContext.mcp !== undefined
+                    ? combineToolRegistries(
+                        options.tools,
+                        mcpHost.toolRegistry(
+                          input.sessionId,
+                          requireMcpCommittedProfile(committedMcpProfile, activePromptContext),
+                          artifactStore,
+                        ),
+                      )
+                    : options.tools,
+              }),
           ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
         };
         const session = new AgentSession(sessionDependencies);
+        let resolveSessionSettlement = () => {};
+        const sessionSettlement = new Promise<void>((resolve) => {
+          resolveSessionSettlement = resolve;
+        });
         const unsubscribe = session.subscribe((event) => {
           for (const listener of listeners) {
             listener(event);
           }
         });
         activeSession = session;
+        activeSessionSettlement = sessionSettlement;
         try {
           const runLimits = resumeState?.limits ?? input.limits;
           const result = await session.run(
@@ -1008,18 +1832,610 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               ...(runLimits === undefined ? {} : { limits: runLimits }),
             },
           );
+          await flushPendingMcpCatalogChanges(input.sessionId);
           const snapshot = await inspectSession({ sessionId: input.sessionId }, artifactCache);
           if (snapshot.schemaVersion !== 3) {
             throw new SessionLifecycleError("session_invalid");
           }
           return { result, snapshot };
         } finally {
+          resolveSessionSettlement();
           if (activeSession === session) {
             activeSession = undefined;
           }
+          if (activeSessionSettlement === sessionSettlement) {
+            activeSessionSettlement = undefined;
+          }
           unsubscribe();
+          const live = mcpHost.snapshot(input.sessionId);
+          if (live?.profile !== undefined) {
+            armMcpIdle(input.sessionId, live.activation.generationId);
+          }
         }
       });
+    },
+    async configureMcp(command) {
+      if (activeSession !== undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      await pendingMcpCatalogDurability.get(command.sessionId);
+      if (command.type === "cancel_configuration") {
+        const before = await inspectSession({ sessionId: command.sessionId });
+        const beforeMcp = before.schemaVersion === 3 ? before.mcp : undefined;
+        const activation =
+          beforeMcp?.workspaceConfirmed === true ? beforeMcp.activation : undefined;
+        if (
+          before.schemaVersion !== 3 ||
+          (before.status !== "idle" && before.status !== "settled") ||
+          activation?.generationId !== command.generationId ||
+          (activation.status !== "activating" && activation.status !== "ready")
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const closed = await mcpHost.closeSession({
+          sessionId: command.sessionId,
+          generationId: command.generationId,
+        });
+        await activeMcpConfigurationOperations.get(command.generationId);
+        if (closed.status !== "closed") {
+          throw new SessionLifecycleError("mcp_shutdown_unconfirmed");
+        }
+        return withOwner(async () => {
+          const inspected = await inspectSession({ sessionId: command.sessionId });
+          if (inspected.schemaVersion !== 3) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          if (closed.servers.length > 0) {
+            const store = await openJsonlSessionStore<SessionRecord>({
+              workspaceRoot: options.workspaceRoot,
+              sessionId: command.sessionId,
+              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+            });
+            for (const [index, server] of closed.servers.entries()) {
+              await store.append({
+                schemaVersion: 3,
+                sequence: inspected.lastSequence + index + 1,
+                record: {
+                  type: "mcp_server_closed",
+                  recordVersion: 1,
+                  generationId: command.generationId,
+                  attempt: closed.attempt,
+                  serverId: server.serverId,
+                  definitionDigest: server.definitionDigest,
+                  reason: "session_close",
+                },
+              });
+            }
+          }
+          const snapshot = await inspectSession({ sessionId: command.sessionId });
+          if (snapshot.schemaVersion !== 3) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          return { status: "updated" as const, snapshot };
+        });
+      }
+      if (command.type === "revalidate_catalog") {
+        disarmMcpIdle(command.sessionId);
+        await waitForMcpIdleOperation(command.sessionId);
+      }
+      let ownerOperation!: Promise<McpConfigurationResult>;
+      ownerOperation = withOwner(async () => {
+        await flushPendingMcpCatalogChanges(command.sessionId);
+        const inspected = await inspectSession({ sessionId: command.sessionId });
+        if (
+          inspected.schemaVersion !== 3 ||
+          (inspected.status !== "idle" && inspected.status !== "settled")
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const store = await openJsonlSessionStore<SessionRecord>({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: command.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        if (command.type === "confirm_workspace") {
+          if (
+            inspected.mcp === undefined ||
+            inspected.mcp.workspaceConfirmed ||
+            inspected.mcp.source.digest !== command.sourceDigest
+          ) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          await store.append({
+            schemaVersion: 3,
+            sequence: inspected.lastSequence + 1,
+            record: {
+              type: "mcp_workspace_confirmed",
+              recordVersion: 1,
+              sourceDigest: command.sourceDigest,
+              canonicalizerVersion: 1,
+            },
+          });
+        } else if (command.type === "approve_server") {
+          const server = inspected.mcp?.servers.find(
+            (candidate) => candidate.serverId === command.serverId,
+          );
+          if (
+            inspected.mcp === undefined ||
+            !inspected.mcp.workspaceConfirmed ||
+            server === undefined ||
+            server.status !== "approval_required" ||
+            server.definitionDigest !== command.definitionDigest
+          ) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          await store.append({
+            schemaVersion: 3,
+            sequence: inspected.lastSequence + 1,
+            record: {
+              type: "mcp_server_definition_approved",
+              recordVersion: 1,
+              sourceDigest: inspected.mcp.source.digest,
+              serverId: command.serverId,
+              definitionDigest: command.definitionDigest,
+            },
+          });
+        } else if (command.type === "activate_servers") {
+          if (
+            inspected.mcp?.status !== "activation_required" ||
+            command.servers.length < 1 ||
+            command.servers.length > 4 ||
+            new Set(command.servers.map((server) => server.serverId)).size !==
+              command.servers.length
+          ) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          const selectedServers = command.servers.map((selection) => {
+            const server = inspected.mcp?.servers.find(
+              (candidate) => candidate.serverId === selection.serverId,
+            );
+            if (
+              server === undefined ||
+              server.status !== "approved" ||
+              server.definitionDigest !== selection.definitionDigest
+            ) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+            return server;
+          });
+          const generationId = randomUUID();
+          const attempt = 1;
+          await store.append({
+            schemaVersion: 3,
+            sequence: inspected.lastSequence + 1,
+            record: {
+              type: "mcp_activation_started",
+              recordVersion: 1,
+              generationId,
+              attempt,
+              reason: "initial",
+              servers: selectedServers.map((server) => ({
+                serverId: server.serverId,
+                definitionDigest: server.definitionDigest,
+                startupEffects: server.startupEffects,
+              })),
+            },
+          });
+          trackMcpConfigurationOperation(generationId, ownerOperation);
+          let activationPrepared = false;
+          let readySettlementDurable = false;
+          try {
+            const live = await mcpHost.activate({
+              sessionId: command.sessionId,
+              generationId,
+              attempt,
+              servers: selectedServers,
+            });
+            activationPrepared = true;
+            await options[mcpActivationSettlementBarrier]?.beforeReadySettlement({
+              sessionId: command.sessionId,
+              generationId,
+            });
+            await store.append({
+              schemaVersion: 3,
+              sequence: inspected.lastSequence + 2,
+              record: {
+                type: "mcp_activation_settled",
+                recordVersion: 1,
+                generationId,
+                attempt,
+                status: "ready",
+                catalogDigest: live.catalog.digest,
+                servers: live.settledServers,
+              },
+            });
+            readySettlementDurable = true;
+            mcpHost.commitActivation({
+              sessionId: command.sessionId,
+              generationId,
+              catalogDigest: live.catalog.digest,
+            });
+            await flushPendingMcpCatalogChanges(command.sessionId);
+          } catch (caughtError) {
+            if (readySettlementDurable && mcpHost.wasGenerationCancelled(generationId)) {
+              throw new SessionLifecycleError("mcp_activation_cancelled");
+            }
+            const error =
+              activationPrepared &&
+              !mcpHost.wasGenerationCancelled(generationId) &&
+              !(caughtError instanceof McpHostError)
+                ? await closePreparedMcpActivation({
+                    sessionId: command.sessionId,
+                    generationId,
+                    cause: caughtError,
+                  })
+                : caughtError;
+            if (mcpHost.wasGenerationCancelled(generationId)) {
+              const closedServers = error instanceof McpHostError ? error.closedServers : [];
+              for (const [index, server] of closedServers.entries()) {
+                await store.append({
+                  schemaVersion: 3,
+                  sequence: inspected.lastSequence + index + 2,
+                  record: {
+                    type: "mcp_server_closed",
+                    recordVersion: 1,
+                    generationId,
+                    attempt,
+                    serverId: server.serverId,
+                    definitionDigest: server.definitionDigest,
+                    reason: "session_close",
+                  },
+                });
+              }
+              await store.append({
+                schemaVersion: 3,
+                sequence: inspected.lastSequence + closedServers.length + 2,
+                record: {
+                  type: "mcp_activation_settled",
+                  recordVersion: 1,
+                  generationId,
+                  attempt,
+                  status: "cancelled",
+                  servers: [],
+                },
+              });
+              throw new SessionLifecycleError("mcp_activation_cancelled");
+            }
+            const failure =
+              error instanceof McpHostError
+                ? {
+                    code: error.code,
+                    ...(error.serverId === undefined ? {} : { serverId: error.serverId }),
+                  }
+                : { code: "mcp_start_failed" as const };
+            const closedServers = error instanceof McpHostError ? error.closedServers : [];
+            for (const [index, server] of closedServers.entries()) {
+              await store.append({
+                schemaVersion: 3,
+                sequence: inspected.lastSequence + index + 2,
+                record: {
+                  type: "mcp_server_closed",
+                  recordVersion: 1,
+                  generationId,
+                  attempt,
+                  serverId: server.serverId,
+                  definitionDigest: server.definitionDigest,
+                  reason:
+                    failure.serverId === undefined || server.serverId === failure.serverId
+                      ? "failed"
+                      : "peer_failure",
+                },
+              });
+            }
+            await store.append({
+              schemaVersion: 3,
+              sequence: inspected.lastSequence + closedServers.length + 2,
+              record: {
+                type: "mcp_activation_settled",
+                recordVersion: 1,
+                generationId,
+                attempt,
+                status: "failed",
+                servers: [],
+                error: failure,
+              },
+            });
+            throw new SessionLifecycleError(failure.code);
+          }
+        } else if (command.type === "retry_activation") {
+          if (
+            inspected.mcp?.status !== "activation_failed" ||
+            inspected.mcp.activation?.status !== "failed" ||
+            inspected.mcp.activation.generationId !== command.generationId
+          ) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          const records = await readJsonlSessionRecords({
+            workspaceRoot: options.workspaceRoot,
+            sessionId: command.sessionId,
+            ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+          });
+          const failedStart = records.findLast(
+            (entry) =>
+              entry.schemaVersion === 3 &&
+              entry.record.type === "mcp_activation_started" &&
+              entry.record.generationId === command.generationId,
+          );
+          if (
+            failedStart?.schemaVersion !== 3 ||
+            failedStart.record.type !== "mcp_activation_started"
+          ) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          const selectedServers = failedStart.record.servers.map((selection) => {
+            const server = inspected.mcp?.servers.find(
+              (candidate) =>
+                candidate.serverId === selection.serverId &&
+                candidate.definitionDigest === selection.definitionDigest &&
+                candidate.status === "approved",
+            );
+            if (server === undefined) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+            return server;
+          });
+          const generationId = randomUUID();
+          const attempt = failedStart.record.attempt + 1;
+          await store.append({
+            schemaVersion: 3,
+            sequence: inspected.lastSequence + 1,
+            record: {
+              type: "mcp_activation_started",
+              recordVersion: 1,
+              generationId,
+              attempt,
+              reason: "explicit_retry",
+              servers: selectedServers.map((server) => ({
+                serverId: server.serverId,
+                definitionDigest: server.definitionDigest,
+                startupEffects: server.startupEffects,
+              })),
+            },
+          });
+          trackMcpConfigurationOperation(generationId, ownerOperation);
+          let activationPrepared = false;
+          let readySettlementDurable = false;
+          try {
+            const live = await mcpHost.activate({
+              sessionId: command.sessionId,
+              generationId,
+              attempt,
+              servers: selectedServers,
+            });
+            activationPrepared = true;
+            await options[mcpActivationSettlementBarrier]?.beforeReadySettlement({
+              sessionId: command.sessionId,
+              generationId,
+            });
+            await store.append({
+              schemaVersion: 3,
+              sequence: inspected.lastSequence + 2,
+              record: {
+                type: "mcp_activation_settled",
+                recordVersion: 1,
+                generationId,
+                attempt,
+                status: "ready",
+                catalogDigest: live.catalog.digest,
+                servers: live.settledServers,
+              },
+            });
+            readySettlementDurable = true;
+            mcpHost.commitActivation({
+              sessionId: command.sessionId,
+              generationId,
+              catalogDigest: live.catalog.digest,
+            });
+            await flushPendingMcpCatalogChanges(command.sessionId);
+          } catch (caughtError) {
+            if (readySettlementDurable && mcpHost.wasGenerationCancelled(generationId)) {
+              throw new SessionLifecycleError("mcp_activation_cancelled");
+            }
+            const error =
+              activationPrepared &&
+              !mcpHost.wasGenerationCancelled(generationId) &&
+              !(caughtError instanceof McpHostError)
+                ? await closePreparedMcpActivation({
+                    sessionId: command.sessionId,
+                    generationId,
+                    cause: caughtError,
+                  })
+                : caughtError;
+            if (mcpHost.wasGenerationCancelled(generationId)) {
+              const closedServers = error instanceof McpHostError ? error.closedServers : [];
+              for (const [index, server] of closedServers.entries()) {
+                await store.append({
+                  schemaVersion: 3,
+                  sequence: inspected.lastSequence + index + 2,
+                  record: {
+                    type: "mcp_server_closed",
+                    recordVersion: 1,
+                    generationId,
+                    attempt,
+                    serverId: server.serverId,
+                    definitionDigest: server.definitionDigest,
+                    reason: "session_close",
+                  },
+                });
+              }
+              await store.append({
+                schemaVersion: 3,
+                sequence: inspected.lastSequence + closedServers.length + 2,
+                record: {
+                  type: "mcp_activation_settled",
+                  recordVersion: 1,
+                  generationId,
+                  attempt,
+                  status: "cancelled",
+                  servers: [],
+                },
+              });
+              throw new SessionLifecycleError("mcp_activation_cancelled");
+            }
+            const failure =
+              error instanceof McpHostError
+                ? {
+                    code: error.code,
+                    ...(error.serverId === undefined ? {} : { serverId: error.serverId }),
+                  }
+                : { code: "mcp_start_failed" as const };
+            const closedServers = error instanceof McpHostError ? error.closedServers : [];
+            for (const [index, server] of closedServers.entries()) {
+              await store.append({
+                schemaVersion: 3,
+                sequence: inspected.lastSequence + index + 2,
+                record: {
+                  type: "mcp_server_closed",
+                  recordVersion: 1,
+                  generationId,
+                  attempt,
+                  serverId: server.serverId,
+                  definitionDigest: server.definitionDigest,
+                  reason:
+                    failure.serverId === undefined || server.serverId === failure.serverId
+                      ? "failed"
+                      : "peer_failure",
+                },
+              });
+            }
+            await store.append({
+              schemaVersion: 3,
+              sequence: inspected.lastSequence + closedServers.length + 2,
+              record: {
+                type: "mcp_activation_settled",
+                recordVersion: 1,
+                generationId,
+                attempt,
+                status: "failed",
+                servers: [],
+                error: failure,
+              },
+            });
+            throw new SessionLifecycleError(failure.code);
+          }
+        } else if (command.type === "revalidate_catalog") {
+          if (
+            inspected.mcp?.status !== "catalog_stale" ||
+            inspected.mcp.activation?.generationId !== command.generationId ||
+            inspected.mcp.profile === undefined
+          ) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          const records = await readJsonlSessionRecords({
+            workspaceRoot: options.workspaceRoot,
+            sessionId: command.sessionId,
+            ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+          });
+          const genesis = records[0];
+          if (genesis === undefined || !isGenesisRecord(genesis)) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          const profile = await mcpCommittedProfileFromLineage(options, genesis, records);
+          if (profile?.digest !== inspected.mcp.profile.digest) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          try {
+            const prepared = await mcpHost.prepareToolProfileRevalidation({
+              sessionId: command.sessionId,
+              generationId: command.generationId,
+              profile,
+            });
+            const staleServerIds = mcpStaleCatalogServersFromRecords(
+              records,
+              prepared.generationId,
+              prepared.catalogDigest,
+            );
+            if (
+              prepared.serverIds.length === 0 ||
+              prepared.serverIds.some((serverId) => !staleServerIds.has(serverId))
+            ) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+            for (const [index, serverId] of prepared.serverIds.entries()) {
+              await store.append({
+                schemaVersion: 3,
+                sequence: inspected.lastSequence + index + 1,
+                record: {
+                  type: "mcp_catalog_state_changed",
+                  recordVersion: 1,
+                  generationId: prepared.generationId,
+                  serverId,
+                  catalogDigest: prepared.catalogDigest,
+                  status: "ready",
+                  reason: "revalidated",
+                },
+              });
+            }
+            mcpHost.commitToolProfileRevalidation({
+              sessionId: command.sessionId,
+              generationId: prepared.generationId,
+              revalidationId: prepared.revalidationId,
+              profileDigest: profile.digest,
+            });
+            armMcpIdle(command.sessionId, command.generationId);
+          } catch (error) {
+            const live = mcpHost.snapshot(command.sessionId);
+            if (live?.profile !== undefined) {
+              armMcpIdle(command.sessionId, live.activation.generationId);
+            }
+            if (error instanceof SessionLifecycleError) {
+              throw error;
+            }
+            throw new SessionLifecycleError("mcp_catalog_invalid");
+          }
+        } else {
+          if (
+            inspected.mcp?.status !== "tool_selection_required" ||
+            inspected.mcp.activation?.generationId !== command.generationId
+          ) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          let profile: McpToolProfileV1;
+          try {
+            profile = mcpHost.prepareToolProfile({
+              sessionId: command.sessionId,
+              generationId: command.generationId,
+              selections: command.selections,
+            });
+          } catch {
+            throw new SessionLifecycleError("mcp_catalog_invalid");
+          }
+          const records = await readJsonlSessionRecords({
+            workspaceRoot: options.workspaceRoot,
+            sessionId: command.sessionId,
+            ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+          });
+          const genesis = records[0];
+          if (genesis === undefined || !isGenesisRecord(genesis)) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          const activePromptContext = promptContextRecordFromRecords(genesis, records);
+          if (activePromptContext?.recordVersion !== 3 || activePromptContext.mcp !== undefined) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          const nextPromptContext = commitMcpToolProfileV3(activePromptContext, profile);
+          await store.append({
+            schemaVersion: 3,
+            sequence: inspected.lastSequence + 1,
+            record: {
+              type: "mcp_tool_profile_committed",
+              recordVersion: 1,
+              profile,
+              previousAssemblyIdentityDigest: activePromptContext.assemblyIdentityDigest,
+              assemblyIdentityDigest: nextPromptContext.assemblyIdentityDigest,
+            },
+          });
+          mcpHost.commitToolProfile(command.sessionId, profile);
+          await flushPendingMcpCatalogChanges(command.sessionId);
+          armMcpIdle(command.sessionId, command.generationId);
+        }
+        const snapshot = await inspectSession({ sessionId: command.sessionId });
+        if (snapshot.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        return { status: "updated", snapshot };
+      });
+      return ownerOperation;
     },
     decidePermission(command) {
       return (
@@ -1033,6 +2449,17 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       );
     },
     async inspect(input) {
+      await waitForMcpIdleOperation(input.sessionId);
+      if (activeSession === undefined) {
+        await pendingMcpCatalogDurability.get(input.sessionId);
+        if (
+          [...pendingMcpCatalogChanges.values()].some(
+            (change) => change.sessionId === input.sessionId,
+          )
+        ) {
+          await runWithOwner(() => flushPendingMcpCatalogChanges(input.sessionId));
+        }
+      }
       return inspectSession(input);
     },
     async reloadRepositoryInstructions(input) {
@@ -1138,7 +2565,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         }
         if (
           inspected.status !== "idle" ||
-          inspected.promptContext?.profileVersion !== 2 ||
+          (inspected.promptContext?.profileVersion !== 2 &&
+            inspected.promptContext?.profileVersion !== 3) ||
           inspected.skillContext === undefined
         ) {
           return {
@@ -1161,7 +2589,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         }
         const promptContext = promptContextRecordFromRecords(genesis, records);
         const skillContext = skillContextRecordFromRecords(genesis, records);
-        if (promptContext?.recordVersion !== 2 || skillContext === undefined) {
+        if (!hasSkillPromptContext(promptContext) || skillContext === undefined) {
           throw new SessionLifecycleError("session_invalid");
         }
         let nextSkillContext: SkillContextRecordV1;
@@ -1251,6 +2679,358 @@ function isGenesisRecord(record: SessionRecord): record is SessionGenesisRecord 
   return record.schemaVersion === 3 && record.record.type === "session_genesis";
 }
 
+function mcpWorkspaceConfirmationFromRecords(
+  records: readonly SessionRecord[],
+): SessionMcpWorkspaceConfirmedRecord["record"] | undefined {
+  const confirmed = records.findLast(
+    (entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_workspace_confirmed",
+  );
+  return confirmed?.schemaVersion === 3 && confirmed.record.type === "mcp_workspace_confirmed"
+    ? confirmed.record
+    : undefined;
+}
+
+function mcpServerApprovalsFromRecords(
+  records: readonly SessionRecord[],
+): ReadonlyMap<string, `sha256:${string}`> {
+  return new Map(
+    records.flatMap((entry) =>
+      entry.schemaVersion === 3 && entry.record.type === "mcp_server_definition_approved"
+        ? [[entry.record.serverId, entry.record.definitionDigest] as const]
+        : [],
+    ),
+  );
+}
+
+function mcpActivationFailureFromRecords(records: readonly SessionRecord[]):
+  | {
+      readonly code:
+        | "mcp_bootstrap_failed"
+        | "mcp_catalog_invalid"
+        | "mcp_catalog_too_large"
+        | "mcp_initialize_failed"
+        | "mcp_shutdown_unconfirmed"
+        | "mcp_start_failed"
+        | "mcp_startup_timeout";
+      readonly serverId?: string;
+    }
+  | undefined {
+  const settled = records.findLast(
+    (entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_activation_settled",
+  );
+  return settled?.schemaVersion === 3 &&
+    settled.record.type === "mcp_activation_settled" &&
+    settled.record.status === "failed"
+    ? settled.record.error
+    : undefined;
+}
+
+function mcpActivationFromRecords(records: readonly SessionRecord[]):
+  | {
+      readonly attempt: number;
+      readonly generationId: string;
+      readonly status: "activating" | "ready" | "failed" | "cancelled";
+    }
+  | undefined {
+  const started = records.findLast(
+    (entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_activation_started",
+  );
+  if (started?.schemaVersion !== 3 || started.record.type !== "mcp_activation_started") {
+    return undefined;
+  }
+  const startedGenerationId = started.record.generationId;
+  const settled = records.findLast(
+    (entry) =>
+      entry.schemaVersion === 3 &&
+      entry.record.type === "mcp_activation_settled" &&
+      entry.record.generationId === startedGenerationId,
+  );
+  if (settled?.schemaVersion !== 3 || settled.record.type !== "mcp_activation_settled") {
+    return {
+      attempt: started.record.attempt,
+      generationId: started.record.generationId,
+      status: "activating",
+    };
+  }
+  const wasClosed = records.some(
+    (entry) =>
+      entry.schemaVersion === 3 &&
+      entry.record.type === "mcp_server_closed" &&
+      entry.record.generationId === startedGenerationId,
+  );
+  return {
+    attempt: settled.record.attempt,
+    generationId: settled.record.generationId,
+    status: settled.record.status === "ready" && wasClosed ? "cancelled" : settled.record.status,
+  };
+}
+
+function mcpCommittedProfileFromRecords(
+  records: readonly SessionRecord[],
+): McpToolProfileV1 | undefined {
+  const committed = records.findLast(
+    (entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_tool_profile_committed",
+  );
+  return committed?.schemaVersion === 3 && committed.record.type === "mcp_tool_profile_committed"
+    ? committed.record.profile
+    : undefined;
+}
+
+function mcpCatalogStateFromRecords(
+  records: readonly SessionRecord[],
+): "ready" | "stale" | "shutdown_unconfirmed" | undefined {
+  const staleCatalogs = new Set<string>();
+  const unconfirmedCatalogs = new Set<string>();
+  let state: "ready" | "stale" | "shutdown_unconfirmed" | undefined;
+  for (const entry of records) {
+    if (entry.schemaVersion !== 3) {
+      continue;
+    }
+    if (entry.record.type === "mcp_activation_settled" && entry.record.status === "ready") {
+      staleCatalogs.clear();
+      unconfirmedCatalogs.clear();
+      state = "ready";
+      continue;
+    }
+    if (entry.record.type !== "mcp_catalog_state_changed") {
+      continue;
+    }
+    const key = `${entry.record.generationId}:${entry.record.serverId}:${entry.record.catalogDigest}`;
+    if (entry.record.status === "stale") {
+      staleCatalogs.add(key);
+      if (entry.record.reason === "shutdown_unconfirmed") {
+        unconfirmedCatalogs.add(key);
+      }
+    } else {
+      staleCatalogs.delete(key);
+      unconfirmedCatalogs.delete(key);
+    }
+    state =
+      unconfirmedCatalogs.size > 0
+        ? "shutdown_unconfirmed"
+        : staleCatalogs.size === 0
+          ? "ready"
+          : "stale";
+  }
+  return state;
+}
+
+function mcpStaleCatalogServersFromRecords(
+  records: readonly SessionRecord[],
+  generationId: string,
+  catalogDigest: `sha256:${string}`,
+): ReadonlySet<string> {
+  const serverIds = new Set<string>();
+  for (const entry of records) {
+    if (
+      entry.schemaVersion !== 3 ||
+      entry.record.type !== "mcp_catalog_state_changed" ||
+      entry.record.generationId !== generationId ||
+      entry.record.catalogDigest !== catalogDigest
+    ) {
+      continue;
+    }
+    if (entry.record.status === "stale") {
+      serverIds.add(entry.record.serverId);
+    } else {
+      serverIds.delete(entry.record.serverId);
+    }
+  }
+  return serverIds;
+}
+
+async function mcpWorkspaceConfirmationFromLineage(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<SessionMcpWorkspaceConfirmedRecord["record"] | undefined> {
+  const own = mcpWorkspaceConfirmationFromRecords(records);
+  if (own !== undefined || genesis.record.lineage === undefined) {
+    return own;
+  }
+  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  return mcpWorkspaceConfirmationFromLineage(options, parentGenesis, prefixRecords);
+}
+
+async function mcpServerApprovalsFromLineage(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<ReadonlyMap<string, `sha256:${string}`>> {
+  const approvals =
+    genesis.record.lineage === undefined
+      ? new Map<string, `sha256:${string}`>()
+      : new Map(
+          await (async () => {
+            const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(
+              options,
+              genesis,
+            );
+            return mcpServerApprovalsFromLineage(options, parentGenesis, prefixRecords);
+          })(),
+        );
+  for (const [serverId, digest] of mcpServerApprovalsFromRecords(records)) {
+    approvals.set(serverId, digest);
+  }
+  return approvals;
+}
+
+async function mcpCommittedProfileFromLineage(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<McpToolProfileV1 | undefined> {
+  const own = mcpCommittedProfileFromRecords(records);
+  if (own !== undefined || genesis.record.lineage === undefined) {
+    return own;
+  }
+  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  return mcpCommittedProfileFromLineage(options, parentGenesis, prefixRecords);
+}
+
+async function mcpCatalogStateFromLineage(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<"ready" | "stale" | "shutdown_unconfirmed" | undefined> {
+  const own = mcpCatalogStateFromRecords(records);
+  if (own !== undefined || genesis.record.lineage === undefined) {
+    return own;
+  }
+  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  return mcpCatalogStateFromLineage(options, parentGenesis, prefixRecords);
+}
+
+type McpLineageAuthority = {
+  confirmation?: SessionMcpWorkspaceConfirmedRecord["record"];
+  readonly approvals: Map<string, `sha256:${string}`>;
+  profile?: McpToolProfileV1;
+};
+
+async function validateMcpAuthorityFromLineage(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<McpLineageAuthority> {
+  let inherited: McpLineageAuthority = { approvals: new Map() };
+  if (genesis.record.lineage !== undefined) {
+    const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+    inherited = await validateMcpAuthorityFromLineage(options, parentGenesis, prefixRecords);
+  }
+  const authority: McpLineageAuthority = {
+    approvals: new Map(inherited.approvals),
+    ...(inherited.confirmation === undefined ? {} : { confirmation: inherited.confirmation }),
+    ...(inherited.profile === undefined ? {} : { profile: inherited.profile }),
+  };
+  for (const entry of records) {
+    if (entry.schemaVersion !== 3) {
+      continue;
+    }
+    const record = entry.record;
+    if (record.type === "mcp_workspace_confirmed") {
+      authority.confirmation = record;
+      authority.approvals.clear();
+      delete authority.profile;
+      continue;
+    }
+    if (record.type === "mcp_server_definition_approved") {
+      if (authority.confirmation?.sourceDigest !== record.sourceDigest) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      authority.approvals.set(record.serverId, record.definitionDigest);
+      continue;
+    }
+    if (record.type === "mcp_activation_started") {
+      const selectedServers = record.servers.map(({ serverId, definitionDigest }) => ({
+        serverId,
+        definitionDigest,
+      }));
+      if (
+        record.servers.some(
+          (server) => authority.approvals.get(server.serverId) !== server.definitionDigest,
+        ) ||
+        (record.reason === "idle_reactivate" &&
+          (authority.profile === undefined ||
+            JSON.stringify(selectedServers) !==
+              JSON.stringify(
+                authority.profile.servers.map(({ serverId, definitionDigest }) => ({
+                  serverId,
+                  definitionDigest,
+                })),
+              )))
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      continue;
+    }
+    if (record.type === "mcp_tool_profile_committed") {
+      authority.profile = record.profile;
+    }
+  }
+  return authority;
+}
+
+function requireMcpCommittedProfile(
+  profile: McpToolProfileV1 | undefined,
+  context: PromptContextRecordV3,
+): McpToolProfileV1 {
+  if (context.mcp === undefined || profile?.digest !== context.mcp.profileDigest) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return profile;
+}
+
+function combineToolRegistries(
+  base: ToolRegistry | undefined,
+  additional: ToolRegistry,
+): ToolRegistry {
+  if (base === undefined) {
+    return additional;
+  }
+  const definitions = [...base.definitions(), ...additional.definitions()];
+  const names = new Set(definitions.map((definition) => definition.name));
+  if (names.size !== definitions.length) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return {
+    definitions: () => definitions,
+    resolve(name) {
+      return base.resolve(name) ?? additional.resolve(name);
+    },
+  };
+}
+
+function mcpProfileDefinitionRegistry(profile: McpToolProfileV1): ToolRegistry {
+  const adapters = profile.tools.map((tool) => {
+    const definition = {
+      name: tool.qualifiedName,
+      description: tool.modelDescription,
+      inputSchema: tool.modelProjection.schema,
+    };
+    return {
+      definition,
+      definitionDigest: tool.definitionDigest,
+      outputSchema: z.json(),
+      effect: tool.effect,
+      replay: tool.replay,
+      cancellation: tool.cancellation,
+      maximumResult: { maximumBytes: tool.outputPolicy.maximumInlineBytes },
+      prepare: () => ({
+        status: "failed" as const,
+        error: {
+          code: "tool_io_failed" as const,
+          message: "An inert MCP compatibility adapter cannot execute tools.",
+        },
+      }),
+    };
+  });
+  const byName = new Map(adapters.map((adapter) => [adapter.definition.name, adapter]));
+  return {
+    definitions: () => adapters.map((adapter) => adapter.definition),
+    resolve: (name) => byName.get(name),
+  };
+}
+
 type ValidatedToolState = {
   readonly call: { readonly id: string; readonly name: string; readonly argumentsJson: string };
   readonly intent: {
@@ -1283,7 +3063,8 @@ function validateCurrentSessionHistory(
     genesis.sequence !== 1 ||
     records[0] !== genesis ||
     records.some((record) => record.schemaVersion !== 3) ||
-    (genesis.record.promptContext?.recordVersion === 2) !==
+    (genesis.record.promptContext !== undefined &&
+      genesis.record.promptContext.recordVersion !== 1) !==
       (genesis.record.skillContext !== undefined) ||
     (genesis.record.skillContext !== undefined &&
       !isSkillContextRecordV1Valid(genesis.record.skillContext)) ||
@@ -1332,16 +3113,272 @@ function validateCurrentSessionHistory(
   let skillResourceRunBytes = 0;
   const activatableRepositoryRevisions = new Map<number, ValidatedToolState>();
   const publishedRepositoryRevisions = new Set<number>();
+  let mcpWorkspaceConfirmation: SessionMcpWorkspaceConfirmedRecord["record"] | undefined;
+  const mcpServerApprovals = new Map<string, SessionMcpServerDefinitionApprovedRecord["record"]>();
+  let mcpActivationStarted: SessionMcpActivationStartedRecord["record"] | undefined;
+  let mcpActivationSettled: SessionMcpActivationSettledRecord["record"] | undefined;
+  let mcpToolProfile: SessionMcpToolProfileCommittedRecord["record"] | undefined;
+  const closedMcpServers = new Set<string>();
+  const pendingMcpServerClosures = new Map<string, SessionMcpServerClosedRecord["record"]>();
+  const staleMcpCatalogs = new Set<string>();
+  const inheritedMcpProfile =
+    genesis.record.lineage !== undefined &&
+    activePromptContext?.recordVersion === 3 &&
+    activePromptContext.mcp !== undefined;
 
   for (const entry of currentRecords.slice(1)) {
-    if (sawSettlement) {
-      throw new SessionLifecycleError("session_invalid");
-    }
     const record = entry.record;
     if (record.type === "session_genesis") {
       throw new SessionLifecycleError("session_invalid");
     }
+    if (record.type === "mcp_workspace_confirmed") {
+      if (run !== undefined || mcpWorkspaceConfirmation !== undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      mcpWorkspaceConfirmation = record;
+      continue;
+    }
+    if (record.type === "mcp_server_definition_approved") {
+      if (
+        run !== undefined ||
+        (mcpWorkspaceConfirmation === undefined && genesis.record.lineage === undefined) ||
+        (mcpWorkspaceConfirmation !== undefined &&
+          record.sourceDigest !== mcpWorkspaceConfirmation.sourceDigest) ||
+        mcpServerApprovals.has(record.serverId)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      mcpServerApprovals.set(record.serverId, record);
+      continue;
+    }
+    if (record.type === "mcp_activation_started") {
+      const expectedReason =
+        mcpToolProfile !== undefined || inheritedMcpProfile
+          ? "idle_reactivate"
+          : mcpActivationStarted === undefined
+            ? "initial"
+            : "explicit_retry";
+      if (
+        run !== undefined ||
+        (mcpWorkspaceConfirmation === undefined && genesis.record.lineage === undefined) ||
+        (mcpActivationStarted !== undefined && mcpActivationSettled === undefined) ||
+        record.reason !== expectedReason ||
+        record.attempt !== (mcpActivationStarted?.attempt ?? 0) + 1 ||
+        record.servers.some(
+          (server) =>
+            mcpServerApprovals.get(server.serverId)?.definitionDigest !== server.definitionDigest &&
+            genesis.record.lineage === undefined,
+        ) ||
+        (mcpToolProfile !== undefined &&
+          JSON.stringify(
+            record.servers.map(({ serverId, definitionDigest }) => ({
+              serverId,
+              definitionDigest,
+            })),
+          ) !==
+            JSON.stringify(
+              mcpToolProfile.profile.servers.map(({ serverId, definitionDigest }) => ({
+                serverId,
+                definitionDigest,
+              })),
+            ))
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      mcpActivationStarted = record;
+      mcpActivationSettled = undefined;
+      continue;
+    }
+    if (record.type === "mcp_activation_settled") {
+      const pendingClosures = [...pendingMcpServerClosures.values()].filter(
+        (closure) => closure.generationId === record.generationId,
+      );
+      const validTerminalClosures =
+        pendingClosures.length === 0 ||
+        (record.status === "failed" &&
+          record.error?.code === "mcp_shutdown_unconfirmed" &&
+          pendingClosures.length <= (mcpActivationStarted?.servers.length ?? 0) &&
+          pendingClosures.every(
+            (closure) =>
+              closure.reason === "failed" ||
+              closure.reason === "peer_failure" ||
+              closure.reason === "stale",
+          )) ||
+        (record.status === "failed" &&
+          (mcpToolProfile !== undefined || inheritedMcpProfile) &&
+          record.error?.serverId === undefined &&
+          pendingClosures.length === mcpActivationStarted?.servers.length &&
+          pendingClosures.every((closure) => closure.reason === "stale")) ||
+        (record.status === "failed" &&
+          record.error?.serverId === undefined &&
+          pendingClosures.length === mcpActivationStarted?.servers.length &&
+          pendingClosures.every((closure) => closure.reason === "failed")) ||
+        (record.status === "failed" &&
+          pendingClosures.length === mcpActivationStarted?.servers.length &&
+          pendingClosures.some(
+            (closure) => closure.serverId === record.error?.serverId && closure.reason === "failed",
+          ) &&
+          pendingClosures.every((closure) =>
+            closure.serverId === record.error?.serverId
+              ? closure.reason === "failed"
+              : closure.reason === "peer_failure",
+          )) ||
+        (record.status === "cancelled" &&
+          pendingClosures.length === mcpActivationStarted?.servers.length &&
+          pendingClosures.every((closure) => closure.reason === "session_close"));
+      if (
+        run !== undefined ||
+        mcpActivationStarted === undefined ||
+        mcpActivationSettled !== undefined ||
+        record.generationId !== mcpActivationStarted.generationId ||
+        record.attempt !== mcpActivationStarted.attempt ||
+        (record.status === "ready" &&
+          (record.catalogDigest === undefined ||
+            record.error !== undefined ||
+            record.servers.length !== mcpActivationStarted.servers.length)) ||
+        (record.status !== "ready" &&
+          (record.catalogDigest !== undefined || record.servers.length !== 0)) ||
+        !validTerminalClosures
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      mcpActivationSettled = record;
+      for (const closure of pendingClosures) {
+        pendingMcpServerClosures.delete(`${closure.generationId}:${closure.serverId}`);
+      }
+      continue;
+    }
+    if (record.type === "mcp_server_closed") {
+      const key = `${record.generationId}:${record.serverId}`;
+      const settledServer = mcpActivationSettled?.servers.find(
+        (server) => server.serverId === record.serverId,
+      );
+      const startedServer = mcpActivationStarted?.servers.find(
+        (server) => server.serverId === record.serverId,
+      );
+      const hasCommittedProfile = mcpToolProfile !== undefined || inheritedMcpProfile;
+      const validFailedClose =
+        !hasCommittedProfile &&
+        mcpActivationSettled?.status === "failed" &&
+        startedServer?.definitionDigest === record.definitionDigest &&
+        ((record.reason === "failed" && mcpActivationSettled.error?.serverId === record.serverId) ||
+          (record.reason === "peer_failure" &&
+            mcpActivationSettled.error?.serverId !== record.serverId));
+      const validPendingFailureClose =
+        !hasCommittedProfile &&
+        mcpActivationSettled === undefined &&
+        startedServer?.definitionDigest === record.definitionDigest &&
+        (record.reason === "failed" || record.reason === "peer_failure");
+      const validPendingCancelledClose =
+        !hasCommittedProfile &&
+        mcpActivationSettled === undefined &&
+        startedServer?.definitionDigest === record.definitionDigest &&
+        record.reason === "session_close";
+      const validPendingProfileClose =
+        hasCommittedProfile &&
+        mcpActivationSettled === undefined &&
+        startedServer?.definitionDigest === record.definitionDigest &&
+        (record.reason === "failed" ||
+          record.reason === "peer_failure" ||
+          record.reason === "stale");
+      const validReadyClose =
+        mcpActivationSettled?.status === "ready" &&
+        settledServer?.definitionDigest === record.definitionDigest &&
+        (((record.reason === "idle" || record.reason === "stale") && hasCommittedProfile) ||
+          record.reason === "session_close");
+      if (
+        run !== undefined ||
+        (!validFailedClose &&
+          !validPendingFailureClose &&
+          !validPendingCancelledClose &&
+          !validPendingProfileClose &&
+          !validReadyClose) ||
+        record.generationId !==
+          (mcpActivationSettled?.generationId ?? mcpActivationStarted?.generationId) ||
+        record.attempt !== (mcpActivationSettled?.attempt ?? mcpActivationStarted?.attempt) ||
+        closedMcpServers.has(key)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      closedMcpServers.add(key);
+      if (validPendingFailureClose || validPendingCancelledClose || validPendingProfileClose) {
+        pendingMcpServerClosures.set(key, record);
+      }
+      continue;
+    }
+    if (record.type === "mcp_tool_profile_committed") {
+      let nextPromptContext: PromptContextRecordV3;
+      try {
+        if (
+          activePromptContext?.recordVersion !== 3 ||
+          activePromptContext.mcp !== undefined ||
+          record.previousAssemblyIdentityDigest !== activePromptContext.assemblyIdentityDigest
+        ) {
+          throw new Error("invalid MCP prompt transition");
+        }
+        nextPromptContext = commitMcpToolProfileV3(activePromptContext, record.profile);
+      } catch {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      if (
+        run !== undefined ||
+        mcpActivationSettled?.status !== "ready" ||
+        mcpToolProfile !== undefined ||
+        record.profile.generationId !== mcpActivationSettled.generationId ||
+        record.profile.digest.length !== 71 ||
+        !isMcpToolProfileV1Valid(record.profile) ||
+        JSON.stringify(record.profile.servers) !== JSON.stringify(mcpActivationSettled.servers) ||
+        record.assemblyIdentityDigest !== nextPromptContext.assemblyIdentityDigest
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      activePromptContext = nextPromptContext;
+      mcpToolProfile = record;
+      continue;
+    }
+    if (record.type === "mcp_catalog_state_changed") {
+      const staleKey = `${record.generationId}:${record.serverId}:${record.catalogDigest}`;
+      const validIdentity =
+        mcpActivationSettled?.status === "ready" &&
+        record.generationId === mcpActivationSettled.generationId &&
+        record.catalogDigest === mcpActivationSettled.catalogDigest &&
+        mcpActivationSettled.servers.some((server) => server.serverId === record.serverId);
+      if (record.status === "stale") {
+        const validOccurrence =
+          record.runId === undefined ? run === undefined : record.runId === run?.runId;
+        if (!validOccurrence || !validIdentity || staleMcpCatalogs.has(staleKey)) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        staleMcpCatalogs.add(staleKey);
+      } else {
+        if (
+          run !== undefined ||
+          mcpToolProfile === undefined ||
+          !validIdentity ||
+          !staleMcpCatalogs.delete(staleKey)
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+      }
+      continue;
+    }
     if (record.type === "logical_run_started") {
+      if (sawSettlement) {
+        attemptState = undefined;
+        sawUserMessage = false;
+        sawSettlement = false;
+        sawSessionInterruption = false;
+        sawModelStart = false;
+        sawModelCompletion = false;
+        publishedResponseSequence = undefined;
+        terminalIntent = undefined;
+        lastContextTerminal = undefined;
+        lastUsage = undefined;
+        toolStates = new Map();
+        skillPermissions.clear();
+        committedSkillResourceReads.clear();
+        skillResourceRunBytes = 0;
+      }
       if (
         run !== undefined ||
         attemptState !== undefined ||
@@ -1450,7 +3487,7 @@ function validateCurrentSessionHistory(
       if (
         run === undefined ||
         record.trigger.runId !== run.runId ||
-        activePromptContext?.recordVersion !== 2 ||
+        !hasSkillPromptContext(activePromptContext) ||
         activeSkillContext === undefined ||
         record.previousRepositoryRevision !== activePromptContext.repository.revision ||
         record.previousRepositoryDigest !== activePromptContext.repository.effectiveDigest ||
@@ -1471,10 +3508,9 @@ function validateCurrentSessionHistory(
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
-      let nextPromptContext = replacePromptRepositoryV1(
-        activePromptContext,
-        record.repository,
-      ) as PromptContextRecordV2;
+      let nextPromptContext = replacePromptRepositoryV1(activePromptContext, record.repository) as
+        | PromptContextRecordV2
+        | PromptContextRecordV3;
       nextPromptContext = replacePromptSkillsV2(nextPromptContext, record.skillContext);
       if (
         nextPromptContext.assemblyIdentityDigest !== record.assemblyIdentityDigest ||
@@ -1494,7 +3530,7 @@ function validateCurrentSessionHistory(
       if (
         run === undefined ||
         record.trigger.runId !== run.runId ||
-        activePromptContext?.recordVersion !== 2 ||
+        !hasSkillPromptContext(activePromptContext) ||
         activeSkillContext === undefined ||
         record.activeRepositoryRevision !== activePromptContext.repository.revision ||
         record.activeRepositoryDigest !== activePromptContext.repository.effectiveDigest ||
@@ -1521,7 +3557,7 @@ function validateCurrentSessionHistory(
         (record.reason === undefined
           ? run !== undefined
           : record.reason !== "extension_reconciliation" || attemptState?.status === "started") ||
-        activePromptContext?.recordVersion !== 2 ||
+        !hasSkillPromptContext(activePromptContext) ||
         activeSkillContext === undefined ||
         record.previousRevision !== activeSkillContext.registry.revision ||
         record.previousRegistryDigest !== activeSkillContext.registry.digest ||
@@ -1580,7 +3616,7 @@ function validateCurrentSessionHistory(
         (attemptState !== undefined &&
           (attemptState.status !== "completed" ||
             attemptState.response?.response.finishReason !== "tool_calls")) ||
-        activePromptContext?.recordVersion !== 2 ||
+        !hasSkillPromptContext(activePromptContext) ||
         previousSkillContext === undefined ||
         record.previousActivationDigest !== previousSkillContext.activationDigest ||
         !isSkillContextRecordV1Valid(record.skillContext) ||
@@ -1853,6 +3889,7 @@ function validateCurrentSessionHistory(
         throw new SessionLifecycleError("session_invalid");
       }
       sawSettlement = true;
+      run = undefined;
       continue;
     }
     const event = record.event;
@@ -2030,6 +4067,7 @@ function validateCurrentSessionHistory(
         throw new SessionLifecycleError("session_invalid");
       }
       sawSettlement = true;
+      run = undefined;
       continue;
     }
     if (
@@ -2412,7 +4450,7 @@ async function validateSessionLineage(
   }
   const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
   const expectedPromptContext = promptContextRecordFromRecords(parentGenesis, prefixRecords);
-  if (JSON.stringify(genesis.record.promptContext) !== JSON.stringify(expectedPromptContext)) {
+  if (!isDeepStrictEqual(genesis.record.promptContext, expectedPromptContext)) {
     throw new SessionLifecycleError("session_invalid");
   }
   await validateInheritedContextEvidence(options, parentGenesis, prefixRecords);
@@ -2778,7 +4816,12 @@ function isCompleteBranchBoundary(records: readonly SessionRecord[]): boolean {
               entry.record.trigger === undefined) ||
             entry.record.type === "skill_catalog_committed" ||
             entry.record.type === "skill_catalog_failed" ||
-            entry.record.type === "skill_revoked",
+            entry.record.type === "skill_revoked" ||
+            entry.record.type === "mcp_workspace_confirmed" ||
+            entry.record.type === "mcp_server_definition_approved" ||
+            entry.record.type === "mcp_activation_started" ||
+            entry.record.type === "mcp_activation_settled" ||
+            entry.record.type === "mcp_tool_profile_committed",
         )
     );
   }
@@ -2905,19 +4948,36 @@ function promptContextRecordFromRecords(
       context = next;
       continue;
     }
+    if (entry.record.type === "mcp_tool_profile_committed") {
+      if (
+        context?.recordVersion !== 3 ||
+        context.mcp !== undefined ||
+        entry.record.previousAssemblyIdentityDigest !== context.assemblyIdentityDigest
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const next = commitMcpToolProfileV3(context, entry.record.profile);
+      if (
+        next.assemblyIdentityDigest !== entry.record.assemblyIdentityDigest ||
+        !isPromptContextRecordValid(next)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      context = next;
+      continue;
+    }
     if (entry.record.type === "path_context_committed") {
       if (
-        context?.recordVersion !== 2 ||
+        !hasSkillPromptContext(context) ||
         entry.record.previousRepositoryRevision !== context.repository.revision ||
         entry.record.previousRepositoryDigest !== context.repository.effectiveDigest ||
         entry.record.repository.revision !== context.repository.revision + 1
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
-      let next = replacePromptRepositoryV1(
-        context,
-        entry.record.repository,
-      ) as PromptContextRecordV2;
+      let next = replacePromptRepositoryV1(context, entry.record.repository) as
+        | PromptContextRecordV2
+        | PromptContextRecordV3;
       next = replacePromptSkillsV2(next, entry.record.skillContext);
       if (
         next.assemblyIdentityDigest !== entry.record.assemblyIdentityDigest ||
@@ -2929,7 +4989,7 @@ function promptContextRecordFromRecords(
       continue;
     }
     if (entry.record.type === "skill_activation_batch_committed") {
-      if (context?.recordVersion !== 2) {
+      if (!hasSkillPromptContext(context)) {
         throw new SessionLifecycleError("session_invalid");
       }
       const next = replacePromptSkillsV2(context, entry.record.skillContext);
@@ -2942,7 +5002,7 @@ function promptContextRecordFromRecords(
       context = next;
     }
     if (entry.record.type === "skill_catalog_committed") {
-      if (context?.recordVersion !== 2) {
+      if (!hasSkillPromptContext(context)) {
         throw new SessionLifecycleError("session_invalid");
       }
       const next = replacePromptSkillsV2(context, entry.record.skillContext);
@@ -3822,6 +5882,7 @@ async function settleIndeterminateToolEffects(
           name: call.name,
           error: {
             code: "tool_effect_indeterminate",
+            reason: "process_restart",
             message,
           },
         },
@@ -3841,6 +5902,7 @@ async function settleIndeterminateToolEffects(
           status: "failed",
           error: {
             code: "tool_effect_indeterminate",
+            reason: "process_restart",
             message: indeterminateToolMessage(first),
           },
         },
@@ -4963,6 +7025,24 @@ function inlineModelResponseField(field: string | SessionModelResponseField): st
 
 function sessionLifecycleErrorMessage(code: SessionLifecycleError["code"]): string {
   switch (code) {
+    case "mcp_bootstrap_failed":
+      return "The exact MCP package bootstrap failed.";
+    case "mcp_config_invalid":
+      return "The project MCP configuration is invalid.";
+    case "mcp_catalog_invalid":
+      return "The MCP tool catalog is invalid.";
+    case "mcp_catalog_too_large":
+      return "The MCP tool catalog exceeded its bounded limits.";
+    case "mcp_initialize_failed":
+      return "The MCP server initialization failed.";
+    case "mcp_start_failed":
+      return "The approved MCP server could not be started.";
+    case "mcp_startup_timeout":
+      return "The MCP server startup deadline elapsed.";
+    case "mcp_activation_cancelled":
+      return "The MCP activation was cancelled before it became ready.";
+    case "mcp_shutdown_unconfirmed":
+      return "The MCP server shutdown could not be causally confirmed.";
     case "project_in_use":
       return "Another process owns lifecycle mutations for this canonical project.";
     case "project_owner_unavailable":

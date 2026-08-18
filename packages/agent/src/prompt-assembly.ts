@@ -4,6 +4,7 @@ import { z } from "zod";
 
 import type { ContextProfile } from "./context-profile.js";
 import type { ModelMessage } from "./index.js";
+import type { McpToolProfileV1 } from "./mcp-host.js";
 import type { SkillContextRecordV1 } from "./skills.js";
 import type { ModelToolDefinition, ToolRegistry } from "./tool-runtime.js";
 
@@ -109,11 +110,38 @@ export type PromptContextRecordV2 = Omit<
   readonly assemblyIdentityDigest: Sha256Digest;
 };
 
-export type PromptContextRecord = PromptContextRecordV1 | PromptContextRecordV2;
+export type PromptContextRecordV3 = Omit<
+  PromptContextRecordV2,
+  "recordVersion" | "profileVersion" | "assemblyVersion" | "assemblyIdentityDigest"
+> & {
+  readonly recordVersion: 3;
+  readonly profileVersion: 3;
+  readonly assemblyVersion: 3;
+  readonly mcp?:
+    | {
+        readonly version: 1;
+        readonly profileDigest: Sha256Digest;
+        readonly generationId: string;
+        readonly projectorVersion: 1;
+      }
+    | undefined;
+  readonly assemblyIdentityDigest: Sha256Digest;
+};
+
+export type PromptContextRecord =
+  | PromptContextRecordV1
+  | PromptContextRecordV2
+  | PromptContextRecordV3;
+
+export function hasSkillPromptContext(
+  context: PromptContextRecord | undefined,
+): context is PromptContextRecordV2 | PromptContextRecordV3 {
+  return context?.recordVersion === 2 || context?.recordVersion === 3;
+}
 
 export type PromptContextSnapshot = {
-  readonly profileVersion: 1 | 2;
-  readonly assemblyVersion: 1 | 2;
+  readonly profileVersion: 1 | 2 | 3;
+  readonly assemblyVersion: 1 | 2 | 3;
   readonly base: {
     readonly version: 1;
     readonly digest: Sha256Digest;
@@ -135,6 +163,7 @@ export type PromptContextSnapshot = {
     readonly effectiveDigest: Sha256Digest;
   };
   readonly skills?: PromptContextRecordV2["skills"];
+  readonly mcp?: PromptContextRecordV3["mcp"];
   readonly assemblyIdentityDigest: Sha256Digest;
   readonly lastRequestProjectionDigest?: Sha256Digest;
 };
@@ -252,9 +281,59 @@ export const promptContextRecordV2Schema: z.ZodType<PromptContextRecordV2> = z.s
   assemblyIdentityDigest: digestSchema,
 });
 
+export const promptContextRecordV3Schema: z.ZodType<PromptContextRecordV3> = z.strictObject({
+  recordVersion: z.literal(3),
+  profileVersion: z.literal(3),
+  assemblyVersion: z.literal(3),
+  base: z.strictObject({
+    version: z.literal(1),
+    content: z
+      .string()
+      .min(1)
+      .max(16 * 1024),
+    digest: digestSchema,
+  }),
+  toolProfile: z.strictObject({
+    version: z.literal(1),
+    definitions: z
+      .array(
+        z.strictObject({
+          name: z.string().min(1).max(256),
+          digest: digestSchema,
+          definition: z.strictObject({
+            name: z.string().min(1).max(256),
+            description: z.string(),
+            inputSchema: z.record(z.string(), z.unknown()),
+          }),
+        }),
+      )
+      .max(128),
+    digest: digestSchema,
+  }),
+  repository: repositoryInstructionRevisionV1Schema,
+  skills: z.strictObject({
+    version: z.literal(1),
+    usageDigest: digestSchema,
+    registryDigest: digestSchema,
+    catalogRevision: z.number().int().positive(),
+    projectionDigest: digestSchema,
+    activationDigest: digestSchema,
+  }),
+  mcp: z
+    .strictObject({
+      version: z.literal(1),
+      profileDigest: digestSchema,
+      generationId: z.uuid(),
+      projectorVersion: z.literal(1),
+    })
+    .optional(),
+  assemblyIdentityDigest: digestSchema,
+});
+
 export const promptContextRecordSchema = z.union([
   promptContextRecordV1Schema,
   promptContextRecordV2Schema,
+  promptContextRecordV3Schema,
 ]) as z.ZodType<PromptContextRecord>;
 
 export function createPromptContextV1(
@@ -268,7 +347,7 @@ export function createPromptContextV1(
 ): PromptContextRecordV1 {
   const definitions = tools?.definitions() ?? [];
   const seenNames = new Set<string>();
-  const definitionIdentities = definitions.map((definition) => {
+  for (const definition of definitions) {
     if (seenNames.has(definition.name)) {
       throw new TypeError(`Duplicate model-visible tool name: ${definition.name}`);
     }
@@ -280,17 +359,10 @@ export function createPromptContextV1(
     ) {
       throw new TypeError(`Tool definition cannot be resolved exactly: ${definition.name}`);
     }
-    return {
-      name: definition.name,
-      digest: digestCanonicalJson({ version: 1, definition }),
-      definition,
-    };
-  });
+  }
+  const toolProfile = createPromptToolProfile(definitions);
   const baseDigest = digestText(adamBasePromptV1);
-  const toolProfileDigest = digestCanonicalJson({
-    version: 1,
-    definitions: definitionIdentities.map(({ name, digest }) => ({ name, digest })),
-  });
+  const toolProfileDigest = toolProfile.digest;
   const repositoryEffectiveDigest = repository.effectiveDigest;
   const repositoryRevision = repository.revision;
   return {
@@ -298,11 +370,7 @@ export function createPromptContextV1(
     profileVersion: 1,
     assemblyVersion: 1,
     base: { version: 1, content: adamBasePromptV1, digest: baseDigest },
-    toolProfile: {
-      version: 1,
-      definitions: definitionIdentities,
-      digest: toolProfileDigest,
-    },
+    toolProfile,
     repository,
     assemblyIdentityDigest: digestCanonicalJson({
       version: 1,
@@ -311,6 +379,100 @@ export function createPromptContextV1(
       repositoryEffectiveDigest,
       repositoryRevision,
       roleOrderVersion: 1,
+    }),
+  };
+}
+
+function createPromptToolProfile(
+  definitions: readonly ModelToolDefinition[],
+): PromptContextRecordV1["toolProfile"] {
+  const seenNames = new Set<string>();
+  const identities = definitions.map((definition) => {
+    if (seenNames.has(definition.name)) {
+      throw new TypeError(`Duplicate model-visible tool name: ${definition.name}`);
+    }
+    seenNames.add(definition.name);
+    return {
+      name: definition.name,
+      digest: digestCanonicalJson({ version: 1, definition }),
+      definition,
+    };
+  });
+  return {
+    version: 1,
+    definitions: identities,
+    digest: digestCanonicalJson({
+      version: 1,
+      definitions: identities.map(({ name, digest }) => ({ name, digest })),
+    }),
+  };
+}
+
+function digestSkillPromptIdentity(input: {
+  readonly version: 2 | 3;
+  readonly baseDigest: Sha256Digest;
+  readonly toolProfileDigest: Sha256Digest;
+  readonly repository: PromptContextRecordV1["repository"];
+  readonly skills: PromptContextRecordV2["skills"];
+  readonly mcp?: PromptContextRecordV3["mcp"];
+}): Sha256Digest {
+  return digestCanonicalJson({
+    version: input.version,
+    baseDigest: input.baseDigest,
+    toolProfileDigest: input.toolProfileDigest,
+    repositoryEffectiveDigest: input.repository.effectiveDigest,
+    repositoryRevision: input.repository.revision,
+    skillUsageDigest: input.skills.usageDigest,
+    skillRegistryDigest: input.skills.registryDigest,
+    skillCatalogRevision: input.skills.catalogRevision,
+    skillProjectionDigest: input.skills.projectionDigest,
+    skillActivationDigest: input.skills.activationDigest,
+    ...(input.version === 2
+      ? {}
+      : {
+          mcpProfileDigest: input.mcp?.profileDigest ?? null,
+          mcpGenerationId: input.mcp?.generationId ?? null,
+          mcpProjectorVersion: input.mcp?.projectorVersion ?? null,
+        }),
+    roleOrderVersion: input.version,
+  });
+}
+
+export function commitMcpToolProfileV3(
+  context: PromptContextRecordV3,
+  profile: McpToolProfileV1,
+): PromptContextRecordV3 {
+  if (context.mcp !== undefined) {
+    throw new TypeError("The MCP Tool Profile revision is already committed.");
+  }
+  const toolProfile = createPromptToolProfile([
+    ...context.toolProfile.definitions.map((entry) => entry.definition),
+    ...profile.tools.map((tool) => ({
+      name: tool.qualifiedName,
+      description: tool.modelDescription,
+      inputSchema: tool.modelProjection.schema,
+    })),
+  ]);
+  const mcp: PromptContextRecordV3["mcp"] = {
+    version: 1,
+    profileDigest: profile.digest,
+    generationId: profile.generationId,
+    projectorVersion: profile.projectorVersion,
+  };
+  return {
+    ...context,
+    recordVersion: 3,
+    profileVersion: 3,
+    assemblyVersion: 3,
+    toolProfile,
+    mcp,
+    assemblyIdentityDigest: digestSkillPromptIdentity({
+      version: 3,
+      baseDigest: context.base.digest,
+      toolProfileDigest: toolProfile.digest,
+      repository: context.repository,
+      skills: context.skills,
+      mcp,
     }),
   };
 }
@@ -351,6 +513,27 @@ export function createPromptContextV2(
   };
 }
 
+export function createPromptContextV3(
+  tools: ToolRegistry,
+  repository: PromptContextRecordV1["repository"],
+  skillContext: SkillContextRecordV1,
+): PromptContextRecordV3 {
+  const v2 = createPromptContextV2(tools, repository, skillContext);
+  return {
+    ...v2,
+    recordVersion: 3,
+    profileVersion: 3,
+    assemblyVersion: 3,
+    assemblyIdentityDigest: digestSkillPromptIdentity({
+      version: 3,
+      baseDigest: v2.base.digest,
+      toolProfileDigest: v2.toolProfile.digest,
+      repository: v2.repository,
+      skills: v2.skills,
+    }),
+  };
+}
+
 export function createRepositoryInstructionRevisionV1(input: {
   readonly revision: number;
   readonly activeScopes: readonly string[];
@@ -376,22 +559,17 @@ export function replacePromptRepositoryV1(
   context: PromptContextRecord,
   repository: PromptContextRecordV1["repository"],
 ): PromptContextRecord {
-  if (context.recordVersion === 2) {
+  if (context.recordVersion !== 1) {
     return {
       ...context,
       repository,
-      assemblyIdentityDigest: digestCanonicalJson({
-        version: 2,
+      assemblyIdentityDigest: digestSkillPromptIdentity({
+        version: context.recordVersion,
         baseDigest: context.base.digest,
         toolProfileDigest: context.toolProfile.digest,
-        repositoryEffectiveDigest: repository.effectiveDigest,
-        repositoryRevision: repository.revision,
-        skillUsageDigest: context.skills.usageDigest,
-        skillRegistryDigest: context.skills.registryDigest,
-        skillCatalogRevision: context.skills.catalogRevision,
-        skillProjectionDigest: context.skills.projectionDigest,
-        skillActivationDigest: context.skills.activationDigest,
-        roleOrderVersion: 2,
+        repository,
+        skills: context.skills,
+        ...(context.recordVersion === 3 && context.mcp !== undefined ? { mcp: context.mcp } : {}),
       }),
     };
   }
@@ -409,10 +587,10 @@ export function replacePromptRepositoryV1(
   };
 }
 
-export function replacePromptSkillsV2(
-  context: PromptContextRecordV2,
+export function replacePromptSkillsV2<T extends PromptContextRecordV2 | PromptContextRecordV3>(
+  context: T,
   skillContext: SkillContextRecordV1,
-): PromptContextRecordV2 {
+): T {
   const skills: PromptContextRecordV2["skills"] = {
     ...context.skills,
     registryDigest: skillContext.registry.digest,
@@ -423,20 +601,15 @@ export function replacePromptSkillsV2(
   return {
     ...context,
     skills,
-    assemblyIdentityDigest: digestCanonicalJson({
-      version: 2,
+    assemblyIdentityDigest: digestSkillPromptIdentity({
+      version: context.recordVersion,
       baseDigest: context.base.digest,
       toolProfileDigest: context.toolProfile.digest,
-      repositoryEffectiveDigest: context.repository.effectiveDigest,
-      repositoryRevision: context.repository.revision,
-      skillUsageDigest: skills.usageDigest,
-      skillRegistryDigest: skills.registryDigest,
-      skillCatalogRevision: skills.catalogRevision,
-      skillProjectionDigest: skills.projectionDigest,
-      skillActivationDigest: skills.activationDigest,
-      roleOrderVersion: 2,
+      repository: context.repository,
+      skills,
+      ...(context.recordVersion === 3 && context.mcp !== undefined ? { mcp: context.mcp } : {}),
     }),
-  };
+  } as T;
 }
 
 export function promptContextSnapshot(context: PromptContextRecord): PromptContextSnapshot {
@@ -457,7 +630,8 @@ export function promptContextSnapshot(context: PromptContextRecord): PromptConte
       diagnostics: context.repository.diagnostics,
       effectiveDigest: context.repository.effectiveDigest,
     },
-    ...(context.recordVersion === 2 ? { skills: context.skills } : {}),
+    ...(context.recordVersion === 1 ? {} : { skills: context.skills }),
+    ...(context.recordVersion === 3 && context.mcp !== undefined ? { mcp: context.mcp } : {}),
     assemblyIdentityDigest: context.assemblyIdentityDigest,
   };
 }
@@ -477,7 +651,9 @@ export function isPromptContextCompatible(
           )
         : canonicalJson(context.toolProfile) === canonicalJson(supported.toolProfile);
     return (
-      (context.profileVersion === 1 || context.profileVersion === 2) &&
+      (context.profileVersion === 1 ||
+        context.profileVersion === 2 ||
+        context.profileVersion === 3) &&
       context.assemblyVersion === context.profileVersion &&
       context.base.digest === supported.base.digest &&
       toolProfileCompatible &&
@@ -511,7 +687,7 @@ export function isPromptContextRecordCompatible(
 export function isPromptContextRecordValid(context: PromptContextRecord): boolean {
   try {
     if (
-      (context.recordVersion !== 1 && context.recordVersion !== 2) ||
+      (context.recordVersion !== 1 && context.recordVersion !== 2 && context.recordVersion !== 3) ||
       context.profileVersion !== context.recordVersion ||
       context.assemblyVersion !== context.recordVersion ||
       context.base.version !== 1 ||
@@ -563,21 +739,29 @@ export function isPromptContextRecordValid(context: PromptContextRecord): boolea
         })
       );
     }
+    if (context.recordVersion === 2) {
+      return (
+        context.skills.usageDigest === digestText(skillUsagePromptV1) &&
+        context.assemblyIdentityDigest ===
+          digestSkillPromptIdentity({
+            version: 2,
+            baseDigest: context.base.digest,
+            toolProfileDigest: context.toolProfile.digest,
+            repository: context.repository,
+            skills: context.skills,
+          })
+      );
+    }
     return (
       context.skills.usageDigest === digestText(skillUsagePromptV1) &&
       context.assemblyIdentityDigest ===
-        digestCanonicalJson({
-          version: 2,
+        digestSkillPromptIdentity({
+          version: 3,
           baseDigest: context.base.digest,
           toolProfileDigest: context.toolProfile.digest,
-          repositoryEffectiveDigest,
-          repositoryRevision: context.repository.revision,
-          skillUsageDigest: context.skills.usageDigest,
-          skillRegistryDigest: context.skills.registryDigest,
-          skillCatalogRevision: context.skills.catalogRevision,
-          skillProjectionDigest: context.skills.projectionDigest,
-          skillActivationDigest: context.skills.activationDigest,
-          roleOrderVersion: 2,
+          repository: context.repository,
+          skills: context.skills,
+          mcp: context.mcp,
         })
     );
   } catch {
@@ -713,9 +897,9 @@ export function assemblePromptMessagesV1(
     context.recordVersion === 1 ? transcript : insertSkillUsageProjection(transcript);
   const repositoryMessage = createRepositoryProjectionMessageV1(context.repository);
   const catalogMessage =
-    context.recordVersion === 2 ? createSkillCatalogProjectionMessage(skillContext) : undefined;
+    context.recordVersion === 1 ? undefined : createSkillCatalogProjectionMessage(skillContext);
   const activatedMessage =
-    context.recordVersion === 2
+    context.recordVersion !== 1
       ? createActivatedSkillsProjectionMessage(skillContext, activeSkillContents)
       : undefined;
   if (

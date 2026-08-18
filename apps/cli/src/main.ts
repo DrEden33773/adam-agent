@@ -289,6 +289,9 @@ function formatPermissionPrompt(
       event.subject.path === undefined ? "" : ` resource ${quoteForTerminal(event.subject.path)}`;
     return `Allow ${event.name} for Agent Skill ${quoteForTerminal(event.subject.qualifiedId)}${resource} [y/N] `;
   }
+  if (event.subject.type === "mcp_tool") {
+    return `Allow ${event.name} from MCP server ${quoteForTerminal(event.subject.serverId)} [y/N] `;
+  }
   return `Allow ${event.name} for ${quoteForTerminal(event.subject.path)} [y/N] `;
 }
 

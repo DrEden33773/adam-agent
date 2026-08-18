@@ -13,6 +13,16 @@ export type ToolArtifactSource = {
   readonly truncated: boolean;
 };
 
+export type McpToolResultArtifactSourceV1 = {
+  readonly type: "mcp_tool_result";
+  readonly schemaVersion: 1;
+  readonly callId: string;
+  readonly toolName: string;
+  readonly serverId: string;
+  readonly originalName: string;
+  readonly definitionDigest: string;
+};
+
 export type ExtensionArtifactSource = {
   readonly type: "extension_operation";
   readonly contract: { readonly id: string; readonly version: number };
@@ -49,6 +59,7 @@ export type SkillArtifactSource = {
 
 export type ArtifactSource =
   | ExtensionArtifactSource
+  | McpToolResultArtifactSourceV1
   | ModelResponseArtifactSource
   | SkillArtifactSource
   | ToolArtifactSource;
