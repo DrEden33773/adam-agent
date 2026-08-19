@@ -70,7 +70,7 @@ type JsonRpcRequest = {
   readonly params?: {
     readonly cursor?: string;
     readonly name?: string;
-    readonly arguments?: Readonly<Record<string, unknown>>;
+    readonly arguments?: Readonly<Record<string, unknown>> & { readonly value?: unknown };
   };
 };
 
@@ -445,7 +445,7 @@ function respond(request: JsonRpcRequest): void {
       }
       return;
     }
-    const value = request.params?.arguments?.["value"];
+    const value = request.params?.arguments?.value;
     if (request.params?.name !== "echo" || typeof value !== "string") {
       writeResult(request, {
         content: [{ type: "text", text: "invalid fixture call" }],

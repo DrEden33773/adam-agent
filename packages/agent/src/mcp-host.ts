@@ -37,6 +37,31 @@ import type { ArtifactStore } from "./artifact-store.js";
 import type { JsonValue, ToolEffect, ToolRegistry, ToolResult } from "./tool-runtime.js";
 
 type Sha256Digest = `sha256:${string}`;
+type McpJsonRecord = Readonly<Record<string, unknown>> & {
+  readonly $anchor?: unknown;
+  readonly $dynamicAnchor?: unknown;
+  readonly $dynamicRef?: unknown;
+  readonly $id?: unknown;
+  readonly $recursiveRef?: unknown;
+  readonly $ref?: unknown;
+  readonly $schema?: unknown;
+  readonly allOf?: unknown;
+  readonly args?: unknown;
+  readonly bin?: unknown;
+  readonly command?: unknown;
+  readonly cwd?: unknown;
+  readonly env?: unknown;
+  readonly integrity?: unknown;
+  readonly link?: unknown;
+  readonly mcpServers?: unknown;
+  readonly name?: unknown;
+  readonly packages?: unknown;
+  readonly properties?: unknown;
+  readonly required?: unknown;
+  readonly resolved?: unknown;
+  readonly type?: unknown;
+  readonly version?: unknown;
+};
 type McpActivationErrorCode =
   | "mcp_bootstrap_failed"
   | "mcp_catalog_invalid"
@@ -336,9 +361,9 @@ export async function inspectMcpConfiguration(
   if (
     !isRecord(parsed) ||
     Object.keys(parsed).length !== 1 ||
-    !isRecord(parsed["mcpServers"]) ||
-    Object.keys(parsed["mcpServers"]).length > 8 ||
-    Object.entries(parsed["mcpServers"]).some(
+    !isRecord(parsed.mcpServers) ||
+    Object.keys(parsed.mcpServers).length > 8 ||
+    Object.entries(parsed.mcpServers).some(
       ([serverId, value]) =>
         !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(serverId) ||
         !isRecord(value) ||
@@ -370,7 +395,7 @@ export async function inspectMcpConfiguration(
   let inspections: readonly McpServerConfigurationInspection[];
   try {
     inspections = await Promise.all(
-      Object.entries(parsed["mcpServers"])
+      Object.entries(parsed.mcpServers)
         .sort(([left], [right]) => compareCodeUnits(left, right))
         .map(([serverId, value]) =>
           inspectMcpServerConfiguration({ canonicalWorkspaceRoot, serverId, value }),
@@ -612,7 +637,7 @@ async function inspectMcpServerConfiguration(input: {
   if (!isRecord(input.value)) {
     throw new McpConfigurationError();
   }
-  const type = input.value["type"];
+  const type = input.value.type;
   if (
     (typeof type === "string" && type !== "stdio") ||
     Object.keys(input.value).some((key) => unsupportedMcpServerConfigurationFields.has(key))
@@ -1797,7 +1822,7 @@ async function bootstrapExactMcpPackage(
         effectiveSignal,
       ),
     );
-    if (manifest["name"] !== command.packageName || manifest["version"] !== command.version) {
+    if (manifest.name !== command.packageName || manifest.version !== command.version) {
       throw new Error("The installed MCP package identity did not match its approval.");
     }
     const lock = parseJsonRecord(
@@ -1807,7 +1832,7 @@ async function bootstrapExactMcpPackage(
         effectiveSignal,
       ),
     );
-    const lockPackages = lock["packages"];
+    const lockPackages = lock.packages;
     if (!isRecord(lockPackages)) {
       throw new Error("The MCP package lock was unavailable.");
     }
@@ -1833,15 +1858,15 @@ async function bootstrapExactMcpPackage(
         isAbsolute(lockPath) ||
         lockPath.split("/").includes("..") ||
         !isRecord(lockValue) ||
-        lockValue["link"] === true ||
-        typeof lockValue["version"] !== "string" ||
-        typeof lockValue["integrity"] !== "string" ||
-        !lockValue["integrity"].startsWith("sha512-") ||
-        typeof lockValue["resolved"] !== "string"
+        lockValue.link === true ||
+        typeof lockValue.version !== "string" ||
+        typeof lockValue.integrity !== "string" ||
+        !lockValue.integrity.startsWith("sha512-") ||
+        typeof lockValue.resolved !== "string"
       ) {
         throw new Error("The MCP package dependency lock was invalid.");
       }
-      const resolvedUrl = new URL(lockValue["resolved"]);
+      const resolvedUrl = new URL(lockValue.resolved);
       if (
         resolvedUrl.origin !== registryOrigin ||
         resolvedUrl.username.length > 0 ||
@@ -1861,29 +1886,29 @@ async function bootstrapExactMcpPackage(
         ),
       );
       if (
-        typeof installedManifest["name"] !== "string" ||
-        installedManifest["version"] !== lockValue["version"]
+        typeof installedManifest.name !== "string" ||
+        installedManifest.version !== lockValue.version
       ) {
         throw new Error("The MCP package dependency identity was invalid.");
       }
       dependencyTree.push({
         path: lockPath,
-        name: installedManifest["name"],
-        version: lockValue["version"],
-        integrity: lockValue["integrity"],
+        name: installedManifest.name,
+        version: lockValue.version,
+        integrity: lockValue.integrity,
       });
     }
     const lockedPackage = lockPackages[packageRelativePath];
     if (
       !isRecord(lockedPackage) ||
-      lockedPackage["version"] !== command.version ||
-      typeof lockedPackage["integrity"] !== "string" ||
-      typeof lockedPackage["resolved"] !== "string" ||
-      new URL(lockedPackage["resolved"]).origin !== registryOrigin
+      lockedPackage.version !== command.version ||
+      typeof lockedPackage.integrity !== "string" ||
+      typeof lockedPackage.resolved !== "string" ||
+      new URL(lockedPackage.resolved).origin !== registryOrigin
     ) {
       throw new Error("The MCP package lock identity was invalid.");
     }
-    const binRelativePath = resolveNpmDefaultBin(command.packageName, manifest["bin"]);
+    const binRelativePath = resolveNpmDefaultBin(command.packageName, manifest.bin);
     const stagingBin = await realpath(resolve(stagingPackageRoot, binRelativePath));
     if (!isPathInside(stagingPackageRoot, stagingBin) || !(await stat(stagingBin)).isFile()) {
       throw new Error("The MCP package bin escaped its package root.");
@@ -1899,7 +1924,7 @@ async function bootstrapExactMcpPackage(
         version: 1,
         packageName: command.packageName,
         packageVersion: command.version,
-        integrity: lockedPackage["integrity"],
+        integrity: lockedPackage.integrity,
         dependencyTreeDigest: sha256(canonicalJson({ version: 1, packages: dependencyTree })),
         binPolicy: command.binPolicy,
         binRelativePath,
@@ -2049,7 +2074,7 @@ function resolveNpmDefaultBin(packageName: string, bin: unknown): string {
   return selected[1];
 }
 
-function parseJsonRecord(source: string): Record<string, unknown> {
+function parseJsonRecord(source: string): McpJsonRecord {
   const value = JSON.parse(source) as unknown;
   if (!isRecord(value)) {
     throw new Error("The MCP package metadata was invalid.");
@@ -2313,7 +2338,7 @@ async function executeMcpTool(input: {
       });
       let remainingPreviewBytes = 4_096;
       const previewContent = content.slice(0, 64).map((block) => {
-        const text = block["text"];
+        const text = block.text;
         const totalBytes = typeof text === "string" ? Buffer.byteLength(text, "utf8") : 0;
         const preview = typeof text === "string" ? truncateUtf8(text, remainingPreviewBytes) : "";
         remainingPreviewBytes -= Buffer.byteLength(preview, "utf8");
@@ -2518,11 +2543,11 @@ async function discoverMcpTools(
   const catalog = await listAllTools(client, server.serverId, signal);
   const validatorProvider = new AjvJsonSchemaValidator();
   return catalog.tools.flatMap((tool): McpDiscoveredTool[] => {
-    const inputSchema = tool.inputSchema as Readonly<Record<string, unknown>>;
+    const inputSchema = tool.inputSchema as McpJsonRecord;
     try {
       assertMcpSchemaAdmissible(inputSchema);
       if (tool.outputSchema !== undefined) {
-        assertMcpSchemaAdmissible(tool.outputSchema as Readonly<Record<string, unknown>>);
+        assertMcpSchemaAdmissible(tool.outputSchema as McpJsonRecord);
       }
       const validateInput = validatorProvider.getValidator<unknown>(
         structuredClone(tool.inputSchema) as JsonSchemaType,
@@ -2611,13 +2636,13 @@ const mcpSchemaLimits = {
   maximumReferenceSegments: 32,
 } as const;
 
-function assertMcpSchemaAdmissible(root: Readonly<Record<string, unknown>>): void {
+function assertMcpSchemaAdmissible(root: McpJsonRecord): void {
   let branchCount = 0;
   let definitionCount = 0;
   let nodeCount = 0;
   let propertyCount = 0;
   let referenceCount = 0;
-  const activeObjects = new Set<Readonly<Record<string, unknown>>>();
+  const activeObjects = new Set<McpJsonRecord>();
 
   schemaDialect(root);
 
@@ -2640,7 +2665,7 @@ function assertMcpSchemaAdmissible(root: Readonly<Record<string, unknown>>): voi
     }
     activeObjects.add(value);
     try {
-      const properties = value["properties"];
+      const properties = value.properties;
       if (isRecord(properties)) {
         propertyCount += Object.keys(properties).length;
         if (propertyCount > mcpSchemaLimits.maximumProperties) {
@@ -2669,15 +2694,15 @@ function assertMcpSchemaAdmissible(root: Readonly<Record<string, unknown>>): voi
         }
       }
       if (
-        value["$dynamicRef"] !== undefined ||
-        value["$recursiveRef"] !== undefined ||
-        value["$id"] !== undefined ||
-        value["$anchor"] !== undefined ||
-        value["$dynamicAnchor"] !== undefined
+        value.$dynamicRef !== undefined ||
+        value.$recursiveRef !== undefined ||
+        value.$id !== undefined ||
+        value.$anchor !== undefined ||
+        value.$dynamicAnchor !== undefined
       ) {
         throw new TypeError("MCP schema dynamic or alternate reference scopes are unsupported.");
       }
-      const reference = value["$ref"];
+      const reference = value.$ref;
       if (reference !== undefined) {
         referenceCount += 1;
         if (
@@ -2706,10 +2731,10 @@ function assertMcpSchemaAdmissible(root: Readonly<Record<string, unknown>>): voi
 }
 
 function validateMcpReferenceGraph(
-  root: Readonly<Record<string, unknown>>,
+  root: McpJsonRecord,
   value: unknown,
   referenceDepth: number,
-  activeTargets: Set<Readonly<Record<string, unknown>>>,
+  activeTargets: Set<McpJsonRecord>,
 ): void {
   if (Array.isArray(value)) {
     for (const item of value) {
@@ -2720,7 +2745,7 @@ function validateMcpReferenceGraph(
   if (!isRecord(value)) {
     return;
   }
-  const reference = value["$ref"];
+  const reference = value.$ref;
   if (typeof reference === "string") {
     if (referenceDepth >= mcpSchemaLimits.maximumReferenceDepth) {
       throw new TypeError("MCP schema reference depth limit exceeded.");
@@ -2743,10 +2768,7 @@ function validateMcpReferenceGraph(
   }
 }
 
-function resolveLocalSchemaReference(
-  root: Readonly<Record<string, unknown>>,
-  reference: string,
-): unknown {
+function resolveLocalSchemaReference(root: McpJsonRecord, reference: string): unknown {
   let current: unknown = root;
   for (const encodedSegment of reference.slice(2).split("/")) {
     const segment = encodedSegment.replace(/~1/gu, "/").replace(/~0/gu, "~");
@@ -2758,11 +2780,11 @@ function resolveLocalSchemaReference(
   return current;
 }
 
-function projectMcpInputSchemaV1(schema: Readonly<Record<string, unknown>>): {
+function projectMcpInputSchemaV1(schema: McpJsonRecord): {
   readonly schema: Readonly<Record<string, unknown>>;
   readonly compatibilityHint?: string;
 } {
-  const allOf = schema["allOf"];
+  const allOf = schema.allOf;
   const rootChoice = (["anyOf", "oneOf"] as const).find(
     (keyword) => Array.isArray(schema[keyword]) && schema[keyword].length > 0,
   );
@@ -2775,25 +2797,25 @@ function projectMcpInputSchemaV1(schema: Readonly<Record<string, unknown>>): {
   if (!Array.isArray(allOf) || allOf.length === 0) {
     return { schema };
   }
-  const rootProperties = isRecord(schema["properties"]) ? schema["properties"] : {};
+  const rootProperties = isRecord(schema.properties) ? schema.properties : {};
   const properties: Record<string, unknown> = { ...rootProperties };
-  const required: string[] = Array.isArray(schema["required"])
-    ? schema["required"].filter((entry): entry is string => typeof entry === "string")
+  const required: string[] = Array.isArray(schema.required)
+    ? schema.required.filter((entry): entry is string => typeof entry === "string")
     : [];
   const seenRequired = new Set(required);
   for (const unresolvedBranch of allOf) {
     const branch = resolveMcpProjectionBranch(schema, unresolvedBranch);
-    if (!isRecord(branch) || (branch["type"] !== undefined && branch["type"] !== "object")) {
+    if (!isRecord(branch) || (branch.type !== undefined && branch.type !== "object")) {
       throw new TypeError("MCP root allOf branches must be object schemas.");
     }
-    const branchProperties = branch["properties"];
+    const branchProperties = branch.properties;
     if (branchProperties !== undefined && !isRecord(branchProperties)) {
       throw new TypeError("MCP root allOf properties must be an object.");
     }
     for (const [name, value] of Object.entries(branchProperties ?? {})) {
       properties[name] ??= value;
     }
-    const branchRequired = branch["required"];
+    const branchRequired = branch.required;
     if (
       branchRequired !== undefined &&
       (!Array.isArray(branchRequired) || branchRequired.some((entry) => typeof entry !== "string"))
@@ -2819,33 +2841,33 @@ function projectMcpInputSchemaV1(schema: Readonly<Record<string, unknown>>): {
 }
 
 function projectMcpRootChoice(
-  schema: Readonly<Record<string, unknown>>,
+  schema: McpJsonRecord,
   keyword: "anyOf" | "oneOf",
 ): { readonly schema: Readonly<Record<string, unknown>>; readonly compatibilityHint: string } {
   const branches = schema[keyword];
   if (!Array.isArray(branches) || branches.length === 0) {
     throw new TypeError("MCP root choice requires branches.");
   }
-  const properties: Record<string, unknown> = isRecord(schema["properties"])
-    ? { ...schema["properties"] }
+  const properties: Record<string, unknown> = isRecord(schema.properties)
+    ? { ...schema.properties }
     : {};
   const rootPropertyNames = new Set(Object.keys(properties));
-  const rootRequired = Array.isArray(schema["required"])
-    ? schema["required"].filter((entry): entry is string => typeof entry === "string")
+  const rootRequired = Array.isArray(schema.required)
+    ? schema.required.filter((entry): entry is string => typeof entry === "string")
     : [];
   const branchRequirements: string[][] = [];
   const branchPropertySets: Readonly<Record<string, unknown>>[] = [];
   for (const unresolvedBranch of branches) {
     const branch = resolveMcpProjectionBranch(schema, unresolvedBranch);
-    if (!isRecord(branch) || (branch["type"] !== undefined && branch["type"] !== "object")) {
+    if (!isRecord(branch) || (branch.type !== undefined && branch.type !== "object")) {
       throw new TypeError("MCP root choice branches must be object schemas.");
     }
-    const branchProperties = branch["properties"];
+    const branchProperties = branch.properties;
     if (branchProperties !== undefined && !isRecord(branchProperties)) {
       throw new TypeError("MCP root choice properties must be an object.");
     }
     branchPropertySets.push(branchProperties ?? {});
-    const branchRequired = branch["required"];
+    const branchRequired = branch.required;
     if (
       branchRequired !== undefined &&
       (!Array.isArray(branchRequired) || branchRequired.some((entry) => typeof entry !== "string"))
@@ -2890,17 +2912,14 @@ function projectMcpRootChoice(
   };
 }
 
-function resolveMcpProjectionBranch(
-  root: Readonly<Record<string, unknown>>,
-  branch: unknown,
-): Readonly<Record<string, unknown>> {
+function resolveMcpProjectionBranch(root: McpJsonRecord, branch: unknown): McpJsonRecord {
   let current = branch;
-  const seen = new Set<Readonly<Record<string, unknown>>>();
+  const seen = new Set<McpJsonRecord>();
   for (let depth = 0; depth <= mcpSchemaLimits.maximumReferenceDepth; depth += 1) {
     if (!isRecord(current)) {
       throw new TypeError("MCP root combinator branches must be object schemas.");
     }
-    const reference = current["$ref"];
+    const reference = current.$ref;
     if (reference === undefined) {
       return current;
     }
@@ -3396,11 +3415,11 @@ async function createExecutableServerPreview(input: {
   if (!isRecord(input.value)) {
     throw new TypeError("MCP server configuration must be an object.");
   }
-  const type = input.value["type"];
-  const command = input.value["command"];
-  const args = input.value["args"] ?? [];
-  const configuredCwd = input.value["cwd"] ?? ".";
-  const env = input.value["env"] ?? {};
+  const type = input.value.type;
+  const command = input.value.command;
+  const args = input.value.args ?? [];
+  const configuredCwd = input.value.cwd ?? ".";
+  const env = input.value.env ?? {};
   if (
     (type !== undefined && type !== "stdio") ||
     typeof command !== "string" ||
@@ -3731,9 +3750,9 @@ function isJsonValue(value: unknown): value is JsonValue {
 }
 
 function schemaDialect(
-  schema: Readonly<Record<string, unknown>>,
+  schema: McpJsonRecord,
 ): McpToolProfileV1["tools"][number]["rawSchema"]["dialect"] {
-  const declared = schema["$schema"];
+  const declared = schema.$schema;
   if (declared === undefined) {
     return "unstamped";
   }
@@ -3819,7 +3838,7 @@ function asError(error: unknown): Error {
   return error instanceof Error ? error : new Error("MCP transport failed.");
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+function isRecord(value: unknown): value is McpJsonRecord {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 

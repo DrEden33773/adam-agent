@@ -76,6 +76,6 @@ Build a lightweight, inspectable local coding agent. Make the core coding path r
 - Keep live-provider, live-Web, and external MCP tests opt-in; ordinary CI must not require credentials or network access.
 - Run focused tests while iterating and the complete Linux check once before merge.
 - Use Node.js 24 LTS, ESM, strict TypeScript, and the exact pnpm 11 release declared by `packageManager`. Commit `pnpm-lock.yaml`; do not use npm, Yarn, or Bun lockfiles.
-- Use Biome for TypeScript and JavaScript formatting and linting, and markdownlint-cli2 for Markdown. Keep hooks check-only; use explicit `*:fix` commands for intentional rewrites.
+- Use Biome for TypeScript and JavaScript formatting and linting, and markdownlint-cli2 for Markdown. Keep hooks check-only; use explicit `*:fix` commands for intentional rewrites. Treat `useLiteralKeys` as a required check: prefer dot access after narrowing known fields, but retain `noPropertyAccessFromIndexSignature` and use a narrowly explained suppression when an intentionally dynamic key cannot be typed safely.
 - Run `pnpm quality:check` before merge. Keep one Linux quality workflow until product behavior creates a demonstrated need for another job.
 - Do not introduce Nx, Turborepo, or another task orchestrator while pnpm workspaces and TypeScript project references are sufficient.
