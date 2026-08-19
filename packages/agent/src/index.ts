@@ -30,10 +30,12 @@ import {
   digestPromptMessagePrefixV1,
   digestPromptRequestV1,
   estimatePromptTokensV1,
+  hasSkillPromptContext,
   isPromptContextRecordCompatible,
   type PromptContextRecord,
   type PromptContextRecordV1,
   type PromptContextRecordV2,
+  type PromptContextRecordV3,
   replacePromptRepositoryV1,
   replacePromptSkillsV2,
 } from "./prompt-assembly.js";
@@ -151,6 +153,10 @@ export {
   type CurrentSessionSnapshot,
   createSessionLifecycle,
   type LegacySessionSnapshot,
+  type McpCloseResult,
+  type McpConfigurationCommand,
+  type McpConfigurationResult,
+  type McpSessionSnapshot,
   type RepositoryInstructionsReloadResult,
   type SessionCommand,
   type SessionContextSnapshot,
@@ -288,13 +294,22 @@ export type RunResult =
               | "invalid_run_limits"
               | "run_already_active"
               | "session_persistence_failed"
-              | "tool_effect_indeterminate"
               | "turn_limit_exceeded"
               | "token_limit_exceeded"
               | "token_usage_missing"
               | "context_compaction_input_unrecoverable"
               | "context_compaction_invalid"
               | "context_window_unrecoverable";
+            readonly message: string;
+          }
+        | {
+            readonly code: "tool_effect_indeterminate";
+            readonly reason:
+              | "mcp_request_timeout"
+              | "mcp_caller_cancelled"
+              | "mcp_connection_closed"
+              | "mcp_protocol_error"
+              | "process_restart";
             readonly message: string;
           }
         | {
@@ -460,6 +475,14 @@ export type RuntimeEvent =
       readonly name: string;
       readonly error: Extract<ToolResult, { readonly status: "failed" }>["error"];
     }
+  | {
+      readonly type: "mcp_catalog_state_changed";
+      readonly generationId: string;
+      readonly serverId: string;
+      readonly catalogDigest: `sha256:${string}`;
+      readonly status: "stale";
+      readonly reason: "list_changed";
+    }
   | { readonly type: "session_interrupted"; readonly reason: "cancelled" }
   | { readonly type: "session_settled"; readonly result: RunResult };
 
@@ -565,11 +588,9 @@ export class AgentSession {
     this.#model = dependencies.model;
     const durablePromptContext = this.#durableContext?.promptContext;
     const selectedToolNames =
-      durablePromptContext?.recordVersion === 2
-        ? undefined
-        : durablePromptContext?.recordVersion === 1
-          ? durablePromptContext.toolProfile.definitions.map((definition) => definition.name)
-          : ["read_file", "write_file", "edit_file", "run_shell"];
+      durablePromptContext === undefined
+        ? ["read_file", "write_file", "edit_file", "run_shell"]
+        : durablePromptContext.toolProfile.definitions.map((definition) => definition.name);
     this.#tools =
       this.#durableContext !== undefined && durablePromptContext === undefined
         ? filterLiveToolRegistry(dependencies.tools, [
@@ -595,7 +616,7 @@ export class AgentSession {
     ) {
       throw new TypeError("The exact recorded prompt and tool profile is not supported.");
     }
-    if ((this.#promptContext?.recordVersion === 2) !== (this.#skillContext !== undefined)) {
+    if (hasSkillPromptContext(this.#promptContext) !== (this.#skillContext !== undefined)) {
       throw new TypeError("The exact recorded Skill profile is not supported.");
     }
     this.#hasUncheckpointedInheritedMessages = this.#durableContext?.hasInheritedMessages === true;
@@ -1787,7 +1808,11 @@ export class AgentSession {
     const skillContext = this.#skillContext;
     const promptContext = this.#promptContext;
     const runId = this.#activeRunId;
-    if (skillContext === undefined || promptContext?.recordVersion !== 2 || runId === undefined) {
+    if (
+      skillContext === undefined ||
+      !hasSkillPromptContext(promptContext) ||
+      runId === undefined
+    ) {
       return skillActivationFailure("Agent Skills are unavailable in this session.");
     }
     const resolved: Array<{
@@ -1973,10 +1998,7 @@ export class AgentSession {
         activationIndex: activation.activationIndex,
       };
     });
-    const nextPromptContext = replacePromptSkillsV2(
-      promptContext as PromptContextRecordV2,
-      stagedContext,
-    );
+    const nextPromptContext = replacePromptSkillsV2(promptContext, stagedContext);
     const newActivations = stagedContext.active.slice(skillContext.active.length);
     const committed = await this.#withCurrentExtensionSkills(
       stagedContext,
@@ -2057,7 +2079,7 @@ export class AgentSession {
       options.repositoryDisposition === "mutation_retry_required" ||
       options.repositoryDisposition === "unavailable"
     ) {
-      const combinedProjectContext = this.#promptContext?.recordVersion === 2;
+      const combinedProjectContext = hasSkillPromptContext(this.#promptContext);
       const result: Extract<ToolResult, { readonly status: "failed" }> =
         options.repositoryDisposition === "mutation_retry_required"
           ? {
@@ -2207,6 +2229,12 @@ export class AgentSession {
       await this.#appendToolResult(messages, call, result);
       return undefined;
     }
+    const preDispatchFailure = preparedCall.validateBeforeDispatch?.();
+    if (preDispatchFailure !== undefined) {
+      toolResultsById.set(call.id, { call, result: preDispatchFailure });
+      await this.#appendToolResult(messages, call, preDispatchFailure);
+      return undefined;
+    }
     if (options.emitStarted) {
       await this.#emit({ type: "tool_started", callId: call.id, name: call.name });
     }
@@ -2221,6 +2249,12 @@ export class AgentSession {
           : await preparedCall.execute({ signal, callId: call.id, toolName: call.name });
     toolResultsById.set(call.id, { call, result });
     await this.#appendToolResult(messages, call, result);
+    if (result.status === "failed" && result.error.code === "tool_effect_indeterminate") {
+      return this.#settle({
+        status: "failed",
+        error: result.error,
+      });
+    }
     return undefined;
   }
 
@@ -2246,7 +2280,7 @@ export class AgentSession {
     if (
       qualifiedId === undefined ||
       skillContext === undefined ||
-      promptContext?.recordVersion !== 2 ||
+      !hasSkillPromptContext(promptContext) ||
       runId === undefined ||
       !skillContext.catalog.entries.some((entry) => entry.qualifiedId === qualifiedId)
     ) {
@@ -2547,7 +2581,7 @@ export class AgentSession {
     }
     const requestedScopes = repositoryScopesFromPermissionSubject(subject);
     const activeScopes = new Set(context.repository.activeScopes);
-    if (context.recordVersion === 2 && this.#skillContext !== undefined) {
+    if (hasSkillPromptContext(context) && this.#skillContext !== undefined) {
       const activeSkillScopes = new Set(this.#skillContext.activeProjectScopes);
       if (
         requestedScopes.every((scope) => activeScopes.has(scope) && activeSkillScopes.has(scope))
@@ -2663,7 +2697,7 @@ export class AgentSession {
     const projectId = this.#durableContext?.projectId;
     const sessionId = this.#durableContext?.sessionId;
     if (
-      promptContext?.recordVersion !== 2 ||
+      !hasSkillPromptContext(promptContext) ||
       skillContext === undefined ||
       workspaceRoot === undefined ||
       runId === undefined ||
@@ -2724,10 +2758,9 @@ export class AgentSession {
         "Project path context could not be loaded safely.",
       );
     }
-    let nextPromptContext = replacePromptRepositoryV1(
-      promptContext,
-      repository,
-    ) as PromptContextRecordV2;
+    let nextPromptContext = replacePromptRepositoryV1(promptContext, repository) as
+      | PromptContextRecordV2
+      | PromptContextRecordV3;
     nextPromptContext = replacePromptSkillsV2(nextPromptContext, nextSkillContext);
     const mutation = call.name !== "read_file";
     await this.#appendRecord({
@@ -3030,6 +3063,16 @@ export class AgentSession {
         output: result.output,
       });
     } else {
+      if (result.error.code === "mcp_catalog_stale") {
+        await this.#emit({
+          type: "mcp_catalog_state_changed",
+          generationId: result.error.generationId,
+          serverId: result.error.serverId,
+          catalogDigest: result.error.catalogDigest,
+          status: "stale",
+          reason: "list_changed",
+        });
+      }
       await this.#emit({
         type: "tool_failed",
         callId: call.id,
@@ -3077,6 +3120,28 @@ export class AgentSession {
   }
 
   async #emit(event: RuntimeEvent): Promise<void> {
+    if (event.type === "mcp_catalog_state_changed") {
+      const runId = this.#activeRunId;
+      if (runId === undefined || this.#durableContext === undefined) {
+        throw new Error("Cannot persist an MCP catalog transition without an active durable run.");
+      }
+      await this.#appendRecord({
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "mcp_catalog_state_changed",
+          recordVersion: 1,
+          runId,
+          generationId: event.generationId,
+          serverId: event.serverId,
+          catalogDigest: event.catalogDigest,
+          status: event.status,
+          reason: event.reason,
+        },
+      });
+      this.#publish(event);
+      return;
+    }
     if (
       event.type === "model_message_completed" &&
       this.#durableContext !== undefined &&

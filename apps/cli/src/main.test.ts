@@ -43,7 +43,7 @@ function promptProjectionFor(
   snapshot: {
     readonly promptContext?: {
       readonly assemblyIdentityDigest: `sha256:${string}`;
-      readonly profileVersion: 1 | 2;
+      readonly profileVersion: 1 | 2 | 3;
     };
   },
   userMessage: string,
@@ -62,7 +62,7 @@ function promptProjectionFor(
           version: 1,
           messages: [
             { role: "system", content: adamBasePrompt },
-            ...(snapshot.promptContext?.profileVersion === 2
+            ...(snapshot.promptContext !== undefined && snapshot.promptContext.profileVersion !== 1
               ? [{ role: "developer", content: skillUsagePrompt }]
               : []),
             { role: "user", content: userMessage },

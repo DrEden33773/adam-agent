@@ -7,12 +7,38 @@ export {
 } from "./biome-execution.js";
 export type { ContextProfile } from "./context-profile.js";
 export { digestContextRecordPrefix } from "./durable-context.js";
+export type {
+  McpBeforeToolDispatchBarrier,
+  McpBootstrapScheduler,
+  McpCloseConfirmation,
+  McpDiscoveryScheduler,
+  McpIdleScheduler,
+  McpRequestScheduler,
+} from "./mcp-host.js";
+export {
+  mcpBeforeToolDispatchBarrier,
+  mcpBootstrapScheduler,
+  mcpCloseConfirmation,
+  mcpDiscoveryScheduler,
+  mcpIdleScheduler,
+  mcpPackageManagerCliPath,
+  mcpPackageRegistryUrl,
+  mcpRequestScheduler,
+} from "./mcp-host.js";
 export { preparedDirectDeepSeekV2ContextProfile } from "./model-targets.js";
 export type { PatchFileSystem } from "./patch-transaction.js";
 export {
   sessionDurableContext,
   sessionDurableOutputLimits,
 } from "./session-durable-context.js";
+export {
+  type McpActivationSettlementBarrier,
+  type McpCatalogStaleDurableBarrier,
+  type McpCatalogStaleObservationBarrier,
+  mcpActivationSettlementBarrier,
+  mcpCatalogStaleDurableBarrier,
+  mcpCatalogStaleObservationBarrier,
+} from "./session-lifecycle.js";
 export {
   openJsonlSessionStore,
   type SessionContextCompactionCommittedRecord,

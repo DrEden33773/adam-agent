@@ -10,6 +10,7 @@ import type { ContextProfile } from "./context-profile.js";
 import type { ContextCallUsage, ContextEvidenceV1, ContextSummaryV1 } from "./durable-context.js";
 import { maximumInlineModelResponseFieldBytes } from "./durable-model-response-policy.js";
 import type { RunResult, RuntimeEvent } from "./index.js";
+import type { McpToolProfileV1 } from "./mcp-host.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import {
@@ -24,11 +25,14 @@ import {
 import { type SkillContextRecordV1, skillContextRecordV1Schema } from "./skills.js";
 import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from "./tool-runtime.js";
 
-export type CanonicalRuntimeEvent = Exclude<RuntimeEvent, { readonly type: "model_message_delta" }>;
+export type CanonicalRuntimeEvent = Exclude<
+  RuntimeEvent,
+  { readonly type: "model_message_delta" | "mcp_catalog_state_changed" }
+>;
 
 type V1PermissionSubject = Exclude<
   PermissionSubject,
-  { readonly type: "extension_capability" | "patch" | "skill" }
+  { readonly type: "extension_capability" | "mcp_tool" | "patch" | "skill" }
 >;
 type V1ToolError = {
   readonly code:
@@ -98,6 +102,130 @@ export type SessionGenesisRecord = {
       readonly prefixDigest: string;
     };
   };
+};
+
+export type SessionMcpWorkspaceConfirmedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "mcp_workspace_confirmed";
+    readonly recordVersion: 1;
+    readonly sourceDigest: Sha256Digest;
+    readonly canonicalizerVersion: 1;
+  };
+};
+
+export type SessionMcpServerDefinitionApprovedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "mcp_server_definition_approved";
+    readonly recordVersion: 1;
+    readonly sourceDigest: Sha256Digest;
+    readonly serverId: string;
+    readonly definitionDigest: Sha256Digest;
+  };
+};
+
+export type SessionMcpActivationStartedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "mcp_activation_started";
+    readonly recordVersion: 1;
+    readonly generationId: string;
+    readonly attempt: number;
+    readonly reason: "initial" | "explicit_retry" | "idle_reactivate";
+    readonly servers: readonly {
+      readonly serverId: string;
+      readonly definitionDigest: Sha256Digest;
+      readonly startupEffects: readonly ["execute"] | readonly ["execute", "network"];
+    }[];
+  };
+};
+
+export type SessionMcpActivationSettledRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "mcp_activation_settled";
+    readonly recordVersion: 1;
+    readonly generationId: string;
+    readonly attempt: number;
+    readonly status: "ready" | "failed" | "cancelled";
+    readonly catalogDigest?: Sha256Digest;
+    readonly servers: readonly {
+      readonly serverId: string;
+      readonly definitionDigest: Sha256Digest;
+      readonly protocolVersion: string;
+      readonly serverName: string;
+      readonly serverVersion: string;
+      readonly capabilityDigest: Sha256Digest;
+      readonly launchIdentityDigest: Sha256Digest;
+    }[];
+    readonly error?: {
+      readonly code:
+        | "mcp_bootstrap_failed"
+        | "mcp_catalog_invalid"
+        | "mcp_catalog_too_large"
+        | "mcp_initialize_failed"
+        | "mcp_shutdown_unconfirmed"
+        | "mcp_start_failed"
+        | "mcp_startup_timeout";
+      readonly serverId?: string;
+    };
+  };
+};
+
+export type SessionMcpServerClosedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "mcp_server_closed";
+    readonly recordVersion: 1;
+    readonly generationId: string;
+    readonly attempt: number;
+    readonly serverId: string;
+    readonly definitionDigest: Sha256Digest;
+    readonly reason: "idle" | "session_close" | "peer_failure" | "stale" | "failed";
+  };
+};
+
+export type SessionMcpToolProfileCommittedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "mcp_tool_profile_committed";
+    readonly recordVersion: 1;
+    readonly profile: McpToolProfileV1;
+    readonly previousAssemblyIdentityDigest: Sha256Digest;
+    readonly assemblyIdentityDigest: Sha256Digest;
+  };
+};
+
+export type SessionMcpCatalogStateChangedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record:
+    | {
+        readonly type: "mcp_catalog_state_changed";
+        readonly recordVersion: 1;
+        readonly runId?: string;
+        readonly generationId: string;
+        readonly serverId: string;
+        readonly catalogDigest: Sha256Digest;
+        readonly status: "stale";
+        readonly reason: "list_changed" | "server_closed" | "shutdown_unconfirmed";
+      }
+    | {
+        readonly type: "mcp_catalog_state_changed";
+        readonly recordVersion: 1;
+        readonly generationId: string;
+        readonly serverId: string;
+        readonly catalogDigest: Sha256Digest;
+        readonly status: "ready";
+        readonly reason: "revalidated";
+      };
 };
 
 export type SessionLogicalRunStartedRecord = {
@@ -515,6 +643,13 @@ export type SessionRepositoryInstructionsFailedRecord = {
 
 export type SessionV3Record =
   | SessionGenesisRecord
+  | SessionMcpWorkspaceConfirmedRecord
+  | SessionMcpServerDefinitionApprovedRecord
+  | SessionMcpActivationStartedRecord
+  | SessionMcpActivationSettledRecord
+  | SessionMcpServerClosedRecord
+  | SessionMcpToolProfileCommittedRecord
+  | SessionMcpCatalogStateChangedRecord
   | SessionLogicalRunStartedRecord
   | SessionSkillActivationBatchCommittedRecord
   | SessionSkillActivatedRecord
@@ -576,7 +711,6 @@ const ordinaryRunErrorCodeSchema = z.enum([
   "invalid_run_limits",
   "run_already_active",
   "session_persistence_failed",
-  "tool_effect_indeterminate",
   "turn_limit_exceeded",
   "token_limit_exceeded",
   "token_usage_missing",
@@ -586,6 +720,17 @@ const ordinaryRunErrorCodeSchema = z.enum([
 ]);
 type RunFailure = Extract<RunResult, { readonly status: "failed" }>["error"];
 const runFailureSchema: z.ZodType<RunFailure> = z.discriminatedUnion("code", [
+  z.strictObject({
+    code: z.literal("tool_effect_indeterminate"),
+    reason: z.enum([
+      "mcp_request_timeout",
+      "mcp_caller_cancelled",
+      "mcp_connection_closed",
+      "mcp_protocol_error",
+      "process_restart",
+    ]),
+    message: z.string(),
+  }),
   z.strictObject({
     code: ordinaryRunErrorCodeSchema,
     message: z.string(),
@@ -623,6 +768,13 @@ const runFailureSchema: z.ZodType<RunFailure> = z.discriminatedUnion("code", [
     requestId: z.string().max(128).optional(),
   }),
 ]);
+const legacyRunFailureSchema = z.union([
+  runFailureSchema,
+  z.strictObject({
+    code: z.literal("tool_effect_indeterminate"),
+    message: z.string(),
+  }),
+]);
 const runResultSchema: z.ZodType<RunResult> = z.discriminatedUnion("status", [
   z.strictObject({ status: z.literal("completed"), answer: z.string() }),
   z.strictObject({
@@ -640,6 +792,25 @@ const runResultSchema: z.ZodType<RunResult> = z.discriminatedUnion("status", [
   z.strictObject({
     status: z.literal("failed"),
     error: runFailureSchema,
+  }),
+]);
+const legacyRunResultSchema = z.discriminatedUnion("status", [
+  z.strictObject({ status: z.literal("completed"), answer: z.string() }),
+  z.strictObject({
+    status: z.literal("incomplete"),
+    reason: z.literal("output_limit"),
+    answer: z.string(),
+  }),
+  z.strictObject({
+    status: z.literal("cancelled"),
+    error: z.strictObject({
+      code: z.literal("session_cancelled"),
+      message: z.string(),
+    }),
+  }),
+  z.strictObject({
+    status: z.literal("failed"),
+    error: legacyRunFailureSchema,
   }),
 ]);
 const v1ToolErrorSchema = z.strictObject({
@@ -714,6 +885,36 @@ const v2ToolErrorSchema = z.discriminatedUnion("code", [
         }),
       ),
     recoveryReference: z.strictObject({ id: z.uuid() }),
+  }),
+]);
+const currentToolErrorSchema = z.union([
+  v2ToolErrorSchema,
+  z.strictObject({
+    code: z.literal("tool_effect_indeterminate"),
+    reason: z.enum([
+      "mcp_request_timeout",
+      "mcp_caller_cancelled",
+      "mcp_connection_closed",
+      "mcp_protocol_error",
+      "process_restart",
+    ]),
+    message: z.string(),
+  }),
+  z.strictObject({
+    code: z.enum([
+      "mcp_output_invalid",
+      "mcp_output_unsupported",
+      "mcp_protocol_error",
+      "mcp_result_too_large",
+    ]),
+    message: z.string(),
+  }),
+  z.strictObject({
+    code: z.literal("mcp_catalog_stale"),
+    message: z.string(),
+    generationId: z.uuid(),
+    serverId: z.string().min(1).max(128),
+    catalogDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   }),
 ]);
 const v1PermissionSubjectSchema = z.discriminatedUnion("type", [
@@ -798,6 +999,28 @@ const v2PermissionSubjectSchema = z.discriminatedUnion("type", [
     cwd: z.literal("."),
   }),
 ]);
+const mcpPermissionSubjectSchema = z.strictObject({
+  type: z.literal("mcp_tool"),
+  serverId: z.string().min(1).max(128),
+  originalName: z.string().min(1).max(256),
+  qualifiedName: z.string().min(1).max(64),
+  serverDefinitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+});
+const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("file"), path: z.string() }),
+  z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
+  extensionCapabilityPermissionSubjectSchema,
+  patchPermissionSubjectSchema,
+  skillPermissionSubjectSchema,
+  mcpPermissionSubjectSchema,
+  z.strictObject({
+    type: z.literal("command"),
+    command: z.string(),
+    cwd: z.literal("."),
+  }),
+]) as unknown as z.ZodType<PermissionSubject>;
 
 function isCanonicalPatchPath(path: string): boolean {
   return (
@@ -809,6 +1032,7 @@ function isCanonicalPatchPath(path: string): boolean {
 }
 function createCanonicalRuntimeEventSchema(options: {
   readonly permissionSubject: z.ZodType;
+  readonly runResult: z.ZodType;
   readonly toolError: z.ZodType;
 }): z.ZodType<CanonicalRuntimeEvent> {
   return z.discriminatedUnion("type", [
@@ -876,17 +1100,24 @@ function createCanonicalRuntimeEventSchema(options: {
       error: options.toolError,
     }),
     z.strictObject({ type: z.literal("session_interrupted"), reason: z.literal("cancelled") }),
-    z.strictObject({ type: z.literal("session_settled"), result: runResultSchema }),
+    z.strictObject({ type: z.literal("session_settled"), result: options.runResult }),
   ]) as z.ZodType<CanonicalRuntimeEvent>;
 }
 
 const v1CanonicalRuntimeEventSchema = createCanonicalRuntimeEventSchema({
   permissionSubject: v1PermissionSubjectSchema,
+  runResult: legacyRunResultSchema,
   toolError: v1ToolErrorSchema,
 }) as z.ZodType<V1CanonicalRuntimeEvent>;
 const v2CanonicalRuntimeEventSchema = createCanonicalRuntimeEventSchema({
   permissionSubject: v2PermissionSubjectSchema,
+  runResult: legacyRunResultSchema,
   toolError: v2ToolErrorSchema,
+});
+const currentCanonicalRuntimeEventSchema = createCanonicalRuntimeEventSchema({
+  permissionSubject: currentPermissionSubjectSchema,
+  runResult: runResultSchema,
+  toolError: currentToolErrorSchema,
 });
 const modelTargetIdentitySchema = z.strictObject({
   targetId: z.string().min(1).max(256),
@@ -1037,7 +1268,7 @@ const contextEvidenceSchema: z.ZodType<ContextEvidenceV1> = z.strictObject({
         name: z.string().min(1).max(256),
         decision: z.enum(["allow", "deny"]),
         effect: z.string().min(1).max(64).optional(),
-        subject: v2PermissionSubjectSchema.optional(),
+        subject: currentPermissionSubjectSchema.optional(),
         sequence: z.number().int().positive(),
       }),
     )
@@ -1081,6 +1312,172 @@ const sessionV3RecordSchema = z.union([
         prefixDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
       })
       .optional(),
+  }),
+  z.strictObject({
+    type: z.literal("mcp_workspace_confirmed"),
+    recordVersion: z.literal(1),
+    sourceDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    canonicalizerVersion: z.literal(1),
+  }),
+  z.strictObject({
+    type: z.literal("mcp_server_definition_approved"),
+    recordVersion: z.literal(1),
+    sourceDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    serverId: z.string().min(1).max(128),
+    definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  }),
+  z.strictObject({
+    type: z.literal("mcp_activation_started"),
+    recordVersion: z.literal(1),
+    generationId: z.uuid(),
+    attempt: z.number().int().positive(),
+    reason: z.enum(["initial", "explicit_retry", "idle_reactivate"]),
+    servers: z
+      .array(
+        z.strictObject({
+          serverId: z.string().min(1).max(128),
+          definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+          startupEffects: z.union([
+            z.tuple([z.literal("execute")]),
+            z.tuple([z.literal("execute"), z.literal("network")]),
+          ]),
+        }),
+      )
+      .min(1)
+      .max(4),
+  }),
+  z.strictObject({
+    type: z.literal("mcp_activation_settled"),
+    recordVersion: z.literal(1),
+    generationId: z.uuid(),
+    attempt: z.number().int().positive(),
+    status: z.enum(["ready", "failed", "cancelled"]),
+    catalogDigest: z
+      .string()
+      .regex(/^sha256:[0-9a-f]{64}$/u)
+      .optional(),
+    servers: z
+      .array(
+        z.strictObject({
+          serverId: z.string().min(1).max(128),
+          definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+          protocolVersion: z.string().min(1).max(64),
+          serverName: z.string().min(1).max(256),
+          serverVersion: z.string().min(1).max(128),
+          capabilityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+          launchIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+        }),
+      )
+      .max(4),
+    error: z
+      .strictObject({
+        code: z.enum([
+          "mcp_bootstrap_failed",
+          "mcp_catalog_invalid",
+          "mcp_catalog_too_large",
+          "mcp_initialize_failed",
+          "mcp_shutdown_unconfirmed",
+          "mcp_start_failed",
+          "mcp_startup_timeout",
+        ]),
+        serverId: z.string().min(1).max(128).optional(),
+      })
+      .optional(),
+  }),
+  z.strictObject({
+    type: z.literal("mcp_server_closed"),
+    recordVersion: z.literal(1),
+    generationId: z.uuid(),
+    attempt: z.number().int().positive(),
+    serverId: z.string().min(1).max(128),
+    definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    reason: z.enum(["idle", "session_close", "peer_failure", "stale", "failed"]),
+  }),
+  z.strictObject({
+    type: z.literal("mcp_tool_profile_committed"),
+    recordVersion: z.literal(1),
+    profile: z.strictObject({
+      version: z.literal(1),
+      generationId: z.uuid(),
+      sdk: z.strictObject({
+        package: z.literal("@modelcontextprotocol/client"),
+        version: z.literal("2.0.0"),
+      }),
+      projectorVersion: z.literal(1),
+      servers: z
+        .array(
+          z.strictObject({
+            serverId: z.string().min(1).max(128),
+            definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+            protocolVersion: z.string().min(1).max(64),
+            serverName: z.string().min(1).max(256),
+            serverVersion: z.string().min(1).max(128),
+            capabilityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+            launchIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+          }),
+        )
+        .min(1)
+        .max(4),
+      tools: z
+        .array(
+          z.strictObject({
+            serverId: z.string().min(1).max(128),
+            serverDefinitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+            originalName: z.string().min(1).max(256),
+            qualifiedName: z
+              .string()
+              .min(1)
+              .max(64)
+              .regex(/^[A-Za-z0-9_]+$/u),
+            definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+            modelDescription: z.string().max(2 * 1024),
+            rawSchema: z.strictObject({
+              dialect: z.enum(["unstamped", "2020-12", "2019-09", "draft-07", "draft-06"]),
+              provenance: z.literal("tools/list"),
+              value: z.record(z.string(), z.unknown()),
+              digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+            }),
+            modelProjection: z.strictObject({
+              version: z.literal(1),
+              schema: z.record(z.string(), z.unknown()),
+              digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+            }),
+            effect: z.enum(["read", "write", "execute", "network", "delegate", "administrative"]),
+            replay: z.literal("never"),
+            cancellation: z.literal("abort_signal"),
+            outputPolicy: z.strictObject({
+              version: z.literal(1),
+              maximumInlineBytes: z.literal(64 * 1024),
+              maximumRawBytes: z.literal(8 * 1024 * 1024),
+              supportedContent: z.tuple([z.literal("text"), z.literal("structured_json")]),
+            }),
+          }),
+        )
+        .min(1)
+        .max(20),
+      digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    }),
+    previousAssemblyIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    assemblyIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  }),
+  z.strictObject({
+    type: z.literal("mcp_catalog_state_changed"),
+    recordVersion: z.literal(1),
+    runId: z.uuid().optional(),
+    generationId: z.uuid(),
+    serverId: z.string().min(1).max(128),
+    catalogDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    status: z.literal("stale"),
+    reason: z.enum(["list_changed", "server_closed", "shutdown_unconfirmed"]),
+  }),
+  z.strictObject({
+    type: z.literal("mcp_catalog_state_changed"),
+    recordVersion: z.literal(1),
+    generationId: z.uuid(),
+    serverId: z.string().min(1).max(128),
+    catalogDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    status: z.literal("ready"),
+    reason: z.literal("revalidated"),
   }),
   z.strictObject({
     type: z.literal("logical_run_started"),
@@ -1335,7 +1732,7 @@ const sessionV3RecordSchema = z.union([
   z.strictObject({
     type: z.literal("runtime_event"),
     runId: z.uuid(),
-    event: v2CanonicalRuntimeEventSchema,
+    event: currentCanonicalRuntimeEventSchema,
   }),
   z.strictObject({
     type: z.literal("context_compaction_started"),

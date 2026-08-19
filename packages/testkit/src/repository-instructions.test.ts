@@ -179,8 +179,8 @@ test("root AGENTS.md is frozen in revision 1 and projected as untrusted user con
       { role: "user", content: "Inspect the project." },
     ]);
     expect(created.promptContext).toEqual({
-      profileVersion: 2,
-      assemblyVersion: 2,
+      profileVersion: 3,
+      assemblyVersion: 3,
       base: {
         version: 1,
         digest: "sha256:e650f56f448da05ee6f1d75cb343c07ed77086e5bf267aaca97b93d50fb0fa5f",
