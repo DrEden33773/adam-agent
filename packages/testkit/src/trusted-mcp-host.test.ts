@@ -73,6 +73,16 @@ const mcpServerFixturePath = fileURLToPath(
   new URL("../dist/mcp-stdio-server.fixture.js", import.meta.url),
 );
 
+type PersistedRecordProjection = Readonly<Record<string, unknown>> & {
+  readonly reason?: unknown;
+  readonly status?: unknown;
+  readonly type?: unknown;
+};
+
+type PersistedRecordEnvelope = {
+  readonly record?: PersistedRecordProjection;
+};
+
 function observeFileCreation(path: string): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -261,10 +271,7 @@ test("SessionLifecycle rejects non-UTF-8 MCP configuration bytes without an orph
   await mkdir(workspaceRoot);
   await writeFile(
     join(workspaceRoot, ".mcp.json"),
-    Buffer.from(
-      '{"mcpServers":{"fixture":{"command":"' + String.fromCharCode(0xff) + '"}}}',
-      "latin1",
-    ),
+    Buffer.from(`{"mcpServers":{"fixture":{"command":"${String.fromCharCode(0xff)}"}}}`, "latin1"),
   );
 
   try {
@@ -2008,8 +2015,8 @@ test("SessionLifecycle close racing ready publication leaves one replayable MCP 
     const settlements = (await readFile(sessionPath, "utf8"))
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { readonly record?: Record<string, unknown> })
-      .filter((entry) => entry.record?.["type"] === "mcp_activation_settled");
+      .map((line) => JSON.parse(line) as PersistedRecordEnvelope)
+      .filter((entry) => entry.record?.type === "mcp_activation_settled");
     expect(settlements).toHaveLength(1);
 
     const cold = createSessionLifecycle({ stateRoot, workspaceRoot });
@@ -2943,16 +2950,16 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
     const terminalRecords = (await readFile(sessionPath, "utf8"))
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { readonly record?: Record<string, unknown> })
+      .map((line) => JSON.parse(line) as PersistedRecordEnvelope)
       .filter((entry) =>
         ["mcp_activation_started", "mcp_server_closed", "mcp_activation_settled"].includes(
-          String(entry.record?.["type"]),
+          String(entry.record?.type),
         ),
       )
       .map((entry) => ({
-        type: entry.record?.["type"],
-        status: entry.record?.["status"],
-        reason: entry.record?.["reason"],
+        type: entry.record?.type,
+        status: entry.record?.status,
+        reason: entry.record?.reason,
       }));
     expect(terminalRecords).toEqual([
       { type: "mcp_activation_started", status: undefined, reason: "initial" },
@@ -5844,12 +5851,16 @@ test("SessionLifecycle spills a complete MCP result above 64 KiB before publishi
       latest?.role === "tool" && latest.result.status === "completed"
         ? latest.result.output
         : undefined;
-    const accepted =
+    const artifact =
       typeof output === "object" &&
       output !== null &&
       !Array.isArray(output) &&
-      "artifact" in output &&
-      JSON.stringify(output["artifact"]) ===
+      "artifact" in output
+        ? (output as { readonly artifact?: unknown }).artifact
+        : undefined;
+    const accepted =
+      artifact !== undefined &&
+      JSON.stringify(artifact) ===
         JSON.stringify({
           id: expectedArtifactId,
           mediaType: "application/json",
@@ -7000,8 +7011,8 @@ test("SessionLifecycle refuses to commit a profile after its ready catalog becom
     const records = (await readFile(sessionPath, "utf8"))
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { readonly record?: Record<string, unknown> });
-    expect(records.some((entry) => entry.record?.["type"] === "mcp_tool_profile_committed")).toBe(
+      .map((line) => JSON.parse(line) as PersistedRecordEnvelope);
+    expect(records.some((entry) => entry.record?.type === "mcp_tool_profile_committed")).toBe(
       false,
     );
   } finally {
@@ -7571,8 +7582,8 @@ test("SessionLifecycle durably records list_changed even without a later MCP cal
     const catalogTransitions = (await readFile(sessionPath, "utf8"))
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { readonly record?: Record<string, unknown> })
-      .filter((entry) => entry.record?.["type"] === "mcp_catalog_state_changed")
+      .map((line) => JSON.parse(line) as PersistedRecordEnvelope)
+      .filter((entry) => entry.record?.type === "mcp_catalog_state_changed")
       .map((entry) => entry.record);
 
     expect(catalogTransitions).toEqual([
@@ -7730,8 +7741,8 @@ test("SessionLifecycle explicitly revalidates an unchanged stale MCP profile at 
     const catalogTransitions = (await readFile(sessionPath, "utf8"))
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { readonly record?: Record<string, unknown> })
-      .filter((entry) => entry.record?.["type"] === "mcp_catalog_state_changed")
+      .map((line) => JSON.parse(line) as PersistedRecordEnvelope)
+      .filter((entry) => entry.record?.type === "mcp_catalog_state_changed")
       .map((entry) => entry.record);
     expect(catalogTransitions).toEqual([
       expect.objectContaining({ status: "stale", reason: "list_changed" }),
@@ -7910,8 +7921,8 @@ test("SessionLifecycle close durably records each causally closed committed MCP 
     const closeRecords = (await readFile(sessionPath, "utf8"))
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { readonly record?: Record<string, unknown> })
-      .filter((entry) => entry.record?.["type"] === "mcp_server_closed")
+      .map((line) => JSON.parse(line) as PersistedRecordEnvelope)
+      .filter((entry) => entry.record?.type === "mcp_server_closed")
       .map((entry) => entry.record);
 
     expect(closeRecords).toEqual([
@@ -8015,16 +8026,16 @@ test("SessionLifecycle close interrupts an in-progress activation and waits for 
     const terminalRecords = (await readFile(sessionPath, "utf8"))
       .trim()
       .split("\n")
-      .map((line) => JSON.parse(line) as { readonly record?: Record<string, unknown> })
+      .map((line) => JSON.parse(line) as PersistedRecordEnvelope)
       .filter((entry) =>
         ["mcp_activation_started", "mcp_server_closed", "mcp_activation_settled"].includes(
-          String(entry.record?.["type"]),
+          String(entry.record?.type),
         ),
       )
       .map((entry) => ({
-        type: entry.record?.["type"],
-        status: entry.record?.["status"],
-        reason: entry.record?.["reason"],
+        type: entry.record?.type,
+        status: entry.record?.status,
+        reason: entry.record?.reason,
       }));
     await cold.close();
 
