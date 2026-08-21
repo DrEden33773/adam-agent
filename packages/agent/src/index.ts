@@ -135,6 +135,12 @@ export {
   OperationStoreError,
 } from "./operation-store.js";
 export {
+  createPresentationPreferences,
+  type PresentationPreferences,
+  type PresentationPreferencesDiagnostic,
+  type PresentationPreferencesSnapshot,
+} from "./presentation-preferences.js";
+export {
   type CreatePresentationSessionOptions,
   createPresentationSession,
 } from "./presentation-session.js";

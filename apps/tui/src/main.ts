@@ -6,6 +6,7 @@ import { basename, join } from "node:path";
 import {
   createModelTargets,
   createPermissionPolicy,
+  createPresentationPreferences,
   createPresentationSession,
   createSessionLifecycle,
   ModelTargetError,
@@ -22,12 +23,12 @@ try {
   if (command.type === "help") {
     process.stdout.write(`${usage()}\n`);
   } else {
-    const startupSignal = new AbortController().signal;
     const workspaceRoot = process.cwd();
     const { ADAM_AGENT_STATE_ROOT: configuredStateRoot } = process.env;
     const stateRoot =
       command.stateRoot ?? configuredStateRoot ?? join(homedir(), ".local", "state", "adam-agent");
     const modelTargets = createModelTargets({ environment: process.env });
+    const preferences = createPresentationPreferences({ environment: process.env });
     const lifecycle = createSessionLifecycle({
       modelTargets,
       permissions: createPermissionPolicy({
@@ -48,6 +49,8 @@ try {
         }
         const presentation = await createPresentationSession({
           lifecycle,
+          modelTargets,
+          preferences,
           projectLabel: basename(workspaceRoot),
           sessionId: command.resumeSessionId,
           stateRoot,
@@ -62,34 +65,31 @@ try {
           },
         });
       } else {
-        const targetId = command.targetId ?? selectModelTargetId(process.env);
-        const targets = await modelTargets.snapshot({
-          discoverGateway: false,
-          signal: startupSignal,
-        });
-        const selected = targets.targets.find((target) => target.identity.targetId === targetId);
-        if (selected === undefined) {
-          throw new TuiConfigurationError(`The exact target ${targetId} is not available.`);
-        }
-        if (selected.readiness.status !== "available") {
-          throw new TuiConfigurationError(
-            `The exact target ${targetId} is missing its required credential.`,
-          );
-        }
+        const {
+          ADAM_AGENT_MODEL: configuredModel,
+          ADAM_AGENT_PROVIDER: configuredProvider,
+          ADAM_AGENT_TARGET: configuredTarget,
+        } = process.env;
+        const hasConfiguredTargetSelector =
+          command.targetId !== undefined ||
+          configuredTarget !== undefined ||
+          configuredProvider !== undefined ||
+          configuredModel !== undefined;
+        const startupTargetId = hasConfiguredTargetSelector
+          ? (command.targetId ?? selectModelTargetId(process.env))
+          : undefined;
         const presentation = await createPresentationSession({
           lifecycle,
+          modelTargets,
+          openProject: true,
+          preferences,
           projectLabel: basename(workspaceRoot),
           stateRoot,
-          targetIdentity: selected.identity,
           workspaceRoot,
         });
         await runTui({
           presentation,
-          targetStatus: {
-            targetId: selected.identity.targetId,
-            certification:
-              selected.identity.certification === "certified" ? "Certified" : "Experimental",
-          },
+          ...(startupTargetId === undefined ? {} : { startupTargetId }),
         });
       }
     } finally {

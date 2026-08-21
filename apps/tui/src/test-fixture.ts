@@ -13,6 +13,7 @@ import {
 import {
   type PresentationArtifactReadBarrier,
   presentationArtifactReadBarrier,
+  presentationHistoryPageSize,
 } from "@adam-agent/agent/internal-testing";
 
 import { type ClipboardAdapter, type DeadlineScheduler, runTui } from "./tui-app.js";
@@ -47,12 +48,21 @@ const lifecycle = createSessionLifecycle({
 try {
   const previewBarrier = previewReadBarrier(options);
   const resumedSessionId =
-    options.scenario === "resume"
+    options.scenario === "resume" || options.scenario === "history"
       ? await lifecycle.create({ targetIdentity }).then(async (created) => {
-          await lifecycle.continue({
-            sessionId: created.sessionId,
-            input: { text: "Resume transcript" },
-          });
+          if (options.scenario === "history") {
+            for (let index = 1; index <= 3; index += 1) {
+              await lifecycle.continue({
+                sessionId: created.sessionId,
+                input: { text: `History prompt ${index}` },
+              });
+            }
+          } else {
+            await lifecycle.continue({
+              sessionId: created.sessionId,
+              input: { text: "Resume transcript" },
+            });
+          }
           return created.sessionId;
         })
       : undefined;
@@ -74,6 +84,7 @@ try {
           sessionId: resumedSessionId,
           stateRoot: options.stateRoot,
           workspaceRoot: options.workspaceRoot,
+          ...(options.scenario === "history" ? { [presentationHistoryPageSize]: 2 } : {}),
           ...(previewBarrier === undefined
             ? {}
             : { [presentationArtifactReadBarrier]: previewBarrier }),
@@ -98,11 +109,13 @@ function parseArguments(arguments_: readonly string[]): {
     | "clipboard-timeout"
     | "clipboard-success"
     | "deadline"
+    | "history"
     | "mutation"
     | "mutation-delayed-preview"
     | "read"
     | "resume"
     | "shell"
+    | "skill-selection"
     | "streaming"
     | "unsafe-output";
   readonly stateRoot: string;
@@ -120,11 +133,13 @@ function parseArguments(arguments_: readonly string[]): {
     scenario !== "clipboard-timeout" &&
     scenario !== "clipboard-success" &&
     scenario !== "deadline" &&
+    scenario !== "history" &&
     scenario !== "mutation" &&
     scenario !== "mutation-delayed-preview" &&
     scenario !== "read" &&
     scenario !== "resume" &&
     scenario !== "shell" &&
+    scenario !== "skill-selection" &&
     scenario !== "streaming" &&
     scenario !== "unsafe-output"
   ) {
@@ -151,11 +166,13 @@ function createFixtureModelTargets(options: {
     | "clipboard-timeout"
     | "clipboard-success"
     | "deadline"
+    | "history"
     | "mutation"
     | "mutation-delayed-preview"
     | "read"
     | "resume"
     | "shell"
+    | "skill-selection"
     | "streaming"
     | "unsafe-output";
 }): ModelTargets | undefined {
@@ -221,6 +238,8 @@ function createFixtureModelTargets(options: {
           request.signal.addEventListener("abort", () => resolve(), { once: true });
         });
         throw request.signal.reason;
+      } else if (options.scenario === "history") {
+        yield { type: "text_delta", text: "History answer." };
       } else if (options.scenario === "resume") {
         yield { type: "text_delta", text: "Previous answer." };
       } else if (options.scenario === "shell") {
@@ -237,6 +256,8 @@ function createFixtureModelTargets(options: {
           return;
         }
         yield { type: "text_delta", text: "Shell card complete." };
+      } else if (options.scenario === "skill-selection") {
+        yield { type: "text_delta", text: "Skill selection complete." };
       } else if (options.scenario === "unsafe-output") {
         yield {
           type: "text_delta",

@@ -342,6 +342,7 @@ export type SessionNamingResult = {
 };
 
 export type ProjectSessionCatalogPage = {
+  readonly projectId: string;
   readonly items: readonly SessionSnapshot[];
   readonly nextCursor: string | null;
 };
@@ -3038,7 +3039,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           .sort();
       } catch (error) {
         if (isNodeError(error) && error.code === "ENOENT") {
-          return { items: [], nextCursor: null };
+          return { projectId, items: [], nextCursor: null };
         }
         throw error;
       }
@@ -3053,6 +3054,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       );
       const lastSessionId = selectedIds.at(-1);
       return {
+        projectId,
         items,
         nextCursor:
           lastSessionId !== undefined && start + selectedIds.length < sessionIds.length

@@ -3,6 +3,23 @@ export type ProjectDisplay = {
   readonly label: string;
 };
 
+export type TargetDisplay = {
+  readonly targetId: string;
+  readonly label: string;
+  readonly route: "direct" | "vercel-ai-gateway";
+  readonly certification: "Certified" | "Experimental";
+  readonly readiness: {
+    readonly status: "available" | "missing";
+    readonly credentialSource: string;
+  };
+};
+
+export type TargetCatalogDisplay = {
+  readonly items: readonly TargetDisplay[];
+  readonly defaultTargetId: string | null;
+  readonly diagnostic: { readonly code: string; readonly message: string } | null;
+};
+
 export type SessionSummary = {
   readonly id: string;
   readonly label: string;
@@ -179,6 +196,127 @@ export type ActiveSessionDisplay = {
   readonly session: SessionSummary;
   readonly transcript: TranscriptPage;
   readonly pendingInteractions: readonly PendingInteraction[];
+  readonly repositoryInstructions: RepositoryInstructionsDisplay | null;
+  readonly skills: SkillCatalogDisplay | null;
+  readonly projectPaths: ProjectPathCatalogDisplay;
+  readonly mcp: McpDisplay | null;
+};
+
+export type McpDisplay = {
+  readonly schemaVersion: 1;
+  readonly status:
+    | "workspace_confirmation_required"
+    | "server_approval_required"
+    | "activation_required"
+    | "activation_failed"
+    | "mcp_shutdown_unconfirmed"
+    | "catalog_stale"
+    | "tool_selection_required"
+    | "profile_committed"
+    | "profile_reactivation_required";
+  readonly workspaceConfirmed: boolean;
+  readonly source: { readonly path: ".mcp.json"; readonly digest: `sha256:${string}` };
+  readonly servers: readonly {
+    readonly serverId: string;
+    readonly status: "approval_required" | "approved" | "ready" | "unsupported";
+    readonly transport: "stdio";
+    readonly command:
+      | { readonly kind: "executable"; readonly path: string }
+      | { readonly kind: "npm_package"; readonly packageName: string; readonly version: string };
+    readonly arguments: readonly string[];
+    readonly cwd: string;
+    readonly requestedEnvironmentNames: readonly string[];
+    readonly startupEffects: readonly ("execute" | "network")[];
+    readonly definitionDigest: `sha256:${string}`;
+  }[];
+  readonly activation: {
+    readonly attempt: number;
+    readonly generationId: string;
+    readonly status: "activating" | "ready" | "failed" | "cancelled";
+  } | null;
+  readonly catalog: {
+    readonly status: "ready" | "stale";
+    readonly digest: `sha256:${string}`;
+    readonly tools: readonly {
+      readonly serverId: string;
+      readonly originalName: string;
+      readonly qualifiedName: string;
+      readonly description: string;
+      readonly rawSchemaDigest: `sha256:${string}`;
+      readonly modelProjectionDigest: `sha256:${string}`;
+      readonly definitionDigest: `sha256:${string}`;
+    }[];
+  } | null;
+  readonly profile: {
+    readonly version: 1;
+    readonly digest: `sha256:${string}`;
+    readonly projectorVersion: 1;
+    readonly tools: readonly {
+      readonly serverId: string;
+      readonly originalName: string;
+      readonly qualifiedName: string;
+      readonly definitionDigest: `sha256:${string}`;
+      readonly rawSchemaDigest: `sha256:${string}`;
+      readonly modelProjectionDigest: `sha256:${string}`;
+      readonly effect: "read" | "write" | "execute" | "network" | "delegate" | "administrative";
+    }[];
+  } | null;
+  readonly diagnostics: readonly { readonly code: string; readonly serverId?: string }[];
+};
+
+export type ProjectPathCatalogDisplay = {
+  readonly items: readonly string[];
+  readonly omittedCount: number;
+  readonly diagnostic: { readonly code: "project_path_catalog_truncated" } | null;
+};
+
+export type SkillCatalogDisplay = {
+  readonly revision: number;
+  readonly items: readonly {
+    readonly qualifiedId: string;
+    readonly name: string;
+    readonly description: string;
+    readonly source:
+      | { readonly type: "project"; readonly scope: string }
+      | { readonly type: "user" }
+      | {
+          readonly type: "extension";
+          readonly extensionId: string;
+          readonly packageName: string;
+          readonly packageVersion: string;
+        };
+    readonly active: boolean;
+  }[];
+  readonly diagnostics: readonly {
+    readonly code: string;
+    readonly source: "project" | "user" | "extension";
+    readonly scope?: string;
+    readonly packagePath: string;
+  }[];
+  readonly overflow: {
+    readonly omittedCount: number;
+    readonly shortenedCount: number;
+  };
+  readonly reloadAvailable: boolean;
+};
+
+export type RepositoryInstructionsDisplay = {
+  readonly revision: number;
+  readonly activeScopes: readonly string[];
+  readonly sources: readonly {
+    readonly scope: string;
+    readonly path: string;
+    readonly selectedName: "AGENTS.md" | "AGENTS.override.md";
+    readonly loadReason: "explicit_reload" | "path_scope_activation" | "root_eager";
+  }[];
+  readonly diagnostics: readonly {
+    readonly code: string;
+    readonly scope?: string;
+    readonly path?: string;
+    readonly candidate?: string;
+  }[];
+  readonly effectiveDigest: string;
+  readonly reloadAvailable: boolean;
 };
 
 export type PendingInteraction = {
@@ -207,6 +345,7 @@ export type AuthoritativePresentationSnapshot = {
     | { readonly status: "repairing"; readonly reason: "open" | "gap" | "reconnect" }
     | { readonly status: "degraded"; readonly fault: PresentationFault };
   readonly project: ProjectDisplay;
+  readonly targets: TargetCatalogDisplay;
   readonly sessions: SessionSummaryPage;
   readonly active: ActiveSessionDisplay | null;
 };
@@ -267,6 +406,10 @@ export type PresentationCommand =
       readonly targetId: string;
     }
   | {
+      readonly type: "set_default_target";
+      readonly targetId: string;
+    }
+  | {
       readonly type: "load_older_transcript";
       readonly before: string;
     }
@@ -291,6 +434,58 @@ export type PresentationCommand =
   | {
       readonly type: "regenerate_session_title";
       readonly sessionId: string;
+    }
+  | {
+      readonly type: "reload_repository_instructions";
+      readonly sessionId: string;
+    }
+  | {
+      readonly type: "reload_skills";
+      readonly sessionId: string;
+    }
+  | {
+      readonly type: "confirm_mcp_workspace";
+      readonly sessionId: string;
+      readonly sourceDigest: `sha256:${string}`;
+    }
+  | {
+      readonly type: "approve_mcp_server";
+      readonly sessionId: string;
+      readonly serverId: string;
+      readonly definitionDigest: `sha256:${string}`;
+    }
+  | {
+      readonly type: "activate_mcp_servers";
+      readonly sessionId: string;
+      readonly servers: readonly {
+        readonly serverId: string;
+        readonly definitionDigest: `sha256:${string}`;
+      }[];
+    }
+  | {
+      readonly type: "commit_mcp_tool_profile";
+      readonly sessionId: string;
+      readonly generationId: string;
+      readonly selections: readonly {
+        readonly qualifiedName: string;
+        readonly definitionDigest: `sha256:${string}`;
+        readonly effect: "read" | "write" | "execute" | "network" | "delegate" | "administrative";
+      }[];
+    }
+  | {
+      readonly type: "retry_mcp_activation";
+      readonly sessionId: string;
+      readonly generationId: string;
+    }
+  | {
+      readonly type: "revalidate_mcp_catalog";
+      readonly sessionId: string;
+      readonly generationId: string;
+    }
+  | {
+      readonly type: "cancel_mcp_configuration";
+      readonly sessionId: string;
+      readonly generationId: string;
     }
   | {
       readonly type: "submit_prompt";
