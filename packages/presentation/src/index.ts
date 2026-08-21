@@ -192,9 +192,35 @@ export type TranscriptPage = {
   readonly olderCursor: string | null;
 };
 
+export type SessionContextDisplay = {
+  readonly profile: {
+    readonly contextWindowTokens: number;
+    readonly maximumOutputTokens: number;
+    readonly compactAtTokens: number;
+    readonly postCompactTargetTokens: number;
+    readonly retainedTargetTokens: number;
+    readonly estimatorVersion: number;
+  };
+  readonly ordinaryUsage: ContextUsageDisplay;
+  readonly compactionUsage: ContextUsageDisplay;
+  readonly active:
+    | { readonly source: "provider_reported" | "estimated"; readonly tokens: number }
+    | { readonly source: "unknown" };
+};
+
+export type ContextUsageDisplay = {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly reasoningTokens: number;
+  readonly cachedInputTokens: number;
+  readonly cacheMissInputTokens: number;
+  readonly unknownCalls: number;
+};
+
 export type ActiveSessionDisplay = {
   readonly session: SessionSummary;
   readonly transcript: TranscriptPage;
+  readonly context: SessionContextDisplay | null;
   readonly pendingInteractions: readonly PendingInteraction[];
   readonly repositoryInstructions: RepositoryInstructionsDisplay | null;
   readonly skills: SkillCatalogDisplay | null;

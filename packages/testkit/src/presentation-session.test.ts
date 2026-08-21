@@ -530,6 +530,7 @@ test("PresentationSession opens a real new session as authoritative empty projec
             },
           },
           transcript: { items: [], olderCursor: null },
+          context: null,
           pendingInteractions: [],
           repositoryInstructions: {
             revision: 1,

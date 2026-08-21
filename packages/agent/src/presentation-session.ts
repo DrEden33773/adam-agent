@@ -263,6 +263,7 @@ export async function createPresentationSession(
           : {
               session: summary,
               transcript: transcriptPage(transcript, loadedTranscriptStart, created.sessionId),
+              context: projectSessionContext(created),
               pendingInteractions: await projectPendingInteractions(records, options),
               repositoryInstructions: projectRepositoryInstructions(created),
               skills: projectSkills(created),
@@ -341,6 +342,7 @@ export async function createPresentationSession(
           active: {
             session: activatedSummary,
             transcript: transcriptPage(transcript, loadedTranscriptStart, snapshot.sessionId),
+            context: projectSessionContext(snapshot),
             pendingInteractions: await projectPendingInteractions(activatedRecords, options),
             repositoryInstructions: projectRepositoryInstructions(snapshot),
             skills: projectSkills(snapshot),
@@ -1464,6 +1466,21 @@ function isKnownArtifact(
       candidate.byteCount === artifact.byteCount &&
       candidate.source === artifact.source,
   );
+}
+
+function projectSessionContext(
+  snapshot: CurrentSessionSnapshot,
+): import("@adam-agent/presentation").SessionContextDisplay | null {
+  const context = snapshot.context;
+  if (context === undefined) {
+    return null;
+  }
+  return {
+    profile: context.profile,
+    ordinaryUsage: context.ordinaryUsage,
+    compactionUsage: context.compactionUsage,
+    active: context.active,
+  };
 }
 
 function boundedHistoryPageSize(value: number | undefined): number {
