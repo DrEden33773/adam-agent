@@ -69,6 +69,7 @@ describe("presentation reconciliation", () => {
       revision: 2,
       authoritative: emptySnapshot,
       transient: {
+        activity: "replying",
         assistant: {
           streamId: "stream-1",
           afterSequence: 0,
