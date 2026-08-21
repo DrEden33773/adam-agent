@@ -46,6 +46,18 @@ export type ModelResponseArtifactSource = {
   readonly provenance: "provider_model_response";
 };
 
+export type ChangePreviewArtifactSource = {
+  readonly type: "change_preview";
+  readonly schemaVersion: 1;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly runId: string;
+  readonly callId: string;
+  readonly toolName: "write_file" | "edit_file";
+  readonly argumentsDigest: string;
+  readonly provenance: "prepared_tool_change";
+};
+
 export type SkillArtifactSource = {
   readonly type: "skill";
   readonly schemaVersion: 1;
@@ -58,6 +70,7 @@ export type SkillArtifactSource = {
 };
 
 export type ArtifactSource =
+  | ChangePreviewArtifactSource
   | ExtensionArtifactSource
   | McpToolResultArtifactSourceV1
   | ModelResponseArtifactSource

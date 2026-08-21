@@ -20,7 +20,6 @@ import {
   type ContextProfile,
   createCodingToolRegistry,
   createPermissionPolicy,
-  createSessionLifecycle,
   type ModelRequest,
   type ModelTargetIdentity,
   type ModelTargets,
@@ -42,7 +41,10 @@ import {
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
-import { FakeModelDriver } from "./index.js";
+import {
+  createSessionLifecycleForTesting as createSessionLifecycle,
+  FakeModelDriver,
+} from "./index.js";
 import {
   createForeignTransitiveNpmRegistryFixture,
   createGatedLocalNpmRegistryFixture,

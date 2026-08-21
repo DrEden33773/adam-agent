@@ -1,4 +1,19 @@
-import type { ModelDriver, ModelEvent, ModelRequest } from "@adam-agent/agent";
+import {
+  createSessionLifecycle,
+  type ModelDriver,
+  type ModelEvent,
+  type ModelRequest,
+  type SessionLifecycle,
+  type SessionLifecycleOptions,
+} from "@adam-agent/agent";
+import { sessionAutomaticTitlesEnabled } from "@adam-agent/agent/internal-testing";
+
+/** Keeps pre-B9 fixtures focused on their original provider/session contract. */
+export function createSessionLifecycleForTesting(
+  options: SessionLifecycleOptions,
+): SessionLifecycle {
+  return createSessionLifecycle({ ...options, [sessionAutomaticTitlesEnabled]: false });
+}
 
 export type FakeModelScript =
   | readonly ModelEvent[]

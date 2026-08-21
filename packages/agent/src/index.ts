@@ -1,7 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { isDeepStrictEqual } from "node:util";
-import type { ArtifactStore, ModelResponseArtifactSource } from "./artifact-store.js";
+import type {
+  ArtifactReference,
+  ArtifactStore,
+  ChangePreviewArtifactSource,
+  ModelResponseArtifactSource,
+} from "./artifact-store.js";
 import { type ContextProfile, resolveOrdinaryMaximumOutputTokens } from "./context-profile.js";
 import {
   type ContextCallUsage,
@@ -49,6 +54,7 @@ import {
   sessionDurableContext,
   sessionDurableOutputLimits,
 } from "./session-durable-context.js";
+import { sessionTitleFallback } from "./session-naming.js";
 import {
   activateSkillContextV1,
   buildSkillResourceManifestV1,
@@ -128,6 +134,10 @@ export {
   type OperationStore,
   OperationStoreError,
 } from "./operation-store.js";
+export {
+  type CreatePresentationSessionOptions,
+  createPresentationSession,
+} from "./presentation-session.js";
 
 import {
   type CanonicalRuntimeEvent,
@@ -158,13 +168,19 @@ export {
   type McpConfigurationResult,
   type McpSessionSnapshot,
   type RepositoryInstructionsReloadResult,
+  type SessionBranchInput,
   type SessionCommand,
   type SessionContextSnapshot,
   type SessionContinueResult,
   type SessionLifecycle,
   SessionLifecycleError,
   type SessionLifecycleOptions,
+  type SessionMetadataEvent,
+  type SessionMetadataListener,
+  type SessionNamingResult,
   type SessionResumeResult,
+  type SessionRuntimeNotification,
+  type SessionRuntimeNotificationListener,
   type SessionSnapshot,
 } from "./session-lifecycle.js";
 export {
@@ -451,6 +467,7 @@ export type RuntimeEvent =
       readonly effect: ToolEffect;
       readonly scope: "call";
       readonly subject: PermissionSubject;
+      readonly changePreviewRef?: ArtifactReference<ChangePreviewArtifactSource> | undefined;
     }
   | {
       readonly type: "tool_permission_decided";
@@ -461,6 +478,7 @@ export type RuntimeEvent =
       readonly effect?: ToolEffect | undefined;
       readonly scope?: "call" | undefined;
       readonly subject?: PermissionSubject | undefined;
+      readonly changePreviewRef?: ArtifactReference<ChangePreviewArtifactSource> | undefined;
     }
   | { readonly type: "tool_started"; readonly callId: string; readonly name: string }
   | {
@@ -488,6 +506,16 @@ export type RuntimeEvent =
 
 export type RuntimeEventListener = (event: RuntimeEvent) => void;
 
+export type RuntimeEventNotification = {
+  readonly notificationId: string;
+  readonly sessionId: string | null;
+  readonly runId: string | null;
+  readonly throughSequence: number;
+  readonly event: RuntimeEvent;
+};
+
+export type RuntimeEventNotificationListener = (notification: RuntimeEventNotification) => void;
+
 class SessionPersistenceError extends Error {}
 
 type AgentSessionBaseDependencies = {
@@ -512,6 +540,8 @@ export type AgentSessionDependencies = AgentSessionBaseDependencies &
 
 export class AgentSession {
   readonly #listeners = new Set<RuntimeEventListener>();
+  readonly #notificationListeners = new Set<RuntimeEventNotificationListener>();
+  #nextNotification = 1;
   readonly #artifactStore: ArtifactStore | undefined;
   readonly #model: ModelDriver;
   readonly #tools: ToolRegistry | undefined;
@@ -631,6 +661,13 @@ export class AgentSession {
     };
   }
 
+  subscribeNotifications(listener: RuntimeEventNotificationListener): () => void {
+    this.#notificationListeners.add(listener);
+    return () => {
+      this.#notificationListeners.delete(listener);
+    };
+  }
+
   abort(): void {
     this.#activeAbortController?.abort();
   }
@@ -688,7 +725,8 @@ export class AgentSession {
       };
     }
     this.#terminalResult = undefined;
-    this.#activeRunId = this.#durableContext?.resume?.runId ?? randomUUID();
+    this.#activeRunId =
+      this.#durableContext?.resume?.runId ?? this.#durableContext?.newRunId ?? randomUUID();
     const abortController = new AbortController();
     const abortFromCaller = () => abortController.abort(options.signal?.reason);
     if (options.signal?.aborted === true) {
@@ -704,17 +742,43 @@ export class AgentSession {
           requestId: `${this.#activeRunId}:skill:${index + 1}`,
         }));
         if (this.#durableContext !== undefined && this.#durableContext.resume === undefined) {
+          const isFirstLogicalRun = !(await this.#store.read()).some(
+            (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
+          );
+          const genesisHasFallback = (await this.#store.read()).some(
+            (record) =>
+              record.schemaVersion === 3 &&
+              record.record.type === "session_genesis" &&
+              record.record.naming !== undefined,
+          );
+          const logicalRunStartedSequence = this.#nextSequence;
           await this.#appendRecord({
             schemaVersion: 3,
-            sequence: this.#nextSequence,
+            sequence: logicalRunStartedSequence,
             record: {
               type: "logical_run_started",
               runId: this.#activeRunId,
               userMessage: input.text,
+              ...(isFirstLogicalRun && !genesisHasFallback
+                ? {
+                    naming: {
+                      profileVersion: 1 as const,
+                      fallbackTitle: sessionTitleFallback(input.text),
+                    },
+                  }
+                : {}),
               ...(explicitSkills.length === 0 ? {} : { skills: explicitSkills }),
               ...(options.limits === undefined ? {} : { limits: options.limits }),
             },
           });
+          const sessionId = this.#durableContext.sessionId;
+          if (sessionId !== undefined) {
+            await this.#durableContext.afterLogicalRunStarted?.({
+              sessionId,
+              runId: this.#activeRunId,
+              sequence: logicalRunStartedSequence,
+            });
+          }
         }
         return await this.#run(input, abortController.signal, options.limits, explicitSkills);
       } catch (error) {
@@ -2169,6 +2233,64 @@ export class AgentSession {
       await this.#appendToolResult(messages, call, repositoryPreflight);
       return undefined;
     }
+    let changePreviewRef: ArtifactReference<ChangePreviewArtifactSource> | undefined;
+    if (preparedCall.changePreview !== undefined) {
+      const runId = this.#activeRunId;
+      const durableContext = this.#durableContext;
+      const previewBytes = Buffer.from(preparedCall.changePreview.text, "utf8");
+      if (
+        this.#artifactStore !== undefined &&
+        durableContext?.projectId !== undefined &&
+        durableContext.sessionId !== undefined &&
+        runId !== undefined
+      ) {
+        if (
+          (call.name !== "write_file" && call.name !== "edit_file") ||
+          previewBytes.byteLength > 64 * 1024
+        ) {
+          const result: ToolResult = {
+            status: "failed",
+            error: {
+              code: "artifact_store_failed",
+              message: "The canonical change preview could not be made durable.",
+            },
+          };
+          toolResultsById.set(call.id, { call, result });
+          await this.#appendToolResult(messages, call, result);
+          return undefined;
+        }
+        try {
+          changePreviewRef = await this.#artifactStore.write<ChangePreviewArtifactSource>({
+            bytes: previewBytes,
+            mediaType: "text/x-diff; charset=utf-8",
+            source: {
+              type: "change_preview",
+              schemaVersion: 1,
+              projectId: durableContext.projectId,
+              sessionId: durableContext.sessionId,
+              runId,
+              callId: call.id,
+              toolName: call.name,
+              argumentsDigest: `sha256:${createHash("sha256")
+                .update(call.argumentsJson, "utf8")
+                .digest("hex")}`,
+              provenance: "prepared_tool_change",
+            },
+          });
+        } catch {
+          const result: ToolResult = {
+            status: "failed",
+            error: {
+              code: "artifact_store_failed",
+              message: "The canonical change preview could not be made durable.",
+            },
+          };
+          toolResultsById.set(call.id, { call, result });
+          await this.#appendToolResult(messages, call, result);
+          return undefined;
+        }
+      }
+    }
     const permissionInput: PermissionPolicyInput = {
       callId: call.id,
       name: call.name,
@@ -2195,7 +2317,12 @@ export class AgentSession {
       const requestId = `${runId}:${call.id}`;
       const pendingDecision = this.#createPendingPermissionDecision(requestId, signal);
       try {
-        await this.#emit({ type: "tool_permission_requested", requestId, ...permissionInput });
+        await this.#emit({
+          type: "tool_permission_requested",
+          requestId,
+          ...permissionInput,
+          ...(changePreviewRef === undefined ? {} : { changePreviewRef }),
+        });
         const userDecision = await pendingDecision.promise;
         if (userDecision === undefined) {
           return this.#settleCancelled();
@@ -2206,13 +2333,19 @@ export class AgentSession {
           requestId,
           decision,
           ...permissionInput,
+          ...(changePreviewRef === undefined ? {} : { changePreviewRef }),
         });
       } finally {
         pendingDecision.cancel();
       }
     } else {
       decision = policyDecision;
-      await this.#emit({ type: "tool_permission_decided", decision, ...permissionInput });
+      await this.#emit({
+        type: "tool_permission_decided",
+        decision,
+        ...permissionInput,
+        ...(changePreviewRef === undefined ? {} : { changePreviewRef }),
+      });
     }
     if (signal.aborted) {
       return this.#settleCancelled();
@@ -3189,14 +3322,23 @@ export class AgentSession {
         throw new SessionPersistenceError();
       }
     }
-    for (const listener of this.#listeners) {
-      listener(event);
-    }
+    this.#publish(event);
   }
 
   #publish(event: RuntimeEvent): void {
     for (const listener of this.#listeners) {
       listener(event);
+    }
+    const notification: RuntimeEventNotification = {
+      notificationId: `${this.#activeRunId ?? "idle"}:${this.#nextNotification}`,
+      sessionId: this.#durableContext?.sessionId ?? null,
+      runId: this.#activeRunId ?? null,
+      throughSequence: Math.max(0, this.#nextSequence - 1),
+      event,
+    };
+    this.#nextNotification += 1;
+    for (const listener of this.#notificationListeners) {
+      listener(notification);
     }
   }
 

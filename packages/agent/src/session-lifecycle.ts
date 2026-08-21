@@ -1,10 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import { realpath } from "node:fs/promises";
+import { readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
-import { type ArtifactStore, createFileArtifactStore, readFileArtifact } from "./artifact-store.js";
+import {
+  type ArtifactReference,
+  type ArtifactStore,
+  type ChangePreviewArtifactSource,
+  createFileArtifactStore,
+  readFileArtifact,
+} from "./artifact-store.js";
 import { type ContextProfile, isContextProfileSupported } from "./context-profile.js";
 import {
   type ContextEvidenceV1,
@@ -34,6 +40,7 @@ import {
   type RunResult,
   type RuntimeEvent,
   type RuntimeEventListener,
+  type RuntimeEventNotification,
   type UserInput,
 } from "./index.js";
 import {
@@ -97,6 +104,7 @@ import {
   sessionDurableContext,
   sessionDurableOutputLimits,
 } from "./session-durable-context.js";
+import { normalizedSessionTitle, sessionTitleFallback } from "./session-naming.js";
 import {
   createJsonlSessionStore,
   openJsonlSessionStore,
@@ -130,6 +138,7 @@ import {
   skillContextSnapshot,
 } from "./skills.js";
 import {
+  canonicalChangePreviewForToolCall,
   createCodingToolRegistry,
   type PermissionPolicy,
   type ToolEffect,
@@ -155,11 +164,7 @@ export type CurrentSessionSnapshot = {
     readonly field: "reasoning" | "text";
     readonly responseSequence: number;
   };
-  readonly lineage?: {
-    readonly parentSessionId: string;
-    readonly parentEventPosition: number;
-    readonly prefixDigest: string;
-  };
+  readonly lineage?: SessionGenesisRecord["record"]["lineage"];
   readonly run?: {
     readonly runId: string;
     readonly status: "interrupted" | "settled";
@@ -270,6 +275,38 @@ export type McpCatalogStaleDurableBarrier = {
   }): void;
 };
 
+/** Tests only. Production title deadlines use the Node timer scheduler below. */
+export const sessionTitleDeadlineScheduler = Symbol("adam-agent.session-title-deadline-scheduler");
+
+export type SessionTitleDeadlineScheduler = {
+  schedule(delayMilliseconds: number, onDeadline: () => void): { cancel(): void };
+};
+
+/** Tests only. Production runs have no post-fsync crash-observation barrier. */
+export const sessionLogicalRunStartedBarrier = Symbol(
+  "adam-agent.session-logical-run-started-barrier",
+);
+
+export type SessionLogicalRunStartedBarrier = {
+  afterDurableRecord(input: {
+    readonly sessionId: string;
+    readonly runId: string;
+    readonly sequence: number;
+  }): Promise<void>;
+};
+
+/** Tests only. Production lifecycle instances always default automatic titles on. */
+export const sessionAutomaticTitlesEnabled = Symbol("adam-agent.session-automatic-titles-enabled");
+
+/** Tests only. Production publishes each exact runtime notification once. */
+export const sessionRuntimeNotificationTransform = Symbol(
+  "adam-agent.session-runtime-notification-transform",
+);
+
+export type SessionRuntimeNotificationTransform = {
+  project(notification: SessionRuntimeNotification): readonly SessionRuntimeNotification[];
+};
+
 export type SessionLifecycleOptions = {
   readonly extensionHost?: ExtensionHost;
   readonly modelTargets?: ModelTargets;
@@ -288,12 +325,41 @@ export type SessionLifecycleOptions = {
   readonly [mcpCatalogStaleObservationBarrier]?: McpCatalogStaleObservationBarrier;
   readonly [mcpCatalogStaleDurableBarrier]?: McpCatalogStaleDurableBarrier;
   readonly [mcpCloseConfirmation]?: McpCloseConfirmation;
+  readonly [sessionTitleDeadlineScheduler]?: SessionTitleDeadlineScheduler;
+  readonly [sessionLogicalRunStartedBarrier]?: SessionLogicalRunStartedBarrier;
+  readonly [sessionAutomaticTitlesEnabled]?: boolean;
+  readonly [sessionRuntimeNotificationTransform]?: SessionRuntimeNotificationTransform;
 };
 
 export type SessionContinueResult = {
   readonly result: RunResult;
   readonly snapshot: CurrentSessionSnapshot;
 };
+
+export type SessionNamingResult = {
+  readonly status: "updated";
+  readonly snapshot: CurrentSessionSnapshot;
+};
+
+export type ProjectSessionCatalogPage = {
+  readonly items: readonly SessionSnapshot[];
+  readonly nextCursor: string | null;
+};
+
+export type SessionMetadataEvent = {
+  readonly type: "session_naming_changed";
+  readonly sessionId: string;
+  readonly throughSequence: number;
+};
+
+export type SessionMetadataListener = (event: SessionMetadataEvent) => void | Promise<void>;
+
+export type SessionRuntimeNotification = RuntimeEventNotification & {
+  readonly sessionId: string;
+  readonly runId: string;
+};
+
+export type SessionRuntimeNotificationListener = (notification: SessionRuntimeNotification) => void;
 
 export type RepositoryInstructionsReloadResult =
   | {
@@ -375,6 +441,20 @@ export type McpCloseResult = {
   readonly status: "closed" | "mcp_shutdown_unconfirmed";
 };
 
+export type SessionBranchInput = {
+  readonly parentSessionId: string;
+  readonly targetId?: string;
+} & (
+  | { readonly atSequence: number; readonly sourceBoundary?: never }
+  | {
+      readonly atSequence?: never;
+      readonly sourceBoundary: {
+        readonly sessionId: string;
+        readonly sequence: number;
+      };
+    }
+);
+
 export type SessionCommand =
   | { readonly type: "create"; readonly targetIdentity: ModelTargetIdentity }
   | { readonly type: "resume"; readonly sessionId: string }
@@ -383,41 +463,50 @@ export type SessionCommand =
       readonly sessionId: string;
       readonly input?: UserInput;
       readonly limits?: RunOptions["limits"];
+      readonly runId?: string;
       readonly signal?: AbortSignal;
     }
-  | {
+  | ({
       readonly type: "branch";
-      readonly parentSessionId: string;
-      readonly atSequence: number;
-      readonly targetId?: string;
-    }
+    } & SessionBranchInput)
   | { readonly type: "reload_repository_instructions"; readonly sessionId: string }
   | { readonly type: "reload_skills"; readonly sessionId: string }
   | McpConfigurationCommand;
 
 export interface SessionLifecycle {
-  branch(input: {
-    readonly parentSessionId: string;
-    readonly atSequence: number;
-    readonly targetId?: string;
-  }): Promise<CurrentSessionSnapshot>;
+  branch(input: SessionBranchInput): Promise<CurrentSessionSnapshot>;
   close(): Promise<McpCloseResult>;
   continue(input: {
     readonly sessionId: string;
     readonly input?: UserInput;
     readonly limits?: RunOptions["limits"];
+    readonly runId?: string;
     readonly signal?: AbortSignal;
   }): Promise<SessionContinueResult>;
   configureMcp(command: McpConfigurationCommand): Promise<McpConfigurationResult>;
   create(input: { readonly targetIdentity: ModelTargetIdentity }): Promise<CurrentSessionSnapshot>;
   decidePermission(command: PermissionDecisionCommand): PermissionDecisionCommandResult;
+  enableAutomaticTitles(): void;
+  ensureAutomaticTitle(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
   inspect(input: { readonly sessionId: string }): Promise<SessionSnapshot>;
+  listProjectSessions(input?: {
+    readonly cursor?: string;
+    readonly limit?: number;
+  }): Promise<ProjectSessionCatalogPage>;
   reloadRepositoryInstructions(input: {
     readonly sessionId: string;
   }): Promise<RepositoryInstructionsReloadResult>;
   reloadSkills(input: { readonly sessionId: string }): Promise<SkillsReloadResult>;
+  regenerateSessionTitle(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
   resume(input: { readonly sessionId: string }): Promise<SessionResumeResult>;
+  clearSessionManualName(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
+  setSessionManualName(input: {
+    readonly sessionId: string;
+    readonly name: string;
+  }): Promise<SessionNamingResult>;
   subscribe(listener: RuntimeEventListener): () => void;
+  subscribeSessionEvents(listener: SessionRuntimeNotificationListener): () => void;
+  subscribeMetadata(listener: SessionMetadataListener): () => void;
 }
 
 export class SessionLifecycleError extends Error {
@@ -447,11 +536,44 @@ export class SessionLifecycleError extends Error {
   }
 }
 
+function encodeProjectSessionCatalogCursor(sessionId: string): string {
+  return `project-sessions:v1:${Buffer.from(sessionId, "utf8").toString("base64url")}`;
+}
+
+function decodeProjectSessionCatalogCursor(cursor: string | undefined): string | undefined {
+  if (cursor === undefined) {
+    return undefined;
+  }
+  const prefix = "project-sessions:v1:";
+  if (!cursor.startsWith(prefix)) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  const sessionId = Buffer.from(cursor.slice(prefix.length), "base64url").toString("utf8");
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(sessionId)
+  ) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return sessionId;
+}
+
+function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+  return error instanceof Error && "code" in error;
+}
+
 const nodeMcpIdleScheduler: McpIdleScheduler = {
   schedule(delayMilliseconds, task) {
     const timer = setTimeout(() => {
       void task().catch(() => undefined);
     }, delayMilliseconds);
+    timer.unref();
+    return { cancel: () => clearTimeout(timer) };
+  },
+};
+
+const nodeSessionTitleDeadlineScheduler: SessionTitleDeadlineScheduler = {
+  schedule(delayMilliseconds, onDeadline) {
+    const timer = setTimeout(onDeadline, delayMilliseconds);
     timer.unref();
     return { cancel: () => clearTimeout(timer) };
   },
@@ -470,12 +592,22 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }),
   };
   const listeners = new Set<RuntimeEventListener>();
+  const sessionEventListeners = new Set<SessionRuntimeNotificationListener>();
+  const metadataListeners = new Set<SessionMetadataListener>();
   let activeSession: AgentSession | undefined;
   let activeSessionSettlement: Promise<void> | undefined;
   let lifecycleClosing = false;
+  let automaticTitlesEnabled = options[sessionAutomaticTitlesEnabled] ?? true;
   let lifecycleClosePromise: Promise<McpCloseResult> | undefined;
   const pendingMcpCatalogDurability = new Map<string, Promise<void>>();
   let scheduleMcpCatalogFlush = (_sessionId: string) => {};
+  const publishMetadata = async (event: SessionMetadataEvent): Promise<void> => {
+    for (const listener of metadataListeners) {
+      void Promise.resolve()
+        .then(() => listener(event))
+        .catch(() => undefined);
+    }
+  };
   const owner = createProjectLifecycleOwner(options);
   const pendingMcpCatalogChanges = new Map<
     string,
@@ -554,21 +686,320 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
     });
   };
-  const runWithOwner = async <T>(operation: () => Promise<T>): Promise<T> => {
+  let trackedOwnerOperation:
+    | { readonly kind: "ordinary" | "title"; readonly settlement: Promise<void> }
+    | undefined;
+  const executeWithOwner = async <T>(
+    kind: "ordinary" | "title",
+    operation: () => Promise<T>,
+  ): Promise<T> => {
+    const active = trackedOwnerOperation;
+    if (active !== undefined && (kind === "title" || active.kind === "title")) {
+      await active.settlement;
+    }
+    const operationPromise = owner.run(operation);
+    let trackedSettlement: Promise<void> | undefined;
+    if (trackedOwnerOperation === undefined) {
+      trackedSettlement = operationPromise.then(
+        () => undefined,
+        () => undefined,
+      );
+      trackedOwnerOperation = { kind, settlement: trackedSettlement };
+    }
     try {
-      return await owner.run(operation);
+      return await operationPromise;
     } catch (error) {
       if (error instanceof ProjectLifecycleOwnerError) {
         throw new SessionLifecycleError(error.code);
       }
       throw error;
+    } finally {
+      if (trackedOwnerOperation?.settlement === trackedSettlement) {
+        trackedOwnerOperation = undefined;
+      }
     }
   };
+  const runWithOwner = <T>(operation: () => Promise<T>): Promise<T> =>
+    executeWithOwner("ordinary", operation);
+  const runTitleWithOwner = <T>(operation: () => Promise<T>): Promise<T> =>
+    executeWithOwner("title", operation);
   const withOwner = async <T>(operation: () => Promise<T>): Promise<T> => {
     if (lifecycleClosing) {
       throw new SessionLifecycleError("session_invalid");
     }
     return runWithOwner(operation);
+  };
+  const titleOperations = new Set<Promise<void>>();
+  const activeTitleSessions = new Set<string>();
+  const commitTitleFailure = async (
+    input: { readonly sessionId: string; readonly generationId: string },
+    reason: "model_request_failed" | "invalid_title",
+  ): Promise<void> => {
+    await runTitleWithOwner(async () => {
+      const records = await readJsonlSessionRecords({
+        workspaceRoot: options.workspaceRoot,
+        sessionId: input.sessionId,
+        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+      });
+      if (
+        records.some(
+          (entry) =>
+            entry.schemaVersion === 3 &&
+            (entry.record.type === "session_title_generation_completed" ||
+              entry.record.type === "session_title_generation_failed") &&
+            entry.record.generationId === input.generationId,
+        )
+      ) {
+        return;
+      }
+      const store = await openJsonlSessionStore<SessionRecord>({
+        workspaceRoot: options.workspaceRoot,
+        sessionId: input.sessionId,
+        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+      });
+      const sequence = (records.at(-1)?.sequence ?? 0) + 1;
+      await store.append({
+        schemaVersion: 3,
+        sequence,
+        record: {
+          type: "session_title_generation_failed",
+          recordVersion: 1,
+          generationId: input.generationId,
+          reason,
+        },
+      });
+      await publishMetadata({
+        type: "session_naming_changed",
+        sessionId: input.sessionId,
+        throughSequence: sequence,
+      });
+    });
+  };
+  const settleTitleGeneration = async (input: {
+    readonly sessionId: string;
+    readonly generationId: string;
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly userMessage: string;
+  }): Promise<void> => {
+    const deadlineController = new AbortController();
+    const deadline = (
+      options[sessionTitleDeadlineScheduler] ?? nodeSessionTitleDeadlineScheduler
+    ).schedule(30_000, () => deadlineController.abort(new Error("Title generation deadline.")));
+    try {
+      if (options.modelTargets === undefined) {
+        await commitTitleFailure(input, "model_request_failed");
+        return;
+      }
+      const signal = deadlineController.signal;
+      const resolved = await options.modelTargets.resolve({
+        targetId: input.targetIdentity.targetId,
+        targetIdentity: input.targetIdentity,
+        allowExperimental: input.targetIdentity.certification === "experimental",
+        signal,
+      });
+      let text = "";
+      let finish: "stop" | undefined;
+      let usage:
+        | { readonly status: "unknown" }
+        | {
+            readonly status: "known";
+            readonly inputTokens: number;
+            readonly outputTokens: number;
+          } = {
+        status: "unknown",
+      };
+      for await (const event of resolved.driver.stream({
+        messages: [
+          {
+            role: "system",
+            content:
+              "Generate one concise plain-text title for this coding session. Return only the title.",
+          },
+          { role: "user", content: boundedTitleInput(input.userMessage) },
+        ],
+        tools: [],
+        maximumOutputTokens: 64,
+        signal,
+      })) {
+        if (event.type === "text_delta") {
+          text += event.text;
+          if (Buffer.byteLength(text, "utf8") > 16 * 1024) {
+            await commitTitleFailure(input, "invalid_title");
+            return;
+          }
+        } else if (event.type === "usage") {
+          usage = {
+            status: "known",
+            inputTokens: event.inputTokens,
+            outputTokens: event.outputTokens,
+          };
+        } else if (event.type === "finish") {
+          finish = event.reason === "stop" ? "stop" : undefined;
+        } else if (event.type.startsWith("tool_call_")) {
+          await commitTitleFailure(input, "invalid_title");
+          return;
+        }
+      }
+      const title = normalizedSessionTitle(text);
+      if (finish !== "stop" || title === null) {
+        await commitTitleFailure(input, "invalid_title");
+        return;
+      }
+      await runTitleWithOwner(async () => {
+        const records = await readJsonlSessionRecords({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        const latestGeneration = records.findLast(
+          (entry) =>
+            entry.schemaVersion === 3 && entry.record.type === "session_title_generation_started",
+        );
+        if (
+          latestGeneration?.schemaVersion !== 3 ||
+          latestGeneration.record.type !== "session_title_generation_started" ||
+          latestGeneration.record.generationId !== input.generationId ||
+          records.some(
+            (entry) =>
+              entry.schemaVersion === 3 &&
+              (entry.record.type === "session_title_generation_completed" ||
+                entry.record.type === "session_title_generation_failed") &&
+              entry.record.generationId === input.generationId,
+          )
+        ) {
+          return;
+        }
+        const store = await openJsonlSessionStore<SessionRecord>({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        const sequence = (records.at(-1)?.sequence ?? 0) + 1;
+        await store.append({
+          schemaVersion: 3,
+          sequence,
+          record: {
+            type: "session_title_generation_completed",
+            recordVersion: 1,
+            generationId: input.generationId,
+            title,
+            usage,
+          },
+        });
+        await publishMetadata({
+          type: "session_naming_changed",
+          sessionId: input.sessionId,
+          throughSequence: sequence,
+        });
+      });
+    } catch {
+      try {
+        await commitTitleFailure(input, "model_request_failed");
+      } catch {
+        // Automatic naming metadata never changes the ordinary turn result.
+      }
+    } finally {
+      deadline.cancel();
+    }
+  };
+  const startAutomaticTitle = async (
+    sessionId: string,
+    sessionSnapshot: CurrentSessionSnapshot,
+    eligible: boolean,
+  ): Promise<CurrentSessionSnapshot | undefined> => {
+    if (!automaticTitlesEnabled || !eligible) {
+      return undefined;
+    }
+    try {
+      return await withOwner(async () => {
+        const records = await readJsonlSessionRecords({
+          workspaceRoot: options.workspaceRoot,
+          sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        if (
+          records.some(
+            (entry) =>
+              entry.schemaVersion === 3 &&
+              (entry.record.type === "session_title_generation_started" ||
+                entry.record.type === "session_title_generation_skipped_manual"),
+          )
+        ) {
+          return;
+        }
+        const store = await openJsonlSessionStore<SessionRecord>({
+          workspaceRoot: options.workspaceRoot,
+          sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        let manualNameActive = false;
+        for (const entry of records) {
+          if (entry.schemaVersion !== 3) {
+            continue;
+          }
+          if (entry.record.type === "session_manual_name_set") {
+            manualNameActive = true;
+          } else if (entry.record.type === "session_manual_name_cleared") {
+            manualNameActive = false;
+          }
+        }
+        if (manualNameActive) {
+          const sequence = (records.at(-1)?.sequence ?? 0) + 1;
+          await store.append({
+            schemaVersion: 3,
+            sequence,
+            record: { type: "session_title_generation_skipped_manual", recordVersion: 1 },
+          });
+          await publishMetadata({
+            type: "session_naming_changed",
+            sessionId,
+            throughSequence: sequence,
+          });
+          const snapshot = await inspectSession({ sessionId });
+          return snapshot.schemaVersion === 3 ? snapshot : undefined;
+        }
+        const generationId = randomUUID();
+        const sequence = (records.at(-1)?.sequence ?? 0) + 1;
+        await store.append({
+          schemaVersion: 3,
+          sequence,
+          record: {
+            type: "session_title_generation_started",
+            recordVersion: 1,
+            generationId,
+            reason: "automatic",
+            targetIdentity: sessionSnapshot.targetIdentity,
+          },
+        });
+        await publishMetadata({
+          type: "session_naming_changed",
+          sessionId,
+          throughSequence: sequence,
+        });
+        const firstRun = records.find(
+          (entry) => entry.schemaVersion === 3 && entry.record.type === "logical_run_started",
+        );
+        if (firstRun?.schemaVersion === 3 && firstRun.record.type === "logical_run_started") {
+          const operation = settleTitleGeneration({
+            sessionId,
+            generationId,
+            targetIdentity: sessionSnapshot.targetIdentity,
+            userMessage: firstRun.record.userMessage,
+          });
+          titleOperations.add(operation);
+          activeTitleSessions.add(sessionId);
+          void operation.finally(() => {
+            titleOperations.delete(operation);
+            activeTitleSessions.delete(sessionId);
+          });
+        }
+        const snapshot = await inspectSession({ sessionId });
+        return snapshot.schemaVersion === 3 ? snapshot : undefined;
+      });
+    } catch {
+      // Automatic naming metadata never changes the ordinary turn result.
+      return undefined;
+    }
   };
   const flushPendingMcpCatalogChanges = async (sessionId: string): Promise<void> => {
     const changes = [...pendingMcpCatalogChanges.entries()]
@@ -797,7 +1228,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     if (first.record.projectId !== projectId) {
       throw new SessionLifecycleError("session_project_mismatch");
     }
-    validateCurrentSessionHistory(first, records);
+    validateCurrentSessionHistory(first, records, options.workspaceRoot);
     await validateSessionLineage(options, first, new Set([input.sessionId]));
     await validateMcpAuthorityFromLineage(options, first, records);
     await skillResourceBytesFromLineage(options, first, records);
@@ -1033,7 +1464,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     async branch(input) {
       return withOwner(async () => {
         const artifactCache = createArtifactMaterializationCache();
-        if (!Number.isSafeInteger(input.atSequence) || input.atSequence <= 0) {
+        const requestedPosition = input.sourceBoundary?.sequence ?? input.atSequence;
+        if (
+          requestedPosition === undefined ||
+          !Number.isSafeInteger(requestedPosition) ||
+          requestedPosition <= 0
+        ) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
         }
         let parent = await inspectSession({ sessionId: input.parentSessionId }, artifactCache);
@@ -1048,7 +1484,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           sessionId: input.parentSessionId,
           ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
         });
-        const requestedCurrentTail = input.atSequence === parentRecords.length;
+        const requestedCurrentTail =
+          input.sourceBoundary === undefined && input.atSequence === parentRecords.length;
         let normalizedCurrentTail = false;
         if (parent.status === "interrupted" && requestedCurrentTail) {
           const restoredUserMessage = await appendMissingUserMessage(options, parent);
@@ -1106,17 +1543,44 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             });
           }
         }
-        const parentEventPosition =
-          requestedCurrentTail && normalizedCurrentTail ? parentRecords.length : input.atSequence;
-        if (parentEventPosition > parentRecords.length) {
+        const sourceSessionId = input.sourceBoundary?.sessionId ?? input.parentSessionId;
+        const sourceEventPosition =
+          input.sourceBoundary === undefined
+            ? requestedCurrentTail && normalizedCurrentTail
+              ? parentRecords.length
+              : input.atSequence
+            : input.sourceBoundary.sequence;
+        const parentGenesisRecord = parentRecords[0];
+        if (
+          parentGenesisRecord === undefined ||
+          !isGenesisRecord(parentGenesisRecord) ||
+          !(await sessionInheritsSourceBoundary(
+            options,
+            parentGenesisRecord,
+            sourceSessionId,
+            sourceEventPosition,
+            new Set(),
+          ))
+        ) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
         }
-        const parentPrefix = parentRecords.slice(0, parentEventPosition);
+        const sourceRecords =
+          sourceSessionId === input.parentSessionId
+            ? parentRecords
+            : await readJsonlSessionRecords({
+                workspaceRoot: options.workspaceRoot,
+                sessionId: sourceSessionId,
+                ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+              });
+        if (sourceEventPosition > sourceRecords.length) {
+          throw new SessionLifecycleError("session_branch_boundary_invalid");
+        }
+        const parentPrefix = sourceRecords.slice(0, sourceEventPosition);
         const parentGenesis = parentPrefix[0];
         if (parentGenesis === undefined || !isGenesisRecord(parentGenesis)) {
           throw new SessionLifecycleError("session_invalid");
         }
-        validateCurrentSessionHistory(parentGenesis, parentPrefix);
+        validateCurrentSessionHistory(parentGenesis, parentPrefix, options.workspaceRoot);
         await validateMcpAuthorityFromLineage(options, parentGenesis, parentPrefix);
         await replayArtifactBytesFromLineage(options, parentGenesis, parentPrefix, artifactCache);
         if (!isCompleteBranchBoundary(parentPrefix)) {
@@ -1157,6 +1621,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
         });
         const prefix = `${parentPrefix.map((record) => JSON.stringify(record)).join("\n")}\n`;
+        const branchFallback = sessionTitleFallback(
+          `Branch of ${sessionDisplayLabelFromRecords(parentRecords)}`,
+        );
         const genesis: SessionGenesisRecord = {
           schemaVersion: 3,
           sequence: 1,
@@ -1165,13 +1632,25 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             sessionId,
             projectId: parent.projectId,
             targetIdentity,
+            naming: { profileVersion: 1, fallbackTitle: branchFallback },
             ...(parentPromptContext === undefined ? {} : { promptContext: parentPromptContext }),
             ...(parentSkillContext === undefined ? {} : { skillContext: parentSkillContext }),
-            lineage: {
-              parentSessionId: input.parentSessionId,
-              parentEventPosition,
-              prefixDigest: `sha256:${createHash("sha256").update(prefix).digest("hex")}`,
-            },
+            lineage:
+              input.sourceBoundary === undefined
+                ? {
+                    parentSessionId: input.parentSessionId,
+                    parentEventPosition: sourceEventPosition,
+                    prefixDigest: `sha256:${createHash("sha256").update(prefix).digest("hex")}`,
+                  }
+                : {
+                    recordVersion: 2,
+                    parentSessionId: input.parentSessionId,
+                    sourceSessionId,
+                    sourceEventPosition,
+                    sourcePrefixDigest: `sha256:${createHash("sha256")
+                      .update(prefix)
+                      .digest("hex")}`,
+                  },
           },
         };
         await store.append(genesis);
@@ -1235,6 +1714,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       activeSession?.abort();
       lifecycleClosePromise = (async (): Promise<McpCloseResult> => {
         await runningSession;
+        await Promise.allSettled(titleOperations);
         await Promise.allSettled(pendingMcpCatalogDurability.values());
         for (const timer of mcpIdleTimers.values()) {
           timer.cancel();
@@ -1403,9 +1883,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       });
     },
     async continue(input) {
+      if (input.runId !== undefined && !z.uuid().safeParse(input.runId).success) {
+        throw new SessionLifecycleError("session_invalid");
+      }
       disarmMcpIdle(input.sessionId);
       await waitForMcpIdleOperation(input.sessionId);
-      return withOwner(async () => {
+      const continued = await withOwner(async () => {
         const artifactCache = createArtifactMaterializationCache();
         const resumed = await resumeSession({ sessionId: input.sessionId }, artifactCache);
         if (resumed.status === "rejected") {
@@ -1707,6 +2190,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           resumed.snapshot.status === "interrupted"
             ? createAgentResumeState(replayRecords, options, resumed.snapshot)
             : undefined;
+        if (
+          input.runId !== undefined &&
+          (input.input === undefined ||
+            resumeState !== undefined ||
+            replayRecords.some(
+              (record) =>
+                record.schemaVersion === 3 &&
+                "runId" in record.record &&
+                record.record.runId === input.runId,
+            ))
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
         const ownMessages =
           resumeState === undefined ? modelMessagesFromCompleteRecords(replayRecords) : [];
         const initialMessages = replayRecords.some(
@@ -1745,6 +2241,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           [sessionDurableContext]: {
             ...(initialMessages.length === 0 ? {} : { hasInheritedMessages: true }),
             nextSequence: (replayRecords.at(-1)?.sequence ?? resumed.snapshot.lastSequence) + 1,
+            ...(input.runId === undefined ? {} : { newRunId: input.runId }),
             projectId: resumed.snapshot.projectId,
             referencedModelResponseArtifactBytes,
             skillResourceLineageBytes,
@@ -1760,6 +2257,17 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               ? {}
               : { repositoryWorkspaceRoot: options.workspaceRoot }),
             sessionId: resumed.snapshot.sessionId,
+            ...(options[sessionLogicalRunStartedBarrier] === undefined
+              ? {}
+              : {
+                  afterLogicalRunStarted: (started: {
+                    readonly sessionId: string;
+                    readonly runId: string;
+                    readonly sequence: number;
+                  }) =>
+                    options[sessionLogicalRunStartedBarrier]?.afterDurableRecord(started) ??
+                    Promise.resolve(),
+                }),
             targetIdentity: resumed.snapshot.targetIdentity,
             ...(activePromptContext === undefined ? {} : { promptContext: activePromptContext }),
             ...(activeSkillContext === undefined ? {} : { skillContext: activeSkillContext }),
@@ -1821,6 +2329,24 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             listener(event);
           }
         });
+        const unsubscribeNotifications = session.subscribeNotifications((notification) => {
+          if (notification.sessionId === null || notification.runId === null) {
+            return;
+          }
+          const sessionNotification: SessionRuntimeNotification = {
+            ...notification,
+            sessionId: notification.sessionId,
+            runId: notification.runId,
+          };
+          const projected = options[sessionRuntimeNotificationTransform]?.project(
+            sessionNotification,
+          ) ?? [sessionNotification];
+          for (const notification of projected) {
+            for (const listener of sessionEventListeners) {
+              listener(notification);
+            }
+          }
+        });
         activeSession = session;
         activeSessionSettlement = sessionSettlement;
         try {
@@ -1847,12 +2373,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             activeSessionSettlement = undefined;
           }
           unsubscribe();
+          unsubscribeNotifications();
           const live = mcpHost.snapshot(input.sessionId);
           if (live?.profile !== undefined) {
             armMcpIdle(input.sessionId, live.activation.generationId);
           }
         }
       });
+      const titleSnapshot = await startAutomaticTitle(
+        input.sessionId,
+        continued.snapshot,
+        continued.result.status === "completed" && continued.result.answer.length > 0,
+      );
+      return titleSnapshot === undefined ? continued : { ...continued, snapshot: titleSnapshot };
     },
     async configureMcp(command) {
       if (activeSession !== undefined) {
@@ -2448,6 +2981,28 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         }
       );
     },
+    enableAutomaticTitles() {
+      if (!lifecycleClosing) {
+        automaticTitlesEnabled = true;
+      }
+    },
+    async ensureAutomaticTitle(input) {
+      const snapshot = await inspectSession(input);
+      if (snapshot.schemaVersion !== 3) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const records = await readJsonlSessionRecords({
+        workspaceRoot: options.workspaceRoot,
+        sessionId: input.sessionId,
+        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+      });
+      const titleSnapshot = await startAutomaticTitle(
+        input.sessionId,
+        snapshot,
+        hasSuccessfullySettledAssistant(records),
+      );
+      return { status: "updated", snapshot: titleSnapshot ?? snapshot };
+    },
     async inspect(input) {
       await waitForMcpIdleOperation(input.sessionId);
       if (activeSession === undefined) {
@@ -2461,6 +3016,49 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         }
       }
       return inspectSession(input);
+    },
+    async listProjectSessions(input = {}) {
+      const limit = input.limit ?? 100;
+      if (!Number.isSafeInteger(limit) || limit <= 0 || limit > 100) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const afterSessionId = decodeProjectSessionCatalogCursor(input.cursor);
+      const projectId = await canonicalProjectId(options.workspaceRoot);
+      const sessionsDirectory = join(
+        effectiveSessionStateRoot(options.stateRoot),
+        "projects",
+        projectId.replace(/^sha256:/u, ""),
+        "sessions",
+      );
+      let sessionIds: string[];
+      try {
+        sessionIds = (await readdir(sessionsDirectory, { withFileTypes: true }))
+          .filter((entry) => entry.isFile() && /^[0-9a-f-]{36}\.jsonl$/u.test(entry.name))
+          .map((entry) => entry.name.slice(0, -".jsonl".length))
+          .sort();
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") {
+          return { items: [], nextCursor: null };
+        }
+        throw error;
+      }
+      const afterIndex =
+        afterSessionId === undefined
+          ? 0
+          : sessionIds.findIndex((sessionId) => sessionId > afterSessionId);
+      const start = afterIndex < 0 ? sessionIds.length : afterIndex;
+      const selectedIds = sessionIds.slice(start, start + limit);
+      const items = await Promise.all(
+        selectedIds.map((sessionId) => inspectSession({ sessionId })),
+      );
+      const lastSessionId = selectedIds.at(-1);
+      return {
+        items,
+        nextCursor:
+          lastSessionId !== undefined && start + selectedIds.length < sessionIds.length
+            ? encodeProjectSessionCatalogCursor(lastSessionId)
+            : null,
+      };
     },
     async reloadRepositoryInstructions(input) {
       if (activeSession !== undefined) {
@@ -2663,8 +3261,244 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         return { status: "reloaded", snapshot };
       });
     },
+    async regenerateSessionTitle(input) {
+      if (activeSession !== undefined || activeTitleSessions.has(input.sessionId)) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const started = await withOwner(async () => {
+        const inspected = await inspectSession({ sessionId: input.sessionId });
+        if (inspected.schemaVersion !== 3 || options.modelTargets === undefined) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const records = await readJsonlSessionRecords({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        const firstRun = records.find(
+          (entry) => entry.schemaVersion === 3 && entry.record.type === "logical_run_started",
+        );
+        if (firstRun?.schemaVersion !== 3 || firstRun.record.type !== "logical_run_started") {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const latestStarted = records.findLast(
+          (entry) =>
+            entry.schemaVersion === 3 && entry.record.type === "session_title_generation_started",
+        );
+        if (
+          latestStarted?.schemaVersion === 3 &&
+          latestStarted.record.type === "session_title_generation_started"
+        ) {
+          const latestGenerationId = latestStarted.record.generationId;
+          const latestIsActive = !records.some(
+            (entry) =>
+              entry.schemaVersion === 3 &&
+              (entry.record.type === "session_title_generation_completed" ||
+                entry.record.type === "session_title_generation_failed") &&
+              entry.record.generationId === latestGenerationId,
+          );
+          if (latestIsActive) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+        }
+        const generationId = randomUUID();
+        const store = await openJsonlSessionStore<SessionRecord>({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        const sequence = (records.at(-1)?.sequence ?? 0) + 1;
+        await store.append({
+          schemaVersion: 3,
+          sequence,
+          record: {
+            type: "session_title_generation_started",
+            recordVersion: 1,
+            generationId,
+            reason: "regenerate",
+            targetIdentity: inspected.targetIdentity,
+          },
+        });
+        await publishMetadata({
+          type: "session_naming_changed",
+          sessionId: input.sessionId,
+          throughSequence: sequence,
+        });
+        const snapshot = await inspectSession({ sessionId: input.sessionId });
+        if (snapshot.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        return {
+          generationId,
+          targetIdentity: inspected.targetIdentity,
+          userMessage: firstRun.record.userMessage,
+          result: { status: "updated" as const, snapshot },
+        };
+      });
+      const operation = settleTitleGeneration({
+        sessionId: input.sessionId,
+        generationId: started.generationId,
+        targetIdentity: started.targetIdentity,
+        userMessage: started.userMessage,
+      });
+      titleOperations.add(operation);
+      activeTitleSessions.add(input.sessionId);
+      void operation.finally(() => {
+        titleOperations.delete(operation);
+        activeTitleSessions.delete(input.sessionId);
+      });
+      return started.result;
+    },
     async resume(input) {
-      return withOwner(() => resumeSession(input));
+      if (activeTitleSessions.has(input.sessionId)) {
+        const snapshot = await inspectSession(input);
+        return snapshot.schemaVersion === 3
+          ? { status: "ready" as const, snapshot }
+          : {
+              status: "rejected" as const,
+              snapshot,
+              error: {
+                code: "non_resumable_legacy_session" as const,
+                message: "Legacy sessions cannot be resumed.",
+              },
+            };
+      }
+      return withOwner(async () => {
+        const resumed = await resumeSession(input);
+        if (resumed.status === "rejected") {
+          return resumed;
+        }
+        const records = await readJsonlSessionRecords({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        const started = records.findLast(
+          (entry) =>
+            entry.schemaVersion === 3 && entry.record.type === "session_title_generation_started",
+        );
+        if (
+          started?.schemaVersion === 3 &&
+          started.record.type === "session_title_generation_started"
+        ) {
+          const generationId = started.record.generationId;
+          const terminalExists = records.some(
+            (entry) =>
+              entry.schemaVersion === 3 &&
+              (entry.record.type === "session_title_generation_completed" ||
+                entry.record.type === "session_title_generation_failed") &&
+              entry.record.generationId === generationId,
+          );
+          if (terminalExists) {
+            return resumed;
+          }
+          const store = await openJsonlSessionStore<SessionRecord>({
+            workspaceRoot: options.workspaceRoot,
+            sessionId: input.sessionId,
+            ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+          });
+          const sequence = (records.at(-1)?.sequence ?? 0) + 1;
+          await store.append({
+            schemaVersion: 3,
+            sequence,
+            record: {
+              type: "session_title_generation_failed",
+              recordVersion: 1,
+              generationId,
+              reason: "process_restart",
+            },
+          });
+          await publishMetadata({
+            type: "session_naming_changed",
+            sessionId: input.sessionId,
+            throughSequence: sequence,
+          });
+          const snapshot = await inspectSession(input);
+          if (snapshot.schemaVersion !== 3) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          return { status: "ready" as const, snapshot };
+        }
+        return resumed;
+      });
+    },
+    async clearSessionManualName(input) {
+      if (activeSession !== undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return withOwner(async () => {
+        const inspected = await inspectSession({ sessionId: input.sessionId });
+        if (inspected.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const records = await readJsonlSessionRecords({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        const store = await openJsonlSessionStore<SessionRecord>({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        const sequence = (records.at(-1)?.sequence ?? 0) + 1;
+        await store.append({
+          schemaVersion: 3,
+          sequence,
+          record: { type: "session_manual_name_cleared", recordVersion: 1 },
+        });
+        await publishMetadata({
+          type: "session_naming_changed",
+          sessionId: input.sessionId,
+          throughSequence: sequence,
+        });
+        const snapshot = await inspectSession({ sessionId: input.sessionId });
+        if (snapshot.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        return { status: "updated", snapshot };
+      });
+    },
+    async setSessionManualName(input) {
+      if (activeSession !== undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return withOwner(async () => {
+        const name = normalizedSessionTitle(input.name);
+        if (name === null) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const inspected = await inspectSession({ sessionId: input.sessionId });
+        if (inspected.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const records = await readJsonlSessionRecords({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        const store = await openJsonlSessionStore<SessionRecord>({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: input.sessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
+        const sequence = (records.at(-1)?.sequence ?? 0) + 1;
+        await store.append({
+          schemaVersion: 3,
+          sequence,
+          record: { type: "session_manual_name_set", recordVersion: 1, name },
+        });
+        await publishMetadata({
+          type: "session_naming_changed",
+          sessionId: input.sessionId,
+          throughSequence: sequence,
+        });
+        const snapshot = await inspectSession({ sessionId: input.sessionId });
+        if (snapshot.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        return { status: "updated", snapshot };
+      });
     },
     subscribe(listener) {
       listeners.add(listener);
@@ -2672,11 +3506,66 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         listeners.delete(listener);
       };
     },
+    subscribeSessionEvents(listener) {
+      sessionEventListeners.add(listener);
+      return () => {
+        sessionEventListeners.delete(listener);
+      };
+    },
+    subscribeMetadata(listener) {
+      metadataListeners.add(listener);
+      return () => {
+        metadataListeners.delete(listener);
+      };
+    },
   };
 }
 
 function isGenesisRecord(record: SessionRecord): record is SessionGenesisRecord {
   return record.schemaVersion === 3 && record.record.type === "session_genesis";
+}
+
+function boundedTitleInput(input: string): string {
+  let normalized = "";
+  for (const character of input) {
+    const codePoint = character.codePointAt(0) ?? 0;
+    normalized += codePoint < 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f) ? " " : character;
+  }
+  normalized = normalized.trim().split(/\s+/u).filter(Boolean).join(" ");
+  let bounded = "";
+  for (const character of normalized) {
+    if (Buffer.byteLength(bounded + character, "utf8") > 4 * 1024) {
+      break;
+    }
+    bounded += character;
+  }
+  return bounded;
+}
+
+function sessionDisplayLabelFromRecords(records: readonly SessionRecord[]): string {
+  const genesis = records[0];
+  let fallbackTitle =
+    genesis?.schemaVersion === 3 && genesis.record.type === "session_genesis"
+      ? (genesis.record.naming?.fallbackTitle ?? null)
+      : null;
+  let manualName: string | null = null;
+  let generatedTitle: string | null = null;
+  for (const entry of records) {
+    if (entry.schemaVersion !== 3) {
+      continue;
+    }
+    if (entry.record.type === "logical_run_started" && fallbackTitle === null) {
+      fallbackTitle =
+        entry.record.naming?.fallbackTitle ?? sessionTitleFallback(entry.record.userMessage);
+    } else if (entry.record.type === "session_manual_name_set") {
+      manualName = entry.record.name;
+    } else if (entry.record.type === "session_manual_name_cleared") {
+      manualName = null;
+    } else if (entry.record.type === "session_title_generation_completed") {
+      generatedTitle = entry.record.title;
+    }
+  }
+  return manualName ?? generatedTitle ?? fallbackTitle ?? "New session";
 }
 
 function mcpWorkspaceConfirmationFromRecords(
@@ -3037,6 +3926,7 @@ type ValidatedToolState = {
     readonly effect?: string | undefined;
   };
   decision?: "allow" | "deny";
+  changePreviewRef?: ArtifactReference<ChangePreviewArtifactSource>;
   permissionRequestId?: string;
   requested: boolean;
   repositoryActivationPublished?: boolean;
@@ -3058,6 +3948,7 @@ type ValidatedAttemptState = {
 function validateCurrentSessionHistory(
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
+  workspaceRoot: string,
 ): void {
   if (
     genesis.sequence !== 1 ||
@@ -3111,6 +4002,16 @@ function validateCurrentSessionHistory(
   const publishedSkillActivations = new Set<number>();
   const publishedSkillRevocations = new Set<number>();
   let skillResourceRunBytes = 0;
+  let manualSessionName: string | null = null;
+  let automaticTitleEligible = false;
+  let automaticTitleSlotClosed = false;
+  let activeTitleGeneration:
+    | {
+        readonly generationId: string;
+        readonly reason: "automatic" | "regenerate";
+      }
+    | undefined;
+  const titleGenerationIds = new Set<string>();
   const activatableRepositoryRevisions = new Map<number, ValidatedToolState>();
   const publishedRepositoryRevisions = new Set<number>();
   let mcpWorkspaceConfirmation: SessionMcpWorkspaceConfirmedRecord["record"] | undefined;
@@ -3743,6 +4644,64 @@ function validateCurrentSessionHistory(
       committedSkillResourceReads.add(record.callId);
       continue;
     }
+    if (record.type === "session_manual_name_set") {
+      if (run !== undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      manualSessionName = record.name;
+      continue;
+    }
+    if (record.type === "session_manual_name_cleared") {
+      if (run !== undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      manualSessionName = null;
+      continue;
+    }
+    if (record.type === "session_title_generation_started") {
+      if (
+        run !== undefined ||
+        activeTitleGeneration !== undefined ||
+        titleGenerationIds.has(record.generationId) ||
+        !sameModelTargetIdentity(record.targetIdentity, genesis.record.targetIdentity) ||
+        (record.reason === "automatic" &&
+          (!automaticTitleEligible || automaticTitleSlotClosed || manualSessionName !== null))
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      titleGenerationIds.add(record.generationId);
+      activeTitleGeneration = {
+        generationId: record.generationId,
+        reason: record.reason,
+      };
+      if (record.reason === "automatic") {
+        automaticTitleSlotClosed = true;
+      }
+      continue;
+    }
+    if (
+      record.type === "session_title_generation_completed" ||
+      record.type === "session_title_generation_failed"
+    ) {
+      if (run !== undefined || activeTitleGeneration?.generationId !== record.generationId) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      activeTitleGeneration = undefined;
+      continue;
+    }
+    if (record.type === "session_title_generation_skipped_manual") {
+      if (
+        run !== undefined ||
+        activeTitleGeneration !== undefined ||
+        !automaticTitleEligible ||
+        automaticTitleSlotClosed ||
+        manualSessionName === null
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      automaticTitleSlotClosed = true;
+      continue;
+    }
     if (run === undefined || record.runId !== run.runId) {
       throw new SessionLifecycleError("session_invalid");
     }
@@ -3887,6 +4846,14 @@ function validateCurrentSessionHistory(
         !sawModelCompletion
       ) {
         throw new SessionLifecycleError("session_invalid");
+      }
+      const settledResponse = attemptState.response;
+      if (
+        record.status === "completed" &&
+        settledResponse !== undefined &&
+        hasNonEmptyModelResponseText(settledResponse.response.text)
+      ) {
+        automaticTitleEligible = true;
       }
       sawSettlement = true;
       run = undefined;
@@ -4066,6 +5033,9 @@ function validateCurrentSessionHistory(
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
+      if (event.result.status === "completed" && event.result.answer.length > 0) {
+        automaticTitleEligible = true;
+      }
       sawSettlement = true;
       run = undefined;
       continue;
@@ -4103,6 +5073,18 @@ function validateCurrentSessionHistory(
                 (event.type !== "tool_failed" ||
                   (event.error.code !== "repository_context_changed" &&
                     event.error.code !== "project_context_changed")))))
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      if (
+        (event.type === "tool_permission_requested" || event.type === "tool_permission_decided") &&
+        !isCanonicalChangePreviewReference({
+          event,
+          genesis,
+          runId: run.runId,
+          state,
+          workspaceRoot,
+        })
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
@@ -4369,6 +5351,45 @@ function isContextProfileValid(profile: ContextProfile): boolean {
   return isContextProfileSupported(profile);
 }
 
+function hasSuccessfullySettledAssistant(records: readonly SessionRecord[]): boolean {
+  const completedResponseSequences = new Set(
+    records.flatMap((entry) =>
+      entry.schemaVersion === 3 &&
+      entry.record.type === "run_settled" &&
+      entry.record.status === "completed"
+        ? [entry.record.responseSequence]
+        : [],
+    ),
+  );
+  return records.some((entry) => {
+    if (entry.schemaVersion !== 3) {
+      return false;
+    }
+    if (
+      entry.record.type === "runtime_event" &&
+      entry.record.event.type === "session_settled" &&
+      entry.record.event.result.status === "completed"
+    ) {
+      return entry.record.event.result.answer.length > 0;
+    }
+    if (
+      entry.record.type !== "model_response_completed" ||
+      !completedResponseSequences.has(entry.sequence)
+    ) {
+      return false;
+    }
+    return hasNonEmptyModelResponseText(entry.record.response.text);
+  });
+}
+
+function hasNonEmptyModelResponseText(field: string | SessionModelResponseField): boolean {
+  return typeof field === "string"
+    ? field.length > 0
+    : field.storage === "inline"
+      ? field.text.length > 0
+      : field.reference.byteCount > 0;
+}
+
 function isMatchingStartedAttempt(
   attempt: ValidatedAttemptState | undefined,
   record: { readonly attempt: number; readonly turn: number },
@@ -4415,6 +5436,54 @@ function validatePermissionEffect(state: ValidatedToolState, effect: string | un
   }
 }
 
+function isCanonicalChangePreviewReference(input: {
+  readonly event: Extract<
+    RuntimeEvent,
+    { readonly type: "tool_permission_requested" | "tool_permission_decided" }
+  >;
+  readonly genesis: SessionGenesisRecord;
+  readonly runId: string;
+  readonly state: ValidatedToolState;
+  readonly workspaceRoot: string;
+}): boolean {
+  const reference = input.event.changePreviewRef;
+  if (reference === undefined) {
+    return input.state.changePreviewRef === undefined;
+  }
+  const argumentsDigest = `sha256:${createHash("sha256")
+    .update(input.state.call.argumentsJson, "utf8")
+    .digest("hex")}`;
+  if (
+    (input.state.call.name !== "write_file" && input.state.call.name !== "edit_file") ||
+    reference.source.projectId !== input.genesis.record.projectId ||
+    reference.source.sessionId !== input.genesis.record.sessionId ||
+    reference.source.runId !== input.runId ||
+    reference.source.callId !== input.state.call.id ||
+    reference.source.toolName !== input.state.call.name ||
+    reference.source.argumentsDigest !== argumentsDigest ||
+    (input.state.changePreviewRef !== undefined &&
+      !isDeepStrictEqual(input.state.changePreviewRef, reference))
+  ) {
+    return false;
+  }
+  const expectedPreview = canonicalChangePreviewForToolCall({
+    workspaceRoot: input.workspaceRoot,
+    call: input.state.call,
+  });
+  if (expectedPreview === undefined) {
+    return false;
+  }
+  const expectedBytes = Buffer.from(expectedPreview, "utf8");
+  if (
+    reference.id !== `sha256:${createHash("sha256").update(expectedBytes).digest("hex")}` ||
+    reference.byteCount !== expectedBytes.byteLength
+  ) {
+    return false;
+  }
+  input.state.changePreviewRef = reference;
+  return true;
+}
+
 function sameResponseUsage(
   response:
     | {
@@ -4454,10 +5523,74 @@ async function validateSessionLineage(
     throw new SessionLifecycleError("session_invalid");
   }
   await validateInheritedContextEvidence(options, parentGenesis, prefixRecords);
+  if ("recordVersion" in lineage) {
+    const declaredParentRecords = await readJsonlSessionRecords({
+      workspaceRoot: options.workspaceRoot,
+      sessionId: lineage.parentSessionId,
+      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+    });
+    const declaredParentGenesis = declaredParentRecords[0];
+    if (declaredParentGenesis === undefined || !isGenesisRecord(declaredParentGenesis)) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    await validateSessionLineage(
+      options,
+      declaredParentGenesis,
+      new Set([...visited, lineage.parentSessionId]),
+    );
+    return;
+  }
   await validateSessionLineage(
     options,
     parentGenesis,
     new Set([...visited, lineage.parentSessionId]),
+  );
+}
+
+async function sessionInheritsSourceBoundary(
+  options: SessionLifecycleOptions,
+  sessionGenesis: SessionGenesisRecord,
+  sourceSessionId: string,
+  sourceEventPosition: number,
+  visited: ReadonlySet<string>,
+): Promise<boolean> {
+  if (visited.has(sessionGenesis.record.sessionId)) {
+    return false;
+  }
+  if (sessionGenesis.record.sessionId === sourceSessionId) {
+    const ownRecords = await readJsonlSessionRecords({
+      workspaceRoot: options.workspaceRoot,
+      sessionId: sourceSessionId,
+      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+    });
+    return sourceEventPosition <= ownRecords.length;
+  }
+  const lineage = sessionGenesis.record.lineage;
+  if (lineage === undefined) {
+    return false;
+  }
+  const inheritedSessionId =
+    "recordVersion" in lineage ? lineage.sourceSessionId : lineage.parentSessionId;
+  const inheritedEventPosition =
+    "recordVersion" in lineage ? lineage.sourceEventPosition : lineage.parentEventPosition;
+  if (sourceSessionId === inheritedSessionId) {
+    return sourceEventPosition <= inheritedEventPosition;
+  }
+  const inheritedRecords = await readJsonlSessionRecords({
+    workspaceRoot: options.workspaceRoot,
+    sessionId: inheritedSessionId,
+    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+  });
+  const inheritedGenesis = inheritedRecords[0];
+  if (inheritedGenesis === undefined || !isGenesisRecord(inheritedGenesis)) {
+    return false;
+  }
+  return sessionInheritsSourceBoundary(
+    options,
+    inheritedGenesis,
+    sourceSessionId,
+    sourceEventPosition,
+    new Set([...visited, sessionGenesis.record.sessionId]),
   );
 }
 
@@ -4682,9 +5815,9 @@ async function readValidatedLineagePrefix(
   if (lineage === undefined) {
     throw new SessionLifecycleError("session_invalid");
   }
-  let parentRecords: readonly SessionRecord[];
+  let declaredParentRecords: readonly SessionRecord[];
   try {
-    parentRecords = await readJsonlSessionRecords({
+    declaredParentRecords = await readJsonlSessionRecords({
       workspaceRoot: options.workspaceRoot,
       sessionId: lineage.parentSessionId,
       ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
@@ -4692,23 +5825,56 @@ async function readValidatedLineagePrefix(
   } catch {
     throw new SessionLifecycleError("session_invalid");
   }
+  const declaredParentGenesis = declaredParentRecords[0];
+  if (
+    declaredParentGenesis === undefined ||
+    !isGenesisRecord(declaredParentGenesis) ||
+    declaredParentGenesis.record.sessionId !== lineage.parentSessionId ||
+    declaredParentGenesis.record.projectId !== childGenesis.record.projectId
+  ) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  const sourceSessionId =
+    "recordVersion" in lineage ? lineage.sourceSessionId : lineage.parentSessionId;
+  const sourceEventPosition =
+    "recordVersion" in lineage ? lineage.sourceEventPosition : lineage.parentEventPosition;
+  if (
+    !(await sessionInheritsSourceBoundary(
+      options,
+      declaredParentGenesis,
+      sourceSessionId,
+      sourceEventPosition,
+      new Set(),
+    ))
+  ) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  const parentRecords =
+    sourceSessionId === lineage.parentSessionId
+      ? declaredParentRecords
+      : await readJsonlSessionRecords({
+          workspaceRoot: options.workspaceRoot,
+          sessionId: sourceSessionId,
+          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+        });
   const parentGenesis = parentRecords[0];
   if (
     parentGenesis === undefined ||
     !isGenesisRecord(parentGenesis) ||
-    parentGenesis.record.sessionId !== lineage.parentSessionId ||
     parentGenesis.record.projectId !== childGenesis.record.projectId ||
-    lineage.parentEventPosition > parentRecords.length
+    sourceEventPosition > parentRecords.length
   ) {
     throw new SessionLifecycleError("session_invalid");
   }
-  const prefixRecords = parentRecords.slice(0, lineage.parentEventPosition);
+  const prefixRecords = parentRecords.slice(0, sourceEventPosition);
   const prefix = `${prefixRecords.map((record) => JSON.stringify(record)).join("\n")}\n`;
   const digest = `sha256:${createHash("sha256").update(prefix).digest("hex")}`;
-  if (digest !== lineage.prefixDigest || !isCompleteBranchBoundary(prefixRecords)) {
+  const expectedDigest =
+    "recordVersion" in lineage ? lineage.sourcePrefixDigest : lineage.prefixDigest;
+  if (digest !== expectedDigest || !isCompleteBranchBoundary(prefixRecords)) {
     throw new SessionLifecycleError("session_invalid");
   }
-  validateCurrentSessionHistory(parentGenesis, prefixRecords);
+  validateCurrentSessionHistory(parentGenesis, prefixRecords, options.workspaceRoot);
   return { parentGenesis, prefixRecords };
 }
 

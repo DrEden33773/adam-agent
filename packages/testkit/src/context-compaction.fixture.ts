@@ -9,6 +9,7 @@ import {
   type ModelTargetIdentity,
   type ModelTargets,
 } from "@adam-agent/agent";
+import { sessionAutomaticTitlesEnabled } from "@adam-agent/agent/internal-testing";
 
 const workspaceRoot = requiredEnvironment("ADAM_AGENT_FIXTURE_WORKSPACE_ROOT");
 const stateRoot = requiredEnvironment("ADAM_AGENT_FIXTURE_STATE_ROOT");
@@ -212,6 +213,7 @@ const modelTargets: ModelTargets = {
   },
 };
 const lifecycle = createSessionLifecycle({
+  [sessionAutomaticTitlesEnabled]: false,
   modelTargets,
   stateRoot,
   workspaceRoot,

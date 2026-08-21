@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@adam-agent/extension-api": "workspace:*",
+    "@adam-agent/presentation": "workspace:*",
     "@ai-sdk/deepseek": "3.0.28",
     "@ai-sdk/gateway": "4.0.52",
     "@ai-sdk/provider": "4.0.7",

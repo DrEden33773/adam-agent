@@ -1,0 +1,4395 @@
+import { createHash } from "node:crypto";
+import { rmSync } from "node:fs";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  type ContextProfile,
+  createCodingToolRegistry,
+  createFileArtifactStore,
+  createPermissionPolicy,
+  createPresentationSession,
+  createReadToolRegistry,
+  createSessionLifecycle,
+  type ModelDriver,
+  ModelDriverError,
+  type ModelTargetIdentity,
+  type ModelTargets,
+  type SessionLifecycle,
+} from "@adam-agent/agent";
+import {
+  assemblePromptMessagesV1,
+  digestPromptRequestV1,
+  openJsonlSessionStore,
+  presentationCatalogPageSize,
+  presentationHistoryPageSize,
+  presentationHydrationBarrier,
+  presentationRuntimeRefreshBarrier,
+  type SessionRecord,
+  sessionAutomaticTitlesEnabled,
+  sessionLogicalRunStartedBarrier,
+  sessionRuntimeNotificationTransform,
+  sessionTitleDeadlineScheduler,
+} from "@adam-agent/agent/internal-testing";
+import { expect, test } from "vitest";
+import { FakeModelDriver } from "./index.js";
+
+const targetIdentity: ModelTargetIdentity = {
+  targetId: "deepseek-v4-flash.direct",
+  vendor: "deepseek",
+  modelId: "deepseek-v4-flash",
+  route: "direct",
+  profileVersion: 1,
+  certification: "certified",
+};
+
+const contextProfile: ContextProfile = {
+  version: 1,
+  contextWindowTokens: 1_000_000,
+  maximumOutputTokens: 32_768,
+  compactAtTokens: 800_000,
+  postCompactTargetTokens: 200_000,
+  retainedTargetTokens: 20_000,
+  estimatorVersion: 1,
+};
+
+test("PresentationSession opens a real new session as authoritative empty project history", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-open-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+
+    const state = presentation.getState();
+    expect(state).toEqual({
+      revision: 1,
+      authoritative: {
+        schemaVersion: 1,
+        continuity: {
+          status: "current",
+          sessionThroughSequence: 1,
+          operationThrough: [],
+        },
+        project: { id: state.authoritative.project.id, label: "workspace" },
+        sessions: {
+          items: [
+            {
+              id: state.authoritative.active?.session.id,
+              label: "New session",
+              targetId: "deepseek-v4-flash.direct",
+              status: "idle",
+              naming: {
+                manualName: null,
+                generatedTitle: null,
+                fallbackTitle: null,
+                displayLabel: "New session",
+                generation: { status: "not_started" },
+              },
+            },
+          ],
+          nextCursor: null,
+        },
+        active: {
+          session: {
+            id: state.authoritative.active?.session.id,
+            label: "New session",
+            targetId: "deepseek-v4-flash.direct",
+            status: "idle",
+            naming: {
+              manualName: null,
+              generatedTitle: null,
+              fallbackTitle: null,
+              displayLabel: "New session",
+              generation: { status: "not_started" },
+            },
+          },
+          transcript: { items: [], olderCursor: null },
+          pendingInteractions: [],
+        },
+      },
+      transient: null,
+    });
+    expect(state.authoritative.project.id).toMatch(/^sha256:[0-9a-f]{64}$/u);
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession opens an existing authoritative session by identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-existing-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState()).toMatchObject({
+      authoritative: {
+        continuity: { status: "current", sessionThroughSequence: 1 },
+        project: { id: created.projectId },
+        sessions: { items: [{ id: created.sessionId }] },
+        active: {
+          session: {
+            id: created.sessionId,
+            targetId: "deepseek-v4-flash.direct",
+            status: "idle",
+          },
+          transcript: { items: [] },
+        },
+      },
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession catches up a durable settlement that arrives after hydration", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-catch-up-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Durable answer." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionAutomaticTitlesEnabled]: true,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationHydrationBarrier]: {
+        async afterHydrate() {
+          await lifecycle.continue({
+            sessionId: created.sessionId,
+            input: { text: "Complete during hydration" },
+          });
+        },
+      },
+    });
+
+    expect(presentation.getState()).toMatchObject({
+      authoritative: {
+        continuity: { status: "current", sessionThroughSequence: 9 },
+        active: { session: { id: created.sessionId, status: "settled" } },
+      },
+      transient: null,
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession projects one settled run as stable user and assistant chronology", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-chronology-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Durable answer." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Complete before opening" },
+    });
+
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.transcript).toEqual({
+      items: [
+        {
+          type: "user_message",
+          id: `${created.sessionId}:2`,
+          sequence: 2,
+          sourceSessionId: created.sessionId,
+          branchBoundary: null,
+          text: "Complete before opening",
+        },
+        {
+          type: "assistant_message",
+          id: `${created.sessionId}:6`,
+          sequence: 6,
+          sourceSessionId: created.sessionId,
+          branchBoundary: { sessionId: created.sessionId, sequence: 8 },
+          text: "Durable answer.",
+          artifact: null,
+        },
+      ],
+      olderCursor: null,
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession loads older chronology through an opaque tail cursor", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-paging-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver((request) => {
+    const message = [...request.messages].reverse().find((entry) => entry.role === "user");
+    return [
+      { type: "text_delta", text: `Answer: ${message?.content ?? "missing"}` },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.setSessionManualName({ sessionId: created.sessionId, name: "Paging" });
+    for (const text of ["First", "Second", "Third"]) {
+      await lifecycle.continue({ sessionId: created.sessionId, input: { text } });
+    }
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationHistoryPageSize]: 2,
+    });
+
+    const initial = presentation.getState();
+    expect(initial.authoritative.active?.transcript).toMatchObject({
+      items: [
+        { type: "user_message", text: "Third" },
+        { type: "assistant_message", text: "Answer: Third" },
+      ],
+      olderCursor: expect.any(String),
+    });
+    const before = initial.authoritative.active?.transcript.olderCursor;
+    if (before === null || before === undefined) {
+      throw new Error("Expected an opaque older-history cursor.");
+    }
+    let notifications = 0;
+    const unsubscribe = presentation.subscribe(() => {
+      notifications += 1;
+    });
+
+    await expect(
+      presentation.dispatch({ type: "load_older_transcript", before }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.active?.transcript).toMatchObject({
+      items: [
+        { type: "user_message", text: "Second" },
+        { type: "assistant_message", text: "Answer: Second" },
+        { type: "user_message", text: "Third" },
+        { type: "assistant_message", text: "Answer: Third" },
+      ],
+      olderCursor: expect.any(String),
+    });
+    expect(notifications).toBe(1);
+    unsubscribe();
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession links an artifact-backed assistant response without embedding bytes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-artifact-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const answer = "a".repeat(256 * 1024 + 1);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: answer },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Create a large response" },
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.transcript.items).toContainEqual({
+      type: "assistant_message",
+      id: expect.stringMatching(new RegExp(`^${created.sessionId}:[0-9]+$`, "u")),
+      sequence: expect.any(Number),
+      sourceSessionId: created.sessionId,
+      branchBoundary: { sessionId: created.sessionId, sequence: expect.any(Number) },
+      text: null,
+      artifact: {
+        id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        mediaType: "text/plain; charset=utf-8",
+        byteCount: 256 * 1024 + 1,
+        source: "model_response",
+      },
+    });
+    expect(JSON.stringify(presentation.getState())).not.toContain(answer.slice(0, 4_096));
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession preserves a durable compaction marker in visible chronology", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-compaction-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "context.txt"), "durable context detail ".repeat(1_000));
+  const compactingProfile: ContextProfile = {
+    ...contextProfile,
+    contextWindowTokens: 20_000,
+    maximumOutputTokens: 100,
+    compactAtTokens: 4_000,
+    postCompactTargetTokens: 3_000,
+    retainedTargetTokens: 500,
+  };
+  let ordinaryCall = 0;
+  const summary = JSON.stringify({
+    schemaVersion: 1,
+    objective: "Use the repository context and finish the requested task.",
+    constraints: ["Keep durable history authoritative."],
+    progress: ["The context file was read."],
+    unresolvedQuestions: [],
+    failures: [],
+    remainingVerification: ["Return the final answer."],
+    nextSafeAction: "Continue with the compacted context.",
+  });
+  const driver = new FakeModelDriver((request) => {
+    if (request.tools.length === 0) {
+      return [
+        { type: "text_delta", text: summary },
+        { type: "usage", inputTokens: 560, outputTokens: 40 },
+        { type: "finish", reason: "stop" },
+      ];
+    }
+    ordinaryCall += 1;
+    if (ordinaryCall === 1) {
+      return [
+        { type: "usage", inputTokens: 20, outputTokens: 8 },
+        { type: "tool_call_start", id: "read-context", name: "read_file" },
+        { type: "tool_call_delta", id: "read-context", json: '{"path":"context.txt"}' },
+        { type: "tool_call_end", id: "read-context" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    return [
+      { type: "text_delta", text: "Compaction preserved the task." },
+      { type: "usage", inputTokens: 90, outputTokens: 12 },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: compactingProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: compactingProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Read context.txt and finish the task." },
+      limits: { maxTurns: 2 },
+    });
+    expect(continued.result).toEqual({
+      status: "completed",
+      answer: "Compaction preserved the task.",
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.transcript.items).toContainEqual({
+      type: "compaction_marker",
+      id: expect.stringMatching(new RegExp(`^${created.sessionId}:[0-9]+$`, "u")),
+      sequence: expect.any(Number),
+      sourceSessionId: created.sessionId,
+      branchBoundary: null,
+      windowNumber: 1,
+      sourceThrough: expect.any(Number),
+      retainedFrom: expect.any(Number),
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession preserves a causally cancelled run as an interrupted notice", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-interrupted-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelStarted = Promise.withResolvers<void>();
+  const model: ModelDriver = {
+    async *stream(request) {
+      modelStarted.resolve();
+      await new Promise<void>((resolve) => {
+        if (request.signal.aborted) {
+          resolve();
+          return;
+        }
+        request.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      throw request.signal.reason;
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const controller = new AbortController();
+    const continuation = lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Cancel after the model starts" },
+      signal: controller.signal,
+    });
+    await modelStarted.promise;
+    controller.abort(new Error("fixture cancellation"));
+    await expect(continuation).resolves.toMatchObject({ result: { status: "cancelled" } });
+
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    expect(presentation.getState().authoritative.active?.transcript.items).toContainEqual({
+      type: "session_notice",
+      id: expect.stringMatching(new RegExp(`^${created.sessionId}:[0-9]+$`, "u")),
+      sequence: expect.any(Number),
+      sourceSessionId: created.sessionId,
+      branchBoundary: { sessionId: created.sessionId, sequence: expect.any(Number) },
+      status: "interrupted",
+      reason: "cancelled",
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession resumes and normalizes an in-flight provider attempt before display", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-resume-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const firstLifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const created = await firstLifecycle.create({ targetIdentity });
+    const store = await openJsonlSessionStore<SessionRecord>({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    const genesis = (await store.read())[0];
+    if (
+      genesis?.schemaVersion !== 3 ||
+      genesis.record.type !== "session_genesis" ||
+      genesis.record.promptContext === undefined
+    ) {
+      throw new Error("Expected a current prompt context fixture.");
+    }
+    const promptMessages = assemblePromptMessagesV1(
+      [{ role: "user", content: "Recover the display" }],
+      genesis.record.promptContext,
+      genesis.record.skillContext,
+      new Map(),
+    );
+    const promptTools = genesis.record.promptContext.toolProfile.definitions.map(
+      ({ definition }) => definition,
+    );
+    const runId = "123e4567-e89b-42d3-a456-426614170001";
+    await store.append({
+      schemaVersion: 3,
+      sequence: 2,
+      record: { type: "logical_run_started", runId, userMessage: "Recover the display" },
+    });
+    await store.append({
+      schemaVersion: 3,
+      sequence: 3,
+      record: {
+        type: "runtime_event",
+        runId,
+        event: { type: "user_message", text: "Recover the display" },
+      },
+    });
+    await store.append({
+      schemaVersion: 3,
+      sequence: 4,
+      record: {
+        type: "provider_attempt_started",
+        runId,
+        turn: 1,
+        attempt: 1,
+        targetIdentity,
+        promptProjection: {
+          version: 1,
+          assemblyIdentityDigest: genesis.record.promptContext.assemblyIdentityDigest,
+          requestProjectionDigest: digestPromptRequestV1(promptMessages, promptTools),
+        },
+      },
+    });
+    await store.append({
+      schemaVersion: 3,
+      sequence: 5,
+      record: {
+        type: "runtime_event",
+        runId,
+        event: { type: "model_message_started" },
+      },
+    });
+    await firstLifecycle.close();
+
+    const resumeTargets: ModelTargets = {
+      async resolve() {
+        return {
+          identity: targetIdentity,
+          driver: new FakeModelDriver([]),
+          contextProfile,
+        };
+      },
+      async snapshot() {
+        return {
+          targets: [
+            {
+              identity: targetIdentity,
+              readiness: { status: "available", credentialSource: "deterministic test adapter" },
+              contextProfile,
+            },
+          ],
+        };
+      },
+    };
+    const restarted = createSessionLifecycle({
+      modelTargets: resumeTargets,
+      stateRoot,
+      workspaceRoot,
+    });
+    const presentation = await createPresentationSession({
+      lifecycle: restarted,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState()).toMatchObject({
+      authoritative: {
+        continuity: { status: "current", sessionThroughSequence: 6 },
+        active: {
+          session: { status: "interrupted" },
+          transcript: {
+            items: [
+              { type: "user_message", text: "Recover the display" },
+              { type: "session_notice", status: "interrupted", reason: "process_restart" },
+            ],
+          },
+        },
+      },
+    });
+
+    await presentation.close();
+    await restarted.close();
+  } finally {
+    await firstLifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession reconstructs a child transcript from its durable branch prefix", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-branch-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Parent answer." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const parent = await lifecycle.create({ targetIdentity });
+    await lifecycle.setSessionManualName({ sessionId: parent.sessionId, name: "Parent" });
+    const completed = await lifecycle.continue({
+      sessionId: parent.sessionId,
+      input: { text: "Parent prompt" },
+    });
+    const child = await lifecycle.branch({
+      parentSessionId: parent.sessionId,
+      atSequence: completed.snapshot.lastSequence,
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: child.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.transcript).toEqual({
+      items: [
+        {
+          type: "user_message",
+          id: `${parent.sessionId}:3`,
+          sequence: 3,
+          sourceSessionId: parent.sessionId,
+          branchBoundary: null,
+          text: "Parent prompt",
+        },
+        {
+          type: "assistant_message",
+          id: `${parent.sessionId}:7`,
+          sequence: 7,
+          sourceSessionId: parent.sessionId,
+          branchBoundary: { sessionId: parent.sessionId, sequence: 9 },
+          text: "Parent answer.",
+          artifact: null,
+        },
+      ],
+      olderCursor: null,
+    });
+    expect(presentation.getState().authoritative.active?.session.id).toBe(child.sessionId);
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession uses the atomically recorded first-run fallback label", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-fallback-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Named." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "  Fix\n transcript\u0007 hydration  " },
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.session.naming.fallbackTitle).toBe(
+      "Fix transcript hydration",
+    );
+    const store = await openJsonlSessionStore<SessionRecord>({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    expect(
+      (await store.read()).find(
+        (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
+      ),
+    ).toMatchObject({
+      record: {
+        type: "logical_run_started",
+        userMessage: "  Fix\n transcript\u0007 hydration  ",
+        naming: { profileVersion: 1, fallbackTitle: "Fix transcript hydration" },
+      },
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle exposes the atomic fallback at the post-fsync crash boundary", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-fallback-crash-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const reachedBoundary = Promise.withResolvers<void>();
+  const releaseBoundary = Promise.withResolvers<void>();
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: targetIdentity,
+        driver: new FakeModelDriver([
+          { type: "text_delta", text: "Must not precede the boundary." },
+          { type: "finish", reason: "stop" },
+        ]),
+        contextProfile,
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionLogicalRunStartedBarrier]: {
+      async afterDurableRecord() {
+        reachedBoundary.resolve();
+        await releaseBoundary.promise;
+      },
+    },
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const controller = new AbortController();
+    const continuation = lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "  Atomic\n fallback at crash  " },
+      signal: controller.signal,
+    });
+    await reachedBoundary.promise;
+    const store = await openJsonlSessionStore<SessionRecord>({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    expect(await store.read()).toEqual([
+      expect.objectContaining({ record: expect.objectContaining({ type: "session_genesis" }) }),
+      expect.objectContaining({
+        sequence: 2,
+        record: {
+          type: "logical_run_started",
+          runId: expect.any(String),
+          userMessage: "  Atomic\n fallback at crash  ",
+          naming: { profileVersion: 1, fallbackTitle: "Atomic fallback at crash" },
+        },
+      }),
+    ]);
+    controller.abort();
+    releaseBoundary.resolve();
+    await expect(continuation).resolves.toMatchObject({ result: { status: "cancelled" } });
+  } finally {
+    releaseBoundary.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession durably sets a manual name with authoritative sequence truth", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-manual-name-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+
+    await expect(
+      presentation.dispatch({
+        type: "set_session_manual_name",
+        sessionId,
+        name: "Manual presentation name",
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState()).toMatchObject({
+      authoritative: {
+        continuity: { status: "current", sessionThroughSequence: 2 },
+        sessions: {
+          items: [
+            {
+              id: sessionId,
+              label: "Manual presentation name",
+              naming: {
+                manualName: "Manual presentation name",
+                generatedTitle: null,
+                fallbackTitle: null,
+                displayLabel: "Manual presentation name",
+              },
+            },
+          ],
+        },
+        active: {
+          session: {
+            id: sessionId,
+            label: "Manual presentation name",
+            naming: { manualName: "Manual presentation name" },
+          },
+        },
+      },
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession clears a manual name to reveal the durable fallback", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-clear-name-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Done." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.setSessionManualName({
+      sessionId: created.sessionId,
+      name: "Temporary manual title",
+    });
+    await lifecycle.continue({ sessionId: created.sessionId, input: { text: "Fallback title" } });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    await expect(
+      presentation.dispatch({
+        type: "clear_session_manual_name",
+        sessionId: created.sessionId,
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.active?.session).toMatchObject({
+      label: "Fallback title",
+      naming: {
+        manualName: null,
+        generatedTitle: null,
+        fallbackTitle: "Fallback title",
+        displayLabel: "Fallback title",
+      },
+    });
+    expect(presentation.getState().authoritative.continuity).toMatchObject({
+      status: "current",
+      sessionThroughSequence: 11,
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession closes the automatic title slot as in progress after the first turn", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-title-started-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const releaseTitle = Promise.withResolvers<void>();
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        await releaseTitle.promise;
+        yield { type: "text_delta", text: "Generated later" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "text_delta", text: "Ordinary answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  lifecycle.enableAutomaticTitles();
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "First successful prompt" },
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+      manualName: null,
+      generatedTitle: null,
+      fallbackTitle: "First successful prompt",
+      displayLabel: "First successful prompt",
+      generation: {
+        status: "in_progress",
+        generationId: expect.stringMatching(
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+        ),
+      },
+    });
+
+    await presentation.close();
+    releaseTitle.resolve();
+  } finally {
+    releaseTitle.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession restores one completed no-tools automatic title with separate usage", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-title-completed-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let ordinaryCalls = 0;
+  let titleRequest:
+    | { readonly tools: number; readonly maximumOutputTokens: number; readonly messages: unknown }
+    | undefined;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        titleRequest = {
+          tools: request.tools.length,
+          maximumOutputTokens: request.maximumOutputTokens,
+          messages: request.messages,
+        };
+        yield { type: "text_delta", text: "Generated concise title" };
+        yield { type: "usage", inputTokens: 14, outputTokens: 4 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCalls += 1;
+      yield { type: "text_delta", text: "Ordinary answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  lifecycle.enableAutomaticTitles();
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Summarize this session title" },
+    });
+    await lifecycle.close();
+
+    const restarted = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const presentation = await createPresentationSession({
+      lifecycle: restarted,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+      manualName: null,
+      generatedTitle: "Generated concise title",
+      fallbackTitle: "Summarize this session title",
+      displayLabel: "Generated concise title",
+      generation: {
+        status: "completed",
+        usage: { status: "known", inputTokens: 14, outputTokens: 4 },
+      },
+    });
+    expect({ ordinaryCalls, titleRequest }).toEqual({
+      ordinaryCalls: 1,
+      titleRequest: {
+        tools: 0,
+        maximumOutputTokens: 64,
+        messages: [
+          {
+            role: "system",
+            content:
+              "Generate one concise plain-text title for this coding session. Return only the title.",
+          },
+          { role: "user", content: "Summarize this session title" },
+        ],
+      },
+    });
+
+    await presentation.close();
+    await restarted.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps the fallback when automatic title generation fails", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-title-failed-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        throw new Error("private provider failure");
+      }
+      yield { type: "text_delta", text: "Ordinary answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  lifecycle.enableAutomaticTitles();
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Fallback survives title failure" },
+    });
+    await lifecycle.close();
+
+    const restarted = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const presentation = await createPresentationSession({
+      lifecycle: restarted,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+      generatedTitle: null,
+      fallbackTitle: "Fallback survives title failure",
+      displayLabel: "Fallback survives title failure",
+      generation: {
+        status: "failed",
+        reason: "model_request_failed",
+      },
+    });
+
+    await presentation.close();
+    await restarted.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle defaults automatic titles on before Presentation attaches", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-title-catchup-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let titleCalls = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        titleCalls += 1;
+        yield { type: "text_delta", text: "Caught up title" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "text_delta", text: "Headless answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Name this earlier headless turn" },
+    });
+    await lifecycle.close();
+    expect(titleCalls).toBe(1);
+
+    const restarted = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const presentation = await createPresentationSession({
+      lifecycle: restarted,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+      generatedTitle: "Caught up title",
+      displayLabel: "Caught up title",
+      generation: { status: "completed" },
+    });
+    expect(titleCalls).toBe(1);
+    await presentation.close();
+    await restarted.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle enforces the 30-second title deadline through an injected scheduler", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-title-deadline-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const deadlineScheduled = Promise.withResolvers<void>();
+  let expireTitle: (() => void) | undefined;
+  let scheduledMilliseconds: number | undefined;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        await new Promise<void>((_resolve, reject) => {
+          request.signal.addEventListener("abort", () => reject(request.signal.reason), {
+            once: true,
+          });
+        });
+        return;
+      }
+      yield { type: "text_delta", text: "Ordinary answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionTitleDeadlineScheduler]: {
+      schedule(delayMilliseconds, onDeadline) {
+        scheduledMilliseconds = delayMilliseconds;
+        expireTitle = onDeadline;
+        deadlineScheduled.resolve();
+        return { cancel() {} };
+      },
+    },
+  });
+  lifecycle.enableAutomaticTitles();
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Bound title generation by policy" },
+    });
+    await deadlineScheduled.promise;
+    expect(scheduledMilliseconds).toBe(30_000);
+    expireTitle?.();
+    await lifecycle.close();
+    const store = await openJsonlSessionStore<SessionRecord>({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    expect(await store.read()).toContainEqual(
+      expect.objectContaining({
+        record: expect.objectContaining({
+          type: "session_title_generation_failed",
+          reason: "model_request_failed",
+        }),
+      }),
+    );
+  } finally {
+    expireTitle?.();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession settles an orphaned title attempt once without retry after restart", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-title-restart-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const releaseTitle = Promise.withResolvers<void>();
+  let titleCalls = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        titleCalls += 1;
+        await releaseTitle.promise;
+        yield { type: "text_delta", text: "Must not win after restart" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "text_delta", text: "Ordinary answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const firstLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  firstLifecycle.enableAutomaticTitles();
+
+  try {
+    const created = await firstLifecycle.create({ targetIdentity });
+    await firstLifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Do not retry this title" },
+    });
+    expect(titleCalls).toBe(1);
+
+    const restarted = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const presentation = await createPresentationSession({
+      lifecycle: restarted,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+      generatedTitle: null,
+      fallbackTitle: "Do not retry this title",
+      displayLabel: "Do not retry this title",
+      generation: { status: "failed", reason: "process_restart" },
+    });
+    expect(titleCalls).toBe(1);
+
+    await presentation.close();
+    await restarted.close();
+  } finally {
+    releaseTitle.resolve();
+    await firstLifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession records skipped manual automatic naming without a title call", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-title-skipped-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let titleCalls = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        titleCalls += 1;
+        yield { type: "text_delta", text: "Should not be requested" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "text_delta", text: "Ordinary answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  lifecycle.enableAutomaticTitles();
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+    await presentation.dispatch({
+      type: "set_session_manual_name",
+      sessionId,
+      name: "Manual wins",
+    });
+    await lifecycle.continue({ sessionId, input: { text: "First prompt after manual naming" } });
+    await lifecycle.close();
+
+    const restarted = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const restored = await createPresentationSession({
+      lifecycle: restarted,
+      projectLabel: "workspace",
+      sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    expect(restored.getState().authoritative.active?.session.naming).toMatchObject({
+      manualName: "Manual wins",
+      generatedTitle: null,
+      fallbackTitle: "First prompt after manual naming",
+      displayLabel: "Manual wins",
+      generation: { status: "skipped_manual" },
+    });
+    expect(titleCalls).toBe(0);
+
+    await restored.close();
+    await restarted.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession explicitly regenerates and replaces the generated title", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-title-regenerate-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let titleCalls = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        titleCalls += 1;
+        yield {
+          type: "text_delta",
+          text: titleCalls === 1 ? "Initial generated title" : "Regenerated title",
+        };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "text_delta", text: "Ordinary answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const firstLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  firstLifecycle.enableAutomaticTitles();
+
+  try {
+    const created = await firstLifecycle.create({ targetIdentity });
+    await firstLifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Regenerate this title" },
+    });
+    await firstLifecycle.close();
+
+    const secondLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const presentation = await createPresentationSession({
+      lifecycle: secondLifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    await expect(
+      presentation.dispatch({
+        type: "regenerate_session_title",
+        sessionId: created.sessionId,
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    await presentation.close();
+    await secondLifecycle.close();
+
+    const thirdLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const restored = await createPresentationSession({
+      lifecycle: thirdLifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    expect(restored.getState().authoritative.active?.session.naming).toMatchObject({
+      generatedTitle: "Regenerated title",
+      displayLabel: "Regenerated title",
+      generation: { status: "completed" },
+    });
+    expect(titleCalls).toBe(2);
+
+    await restored.close();
+    await thirdLifecycle.close();
+  } finally {
+    await firstLifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession gives a child an immutable branch fallback before its first turn", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-branch-name-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let titleCalls = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        titleCalls += 1;
+        yield { type: "text_delta", text: "Generated parent title" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "text_delta", text: "Parent answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const firstLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  firstLifecycle.enableAutomaticTitles();
+
+  try {
+    const parent = await firstLifecycle.create({ targetIdentity });
+    await firstLifecycle.continue({
+      sessionId: parent.sessionId,
+      input: { text: "Parent prompt" },
+    });
+    await firstLifecycle.close();
+
+    const secondLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    await secondLifecycle.setSessionManualName({
+      sessionId: parent.sessionId,
+      name: "Parent snapshot name",
+    });
+    const parentSnapshot = await secondLifecycle.inspect({ sessionId: parent.sessionId });
+    const child = await secondLifecycle.branch({
+      parentSessionId: parent.sessionId,
+      atSequence: parentSnapshot.lastSequence,
+    });
+    const presentation = await createPresentationSession({
+      lifecycle: secondLifecycle,
+      projectLabel: "workspace",
+      sessionId: child.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+      manualName: null,
+      generatedTitle: null,
+      fallbackTitle: "Branch of Parent snapshot name",
+      displayLabel: "Branch of Parent snapshot name",
+      generation: { status: "not_started" },
+    });
+    expect(titleCalls).toBe(1);
+
+    await presentation.close();
+    await secondLifecycle.close();
+  } finally {
+    await firstLifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession strips terminal controls and bounds manual names by grapheme", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-name-unicode-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+    await presentation.dispatch({
+      type: "set_session_manual_name",
+      sessionId,
+      name: `\u001b[31m${"界".repeat(61)}\u001b[0m`,
+    });
+
+    expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+      manualName: "界".repeat(60),
+      displayLabel: "界".repeat(60),
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps manual precedence when an in-flight title settles late", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-title-race-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const releaseTitle = Promise.withResolvers<void>();
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        await releaseTitle.promise;
+        yield { type: "text_delta", text: "Late generated title" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "text_delta", text: "Ordinary answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  lifecycle.enableAutomaticTitles();
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Race the title" },
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    await presentation.dispatch({
+      type: "set_session_manual_name",
+      sessionId: created.sessionId,
+      name: "Manual stays visible",
+    });
+    const invalidated = Promise.withResolvers<"invalidated">();
+    const unsubscribe = presentation.subscribe(() => invalidated.resolve("invalidated"));
+
+    releaseTitle.resolve();
+    const closed = lifecycle.close().then(() => "closed" as const);
+    await expect(Promise.race([invalidated.promise, closed])).resolves.toBe("invalidated");
+    expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+      manualName: "Manual stays visible",
+      generatedTitle: "Late generated title",
+      displayLabel: "Manual stays visible",
+      generation: { status: "completed" },
+    });
+
+    unsubscribe();
+    await presentation.close();
+    await closed;
+  } finally {
+    releaseTitle.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession normalizes a real read call without exposing raw arguments", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-read-card-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "notes.txt"), "hello read\n");
+  let call = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        throw new Error("The fixture does not allow a title call.");
+      }
+      call += 1;
+      if (call === 1) {
+        yield { type: "tool_call_start", id: "read-notes", name: "read_file" };
+        yield { type: "tool_call_delta", id: "read-notes", json: '{"path":"notes.txt"}' };
+        yield { type: "tool_call_end", id: "read-notes" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Read complete." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.setSessionManualName({ sessionId: created.sessionId, name: "No auto title" });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Read notes.txt" },
+      limits: { maxTurns: 2 },
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    const tool = presentation
+      .getState()
+      .authoritative.active?.transcript.items.find((item) => item.type === "tool_call");
+    expect(tool).toMatchObject({
+      type: "tool_call",
+      id: expect.stringMatching(new RegExp(`^${created.sessionId}:[0-9]+$`, "u")),
+      sequence: expect.any(Number),
+      callId: "read-notes",
+      qualifiedName: "read_file",
+      kind: "read",
+      effect: "read",
+      label: "read",
+      subject: { type: "path", value: "notes.txt" },
+      status: "completed",
+      resultSummary: "11 bytes",
+      artifacts: [],
+      changePreviewRef: null,
+    });
+    expect(JSON.stringify(tool)).not.toContain('{"path":"notes.txt"}');
+    expect(JSON.stringify(tool)).not.toContain("hello read");
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession exposes a bounded shell summary and durable overflow artifact", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-shell-artifact-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const command = "yes x | head -c 70000";
+  let call = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        throw new Error("The fixture does not allow a title call.");
+      }
+      call += 1;
+      if (call === 1) {
+        yield { type: "tool_call_start", id: "shell-output", name: "run_shell" };
+        yield {
+          type: "tool_call_delta",
+          id: "shell-output",
+          json: JSON.stringify({ command }),
+        };
+        yield { type: "tool_call_end", id: "shell-output" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Shell complete." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({
+      artifactStore: await createFileArtifactStore({ root: join(stateRoot, "artifacts") }),
+      stateRoot,
+      workspaceRoot,
+    }),
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.setSessionManualName({ sessionId: created.sessionId, name: "No auto title" });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Run a bounded output command" },
+      limits: { maxTurns: 2 },
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    const tool = presentation
+      .getState()
+      .authoritative.active?.transcript.items.find(
+        (item) => item.type === "tool_call" && item.callId === "shell-output",
+      );
+    expect(tool).toMatchObject({
+      type: "tool_call",
+      kind: "shell",
+      effect: "execute",
+      label: "shell",
+      subject: { type: "command", value: command },
+      status: "completed",
+      resultSummary: "exit 0 · 70000 stdout bytes",
+      artifacts: [
+        {
+          id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+          mediaType: "application/octet-stream",
+          byteCount: 70_000,
+          source: "tool_output",
+        },
+      ],
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession projects one live pending permission with its inline tool card", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-permission-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "pending.txt"), "pending\n");
+  const model = new FakeModelDriver([
+    { type: "tool_call_start", id: "pending-read", name: "read_file" },
+    { type: "tool_call_delta", id: "pending-read", json: '{"path":"pending.txt"}' },
+    { type: "tool_call_end", id: "pending-read" },
+    { type: "finish", reason: "tool_calls" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }),
+    stateRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+  let requestId: string | undefined;
+  const permissionRequested = Promise.withResolvers<void>();
+  const unsubscribeLifecycle = lifecycle.subscribe((event) => {
+    if (event.type === "tool_permission_requested") {
+      requestId = event.requestId;
+      permissionRequested.resolve();
+    }
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+    const pendingVisible = Promise.withResolvers<void>();
+    const unsubscribePresentation = presentation.subscribe(() => {
+      if (presentation.getState().authoritative.active?.pendingInteractions.length === 1) {
+        pendingVisible.resolve();
+      }
+    });
+    const continuation = lifecycle.continue({
+      sessionId,
+      input: { text: "Read pending.txt" },
+      limits: { maxTurns: 1 },
+    });
+    await permissionRequested.promise;
+    let failureGuard: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        pendingVisible.promise,
+        new Promise<never>((_resolve, reject) => {
+          failureGuard = setTimeout(
+            () => reject(new Error("The pending Presentation state was never published.")),
+            5_000,
+          );
+        }),
+      ]);
+      const active = presentation.getState().authoritative.active;
+      expect(active?.transcript.items).toContainEqual(
+        expect.objectContaining({
+          type: "tool_call",
+          callId: "pending-read",
+          status: "permission_required",
+        }),
+      );
+      expect(active?.pendingInteractions).toEqual([
+        {
+          type: "permission",
+          requestId,
+          callId: "pending-read",
+          effect: "read",
+          subject: { type: "path", value: "pending.txt" },
+          canAllow: true,
+          changePreviewRef: null,
+        },
+      ]);
+    } finally {
+      if (failureGuard !== undefined) {
+        clearTimeout(failureGuard);
+      }
+      if (requestId !== undefined) {
+        lifecycle.decidePermission({ requestId, decision: "deny" });
+      }
+      await continuation;
+      unsubscribePresentation();
+      await presentation.close();
+    }
+  } finally {
+    unsubscribeLifecycle();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession publishes a durable change preview before write permission", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-write-preview-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const model = new FakeModelDriver([
+    { type: "tool_call_start", id: "pending-write", name: "write_file" },
+    {
+      type: "tool_call_delta",
+      id: "pending-write",
+      json: '{"path":"created.txt","content":"line one\\nline two\\n"}',
+    },
+    { type: "tool_call_end", id: "pending-write" },
+    { type: "finish", reason: "tool_calls" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ stateRoot, workspaceRoot }),
+    workspaceRoot,
+  });
+  let requestId: string | undefined;
+  const permissionRequested = Promise.withResolvers<void>();
+  const unsubscribeLifecycle = lifecycle.subscribe((event) => {
+    if (event.type === "tool_permission_requested") {
+      requestId = event.requestId;
+      permissionRequested.resolve();
+    }
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+    const previewVisible = Promise.withResolvers<void>();
+    const unsubscribePresentation = presentation.subscribe(() => {
+      const preview =
+        presentation.getState().authoritative.active?.pendingInteractions[0]?.changePreviewRef;
+      if (preview !== undefined && preview !== null) {
+        previewVisible.resolve();
+      }
+    });
+    const continuation = lifecycle.continue({
+      sessionId,
+      input: { text: "Create created.txt" },
+      limits: { maxTurns: 1 },
+    });
+    await permissionRequested.promise;
+    let failureGuard: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        previewVisible.promise,
+        new Promise<never>((_resolve, reject) => {
+          failureGuard = setTimeout(
+            () => reject(new Error("The durable change preview was never published.")),
+            5_000,
+          );
+        }),
+      ]);
+      const pending = presentation.getState().authoritative.active?.pendingInteractions[0];
+      expect(pending).toMatchObject({
+        type: "permission",
+        requestId,
+        callId: "pending-write",
+        effect: "write",
+        subject: { type: "path", value: "created.txt" },
+        canAllow: true,
+        changePreviewRef: {
+          id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+          mediaType: "text/x-diff; charset=utf-8",
+          byteCount: expect.any(Number),
+          source: "change_preview",
+        },
+      });
+      expect(
+        presentation
+          .getState()
+          .authoritative.active?.transcript.items.find(
+            (item) => item.type === "tool_call" && item.callId === "pending-write",
+          ),
+      ).toMatchObject({ changePreviewRef: pending?.changePreviewRef });
+      const previewId = pending?.changePreviewRef?.id;
+      if (previewId === undefined || requestId === undefined) {
+        throw new Error("Expected an actionable canonical preview.");
+      }
+      rmSync(join(stateRoot, "artifacts", previewId.replace(/^sha256:/u, "")));
+      await expect(
+        presentation.dispatch({
+          type: "decide_permission",
+          requestId,
+          decision: "allow",
+        }),
+      ).resolves.toMatchObject({ status: "rejected", code: "authority_rejected" });
+    } finally {
+      if (failureGuard !== undefined) {
+        clearTimeout(failureGuard);
+      }
+      if (requestId !== undefined) {
+        lifecycle.decidePermission({ requestId, decision: "deny" });
+      }
+      await continuation;
+      unsubscribePresentation();
+      await presentation.close();
+    }
+  } finally {
+    unsubscribeLifecycle();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession publishes a canonical structured-edit preview before permission", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-edit-preview-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "edit.txt"), "before\n");
+  const model = new FakeModelDriver([
+    { type: "tool_call_start", id: "pending-edit", name: "edit_file" },
+    {
+      type: "tool_call_delta",
+      id: "pending-edit",
+      json: JSON.stringify({
+        operations: [
+          {
+            kind: "update",
+            path: "edit.txt",
+            edits: [{ oldText: "before", newText: "after" }],
+          },
+        ],
+      }),
+    },
+    { type: "tool_call_end", id: "pending-edit" },
+    { type: "finish", reason: "tool_calls" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ stateRoot, workspaceRoot }),
+    workspaceRoot,
+  });
+  let requestId: string | undefined;
+  const permissionRequested = Promise.withResolvers<void>();
+  const unsubscribeLifecycle = lifecycle.subscribe((event) => {
+    if (event.type === "tool_permission_requested") {
+      requestId = event.requestId;
+      permissionRequested.resolve();
+    }
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+    const previewVisible = Promise.withResolvers<void>();
+    const unsubscribePresentation = presentation.subscribe(() => {
+      const preview =
+        presentation.getState().authoritative.active?.pendingInteractions[0]?.changePreviewRef;
+      if (preview !== undefined && preview !== null) {
+        previewVisible.resolve();
+      }
+    });
+    const continuation = lifecycle.continue({
+      sessionId,
+      input: { text: "Update edit.txt" },
+      limits: { maxTurns: 1 },
+    });
+    await permissionRequested.promise;
+    let failureGuard: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        previewVisible.promise,
+        new Promise<never>((_resolve, reject) => {
+          failureGuard = setTimeout(
+            () => reject(new Error("The structured-edit preview was never published.")),
+            5_000,
+          );
+        }),
+      ]);
+      expect(presentation.getState().authoritative.active?.pendingInteractions[0]).toMatchObject({
+        requestId,
+        callId: "pending-edit",
+        canAllow: true,
+        changePreviewRef: { source: "change_preview" },
+      });
+    } finally {
+      if (failureGuard !== undefined) {
+        clearTimeout(failureGuard);
+      }
+      if (requestId !== undefined) {
+        lifecycle.decidePermission({ requestId, decision: "deny" });
+      }
+      await continuation;
+      unsubscribePresentation();
+      await presentation.close();
+    }
+  } finally {
+    unsubscribeLifecycle();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession disables allow when the canonical preview artifact is missing", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-preview-missing-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const model = new FakeModelDriver([
+    { type: "tool_call_start", id: "missing-preview", name: "write_file" },
+    {
+      type: "tool_call_delta",
+      id: "missing-preview",
+      json: '{"path":"missing.txt","content":"content\\n"}',
+    },
+    { type: "tool_call_end", id: "missing-preview" },
+    { type: "finish", reason: "tool_calls" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ stateRoot, workspaceRoot }),
+    workspaceRoot,
+  });
+  let requestId: string | undefined;
+  const permissionRequested = Promise.withResolvers<void>();
+  const unsubscribeLifecycle = lifecycle.subscribe((event) => {
+    if (event.type !== "tool_permission_requested") {
+      return;
+    }
+    requestId = event.requestId;
+    const artifactId = event.changePreviewRef?.id;
+    if (artifactId !== undefined) {
+      rmSync(join(stateRoot, "artifacts", artifactId.replace(/^sha256:/u, "")));
+    }
+    permissionRequested.resolve();
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+    const pendingVisible = Promise.withResolvers<void>();
+    const unsubscribePresentation = presentation.subscribe(() => {
+      if (presentation.getState().authoritative.active?.pendingInteractions.length === 1) {
+        pendingVisible.resolve();
+      }
+    });
+    const continuation = lifecycle.continue({
+      sessionId,
+      input: { text: "Create a file with a missing preview" },
+      limits: { maxTurns: 1 },
+    });
+    await permissionRequested.promise;
+    let failureGuard: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        pendingVisible.promise,
+        new Promise<never>((_resolve, reject) => {
+          failureGuard = setTimeout(
+            () => reject(new Error("The pending missing-preview state was never published.")),
+            5_000,
+          );
+        }),
+      ]);
+      expect(presentation.getState().authoritative.active?.pendingInteractions[0]).toMatchObject({
+        requestId,
+        callId: "missing-preview",
+        effect: "write",
+        canAllow: false,
+        changePreviewRef: {
+          id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+          source: "change_preview",
+        },
+      });
+      await expect(
+        presentation.dispatch({
+          type: "decide_permission",
+          requestId: requestId ?? "missing-request",
+          decision: "allow",
+        }),
+      ).resolves.toMatchObject({ status: "rejected", code: "authority_rejected" });
+    } finally {
+      if (failureGuard !== undefined) {
+        clearTimeout(failureGuard);
+      }
+      if (requestId !== undefined) {
+        lifecycle.decidePermission({ requestId, decision: "deny" });
+      }
+      await continuation;
+      unsubscribePresentation();
+      await presentation.close();
+    }
+  } finally {
+    unsubscribeLifecycle();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a preview reference whose provenance no longer matches its call", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-preview-provenance-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const model = new FakeModelDriver([
+    { type: "tool_call_start", id: "bound-preview", name: "write_file" },
+    {
+      type: "tool_call_delta",
+      id: "bound-preview",
+      json: '{"path":"bound.txt","content":"content\\n"}',
+    },
+    { type: "tool_call_end", id: "bound-preview" },
+    { type: "finish", reason: "tool_calls" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ stateRoot, workspaceRoot }),
+    workspaceRoot,
+  });
+  const requested = Promise.withResolvers<string>();
+  const unsubscribe = lifecycle.subscribe((event) => {
+    if (event.type === "tool_permission_requested") {
+      requested.resolve(event.requestId);
+    }
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const continuation = lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Prepare one bound preview" },
+      limits: { maxTurns: 1 },
+    });
+    const requestId = await requested.promise;
+    expect(lifecycle.decidePermission({ requestId, decision: "deny" })).toMatchObject({
+      status: "accepted",
+    });
+    await continuation;
+    const sessionPath = join(
+      stateRoot,
+      "projects",
+      created.projectId.replace(/^sha256:/u, ""),
+      "sessions",
+      `${created.sessionId}.jsonl`,
+    );
+    const records = (await readFile(sessionPath, "utf8"))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as SessionRecord);
+    const tampered = records.map((record) => {
+      if (
+        record.schemaVersion !== 3 ||
+        record.record.type !== "runtime_event" ||
+        record.record.event.type !== "tool_permission_requested" ||
+        record.record.event.changePreviewRef === undefined
+      ) {
+        return record;
+      }
+      return {
+        ...record,
+        record: {
+          ...record.record,
+          event: {
+            ...record.record.event,
+            changePreviewRef: {
+              ...record.record.event.changePreviewRef,
+              source: {
+                ...record.record.event.changePreviewRef.source,
+                callId: "substituted-call",
+              },
+            },
+          },
+        },
+      };
+    });
+    await writeFile(
+      sessionPath,
+      `${tampered.map((record) => JSON.stringify(record)).join("\n")}\n`,
+    );
+
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+  } finally {
+    unsubscribe();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession creates and selects sessions through semantic commands", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-create-select-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const firstSessionId = presentation.getState().authoritative.active?.session.id;
+    if (firstSessionId === undefined) {
+      throw new Error("Expected an initial session.");
+    }
+
+    await expect(
+      presentation.dispatch({
+        type: "create_session",
+        targetId: "deepseek-v4-flash.direct",
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    const secondSessionId = presentation.getState().authoritative.active?.session.id;
+    expect(secondSessionId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
+    );
+    expect(secondSessionId).not.toBe(firstSessionId);
+    expect(presentation.getState().authoritative.sessions.items).toHaveLength(2);
+
+    await expect(
+      presentation.dispatch({ type: "select_session", sessionId: firstSessionId }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState()).toMatchObject({
+      authoritative: {
+        continuity: { status: "current", sessionThroughSequence: 1 },
+        active: {
+          session: { id: firstSessionId, label: "New session" },
+          transcript: { items: [], olderCursor: null },
+        },
+      },
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession discovers and selects cold sibling project sessions", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-cold-catalog-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const first = await lifecycle.create({ targetIdentity });
+    const second = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: second.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    try {
+      expect(
+        presentation
+          .getState()
+          .authoritative.sessions.items.map((session) => session.id)
+          .sort(),
+      ).toEqual([first.sessionId, second.sessionId].sort());
+      await expect(
+        presentation.dispatch({ type: "select_session", sessionId: first.sessionId }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      expect(presentation.getState().authoritative.active?.session.id).toBe(first.sessionId);
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession consumes the opaque project catalog cursor", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-catalog-page-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const created = [
+      await lifecycle.create({ targetIdentity }),
+      await lifecycle.create({ targetIdentity }),
+    ].sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+    const first = created[0];
+    if (first === undefined) {
+      throw new Error("Expected a project session.");
+    }
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: first.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationCatalogPageSize]: 1,
+    });
+    try {
+      const cursor = presentation.getState().authoritative.sessions.nextCursor;
+      expect(presentation.getState().authoritative.sessions.items).toHaveLength(1);
+      if (cursor === null) {
+        throw new Error("Expected an opaque catalog cursor.");
+      }
+      await expect(
+        presentation.dispatch({ type: "load_more_sessions", after: cursor }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      expect(presentation.getState().authoritative.sessions).toMatchObject({
+        items: [{ id: created[0]?.sessionId }, { id: created[1]?.sessionId }],
+        nextCursor: null,
+      });
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession rejects a failed catalog page inside CommandReceipt", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-catalog-failure-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const first = await lifecycle.create({ targetIdentity });
+    await lifecycle.create({ targetIdentity });
+    const presentationLifecycle: SessionLifecycle = {
+      ...lifecycle,
+      async listProjectSessions(input) {
+        if (input?.cursor !== undefined) {
+          throw new Error("injected catalog read failure");
+        }
+        return lifecycle.listProjectSessions(input);
+      },
+    };
+    const presentation = await createPresentationSession({
+      lifecycle: presentationLifecycle,
+      projectLabel: "workspace",
+      sessionId: first.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationCatalogPageSize]: 1,
+    });
+    try {
+      const cursor = presentation.getState().authoritative.sessions.nextCursor;
+      if (cursor === null) {
+        throw new Error("Expected an opaque catalog cursor.");
+      }
+      await expect(
+        presentation.dispatch({ type: "load_more_sessions", after: cursor }),
+      ).resolves.toEqual({
+        status: "rejected",
+        code: "persistence_failed",
+        message: "The project session catalog could not be read.",
+      });
+      expect(presentation.getState().authoritative.sessions.nextCursor).toBe(cursor);
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession admits one submit and cancellation without retrying the run", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-submit-cancel-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelStarted = Promise.withResolvers<void>();
+  let modelCalls = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      modelCalls += 1;
+      modelStarted.resolve();
+      await new Promise<void>((resolve) => {
+        if (request.signal.aborted) {
+          resolve();
+          return;
+        }
+        request.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      throw request.signal.reason;
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_prompt",
+        sessionId,
+        text: "Cancel this run",
+        skills: [],
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    await modelStarted.promise;
+    const cancelledVisible = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation
+          .getState()
+          .authoritative.active?.transcript.items.some(
+            (item) =>
+              item.type === "session_notice" &&
+              item.status === "interrupted" &&
+              item.reason === "cancelled",
+          )
+      ) {
+        cancelledVisible.resolve();
+      }
+    });
+    await expect(presentation.dispatch({ type: "cancel_run", sessionId })).resolves.toMatchObject({
+      status: "admitted",
+      resource: null,
+    });
+    let failureGuard: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        cancelledVisible.promise,
+        new Promise<never>((_resolve, reject) => {
+          failureGuard = setTimeout(
+            () => reject(new Error("The cancelled durable settlement was never projected.")),
+            5_000,
+          );
+        }),
+      ]);
+      expect(modelCalls).toBe(1);
+    } finally {
+      if (failureGuard !== undefined) {
+        clearTimeout(failureGuard);
+      }
+      unsubscribe();
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession rejects submit when lifecycle admission fails before durable user input", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-submit-rejected-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("target unavailable");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId,
+          text: "This cannot be admitted",
+          skills: [],
+        }),
+      ).resolves.toMatchObject({ status: "rejected", code: "not_available" });
+      expect(presentation.getState().authoritative.active?.transcript.items).toEqual([]);
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession binds a submit receipt to its exact durable run", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-submit-run-id-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Exact run." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  let durableRunId: string | undefined;
+  const unsubscribe = lifecycle.subscribeSessionEvents((notification) => {
+    if (notification.event.type === "user_message") {
+      durableRunId = notification.runId;
+    }
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      const receipt = await presentation.dispatch({
+        type: "submit_prompt",
+        sessionId,
+        text: "Bind this exact run",
+        skills: [],
+      });
+      expect(receipt).toMatchObject({ status: "admitted", resource: null });
+      if (receipt.status !== "admitted") {
+        throw new Error("Expected an admitted submit command.");
+      }
+      expect(receipt.commandId).toBe(durableRunId);
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    unsubscribe();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession publishes live assistant progress and replaces it with durable completion", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-live-reconcile-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const releaseCompletion = Promise.withResolvers<void>();
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        yield { type: "text_delta", text: "Live reconciliation" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "text_delta", text: "Streaming answer" };
+      await releaseCompletion.promise;
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      const transientVisible = Promise.withResolvers<void>();
+      const durableVisible = Promise.withResolvers<void>();
+      let failureGuard: ReturnType<typeof setTimeout> | undefined;
+      const failed = new Promise<never>((_resolve, reject) => {
+        failureGuard = setTimeout(
+          () => reject(new Error("Live Presentation reconciliation did not settle.")),
+          5_000,
+        );
+      });
+      const unsubscribe = presentation.subscribe(() => {
+        const current = presentation.getState();
+        if (current.transient?.assistant?.text === "Streaming answer") {
+          transientVisible.resolve();
+        }
+        if (
+          current.transient === null &&
+          current.authoritative.active?.transcript.items.some(
+            (item) => item.type === "assistant_message" && item.text === "Streaming answer",
+          )
+        ) {
+          durableVisible.resolve();
+        }
+      });
+      try {
+        await expect(
+          presentation.dispatch({
+            type: "submit_prompt",
+            sessionId,
+            text: "Stream one answer",
+            skills: [],
+          }),
+        ).resolves.toMatchObject({ status: "admitted", resource: null });
+        await Promise.race([transientVisible.promise, failed]);
+        releaseCompletion.resolve();
+        await Promise.race([durableVisible.promise, failed]);
+        expect(presentation.getState().transient).toBeNull();
+      } finally {
+        if (failureGuard !== undefined) {
+          clearTimeout(failureGuard);
+        }
+        unsubscribe();
+      }
+    } finally {
+      releaseCompletion.resolve();
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession deduplicates notifications and repairs an impossible durable gap", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-gap-repair-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let injected = false;
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Gap repaired." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionRuntimeNotificationTransform]: {
+      project(notification) {
+        if (injected || notification.event.type !== "user_message") {
+          return [notification];
+        }
+        injected = true;
+        return [
+          notification,
+          notification,
+          {
+            ...notification,
+            notificationId: `${notification.notificationId}:impossible-gap`,
+            throughSequence: notification.throughSequence + 100,
+          },
+        ];
+      },
+    },
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const repairing = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (presentation.getState().authoritative.continuity.status === "repairing") {
+        repairing.resolve();
+      }
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId,
+          text: "Repair one notification gap",
+          skills: [],
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await repairing.promise;
+    } finally {
+      unsubscribe();
+      await presentation.close();
+    }
+    expect(presentation.getState().authoritative.continuity).toMatchObject({ status: "current" });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession repairs a lower-sequence runtime notification regression", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-regression-repair-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let injected = false;
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Regression repaired." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionRuntimeNotificationTransform]: {
+      project(notification) {
+        if (injected || notification.event.type !== "model_message_started") {
+          return [notification];
+        }
+        injected = true;
+        return [
+          notification,
+          {
+            ...notification,
+            notificationId: `${notification.notificationId}:regression`,
+            throughSequence: Math.max(0, notification.throughSequence - 1),
+          },
+        ];
+      },
+    },
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const repairing = Promise.withResolvers<void>();
+    const completed = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      const current = presentation.getState();
+      if (current.authoritative.continuity.status === "repairing") {
+        repairing.resolve();
+      }
+      if (
+        injected &&
+        current.authoritative.continuity.status === "current" &&
+        current.authoritative.active?.transcript.items.some(
+          (item) => item.type === "assistant_message" && item.text === "Regression repaired.",
+        )
+      ) {
+        completed.resolve();
+      }
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId,
+          text: "Repair one lower notification",
+          skills: [],
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await repairing.promise;
+      await completed.promise;
+      expect(presentation.getState().authoritative.continuity).toMatchObject({
+        status: "current",
+      });
+    } finally {
+      unsubscribe();
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession recovers after one authoritative runtime refresh failure", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-refresh-recovery-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Recovered answer." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  let failedOnce = false;
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+      [presentationRuntimeRefreshBarrier]: {
+        async beforeRead(notification) {
+          if (!failedOnce && notification.event.type === "user_message") {
+            failedOnce = true;
+            throw new Error("injected read failure");
+          }
+        },
+      },
+    });
+    const degraded = Promise.withResolvers<void>();
+    const recovered = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      const current = presentation.getState();
+      if (current.authoritative.continuity.status === "degraded") {
+        degraded.resolve();
+      }
+      if (
+        failedOnce &&
+        current.authoritative.continuity.status === "current" &&
+        current.authoritative.active?.transcript.items.some(
+          (item) => item.type === "assistant_message" && item.text === "Recovered answer.",
+        )
+      ) {
+        recovered.resolve();
+      }
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId,
+          text: "Recover one failed refresh",
+          skills: [],
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await degraded.promise;
+      await recovered.promise;
+    } finally {
+      unsubscribe();
+      await expect(presentation.close()).resolves.toBeUndefined();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession subscriber failures cannot poison runtime settlement or close", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-subscriber-failure-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Observer-safe answer." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const subscriberCalled = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      subscriberCalled.resolve();
+      throw new Error("subscriber failed");
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId,
+          text: "Keep observer failures isolated",
+          skills: [],
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await subscriberCalled.promise;
+      await expect(presentation.close()).resolves.toBeUndefined();
+    } finally {
+      unsubscribe();
+      await presentation.close().catch(() => undefined);
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps an active run bound to its source session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-session-bound-run-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelStarted = Promise.withResolvers<void>();
+  const model: ModelDriver = {
+    async *stream(request) {
+      modelStarted.resolve();
+      await new Promise<void>((resolve) => {
+        request.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      throw request.signal.reason;
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const source = await lifecycle.create({ targetIdentity });
+    const sibling = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: source.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    try {
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId: source.sessionId,
+          text: "Remain bound to this session",
+          skills: [],
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await modelStarted.promise;
+      await expect(
+        presentation.dispatch({ type: "select_session", sessionId: sibling.sessionId }),
+      ).resolves.toMatchObject({ status: "rejected", code: "conflict" });
+      expect(presentation.getState().authoritative.active?.session.id).toBe(source.sessionId);
+      await expect(
+        presentation.dispatch({ type: "cancel_run", sessionId: source.sessionId }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession preserves failed and output-limited run notices", async () => {
+  for (const scenario of ["failed", "incomplete"] as const) {
+    const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-presentation-${scenario}-notice-`));
+    const stateRoot = join(testRoot, "state");
+    const workspaceRoot = join(testRoot, "workspace");
+    await mkdir(workspaceRoot);
+    const model: ModelDriver = {
+      async *stream() {
+        if (scenario === "failed") {
+          throw new ModelDriverError("transport", "private provider detail", {
+            cause: new Error("private cause"),
+          });
+        }
+        yield { type: "text_delta", text: "Partial answer" };
+        yield { type: "finish", reason: "length" };
+      },
+    };
+    const modelTargets: ModelTargets = {
+      async resolve() {
+        return { identity: targetIdentity, driver: model, contextProfile };
+      },
+      async snapshot() {
+        return {
+          targets: [
+            {
+              identity: targetIdentity,
+              readiness: { status: "available", credentialSource: "deterministic test adapter" },
+              contextProfile,
+            },
+          ],
+        };
+      },
+    };
+    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+    try {
+      const presentation = await createPresentationSession({
+        lifecycle,
+        projectLabel: "workspace",
+        targetIdentity,
+        stateRoot,
+        workspaceRoot,
+      });
+      const noticeVisible = Promise.withResolvers<void>();
+      const unsubscribe = presentation.subscribe(() => {
+        if (
+          presentation
+            .getState()
+            .authoritative.active?.transcript.items.some(
+              (item) => item.type === "session_notice" && item.status === scenario,
+            )
+        ) {
+          noticeVisible.resolve();
+        }
+      });
+      try {
+        const sessionId = presentation.getState().authoritative.active?.session.id;
+        if (sessionId === undefined) {
+          throw new Error("Expected an active session.");
+        }
+        await expect(
+          presentation.dispatch({
+            type: "submit_prompt",
+            sessionId,
+            text: `Project the ${scenario} outcome`,
+            skills: [],
+          }),
+        ).resolves.toMatchObject({ status: "admitted", resource: null });
+        await noticeVisible.promise;
+        const notice = presentation
+          .getState()
+          .authoritative.active?.transcript.items.find(
+            (item) => item.type === "session_notice" && item.status === scenario,
+          );
+        expect(notice).toMatchObject(
+          scenario === "failed"
+            ? { status: "failed", code: expect.any(String), message: expect.any(String) }
+            : { status: "incomplete", reason: "output_limit" },
+        );
+        expect(JSON.stringify(notice)).not.toContain("private provider detail");
+      } finally {
+        unsubscribe();
+        await presentation.close();
+      }
+    } finally {
+      await lifecycle.close();
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("PresentationSession preserves a bounded tool failure cause", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-tool-failure-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const model = new FakeModelDriver((request) =>
+    request.messages.at(-1)?.role === "user"
+      ? [
+          { type: "tool_call_start", id: "missing-read", name: "read_file" },
+          {
+            type: "tool_call_delta",
+            id: "missing-read",
+            json: '{"path":"missing.txt"}',
+          },
+          { type: "tool_call_end", id: "missing-read" },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          { type: "text_delta", text: "The missing read was handled." },
+          { type: "finish", reason: "stop" },
+        ],
+  );
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const failedToolVisible = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation
+          .getState()
+          .authoritative.active?.transcript.items.some(
+            (item) =>
+              item.type === "tool_call" &&
+              item.callId === "missing-read" &&
+              item.status === "failed",
+          )
+      ) {
+        failedToolVisible.resolve();
+      }
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      await presentation.dispatch({
+        type: "submit_prompt",
+        sessionId,
+        text: "Read one missing file",
+        skills: [],
+      });
+      await failedToolVisible.promise;
+      expect(
+        presentation
+          .getState()
+          .authoritative.active?.transcript.items.find(
+            (item) => item.type === "tool_call" && item.callId === "missing-read",
+          ),
+      ).toMatchObject({
+        status: "failed",
+        source: {
+          provenance: "provider_model_response",
+          argumentsDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        },
+        durationMs: null,
+        outcome: {
+          status: "failed",
+          code: "not_found",
+          message: expect.any(String),
+        },
+        resultSummary: expect.stringContaining("not_found"),
+      });
+    } finally {
+      unsubscribe();
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession exposes indeterminate tool truth without parsing summary prose", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-indeterminate-tool-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const runId = "123e4567-e89b-42d3-a456-426614170099";
+  const call = { id: "uncertain-call", name: "mcp__server__mutate", argumentsJson: "{}" };
+  const argumentsDigest = `sha256:${createHash("sha256").update(call.argumentsJson).digest("hex")}`;
+  const indeterminate = {
+    code: "tool_effect_indeterminate" as const,
+    reason: "mcp_connection_closed" as const,
+    message: "The remote effect requires inspection.",
+  };
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const store = await openJsonlSessionStore<SessionRecord>({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    const genesis = (await store.read())[0];
+    if (
+      genesis?.schemaVersion !== 3 ||
+      genesis.record.type !== "session_genesis" ||
+      genesis.record.promptContext === undefined
+    ) {
+      throw new Error("Expected a current prompt context fixture.");
+    }
+    const promptMessages = assemblePromptMessagesV1(
+      [{ role: "user", content: "Mutate remotely" }],
+      genesis.record.promptContext,
+      genesis.record.skillContext,
+      new Map(),
+    );
+    const promptTools = genesis.record.promptContext.toolProfile.definitions.map(
+      ({ definition }) => definition,
+    );
+    const records = [
+      {
+        schemaVersion: 3,
+        record: { type: "logical_run_started", runId, userMessage: "Mutate remotely" },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "user_message", text: "Mutate remotely" },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "provider_attempt_started",
+          runId,
+          turn: 1,
+          attempt: 1,
+          targetIdentity,
+          promptProjection: {
+            version: 1,
+            assemblyIdentityDigest: genesis.record.promptContext.assemblyIdentityDigest,
+            requestProjectionDigest: digestPromptRequestV1(promptMessages, promptTools),
+          },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "model_message_started" },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "model_response_completed",
+          runId,
+          turn: 1,
+          attempt: 1,
+          targetIdentity,
+          response: {
+            text: "",
+            toolCalls: [call],
+            toolIntents: [
+              {
+                callId: call.id,
+                name: call.name,
+                argumentsDigest,
+                effect: "network",
+                definitionDigest: `sha256:${"b".repeat(64)}`,
+                replay: "never",
+              },
+            ],
+            finishReason: "tool_calls",
+          },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "model_message_completed", text: "" },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "tool_requested", callId: call.id, name: call.name },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: {
+            type: "tool_permission_decided",
+            callId: call.id,
+            name: call.name,
+            decision: "allow",
+            effect: "network",
+            scope: "call",
+            subject: {
+              type: "mcp_tool",
+              serverId: "server",
+              originalName: "mutate",
+              qualifiedName: call.name,
+              serverDefinitionDigest: `sha256:${"c".repeat(64)}`,
+              definitionDigest: `sha256:${"b".repeat(64)}`,
+              argumentsDigest,
+            },
+          },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "tool_started", callId: call.id, name: call.name },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "tool_failed", callId: call.id, name: call.name, error: indeterminate },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "session_settled", result: { status: "failed", error: indeterminate } },
+        },
+      },
+    ] as const;
+    for (const [index, record] of records.entries()) {
+      await store.append({ ...record, sequence: index + 2 } as SessionRecord);
+    }
+
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    try {
+      expect(
+        presentation
+          .getState()
+          .authoritative.active?.transcript.items.find(
+            (item) => item.type === "tool_call" && item.callId === call.id,
+          ),
+      ).toMatchObject({
+        status: "failed",
+        outcome: {
+          status: "indeterminate",
+          code: "tool_effect_indeterminate",
+          reason: "mcp_connection_closed",
+        },
+      });
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession admits one exact permission decision and rejects its duplicate", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-permission-command-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "allow.txt"), "allowed\n");
+  let modelCalls = 0;
+  const model = new FakeModelDriver((_request) => {
+    modelCalls += 1;
+    return modelCalls === 1
+      ? [
+          { type: "tool_call_start", id: "allow-read", name: "read_file" },
+          { type: "tool_call_delta", id: "allow-read", json: '{"path":"allow.txt"}' },
+          { type: "tool_call_end", id: "allow-read" },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          { type: "text_delta", text: "Allowed once." },
+          { type: "finish", reason: "stop" },
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }),
+    stateRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+  const settled = Promise.withResolvers<void>();
+  const unsubscribeLifecycle = lifecycle.subscribe((event) => {
+    if (event.type === "session_settled") {
+      settled.resolve();
+    }
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+    await presentation.dispatch({
+      type: "set_session_manual_name",
+      sessionId,
+      name: "No automatic title",
+    });
+    await presentation.dispatch({
+      type: "submit_prompt",
+      sessionId,
+      text: "Read allow.txt once",
+      skills: [],
+    });
+    const pending = Promise.withResolvers<string>();
+    const unsubscribePresentation = presentation.subscribe(() => {
+      const requestId =
+        presentation.getState().authoritative.active?.pendingInteractions[0]?.requestId;
+      if (requestId !== undefined) {
+        pending.resolve(requestId);
+      }
+    });
+    const alreadyPending =
+      presentation.getState().authoritative.active?.pendingInteractions[0]?.requestId;
+    if (alreadyPending !== undefined) {
+      pending.resolve(alreadyPending);
+    }
+    let failureGuard: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const requestId = await Promise.race([
+        pending.promise,
+        new Promise<never>((_resolve, reject) => {
+          failureGuard = setTimeout(
+            () => reject(new Error("The permission command fixture never became pending.")),
+            5_000,
+          );
+        }),
+      ]);
+      await expect(
+        presentation.dispatch({ type: "decide_permission", requestId, decision: "allow" }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await expect(
+        presentation.dispatch({ type: "decide_permission", requestId, decision: "allow" }),
+      ).resolves.toMatchObject({ status: "rejected", code: "stale_interaction" });
+      await settled.promise;
+      expect(modelCalls).toBe(2);
+    } finally {
+      if (failureGuard !== undefined) {
+        clearTimeout(failureGuard);
+      }
+      unsubscribePresentation();
+      await presentation.close();
+    }
+  } finally {
+    unsubscribeLifecycle();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession branches at an exact boundary and activates the child", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-branch-command-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Branch source answer." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const parent = await lifecycle.create({ targetIdentity });
+    await lifecycle.setSessionManualName({ sessionId: parent.sessionId, name: "Branch source" });
+    await lifecycle.continue({
+      sessionId: parent.sessionId,
+      input: { text: "Create a branch source" },
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: parent.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    const boundary = presentation.getState().authoritative.continuity;
+    if (boundary.status !== "current") {
+      throw new Error("Expected a current branch boundary.");
+    }
+
+    await expect(
+      presentation.dispatch({
+        type: "branch_session",
+        parentSessionId: parent.sessionId,
+        atSequence: boundary.sessionThroughSequence,
+        targetId: null,
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    const child = presentation.getState().authoritative.active;
+    expect(child?.session).toMatchObject({
+      id: expect.not.stringMatching(parent.sessionId),
+      naming: {
+        manualName: null,
+        fallbackTitle: "Branch of Branch source",
+        displayLabel: "Branch of Branch source",
+      },
+    });
+    expect(child?.transcript.items).toContainEqual(
+      expect.objectContaining({ type: "assistant_message", text: "Branch source answer." }),
+    );
+    expect(presentation.getState().authoritative.sessions.items).toHaveLength(2);
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession branches a branch at one inherited source-aware boundary", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-source-branch-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver((request) => {
+    const message = request.messages.findLast((candidate) => candidate.role === "user");
+    const prompt = message?.content ?? "";
+    return [
+      {
+        type: "text_delta",
+        text: prompt.includes("root") ? "Root answer." : "Child-only answer.",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionAutomaticTitlesEnabled]: false,
+  });
+
+  try {
+    const root = await lifecycle.create({ targetIdentity });
+    const settledRoot = await lifecycle.continue({
+      sessionId: root.sessionId,
+      input: { text: "Complete the root turn" },
+    });
+    const child = await lifecycle.branch({
+      parentSessionId: root.sessionId,
+      atSequence: settledRoot.snapshot.lastSequence,
+    });
+    await lifecycle.setSessionManualName({ sessionId: child.sessionId, name: "Active child" });
+    await lifecycle.continue({
+      sessionId: child.sessionId,
+      input: { text: "Complete the child-only turn" },
+    });
+    const unrelated = await lifecycle.create({ targetIdentity });
+    await expect(
+      lifecycle.branch({
+        parentSessionId: child.sessionId,
+        sourceBoundary: { sessionId: unrelated.sessionId, sequence: 1 },
+      }),
+    ).rejects.toMatchObject({ code: "session_branch_boundary_invalid" });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: child.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    const rootAnswer = presentation
+      .getState()
+      .authoritative.active?.transcript.items.find(
+        (item) => item.type === "assistant_message" && item.text === "Root answer.",
+      );
+    if (rootAnswer?.branchBoundary === null || rootAnswer?.branchBoundary === undefined) {
+      throw new Error("Expected the inherited root answer to expose a complete source boundary.");
+    }
+
+    await expect(
+      presentation.dispatch({
+        type: "branch_session",
+        parentSessionId: child.sessionId,
+        sourceBoundary: rootAnswer.branchBoundary,
+        targetId: null,
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    const grandchild = presentation.getState().authoritative.active;
+    expect(grandchild?.session.naming).toMatchObject({
+      fallbackTitle: "Branch of Active child",
+      displayLabel: "Branch of Active child",
+    });
+    expect(grandchild?.transcript.items).toContainEqual(
+      expect.objectContaining({ type: "assistant_message", text: "Root answer." }),
+    );
+    expect(grandchild?.transcript.items).not.toContainEqual(
+      expect.objectContaining({ type: "assistant_message", text: "Child-only answer." }),
+    );
+    const grandchildId = grandchild?.session.id;
+    if (grandchildId === undefined) {
+      throw new Error("Expected a source-aware grandchild session.");
+    }
+    await expect(lifecycle.inspect({ sessionId: grandchildId })).resolves.toMatchObject({
+      lineage: {
+        recordVersion: 2,
+        parentSessionId: child.sessionId,
+        sourceSessionId: root.sessionId,
+        sourceEventPosition: rootAnswer.branchBoundary.sequence,
+      },
+    });
+
+    await presentation.close();
+    await lifecycle.close();
+    const restarted = createSessionLifecycle({
+      modelTargets,
+      stateRoot,
+      workspaceRoot,
+      [sessionAutomaticTitlesEnabled]: false,
+    });
+    const reopened = await createPresentationSession({
+      lifecycle: restarted,
+      projectLabel: "workspace",
+      sessionId: grandchildId,
+      stateRoot,
+      workspaceRoot,
+    });
+    expect(reopened.getState().authoritative.active?.transcript.items).toContainEqual(
+      expect.objectContaining({ type: "assistant_message", text: "Root answer." }),
+    );
+    expect(reopened.getState().authoritative.active?.transcript.items).not.toContainEqual(
+      expect.objectContaining({ type: "assistant_message", text: "Child-only answer." }),
+    );
+    await reopened.close();
+    await restarted.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});

@@ -19,6 +19,7 @@ export type AgentSessionDurableContext = {
   readonly inheritedEvidence?: ContextEvidenceV1 | undefined;
   readonly initialMessages?: readonly ModelMessage[];
   readonly nextSequence: number;
+  readonly newRunId?: string;
   readonly projectId?: string;
   readonly promptContext?: PromptContextRecord | undefined;
   readonly skillContext?: SkillContextRecordV1 | undefined;
@@ -37,6 +38,13 @@ export type AgentSessionDurableContext = {
   readonly skillResourceLineageBytes?: number;
   readonly skillResourceRunBytes?: number;
   readonly sessionId?: string;
+  readonly afterLogicalRunStarted?:
+    | ((input: {
+        readonly sessionId: string;
+        readonly runId: string;
+        readonly sequence: number;
+      }) => Promise<void>)
+    | undefined;
   readonly targetIdentity: ModelTargetIdentity;
   readonly resume?: {
     readonly runId: string;
