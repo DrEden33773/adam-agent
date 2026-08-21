@@ -2604,6 +2604,7 @@ test("SessionLifecycle atomically fails one MCP generation and causally closes e
   const blockedSpawn = join(testRoot, "blocked-spawned");
   const blockedClose = join(testRoot, "blocked-closed");
   const blockedGate = join(testRoot, "blocked-gate");
+  const blockedInitializeReceived = join(testRoot, "blocked-initialize-received");
   const failingSpawn = join(testRoot, "failing-spawned");
   const failingClose = join(testRoot, "failing-closed");
   await mkdir(workspaceRoot);
@@ -2613,7 +2614,14 @@ test("SessionLifecycle atomically fails one MCP generation and causally closes e
       mcpServers: {
         blocked: {
           command: process.execPath,
-          args: [mcpServerFixturePath, blockedSpawn, blockedClose, "gated-initialize", blockedGate],
+          args: [
+            mcpServerFixturePath,
+            blockedSpawn,
+            blockedClose,
+            "gated-initialize",
+            blockedGate,
+            blockedInitializeReceived,
+          ],
         },
         failing: {
           command: process.execPath,
@@ -2622,7 +2630,7 @@ test("SessionLifecycle atomically fails one MCP generation and causally closes e
             failingSpawn,
             failingClose,
             "fail-initialize-after-gate",
-            blockedSpawn,
+            blockedInitializeReceived,
           ],
         },
       },
@@ -2859,6 +2867,7 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
   const spawnMarker = join(testRoot, "spawned");
   const closeMarker = join(testRoot, "closed");
   const initializeGate = join(testRoot, "initialize-gate");
+  const initializeReceivedMarker = join(testRoot, "initialize-received");
   await mkdir(workspaceRoot);
   await writeFile(
     join(workspaceRoot, ".mcp.json"),
@@ -2872,6 +2881,7 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
             closeMarker,
             "gated-initialize",
             initializeGate,
+            initializeReceivedMarker,
           ],
         },
       },
@@ -2900,7 +2910,7 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
       definitionDigest: preview.definitionDigest,
     });
 
-    const spawned = observeFileCreation(spawnMarker);
+    const initializeReceived = observeFileCreation(initializeReceivedMarker);
     const activation = lifecycle.configureMcp({
       type: "activate_servers",
       sessionId: created.sessionId,
@@ -2910,7 +2920,7 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
       (value) => ({ status: "resolved" as const, value }),
       (error: unknown) => ({ status: "rejected" as const, error }),
     );
-    await spawned;
+    await initializeReceived;
     const activating = await lifecycle.inspect({ sessionId: created.sessionId });
     const activatingMcp = activating.schemaVersion === 3 ? activating.mcp : undefined;
     if (
@@ -2981,6 +2991,7 @@ test("SessionLifecycle bounds initialize and discovery with a deterministic tota
   const spawnMarker = join(testRoot, "spawned");
   const closeMarker = join(testRoot, "closed");
   const initializeGate = join(testRoot, "initialize-gate");
+  const initializeReceivedMarker = join(testRoot, "initialize-received");
   await mkdir(workspaceRoot);
   await writeFile(
     join(workspaceRoot, ".mcp.json"),
@@ -2994,6 +3005,7 @@ test("SessionLifecycle bounds initialize and discovery with a deterministic tota
             closeMarker,
             "gated-initialize",
             initializeGate,
+            initializeReceivedMarker,
           ],
         },
       },
@@ -3026,7 +3038,7 @@ test("SessionLifecycle bounds initialize and discovery with a deterministic tota
       serverId: preview.serverId,
       definitionDigest: preview.definitionDigest,
     });
-    const spawned = observeFileCreation(spawnMarker);
+    const initializeReceived = observeFileCreation(initializeReceivedMarker);
     const activation = lifecycle.configureMcp({
       type: "activate_servers",
       sessionId: created.sessionId,
@@ -3037,7 +3049,7 @@ test("SessionLifecycle bounds initialize and discovery with a deterministic tota
       (error: unknown) => ({ status: "rejected" as const, error }),
     );
 
-    await spawned;
+    await initializeReceived;
     const fixturePid = Number.parseInt(await readFile(spawnMarker, "utf8"), 10);
     await manualDiscoveryDeadline.advanceBy(30_000);
     const outcome = await observedActivation;
@@ -7952,6 +7964,7 @@ test("SessionLifecycle close interrupts an in-progress activation and waits for 
   const spawnMarker = join(testRoot, "spawned");
   const closeMarker = join(testRoot, "closed");
   const initializeGate = join(testRoot, "initialize-gate");
+  const initializeReceivedMarker = join(testRoot, "initialize-received");
   await mkdir(workspaceRoot);
   await writeFile(
     join(workspaceRoot, ".mcp.json"),
@@ -7965,6 +7978,7 @@ test("SessionLifecycle close interrupts an in-progress activation and waits for 
             closeMarker,
             "gated-initialize",
             initializeGate,
+            initializeReceivedMarker,
           ],
         },
       },
@@ -7993,7 +8007,7 @@ test("SessionLifecycle close interrupts an in-progress activation and waits for 
       definitionDigest: preview.definitionDigest,
     });
 
-    const spawned = observeFileCreation(spawnMarker);
+    const initializeReceived = observeFileCreation(initializeReceivedMarker);
     const activation = lifecycle.configureMcp({
       type: "activate_servers",
       sessionId: created.sessionId,
@@ -8003,7 +8017,7 @@ test("SessionLifecycle close interrupts an in-progress activation and waits for 
       () => "fulfilled" as const,
       () => "rejected" as const,
     );
-    await spawned;
+    await initializeReceived;
     const fixturePid = Number.parseInt(await readFile(spawnMarker, "utf8"), 10);
     const firstClose = await lifecycle.close();
     let processAbsentBeforeGate = false;

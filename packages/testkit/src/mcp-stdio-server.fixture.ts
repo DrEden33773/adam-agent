@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, watch, writeFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const spawnMarker = process.argv[2];
@@ -94,26 +94,20 @@ function respond(request: JsonRpcRequest): void {
       process.exit(1);
     }
     if (mode === "fail-initialize-after-gate" && callMarker !== undefined) {
-      if (existsSync(callMarker)) {
+      gateWatcher ??= watchForFile(callMarker, () => {
+        gateWatcher = undefined;
         process.exit(1);
-      }
-      gateWatcher ??= watch(dirname(callMarker), (_event, filename) => {
-        if (filename === basename(callMarker) && existsSync(callMarker)) {
-          gateWatcher?.close();
-          gateWatcher = undefined;
-          process.exit(1);
-        }
       });
       return;
     }
-    if (mode === "gated-initialize" && callMarker !== undefined && !existsSync(callMarker)) {
-      gateWatcher ??= watch(dirname(callMarker), (_event, filename) => {
-        if (filename === basename(callMarker) && existsSync(callMarker)) {
-          gateWatcher?.close();
-          gateWatcher = undefined;
-          writeInitializeResult(request);
-        }
+    if (mode === "gated-initialize" && callMarker !== undefined) {
+      gateWatcher ??= watchForFile(callMarker, () => {
+        gateWatcher = undefined;
+        writeInitializeResult(request);
       });
+      if (notificationGate !== undefined) {
+        writeFileSync(notificationGate, "received");
+      }
       return;
     }
     writeInitializeResult(request);
@@ -122,12 +116,9 @@ function respond(request: JsonRpcRequest): void {
   if (request.method === "tools/list") {
     toolListRequestCount += 1;
     if (mode === "exit-after-gate" && callMarker !== undefined && gateWatcher === undefined) {
-      gateWatcher = watch(dirname(callMarker), (_event, filename) => {
-        if (filename === basename(callMarker) && existsSync(callMarker)) {
-          gateWatcher?.close();
-          gateWatcher = undefined;
-          process.exit(0);
-        }
+      gateWatcher = watchForFile(callMarker, () => {
+        gateWatcher = undefined;
+        process.exit(0);
       });
     }
     if (mode === "malformed-tools-list") {
@@ -510,22 +501,35 @@ function writeInitializeResult(request: JsonRpcRequest): void {
         return;
       }
       listChangedSent = true;
-      gateWatcher?.close();
       gateWatcher = undefined;
       process.stdout.write(
         `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" })}\n`,
       );
     };
-    if (existsSync(notificationGate)) {
-      notify();
-    } else {
-      gateWatcher ??= watch(dirname(notificationGate), (_event, filename) => {
-        if (filename === basename(notificationGate) && existsSync(notificationGate)) {
-          notify();
-        }
-      });
-    }
+    gateWatcher ??= watchForFile(notificationGate, notify);
   }
+}
+
+function watchForFile(path: string, onFile: () => void): ReturnType<typeof watch> | undefined {
+  let settled = false;
+  let watcher: ReturnType<typeof watch> | undefined;
+  const finish = () => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    watcher?.close();
+    onFile();
+  };
+  watcher = watch(dirname(path), () => {
+    if (existsSync(path)) {
+      finish();
+    }
+  });
+  if (existsSync(path)) {
+    finish();
+  }
+  return settled ? undefined : watcher;
 }
 
 function referenceDepthSchema(referenceCount: number): Readonly<Record<string, unknown>> {

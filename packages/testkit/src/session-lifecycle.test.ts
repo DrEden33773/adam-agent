@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -57,6 +57,13 @@ const skillUsagePrompt =
 const codingToolDefinitions = createCodingToolRegistry({
   workspaceRoot: "/tmp/adam-agent-session-lifecycle-tool-definitions",
 }).definitions();
+
+type ChildObservation = {
+  readonly messages: unknown[];
+  stderr: string;
+};
+
+const childObservations = new WeakMap<ChildProcess, ChildObservation>();
 
 function createSessionLifecycle(
   options: Parameters<typeof createRawSessionLifecycle>[0],
@@ -3699,6 +3706,7 @@ test("SessionLifecycle rejects a competing project writer before model dispatch 
     },
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
+  observeChild(owner);
 
   try {
     await waitForChildMessage(owner, "provider-started");
@@ -3773,6 +3781,7 @@ test("SessionLifecycle real-process continuation preserves a completed safe read
     },
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
+  observeChild(owner);
 
   try {
     await waitForChildMessage(owner, "provider-started");
@@ -3882,6 +3891,7 @@ test("SessionLifecycle real-process restart marks a killed structured patch as i
     },
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
+  observeChild(owner);
 
   try {
     await waitForChildMessage(owner, "patch-renamed");
@@ -3985,14 +3995,16 @@ test("SessionLifecycle real-process branch writes independently, survives restar
     },
     stdio: ["ignore", "ignore", "pipe", "ipc"],
   });
+  observeChild(branchProcess);
 
   try {
+    // Terminal IPC is causally published before close and must remain observable afterward.
+    await waitForChildClose(branchProcess);
     const branchMessage = await waitForFixtureRecord<{
       readonly type: "branch-child-completed";
       readonly child: CurrentSessionSnapshotForFixture;
       readonly continued: { readonly result: { readonly status: string } };
     }>(branchProcess, "branch-child-completed");
-    await waitForChildClose(branchProcess);
     const childId = branchMessage.child.sessionId;
     const childStore = await openJsonlSessionStore<SessionRecord>({
       stateRoot,
@@ -4010,6 +4022,7 @@ test("SessionLifecycle real-process branch writes independently, survives restar
       },
       stdio: ["ignore", "ignore", "pipe", "ipc"],
     });
+    observeChild(inspectProcess);
     const inspected = await waitForFixtureRecord<{
       readonly type: "session-inspected";
       readonly resumed: { readonly status: string; readonly snapshot: { readonly status: string } };
@@ -4025,6 +4038,7 @@ test("SessionLifecycle real-process branch writes independently, survives restar
       },
       stdio: ["ignore", "ignore", "pipe", "ipc"],
     });
+    observeChild(crossProjectProcess);
     const crossProject = await waitForFixtureRecord<{
       readonly type: "session-inspection-failed";
       readonly code: string;
@@ -4079,33 +4093,62 @@ type CurrentSessionSnapshotForFixture = {
   };
 };
 
+function observeChild(child: ChildProcess): void {
+  const observation: ChildObservation = { messages: [], stderr: "" };
+  childObservations.set(child, observation);
+  child.on("message", (message) => observation.messages.push(message));
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => {
+    observation.stderr += chunk;
+  });
+}
+
 async function waitForChildMessage(
   child: ReturnType<typeof spawn>,
   expectedMessage: string,
 ): Promise<void> {
+  const observation = requiredChildObservation(child);
+  if (observation.messages.includes(expectedMessage)) {
+    return;
+  }
+  if (child.exitCode !== null || child.signalCode !== null) {
+    throw new Error(
+      `Child closed before readiness: code=${String(child.exitCode)} signal=${String(child.signalCode)}. ${observation.stderr}`,
+    );
+  }
   await new Promise<void>((resolve, reject) => {
-    let stderr = "";
     const timeout = setTimeout(() => {
-      reject(new Error(`Timed out waiting for ${expectedMessage}. stderr: ${stderr}`));
+      child.kill("SIGKILL");
+      cleanup();
+      reject(new Error(`Timed out waiting for ${expectedMessage}. stderr: ${observation.stderr}`));
     }, 10_000);
-    child.stderr?.setEncoding("utf8");
-    child.on("message", (message) => {
+    const onMessage = (message: unknown) => {
       if (message === expectedMessage) {
-        clearTimeout(timeout);
+        cleanup();
         resolve();
       }
-    });
-    child.stderr?.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    child.once("error", (error) => {
-      clearTimeout(timeout);
+    };
+    const onError = (error: Error) => {
+      cleanup();
       reject(error);
-    });
-    child.once("close", (code, signal) => {
+    };
+    const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(
+        new Error(
+          `Child closed before readiness: code=${String(code)} signal=${String(signal)}. ${observation.stderr}`,
+        ),
+      );
+    };
+    const cleanup = () => {
       clearTimeout(timeout);
-      reject(new Error(`Child closed before readiness: code=${code} signal=${signal}. ${stderr}`));
-    });
+      child.off("message", onMessage);
+      child.off("error", onError);
+      child.off("close", onClose);
+    };
+    child.on("message", onMessage);
+    child.once("error", onError);
+    child.once("close", onClose);
   });
 }
 
@@ -4113,30 +4156,51 @@ async function waitForFixtureRecord<RecordType extends { readonly type: string }
   child: ReturnType<typeof spawn>,
   expectedType: RecordType["type"],
 ): Promise<RecordType> {
+  const observation = requiredChildObservation(child);
+  const existing = observation.messages.find(
+    (message) => isFixtureRecord(message) && message.type === expectedType,
+  );
+  if (isFixtureRecord(existing)) {
+    return existing as RecordType;
+  }
+  if (child.exitCode !== null || child.signalCode !== null) {
+    throw new Error(
+      `Child closed before ${expectedType}: code=${String(child.exitCode)} signal=${String(child.signalCode)}. ${observation.stderr}`,
+    );
+  }
   return new Promise<RecordType>((resolve, reject) => {
-    let stderr = "";
     const timeout = setTimeout(() => {
-      reject(new Error(`Timed out waiting for ${expectedType}. stderr: ${stderr}`));
+      child.kill("SIGKILL");
+      cleanup();
+      reject(new Error(`Timed out waiting for ${expectedType}. stderr: ${observation.stderr}`));
     }, 10_000);
-    child.stderr?.setEncoding("utf8");
-    child.on("message", (message) => {
-      if (
-        typeof message === "object" &&
-        message !== null &&
-        "type" in message &&
-        message.type === expectedType
-      ) {
-        clearTimeout(timeout);
+    const onMessage = (message: unknown) => {
+      if (isFixtureRecord(message) && message.type === expectedType) {
+        cleanup();
         resolve(message as RecordType);
       }
-    });
-    child.stderr?.on("data", (chunk: string) => {
-      stderr += chunk;
-    });
-    child.once("error", (error) => {
-      clearTimeout(timeout);
+    };
+    const onError = (error: Error) => {
+      cleanup();
       reject(error);
-    });
+    };
+    const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+      cleanup();
+      reject(
+        new Error(
+          `Child closed before ${expectedType}: code=${String(code)} signal=${String(signal)}. ${observation.stderr}`,
+        ),
+      );
+    };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.off("message", onMessage);
+      child.off("error", onError);
+      child.off("close", onClose);
+    };
+    child.on("message", onMessage);
+    child.once("error", onError);
+    child.once("close", onClose);
   });
 }
 
@@ -4146,17 +4210,40 @@ async function waitForChildClose(child: ReturnType<typeof spawn>): Promise<void>
   }
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      cleanup();
       reject(new Error("Timed out waiting for child closure."));
     }, 10_000);
-    child.once("error", (error) => {
-      clearTimeout(timeout);
+    const onError = (error: Error) => {
+      cleanup();
       reject(error);
-    });
-    child.once("close", () => {
-      clearTimeout(timeout);
+    };
+    const onClose = () => {
+      cleanup();
       resolve();
-    });
+    };
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.off("error", onError);
+      child.off("close", onClose);
+    };
+    child.once("error", onError);
+    child.once("close", onClose);
   });
+}
+
+function requiredChildObservation(child: ChildProcess): ChildObservation {
+  const observation = childObservations.get(child);
+  if (observation === undefined) {
+    throw new Error("The child process was not registered with the fixture collector.");
+  }
+  return observation;
+}
+
+function isFixtureRecord(value: unknown): value is Record<string, unknown> & {
+  readonly type?: unknown;
+} {
+  return typeof value === "object" && value !== null;
 }
 
 function isToolEvent(event: RuntimeEvent): boolean {

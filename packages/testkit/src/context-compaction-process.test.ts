@@ -30,6 +30,13 @@ const targetIdentity: ModelTargetIdentity = {
   certification: "certified",
 };
 
+type FixtureObservation = {
+  readonly messages: unknown[];
+  stderr: string;
+};
+
+const fixtureObservations = new WeakMap<ChildProcess, FixtureObservation>();
+
 test("real process restart continues a dangling compaction as attempt two", async () => {
   const harness = await createProcessHarness("adam-agent-context-started-process-");
   const first = spawnFixture(harness, "started-hang");
@@ -319,8 +326,9 @@ test("real process performs one reactive compaction and one ordinary retry", asy
   const child = spawnFixture(harness, "reactive-complete");
 
   try {
-    const completed = await waitForMessage(child, "context-continued");
+    // Terminal IPC is causally published before close and must remain observable afterward.
     await waitForClose(child);
+    const completed = await waitForMessage(child, "context-continued");
     expect(completed).toMatchObject({
       ordinaryCall: 2,
       compactionCall: 1,
@@ -596,7 +604,7 @@ function spawnFixture(
   mode: string,
   extraEnvironment: Readonly<Record<string, string>> = {},
 ): ChildProcess {
-  return spawn(process.execPath, [fixturePath], {
+  const child = spawn(process.execPath, [fixturePath], {
     env: {
       ...process.env,
       ADAM_AGENT_FIXTURE_MODE: mode,
@@ -607,6 +615,14 @@ function spawnFixture(
     },
     stdio: ["ignore", "pipe", "pipe", "ipc"],
   });
+  const observation: FixtureObservation = { messages: [], stderr: "" };
+  fixtureObservations.set(child, observation);
+  child.on("message", (message) => observation.messages.push(message));
+  child.stderr?.setEncoding("utf8");
+  child.stderr?.on("data", (chunk: string) => {
+    observation.stderr += chunk;
+  });
+  return child;
 }
 
 async function readRecords(harness: {
@@ -633,41 +649,51 @@ async function findSessionPath(stateRoot: string): Promise<string> {
 }
 
 async function waitForMessage(child: ChildProcess, type: string): Promise<Record<string, unknown>> {
+  const observation = fixtureObservations.get(child);
+  if (observation === undefined) {
+    throw new Error("The child process was not registered with the fixture collector.");
+  }
+  const existing = observation.messages.find(
+    (message) => isFixtureMessage(message) && message.type === type,
+  );
+  if (isFixtureMessage(existing)) {
+    return existing;
+  }
+  if (child.exitCode !== null || child.signalCode !== null) {
+    throw new Error(
+      `Process closed before ${type}: code=${String(child.exitCode)} signal=${String(child.signalCode)} stderr=${observation.stderr}`,
+    );
+  }
   return new Promise((resolve, reject) => {
-    let stderr = "";
-    const timeout = setTimeout(() => reject(new Error(`Timed out waiting for ${type}.`)), 10_000);
+    const timeout = setTimeout(() => {
+      child.kill("SIGKILL");
+      cleanup();
+      reject(new Error(`Timed out waiting for ${type}. stderr=${observation.stderr}`));
+    }, 10_000);
     const onMessage = (message: unknown) => {
-      if (
-        typeof message === "object" &&
-        message !== null &&
-        "type" in message &&
-        message.type === type
-      ) {
-        clearTimeout(timeout);
-        child.off("error", onError);
-        child.off("close", onClose);
-        child.off("message", onMessage);
+      if (isFixtureMessage(message) && message.type === type) {
+        cleanup();
         resolve(message as Record<string, unknown>);
       }
     };
     const onError = (error: Error) => {
-      clearTimeout(timeout);
-      child.off("message", onMessage);
+      cleanup();
       reject(error);
     };
     const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
-      clearTimeout(timeout);
-      child.off("error", onError);
-      child.off("message", onMessage);
+      cleanup();
       reject(
         new Error(
-          `Process closed before ${type}: code=${String(code)} signal=${String(signal)} stderr=${stderr}`,
+          `Process closed before ${type}: code=${String(code)} signal=${String(signal)} stderr=${observation.stderr}`,
         ),
       );
     };
-    child.stderr?.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
-    });
+    const cleanup = () => {
+      clearTimeout(timeout);
+      child.off("error", onError);
+      child.off("close", onClose);
+      child.off("message", onMessage);
+    };
     child.on("message", onMessage);
     child.once("error", onError);
     child.once("close", onClose);
@@ -678,5 +704,32 @@ async function waitForClose(child: ChildProcess): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) {
     return;
   }
-  await new Promise<void>((resolve) => child.once("close", () => resolve()));
+  await new Promise<void>((resolve, reject) => {
+    const guard = setTimeout(() => {
+      child.kill("SIGKILL");
+      cleanup();
+      reject(new Error("Timed out waiting for child process closure."));
+    }, 10_000);
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    const onClose = () => {
+      cleanup();
+      resolve();
+    };
+    const cleanup = () => {
+      clearTimeout(guard);
+      child.off("error", onError);
+      child.off("close", onClose);
+    };
+    child.once("error", onError);
+    child.once("close", onClose);
+  });
+}
+
+function isFixtureMessage(value: unknown): value is Record<string, unknown> & {
+  readonly type?: unknown;
+} {
+  return typeof value === "object" && value !== null;
 }

@@ -1877,7 +1877,7 @@ test("slash Fork restores the selected boundary prompt in the child editor", asy
     const beforeFork = fixture.output().length;
     fixture.write("/fork \r");
     await fixture.waitForAfter("Fork from a boundary", beforeFork);
-    for (let page = 0; page < 2; page += 1) {
+    for (const [page, newlyLoadedPrompt] of ["History prompt 2", "History prompt 1"].entries()) {
       for (let step = 0; step <= page; step += 1) {
         const beforeMove = fixture.output().length;
         fixture.write("\u001b[B");
@@ -1885,11 +1885,7 @@ test("slash Fork restores the selected boundary prompt in the child editor", asy
       }
       const beforeLoad = fixture.output().length;
       fixture.write("\r");
-      const result = await Promise.race([
-        fixture.waitForAfter("Fork from a boundary", beforeLoad).then(() => "loaded" as const),
-        fixture.waitForAfter("Adam · Branch of ", beforeLoad).then(() => "forked" as const),
-      ]);
-      expect(result).toBe("loaded");
+      await fixture.waitForAfter(newlyLoadedPrompt, beforeLoad);
     }
     const beforeSearch = fixture.output().length;
     fixture.write("prompt1");
@@ -2261,6 +2257,7 @@ test("Enter cannot allow a mutation while its canonical preview is still loading
     await fixture.waitFor("Allow unavailable");
     await waitForPath(join(controlRoot, "preview-requested"));
     fixture.write("\r");
+    await waitForPath(join(controlRoot, "permission-decision-submitted"));
     await writeFile(join(controlRoot, "release-preview"), "release\n", "utf8");
     await waitForPath(join(controlRoot, "preview-read-complete"));
     await fixture.waitFor("denied");

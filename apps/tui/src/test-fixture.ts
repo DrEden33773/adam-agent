@@ -16,6 +16,7 @@ import {
   presentationArtifactReadBarrier,
   presentationHistoryPageSize,
 } from "@adam-agent/agent/internal-testing";
+import type { PresentationSession } from "@adam-agent/presentation";
 import { type FixtureScenario, isFixtureScenario } from "./fixture-scenario.js";
 import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 import { type ClipboardAdapter, type DeadlineScheduler, runTui } from "./tui-app.js";
@@ -142,14 +143,44 @@ try {
   );
   const clipboard = clipboardAdapter(options);
   const deadlineScheduler = controlledDeadlineScheduler(options);
+  const tuiPresentation = observePermissionDecision(presentation, options);
   await runTui({
     ...(clipboard === undefined ? {} : { clipboard }),
     ...(deadlineScheduler === undefined ? {} : { deadlineScheduler }),
-    presentation,
+    presentation: tuiPresentation,
     targetStatus: { targetId: targetIdentity.targetId, certification: "Certified" },
   });
 } finally {
   requireConfirmedLifecycleClose(await lifecycle.close());
+}
+
+function observePermissionDecision(
+  presentation: PresentationSession,
+  options: {
+    readonly controlRoot?: string;
+    readonly scenario?: FixtureScenario;
+  },
+): PresentationSession {
+  const controlRoot = options.controlRoot;
+  if (options.scenario !== "mutation-delayed-preview" || controlRoot === undefined) {
+    return presentation;
+  }
+  return {
+    close: () => presentation.close(),
+    dispatch: async (command) => {
+      const receipt = presentation.dispatch(command);
+      if (command.type === "decide_permission") {
+        await writeFile(
+          join(controlRoot, "permission-decision-submitted"),
+          `${command.decision}\n`,
+          "utf8",
+        );
+      }
+      return receipt;
+    },
+    getState: () => presentation.getState(),
+    subscribe: (onChange) => presentation.subscribe(onChange),
+  };
 }
 
 function parseArguments(arguments_: readonly string[]): {
