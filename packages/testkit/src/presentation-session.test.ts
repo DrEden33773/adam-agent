@@ -1,9 +1,8 @@
 import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
   type ContextProfile,
@@ -23,6 +22,8 @@ import {
 import {
   assemblePromptMessagesV1,
   digestPromptRequestV1,
+  mcpCatalogStaleDurableBarrier,
+  mcpTransportFactory,
   openJsonlSessionStore,
   presentationCatalogPageSize,
   presentationHistoryPageSize,
@@ -35,7 +36,11 @@ import {
   sessionTitleDeadlineScheduler,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
-import { FakeModelDriver } from "./index.js";
+import {
+  createScriptedMcpTransportFactory,
+  FakeModelDriver,
+  type ScriptedMcpServer,
+} from "./index.js";
 
 const targetIdentity: ModelTargetIdentity = {
   targetId: "deepseek-v4-flash.direct",
@@ -56,30 +61,53 @@ const contextProfile: ContextProfile = {
   estimatorVersion: 1,
 };
 const testEnvironment = process.env as NodeJS.ProcessEnv & { HOME?: string };
-const mcpServerFixturePath = fileURLToPath(
-  new URL("../dist/mcp-stdio-server.fixture.js", import.meta.url),
-);
+async function writeScriptedMcpConfiguration(
+  testRoot: string,
+  workspaceRoot: string,
+): Promise<void> {
+  const executablePath = join(testRoot, "scripted-mcp");
+  await writeFile(executablePath, "#!/bin/sh\nexit 1\n");
+  await chmod(executablePath, 0o755);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({ mcpServers: { fixture: { command: executablePath } } }),
+    "utf8",
+  );
+}
+
+function ordinaryScriptedMcpServer(): ScriptedMcpServer {
+  const inputSchema = {
+    type: "object",
+    properties: { value: { type: "string" } },
+    required: ["value"],
+    additionalProperties: false,
+  } as const;
+  return {
+    toolPages: [
+      {
+        tools: [{ name: "echo", description: "Echo a value.", inputSchema }],
+        nextCursor: "page-2",
+      },
+      {
+        cursor: "page-2",
+        tools: [{ name: "uppercase", description: "Uppercase a value.", inputSchema }],
+      },
+    ],
+  };
+}
 
 async function openActivatedMcpPresentationFixture(prefix: string) {
   const testRoot = await mkdtemp(join(tmpdir(), prefix));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-    "utf8",
-  );
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+  const peer = createScriptedMcpTransportFactory({ fixture: ordinaryScriptedMcpServer() });
+  const lifecycle = createSessionLifecycle({
+    [mcpTransportFactory]: peer,
+    stateRoot,
+    workspaceRoot,
+  });
   try {
     const presentation = await createPresentationSession({
       lifecycle,
@@ -114,6 +142,7 @@ async function openActivatedMcpPresentationFixture(prefix: string) {
     });
     return {
       lifecycle,
+      peer,
       presentation,
       stateRoot,
       testRoot,
@@ -977,23 +1006,15 @@ test("PresentationSession atomically activates approved MCP servers into one exa
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-mcp-activation-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-    "utf8",
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const peer = createScriptedMcpTransportFactory({ fixture: ordinaryScriptedMcpServer() });
+  const lifecycle = createSessionLifecycle({
+    [mcpTransportFactory]: peer,
+    stateRoot,
+    workspaceRoot,
+  });
   try {
     const presentation = await createPresentationSession({
       lifecycle,
@@ -1043,7 +1064,9 @@ test("PresentationSession atomically activates approved MCP servers into one exa
       },
       profile: null,
     });
-    await expect(readFile(spawnMarker, "utf8")).resolves.toMatch(/^\d+$/u);
+    expect(
+      peer.requests("fixture").filter((request) => request.method === "initialize"),
+    ).toHaveLength(1);
 
     await presentation.close();
   } finally {
@@ -1142,6 +1165,7 @@ test("PresentationSession explicitly reactivates one exact committed MCP profile
     await fixture.lifecycle.close();
 
     restarted = createSessionLifecycle({
+      [mcpTransportFactory]: fixture.peer,
       stateRoot: fixture.stateRoot,
       workspaceRoot: fixture.workspaceRoot,
     });
@@ -1183,61 +1207,13 @@ test("PresentationSession refreshes and explicitly revalidates an asynchronously
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-mcp-revalidate-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "list-changed-once", callMarker],
-        },
-      },
-    }),
-    "utf8",
-  );
-  let qualifiedName: string | undefined;
-  let requestCount = 0;
-  const driver = new FakeModelDriver(() => {
-    requestCount += 1;
-    return requestCount === 1
-      ? [
-          { type: "tool_call_start", id: "observe-stale", name: qualifiedName as string } as const,
-          {
-            type: "tool_call_delta",
-            id: "observe-stale",
-            json: '{"value":"first"}',
-          } as const,
-          { type: "tool_call_end", id: "observe-stale" } as const,
-          { type: "finish", reason: "tool_calls" } as const,
-        ]
-      : [
-          { type: "text_delta", text: "Stale catalog recorded." } as const,
-          { type: "finish", reason: "stop" } as const,
-        ];
-  });
-  const modelTargets: ModelTargets = {
-    async resolve() {
-      return { identity: targetIdentity, driver, contextProfile };
-    },
-    async snapshot() {
-      return {
-        targets: [
-          {
-            identity: targetIdentity,
-            readiness: { status: "available", credentialSource: "test" },
-            contextProfile,
-          },
-        ],
-      };
-    },
-  };
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+  const peer = createScriptedMcpTransportFactory({ fixture: ordinaryScriptedMcpServer() });
+  const staleDurable = Promise.withResolvers<void>();
   const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [mcpCatalogStaleDurableBarrier]: { committed: () => staleDurable.resolve() },
+    [mcpTransportFactory]: peer,
     stateRoot,
     workspaceRoot,
   });
@@ -1245,7 +1221,6 @@ test("PresentationSession refreshes and explicitly revalidates an asynchronously
   try {
     const presentation = await createPresentationSession({
       lifecycle,
-      modelTargets,
       projectLabel: "workspace",
       stateRoot,
       targetIdentity,
@@ -1282,7 +1257,6 @@ test("PresentationSession refreshes and explicitly revalidates an asynchronously
       if (tool === undefined || generationId === undefined) {
         throw new Error("Expected an activated MCP catalog.");
       }
-      qualifiedName = tool.qualifiedName;
       await presentation.dispatch({
         type: "commit_mcp_tool_profile",
         sessionId: initial.session.id,
@@ -1296,7 +1270,6 @@ test("PresentationSession refreshes and explicitly revalidates an asynchronously
         ],
       });
       const stale = Promise.withResolvers<void>();
-      const settled = Promise.withResolvers<void>();
       let failureGuard: ReturnType<typeof setTimeout> | undefined;
       const failed = new Promise<never>((_resolve, reject) => {
         failureGuard = setTimeout(() => {
@@ -1320,23 +1293,10 @@ test("PresentationSession refreshes and explicitly revalidates an asynchronously
         if (current.authoritative.active?.mcp?.status === "catalog_stale") {
           stale.resolve();
         }
-        if (
-          current.transient === null &&
-          current.authoritative.active?.transcript.items.some(
-            (item) => item.type === "assistant_message" && item.text === "Stale catalog recorded.",
-          )
-        ) {
-          settled.resolve();
-        }
       });
       try {
-        await presentation.dispatch({
-          type: "submit_prompt",
-          sessionId: initial.session.id,
-          text: "Observe one list change",
-          skills: [],
-        });
-        await Promise.race([Promise.all([stale.promise, settled.promise]), failed]);
+        peer.notifyToolsChanged("fixture");
+        await Promise.race([Promise.all([stale.promise, staleDurable.promise]), failed]);
       } finally {
         if (failureGuard !== undefined) {
           clearTimeout(failureGuard);
@@ -1376,29 +1336,28 @@ test("PresentationSession exposes one failed MCP generation before explicit exac
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-mcp-retry-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const failedOnceMarker = join(testRoot, "failed-once");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "fail-once-initialize",
-            failedOnceMarker,
-          ],
-        },
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+  let initializeAttempts = 0;
+  const peer = createScriptedMcpTransportFactory({
+    fixture: {
+      ...ordinaryScriptedMcpServer(),
+      respond(request, defaultReply) {
+        if (request.method !== "initialize") {
+          return defaultReply;
+        }
+        initializeAttempts += 1;
+        return initializeAttempts === 1
+          ? { kind: "error", code: -32_000, message: "injected initialize failure" }
+          : defaultReply;
       },
-    }),
-    "utf8",
-  );
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+    },
+  });
+  const lifecycle = createSessionLifecycle({
+    [mcpTransportFactory]: peer,
+    stateRoot,
+    workspaceRoot,
+  });
   try {
     const presentation = await createPresentationSession({
       lifecycle,

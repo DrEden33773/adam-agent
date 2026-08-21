@@ -10,10 +10,13 @@ export { digestContextRecordPrefix } from "./durable-context.js";
 export type {
   McpBeforeToolDispatchBarrier,
   McpBootstrapScheduler,
+  McpClientTransport,
   McpCloseConfirmation,
   McpDiscoveryScheduler,
   McpIdleScheduler,
   McpRequestScheduler,
+  McpTransportFactory,
+  McpTransportLaunch,
 } from "./mcp-host.js";
 export {
   mcpBeforeToolDispatchBarrier,
@@ -24,6 +27,7 @@ export {
   mcpPackageManagerCliPath,
   mcpPackageRegistryUrl,
   mcpRequestScheduler,
+  mcpTransportFactory,
 } from "./mcp-host.js";
 export { preparedDirectDeepSeekV2ContextProfile } from "./model-targets.js";
 export type { PatchFileSystem } from "./patch-transaction.js";
