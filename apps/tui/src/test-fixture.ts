@@ -356,8 +356,8 @@ async function waitForFile(
     if (await fileExists(join(directory, filename))) {
       return true;
     }
-    for await (const event of watcher) {
-      if (event.filename === filename && (await fileExists(join(directory, filename)))) {
+    for await (const _event of watcher) {
+      if (await fileExists(join(directory, filename))) {
         return true;
       }
     }
