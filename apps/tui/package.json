@@ -1,0 +1,14 @@
+{
+  "name": "@adam-agent/tui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "adam-agent-tui": "./dist/main.js"
+  },
+  "dependencies": {
+    "@adam-agent/agent": "workspace:*",
+    "@adam-agent/presentation": "workspace:*",
+    "@earendil-works/pi-tui": "0.84.2"
+  }
+}

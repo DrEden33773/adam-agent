@@ -62,6 +62,15 @@ export type ArtifactReference = {
   readonly source: "model_response" | "tool_output" | "change_preview" | "operation";
 };
 
+export type ArtifactChunk = {
+  readonly mediaType: string;
+  readonly offset: number;
+  readonly byteCount: number;
+  readonly totalByteCount: number;
+  readonly eof: boolean;
+  readonly text: string;
+};
+
 export type UserMessageDisplay = {
   readonly type: "user_message";
   readonly id: string;
@@ -203,6 +212,7 @@ export type AuthoritativePresentationSnapshot = {
 };
 
 export type PresentationTransientState = {
+  readonly activity: "working" | "replying" | "using_tool" | null;
   readonly assistant: {
     readonly streamId: string;
     readonly afterSequence: number;
@@ -229,7 +239,11 @@ export type PresentationUpdate =
     };
 
 export type CommandReceipt =
-  | { readonly status: "admitted"; readonly commandId: string; readonly resource: null }
+  | {
+      readonly status: "admitted";
+      readonly commandId: string;
+      readonly resource: ArtifactChunk | null;
+    }
   | {
       readonly status: "rejected";
       readonly code:
@@ -259,6 +273,11 @@ export type PresentationCommand =
   | {
       readonly type: "load_more_sessions";
       readonly after: string;
+    }
+  | {
+      readonly type: "read_artifact";
+      readonly artifact: ArtifactReference;
+      readonly range: null;
     }
   | {
       readonly type: "set_session_manual_name";
@@ -334,6 +353,7 @@ export function reconcilePresentationUpdate(
     revision: state.revision + 1,
     authoritative: state.authoritative,
     transient: {
+      activity: "replying",
       assistant: {
         streamId: update.streamId,
         afterSequence: update.afterSequence,

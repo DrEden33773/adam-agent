@@ -28,8 +28,10 @@ export {
 export { preparedDirectDeepSeekV2ContextProfile } from "./model-targets.js";
 export type { PatchFileSystem } from "./patch-transaction.js";
 export {
+  type PresentationArtifactReadBarrier,
   type PresentationHydrationBarrier,
   type PresentationRuntimeRefreshBarrier,
+  presentationArtifactReadBarrier,
   presentationCatalogPageSize,
   presentationHistoryPageSize,
   presentationHydrationBarrier,

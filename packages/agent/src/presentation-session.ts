@@ -31,6 +31,9 @@ export const presentationCatalogPageSize = Symbol("adam-agent.presentation-catal
 export const presentationRuntimeRefreshBarrier = Symbol(
   "adam-agent.presentation-runtime-refresh-barrier",
 );
+export const presentationArtifactReadBarrier = Symbol(
+  "adam-agent.presentation-artifact-read-barrier",
+);
 
 export type PresentationHydrationBarrier = {
   afterHydrate(input: {
@@ -43,6 +46,11 @@ export type PresentationRuntimeRefreshBarrier = {
   beforeRead(notification: SessionRuntimeNotification): Promise<void>;
 };
 
+export type PresentationArtifactReadBarrier = {
+  beforeRead(): Promise<void>;
+  afterRead?(): Promise<void>;
+};
+
 type PresentationSessionBaseOptions = {
   readonly lifecycle: SessionLifecycle;
   readonly projectLabel: string;
@@ -50,6 +58,7 @@ type PresentationSessionBaseOptions = {
   readonly workspaceRoot: string;
   readonly [presentationHydrationBarrier]?: PresentationHydrationBarrier;
   readonly [presentationRuntimeRefreshBarrier]?: PresentationRuntimeRefreshBarrier;
+  readonly [presentationArtifactReadBarrier]?: PresentationArtifactReadBarrier;
   readonly [presentationHistoryPageSize]?: number;
   readonly [presentationCatalogPageSize]?: number;
 };
@@ -306,6 +315,21 @@ export async function createPresentationSession(
               return;
             }
             const event = notification.event;
+            if (event.type === "user_message" || event.type === "model_message_started") {
+              state = {
+                revision: state.revision + 1,
+                authoritative: state.authoritative,
+                transient: { activity: "working", assistant: null },
+              };
+              publishStateChange();
+            } else if (event.type === "tool_requested" || event.type === "tool_started") {
+              state = {
+                revision: state.revision + 1,
+                authoritative: state.authoritative,
+                transient: { activity: "using_tool", assistant: null },
+              };
+              publishStateChange();
+            }
             if (isModelMessageDelta(event)) {
               const streamId = `${notification.sessionId}:${notification.runId}`;
               const existingText =
@@ -762,6 +786,58 @@ export async function createPresentationSession(
           };
         }
       }
+      if (command.type === "read_artifact") {
+        const active = state.authoritative.active;
+        if (
+          active === null ||
+          command.artifact.source !== "change_preview" ||
+          !isKnownArtifact(active, command.artifact)
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The requested artifact is no longer part of the active presentation.",
+          };
+        }
+        if (options.stateRoot === undefined || command.artifact.byteCount > 64 * 1024) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "The artifact is not available through this Presentation session.",
+          };
+        }
+        try {
+          await options[presentationArtifactReadBarrier]?.beforeRead();
+          const bytes = await readFileArtifact({
+            root: join(options.stateRoot, "artifacts"),
+            id: command.artifact.id,
+            maximumBytes: command.artifact.byteCount,
+          });
+          if (bytes === undefined || bytes.byteLength !== command.artifact.byteCount) {
+            throw new TypeError("The artifact bytes are unavailable.");
+          }
+          const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          await options[presentationArtifactReadBarrier]?.afterRead?.();
+          return {
+            status: "admitted",
+            commandId: randomUUID(),
+            resource: {
+              mediaType: command.artifact.mediaType,
+              offset: 0,
+              byteCount: bytes.byteLength,
+              totalByteCount: bytes.byteLength,
+              eof: true,
+              text,
+            },
+          };
+        } catch {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "The artifact could not be read safely.",
+          };
+        }
+      }
       if (command.type === "set_session_manual_name") {
         if (command.sessionId !== state.authoritative.active?.session.id) {
           return {
@@ -859,6 +935,36 @@ export async function createPresentationSession(
     unsubscribeMetadata();
     throw error;
   }
+}
+
+function isKnownArtifact(
+  active: import("@adam-agent/presentation").ActiveSessionDisplay,
+  artifact: import("@adam-agent/presentation").ArtifactReference,
+): boolean {
+  const candidates = [
+    ...active.pendingInteractions.flatMap((interaction) =>
+      interaction.changePreviewRef === null ? [] : [interaction.changePreviewRef],
+    ),
+    ...active.transcript.items.flatMap((item) => {
+      if (item.type === "assistant_message") {
+        return item.artifact === null ? [] : [item.artifact];
+      }
+      if (item.type === "tool_call") {
+        return [
+          ...item.artifacts,
+          ...(item.changePreviewRef === null ? [] : [item.changePreviewRef]),
+        ];
+      }
+      return [];
+    }),
+  ];
+  return candidates.some(
+    (candidate) =>
+      candidate.id === artifact.id &&
+      candidate.mediaType === artifact.mediaType &&
+      candidate.byteCount === artifact.byteCount &&
+      candidate.source === artifact.source,
+  );
 }
 
 function boundedHistoryPageSize(value: number | undefined): number {
