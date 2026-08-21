@@ -200,20 +200,6 @@ function respond(request: JsonRpcRequest): void {
       });
       return;
     }
-    if (mode === "projection-suite") {
-      const tools = projectionSuiteTools();
-      if (request.params?.cursor === "projection-page-2") {
-        writeResult(request, {
-          tools: tools.filter((tool) => tool.name === "projection_recursive_healthy"),
-        });
-      } else {
-        writeResult(request, {
-          tools: tools.filter((tool) => tool.name !== "projection_recursive_healthy"),
-          nextCursor: "projection-page-2",
-        });
-      }
-      return;
-    }
     if (mode === "schema-reference-admission") {
       writeResult(request, {
         tools: [
@@ -559,116 +545,6 @@ function referenceDepthSchema(referenceCount: number): Readonly<Record<string, u
     required: ["value"],
     additionalProperties: false,
   };
-}
-
-type ProjectionSuiteFixtureTool = Readonly<Record<string, unknown>> & {
-  readonly name: string;
-};
-
-function projectionSuiteTools(): readonly ProjectionSuiteFixtureTool[] {
-  const plainSchema = {
-    type: "object",
-    properties: { value: { type: "string" } },
-    required: ["value"],
-    additionalProperties: false,
-  };
-  return [
-    {
-      name: "projection_order_äther",
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "projection_order_zeta",
-      inputSchema: { type: "object", properties: {} },
-    },
-    {
-      name: "projection_allof",
-      inputSchema: {
-        type: "object",
-        $defs: {
-          left: {
-            type: "object",
-            properties: { left: { type: "string" } },
-            required: ["left"],
-          },
-          right: {
-            type: "object",
-            properties: { right: { type: "integer" } },
-            required: ["right"],
-          },
-        },
-        allOf: [{ $ref: "#/$defs/left" }, { $ref: "#/$defs/right" }],
-        additionalProperties: false,
-      },
-    },
-    {
-      name: "projection_recursive_bad",
-      inputSchema: {
-        type: "object",
-        properties: { next: { $ref: "#" } },
-        additionalProperties: false,
-      },
-    },
-    { name: "projection_recursive_healthy", inputSchema: plainSchema },
-    {
-      name: "projection_ref_bounded",
-      inputSchema: {
-        type: "object",
-        $defs: {
-          payload: {
-            type: "object",
-            properties: { value: { type: "string" } },
-            required: ["value"],
-            additionalProperties: false,
-          },
-        },
-        properties: { payload: { $ref: "#/$defs/payload" } },
-        required: ["payload"],
-        additionalProperties: false,
-      },
-    },
-    { name: "projection_ref_plain", inputSchema: plainSchema },
-    {
-      name: "projection_ref_cyclic",
-      inputSchema: {
-        type: "object",
-        $defs: {
-          node: {
-            type: "object",
-            properties: { next: { $ref: "#/$defs/node" } },
-          },
-        },
-        properties: { node: { $ref: "#/$defs/node" } },
-      },
-    },
-    {
-      name: "projection_ref_remote",
-      inputSchema: {
-        type: "object",
-        properties: { value: { $ref: "https://example.invalid/schema.json" } },
-      },
-    },
-    { name: "projection_depth_within", inputSchema: referenceDepthSchema(16) },
-    { name: "projection_depth_over", inputSchema: referenceDepthSchema(17) },
-    { name: "projection_depth_healthy", inputSchema: plainSchema },
-    {
-      name: "projection_oneof",
-      description: "Choose one projection branch.",
-      inputSchema: {
-        type: "object",
-        oneOf: [
-          {
-            properties: { kind: { const: "left" }, left: { type: "string" } },
-            required: ["kind", "left"],
-          },
-          {
-            properties: { kind: { const: "right" }, right: { type: "integer" } },
-            required: ["kind", "right"],
-          },
-        ],
-      },
-    },
-  ];
 }
 
 function streamOversizedFrame(totalBytes: number): void {
