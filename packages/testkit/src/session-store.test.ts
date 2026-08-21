@@ -8,7 +8,12 @@ import {
   type SessionEventRecord,
   SessionStoreError,
 } from "@adam-agent/agent";
-import type { ContextProfile, SessionRecord } from "@adam-agent/agent/internal-testing";
+import {
+  type ContextProfile,
+  createInMemorySessionStoreDirectory,
+  createJsonlSessionStoreDirectory,
+  type SessionRecord,
+} from "@adam-agent/agent/internal-testing";
 import { expect, expectTypeOf, test } from "vitest";
 
 const runId = "123e4567-e89b-42d3-a456-426614174000";
@@ -35,6 +40,56 @@ type InvalidV1PatchRecord = {
 
 test("SessionEventRecord type pairs each schema version with its event contract", () => {
   expectTypeOf<InvalidV1PatchRecord>().not.toMatchTypeOf<SessionEventRecord>();
+});
+
+test("SessionStoreDirectory adapters create open and list isolated session stores", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-directory-contract-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const sessionId = "10000000-0000-4000-8000-000000000001";
+  const secondSessionId = "10000000-0000-4000-8000-000000000002";
+  const directories = [
+    ["in-memory", createInMemorySessionStoreDirectory<SessionEventRecord>()],
+    [
+      "JSONL",
+      createJsonlSessionStoreDirectory<SessionEventRecord>({
+        stateRoot: join(testRoot, "state"),
+        workspaceRoot,
+      }),
+    ],
+  ] as const;
+  const record: SessionEventRecord = {
+    schemaVersion: 1,
+    runId,
+    sequence: 1,
+    event: { type: "user_message", text: "Directory contract" },
+  };
+
+  try {
+    for (const [name, directory] of directories) {
+      expect(await directory.listSessionIds(), name).toEqual([]);
+      expect(await directory.open(sessionId), name).toBeUndefined();
+      const created = await directory.create(sessionId);
+      await created.append(record);
+      const second = await directory.create(secondSessionId);
+      expect(await second.read(), name).toEqual([]);
+
+      await expect(directory.create(sessionId), name).rejects.toMatchObject({
+        code: "session_log_exists",
+      });
+      expect(await directory.listSessionIds(), name).toEqual([sessionId, secondSessionId]);
+      await expect(
+        directory.open(sessionId).then((store) => store?.read()),
+        name,
+      ).resolves.toEqual([record]);
+      await expect(
+        directory.open(secondSessionId).then((store) => store?.read()),
+        name,
+      ).resolves.toBeUndefined();
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
 });
 
 test("SessionStore adapters append and read versioned records in order", async () => {

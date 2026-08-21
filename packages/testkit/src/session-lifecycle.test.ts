@@ -1,6 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -8,7 +8,6 @@ import { fileURLToPath } from "node:url";
 import {
   type ContextProfile,
   createCodingToolRegistry,
-  createJsonlSessionStore,
   createModelTargets,
   createMutationToolRegistry,
   createPermissionPolicy,
@@ -29,7 +28,7 @@ import {
   sessionAutomaticTitlesEnabled,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
-import { FakeModelDriver } from "./index.js";
+import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
 
 const targetIdentity: ModelTargetIdentity = {
   targetId: "deepseek-v4-flash.direct",
@@ -121,7 +120,10 @@ test("session metadata observers cannot overturn a durable naming mutation", asy
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    stateRoot,
+    workspaceRoot,
+  });
   const releaseObserver = Promise.withResolvers<void>();
   const unsubscribeFailure = lifecycle.subscribeMetadata(() => {
     throw new Error("observer failed");
@@ -205,19 +207,51 @@ const lifecycleOwnerFixturePath = fileURLToPath(
   new URL("../dist/session-lifecycle-owner.fixture.js", import.meta.url),
 );
 
+test("SessionLifecycle rejects a deterministic competing owner and proceeds after release", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-memory-owner-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const workspaceAlias = join(testRoot, "workspace-alias");
+  await mkdir(workspaceRoot);
+  await symlink(workspaceRoot, workspaceAlias, "dir");
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ workspaceRoot });
+  const aliasLifecycle = harness.createLifecycle({ workspaceRoot: workspaceAlias });
+  const competingOwner = await harness.acquireOwner();
+
+  try {
+    await expect(aliasLifecycle.create({ targetIdentity })).rejects.toMatchObject({
+      code: "project_in_use",
+    });
+    await competingOwner.release();
+
+    await expect(aliasLifecycle.create({ targetIdentity })).resolves.toMatchObject({
+      status: "idle",
+      targetIdentity,
+    });
+  } finally {
+    await competingOwner.release();
+    await aliasLifecycle.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle creates durable new-schema genesis for an exact project and target", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-create-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
 
+  const harness = createInMemorySessionLifecycleHarness();
+  const first = harness.createLifecycle({ stateRoot, workspaceRoot });
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
   try {
-    const created = await createSessionLifecycle({ stateRoot, workspaceRoot }).create({
-      targetIdentity,
-    });
-    const inspected = await createSessionLifecycle({ stateRoot, workspaceRoot }).inspect({
-      sessionId: created.sessionId,
-    });
+    const created = await first.create({ targetIdentity });
+    await expect(first.close()).resolves.toEqual({ status: "closed" });
+    const coldLifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
+    cold = coldLifecycle;
+    const inspected = await coldLifecycle.inspect({ sessionId: created.sessionId });
 
     const expected = {
       schemaVersion: 3,
@@ -234,6 +268,42 @@ test("SessionLifecycle creates durable new-schema genesis for an exact project a
     expect({ created, inspected }).toEqual({ created: expected, inspected: expected });
     await expect(stat(join(stateRoot, "artifacts"))).rejects.toMatchObject({ code: "ENOENT" });
   } finally {
+    await first.close();
+    await cold?.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle catalogs shared in-memory sessions through public pagination", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-memory-catalog-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ workspaceRoot });
+
+  try {
+    const created = [
+      await lifecycle.create({ targetIdentity }),
+      await lifecycle.create({ targetIdentity }),
+    ];
+    const firstPage = await lifecycle.listProjectSessions({ limit: 1 });
+    if (firstPage.nextCursor === null) {
+      throw new Error("The first in-memory catalog page requires a continuation cursor.");
+    }
+    const secondPage = await lifecycle.listProjectSessions({
+      cursor: firstPage.nextCursor,
+      limit: 1,
+    });
+
+    expect([...firstPage.items, ...secondPage.items].map((item) => item.sessionId)).toEqual(
+      created.map((item) => item.sessionId).sort(),
+    );
+    expect({ first: firstPage.nextCursor, second: secondPage.nextCursor }).toEqual({
+      first: expect.any(String),
+      second: null,
+    });
+  } finally {
+    await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -243,10 +313,11 @@ test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill s
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
 
   try {
     const tools = createCodingToolRegistry({ stateRoot, workspaceRoot });
-    const lifecycle = createSessionLifecycle({ stateRoot, tools, workspaceRoot });
+    const lifecycle = harness.createLifecycle({ stateRoot, tools, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const inspected = await lifecycle.inspect({ sessionId: created.sessionId });
 
@@ -292,7 +363,8 @@ test("SessionLifecycle restores an uncompacted v1 session after the current targ
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const created = await createSessionLifecycle({ stateRoot, workspaceRoot }).create({
+  const harness = createInMemorySessionLifecycleHarness();
+  const created = await harness.createLifecycle({ stateRoot, workspaceRoot }).create({
     targetIdentity,
   });
   const v2Identity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 2 };
@@ -339,14 +411,16 @@ test("SessionLifecycle restores an uncompacted v1 session after the current targ
   };
 
   try {
-    const continued = await createSessionLifecycle({
-      modelTargets: upgradedTargets,
-      stateRoot,
-      workspaceRoot,
-    }).continue({
-      sessionId: created.sessionId,
-      input: { text: "Continue with the historical profile." },
-    });
+    const continued = await harness
+      .createLifecycle({
+        modelTargets: upgradedTargets,
+        stateRoot,
+        workspaceRoot,
+      })
+      .continue({
+        sessionId: created.sessionId,
+        input: { text: "Continue with the historical profile." },
+      });
 
     expect({ result: continued.result, observedBudgets, v2DriverCalls }).toEqual({
       result: { status: "completed", answer: "Historical v1 restored." },
@@ -395,11 +469,12 @@ test("SessionLifecycle rejects an unsupported historical profile before model re
   };
 
   try {
-    const created = await createSessionLifecycle({ stateRoot, workspaceRoot }).create({
+    const harness = createInMemorySessionLifecycleHarness();
+    const created = await harness.createLifecycle({ stateRoot, workspaceRoot }).create({
       targetIdentity: unsupportedIdentity,
     });
     await expect(
-      createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot }).resume({
+      harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot }).resume({
         sessionId: created.sessionId,
       }),
     ).resolves.toMatchObject({
@@ -407,7 +482,7 @@ test("SessionLifecycle rejects an unsupported historical profile before model re
       error: { code: "model_target_incompatible" },
     });
     await expect(
-      createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot }).continue({
+      harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot }).continue({
         sessionId: created.sessionId,
         input: { text: "This request must not reach the model." },
       }),
@@ -425,13 +500,13 @@ test("SessionLifecycle rejects restored v3 records that violate session causalit
   await mkdir(workspaceRoot);
 
   try {
-    const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     await store.append({
       schemaVersion: 3,
       sequence: 2,
@@ -459,14 +534,14 @@ test("SessionLifecycle rejects a fabricated completed settlement without a provi
   await mkdir(workspaceRoot);
 
   try {
-    const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const runId = "123e4567-e89b-42d3-a456-426614174098";
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     await store.append({
       schemaVersion: 3,
       sequence: 2,
@@ -508,7 +583,8 @@ test("SessionLifecycle keeps legacy history inspectable but rejects model resume
   const workspaceRoot = join(testRoot, "workspace");
   const sessionId = "legacy-session";
   await mkdir(workspaceRoot);
-  const store = await createJsonlSessionStore({ stateRoot, workspaceRoot, sessionId });
+  const harness = createInMemorySessionLifecycleHarness();
+  const store = await harness.sessions.create(sessionId);
   await store.append({
     schemaVersion: 1,
     runId: "123e4567-e89b-42d3-a456-426614174000",
@@ -526,7 +602,7 @@ test("SessionLifecycle keeps legacy history inspectable but rejects model resume
   });
 
   try {
-    const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+    const lifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
     const inspected = await lifecycle.inspect({ sessionId });
     const resumed = await lifecycle.resume({ sessionId });
 
@@ -559,9 +635,10 @@ test("SessionLifecycle hydrate-only resume validates the exact target without mo
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
   let providerWasCalled = false;
+  const harness = createInMemorySessionLifecycleHarness();
 
   try {
-    const created = await createSessionLifecycle({ stateRoot, workspaceRoot }).create({
+    const created = await harness.createLifecycle({ stateRoot, workspaceRoot }).create({
       targetIdentity,
     });
     const modelTargets = createModelTargets({
@@ -571,7 +648,7 @@ test("SessionLifecycle hydrate-only resume validates the exact target without mo
         throw new Error("hydrate-only resume must not call the provider");
       },
     });
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const before = await lifecycle.inspect({ sessionId: created.sessionId });
 
     const resumed = await lifecycle.resume({ sessionId: created.sessionId });
@@ -592,9 +669,10 @@ test("SessionLifecycle branches a complete boundary by reference without changin
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
 
   try {
-    const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+    const lifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
     const parent = await lifecycle.create({ targetIdentity });
     const parentBefore = await lifecycle.inspect({ sessionId: parent.sessionId });
 
@@ -663,28 +741,19 @@ test("SessionLifecycle continues a branch from its referenced parent context", a
       };
     },
   };
+  const harness = createInMemorySessionLifecycleHarness();
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const parent = await lifecycle.create({ targetIdentity });
-    await lifecycle.continue({
+    const parentRun = await lifecycle.continue({
       sessionId: parent.sessionId,
       input: { text: "Parent prompt" },
     });
-    const parentRecords = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: parent.sessionId,
-    }).then((store) => store.read());
-    const responseBoundary = parentRecords.find(
-      (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
-    )?.sequence;
-    if (responseBoundary === undefined) {
-      throw new Error("Expected a complete parent response boundary.");
-    }
+    const branchBoundary = parentRun.snapshot.lastSequence;
     const child = await lifecycle.branch({
       parentSessionId: parent.sessionId,
-      atSequence: responseBoundary,
+      atSequence: branchBoundary,
     });
 
     const childRun = await lifecycle.continue({
@@ -705,7 +774,7 @@ test("SessionLifecycle continues a branch from its referenced parent context", a
         { role: "assistant", content: "Parent answer", toolCalls: [] },
         { role: "user", content: "Child prompt" },
       ],
-      childLineage: expect.objectContaining({ parentEventPosition: responseBoundary }),
+      childLineage: expect.objectContaining({ parentEventPosition: branchBoundary }),
     });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -744,7 +813,8 @@ test("SessionLifecycle retains inherited branch context across a cold continuati
   };
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const root = await lifecycle.create({ targetIdentity });
     const rootRun = await lifecycle.continue({
       sessionId: root.sessionId,
@@ -755,11 +825,10 @@ test("SessionLifecycle retains inherited branch context across a cold continuati
       atSequence: rootRun.snapshot.lastSequence,
     });
     const runId = "123e4567-e89b-42d3-a456-426614174097";
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: child.sessionId,
-    });
+    const store = await harness.sessions.open(child.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the child session store.");
+    }
     const records: readonly Omit<
       Extract<SessionRecord, { readonly schemaVersion: 3 }>,
       "sequence"
@@ -831,9 +900,10 @@ test("SessionLifecycle branches to an explicit compatible exact target only when
       }),
   });
   const currentTargetIdentity = { ...targetIdentity, profileVersion: 2 };
+  const harness = createInMemorySessionLifecycleHarness();
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const parent = await lifecycle.create({ targetIdentity: currentTargetIdentity });
     const parentRun = await lifecycle.continue({
       sessionId: parent.sessionId,
@@ -908,7 +978,8 @@ test("SessionLifecycle rejects an incompatible retarget hidden behind an empty b
   };
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const root = await lifecycle.create({ targetIdentity });
     const rootRun = await lifecycle.continue({
       sessionId: root.sessionId,
@@ -938,14 +1009,14 @@ test("SessionLifecycle normalizes an active provider attempt before branching it
   await mkdir(workspaceRoot);
 
   try {
-    const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
     const parent = await lifecycle.create({ targetIdentity });
     const runId = "123e4567-e89b-42d3-a456-426614174050";
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: parent.sessionId,
-    });
+    const store = await harness.sessions.open(parent.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the parent session store.");
+    }
     await store.append({
       schemaVersion: 3,
       sequence: 2,
@@ -1065,7 +1136,8 @@ test("SessionLifecycle branches completed failed and cancelled runs without reop
         throw new Error("provider offline");
       },
     });
-    const failedLifecycle = createSessionLifecycle({
+    const failedHarness = createInMemorySessionLifecycleHarness();
+    const failedLifecycle = failedHarness.createLifecycle({
       modelTargets: failingTargets,
       stateRoot,
       workspaceRoot: failedWorkspace,
@@ -1116,7 +1188,8 @@ test("SessionLifecycle branches completed failed and cancelled runs without reop
         };
       },
     };
-    const cancelledLifecycle = createSessionLifecycle({
+    const cancelledHarness = createInMemorySessionLifecycleHarness();
+    const cancelledLifecycle = cancelledHarness.createLifecycle({
       modelTargets: cancellingTargets,
       stateRoot,
       workspaceRoot: cancelledWorkspace,
@@ -1227,7 +1300,8 @@ test("SessionLifecycle durably completes a canonical provider response while kee
   });
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const events: RuntimeEvent[] = [];
     lifecycle.subscribe((event) => events.push(event));
@@ -1237,7 +1311,7 @@ test("SessionLifecycle durably completes a canonical provider response while kee
       input: { text: "Introduce yourself" },
       limits: { maxTurns: 2, maxTokens: 100 },
     });
-    const inspected = await createSessionLifecycle({ stateRoot, workspaceRoot }).inspect({
+    const inspected = await harness.createLifecycle({ stateRoot, workspaceRoot }).inspect({
       sessionId: created.sessionId,
     });
 
@@ -1319,14 +1393,14 @@ test("SessionLifecycle continues a run that crashed before its first provider at
   });
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const runId = "123e4567-e89b-42d3-a456-426614174097";
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     await store.append({
       schemaVersion: 3,
       sequence: 2,
@@ -1403,14 +1477,14 @@ test("SessionLifecycle restores the canonical user event after a pre-event crash
   });
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const runId = "123e4567-e89b-42d3-a456-426614174095";
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     await store.append({
       schemaVersion: 3,
       sequence: 2,
@@ -1469,14 +1543,14 @@ test("SessionLifecycle terminalizes a durable cancellation instead of reopening 
   });
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const runId = "123e4567-e89b-42d3-a456-426614174096";
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     const records: readonly Omit<
       Extract<SessionRecord, { readonly schemaVersion: 3 }>,
       "sequence"
@@ -1593,7 +1667,8 @@ test("SessionLifecycle completes a durable run-terminal intent instead of starti
   });
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const runId = "123e4567-e89b-42d3-a456-426614174094";
     const terminalResult = {
@@ -1603,11 +1678,10 @@ test("SessionLifecycle completes a durable run-terminal intent instead of starti
         message: "The model stream ended without a finish event.",
       },
     } as const;
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     const records: readonly Omit<
       Extract<SessionRecord, { readonly schemaVersion: 3 }>,
       "sequence"
@@ -1717,21 +1791,23 @@ test("SessionLifecycle artifactizes replay-critical reasoning instead of truncat
   };
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const continued = await lifecycle.continue({
       sessionId: created.sessionId,
       input: { text: "Think too much" },
     });
-    const completedResponses = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    }).then(async (store) =>
-      (await store.read()).filter(
-        (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
-      ),
-    );
+    const completedResponses = await harness.sessions
+      .open(created.sessionId)
+      .then(async (store) =>
+        store === undefined
+          ? []
+          : (await store.read()).filter(
+              (record) =>
+                record.schemaVersion === 3 && record.record.type === "model_response_completed",
+            ),
+      );
 
     expect(continued).toMatchObject({
       result: { status: "completed", answer: "" },
@@ -1790,7 +1866,8 @@ test("SessionLifecycle classifies an oversized complete response batch as replay
   };
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const continued = await lifecycle.continue({
       sessionId: created.sessionId,
@@ -1843,7 +1920,8 @@ test("SessionLifecycle commits a complete tool response before permission resolu
     if (readTool === undefined) {
       throw new Error("Expected the read_file tool.");
     }
-    const lifecycle = createSessionLifecycle({
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({
       modelTargets,
       stateRoot,
       workspaceRoot,
@@ -1872,11 +1950,9 @@ test("SessionLifecycle commits a complete tool response before permission resolu
     });
     const permission = await permissionRequested;
     const beforeDecision = await lifecycle.inspect({ sessionId: created.sessionId });
-    const durableRecords = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    }).then((store) => store.read());
+    const durableRecords = await harness.sessions
+      .open(created.sessionId)
+      .then((store) => store?.read() ?? []);
     const completedResponse = durableRecords.find(
       (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
     );
@@ -1956,14 +2032,14 @@ test("SessionLifecycle cold continuation interrupts the old attempt and reuses i
   });
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const runId = "123e4567-e89b-42d3-a456-426614174100";
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     await store.append({
       schemaVersion: 3,
       sequence: 2,
@@ -2121,14 +2197,14 @@ test("SessionLifecycle retains reported token usage from an interrupted provider
   };
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const runId = "123e4567-e89b-42d3-a456-426614174101";
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     const records: readonly Omit<
       Extract<SessionRecord, { readonly schemaVersion: 3 }>,
       "sequence"
@@ -2223,7 +2299,8 @@ test("SessionLifecycle settles an exhausted durable tool response before replayi
     if (readTool === undefined) {
       throw new Error("Expected the read_file tool.");
     }
-    const lifecycle = createSessionLifecycle({
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({
       modelTargets,
       permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
       stateRoot,
@@ -2237,11 +2314,10 @@ test("SessionLifecycle settles an exhausted durable tool response before replayi
       name: "read_file",
       argumentsJson: '{"path":"README.md"}',
     } as const;
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     const records: readonly Omit<
       Extract<SessionRecord, { readonly schemaVersion: 3 }>,
       "sequence"
@@ -2389,14 +2465,14 @@ test("SessionLifecycle settles a durable stop response with aggregate usage afte
   });
 
   try {
-    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
     const runId = "123e4567-e89b-42d3-a456-426614174150";
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     const records: readonly Omit<
       Extract<SessionRecord, { readonly schemaVersion: 3 }>,
       "sequence"
@@ -2529,7 +2605,8 @@ test("SessionLifecycle cold continuation replays a completed safe read as contex
     if (readTool === undefined) {
       throw new Error("Expected the read_file tool.");
     }
-    const lifecycle = createSessionLifecycle({
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({
       modelTargets,
       stateRoot,
       workspaceRoot,
@@ -2538,11 +2615,10 @@ test("SessionLifecycle cold continuation replays a completed safe read as contex
     });
     const created = await lifecycle.create({ targetIdentity });
     const runId = "123e4567-e89b-42d3-a456-426614174200";
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     const records: readonly Omit<
       Extract<SessionRecord, { readonly schemaVersion: 3 }>,
       "sequence"
@@ -2791,7 +2867,8 @@ test("SessionLifecycle settles a started unsafe tool effect as indeterminate wit
     if (writeTool === undefined) {
       throw new Error("Expected the write_file tool.");
     }
-    const lifecycle = createSessionLifecycle({
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({
       modelTargets,
       permissions: createPermissionPolicy({ allowedEffects: ["write"] }),
       stateRoot,
@@ -2805,11 +2882,10 @@ test("SessionLifecycle settles a started unsafe tool effect as indeterminate wit
       name: "write_file",
       argumentsJson: '{"path":"unsafe.txt","content":"x"}',
     } as const;
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     const records: readonly Omit<
       Extract<SessionRecord, { readonly schemaVersion: 3 }>,
       "sequence"
@@ -2981,7 +3057,8 @@ test("SessionLifecycle explicitly replays one exact safe read after revalidating
     if (readTool === undefined) {
       throw new Error("Expected the read_file tool.");
     }
-    const lifecycle = createSessionLifecycle({
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({
       modelTargets,
       permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
       stateRoot,
@@ -2995,11 +3072,10 @@ test("SessionLifecycle explicitly replays one exact safe read after revalidating
       name: "read_file",
       argumentsJson: '{"path":"README.md"}',
     } as const;
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     const records: readonly Omit<
       Extract<SessionRecord, { readonly schemaVersion: 3 }>,
       "sequence"
@@ -3106,11 +3182,7 @@ test("SessionLifecycle explicitly replays one exact safe read after revalidating
 
     const hydrated = await lifecycle.resume({ sessionId: created.sessionId });
     const continued = await lifecycle.continue({ sessionId: created.sessionId });
-    const persisted = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    }).then((sessionStore) => sessionStore.read());
+    const persisted = await store.read();
     const publicToolEvents = persisted.flatMap((record) =>
       record.schemaVersion === 3 &&
       record.record.type === "runtime_event" &&
@@ -3197,7 +3269,8 @@ test("SessionLifecycle asks again after restart instead of restoring a pending p
     if (readTool === undefined) {
       throw new Error("Expected the read_file tool.");
     }
-    const lifecycle = createSessionLifecycle({
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({
       modelTargets,
       permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }),
       stateRoot,
@@ -3212,11 +3285,10 @@ test("SessionLifecycle asks again after restart instead of restoring a pending p
       argumentsJson: '{"path":"README.md"}',
     } as const;
     const requestId = `${runId}:${call.id}`;
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     const records: readonly Omit<
       Extract<SessionRecord, { readonly schemaVersion: 3 }>,
       "sequence"
@@ -3398,7 +3470,8 @@ test.each([
       if (readTool === undefined) {
         throw new Error("Expected the read_file tool.");
       }
-      const lifecycle = createSessionLifecycle({
+      const harness = createInMemorySessionLifecycleHarness();
+      const lifecycle = harness.createLifecycle({
         modelTargets,
         permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
         stateRoot,
@@ -3412,11 +3485,10 @@ test.each([
         name: "read_file",
         argumentsJson: '{"path":"README.md"}',
       } as const;
-      const store = await openJsonlSessionStore<SessionRecord>({
-        stateRoot,
-        workspaceRoot,
-        sessionId: created.sessionId,
-      });
+      const store = await harness.sessions.open(created.sessionId);
+      if (store === undefined) {
+        throw new Error("Expected the created session store.");
+      }
       const records: readonly Omit<
         Extract<SessionRecord, { readonly schemaVersion: 3 }>,
         "sequence"
@@ -3663,13 +3735,13 @@ test("SessionLifecycle rejects a title terminal record without its matching dura
   await mkdir(workspaceRoot);
 
   try {
-    const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
     const created = await lifecycle.create({ targetIdentity });
-    const store = await openJsonlSessionStore<SessionRecord>({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
     await store.append({
       schemaVersion: 3,
       sequence: 2,

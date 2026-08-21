@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, type FileHandle, mkdir, open, realpath } from "node:fs/promises";
+import { chmod, type FileHandle, mkdir, open, readdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -765,6 +765,12 @@ export type SessionRecord = SessionEventRecord | SessionV3Record;
 export interface SessionStore<RecordType extends SessionRecord = SessionEventRecord> {
   append(record: RecordType): Promise<void>;
   read(): Promise<readonly RecordType[]>;
+}
+
+export interface SessionStoreDirectory<RecordType extends SessionRecord = SessionRecord> {
+  create(sessionId: string): Promise<SessionStore<RecordType>>;
+  listSessionIds(): Promise<readonly string[]>;
+  open(sessionId: string): Promise<SessionStore<RecordType> | undefined>;
 }
 
 export class SessionStoreError extends Error {
@@ -2040,6 +2046,67 @@ export function createInMemorySessionStore<
   };
 }
 
+export function createInMemorySessionStoreDirectory<
+  RecordType extends SessionRecord = SessionRecord,
+>(): SessionStoreDirectory<RecordType> {
+  const stores = new Map<string, SessionStore<RecordType>>();
+  return {
+    async create(sessionId) {
+      validateSessionId(sessionId);
+      if (stores.has(sessionId)) {
+        throw new SessionStoreError("session_log_exists");
+      }
+      const store = createInMemorySessionStore<RecordType>();
+      stores.set(sessionId, store);
+      return store;
+    },
+    async listSessionIds() {
+      return [...stores.keys()].sort();
+    },
+    async open(sessionId) {
+      validateSessionId(sessionId);
+      const store = stores.get(sessionId);
+      return store !== undefined && (await store.read()).length > 0 ? store : undefined;
+    },
+  };
+}
+
+export function createJsonlSessionStoreDirectory<
+  RecordType extends SessionRecord = SessionRecord,
+>(options: {
+  readonly workspaceRoot: string;
+  readonly stateRoot?: string;
+}): SessionStoreDirectory<RecordType> {
+  return {
+    create(sessionId) {
+      return createJsonlSessionStore<RecordType>({ ...options, sessionId });
+    },
+    async listSessionIds() {
+      const { sessionsDirectory } = await resolveProjectSessionDirectories(options);
+      try {
+        return (await readdir(sessionsDirectory, { withFileTypes: true }))
+          .filter((entry) => entry.isFile() && /^[0-9a-f-]{36}\.jsonl$/u.test(entry.name))
+          .map((entry) => entry.name.slice(0, -".jsonl".length))
+          .sort();
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") {
+          return [];
+        }
+        throw error;
+      }
+    },
+    async open(sessionId) {
+      validateSessionId(sessionId);
+      const sessionPath = await resolveSessionPath({ ...options, sessionId });
+      const log = await readBoundedSessionLog(sessionPath);
+      if (log === undefined || log.records.length === 0) {
+        return undefined;
+      }
+      return createJsonlStore<RecordType>(sessionPath, log.records.length + 1, log.storedBytes);
+    },
+  };
+}
+
 export async function createJsonlSessionStore<
   RecordType extends SessionRecord = SessionEventRecord,
 >(options: {
@@ -2049,12 +2116,8 @@ export async function createJsonlSessionStore<
 }): Promise<SessionStore<RecordType>> {
   validateSessionId(options.sessionId);
 
-  const canonicalWorkspaceRoot = await realpath(options.workspaceRoot);
-  const projectId = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex");
-  const stateRoot = options.stateRoot ?? defaultStateRoot();
-  const projectsDirectory = join(stateRoot, "projects");
-  const projectDirectory = join(projectsDirectory, projectId);
-  const sessionsDirectory = join(projectDirectory, "sessions");
+  const { projectDirectory, projectsDirectory, sessionsDirectory } =
+    await resolveProjectSessionDirectories(options);
   for (const directory of [projectsDirectory, projectDirectory, sessionsDirectory]) {
     await mkdir(directory, { recursive: true, mode: 0o700 });
     await chmod(directory, 0o700);
@@ -2154,10 +2217,27 @@ async function resolveSessionPath(options: {
   readonly stateRoot?: string;
 }): Promise<string> {
   validateSessionId(options.sessionId);
+  const { sessionsDirectory } = await resolveProjectSessionDirectories(options);
+  return join(sessionsDirectory, `${options.sessionId}.jsonl`);
+}
+
+async function resolveProjectSessionDirectories(options: {
+  readonly workspaceRoot: string;
+  readonly stateRoot?: string;
+}): Promise<{
+  readonly projectDirectory: string;
+  readonly projectsDirectory: string;
+  readonly sessionsDirectory: string;
+}> {
   const canonicalWorkspaceRoot = await realpath(options.workspaceRoot);
   const projectId = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex");
-  const stateRoot = options.stateRoot ?? defaultStateRoot();
-  return join(stateRoot, "projects", projectId, "sessions", `${options.sessionId}.jsonl`);
+  const projectsDirectory = join(options.stateRoot ?? defaultStateRoot(), "projects");
+  const projectDirectory = join(projectsDirectory, projectId);
+  return {
+    projectDirectory,
+    projectsDirectory,
+    sessionsDirectory: join(projectDirectory, "sessions"),
+  };
 }
 
 function defaultStateRoot(): string {

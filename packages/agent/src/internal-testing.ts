@@ -37,6 +37,11 @@ export {
   presentationHydrationBarrier,
   presentationRuntimeRefreshBarrier,
 } from "./presentation-session.js";
+export type {
+  ProjectLifecycleOwner,
+  ProjectLifecycleOwnerLease,
+} from "./project-lifecycle-owner.js";
+export { ProjectLifecycleOwnerError } from "./project-lifecycle-owner.js";
 export { assemblePromptMessagesV1, digestPromptRequestV1 } from "./prompt-assembly.js";
 export {
   sessionDurableContext,
@@ -54,10 +59,14 @@ export {
   type SessionTitleDeadlineScheduler,
   sessionAutomaticTitlesEnabled,
   sessionLogicalRunStartedBarrier,
+  sessionProjectLifecycleOwner,
   sessionRuntimeNotificationTransform,
+  sessionStoreDirectory,
   sessionTitleDeadlineScheduler,
 } from "./session-lifecycle.js";
 export {
+  createInMemorySessionStoreDirectory,
+  createJsonlSessionStoreDirectory,
   openJsonlSessionStore,
   type SessionContextCompactionCommittedRecord,
   type SessionContextCompactionFailedRecord,
@@ -69,6 +78,7 @@ export {
   type SessionProviderAttemptStartedRecord,
   type SessionRecord,
   type SessionRuntimeEventRecord,
+  type SessionStoreDirectory,
   type SessionToolIntent,
   type SessionV3Record,
 } from "./session-store.js";
