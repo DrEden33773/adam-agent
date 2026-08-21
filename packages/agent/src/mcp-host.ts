@@ -137,6 +137,9 @@ export const mcpCloseConfirmation = Symbol("adam-agent.mcp-close-confirmation");
 /** Tests only. Production dispatch performs no asynchronous work at this boundary. */
 export const mcpBeforeToolDispatchBarrier = Symbol("adam-agent.mcp-before-tool-dispatch-barrier");
 
+/** Tests only. Production MCP connections always use Adam's stdio transport. */
+export const mcpTransportFactory = Symbol("adam-agent.mcp-transport-factory");
+
 export type McpIdleScheduler = {
   schedule(delayMilliseconds: number, task: () => Promise<void>): { readonly cancel: () => void };
 };
@@ -149,6 +152,22 @@ export type McpCloseConfirmation = {
 };
 export type McpBeforeToolDispatchBarrier = {
   beforeDispatch(): Promise<void>;
+};
+
+export type McpClientTransport = Transport & {
+  readonly failureKind: "protocol_error" | undefined;
+  readonly isUsable: boolean;
+  readonly launchIdentityDigest: Sha256Digest;
+  readonly spawnConfirmed: boolean;
+};
+
+export type McpTransportFactory = {
+  create(input: {
+    readonly generationSignal: AbortSignal;
+    readonly launch: McpTransportLaunch;
+    readonly onUnexpectedClose: () => void;
+    readonly server: McpServerPreview;
+  }): McpClientTransport;
 };
 
 export type McpConfigurationSource = {
@@ -839,6 +858,7 @@ export function createMcpRuntimeHost(options: {
   readonly requestScheduler: McpRequestScheduler;
   readonly closeConfirmation: McpCloseConfirmation;
   readonly beforeToolDispatch?: McpBeforeToolDispatchBarrier;
+  readonly transportFactory?: McpTransportFactory;
 }): McpRuntimeHost {
   const generations = new Map<string, McpGeneration>();
   const packageCaches = new Map<string, McpPackageCache>();
@@ -892,6 +912,7 @@ export function createMcpRuntimeHost(options: {
               signal,
             ),
           options.closeConfirmation,
+          options.transportFactory ?? stdioMcpTransportFactory,
         ),
       ),
     };
@@ -1555,7 +1576,8 @@ type McpServerSlot = {
   readonly resolveLaunch: (signal: AbortSignal) => Promise<ResolvedStdioLaunch>;
   readonly client: Client;
   readonly closeConfirmation: McpCloseConfirmation;
-  transport?: AdamStdioTransport;
+  readonly transportFactory: McpTransportFactory;
+  transport?: McpClientTransport;
   closePromise?: Promise<void>;
   catalogStale: boolean;
   catalogRevision: number;
@@ -1569,6 +1591,7 @@ function createMcpServerSlot(
   server: McpServerPreview,
   resolveLaunch: (signal: AbortSignal) => Promise<ResolvedStdioLaunch>,
   closeConfirmation: McpCloseConfirmation,
+  transportFactory: McpTransportFactory,
 ): McpServerSlot {
   const client = new Client(
     { name: "adam-agent", version: "0.0.0" },
@@ -1591,6 +1614,7 @@ function createMcpServerSlot(
     resolveLaunch,
     client,
     closeConfirmation,
+    transportFactory,
     catalogStale: false,
     catalogRevision: 0,
   };
@@ -2455,7 +2479,7 @@ async function activateServer(
   let scheduledDeadline: { readonly cancel: () => void } | undefined;
   let deadline: AbortController | undefined;
   let phase: "bootstrap" | "initialize" | "catalog" = "bootstrap";
-  let transport: AdamStdioTransport | undefined;
+  let transport: McpClientTransport | undefined;
   try {
     const launch = await slot.resolveLaunch(generationSignal);
     generationSignal.throwIfAborted();
@@ -2468,9 +2492,12 @@ async function activateServer(
       },
     );
     const discoverySignal = AbortSignal.any([generationSignal, activationDeadline.signal]);
-    const activeTransport = new AdamStdioTransport(launch, generationSignal, () =>
-      slot.onUnexpectedClose?.(),
-    );
+    const activeTransport = slot.transportFactory.create({
+      generationSignal,
+      launch,
+      onUnexpectedClose: () => slot.onUnexpectedClose?.(),
+      server,
+    });
     transport = activeTransport;
     slot.transport = activeTransport;
     phase = "initialize";
@@ -2509,7 +2536,7 @@ async function activateServer(
         serverName,
         serverVersion: negotiatedServerVersion,
         capabilityDigest: sha256(canonicalJson(capabilities)),
-        launchIdentityDigest: activeTransport.launch.identityDigest,
+        launchIdentityDigest: activeTransport.launchIdentityDigest,
       },
     };
   } catch (error) {
@@ -3053,14 +3080,16 @@ function toolSlug(value: string, maximumBytes: number): string {
   return (slug.length === 0 ? "tool" : slug).slice(0, maximumBytes);
 }
 
-type ResolvedStdioLaunch = {
+export type McpTransportLaunch = {
   readonly path: string;
   readonly arguments: readonly string[];
   readonly cwd: string;
   readonly identityDigest: Sha256Digest;
 };
 
-class AdamStdioTransport implements Transport {
+type ResolvedStdioLaunch = McpTransportLaunch;
+
+class AdamStdioTransport implements McpClientTransport {
   onclose?: () => void;
   onerror?: (error: Error) => void;
   onmessage?: (message: JSONRPCMessage) => void;
@@ -3094,8 +3123,8 @@ class AdamStdioTransport implements Transport {
     this.#onUnexpectedClose = onUnexpectedClose;
   }
 
-  get launch(): ResolvedStdioLaunch {
-    return this.#launch;
+  get launchIdentityDigest(): Sha256Digest {
+    return this.#launch.identityDigest;
   }
 
   get failureKind(): "protocol_error" | undefined {
@@ -3328,6 +3357,12 @@ class AdamStdioTransport implements Transport {
     this.onclose?.();
   }
 }
+
+const stdioMcpTransportFactory: McpTransportFactory = {
+  create(input) {
+    return new AdamStdioTransport(input.launch, input.generationSignal, input.onUnexpectedClose);
+  },
+};
 
 async function closesBeforeGuard(closed: Promise<void>, milliseconds: number): Promise<boolean> {
   if (milliseconds <= 0) {

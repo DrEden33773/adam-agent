@@ -38,12 +38,17 @@ import {
   mcpPackageManagerCliPath,
   mcpPackageRegistryUrl,
   mcpRequestScheduler,
+  mcpTransportFactory,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
 import {
+  createInMemorySessionLifecycleHarness,
+  createScriptedMcpTransportFactory,
   createSessionLifecycleForTesting as createSessionLifecycle,
   FakeModelDriver,
+  type ScriptedMcpServer,
+  type ScriptedMcpTransportFactory,
 } from "./index.js";
 import {
   createForeignTransitiveNpmRegistryFixture,
@@ -84,6 +89,96 @@ type PersistedRecordProjection = Readonly<Record<string, unknown>> & {
 type PersistedRecordEnvelope = {
   readonly record?: PersistedRecordProjection;
 };
+
+async function writeScriptedMcpConfiguration(
+  testRoot: string,
+  workspaceRoot: string,
+  serverIds: readonly string[] = ["fixture"],
+): Promise<void> {
+  const executablePath = join(testRoot, "scripted-mcp");
+  await writeFile(executablePath, "#!/bin/sh\nexit 1\n");
+  await chmod(executablePath, 0o755);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: Object.fromEntries(
+        serverIds.map((serverId) => [serverId, { command: executablePath }]),
+      ),
+    }),
+  );
+}
+
+function createScriptedMcpLifecycle(
+  options: Parameters<typeof createSessionLifecycle>[0],
+  servers: Readonly<Record<string, ScriptedMcpServer>>,
+): {
+  readonly harness: ReturnType<typeof createInMemorySessionLifecycleHarness>;
+  readonly lifecycle: ReturnType<typeof createSessionLifecycle>;
+  readonly peer: ScriptedMcpTransportFactory;
+} {
+  const peer = createScriptedMcpTransportFactory(servers);
+  const harness = createInMemorySessionLifecycleHarness();
+  return {
+    harness,
+    lifecycle: harness.createLifecycle({ ...options, [mcpTransportFactory]: peer }),
+    peer,
+  };
+}
+
+function scriptedStringTool(
+  name: string,
+  inputSchema: Readonly<Record<string, unknown>> = {
+    type: "object",
+    properties: { value: { type: "string" } },
+    required: ["value"],
+    additionalProperties: false,
+  },
+): {
+  readonly inputSchema: Readonly<Record<string, unknown>>;
+  readonly name: string;
+} {
+  return { inputSchema, name };
+}
+
+function ordinaryScriptedMcpServer(): ScriptedMcpServer {
+  return {
+    toolPages: [
+      {
+        tools: [
+          {
+            ...scriptedStringTool("echo"),
+            description: "Echo a value.",
+          },
+        ],
+        nextCursor: "page-2",
+      },
+      {
+        cursor: "page-2",
+        tools: [
+          {
+            ...scriptedStringTool("uppercase"),
+            description: "Uppercase a value.",
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function scriptedReferenceDepthSchema(referenceCount: number): Readonly<Record<string, unknown>> {
+  return {
+    type: "object",
+    $defs: Object.fromEntries(
+      Array.from({ length: referenceCount }, (_unused, index) => [
+        `level_${index}`,
+        index === referenceCount - 1 ? { type: "string" } : { $ref: `#/$defs/level_${index + 1}` },
+      ]),
+    ),
+    properties: { value: { $ref: "#/$defs/level_0" } },
+    required: ["value"],
+    additionalProperties: false,
+  };
+}
 
 function observeFileCreation(path: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -1842,12 +1937,13 @@ test("SessionLifecycle activates an approved stdio server and discovers every to
   }
 });
 
-test("SessionLifecycle keeps a discovered MCP catalog private until its ready settlement is durable", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-activation-publication-"));
+test("SessionLifecycle receives a real stdio list_changed after one completed tool response", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-list-changed-stdio-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   const spawnMarker = join(testRoot, "spawned");
   const closeMarker = join(testRoot, "closed");
+  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
   await writeFile(
     join(workspaceRoot, ".mcp.json"),
@@ -1855,11 +1951,95 @@ test("SessionLifecycle keeps a discovered MCP catalog private until its ready se
       mcpServers: {
         fixture: {
           command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
+          args: [mcpServerFixturePath, spawnMarker, closeMarker, "list-changed-once", callMarker],
         },
       },
     }),
   );
+
+  let qualifiedName: string | undefined;
+  let requestCount = 0;
+  const driver = new FakeModelDriver(() => {
+    requestCount += 1;
+    return requestCount === 1
+      ? [
+          { type: "tool_call_start", id: "stdio-list-changed", name: qualifiedName as string },
+          {
+            type: "tool_call_delta",
+            id: "stdio-list-changed",
+            json: '{"value":"transport-contract"}',
+          },
+          { type: "tool_call_end", id: "stdio-list-changed" },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          { type: "text_delta", text: "Real stdio list change forwarded." },
+          { type: "finish", reason: "stop" },
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const staleDurable = Promise.withResolvers<void>();
+  const lifecycle = createSessionLifecycle({
+    [mcpCatalogStaleDurableBarrier]: { committed: () => staleDurable.resolve() },
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+  });
+  try {
+    const committed = await commitFixtureEchoTool(lifecycle);
+    qualifiedName = committed.qualifiedName;
+    const continued = lifecycle.continue({
+      sessionId: committed.sessionId,
+      input: { text: "Observe one real stdio list change" },
+      limits: { maxTurns: 2 },
+    });
+    await withFailureGuard(
+      staleDurable.promise,
+      5_000,
+      "The real stdio list_changed notification was not durably observed.",
+    );
+
+    await expect(continued).resolves.toMatchObject({
+      result: { status: "completed", answer: "Real stdio list change forwarded." },
+    });
+    await expect(lifecycle.inspect({ sessionId: committed.sessionId })).resolves.toMatchObject({
+      mcp: { status: "catalog_stale", catalog: { status: "stale" } },
+    });
+    expect(requestCount).toBe(2);
+    await expect(
+      readFile(callMarker, "utf8").then((value) => value.trim().split("\n")),
+    ).resolves.toEqual([
+      JSON.stringify({ name: "echo", arguments: { value: "transport-contract" } }),
+    ]);
+  } finally {
+    await lifecycle.close();
+    await expect(stat(closeMarker)).resolves.toBeDefined();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle keeps a discovered MCP catalog private until its ready settlement is durable", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-activation-publication-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let releaseSettlement = () => {};
   const settlementRelease = new Promise<void>((resolve) => {
@@ -1869,13 +2049,51 @@ test("SessionLifecycle keeps a discovered MCP catalog private until its ready se
   const settlementReached = new Promise<{ readonly generationId: string }>((resolve) => {
     announceSettlement = resolve;
   });
-  const lifecycle = createSessionLifecycle({
+  const scriptedPeer = createScriptedMcpTransportFactory({
+    fixture: {
+      toolPages: [
+        {
+          tools: [
+            {
+              name: "echo",
+              description: "Echo a value.",
+              inputSchema: {
+                type: "object",
+                properties: { value: { type: "string" } },
+                required: ["value"],
+                additionalProperties: false,
+              },
+            },
+          ],
+          nextCursor: "page-2",
+        },
+        {
+          cursor: "page-2",
+          tools: [
+            {
+              name: "uppercase",
+              description: "Uppercase a value.",
+              inputSchema: {
+                type: "object",
+                properties: { value: { type: "string" } },
+                required: ["value"],
+                additionalProperties: false,
+              },
+            },
+          ],
+        },
+      ],
+    },
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
     [mcpActivationSettlementBarrier]: {
       async beforeReadySettlement(input) {
         announceSettlement(input);
         await settlementRelease;
       },
     },
+    [mcpTransportFactory]: scriptedPeer,
     stateRoot,
     workspaceRoot,
   });
@@ -1937,20 +2155,8 @@ test("SessionLifecycle close racing ready publication leaves one replayable MCP 
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-publication-close-race-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let releaseSettlement = () => {};
   const settlementRelease = new Promise<void>((resolve) => {
@@ -1960,16 +2166,19 @@ test("SessionLifecycle close racing ready publication leaves one replayable MCP 
   const settlementReached = new Promise<void>((resolve) => {
     announceSettlement = resolve;
   });
-  const lifecycle = createSessionLifecycle({
-    [mcpActivationSettlementBarrier]: {
-      async beforeReadySettlement() {
-        announceSettlement();
-        await settlementRelease;
+  const { harness, lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      [mcpActivationSettlementBarrier]: {
+        async beforeReadySettlement() {
+          announceSettlement();
+          await settlementRelease;
+        },
       },
+      stateRoot,
+      workspaceRoot,
     },
-    stateRoot,
-    workspaceRoot,
-  });
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -2001,27 +2210,23 @@ test("SessionLifecycle close racing ready publication leaves one replayable MCP 
       5_000,
       "MCP discovery did not reach the durable settlement barrier.",
     );
+    const transportClosed = peer.nextClose("fixture");
     const closing = lifecycle.close();
+    await transportClosed;
     releaseSettlement();
     await expect(activation).rejects.toMatchObject({ code: "mcp_activation_cancelled" });
     await expect(closing).resolves.toEqual({ status: "closed" });
-    await expect(stat(closeMarker)).resolves.toBeDefined();
 
-    const sessionPath = join(
-      stateRoot,
-      "projects",
-      created.projectId.replace(/^sha256:/u, ""),
-      "sessions",
-      `${created.sessionId}.jsonl`,
+    const sessionStore = await harness.sessions.open(created.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the in-memory session store.");
+    }
+    const settlements = (await sessionStore.read()).filter(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_activation_settled",
     );
-    const settlements = (await readFile(sessionPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as PersistedRecordEnvelope)
-      .filter((entry) => entry.record?.type === "mcp_activation_settled");
     expect(settlements).toHaveLength(1);
 
-    const cold = createSessionLifecycle({ stateRoot, workspaceRoot });
+    const cold = harness.createLifecycle({ stateRoot, workspaceRoot });
     await expect(cold.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
       mcp: { status: "activation_required", activation: { status: "cancelled" } },
     });
@@ -2132,22 +2337,13 @@ test("SessionLifecycle rejects and closes an MCP server whose negotiated identit
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-server-identity-bounds-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "oversized-server-identity"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    { fixture: { ...ordinaryScriptedMcpServer(), serverName: "x".repeat(257) } },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -2169,6 +2365,7 @@ test("SessionLifecycle rejects and closes an MCP server whose negotiated identit
       definitionDigest: preview.definitionDigest,
     });
 
+    const transportClosed = peer.nextClose("fixture");
     await expect(
       lifecycle.configureMcp({
         type: "activate_servers",
@@ -2176,6 +2373,7 @@ test("SessionLifecycle rejects and closes an MCP server whose negotiated identit
         servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
       }),
     ).rejects.toMatchObject({ code: "mcp_initialize_failed" });
+    await transportClosed;
     const inspected = await lifecycle.inspect({ sessionId: created.sessionId });
     expect(inspected).toMatchObject({
       mcp: {
@@ -2183,7 +2381,6 @@ test("SessionLifecycle rejects and closes an MCP server whose negotiated identit
         diagnostics: [{ code: "mcp_initialize_failed", serverId: "fixture" }],
       },
     });
-    await expect(stat(closeMarker)).resolves.toBeDefined();
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -2194,34 +2391,25 @@ test("SessionLifecycle causally closes a prepared MCP generation when ready publ
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-publication-failure-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let rejectNextSettlement = true;
-  const lifecycle = createSessionLifecycle({
-    [mcpActivationSettlementBarrier]: {
-      async beforeReadySettlement() {
-        if (rejectNextSettlement) {
-          rejectNextSettlement = false;
-          throw new Error("injected durable publication failure");
-        }
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      [mcpActivationSettlementBarrier]: {
+        async beforeReadySettlement() {
+          if (rejectNextSettlement) {
+            rejectNextSettlement = false;
+            throw new Error("injected durable publication failure");
+          }
+        },
       },
+      stateRoot,
+      workspaceRoot,
     },
-    stateRoot,
-    workspaceRoot,
-  });
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -2243,6 +2431,7 @@ test("SessionLifecycle causally closes a prepared MCP generation when ready publ
       definitionDigest: preview.definitionDigest,
     });
 
+    const transportClosed = peer.nextClose("fixture");
     await expect(
       lifecycle.configureMcp({
         type: "activate_servers",
@@ -2250,7 +2439,7 @@ test("SessionLifecycle causally closes a prepared MCP generation when ready publ
         servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
       }),
     ).rejects.toMatchObject({ code: "mcp_start_failed" });
-    await expect(stat(closeMarker)).resolves.toBeDefined();
+    await transportClosed;
 
     const failed = await lifecycle.inspect({ sessionId: created.sessionId });
     const failedMcp =
@@ -2279,22 +2468,20 @@ test("SessionLifecycle rejects a cyclic tool cursor and closes the failed activa
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-cursor-loop-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "cursor-loop"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [
+          { tools: [scriptedStringTool("first")], nextCursor: "loop" },
+          { cursor: "loop", tools: [scriptedStringTool("second")], nextCursor: "loop" },
+        ],
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -2316,6 +2503,7 @@ test("SessionLifecycle rejects a cyclic tool cursor and closes the failed activa
       definitionDigest: preview.definitionDigest,
     });
 
+    const transportClosed = peer.nextClose("fixture");
     await expect(
       lifecycle.configureMcp({
         type: "activate_servers",
@@ -2328,6 +2516,7 @@ test("SessionLifecycle rejects a cyclic tool cursor and closes the failed activa
         ],
       }),
     ).rejects.toMatchObject({ code: "mcp_catalog_invalid" });
+    await transportClosed;
     const inspected = await lifecycle.inspect({ sessionId: created.sessionId });
     expect(inspected).toMatchObject({
       lastSequence: 6,
@@ -2336,7 +2525,6 @@ test("SessionLifecycle rejects a cyclic tool cursor and closes the failed activa
         diagnostics: [{ code: "mcp_catalog_invalid", serverId: "fixture" }],
       },
     });
-    await expect(stat(closeMarker)).resolves.toBeDefined();
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -2347,31 +2535,29 @@ test("SessionLifecycle surfaces unconfirmed activation shutdown without offering
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-unconfirmed-activation-close-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "cursor-loop"],
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+  let confirmationAttempts = 0;
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      stateRoot,
+      workspaceRoot,
+      [mcpCloseConfirmation]: {
+        async confirm() {
+          confirmationAttempts += 1;
+          throw new Error("Injected close-proof failure.");
         },
       },
-    }),
-  );
-  let confirmationAttempts = 0;
-  const lifecycle = createSessionLifecycle({
-    stateRoot,
-    workspaceRoot,
-    [mcpCloseConfirmation]: {
-      async confirm() {
-        confirmationAttempts += 1;
-        throw new Error("Injected close-proof failure.");
+    },
+    {
+      fixture: {
+        toolPages: [
+          { tools: [scriptedStringTool("first")], nextCursor: "loop" },
+          { cursor: "loop", tools: [scriptedStringTool("second")], nextCursor: "loop" },
+        ],
       },
     },
-  });
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -2393,6 +2579,7 @@ test("SessionLifecycle surfaces unconfirmed activation shutdown without offering
       definitionDigest: preview.definitionDigest,
     });
 
+    const transportClosed = peer.nextClose("fixture");
     await expect(
       lifecycle.configureMcp({
         type: "activate_servers",
@@ -2400,7 +2587,7 @@ test("SessionLifecycle surfaces unconfirmed activation shutdown without offering
         servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
       }),
     ).rejects.toMatchObject({ code: "mcp_shutdown_unconfirmed" });
-    await expect(stat(closeMarker)).resolves.toBeDefined();
+    await transportClosed;
     const inspected = await lifecycle.inspect({ sessionId: created.sessionId });
     expect(inspected).toMatchObject({
       mcp: {
@@ -2437,34 +2624,31 @@ test("SessionLifecycle durably fences an unconfirmed committed MCP shutdown acro
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-unconfirmed-committed-close-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+
+  const {
+    harness,
+    lifecycle: initial,
+    peer,
+  } = createScriptedMcpLifecycle(
+    {
+      [mcpCloseConfirmation]: {
+        async confirm() {
+          throw new Error("Injected close-proof failure.");
         },
       },
-    }),
-  );
-
-  const initial = createSessionLifecycle({
-    [mcpCloseConfirmation]: {
-      async confirm() {
-        throw new Error("Injected close-proof failure.");
-      },
+      stateRoot,
+      workspaceRoot,
     },
-    stateRoot,
-    workspaceRoot,
-  });
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   let cold: ReturnType<typeof createSessionLifecycle> | undefined;
   try {
     const committed = await commitFixtureEchoTool(initial);
+    const transportClosed = peer.nextClose("fixture");
     await expect(initial.close()).resolves.toEqual({ status: "mcp_shutdown_unconfirmed" });
+    await transportClosed;
     await expect(initial.inspect({ sessionId: committed.sessionId })).resolves.toMatchObject({
       mcp: {
         status: "mcp_shutdown_unconfirmed",
@@ -2488,7 +2672,7 @@ test("SessionLifecycle durably fences an unconfirmed committed MCP shutdown acro
         };
       },
     };
-    cold = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    cold = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     await expect(cold.inspect({ sessionId: committed.sessionId })).resolves.toMatchObject({
       mcp: { status: "mcp_shutdown_unconfirmed" },
     });
@@ -2498,7 +2682,6 @@ test("SessionLifecycle durably fences an unconfirmed committed MCP shutdown acro
         input: { text: "Do not restart an unconfirmed MCP generation" },
       }),
     ).rejects.toMatchObject({ code: "mcp_shutdown_unconfirmed" });
-    await expect(readFile(closeMarker, "utf8")).resolves.toBe("closed\n");
   } finally {
     await initial.close();
     await cold?.close();
@@ -2510,29 +2693,27 @@ test("SessionLifecycle explicitly retries the exact failed MCP activation genera
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-explicit-retry-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const failedOnceMarker = join(testRoot, "failed-once");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "fail-once-initialize",
-            failedOnceMarker,
-          ],
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+
+  let initializeAttempts = 0;
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          if (request.method !== "initialize") {
+            return defaultReply;
+          }
+          initializeAttempts += 1;
+          return initializeAttempts === 1
+            ? { kind: "error", code: -32_000, message: "injected initialize failure" }
+            : defaultReply;
         },
       },
-    }),
+    },
   );
-
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -2553,6 +2734,7 @@ test("SessionLifecycle explicitly retries the exact failed MCP activation genera
       serverId: preview.serverId,
       definitionDigest: preview.definitionDigest,
     });
+    const transportClosed = peer.nextClose("fixture");
     await expect(
       lifecycle.configureMcp({
         type: "activate_servers",
@@ -2560,6 +2742,7 @@ test("SessionLifecycle explicitly retries the exact failed MCP activation genera
         servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
       }),
     ).rejects.toMatchObject({ code: "mcp_initialize_failed" });
+    await transportClosed;
     const failed = await lifecycle.inspect({ sessionId: created.sessionId });
     if (failed.schemaVersion !== 3) {
       throw new Error("The fixture requires a current session snapshot.");
@@ -2601,43 +2784,38 @@ test("SessionLifecycle atomically fails one MCP generation and causally closes e
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-peer-failure-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const blockedSpawn = join(testRoot, "blocked-spawned");
-  const blockedClose = join(testRoot, "blocked-closed");
-  const blockedGate = join(testRoot, "blocked-gate");
-  const blockedInitializeReceived = join(testRoot, "blocked-initialize-received");
-  const failingSpawn = join(testRoot, "failing-spawned");
-  const failingClose = join(testRoot, "failing-closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        blocked: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            blockedSpawn,
-            blockedClose,
-            "gated-initialize",
-            blockedGate,
-            blockedInitializeReceived,
-          ],
-        },
-        failing: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            failingSpawn,
-            failingClose,
-            "fail-initialize-after-gate",
-            blockedInitializeReceived,
-          ],
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot, ["blocked", "failing"]);
+
+  let announceBlockedInitialize: (() => void) | undefined;
+  const blockedInitializeReceived = new Promise<void>((resolve) => {
+    announceBlockedInitialize = resolve;
+  });
+  const { harness, lifecycle, peer } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      blocked: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          if (request.method === "initialize") {
+            announceBlockedInitialize?.();
+            return { kind: "hold" };
+          }
+          return defaultReply;
         },
       },
-    }),
+      failing: {
+        ...ordinaryScriptedMcpServer(),
+        async respond(request, defaultReply) {
+          if (request.method === "initialize") {
+            await blockedInitializeReceived;
+            return { kind: "error", code: -32_000, message: "injected peer failure" };
+          }
+          return defaultReply;
+        },
+      },
+    },
   );
-
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -2658,40 +2836,22 @@ test("SessionLifecycle atomically fails one MCP generation and causally closes e
     }
     const approved = configured.snapshot.mcp?.servers ?? [];
     expect(approved.map((server) => server.status)).toEqual(["approved", "approved"]);
-    await expect(stat(blockedSpawn)).rejects.toMatchObject({ code: "ENOENT" });
-    await expect(stat(failingSpawn)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(peer.requests("blocked")).toHaveLength(0);
+    expect(peer.requests("failing")).toHaveLength(0);
 
+    const blockedClosed = peer.nextClose("blocked");
+    const failingClosed = peer.nextClose("failing");
     await expect(
-      withFailureGuard(
-        lifecycle.configureMcp({
-          type: "activate_servers",
-          sessionId: created.sessionId,
-          servers: approved.map((server) => ({
-            serverId: server.serverId,
-            definitionDigest: server.definitionDigest,
-          })),
-        }),
-        5_000,
-        "Peer failure did not settle the MCP generation causally.",
-      ),
-    ).rejects.toMatchObject({ code: "mcp_initialize_failed" });
-
-    const pids = await Promise.all(
-      [blockedSpawn, failingSpawn].map(async (path) =>
-        Number.parseInt(await readFile(path, "utf8"), 10),
-      ),
-    );
-    expect(
-      pids.map((pid) => {
-        try {
-          process.kill(pid, 0);
-          return false;
-        } catch (error) {
-          return error instanceof Error && "code" in error && error.code === "ESRCH";
-        }
+      lifecycle.configureMcp({
+        type: "activate_servers",
+        sessionId: created.sessionId,
+        servers: approved.map((server) => ({
+          serverId: server.serverId,
+          definitionDigest: server.definitionDigest,
+        })),
       }),
-    ).toEqual([true, true]);
-    expect(await readFile(blockedClose, "utf8")).toBe("closed\n");
+    ).rejects.toMatchObject({ code: "mcp_initialize_failed" });
+    await Promise.all([blockedClosed, failingClosed]);
     const failedSnapshot = await lifecycle.inspect({ sessionId: created.sessionId });
     expect(failedSnapshot).toMatchObject({ mcp: { status: "activation_failed" } });
     expect(
@@ -2703,40 +2863,39 @@ test("SessionLifecycle atomically fails one MCP generation and causally closes e
         : undefined,
     ).toEqual({ catalog: false, profile: false });
 
-    const sessionPath = join(
-      stateRoot,
-      "projects",
-      created.projectId.replace(/^sha256:/u, ""),
-      "sessions",
-      `${created.sessionId}.jsonl`,
+    const sessionStore = await harness.sessions.open(created.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the in-memory session store.");
+    }
+    const records = (await sessionStore.read()).filter((entry) => entry.schemaVersion === 3);
+    const settled = records.findLast(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_activation_settled",
     );
-    const records = (await readFile(sessionPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-    const settled = records.findLast((entry) => entry.record?.type === "mcp_activation_settled");
-    expect(settled?.record).toMatchObject({
+    expect(settled?.schemaVersion === 3 ? settled.record : undefined).toMatchObject({
       status: "failed",
       error: { code: "mcp_initialize_failed", serverId: "failing" },
     });
     const closeRecords = records
-      .filter((entry) => entry.record?.type === "mcp_server_closed")
-      .map((entry) => ({
-        serverId: entry.record.serverId,
-        reason: entry.record.reason,
-      }));
+      .filter((entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_server_closed")
+      .map((entry) =>
+        entry.schemaVersion === 3 && entry.record.type === "mcp_server_closed"
+          ? { serverId: entry.record.serverId, reason: entry.record.reason }
+          : undefined,
+      );
     expect(closeRecords).toEqual([
       { serverId: "blocked", reason: "peer_failure" },
       { serverId: "failing", reason: "failed" },
     ]);
     expect(
       records
-        .filter((entry) =>
-          ["mcp_activation_started", "mcp_server_closed", "mcp_activation_settled"].includes(
-            entry.record?.type,
-          ),
+        .filter(
+          (entry) =>
+            entry.schemaVersion === 3 &&
+            ["mcp_activation_started", "mcp_server_closed", "mcp_activation_settled"].includes(
+              entry.record.type,
+            ),
         )
-        .map((entry) => entry.record.type),
+        .map((entry) => (entry.schemaVersion === 3 ? entry.record.type : undefined)),
     ).toEqual([
       "mcp_activation_started",
       "mcp_server_closed",
@@ -2753,20 +2912,8 @@ test("SessionLifecycle cancels an uncommitted MCP generation and returns to base
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-cancel-configuration-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   const requests: ModelRequest[] = [];
   const driver = new FakeModelDriver((request) => {
@@ -2792,7 +2939,10 @@ test("SessionLifecycle cancels an uncommitted MCP generation and returns to base
       };
     },
   };
-  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    { modelTargets, stateRoot, workspaceRoot },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -2827,6 +2977,7 @@ test("SessionLifecycle cancels an uncommitted MCP generation and returns to base
       throw new Error("The fixture requires an active MCP generation.");
     }
 
+    const transportClosed = peer.nextClose("fixture");
     const cancelled = await lifecycle.configureMcp({
       type: "cancel_configuration",
       sessionId: created.sessionId,
@@ -2853,7 +3004,7 @@ test("SessionLifecycle cancels an uncommitted MCP generation and returns to base
       requestCount: 1,
     });
     expect(requests[0]?.tools.some((tool) => tool.name.startsWith("mcp__"))).toBe(false);
-    await expect(stat(closeMarker)).resolves.toBeDefined();
+    await transportClosed;
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -2864,31 +3015,28 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-cancel-activation-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const initializeGate = join(testRoot, "initialize-gate");
-  const initializeReceivedMarker = join(testRoot, "initialize-received");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "gated-initialize",
-            initializeGate,
-            initializeReceivedMarker,
-          ],
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+
+  let announceInitialize: (() => void) | undefined;
+  const initializeReceived = new Promise<void>((resolve) => {
+    announceInitialize = resolve;
+  });
+  const { harness, lifecycle, peer } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          if (request.method === "initialize") {
+            announceInitialize?.();
+            return { kind: "hold" };
+          }
+          return defaultReply;
         },
       },
-    }),
+    },
   );
-
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -2910,7 +3058,6 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
       definitionDigest: preview.definitionDigest,
     });
 
-    const initializeReceived = observeFileCreation(initializeReceivedMarker);
     const activation = lifecycle.configureMcp({
       type: "activate_servers",
       sessionId: created.sessionId,
@@ -2932,11 +3079,13 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
     }
     const generationId = activatingMcp.activation.generationId;
 
+    const transportClosed = peer.nextClose("fixture");
     const cancelled = await lifecycle.configureMcp({
       type: "cancel_configuration",
       sessionId: created.sessionId,
       generationId,
     });
+    await transportClosed;
 
     expect(await activationSettlement).toMatchObject({
       status: "rejected",
@@ -2951,28 +3100,28 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
         },
       },
     });
-    await expect(stat(closeMarker)).resolves.toBeDefined();
-    const sessionPath = join(
-      stateRoot,
-      "projects",
-      created.projectId.replace(/^sha256:/u, ""),
-      "sessions",
-      `${created.sessionId}.jsonl`,
-    );
-    const terminalRecords = (await readFile(sessionPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as PersistedRecordEnvelope)
-      .filter((entry) =>
-        ["mcp_activation_started", "mcp_server_closed", "mcp_activation_settled"].includes(
-          String(entry.record?.type),
-        ),
+    const sessionStore = await harness.sessions.open(created.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the in-memory session store.");
+    }
+    const terminalRecords = (await sessionStore.read())
+      .filter(
+        (entry) =>
+          entry.schemaVersion === 3 &&
+          ["mcp_activation_started", "mcp_server_closed", "mcp_activation_settled"].includes(
+            entry.record.type,
+          ),
       )
-      .map((entry) => ({
-        type: entry.record?.type,
-        status: entry.record?.status,
-        reason: entry.record?.reason,
-      }));
+      .map((entry) => {
+        if (entry.schemaVersion !== 3) {
+          throw new Error("The filtered record must use schema version 3.");
+        }
+        return {
+          type: entry.record.type,
+          status: "status" in entry.record ? entry.record.status : undefined,
+          reason: "reason" in entry.record ? entry.record.reason : undefined,
+        };
+      });
     expect(terminalRecords).toEqual([
       { type: "mcp_activation_started", status: undefined, reason: "initial" },
       { type: "mcp_server_closed", status: undefined, reason: "session_close" },
@@ -2988,36 +3137,33 @@ test("SessionLifecycle bounds initialize and discovery with a deterministic tota
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-discovery-timeout-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const initializeGate = join(testRoot, "initialize-gate");
-  const initializeReceivedMarker = join(testRoot, "initialize-received");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "gated-initialize",
-            initializeGate,
-            initializeReceivedMarker,
-          ],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   const manualDiscoveryDeadline = createManualMcpIdleScheduler();
-  const lifecycle = createSessionLifecycle({
-    [mcpDiscoveryScheduler]: manualDiscoveryDeadline.scheduler,
-    stateRoot,
-    workspaceRoot,
+  let announceInitialize: (() => void) | undefined;
+  const initializeReceived = new Promise<void>((resolve) => {
+    announceInitialize = resolve;
   });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      [mcpDiscoveryScheduler]: manualDiscoveryDeadline.scheduler,
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          if (request.method === "initialize") {
+            announceInitialize?.();
+            return { kind: "hold" };
+          }
+          return defaultReply;
+        },
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -3038,7 +3184,6 @@ test("SessionLifecycle bounds initialize and discovery with a deterministic tota
       serverId: preview.serverId,
       definitionDigest: preview.definitionDigest,
     });
-    const initializeReceived = observeFileCreation(initializeReceivedMarker);
     const activation = lifecycle.configureMcp({
       type: "activate_servers",
       sessionId: created.sessionId,
@@ -3050,22 +3195,15 @@ test("SessionLifecycle bounds initialize and discovery with a deterministic tota
     );
 
     await initializeReceived;
-    const fixturePid = Number.parseInt(await readFile(spawnMarker, "utf8"), 10);
+    const transportClosed = peer.nextClose("fixture");
     await manualDiscoveryDeadline.advanceBy(30_000);
     const outcome = await observedActivation;
-    let fixtureAbsent = false;
-    try {
-      process.kill(fixturePid, 0);
-    } catch (error) {
-      fixtureAbsent = error instanceof Error && "code" in error && error.code === "ESRCH";
-    }
+    await transportClosed;
 
-    expect({ outcome, fixtureAbsent }).toMatchObject({
+    expect({ outcome }).toMatchObject({
       outcome: { status: "rejected", error: { code: "mcp_startup_timeout" } },
-      fixtureAbsent: true,
     });
   } finally {
-    await writeFile(initializeGate, "cleanup").catch(() => undefined);
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -3075,22 +3213,26 @@ test("SessionLifecycle rejects an oversized MCP tool definition without truncati
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-definition-limit-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "oversized-definition"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: [
+              {
+                ...scriptedStringTool("oversized"),
+                description: "x".repeat(16 * 1024),
+              },
+            ],
+          },
+        ],
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -3112,6 +3254,7 @@ test("SessionLifecycle rejects an oversized MCP tool definition without truncati
       definitionDigest: preview.definitionDigest,
     });
 
+    const transportClosed = peer.nextClose("fixture");
     await expect(
       lifecycle.configureMcp({
         type: "activate_servers",
@@ -3119,7 +3262,7 @@ test("SessionLifecycle rejects an oversized MCP tool definition without truncati
         servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
       }),
     ).rejects.toMatchObject({ code: "mcp_catalog_too_large" });
-    await expect(stat(closeMarker)).resolves.toBeDefined();
+    await transportClosed;
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -3130,22 +3273,17 @@ test("SessionLifecycle orders MCP catalog identity by code unit rather than host
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-canonical-order-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "unicode-tool-order"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [{ tools: [scriptedStringTool("äther"), scriptedStringTool("zeta")] }],
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -3186,22 +3324,23 @@ test("SessionLifecycle classifies an MCP catalog over 256 tools as too large", a
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-catalog-tool-limit-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "catalog-tool-overflow"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: Array.from({ length: 257 }, (_unused, toolIndex) =>
+              scriptedStringTool(`tool_${toolIndex.toString().padStart(3, "0")}`),
+            ),
+          },
+        ],
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -3223,6 +3362,7 @@ test("SessionLifecycle classifies an MCP catalog over 256 tools as too large", a
       definitionDigest: preview.definitionDigest,
     });
 
+    const transportClosed = peer.nextClose("fixture");
     await expect(
       lifecycle.configureMcp({
         type: "activate_servers",
@@ -3230,7 +3370,7 @@ test("SessionLifecycle classifies an MCP catalog over 256 tools as too large", a
         servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
       }),
     ).rejects.toMatchObject({ code: "mcp_catalog_too_large" });
-    await expect(stat(closeMarker)).resolves.toBeDefined();
+    await transportClosed;
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -3241,22 +3381,39 @@ test("SessionLifecycle projects root allOf local references without narrowing th
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-allof-projection-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "allof-schema"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: [
+              scriptedStringTool("echo", {
+                type: "object",
+                $defs: {
+                  left: {
+                    type: "object",
+                    properties: { left: { type: "string" } },
+                    required: ["left"],
+                  },
+                  right: {
+                    type: "object",
+                    properties: { right: { type: "integer" } },
+                    required: ["right"],
+                  },
+                },
+                allOf: [{ $ref: "#/$defs/left" }, { $ref: "#/$defs/right" }],
+                additionalProperties: false,
+              }),
+            ],
+          },
+        ],
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -3320,22 +3477,29 @@ test("SessionLifecycle quarantines a recursive MCP schema without hiding its hea
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-recursive-schema-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "recursive-schema"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: [
+              scriptedStringTool("echo", {
+                type: "object",
+                properties: { next: { $ref: "#" } },
+                additionalProperties: false,
+              }),
+            ],
+            nextCursor: "page-2",
+          },
+          { cursor: "page-2", tools: [scriptedStringTool("uppercase")] },
+        ],
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -3378,22 +3542,51 @@ test("SessionLifecycle admits bounded local schema references while quarantining
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-schema-references-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "schema-reference-admission"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: [
+              scriptedStringTool("bounded_local_ref", {
+                type: "object",
+                $defs: {
+                  payload: {
+                    type: "object",
+                    properties: { value: { type: "string" } },
+                    required: ["value"],
+                    additionalProperties: false,
+                  },
+                },
+                properties: { payload: { $ref: "#/$defs/payload" } },
+                required: ["payload"],
+                additionalProperties: false,
+              }),
+              scriptedStringTool("plain_good"),
+              scriptedStringTool("cyclic_local_ref", {
+                type: "object",
+                $defs: {
+                  node: {
+                    type: "object",
+                    properties: { next: { $ref: "#/$defs/node" } },
+                  },
+                },
+                properties: { node: { $ref: "#/$defs/node" } },
+              }),
+              scriptedStringTool("remote_ref", {
+                type: "object",
+                properties: { value: { $ref: "https://example.invalid/schema.json" } },
+              }),
+            ],
+          },
+        ],
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -3453,22 +3646,25 @@ test("SessionLifecycle enforces the MCP local reference-chain depth at the 16/17
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-schema-reference-depth-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "schema-reference-depth"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: [
+              scriptedStringTool("within_limit", scriptedReferenceDepthSchema(16)),
+              scriptedStringTool("over_limit", scriptedReferenceDepthSchema(17)),
+              scriptedStringTool("plain_good"),
+            ],
+          },
+        ],
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -3513,22 +3709,35 @@ test("SessionLifecycle broadens a root oneOf projection and labels its branch re
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-oneof-schema-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "oneof-schema"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: [
+              scriptedStringTool("echo", {
+                type: "object",
+                oneOf: [
+                  {
+                    properties: { kind: { const: "left" }, left: { type: "string" } },
+                    required: ["kind", "left"],
+                  },
+                  {
+                    properties: { kind: { const: "right" }, right: { type: "integer" } },
+                    required: ["kind", "right"],
+                  },
+                ],
+              }),
+            ],
+          },
+        ],
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -3799,22 +4008,35 @@ test("SessionLifecycle rejects a selected MCP Tool Profile above its aggregate d
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-profile-overflow-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "selection-overflow"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: Array.from({ length: 20 }, (_unused, toolIndex) =>
+              scriptedStringTool(`wide_${toolIndex.toString().padStart(2, "0")}`, {
+                type: "object",
+                properties: Object.fromEntries(
+                  Array.from({ length: 48 }, (_property, propertyIndex) => [
+                    `property_${propertyIndex.toString().padStart(2, "0")}`,
+                    {
+                      type: "string",
+                      description: "A bounded property used to exercise aggregate profile limits.",
+                    },
+                  ]),
+                ),
+                additionalProperties: false,
+              }),
+            ),
+          },
+        ],
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -3874,22 +4096,23 @@ test("SessionLifecycle rejects 21 selected MCP tools without truncation and admi
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-profile-count-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "selection-count-boundary"],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: Array.from({ length: 21 }, (_unused, toolIndex) =>
+              scriptedStringTool(`selectable_${toolIndex.toString().padStart(2, "0")}`),
+            ),
+          },
+        ],
+      },
+    },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -3952,22 +4175,14 @@ test("SessionLifecycle commits one discovery-bound MCP Tool Profile before makin
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-profile-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { harness, lifecycle, peer } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
+  let transportClosed: Promise<void> | undefined;
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -4007,6 +4222,7 @@ test("SessionLifecycle commits one discovery-bound MCP Tool Profile before makin
     if (echo === undefined || generationId === undefined) {
       throw new Error("The fixture requires the discovered echo tool and generation.");
     }
+    transportClosed = peer.nextClose("fixture");
 
     const committed = await lifecycle.configureMcp({
       type: "commit_tool_profile",
@@ -4057,21 +4273,18 @@ test("SessionLifecycle commits one discovery-bound MCP Tool Profile before makin
         ],
       }),
     ).rejects.toMatchObject({ code: "session_invalid" });
-    const sessionPath = join(
-      stateRoot,
-      "projects",
-      committed.snapshot.projectId.replace(/^sha256:/u, ""),
-      "sessions",
-      `${created.sessionId}.jsonl`,
-    );
+    const sessionStore = await harness.sessions.open(created.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the committed in-memory session store.");
+    }
     expect(
-      (await readFile(sessionPath, "utf8"))
-        .trim()
-        .split("\n")
-        .filter((line) => JSON.parse(line).record?.type === "mcp_tool_profile_committed"),
+      (await sessionStore.read()).filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "mcp_tool_profile_committed",
+      ),
     ).toHaveLength(1);
 
-    const cold = await createSessionLifecycle({ stateRoot, workspaceRoot }).inspect({
+    const cold = await harness.createLifecycle({ stateRoot, workspaceRoot }).inspect({
       sessionId: created.sessionId,
     });
     expect(cold).toMatchObject({
@@ -4080,8 +4293,10 @@ test("SessionLifecycle commits one discovery-bound MCP Tool Profile before makin
     });
   } finally {
     const closed = await lifecycle.close();
+    if (transportClosed !== undefined) {
+      await transportClosed;
+    }
     expect(closed).toEqual({ status: "closed" });
-    await expect(stat(closeMarker)).resolves.toBeDefined();
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -4090,20 +4305,8 @@ test("SessionLifecycle commits MCP after a base-only run and exposes it only to 
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-after-base-run-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   const requests: ModelRequest[] = [];
   const driver = new FakeModelDriver((request) => {
@@ -4132,7 +4335,10 @@ test("SessionLifecycle commits MCP after a base-only run and exposes it only to 
       };
     },
   };
-  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    { modelTargets, stateRoot, workspaceRoot },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
 
   try {
     const created = await lifecycle.create({ targetIdentity });
@@ -4213,21 +4419,8 @@ test("SessionLifecycle idle-closes a committed MCP generation and reactivates it
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-idle-reactivation-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "ordinary", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   const manualIdle = createManualMcpIdleScheduler();
   let qualifiedName: string | undefined;
@@ -4274,13 +4467,16 @@ test("SessionLifecycle idle-closes a committed MCP generation and reactivates it
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    [mcpIdleScheduler]: manualIdle.scheduler,
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { harness, lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      [mcpIdleScheduler]: manualIdle.scheduler,
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   let resolvePermissionRequest:
     | ((event: Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>) => void)
     | undefined;
@@ -4342,11 +4538,14 @@ test("SessionLifecycle idle-closes a committed MCP generation and reactivates it
         },
       ],
     });
-    const initialPid = Number.parseInt(await readFile(spawnMarker, "utf8"), 10);
+    expect(
+      peer.requests("fixture").filter((request) => request.method === "initialize"),
+    ).toHaveLength(1);
 
+    const idleTransportClosed = peer.nextClose("fixture");
     await manualIdle.advanceBy(10 * 60 * 1_000);
+    await idleTransportClosed;
 
-    expect(await readFile(closeMarker, "utf8")).toBe("closed\n");
     await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
       mcp: { status: "profile_reactivation_required" },
     });
@@ -4357,45 +4556,49 @@ test("SessionLifecycle idle-closes a committed MCP generation and reactivates it
       limits: { maxTurns: 2 },
     });
     const permission = await permissionRequested;
-    const reactivatedPid = Number.parseInt(await readFile(spawnMarker, "utf8"), 10);
-    await expect(stat(callMarker)).rejects.toMatchObject({ code: "ENOENT" });
-    expect(reactivatedPid).not.toBe(initialPid);
+    expect(
+      peer.requests("fixture").filter((request) => request.method === "initialize"),
+    ).toHaveLength(2);
+    expect(
+      peer.requests("fixture").filter((request) => request.method === "tools/call"),
+    ).toHaveLength(0);
     expect(
       lifecycle.decidePermission({ requestId: permission.requestId, decision: "allow" }),
     ).toEqual({ status: "accepted" });
     const continued = await pendingContinue;
     expect(continued.result).toEqual({ status: "completed", answer: "Idle MCP returned." });
 
-    const sessionPath = join(
-      stateRoot,
-      "projects",
-      created.projectId.replace(/^sha256:/u, ""),
-      "sessions",
-      `${created.sessionId}.jsonl`,
-    );
-    const records = (await readFile(sessionPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
-    const idleTransitions = records.slice(6).flatMap((entry) => {
-      if (
-        entry.record?.type === "mcp_server_closed" ||
-        entry.record?.type === "mcp_activation_started" ||
-        entry.record?.type === "mcp_activation_settled"
-      ) {
-        return [
-          {
-            type: entry.record.type,
-            reason: entry.record.reason,
-            attempt: entry.record.attempt,
-          },
-        ];
+    const sessionStore = await harness.sessions.open(created.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the committed in-memory session store.");
+    }
+    const records = await sessionStore.read();
+    const idleTransitions: Array<{
+      readonly attempt: number | undefined;
+      readonly reason: unknown;
+      readonly type: string;
+    }> = [];
+    for (const entry of records.slice(6)) {
+      if (entry.schemaVersion !== 3) {
+        continue;
       }
-      const event = entry.record?.type === "runtime_event" ? entry.record.event : undefined;
-      return event?.callId === "mcp-after-idle"
-        ? [{ type: event.type, attempt: undefined, reason: undefined }]
-        : [];
-    });
+      if (
+        entry.record.type === "mcp_server_closed" ||
+        entry.record.type === "mcp_activation_started" ||
+        entry.record.type === "mcp_activation_settled"
+      ) {
+        idleTransitions.push({
+          type: entry.record.type,
+          reason: "reason" in entry.record ? entry.record.reason : undefined,
+          attempt: "attempt" in entry.record ? entry.record.attempt : undefined,
+        });
+        continue;
+      }
+      const event = entry.record.type === "runtime_event" ? entry.record.event : undefined;
+      if (event !== undefined && "callId" in event && event.callId === "mcp-after-idle") {
+        idleTransitions.push({ type: event.type, attempt: undefined, reason: undefined });
+      }
+    }
     expect(idleTransitions).toEqual([
       { type: "mcp_server_closed", reason: "idle", attempt: 1 },
       { type: "mcp_activation_started", reason: "idle_reactivate", attempt: 2 },
@@ -4416,21 +4619,8 @@ test("SessionLifecycle cold-reactivates an exact committed MCP profile before mo
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-cold-reactivation-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "ordinary", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -4468,7 +4658,14 @@ test("SessionLifecycle cold-reactivates an exact committed MCP profile before mo
       };
     },
   };
-  const initial = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const {
+    harness,
+    lifecycle: initial,
+    peer,
+  } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   let cold: ReturnType<typeof createSessionLifecycle> | undefined;
   try {
     const created = await initial.create({ targetIdentity });
@@ -4517,10 +4714,13 @@ test("SessionLifecycle cold-reactivates an exact committed MCP profile before mo
         },
       ],
     });
-    const initialPid = Number.parseInt(await readFile(spawnMarker, "utf8"), 10);
+    expect(
+      peer.requests("fixture").filter((request) => request.method === "initialize"),
+    ).toHaveLength(1);
     expect(await initial.close()).toEqual({ status: "closed" });
 
-    cold = createSessionLifecycle({
+    cold = harness.createLifecycle({
+      [mcpTransportFactory]: peer,
       modelTargets,
       permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
       stateRoot,
@@ -4539,21 +4739,20 @@ test("SessionLifecycle cold-reactivates an exact committed MCP profile before mo
       input: { text: "Use the exact cold MCP profile" },
       limits: { maxTurns: 2 },
     });
-    const reactivatedPid = Number.parseInt(await readFile(spawnMarker, "utf8"), 10);
 
     expect({
       continued,
       requestCount: requests.length,
-      freshProcess: reactivatedPid !== initialPid,
+      activationCount: peer.requests("fixture").filter((request) => request.method === "initialize")
+        .length,
     }).toMatchObject({
       continued: { result: { status: "completed", answer: "Cold MCP profile restored." } },
       requestCount: 2,
-      freshProcess: true,
+      activationCount: 2,
     });
-    await expect(readFile(callMarker, "utf8").then(JSON.parse)).resolves.toEqual({
-      name: "echo",
-      arguments: { value: "cold" },
-    });
+    expect(peer.requests("fixture").filter((request) => request.method === "tools/call")).toEqual([
+      { method: "tools/call", params: { name: "echo", arguments: { value: "cold" } } },
+    ]);
   } finally {
     await initial.close();
     await cold?.close();
@@ -4565,35 +4764,37 @@ test("SessionLifecycle rejects changed negotiated MCP server identity before mod
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-server-identity-change-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const versionMarker = join(testRoot, "server-version");
   await mkdir(workspaceRoot);
-  await writeFile(versionMarker, "1.0.0");
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "server-version-from-file",
-            versionMarker,
-          ],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const initial = createSessionLifecycle({ stateRoot, workspaceRoot });
+  let serverVersion = "1.0.0";
+  const server: ScriptedMcpServer = {
+    ...ordinaryScriptedMcpServer(),
+    respond(request, defaultReply) {
+      return request.method === "initialize"
+        ? {
+            kind: "result",
+            result: {
+              protocolVersion: "2025-11-25",
+              capabilities: { tools: { listChanged: true } },
+              serverInfo: { name: "adam-scripted-mcp-peer", version: serverVersion },
+            },
+          }
+        : defaultReply;
+    },
+  };
+  const {
+    harness,
+    lifecycle: initial,
+    peer,
+  } = createScriptedMcpLifecycle({ stateRoot, workspaceRoot }, { fixture: server });
   let cold: ReturnType<typeof createSessionLifecycle> | undefined;
   try {
     const committed = await commitFixtureEchoTool(initial);
+    const initialTransportClosed = peer.nextClose("fixture");
     await expect(initial.close()).resolves.toEqual({ status: "closed" });
-    await writeFile(versionMarker, "2.0.0");
+    await initialTransportClosed;
+    serverVersion = "2.0.0";
     let modelRequestCount = 0;
     const driver = new FakeModelDriver(() => {
       modelRequestCount += 1;
@@ -4615,21 +4816,26 @@ test("SessionLifecycle rejects changed negotiated MCP server identity before mod
         };
       },
     };
-    cold = createSessionLifecycle({
+    cold = harness.createLifecycle({
+      [mcpTransportFactory]: peer,
       modelTargets,
       permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
       stateRoot,
       workspaceRoot,
     });
 
+    const reactivationTransportClosed = peer.nextClose("fixture");
     await expect(
       cold.continue({
         sessionId: committed.sessionId,
         input: { text: "Do not rebind a changed MCP server identity" },
       }),
     ).rejects.toMatchObject({ code: "mcp_catalog_invalid" });
+    await reactivationTransportClosed;
     expect(modelRequestCount).toBe(0);
-    await expect(readFile(closeMarker, "utf8")).resolves.toBe("closed\nclosed\n");
+    expect(
+      peer.requests("fixture").filter((request) => request.method === "initialize"),
+    ).toHaveLength(2);
   } finally {
     await initial.close();
     await cold?.close();
@@ -4758,28 +4964,40 @@ test("SessionLifecycle records causal closure before a changed cold MCP profile 
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-cold-profile-change-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const schemaMarker = join(testRoot, "schema-type");
   await mkdir(workspaceRoot);
-  await writeFile(schemaMarker, "string");
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "schema-from-file", schemaMarker],
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+  let schemaType = "string";
+  const server: ScriptedMcpServer = {
+    get toolPages() {
+      return [
+        {
+          tools: [
+            {
+              ...scriptedStringTool("echo", {
+                type: "object",
+                properties: { value: { type: schemaType } },
+                required: ["value"],
+                additionalProperties: false,
+              }),
+              description: "Echo a value.",
+            },
+          ],
         },
-      },
-    }),
-  );
-  const initial = createSessionLifecycle({ stateRoot, workspaceRoot });
+      ];
+    },
+  };
+  const {
+    harness,
+    lifecycle: initial,
+    peer,
+  } = createScriptedMcpLifecycle({ stateRoot, workspaceRoot }, { fixture: server });
   let cold: ReturnType<typeof createSessionLifecycle> | undefined;
   try {
     const committed = await commitFixtureEchoTool(initial);
+    const initialTransportClosed = peer.nextClose("fixture");
     expect(await initial.close()).toEqual({ status: "closed" });
-    await writeFile(schemaMarker, "integer");
+    await initialTransportClosed;
+    schemaType = "integer";
     let modelRequests = 0;
     const driver = new FakeModelDriver(() => {
       modelRequests += 1;
@@ -4804,41 +5022,56 @@ test("SessionLifecycle records causal closure before a changed cold MCP profile 
         };
       },
     };
-    cold = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    cold = harness.createLifecycle({
+      [mcpTransportFactory]: peer,
+      modelTargets,
+      stateRoot,
+      workspaceRoot,
+    });
 
+    const reactivationTransportClosed = peer.nextClose("fixture");
     await expect(
       cold.continue({
         sessionId: committed.sessionId,
         input: { text: "Do not use a changed MCP profile" },
       }),
     ).rejects.toMatchObject({ code: "mcp_catalog_invalid" });
+    await reactivationTransportClosed;
     expect(modelRequests).toBe(0);
-    expect(await readFile(closeMarker, "utf8")).toBe("closed\nclosed\n");
-    const sessionPath = join(
-      stateRoot,
-      "projects",
-      (await cold.inspect({ sessionId: committed.sessionId })).projectId.replace(/^sha256:/u, ""),
-      "sessions",
-      `${committed.sessionId}.jsonl`,
-    );
-    const records = (await readFile(sessionPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
+    const sessionStore = await harness.sessions.open(committed.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the committed in-memory session store.");
+    }
+    const records = await sessionStore.read();
     const started = records.findLast(
       (entry) =>
-        entry.record?.type === "mcp_activation_started" &&
-        entry.record?.reason === "idle_reactivate",
+        entry.schemaVersion === 3 &&
+        entry.record.type === "mcp_activation_started" &&
+        entry.record.reason === "idle_reactivate",
     );
+    const startedGenerationId =
+      started?.schemaVersion === 3 && started.record.type === "mcp_activation_started"
+        ? started.record.generationId
+        : undefined;
     expect(
       records
-        .filter((entry) => entry.record?.generationId === started?.record?.generationId)
-        .map((entry) => ({
-          type: entry.record.type,
-          reason: entry.record.reason,
-          status: entry.record.status,
-          error: entry.record.error,
-        })),
+        .filter(
+          (entry) =>
+            entry.schemaVersion === 3 &&
+            "generationId" in entry.record &&
+            entry.record.generationId === startedGenerationId,
+        )
+        .map((entry) => {
+          if (entry.schemaVersion !== 3) {
+            throw new Error("The filtered record must use schema version 3.");
+          }
+          return {
+            type: entry.record.type,
+            reason: "reason" in entry.record ? entry.record.reason : undefined,
+            status: "status" in entry.record ? entry.record.status : undefined,
+            error: "error" in entry.record ? entry.record.error : undefined,
+          };
+        }),
     ).toEqual([
       {
         type: "mcp_activation_started",
@@ -4870,22 +5103,13 @@ test("SessionLifecycle lets a branch approve against an inherited workspace conf
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-branch-confirmation-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -4934,21 +5158,8 @@ test("SessionLifecycle inherits MCP authority only through the exact branch pref
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-branch-prefix-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "ordinary", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -4983,7 +5194,14 @@ test("SessionLifecycle inherits MCP authority only through the exact branch pref
       };
     },
   };
-  const initial = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const {
+    harness,
+    lifecycle: initial,
+    peer,
+  } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   let cold: ReturnType<typeof createSessionLifecycle> | undefined;
   try {
     const created = await initial.create({ targetIdentity });
@@ -5059,7 +5277,8 @@ test("SessionLifecycle inherits MCP authority only through the exact branch pref
     });
     expect(await initial.close()).toEqual({ status: "closed" });
 
-    cold = createSessionLifecycle({
+    cold = harness.createLifecycle({
+      [mcpTransportFactory]: peer,
       modelTargets,
       permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
       stateRoot,
@@ -5085,22 +5304,14 @@ test("SessionLifecycle rejects a child activation outside its inherited MCP appr
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-branch-authority-tamper-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "ordinary", callMarker],
-        },
-      },
-    }),
-  );
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+  const peer = createScriptedMcpTransportFactory({ fixture: ordinaryScriptedMcpServer() });
+  const lifecycle = createSessionLifecycle({
+    [mcpTransportFactory]: peer,
+    stateRoot,
+    workspaceRoot,
+  });
   try {
     const committed = await commitFixtureEchoTool(lifecycle);
     const child = await lifecycle.branch({
@@ -5163,21 +5374,8 @@ test("SessionLifecycle keeps user-assigned MCP effect authority over server anno
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-invocation-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "annotated-readonly", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -5232,12 +5430,29 @@ test("SessionLifecycle keeps user-assigned MCP effect authority over server anno
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["execute"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["execute"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: [
+              {
+                ...scriptedStringTool("echo"),
+                annotations: { readOnlyHint: true },
+                description: "Echo a value.",
+              },
+            ],
+          },
+        ],
+      },
+    },
+  );
   const events: RuntimeEvent[] = [];
   let resolvePermissionRequest:
     | ((event: Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>) => void)
@@ -5253,6 +5468,7 @@ test("SessionLifecycle keeps user-assigned MCP effect authority over server anno
       resolvePermissionRequest?.(event);
     }
   });
+  let transportClosed: Promise<void> | undefined;
 
   try {
     const created = await lifecycle.create({ targetIdentity });
@@ -5293,6 +5509,7 @@ test("SessionLifecycle keeps user-assigned MCP effect authority over server anno
     if (echo === undefined || generationId === undefined) {
       throw new Error("The fixture requires the discovered echo tool and generation.");
     }
+    transportClosed = peer.nextClose("fixture");
     qualifiedName = echo.qualifiedName;
     const committed = await lifecycle.configureMcp({
       type: "commit_tool_profile",
@@ -5330,7 +5547,9 @@ test("SessionLifecycle keeps user-assigned MCP effect authority over server anno
       limits: { maxTurns: 2 },
     });
     const permissionRequest = await permissionRequested;
-    await expect(stat(callMarker)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(
+      peer.requests("fixture").filter((request) => request.method === "tools/call"),
+    ).toHaveLength(0);
     expect(
       lifecycle.decidePermission({ requestId: permissionRequest.requestId, decision: "allow" }),
     ).toEqual({ status: "accepted" });
@@ -5411,14 +5630,15 @@ test("SessionLifecycle keeps user-assigned MCP effect authority over server anno
         },
       },
     ]);
-    await expect(readFile(callMarker, "utf8").then(JSON.parse)).resolves.toEqual({
-      name: "echo",
-      arguments: { value: "hello" },
-    });
+    expect(peer.requests("fixture").filter((request) => request.method === "tools/call")).toEqual([
+      { method: "tools/call", params: { name: "echo", arguments: { value: "hello" } } },
+    ]);
   } finally {
     const closed = await lifecycle.close();
+    if (transportClosed !== undefined) {
+      await transportClosed;
+    }
     expect(closed).toEqual({ status: "closed" });
-    await expect(stat(closeMarker)).resolves.toBeDefined();
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -5427,22 +5647,17 @@ test("SessionLifecycle rejects a core and MCP qualified-name collision before mo
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-qualified-collision-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const initial = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const {
+    harness,
+    lifecycle: initial,
+    peer,
+  } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   let cold: ReturnType<typeof createSessionLifecycle> | undefined;
   try {
     const committed = await commitFixtureEchoTool(initial);
@@ -5467,7 +5682,13 @@ test("SessionLifecycle rejects a core and MCP qualified-name collision before mo
         return { targets: [] };
       },
     };
-    cold = createSessionLifecycle({ modelTargets, stateRoot, tools, workspaceRoot });
+    cold = harness.createLifecycle({
+      [mcpTransportFactory]: peer,
+      modelTargets,
+      stateRoot,
+      tools,
+      workspaceRoot,
+    });
 
     await expect(cold.resume({ sessionId: committed.sessionId })).rejects.toMatchObject({
       code: "session_invalid",
@@ -5484,21 +5705,8 @@ test("SessionLifecycle completes an MCP tool-level error response without treati
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-tool-error-result-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "tool-error-result", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -5549,12 +5757,31 @@ test("SessionLifecycle completes an MCP tool-level error response without treati
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          return request.method === "tools/call"
+            ? {
+                kind: "result",
+                result: {
+                  content: [{ type: "text", text: "denied" }],
+                  structuredContent: { echoed: "denied" },
+                  isError: true,
+                },
+              }
+            : defaultReply;
+        },
+      },
+    },
+  );
   const events: RuntimeEvent[] = [];
   lifecycle.subscribe((event) => events.push(event));
 
@@ -5586,10 +5813,9 @@ test("SessionLifecycle completes an MCP tool-level error response without treati
         isError: true,
       },
     });
-    await expect(readFile(callMarker, "utf8").then(JSON.parse)).resolves.toEqual({
-      name: "echo",
-      arguments: { value: "denied" },
-    });
+    expect(peer.requests("fixture").filter((request) => request.method === "tools/call")).toEqual([
+      { method: "tools/call", params: { name: "echo", arguments: { value: "denied" } } },
+    ]);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -5600,27 +5826,8 @@ test("SessionLifecycle treats a complete correlated MCP protocol error as determ
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-correlated-error-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "jsonrpc-error-on-call",
-            callMarker,
-          ],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -5663,12 +5870,24 @@ test("SessionLifecycle treats a complete correlated MCP protocol error as determ
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          return request.method === "tools/call"
+            ? { kind: "error", code: -32_000, message: "scripted MCP protocol error" }
+            : defaultReply;
+        },
+      },
+    },
+  );
   const events: RuntimeEvent[] = [];
   lifecycle.subscribe((event) => events.push(event));
 
@@ -5710,21 +5929,8 @@ test("SessionLifecycle rejects invalid raw MCP arguments before permission or di
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-invalid-input-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "ordinary", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -5773,12 +5979,15 @@ test("SessionLifecycle rejects invalid raw MCP arguments before permission or di
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   const events: RuntimeEvent[] = [];
   lifecycle.subscribe((event) => events.push(event));
 
@@ -5812,7 +6021,9 @@ test("SessionLifecycle rejects invalid raw MCP arguments before permission or di
         },
       },
     ]);
-    await expect(stat(callMarker)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(
+      peer.requests("fixture").filter((request) => request.method === "tools/call"),
+    ).toHaveLength(0);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -5823,21 +6034,8 @@ test("SessionLifecycle spills a complete MCP result above 64 KiB before publishi
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-large-result-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "large-result", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   const fullText = "x".repeat(70_000);
   const fullEnvelopeBytes = Buffer.from(
@@ -5910,12 +6108,24 @@ test("SessionLifecycle spills a complete MCP result above 64 KiB before publishi
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          return request.method === "tools/call"
+            ? { kind: "result", result: { content: [{ type: "text", text: fullText }] } }
+            : defaultReply;
+        },
+      },
+    },
+  );
   const events: RuntimeEvent[] = [];
   lifecycle.subscribe((event) => events.push(event));
 
@@ -6006,21 +6216,8 @@ test("SessionLifecycle classifies a post-dispatch MCP disconnect without another
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-indeterminate-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "close-on-call", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -6058,12 +6255,22 @@ test("SessionLifecycle classifies a post-dispatch MCP disconnect without another
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          return request.method === "tools/call" ? { kind: "disconnect" } : defaultReply;
+        },
+      },
+    },
+  );
   const events: RuntimeEvent[] = [];
   lifecycle.subscribe((event) => events.push(event));
 
@@ -6169,10 +6376,9 @@ test("SessionLifecycle classifies a post-dispatch MCP disconnect without another
         },
       },
     ]);
-    await expect(readFile(callMarker, "utf8").then(JSON.parse)).resolves.toEqual({
-      name: "echo",
-      arguments: { value: "once" },
-    });
+    expect(peer.requests("fixture").filter((request) => request.method === "tools/call")).toEqual([
+      { method: "tools/call", params: { name: "echo", arguments: { value: "once" } } },
+    ]);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -6276,21 +6482,8 @@ test("SessionLifecycle times out a dispatched MCP request through a deterministi
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-request-timeout-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "hold-call", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   const manualRequestDeadline = createManualMcpIdleScheduler();
   let qualifiedName: string | undefined;
@@ -6320,20 +6513,37 @@ test("SessionLifecycle times out a dispatched MCP request through a deterministi
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    [mcpRequestScheduler]: manualRequestDeadline.scheduler,
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
+  let resolveDispatched: (() => void) | undefined;
+  const dispatched = new Promise<void>((resolve) => {
+    resolveDispatched = resolve;
   });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      [mcpRequestScheduler]: manualRequestDeadline.scheduler,
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          if (request.method === "tools/call") {
+            resolveDispatched?.();
+            return { kind: "hold" };
+          }
+          return defaultReply;
+        },
+      },
+    },
+  );
   const events: RuntimeEvent[] = [];
   lifecycle.subscribe((event) => events.push(event));
 
   try {
     const committed = await commitFixtureEchoTool(lifecycle);
     qualifiedName = committed.qualifiedName;
-    const dispatched = observeFileCreation(callMarker);
     const pending = lifecycle.continue({
       sessionId: committed.sessionId,
       input: { text: "Call an MCP tool that does not complete" },
@@ -6364,10 +6574,9 @@ test("SessionLifecycle times out a dispatched MCP request through a deterministi
         reason: "mcp_request_timeout",
       },
     });
-    await expect(readFile(callMarker, "utf8").then(JSON.parse)).resolves.toEqual({
-      name: "echo",
-      arguments: { value: "once" },
-    });
+    expect(peer.requests("fixture").filter((request) => request.method === "tools/call")).toEqual([
+      { method: "tools/call", params: { name: "echo", arguments: { value: "once" } } },
+    ]);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -6378,21 +6587,8 @@ test("SessionLifecycle classifies caller cancellation after MCP dispatch without
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-caller-cancelled-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "hold-call", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -6421,18 +6617,35 @@ test("SessionLifecycle classifies caller cancellation after MCP dispatch without
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
+  let resolveDispatched: (() => void) | undefined;
+  const dispatched = new Promise<void>((resolve) => {
+    resolveDispatched = resolve;
   });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          if (request.method === "tools/call") {
+            resolveDispatched?.();
+            return { kind: "hold" };
+          }
+          return defaultReply;
+        },
+      },
+    },
+  );
 
   try {
     const committed = await commitFixtureEchoTool(lifecycle);
     qualifiedName = committed.qualifiedName;
     const controller = new AbortController();
-    const dispatched = observeFileCreation(callMarker);
     const pending = lifecycle.continue({
       sessionId: committed.sessionId,
       input: { text: "Cancel only after the MCP call is dispatched" },
@@ -6471,21 +6684,8 @@ test.each([
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-invalid-output-"));
     const stateRoot = join(testRoot, "state");
     const workspaceRoot = join(testRoot, "workspace");
-    const spawnMarker = join(testRoot, "spawned");
-    const closeMarker = join(testRoot, "closed");
-    const callMarker = join(testRoot, "called");
     await mkdir(workspaceRoot);
-    await writeFile(
-      join(workspaceRoot, ".mcp.json"),
-      JSON.stringify({
-        mcpServers: {
-          fixture: {
-            command: process.execPath,
-            args: [mcpServerFixturePath, spawnMarker, closeMarker, mode, callMarker],
-          },
-        },
-      }),
-    );
+    await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
     let qualifiedName: string | undefined;
     const requests: ModelRequest[] = [];
@@ -6527,12 +6727,46 @@ test.each([
         };
       },
     };
-    const lifecycle = createSessionLifecycle({
-      modelTargets,
-      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-      stateRoot,
-      workspaceRoot,
-    });
+    const { lifecycle } = createScriptedMcpLifecycle(
+      {
+        modelTargets,
+        permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+        stateRoot,
+        workspaceRoot,
+      },
+      {
+        fixture: {
+          toolPages: [
+            {
+              tools: [
+                {
+                  ...scriptedStringTool("echo"),
+                  description: "Echo a value.",
+                  outputSchema: {
+                    type: "object",
+                    properties: { echoed: { type: "integer" } },
+                    required: ["echoed"],
+                    additionalProperties: false,
+                  },
+                },
+              ],
+            },
+          ],
+          respond(request, defaultReply) {
+            return request.method === "tools/call"
+              ? {
+                  kind: "result",
+                  result: {
+                    content: [{ type: "text", text: "wrong" }],
+                    structuredContent: { echoed: "wrong" },
+                    ...(mode === "invalid-error-output" ? { isError: true } : {}),
+                  },
+                }
+              : defaultReply;
+          },
+        },
+      },
+    );
     const events: RuntimeEvent[] = [];
     lifecycle.subscribe((event) => events.push(event));
 
@@ -6615,27 +6849,12 @@ test("SessionLifecycle rejects an excessively deep complete MCP structured resul
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-deep-output-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "deep-structured-result",
-            callMarker,
-          ],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+  let deepStructured: unknown = { echoed: "deep" };
+  for (let depth = 0; depth < 128; depth += 1) {
+    deepStructured = { nested: deepStructured };
+  }
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -6678,12 +6897,30 @@ test("SessionLifecycle rejects an excessively deep complete MCP structured resul
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { lifecycle } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          return request.method === "tools/call"
+            ? {
+                kind: "result",
+                result: {
+                  content: [{ type: "text", text: "deep" }],
+                  structuredContent: deepStructured,
+                },
+              }
+            : defaultReply;
+        },
+      },
+    },
+  );
   try {
     const committed = await commitFixtureEchoTool(lifecycle);
     qualifiedName = committed.qualifiedName;
@@ -6706,21 +6943,8 @@ test("SessionLifecycle rejects an unsupported MCP content block after a complete
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-unsupported-output-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "unsupported-result", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -6769,12 +6993,29 @@ test("SessionLifecycle rejects an unsupported MCP content block after a complete
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          return request.method === "tools/call"
+            ? {
+                kind: "result",
+                result: {
+                  content: [{ type: "image", data: "AA==", mimeType: "image/png" }],
+                },
+              }
+            : defaultReply;
+        },
+      },
+    },
+  );
   const events: RuntimeEvent[] = [];
   lifecycle.subscribe((event) => events.push(event));
 
@@ -6804,10 +7045,9 @@ test("SessionLifecycle rejects an unsupported MCP content block after a complete
         message: "The MCP tool returned a content type that Adam does not support.",
       },
     });
-    await expect(readFile(callMarker, "utf8").then(JSON.parse)).resolves.toEqual({
-      name: "echo",
-      arguments: { value: "image" },
-    });
+    expect(peer.requests("fixture").filter((request) => request.method === "tools/call")).toEqual([
+      { method: "tools/call", params: { name: "echo", arguments: { value: "image" } } },
+    ]);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -6818,21 +7058,8 @@ test("SessionLifecycle rejects a complete MCP result above its raw output limit"
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-result-too-large-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "oversized-result", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -6881,12 +7108,29 @@ test("SessionLifecycle rejects a complete MCP result above its raw output limit"
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          return request.method === "tools/call"
+            ? {
+                kind: "result",
+                result: {
+                  content: [{ type: "text", text: "x".repeat(8 * 1024 * 1024 + 1) }],
+                },
+              }
+            : defaultReply;
+        },
+      },
+    },
+  );
   const events: RuntimeEvent[] = [];
   lifecycle.subscribe((event) => events.push(event));
 
@@ -6916,10 +7160,9 @@ test("SessionLifecycle rejects a complete MCP result above its raw output limit"
         message: "The complete MCP tool result exceeded the 8 MiB raw output limit.",
       },
     });
-    await expect(readFile(callMarker, "utf8").then(JSON.parse)).resolves.toEqual({
-      name: "echo",
-      arguments: { value: "large" },
-    });
+    expect(peer.requests("fixture").filter((request) => request.method === "tools/call")).toEqual([
+      { method: "tools/call", params: { name: "echo", arguments: { value: "large" } } },
+    ]);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -6930,38 +7173,20 @@ test("SessionLifecycle refuses to commit a profile after its ready catalog becom
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-stale-before-profile-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
-  const notificationGate = join(testRoot, "notify-list-changed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "list-changed-on-gate",
-            callMarker,
-            notificationGate,
-          ],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
   let announceStale = () => {};
   const staleObserved = new Promise<void>((resolve) => {
     announceStale = resolve;
   });
-  const lifecycle = createSessionLifecycle({
-    [mcpCatalogStaleObservationBarrier]: { observed: announceStale },
-    stateRoot,
-    workspaceRoot,
-  });
+  const { harness, lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      [mcpCatalogStaleObservationBarrier]: { observed: announceStale },
+      stateRoot,
+      workspaceRoot,
+    },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   try {
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
@@ -6997,8 +7222,8 @@ test("SessionLifecycle refuses to commit a profile after its ready catalog becom
       throw new Error("The fixture requires one discovered MCP tool.");
     }
 
-    await writeFile(notificationGate, "notify");
-    await withFailureGuard(staleObserved, 5_000, "Adam did not observe list_changed.");
+    peer.notifyToolsChanged("fixture");
+    await staleObserved;
     await expect(
       lifecycle.configureMcp({
         type: "commit_tool_profile",
@@ -7015,20 +7240,15 @@ test("SessionLifecycle refuses to commit a profile after its ready catalog becom
     ).rejects.toMatchObject({ code: "session_invalid" });
     const inspected = await lifecycle.inspect({ sessionId: created.sessionId });
     expect(inspected).toMatchObject({ mcp: { status: "catalog_stale" } });
-    const sessionPath = join(
-      stateRoot,
-      "projects",
-      created.projectId.replace(/^sha256:/u, ""),
-      "sessions",
-      `${created.sessionId}.jsonl`,
-    );
-    const records = (await readFile(sessionPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as PersistedRecordEnvelope);
-    expect(records.some((entry) => entry.record?.type === "mcp_tool_profile_committed")).toBe(
-      false,
-    );
+    const sessionStore = await harness.sessions.open(created.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the in-memory session store.");
+    }
+    expect(
+      (await sessionStore.read()).some(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_tool_profile_committed",
+      ),
+    ).toBe(false);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -7039,29 +7259,8 @@ test("SessionLifecycle fences an MCP call when list_changed arrives during permi
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-list-changed-permission-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
-  const notificationGate = join(testRoot, "notify-list-changed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "list-changed-on-gate",
-            callMarker,
-            notificationGate,
-          ],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -7108,13 +7307,16 @@ test("SessionLifecycle fences an MCP call when list_changed arrives during permi
   const staleObserved = new Promise<void>((resolve) => {
     announceStale = resolve;
   });
-  const lifecycle = createSessionLifecycle({
-    [mcpCatalogStaleObservationBarrier]: { observed: announceStale },
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      [mcpCatalogStaleObservationBarrier]: { observed: announceStale },
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   const events: RuntimeEvent[] = [];
   let announcePermission:
     | ((event: Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>) => void)
@@ -7140,8 +7342,8 @@ test("SessionLifecycle fences an MCP call when list_changed arrives during permi
       limits: { maxTurns: 2 },
     });
     const permission = await permissionRequested;
-    await writeFile(notificationGate, "notify");
-    await withFailureGuard(staleObserved, 5_000, "Adam did not observe list_changed.");
+    peer.notifyToolsChanged("fixture");
+    await staleObserved;
     expect(
       lifecycle.decidePermission({ requestId: permission.requestId, decision: "allow" }),
     ).toEqual({ status: "accepted" });
@@ -7160,7 +7362,9 @@ test("SessionLifecycle fences an MCP call when list_changed arrives during permi
       "tool_permission_decided",
       "tool_failed",
     ]);
-    await expect(stat(callMarker)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(
+      peer.requests("fixture").filter((request) => request.method === "tools/call"),
+    ).toHaveLength(0);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -7171,29 +7375,8 @@ test("SessionLifecycle rechecks MCP catalog state after tool_started and before 
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-list-changed-dispatch-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
-  const notificationGate = join(testRoot, "notify-list-changed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "list-changed-on-gate",
-            callMarker,
-            notificationGate,
-          ],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let announceStale = () => {};
   const staleObserved = new Promise<void>((resolve) => {
@@ -7237,14 +7420,17 @@ test("SessionLifecycle rechecks MCP catalog state after tool_started and before 
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
+  const peer = createScriptedMcpTransportFactory({ fixture: ordinaryScriptedMcpServer() });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
     [mcpBeforeToolDispatchBarrier]: {
       async beforeDispatch() {
-        await writeFile(notificationGate, "notify");
+        peer.notifyToolsChanged("fixture");
         await staleObserved;
       },
     },
     [mcpCatalogStaleObservationBarrier]: { observed: announceStale },
+    [mcpTransportFactory]: peer,
     modelTargets,
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     stateRoot,
@@ -7269,7 +7455,9 @@ test("SessionLifecycle rechecks MCP catalog state after tool_started and before 
         .filter((event) => "callId" in event && event.callId === "mcp-dispatch-stale")
         .map((event) => event.type),
     ).toEqual(["tool_requested", "tool_permission_decided", "tool_started", "tool_failed"]);
-    await expect(stat(callMarker)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(
+      peer.requests("fixture").filter((request) => request.method === "tools/call"),
+    ).toHaveLength(0);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -7280,27 +7468,8 @@ test("SessionLifecycle fences new MCP calls after a tools list-changed notificat
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-list-changed-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "list-changed-after-call",
-            callMarker,
-          ],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -7343,12 +7512,30 @@ test("SessionLifecycle fences new MCP calls after a tools list-changed notificat
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  let completedCalls = 0;
+  const { harness, lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          if (request.method !== "tools/call" || defaultReply.kind !== "result") {
+            return defaultReply;
+          }
+          completedCalls += 1;
+          return {
+            ...defaultReply,
+            ...(completedCalls === 1 ? { notifyToolsChanged: true } : {}),
+          };
+        },
+      },
+    },
+  );
   const events: RuntimeEvent[] = [];
   lifecycle.subscribe((event) => events.push(event));
   let cold: ReturnType<typeof createSessionLifecycle> | undefined;
@@ -7410,10 +7597,10 @@ test("SessionLifecycle fences new MCP calls after a tools list-changed notificat
     const secondEvents = events.filter(
       (event) => "callId" in event && event.callId === "mcp-after-stale",
     );
-    const calls = (await readFile(callMarker, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
+    const calls = peer
+      .requests("fixture")
+      .filter((request) => request.method === "tools/call")
+      .map((request) => request.params);
 
     expect({ continued, inspected, requestCount: requests.length, calls }).toMatchObject({
       continued: { result: { status: "completed", answer: "Stale MCP catalog fenced." } },
@@ -7424,33 +7611,29 @@ test("SessionLifecycle fences new MCP calls after a tools list-changed notificat
     expect(secondEvents.map((event) => event.type)).toEqual(["tool_requested", "tool_failed"]);
 
     expect(await lifecycle.close()).toEqual({ status: "closed" });
-    const sessionPath = join(
-      stateRoot,
-      "projects",
-      created.projectId.replace(/^sha256:/u, ""),
-      "sessions",
-      `${created.sessionId}.jsonl`,
-    );
-    const records = (await readFile(sessionPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as { readonly record?: { readonly type?: string } });
-    expect(records.filter((record) => record.record?.type === "mcp_catalog_state_changed")).toEqual(
-      [
-        expect.objectContaining({
-          record: expect.objectContaining({
-            type: "mcp_catalog_state_changed",
-            generationId,
-            serverId: "fixture",
-            catalogDigest: activeMcp.catalog?.digest,
-            status: "stale",
-            reason: "list_changed",
-          }),
+    const sessionStore = await harness.sessions.open(created.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the in-memory session store.");
+    }
+    expect(
+      (await sessionStore.read()).filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "mcp_catalog_state_changed",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        record: expect.objectContaining({
+          type: "mcp_catalog_state_changed",
+          generationId,
+          serverId: "fixture",
+          catalogDigest: activeMcp.catalog?.digest,
+          status: "stale",
+          reason: "list_changed",
         }),
-      ],
-    );
+      }),
+    ]);
 
-    cold = createSessionLifecycle({ stateRoot, workspaceRoot });
+    cold = harness.createLifecycle({ stateRoot, workspaceRoot });
     await expect(cold.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
       mcp: { status: "catalog_stale" },
     });
@@ -7465,45 +7648,27 @@ test("SessionLifecycle persists an idle list_changed before a cold lifecycle can
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-list-changed-idle-cold-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
-  const notificationGate = join(testRoot, "notify-list-changed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "list-changed-on-gate",
-            callMarker,
-            notificationGate,
-          ],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
   let announceDurable = () => {};
   const staleDurable = new Promise<void>((resolve) => {
     announceDurable = resolve;
   });
-  const lifecycle = createSessionLifecycle({
-    [mcpCatalogStaleDurableBarrier]: { committed: announceDurable },
-    stateRoot,
-    workspaceRoot,
-  });
+  const { harness, lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      [mcpCatalogStaleDurableBarrier]: { committed: announceDurable },
+      stateRoot,
+      workspaceRoot,
+    },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   let cold: ReturnType<typeof createSessionLifecycle> | undefined;
   try {
     const committed = await commitFixtureEchoTool(lifecycle);
-    await writeFile(notificationGate, "notify");
-    await withFailureGuard(staleDurable, 5_000, "The idle list_changed was not made durable.");
+    peer.notifyToolsChanged("fixture");
+    await staleDurable;
 
-    cold = createSessionLifecycle({ stateRoot, workspaceRoot });
+    cold = harness.createLifecycle({ stateRoot, workspaceRoot });
     await expect(cold.inspect({ sessionId: committed.sessionId })).resolves.toMatchObject({
       mcp: { status: "catalog_stale" },
     });
@@ -7518,21 +7683,8 @@ test("SessionLifecycle durably records list_changed even without a later MCP cal
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-list-changed-direct-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "list-changed-once", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -7567,12 +7719,24 @@ test("SessionLifecycle durably records list_changed even without a later MCP cal
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  const { harness, lifecycle } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          return request.method === "tools/call" && defaultReply.kind === "result"
+            ? { ...defaultReply, notifyToolsChanged: true }
+            : defaultReply;
+        },
+      },
+    },
+  );
 
   try {
     const committed = await commitFixtureEchoTool(lifecycle);
@@ -7586,19 +7750,15 @@ test("SessionLifecycle durably records list_changed even without a later MCP cal
       result: { status: "completed", answer: "List change observed." },
       snapshot: { mcp: { status: "catalog_stale" } },
     });
-    const sessionPath = join(
-      stateRoot,
-      "projects",
-      continued.snapshot.projectId.replace(/^sha256:/u, ""),
-      "sessions",
-      `${committed.sessionId}.jsonl`,
-    );
-    const catalogTransitions = (await readFile(sessionPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as PersistedRecordEnvelope)
-      .filter((entry) => entry.record?.type === "mcp_catalog_state_changed")
-      .map((entry) => entry.record);
+    const sessionStore = await harness.sessions.open(committed.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the in-memory session store.");
+    }
+    const catalogTransitions = (await sessionStore.read())
+      .filter(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_catalog_state_changed",
+      )
+      .map((entry) => (entry.schemaVersion === 3 ? entry.record : undefined));
 
     expect(catalogTransitions).toEqual([
       expect.objectContaining({
@@ -7618,21 +7778,8 @@ test("SessionLifecycle explicitly revalidates an unchanged stale MCP profile at 
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-list-revalidated-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "list-changed-once", callMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -7689,12 +7836,30 @@ test("SessionLifecycle explicitly revalidates an unchanged stale MCP profile at 
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  let completedCalls = 0;
+  const { harness, lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        ...ordinaryScriptedMcpServer(),
+        respond(request, defaultReply) {
+          if (request.method !== "tools/call" || defaultReply.kind !== "result") {
+            return defaultReply;
+          }
+          completedCalls += 1;
+          return {
+            ...defaultReply,
+            ...(completedCalls === 1 ? { notifyToolsChanged: true } : {}),
+          };
+        },
+      },
+    },
+  );
 
   try {
     const committed = await commitFixtureEchoTool(lifecycle);
@@ -7729,10 +7894,10 @@ test("SessionLifecycle explicitly revalidates an unchanged stale MCP profile at 
       input: { text: "Call the unchanged revalidated profile" },
       limits: { maxTurns: 2 },
     });
-    const calls = (await readFile(callMarker, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
+    const calls = peer
+      .requests("fixture")
+      .filter((request) => request.method === "tools/call")
+      .map((request) => request.params);
 
     expect({ after, requestCount: requests.length, calls }).toMatchObject({
       after: {
@@ -7745,19 +7910,15 @@ test("SessionLifecycle explicitly revalidates an unchanged stale MCP profile at 
         { name: "echo", arguments: { value: "second" } },
       ],
     });
-    const sessionPath = join(
-      stateRoot,
-      "projects",
-      before.snapshot.projectId.replace(/^sha256:/u, ""),
-      "sessions",
-      `${committed.sessionId}.jsonl`,
-    );
-    const catalogTransitions = (await readFile(sessionPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as PersistedRecordEnvelope)
-      .filter((entry) => entry.record?.type === "mcp_catalog_state_changed")
-      .map((entry) => entry.record);
+    const sessionStore = await harness.sessions.open(committed.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the in-memory session store.");
+    }
+    const catalogTransitions = (await sessionStore.read())
+      .filter(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_catalog_state_changed",
+      )
+      .map((entry) => (entry.schemaVersion === 3 ? entry.record : undefined));
     expect(catalogTransitions).toEqual([
       expect.objectContaining({ status: "stale", reason: "list_changed" }),
       expect.objectContaining({ status: "ready", reason: "revalidated" }),
@@ -7772,27 +7933,8 @@ test("SessionLifecycle keeps a stale historical profile closed when a selected t
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-list-revalidation-mismatch-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  const callMarker = join(testRoot, "called");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [
-            mcpServerFixturePath,
-            spawnMarker,
-            closeMarker,
-            "list-changed-then-mutated",
-            callMarker,
-          ],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
   let qualifiedName: string | undefined;
   const requests: ModelRequest[] = [];
@@ -7835,12 +7977,47 @@ test("SessionLifecycle keeps a stale historical profile closed when a selected t
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
-    modelTargets,
-    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-    stateRoot,
-    workspaceRoot,
-  });
+  let schemaType = "string";
+  let completedCalls = 0;
+  const server: ScriptedMcpServer = {
+    get toolPages() {
+      return [
+        {
+          tools: [
+            {
+              ...scriptedStringTool("echo", {
+                type: "object",
+                properties: { value: { type: schemaType } },
+                required: ["value"],
+                additionalProperties: false,
+              }),
+              description: "Echo a value.",
+            },
+          ],
+        },
+      ];
+    },
+    respond(request, defaultReply) {
+      if (request.method !== "tools/call" || defaultReply.kind !== "result") {
+        return defaultReply;
+      }
+      completedCalls += 1;
+      if (completedCalls === 1) {
+        schemaType = "integer";
+        return { ...defaultReply, notifyToolsChanged: true };
+      }
+      return defaultReply;
+    },
+  };
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    { fixture: server },
+  );
 
   try {
     const committed = await commitFixtureEchoTool(lifecycle);
@@ -7869,10 +8046,10 @@ test("SessionLifecycle keeps a stale historical profile closed when a selected t
       mcp: { status: "catalog_stale" },
     });
     expect(requests).toHaveLength(3);
-    const calls = (await readFile(callMarker, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line));
+    const calls = peer
+      .requests("fixture")
+      .filter((request) => request.method === "tools/call")
+      .map((request) => request.params);
     expect(calls).toEqual([{ name: "echo", arguments: { value: "first" } }]);
   } finally {
     await lifecycle.close();
@@ -7884,22 +8061,13 @@ test("SessionLifecycle close durably records each causally closed committed MCP 
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-close-record-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
   await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-  );
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const { harness, lifecycle, peer } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
   try {
     const committed = await commitFixtureEchoTool(lifecycle);
     const beforeClose = await lifecycle.inspect({ sessionId: committed.sessionId });
@@ -7916,7 +8084,9 @@ test("SessionLifecycle close durably records each causally closed committed MCP 
       throw new Error("The fixture requires one committed MCP server.");
     }
 
+    const transportClosed = peer.nextClose("fixture");
     const firstClose = await lifecycle.close();
+    await transportClosed;
     const secondClose = await lifecycle.close();
     const afterClose = await lifecycle.inspect({ sessionId: committed.sessionId });
     expect({ afterClose, firstClose, secondClose }).toMatchObject({
@@ -7924,20 +8094,13 @@ test("SessionLifecycle close durably records each causally closed committed MCP 
       firstClose: { status: "closed" },
       secondClose: { status: "closed" },
     });
-    await expect(stat(closeMarker)).resolves.toBeDefined();
-    const sessionPath = join(
-      stateRoot,
-      "projects",
-      beforeClose.projectId.replace(/^sha256:/u, ""),
-      "sessions",
-      `${committed.sessionId}.jsonl`,
-    );
-    const closeRecords = (await readFile(sessionPath, "utf8"))
-      .trim()
-      .split("\n")
-      .map((line) => JSON.parse(line) as PersistedRecordEnvelope)
-      .filter((entry) => entry.record?.type === "mcp_server_closed")
-      .map((entry) => entry.record);
+    const sessionStore = await harness.sessions.open(committed.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the in-memory session store.");
+    }
+    const closeRecords = (await sessionStore.read())
+      .filter((entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_server_closed")
+      .map((entry) => (entry.schemaVersion === 3 ? entry.record : undefined));
 
     expect(closeRecords).toEqual([
       {
@@ -7950,7 +8113,6 @@ test("SessionLifecycle close durably records each causally closed committed MCP 
         reason: "session_close",
       },
     ]);
-    await expect(readFile(closeMarker, "utf8")).resolves.toBe("closed\n");
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });

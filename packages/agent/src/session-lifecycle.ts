@@ -57,6 +57,7 @@ import {
   type McpRequestScheduler,
   type McpSessionSnapshot,
   type McpToolProfileV1,
+  type McpTransportFactory,
   mcpBeforeToolDispatchBarrier,
   mcpBootstrapScheduler,
   mcpCloseConfirmation,
@@ -66,6 +67,7 @@ import {
   mcpPackageManagerCliPath,
   mcpPackageRegistryUrl,
   mcpRequestScheduler,
+  mcpTransportFactory,
 } from "./mcp-host.js";
 import {
   type ModelTargetIdentity,
@@ -327,6 +329,7 @@ export type SessionLifecycleOptions = {
   readonly [mcpIdleScheduler]?: McpIdleScheduler;
   readonly [mcpPackageRegistryUrl]?: string;
   readonly [mcpRequestScheduler]?: McpRequestScheduler;
+  readonly [mcpTransportFactory]?: McpTransportFactory;
   readonly [mcpActivationSettlementBarrier]?: McpActivationSettlementBarrier;
   readonly [mcpCatalogStaleObservationBarrier]?: McpCatalogStaleObservationBarrier;
   readonly [mcpCatalogStaleDurableBarrier]?: McpCatalogStaleDurableBarrier;
@@ -662,6 +665,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     packageRegistryUrl: options[mcpPackageRegistryUrl] ?? "https://registry.npmjs.org",
     packageManagerCliPath: options[mcpPackageManagerCliPath],
     requestScheduler: options[mcpRequestScheduler] ?? nodeMcpIdleScheduler,
+    ...(options[mcpTransportFactory] === undefined
+      ? {}
+      : { transportFactory: options[mcpTransportFactory] }),
   });
   const closePreparedMcpActivation = async (input: {
     readonly sessionId: string;
