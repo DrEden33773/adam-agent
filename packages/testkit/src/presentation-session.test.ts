@@ -4646,6 +4646,18 @@ test("PresentationSession deduplicates notifications and repairs an impossible d
     const repairing = Promise.withResolvers<void>();
     const repaired = Promise.withResolvers<void>();
     let repairingObserved = false;
+    let failureGuard: ReturnType<typeof setTimeout> | undefined;
+    const failed = new Promise<never>((_resolve, reject) => {
+      failureGuard = setTimeout(() => {
+        reject(
+          new Error(
+            repairingObserved
+              ? "Presentation entered repair but did not return to current state."
+              : "Presentation did not publish the injected repair state.",
+          ),
+        );
+      }, 10_000);
+    });
     const unsubscribe = presentation.subscribe(() => {
       const continuity = presentation.getState().authoritative.continuity;
       if (continuity.status === "repairing") {
@@ -4668,9 +4680,12 @@ test("PresentationSession deduplicates notifications and repairs an impossible d
           skills: [],
         }),
       ).resolves.toMatchObject({ status: "admitted", resource: null });
-      await repairing.promise;
-      await repaired.promise;
+      await Promise.race([repairing.promise, failed]);
+      await Promise.race([repaired.promise, failed]);
     } finally {
+      if (failureGuard !== undefined) {
+        clearTimeout(failureGuard);
+      }
       unsubscribe();
       await presentation.close();
     }
