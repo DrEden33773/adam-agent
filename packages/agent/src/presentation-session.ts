@@ -275,6 +275,11 @@ export async function createPresentationSession(
       authoritative,
       transient: null,
     };
+    const metadataThrough = new Map<string, number>();
+    if (created !== undefined) {
+      metadataThrough.set(`session_naming_changed:${created.sessionId}`, created.lastSequence);
+      metadataThrough.set(`mcp_configuration_changed:${created.sessionId}`, created.lastSequence);
+    }
     const listeners = new Set<() => void>();
     const publishStateChange = (): void => {
       for (const listener of listeners) {
@@ -522,19 +527,28 @@ export async function createPresentationSession(
               };
               publishStateChange();
             }
+            const pendingInteractions = await projectPendingInteractions(refreshedRecords, options);
+            const latest = state.authoritative.active;
+            if (closed || latest === null || latest.session.id !== active.session.id) {
+              return;
+            }
+            const latestSequence =
+              state.authoritative.continuity.status === "current"
+                ? state.authoritative.continuity.sessionThroughSequence
+                : 0;
             state = {
               revision: state.revision + 1,
               authoritative: {
                 ...state.authoritative,
                 continuity: {
                   status: "current",
-                  sessionThroughSequence: activeSequence,
+                  sessionThroughSequence: Math.max(activeSequence, latestSequence),
                   operationThrough: [],
                 },
                 active: {
-                  ...current,
+                  ...latest,
                   transcript: transcriptPage(transcript, loadedTranscriptStart, current.session.id),
-                  pendingInteractions: await projectPendingInteractions(refreshedRecords, options),
+                  pendingInteractions,
                 },
               },
               transient: isAssistantTerminalEvent(event) ? null : state.transient,
@@ -577,12 +591,12 @@ export async function createPresentationSession(
     handleMetadata = (event) => {
       metadataRefresh = metadataRefresh.then(async () => {
         const active = state.authoritative.active;
+        const metadataKey = `${event.type}:${event.sessionId}`;
         if (
           closed ||
           active === null ||
           event.sessionId !== active.session.id ||
-          (state.authoritative.continuity.status === "current" &&
-            event.throughSequence <= state.authoritative.continuity.sessionThroughSequence)
+          event.throughSequence <= (metadataThrough.get(metadataKey) ?? 0)
         ) {
           return;
         }
@@ -591,6 +605,12 @@ export async function createPresentationSession(
             await refreshActiveNaming(event.sessionId, event.throughSequence);
           } else {
             await refreshActiveMcp(event.sessionId, event.throughSequence);
+          }
+          if (!closed && state.authoritative.active?.session.id === event.sessionId) {
+            metadataThrough.set(
+              metadataKey,
+              Math.max(event.throughSequence, metadataThrough.get(metadataKey) ?? 0),
+            );
           }
         } catch {
           if (closed) {

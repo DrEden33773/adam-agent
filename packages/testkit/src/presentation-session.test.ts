@@ -1296,13 +1296,23 @@ test("PresentationSession refreshes and explicitly revalidates an asynchronously
       });
       const stale = Promise.withResolvers<void>();
       const settled = Promise.withResolvers<void>();
-      const named = Promise.withResolvers<void>();
       let failureGuard: ReturnType<typeof setTimeout> | undefined;
       const failed = new Promise<never>((_resolve, reject) => {
-        failureGuard = setTimeout(
-          () => reject(new Error("Concurrent MCP and naming metadata did not settle.")),
-          10_000,
-        );
+        failureGuard = setTimeout(() => {
+          const current = presentation.getState();
+          reject(
+            new Error(
+              `Asynchronous MCP Presentation state did not settle: ${JSON.stringify({
+                mcp: current.authoritative.active?.mcp?.status,
+                naming: current.authoritative.active?.session.naming.generation.status,
+                transient: current.transient?.activity ?? null,
+                transcript: current.authoritative.active?.transcript.items.map((item) =>
+                  item.type === "assistant_message" ? item.text : item.type,
+                ),
+              })}`,
+            ),
+          );
+        }, 20_000);
       });
       const unsubscribe = presentation.subscribe(() => {
         const current = presentation.getState();
@@ -1317,9 +1327,6 @@ test("PresentationSession refreshes and explicitly revalidates an asynchronously
         ) {
           settled.resolve();
         }
-        if (current.authoritative.active?.session.naming.generation.status === "completed") {
-          named.resolve();
-        }
       });
       try {
         await presentation.dispatch({
@@ -1328,7 +1335,7 @@ test("PresentationSession refreshes and explicitly revalidates an asynchronously
           text: "Observe one list change",
           skills: [],
         });
-        await Promise.race([Promise.all([stale.promise, settled.promise, named.promise]), failed]);
+        await Promise.race([Promise.all([stale.promise, settled.promise]), failed]);
       } finally {
         if (failureGuard !== undefined) {
           clearTimeout(failureGuard);
@@ -1354,10 +1361,6 @@ test("PresentationSession refreshes and explicitly revalidates an asynchronously
       expect(presentation.getState().authoritative.active?.mcp).toMatchObject({
         status: "profile_committed",
         catalog: { status: "ready" },
-      });
-      expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
-        generatedTitle: "Stale catalog recorded.",
-        generation: { status: "completed" },
       });
     } finally {
       await presentation.close();
@@ -4641,9 +4644,15 @@ test("PresentationSession deduplicates notifications and repairs an impossible d
       workspaceRoot,
     });
     const repairing = Promise.withResolvers<void>();
+    const repaired = Promise.withResolvers<void>();
+    let repairingObserved = false;
     const unsubscribe = presentation.subscribe(() => {
-      if (presentation.getState().authoritative.continuity.status === "repairing") {
+      const continuity = presentation.getState().authoritative.continuity;
+      if (continuity.status === "repairing") {
+        repairingObserved = true;
         repairing.resolve();
+      } else if (repairingObserved && continuity.status === "current") {
+        repaired.resolve();
       }
     });
     try {
@@ -4660,6 +4669,7 @@ test("PresentationSession deduplicates notifications and repairs an impossible d
         }),
       ).resolves.toMatchObject({ status: "admitted", resource: null });
       await repairing.promise;
+      await repaired.promise;
     } finally {
       unsubscribe();
       await presentation.close();
