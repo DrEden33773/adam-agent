@@ -23,6 +23,7 @@ export class SessionPicker implements Component {
     readonly onLoadMore: () => void;
     readonly onRename: (session: SessionSummary) => void;
     readonly onSelect: (session: SessionSummary) => void;
+    readonly onClose: () => void;
     readonly hasMore: boolean;
   }) {
     this.#onNewSession = options.onNewSession;
@@ -48,6 +49,7 @@ export class SessionPicker implements Component {
       { value: newSessionValue, label: "New Session", description: "Choose an exact target" },
     ];
     this.#list = new SelectList(items, 8, options.theme.editor.selectList);
+    this.#list.onCancel = options.onClose;
     this.#list.onSelect = (item) => {
       if (item.value === newSessionValue) {
         this.#onNewSession();
@@ -91,7 +93,7 @@ export class SessionPicker implements Component {
       ...this.#list.render(width),
       ...(this.#notice === null ? [] : ["", this.#theme.muted(this.#notice)]),
       "",
-      this.#theme.muted("Enter open · r rename · ↑/↓ move · Ctrl+Q exit"),
+      this.#theme.muted("Enter open · r rename · ↑/↓ move · Esc close · Ctrl+Q exit"),
     ];
   }
 }

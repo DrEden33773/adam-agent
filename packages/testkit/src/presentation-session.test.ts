@@ -113,7 +113,11 @@ async function openActivatedMcpPresentationFixture(prefix: string) {
       servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
     });
     return {
+      lifecycle,
       presentation,
+      stateRoot,
+      testRoot,
+      workspaceRoot,
       async close() {
         await presentation.close();
         await lifecycle.close();
@@ -1098,6 +1102,82 @@ test("PresentationSession commits one discovery-bound immutable MCP Tool Profile
   }
 });
 
+test("PresentationSession explicitly reactivates one exact committed MCP profile after restart", async () => {
+  const fixture = await openActivatedMcpPresentationFixture(
+    "adam-agent-presentation-mcp-reactivation-",
+  );
+  let restarted: SessionLifecycle | undefined;
+  let reopened: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+  try {
+    const active = fixture.presentation.getState().authoritative.active;
+    const tool = active?.mcp?.catalog?.tools.find((candidate) => candidate.originalName === "echo");
+    const generationId = active?.mcp?.activation?.generationId;
+    if (
+      active?.mcp === null ||
+      active?.mcp === undefined ||
+      tool === undefined ||
+      generationId === undefined
+    ) {
+      throw new Error("Expected an activated MCP catalog.");
+    }
+    await fixture.presentation.dispatch({
+      type: "commit_mcp_tool_profile",
+      sessionId: active.session.id,
+      generationId,
+      selections: [
+        {
+          qualifiedName: tool.qualifiedName,
+          definitionDigest: tool.definitionDigest,
+          effect: "read",
+        },
+      ],
+    });
+    const profileDigest =
+      fixture.presentation.getState().authoritative.active?.mcp?.profile?.digest;
+    if (profileDigest === undefined) {
+      throw new Error("Expected one committed MCP Tool Profile.");
+    }
+    await fixture.presentation.close();
+    await fixture.lifecycle.close();
+
+    restarted = createSessionLifecycle({
+      stateRoot: fixture.stateRoot,
+      workspaceRoot: fixture.workspaceRoot,
+    });
+    reopened = await createPresentationSession({
+      lifecycle: restarted,
+      projectLabel: "workspace",
+      sessionId: active.session.id,
+      stateRoot: fixture.stateRoot,
+      workspaceRoot: fixture.workspaceRoot,
+    });
+    const reactivation = reopened.getState().authoritative.active;
+    const server = reactivation?.mcp?.servers[0];
+    expect(reactivation?.mcp).toMatchObject({ status: "profile_reactivation_required" });
+    if (server === undefined) {
+      throw new Error("Expected the exact approved MCP server.");
+    }
+
+    await expect(
+      reopened.dispatch({
+        type: "activate_mcp_servers",
+        sessionId: active.session.id,
+        servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(reopened.getState().authoritative.active?.mcp).toMatchObject({
+      status: "profile_committed",
+      profile: { digest: profileDigest },
+    });
+  } finally {
+    await reopened?.close();
+    await restarted?.close();
+    await fixture.presentation.close();
+    await fixture.lifecycle.close();
+    await rm(fixture.testRoot, { recursive: true, force: true });
+  }
+});
+
 test("PresentationSession refreshes and explicitly revalidates an asynchronously stale MCP catalog", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-mcp-revalidate-"));
   const stateRoot = join(testRoot, "state");
@@ -1170,95 +1250,118 @@ test("PresentationSession refreshes and explicitly revalidates an asynchronously
       targetIdentity,
       workspaceRoot,
     });
-    const initial = presentation.getState().authoritative.active;
-    if (initial?.mcp === null || initial?.mcp === undefined) {
-      throw new Error("Expected MCP confirmation state.");
-    }
-    await presentation.dispatch({
-      type: "confirm_mcp_workspace",
-      sessionId: initial.session.id,
-      sourceDigest: initial.mcp.source.digest,
-    });
-    const server = presentation.getState().authoritative.active?.mcp?.servers[0];
-    if (server === undefined) {
-      throw new Error("Expected MCP server preview.");
-    }
-    await presentation.dispatch({
-      type: "approve_mcp_server",
-      sessionId: initial.session.id,
-      serverId: server.serverId,
-      definitionDigest: server.definitionDigest,
-    });
-    await presentation.dispatch({
-      type: "activate_mcp_servers",
-      sessionId: initial.session.id,
-      servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
-    });
-    const activated = presentation.getState().authoritative.active?.mcp;
-    const tool = activated?.catalog?.tools.find((candidate) => candidate.originalName === "echo");
-    const generationId = activated?.activation?.generationId;
-    if (tool === undefined || generationId === undefined) {
-      throw new Error("Expected an activated MCP catalog.");
-    }
-    qualifiedName = tool.qualifiedName;
-    await presentation.dispatch({
-      type: "commit_mcp_tool_profile",
-      sessionId: initial.session.id,
-      generationId,
-      selections: [
-        {
-          qualifiedName: tool.qualifiedName,
-          definitionDigest: tool.definitionDigest,
-          effect: "read",
-        },
-      ],
-    });
-    const stale = Promise.withResolvers<void>();
-    const settled = Promise.withResolvers<void>();
-    const unsubscribe = presentation.subscribe(() => {
-      const current = presentation.getState();
-      if (current.authoritative.active?.mcp?.status === "catalog_stale") {
-        stale.resolve();
+    try {
+      const initial = presentation.getState().authoritative.active;
+      if (initial?.mcp === null || initial?.mcp === undefined) {
+        throw new Error("Expected MCP confirmation state.");
       }
-      if (
-        current.transient === null &&
-        current.authoritative.active?.transcript.items.some(
-          (item) => item.type === "assistant_message" && item.text === "Stale catalog recorded.",
-        )
-      ) {
-        settled.resolve();
+      await presentation.dispatch({
+        type: "confirm_mcp_workspace",
+        sessionId: initial.session.id,
+        sourceDigest: initial.mcp.source.digest,
+      });
+      const server = presentation.getState().authoritative.active?.mcp?.servers[0];
+      if (server === undefined) {
+        throw new Error("Expected MCP server preview.");
       }
-    });
-    await presentation.dispatch({
-      type: "submit_prompt",
-      sessionId: initial.session.id,
-      text: "Observe one list change",
-      skills: [],
-    });
-    await Promise.all([stale.promise, settled.promise]);
-    unsubscribe();
-    const staleMcp = presentation.getState().authoritative.active?.mcp;
-    expect(staleMcp).toMatchObject({ status: "catalog_stale", catalog: { status: "stale" } });
-    const staleGenerationId = staleMcp?.activation?.generationId;
-    if (staleGenerationId === undefined) {
-      throw new Error("Expected one stale MCP generation.");
+      await presentation.dispatch({
+        type: "approve_mcp_server",
+        sessionId: initial.session.id,
+        serverId: server.serverId,
+        definitionDigest: server.definitionDigest,
+      });
+      await presentation.dispatch({
+        type: "activate_mcp_servers",
+        sessionId: initial.session.id,
+        servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
+      });
+      const activated = presentation.getState().authoritative.active?.mcp;
+      const tool = activated?.catalog?.tools.find((candidate) => candidate.originalName === "echo");
+      const generationId = activated?.activation?.generationId;
+      if (tool === undefined || generationId === undefined) {
+        throw new Error("Expected an activated MCP catalog.");
+      }
+      qualifiedName = tool.qualifiedName;
+      await presentation.dispatch({
+        type: "commit_mcp_tool_profile",
+        sessionId: initial.session.id,
+        generationId,
+        selections: [
+          {
+            qualifiedName: tool.qualifiedName,
+            definitionDigest: tool.definitionDigest,
+            effect: "read",
+          },
+        ],
+      });
+      const stale = Promise.withResolvers<void>();
+      const settled = Promise.withResolvers<void>();
+      const named = Promise.withResolvers<void>();
+      let failureGuard: ReturnType<typeof setTimeout> | undefined;
+      const failed = new Promise<never>((_resolve, reject) => {
+        failureGuard = setTimeout(
+          () => reject(new Error("Concurrent MCP and naming metadata did not settle.")),
+          10_000,
+        );
+      });
+      const unsubscribe = presentation.subscribe(() => {
+        const current = presentation.getState();
+        if (current.authoritative.active?.mcp?.status === "catalog_stale") {
+          stale.resolve();
+        }
+        if (
+          current.transient === null &&
+          current.authoritative.active?.transcript.items.some(
+            (item) => item.type === "assistant_message" && item.text === "Stale catalog recorded.",
+          )
+        ) {
+          settled.resolve();
+        }
+        if (current.authoritative.active?.session.naming.generation.status === "completed") {
+          named.resolve();
+        }
+      });
+      try {
+        await presentation.dispatch({
+          type: "submit_prompt",
+          sessionId: initial.session.id,
+          text: "Observe one list change",
+          skills: [],
+        });
+        await Promise.race([Promise.all([stale.promise, settled.promise, named.promise]), failed]);
+      } finally {
+        if (failureGuard !== undefined) {
+          clearTimeout(failureGuard);
+        }
+        unsubscribe();
+      }
+      const staleMcp = presentation.getState().authoritative.active?.mcp;
+      expect(staleMcp).toMatchObject({ status: "catalog_stale", catalog: { status: "stale" } });
+      const staleGenerationId = staleMcp?.activation?.generationId;
+      if (staleGenerationId === undefined) {
+        throw new Error("Expected one stale MCP generation.");
+      }
+      const revalidated = await presentation.dispatch({
+        type: "revalidate_mcp_catalog",
+        sessionId: initial.session.id,
+        generationId: staleGenerationId,
+      });
+      const lifecycleAfterRevalidate = await lifecycle.inspect({ sessionId: initial.session.id });
+      expect({ revalidated, lifecycleAfterRevalidate }).toMatchObject({
+        revalidated: { status: "admitted", resource: null },
+        lifecycleAfterRevalidate: { mcp: { status: "profile_committed" } },
+      });
+      expect(presentation.getState().authoritative.active?.mcp).toMatchObject({
+        status: "profile_committed",
+        catalog: { status: "ready" },
+      });
+      expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+        generatedTitle: "Stale catalog recorded.",
+        generation: { status: "completed" },
+      });
+    } finally {
+      await presentation.close();
     }
-    const revalidated = await presentation.dispatch({
-      type: "revalidate_mcp_catalog",
-      sessionId: initial.session.id,
-      generationId: staleGenerationId,
-    });
-    const lifecycleAfterRevalidate = await lifecycle.inspect({ sessionId: initial.session.id });
-    expect({ revalidated, lifecycleAfterRevalidate }).toMatchObject({
-      revalidated: { status: "admitted", resource: null },
-      lifecycleAfterRevalidate: { mcp: { status: "profile_committed" } },
-    });
-    expect(presentation.getState().authoritative.active?.mcp).toMatchObject({
-      status: "profile_committed",
-      catalog: { status: "ready" },
-    });
-
-    await presentation.close();
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });

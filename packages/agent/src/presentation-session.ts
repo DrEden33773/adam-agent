@@ -356,9 +356,13 @@ export async function createPresentationSession(
         throw new TypeError("The active session disappeared during naming.");
       }
       const refreshedRecords = await readActiveBranchRecords(options, sessionId);
+      const current = state.authoritative.active;
+      if (closed || current === null || current.session.id !== sessionId) {
+        return;
+      }
       const refreshedNaming = sessionNamingFromRecords(refreshedRecords, sessionId);
       const refreshedSummary: SessionSummary = {
-        ...active.session,
+        ...current.session,
         label: refreshedNaming.displayLabel,
         naming: refreshedNaming,
       };
@@ -368,7 +372,12 @@ export async function createPresentationSession(
           ...state.authoritative,
           continuity: {
             status: "current",
-            sessionThroughSequence: throughSequence,
+            sessionThroughSequence: Math.max(
+              throughSequence,
+              state.authoritative.continuity.status === "current"
+                ? state.authoritative.continuity.sessionThroughSequence
+                : 0,
+            ),
             operationThrough: [],
           },
           sessions: {
@@ -377,7 +386,7 @@ export async function createPresentationSession(
               session.id === sessionId ? refreshedSummary : session,
             ),
           },
-          active: { ...active, session: refreshedSummary },
+          active: { ...current, session: refreshedSummary },
         },
         transient: state.transient,
       };
@@ -392,6 +401,10 @@ export async function createPresentationSession(
       if (inspected.schemaVersion !== 3) {
         throw new TypeError("The active MCP session is no longer current.");
       }
+      const current = state.authoritative.active;
+      if (closed || current === null || current.session.id !== sessionId) {
+        return;
+      }
       state = {
         revision: state.revision + 1,
         authoritative: {
@@ -401,13 +414,14 @@ export async function createPresentationSession(
             sessionThroughSequence: Math.max(throughSequence, inspected.lastSequence),
             operationThrough: [],
           },
-          active: { ...active, mcp: projectMcp(inspected) },
+          active: { ...current, mcp: projectMcp(inspected) },
         },
         transient: state.transient,
       };
       publishStateChange();
     };
     let runtimeRefresh = Promise.resolve();
+    let metadataRefresh = Promise.resolve();
     const seenRuntimeNotificationIds = new Set<string>();
     const runtimeNotificationOrder: string[] = [];
     handleRuntime = (notification) => {
@@ -481,7 +495,8 @@ export async function createPresentationSession(
             }
             await options[presentationRuntimeRefreshBarrier]?.beforeRead(notification);
             const refreshedRecords = await readActiveBranchRecords(options, active.session.id);
-            if (closed) {
+            const current = state.authoritative.active;
+            if (closed || current === null || current.session.id !== active.session.id) {
               return;
             }
             transcript = projectTranscript(refreshedRecords);
@@ -517,8 +532,8 @@ export async function createPresentationSession(
                   operationThrough: [],
                 },
                 active: {
-                  ...active,
-                  transcript: transcriptPage(transcript, loadedTranscriptStart, active.session.id),
+                  ...current,
+                  transcript: transcriptPage(transcript, loadedTranscriptStart, current.session.id),
                   pendingInteractions: await projectPendingInteractions(refreshedRecords, options),
                 },
               },
@@ -559,22 +574,46 @@ export async function createPresentationSession(
         handleRuntime(event);
       }
     }
-    handleMetadata = async (event) => {
-      const active = state.authoritative.active;
-      if (
-        closed ||
-        active === null ||
-        event.sessionId !== active.session.id ||
-        (state.authoritative.continuity.status === "current" &&
-          event.throughSequence <= state.authoritative.continuity.sessionThroughSequence)
-      ) {
-        return;
-      }
-      if (event.type === "session_naming_changed") {
-        await refreshActiveNaming(event.sessionId, event.throughSequence);
-      } else {
-        await refreshActiveMcp(event.sessionId, event.throughSequence);
-      }
+    handleMetadata = (event) => {
+      metadataRefresh = metadataRefresh.then(async () => {
+        const active = state.authoritative.active;
+        if (
+          closed ||
+          active === null ||
+          event.sessionId !== active.session.id ||
+          (state.authoritative.continuity.status === "current" &&
+            event.throughSequence <= state.authoritative.continuity.sessionThroughSequence)
+        ) {
+          return;
+        }
+        try {
+          if (event.type === "session_naming_changed") {
+            await refreshActiveNaming(event.sessionId, event.throughSequence);
+          } else {
+            await refreshActiveMcp(event.sessionId, event.throughSequence);
+          }
+        } catch {
+          if (closed) {
+            return;
+          }
+          state = {
+            revision: state.revision + 1,
+            authoritative: {
+              ...state.authoritative,
+              continuity: {
+                status: "degraded",
+                fault: {
+                  code: "authoritative_state_unavailable",
+                  message: "The durable session view is temporarily unavailable.",
+                },
+              },
+            },
+            transient: null,
+          };
+          publishStateChange();
+        }
+      });
+      return metadataRefresh;
     };
     for (const event of bufferedMetadata.splice(0)) {
       await handleMetadata(event);
@@ -1362,8 +1401,9 @@ export async function createPresentationSession(
         activeRun?.controller.abort();
         unsubscribeLifecycle();
         unsubscribeMetadata();
-        await runtimeRefresh;
         await activeRun?.settlement;
+        await runtimeRefresh;
+        await metadataRefresh;
         listeners.clear();
         state = { ...state, transient: null };
         bufferedEvents.length = 0;

@@ -161,6 +161,34 @@ test("the production TUI selects an exact available target before creating an em
   }
 });
 
+test("Escape closes the target picker before idle Ctrl+C can arm exit", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-target-picker-escape-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      program: {
+        arguments: ["--state-root", stateRoot],
+        cwd: workspaceRoot,
+        entrypoint: productionPath,
+        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select a model target");
+    fixture.write("\u001b[27;1;27~");
+    fixture.write("\u0003");
+    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the production TUI creates from one valid saved exact default without opening the target picker", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-default-target-"));
   const configRoot = join(testRoot, "config");
@@ -311,6 +339,10 @@ test("the production TUI shows the project session picker before any target reso
       workspaceRoot,
     });
     await fixture.waitFor("deepseek-v4-flash.direct");
+    await fixture.waitFor("Select a project session");
+    fixture.write("\u001b[27;1;27~");
+    fixture.write("\u0003");
+    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -595,6 +627,41 @@ test("the real TUI opens exact next-turn Skill metadata instead of submitting a 
   }
 });
 
+test("the Skill palette renders untrusted metadata and diagnostic identities as inert text", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-controls-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const validDirectory = join(workspaceRoot, ".agents", "skills", "safe-name");
+  const invalidDirectory = join(workspaceRoot, ".agents", "skills", "wrong-file");
+  const unsafeSequence = "\u001b]52;c;c2NvcGU=\u0007";
+  await mkdir(validDirectory, { recursive: true });
+  await mkdir(invalidDirectory, { recursive: true });
+  await writeFile(
+    join(validDirectory, "SKILL.md"),
+    `---\nname: safe-name\ndescription: Safe ${unsafeSequence} description.\n---\nPrivate body.\n`,
+    "utf8",
+  );
+  await writeFile(
+    join(invalidDirectory, "skill.md"),
+    "---\nname: wrong-file\ndescription: Wrong filename.\n---\n",
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/skills\r");
+    await fixture.waitFor("skill_filename_invalid");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("wrong-file");
+    expect(result.stdout).not.toContain(unsafeSequence);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("idle Ctrl+C closes the Skill palette and returns focus to the editor", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-palette-cancel-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -874,6 +941,110 @@ test("the real TUI MCP wizard preserves every separate B8 authority step", async
     await fixture.waitFor("MCP authority · profile committed");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await waitForPath(closeMarker);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI resumes and explicitly reactivates one committed MCP profile", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-mcp-reactivation-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const spawnMarker = join(testRoot, "mcp-spawned");
+  const closeMarker = join(testRoot, "mcp-closed");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: {
+          command: process.execPath,
+          args: [mcpFixturePath, spawnMarker, closeMarker],
+        },
+      },
+    }),
+    "utf8",
+  );
+  const program = {
+    arguments: ["--state-root", stateRoot],
+    cwd: workspaceRoot,
+    entrypoint: productionPath,
+    environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
+  } as const;
+
+  try {
+    const seed = startFixture({ program, stateRoot, workspaceRoot });
+    await seed.waitFor("Select a model target");
+    seed.write("\r");
+    await seed.waitFor("Adam · New session");
+    seed.write("/mcp\r");
+    await seed.waitFor("MCP authority · workspace confirmation required");
+    seed.write("\r");
+    await seed.waitFor("MCP authority · server approval required");
+    seed.write("\r");
+    await seed.waitFor("MCP authority · activation required");
+    seed.write("\r");
+    await seed.waitFor("MCP authority · tool selection required");
+    seed.write("1c");
+    await seed.waitFor("MCP authority · profile committed");
+    seed.write("\u0011");
+    await expect(seed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    const resumed = startFixture({ program, stateRoot, workspaceRoot });
+    await resumed.waitFor("Select a project session");
+    resumed.write("\r");
+    await resumed.waitFor("Adam · New session");
+    resumed.write("/mcp\r");
+    await resumed.waitFor("MCP authority · profile reactivation required");
+    resumed.write("\r");
+    await resumed.waitFor("MCP authority · profile committed");
+    resumed.write("\u0011");
+    await expect(resumed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the TUI process fails visibly when MCP shutdown cannot be confirmed", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-mcp-close-unconfirmed-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const spawnMarker = join(testRoot, "mcp-spawned");
+  const closeMarker = join(testRoot, "mcp-closed");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: {
+          command: process.execPath,
+          args: [mcpFixturePath, spawnMarker, closeMarker],
+        },
+      },
+    }),
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({
+      scenario: "mcp-close-unconfirmed",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/mcp\r");
+    await fixture.waitFor("MCP authority · workspace confirmation required");
+    fixture.write("\r");
+    await fixture.waitFor("MCP authority · server approval required");
+    fixture.write("\r");
+    await fixture.waitFor("MCP authority · activation required");
+    fixture.write("\r");
+    await fixture.waitFor("MCP authority · tool selection required");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 1, signal: null });
+    expect(`${result.stdout}${result.stderr}`).toContain("MCP shutdown could not be confirmed.");
     await waitForPath(closeMarker);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -1274,6 +1445,7 @@ function startFixture(input: {
     | "clipboard-success"
     | "deadline"
     | "history"
+    | "mcp-close-unconfirmed"
     | "mutation"
     | "mutation-delayed-preview"
     | "read"

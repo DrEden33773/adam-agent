@@ -15,6 +15,7 @@ export class TargetPicker implements Component {
     readonly targets: readonly TargetDisplay[];
     readonly theme: AdamTuiTheme;
     readonly initialNotice?: string;
+    readonly onClose: () => void;
     readonly onSelect: (target: TargetDisplay) => void;
     readonly onSaveDefault: (target: TargetDisplay) => void;
   }) {
@@ -31,6 +32,7 @@ export class TargetPicker implements Component {
       ),
     }));
     this.#list = new SelectList(items, 8, options.theme.editor.selectList);
+    this.#list.onCancel = options.onClose;
     this.#list.setSelectedIndex(
       Math.max(
         0,
@@ -75,7 +77,7 @@ export class TargetPicker implements Component {
       ...this.#list.render(width),
       ...(this.#notice === null ? [] : ["", this.#theme.muted(this.#notice)]),
       "",
-      this.#theme.muted("Enter select · d save default · ↑/↓ move · Ctrl+Q exit"),
+      this.#theme.muted("Enter select · d save default · ↑/↓ move · Esc close · Ctrl+Q exit"),
     ];
   }
 }

@@ -2535,8 +2535,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             },
           });
         } else if (command.type === "activate_servers") {
+          const reactivating = inspected.mcp?.status === "profile_reactivation_required";
           if (
-            inspected.mcp?.status !== "activation_required" ||
+            (inspected.mcp?.status !== "activation_required" && !reactivating) ||
             command.servers.length < 1 ||
             command.servers.length > 4 ||
             new Set(command.servers.map((server) => server.serverId)).size !==
@@ -2557,8 +2558,50 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             }
             return server;
           });
+          let reactivationProfile: McpToolProfileV1 | undefined;
+          let activationRecords: readonly SessionRecord[] = [];
+          if (reactivating) {
+            activationRecords = await readJsonlSessionRecords({
+              workspaceRoot: options.workspaceRoot,
+              sessionId: command.sessionId,
+              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+            });
+            const genesis = activationRecords[0];
+            if (genesis === undefined || !isGenesisRecord(genesis)) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+            const promptContext = promptContextRecordFromRecords(genesis, activationRecords);
+            if (promptContext?.recordVersion !== 3 || promptContext.mcp === undefined) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+            reactivationProfile = requireMcpCommittedProfile(
+              await mcpCommittedProfileFromLineage(options, genesis, activationRecords),
+              promptContext,
+            );
+            if (
+              reactivationProfile.servers.length !== selectedServers.length ||
+              reactivationProfile.servers.some(
+                (profileServer) =>
+                  !selectedServers.some(
+                    (server) =>
+                      server.serverId === profileServer.serverId &&
+                      server.definitionDigest === profileServer.definitionDigest,
+                  ),
+              )
+            ) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+          }
           const generationId = randomUUID();
-          const attempt = 1;
+          const attempt = reactivating
+            ? activationRecords.reduce(
+                (maximum, entry) =>
+                  entry.schemaVersion === 3 && entry.record.type === "mcp_activation_started"
+                    ? Math.max(maximum, entry.record.attempt)
+                    : maximum,
+                0,
+              ) + 1
+            : 1;
           await store.append({
             schemaVersion: 3,
             sequence: inspected.lastSequence + 1,
@@ -2567,7 +2610,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               recordVersion: 1,
               generationId,
               attempt,
-              reason: "initial",
+              reason: reactivating ? "idle_reactivate" : "initial",
               servers: selectedServers.map((server) => ({
                 serverId: server.serverId,
                 definitionDigest: server.definitionDigest,
@@ -2579,12 +2622,21 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           let activationPrepared = false;
           let readySettlementDurable = false;
           try {
-            const live = await mcpHost.activate({
-              sessionId: command.sessionId,
-              generationId,
-              attempt,
-              servers: selectedServers,
-            });
+            const live =
+              reactivationProfile === undefined
+                ? await mcpHost.activate({
+                    sessionId: command.sessionId,
+                    generationId,
+                    attempt,
+                    servers: selectedServers,
+                  })
+                : await mcpHost.reactivateToolProfile({
+                    sessionId: command.sessionId,
+                    generationId,
+                    attempt,
+                    servers: selectedServers,
+                    profile: reactivationProfile,
+                  });
             activationPrepared = true;
             await options[mcpActivationSettlementBarrier]?.beforeReadySettlement({
               sessionId: command.sessionId,

@@ -11,11 +11,13 @@ import {
   type ModelTargets,
 } from "@adam-agent/agent";
 import {
+  mcpCloseConfirmation,
   type PresentationArtifactReadBarrier,
   presentationArtifactReadBarrier,
   presentationHistoryPageSize,
 } from "@adam-agent/agent/internal-testing";
 
+import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 import { type ClipboardAdapter, type DeadlineScheduler, runTui } from "./tui-app.js";
 
 const targetIdentity: ModelTargetIdentity = {
@@ -39,6 +41,15 @@ const contextProfile: ContextProfile = {
 const options = parseArguments(process.argv.slice(2));
 const modelTargets = createFixtureModelTargets(options);
 const lifecycle = createSessionLifecycle({
+  ...(options.scenario === "mcp-close-unconfirmed"
+    ? {
+        [mcpCloseConfirmation]: {
+          async confirm() {
+            throw new Error("Fixture close confirmation failed.");
+          },
+        },
+      }
+    : {}),
   ...(modelTargets === undefined ? {} : { modelTargets }),
   permissions: createPermissionPolicy({ allowedEffects: ["read"], askedEffects: ["write"] }),
   stateRoot: options.stateRoot,
@@ -99,7 +110,7 @@ try {
     targetStatus: { targetId: targetIdentity.targetId, certification: "Certified" },
   });
 } finally {
-  await lifecycle.close();
+  requireConfirmedLifecycleClose(await lifecycle.close());
 }
 
 function parseArguments(arguments_: readonly string[]): {
@@ -110,6 +121,7 @@ function parseArguments(arguments_: readonly string[]): {
     | "clipboard-success"
     | "deadline"
     | "history"
+    | "mcp-close-unconfirmed"
     | "mutation"
     | "mutation-delayed-preview"
     | "read"
@@ -134,6 +146,7 @@ function parseArguments(arguments_: readonly string[]): {
     scenario !== "clipboard-success" &&
     scenario !== "deadline" &&
     scenario !== "history" &&
+    scenario !== "mcp-close-unconfirmed" &&
     scenario !== "mutation" &&
     scenario !== "mutation-delayed-preview" &&
     scenario !== "read" &&
@@ -167,6 +180,7 @@ function createFixtureModelTargets(options: {
     | "clipboard-success"
     | "deadline"
     | "history"
+    | "mcp-close-unconfirmed"
     | "mutation"
     | "mutation-delayed-preview"
     | "read"

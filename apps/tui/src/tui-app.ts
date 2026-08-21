@@ -117,6 +117,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     | undefined;
   const selectedSkills = new Set<string>();
   let previousActiveSessionId = options.presentation.getState().authoritative.active?.session.id;
+  let sessionPickerDismissed = false;
+  let targetPickerDismissed = false;
   let defaultTargetAttempted = false;
   let defaultTargetRejected = false;
   let startupTargetFailure: string | null = null;
@@ -145,6 +147,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       pathPicker = undefined;
       mcpWizard?.hide();
       mcpWizard = undefined;
+      if (active !== null) {
+        sessionPickerDismissed = false;
+        targetPickerDismissed = false;
+      }
       previousActiveSessionId = active?.session.id;
     }
     if (active?.mcp !== null && active?.mcp !== undefined && mcpWizard !== undefined) {
@@ -183,11 +189,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       sessionPicker.hide();
       sessionPicker = undefined;
       tui.setFocus(editor);
-    } else if (needsSessionChoice && sessionPicker === undefined) {
+    } else if (needsSessionChoice && sessionPicker === undefined && !sessionPickerDismissed) {
+      let handle: { hide(): void } | undefined;
+      const close = () => {
+        handle?.hide();
+        sessionPicker = undefined;
+        sessionPickerDismissed = true;
+        statusMessage = "Session selection closed.";
+        tui.setFocus(editor);
+        tui.requestRender();
+      };
       const picker = new SessionPicker({
         sessions: state.authoritative.sessions.items,
         hasMore: state.authoritative.sessions.nextCursor !== null,
         theme,
+        onClose: close,
         onNewSession() {
           newSessionSelected = true;
           sessionPicker?.hide();
@@ -242,29 +258,34 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             });
         },
       });
-      const handle = tui.showOverlay(picker, {
+      handle = tui.showOverlay(picker, {
         width: "80%",
         minWidth: 36,
         maxHeight: "80%",
         margin: 1,
       });
-      const close = () => {
-        handle.hide();
-        sessionPicker = undefined;
-        tui.setFocus(editor);
-        tui.requestRender();
-      };
-      sessionPicker = { close, picker, hide: () => handle.hide() };
+      sessionPicker = { close, picker, hide: () => handle?.hide() };
     } else if (
       active === null &&
       !needsSessionChoice &&
       targetPicker === undefined &&
+      !targetPickerDismissed &&
       (startupTargetId === null || startupTargetId === undefined || defaultTargetRejected) &&
       state.authoritative.targets.items.length > 0
     ) {
+      let handle: { hide(): void } | undefined;
+      const close = () => {
+        handle?.hide();
+        targetPicker = undefined;
+        targetPickerDismissed = true;
+        statusMessage = "Target selection closed.";
+        tui.setFocus(editor);
+        tui.requestRender();
+      };
       const picker = new TargetPicker({
         targets: state.authoritative.targets.items,
         theme,
+        onClose: close,
         ...(state.authoritative.targets.diagnostic !== null
           ? { initialNotice: state.authoritative.targets.diagnostic.message }
           : startupTargetFailure === null
@@ -322,19 +343,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             });
         },
       });
-      const handle = tui.showOverlay(picker, {
+      handle = tui.showOverlay(picker, {
         width: "80%",
         minWidth: 36,
         maxHeight: "80%",
         margin: 1,
       });
-      const close = () => {
-        handle.hide();
-        targetPicker = undefined;
-        tui.setFocus(editor);
-        tui.requestRender();
-      };
-      targetPicker = { close, picker, hide: () => handle.hide() };
+      targetPicker = { close, picker, hide: () => handle?.hide() };
     }
     header.setText(
       theme.primary(`Adam · ${safeTerminalText(active?.session.label ?? "No session")}`),
