@@ -1565,7 +1565,7 @@ test("PresentationSession catches up a durable settlement that arrives after hyd
     if (caughtUp.authoritative.continuity.status !== "current") {
       throw new Error("Expected current Presentation continuity after hydration catch-up.");
     }
-    expect(caughtUp.authoritative.continuity.sessionThroughSequence).toBeGreaterThanOrEqual(9);
+    expect([9, 10]).toContain(caughtUp.authoritative.continuity.sessionThroughSequence);
 
     await presentation.close();
   } finally {
