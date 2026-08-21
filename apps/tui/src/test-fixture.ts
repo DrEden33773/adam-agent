@@ -16,7 +16,7 @@ import {
   presentationArtifactReadBarrier,
   presentationHistoryPageSize,
 } from "@adam-agent/agent/internal-testing";
-
+import { type FixtureScenario, isFixtureScenario } from "./fixture-scenario.js";
 import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 import { type ClipboardAdapter, type DeadlineScheduler, runTui } from "./tui-app.js";
 
@@ -58,8 +58,17 @@ const lifecycle = createSessionLifecycle({
 
 try {
   const previewBarrier = previewReadBarrier(options);
+  if (options.scenario === "session-selection-history") {
+    const selectable = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: selectable.sessionId,
+      input: { text: "Selected session prompt" },
+    });
+  }
   const resumedSessionId =
-    options.scenario === "resume" || options.scenario === "history"
+    options.scenario === "resume" ||
+    options.scenario === "history" ||
+    options.scenario === "unsafe-history"
       ? await lifecycle.create({ targetIdentity }).then(async (created) => {
           if (options.scenario === "history") {
             for (let index = 1; index <= 3; index += 1) {
@@ -68,38 +77,51 @@ try {
                 input: { text: `History prompt ${index}` },
               });
             }
-          } else {
+          } else if (options.scenario === "resume") {
             await lifecycle.continue({
               sessionId: created.sessionId,
               input: { text: "Resume transcript" },
+            });
+          } else {
+            await lifecycle.continue({
+              sessionId: created.sessionId,
+              input: { text: "\u001b]52;c;c2NvcGU=\u0007Visible history\u202E" },
             });
           }
           return created.sessionId;
         })
       : undefined;
   const presentation = await createPresentationSession(
-    resumedSessionId === undefined
+    options.scenario === "session-selection-history"
       ? {
           lifecycle,
+          openProject: true,
           projectLabel: "workspace",
           stateRoot: options.stateRoot,
-          targetIdentity,
           workspaceRoot: options.workspaceRoot,
-          ...(previewBarrier === undefined
-            ? {}
-            : { [presentationArtifactReadBarrier]: previewBarrier }),
         }
-      : {
-          lifecycle,
-          projectLabel: "workspace",
-          sessionId: resumedSessionId,
-          stateRoot: options.stateRoot,
-          workspaceRoot: options.workspaceRoot,
-          ...(options.scenario === "history" ? { [presentationHistoryPageSize]: 2 } : {}),
-          ...(previewBarrier === undefined
-            ? {}
-            : { [presentationArtifactReadBarrier]: previewBarrier }),
-        },
+      : resumedSessionId === undefined
+        ? {
+            lifecycle,
+            projectLabel: "workspace",
+            stateRoot: options.stateRoot,
+            targetIdentity,
+            workspaceRoot: options.workspaceRoot,
+            ...(previewBarrier === undefined
+              ? {}
+              : { [presentationArtifactReadBarrier]: previewBarrier }),
+          }
+        : {
+            lifecycle,
+            projectLabel: "workspace",
+            sessionId: resumedSessionId,
+            stateRoot: options.stateRoot,
+            workspaceRoot: options.workspaceRoot,
+            ...(options.scenario === "history" ? { [presentationHistoryPageSize]: 2 } : {}),
+            ...(previewBarrier === undefined
+              ? {}
+              : { [presentationArtifactReadBarrier]: previewBarrier }),
+          },
   );
   const clipboard = clipboardAdapter(options);
   const deadlineScheduler = controlledDeadlineScheduler(options);
@@ -115,21 +137,7 @@ try {
 
 function parseArguments(arguments_: readonly string[]): {
   readonly controlRoot?: string;
-  readonly scenario?:
-    | "cancellation"
-    | "clipboard-timeout"
-    | "clipboard-success"
-    | "deadline"
-    | "history"
-    | "mcp-close-unconfirmed"
-    | "mutation"
-    | "mutation-delayed-preview"
-    | "read"
-    | "resume"
-    | "shell"
-    | "skill-selection"
-    | "streaming"
-    | "unsafe-output";
+  readonly scenario?: FixtureScenario;
   readonly stateRoot: string;
   readonly workspaceRoot: string;
 } {
@@ -139,23 +147,7 @@ function parseArguments(arguments_: readonly string[]): {
     throw new TypeError("The TUI fixture requires --state-root and --workspace-root.");
   }
   const scenario = optionValue(arguments_, "--scenario");
-  if (
-    scenario !== undefined &&
-    scenario !== "cancellation" &&
-    scenario !== "clipboard-timeout" &&
-    scenario !== "clipboard-success" &&
-    scenario !== "deadline" &&
-    scenario !== "history" &&
-    scenario !== "mcp-close-unconfirmed" &&
-    scenario !== "mutation" &&
-    scenario !== "mutation-delayed-preview" &&
-    scenario !== "read" &&
-    scenario !== "resume" &&
-    scenario !== "shell" &&
-    scenario !== "skill-selection" &&
-    scenario !== "streaming" &&
-    scenario !== "unsafe-output"
-  ) {
+  if (scenario !== undefined && !isFixtureScenario(scenario)) {
     throw new TypeError("The TUI fixture scenario is invalid.");
   }
   const controlRoot = optionValue(arguments_, "--control-root");
@@ -174,21 +166,7 @@ function optionValue(arguments_: readonly string[], option: string): string | un
 
 function createFixtureModelTargets(options: {
   readonly controlRoot?: string;
-  readonly scenario?:
-    | "cancellation"
-    | "clipboard-timeout"
-    | "clipboard-success"
-    | "deadline"
-    | "history"
-    | "mcp-close-unconfirmed"
-    | "mutation"
-    | "mutation-delayed-preview"
-    | "read"
-    | "resume"
-    | "shell"
-    | "skill-selection"
-    | "streaming"
-    | "unsafe-output";
+  readonly scenario?: FixtureScenario;
 }): ModelTargets | undefined {
   if (
     options.scenario === undefined ||
@@ -220,10 +198,19 @@ function createFixtureModelTargets(options: {
         yield { type: "text_delta", text: "Read complete." };
       } else if (
         options.scenario === "mutation" ||
+        options.scenario === "mutation-after-release" ||
         options.scenario === "mutation-delayed-preview"
       ) {
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {
+          if (options.scenario === "mutation-after-release") {
+            await writeFile(
+              join(options.controlRoot as string, "model-started"),
+              "started\n",
+              "utf8",
+            );
+            await waitForFile(options.controlRoot as string, "release-model");
+          }
           yield { type: "tool_call_start", id: "edit-file", name: "edit_file" };
           yield {
             type: "tool_call_delta",
@@ -252,7 +239,11 @@ function createFixtureModelTargets(options: {
           request.signal.addEventListener("abort", () => resolve(), { once: true });
         });
         throw request.signal.reason;
-      } else if (options.scenario === "history") {
+      } else if (
+        options.scenario === "history" ||
+        options.scenario === "session-selection-history" ||
+        options.scenario === "unsafe-history"
+      ) {
         yield { type: "text_delta", text: "History answer." };
       } else if (options.scenario === "resume") {
         yield { type: "text_delta", text: "Previous answer." };
@@ -336,7 +327,12 @@ function clipboardAdapter(options: {
       },
     };
   }
-  if (options.scenario !== "clipboard-success") {
+  if (
+    options.scenario !== "clipboard-success" &&
+    options.scenario !== "history" &&
+    options.scenario !== "session-selection-history" &&
+    options.scenario !== "unsafe-history"
+  ) {
     return undefined;
   }
   return {

@@ -1,14 +1,16 @@
-import type { PresentationSession, RepositoryInstructionsDisplay } from "@adam-agent/presentation";
+import type {
+  ActiveSessionDisplay,
+  PresentationSession,
+  RepositoryInstructionsDisplay,
+} from "@adam-agent/presentation";
 import {
   Box,
   Container,
   Editor,
   isKeyRelease,
   isKeyRepeat,
-  Key,
   Loader,
   Markdown,
-  matchesKey,
   ProcessTerminal,
   Spacer,
   type Terminal,
@@ -16,7 +18,8 @@ import {
   type TUI,
   TuiMainScreen,
 } from "@earendil-works/pi-tui";
-
+import { AdamAutocompleteProvider } from "./command-autocomplete.js";
+import { adamCommandRegistry } from "./command-registry.js";
 import {
   type ClipboardAdapter,
   copyDraftToClipboard,
@@ -25,6 +28,7 @@ import {
   LegacyDuplicateGuard,
   nodeDeadlineScheduler,
 } from "./exit-policy.js";
+import { HelpNavigator, type HelpPage } from "./help-navigator.js";
 import { mcpAdvanceCommand } from "./mcp-advance.js";
 import { McpWizard } from "./mcp-wizard.js";
 import { PermissionOverlay } from "./permission-overlay.js";
@@ -64,7 +68,37 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const root = new Container();
   const header = new Text();
   const transcript = new Container();
-  const editor = new Editor(tui, theme.editor, { paddingX: 1 });
+  const editorSlot = new Container();
+  const createEditor = (active: ActiveSessionDisplay | null): Editor => {
+    const created = new Editor(tui, theme.editor, { paddingX: 1 });
+    created.setAutocompleteProvider(
+      new AdamAutocompleteProvider({
+        getProjectPaths: () =>
+          options.presentation.getState().authoritative.active?.projectPaths.items ?? [],
+        getRunActive: () => {
+          const state = options.presentation.getState();
+          return (
+            state.transient !== null ||
+            (state.authoritative.active?.pendingInteractions.length ?? 0) > 0
+          );
+        },
+        getSkills: () =>
+          options.presentation.getState().authoritative.active?.skills?.items.map((skill) => ({
+            description: skill.description,
+            qualifiedId: skill.qualifiedId,
+          })) ?? [],
+      }),
+    );
+    for (const prompt of authoritativePromptHistory(active)) {
+      created.addToHistory(prompt);
+    }
+    return created;
+  };
+  let editor = createEditor(options.presentation.getState().authoritative.active);
+  let projectedPromptHistory = authoritativePromptHistory(
+    options.presentation.getState().authoritative.active,
+  );
+  let projectedHistorySessionId = options.presentation.getState().authoritative.active?.session.id;
   const statusLine = new Text();
   const footer = new Text();
   const working = new Loader(tui, theme.toolTitle, theme.muted, "Working", { intervalMs: 80 });
@@ -115,6 +149,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly hide: () => void;
       }
     | undefined;
+  let helpNavigator:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+        readonly navigator: HelpNavigator;
+      }
+    | undefined;
   const selectedSkills = new Set<string>();
   let previousActiveSessionId = options.presentation.getState().authoritative.active?.session.id;
   let sessionPickerDismissed = false;
@@ -125,11 +166,43 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   root.addChild(header);
   root.addChild(new Spacer(1));
   root.addChild(transcript);
-  root.addChild(editor);
+  editorSlot.addChild(editor);
+  root.addChild(editorSlot);
   root.addChild(statusLine);
   root.addChild(footer);
   tui.addChild(root);
   tui.setFocus(editor);
+
+  const synchronizePromptHistory = (active: ActiveSessionDisplay | null) => {
+    const nextHistory = authoritativePromptHistory(active);
+    const nextSessionId = active?.session.id;
+    if (
+      projectedHistorySessionId === nextSessionId &&
+      sameStrings(projectedPromptHistory, nextHistory)
+    ) {
+      return;
+    }
+    const previousEditor = editor;
+    const draft = previousEditor.getExpandedText();
+    const wasFocused = previousEditor.focused;
+    const replacement = createEditor(active);
+    replacement.setText(draft);
+    replacement.disableSubmit = previousEditor.disableSubmit;
+    if (previousEditor.onChange !== undefined) {
+      replacement.onChange = previousEditor.onChange;
+    }
+    if (previousEditor.onSubmit !== undefined) {
+      replacement.onSubmit = previousEditor.onSubmit;
+    }
+    editorSlot.clear();
+    editorSlot.addChild(replacement);
+    editor = replacement;
+    projectedPromptHistory = nextHistory;
+    projectedHistorySessionId = nextSessionId;
+    if (wasFocused) {
+      tui.setFocus(editor);
+    }
+  };
 
   const clearExitWindow = () => {
     exitArm.reset();
@@ -139,6 +212,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const renderState = () => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
+    synchronizePromptHistory(active);
     if (active?.session.id !== previousActiveSessionId) {
       selectedSkills.clear();
       skillPalette?.hide();
@@ -436,7 +510,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       clearExitWindow();
       permission.hide();
       permission = undefined;
-      tui.setFocus(editor);
+      tui.setFocus(helpNavigator?.navigator ?? editor);
     } else if (pending !== undefined && permission?.requestId !== pending.requestId) {
       clearExitWindow();
       permission?.hide();
@@ -476,7 +550,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           });
       }
     }
-    if (active === null || runActive) {
+    if (active === null) {
       editor.disableSubmit = true;
     } else {
       editor.disableSubmit = false;
@@ -501,15 +575,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                 selectedSkills.size === 0
                   ? ""
                   : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`
-              }${active.transcript.olderCursor === null ? "" : " · older history available"}`,
+              }${active.transcript.olderCursor === null ? "" : " · older history available"} · ${adamCommandRegistry.footerHint()}`,
             ),
     );
     statusLine.setText(statusMessage === null ? "" : theme.muted(safeTerminalText(statusMessage)));
     tui.requestRender();
   };
-  requestPolicyRender = renderState;
-  renderState();
-  const unsubscribe = options.presentation.subscribe(renderState);
   editor.onChange = () => {
     if (exitArm.armed) {
       clearExitWindow();
@@ -520,7 +591,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       pathPicker === undefined &&
       active !== null &&
       active.projectPaths.items.length > 0 &&
-      editor.getExpandedText().endsWith("@")
+      isProjectPathTrigger(editor.getExpandedText())
     ) {
       let handle: { hide(): void } | undefined;
       const close = () => {
@@ -554,13 +625,122 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
   };
   editor.onSubmit = (text) => {
-    const active = options.presentation.getState().authoritative.active;
-    if (active === null || text.trim().length === 0 || editor.disableSubmit) {
+    const state = options.presentation.getState();
+    const active = state.authoritative.active;
+    if (active === null || text.trim().length === 0) {
       return;
     }
+    const runActive =
+      state.transient !== null || active.pendingInteractions.length > 0 || cancelSettling;
     clearExitWindow();
     editor.disableSubmit = true;
-    if (text.trim() === "/name --clear") {
+    const parsedCommand = adamCommandRegistry.parse(text);
+    if (parsedCommand.kind === "unknown") {
+      const suggestions = adamCommandRegistry.suggest(parsedCommand.name);
+      statusMessage = `Unknown command /${parsedCommand.name}${
+        suggestions.length === 0
+          ? ""
+          : ` · Did you mean ${suggestions.map((command) => `/${command.name}`).join(", ")}?`
+      }`;
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      !adamCommandRegistry.isAvailable(parsedCommand.command, { runActive })
+    ) {
+      statusMessage = `/${parsedCommand.command.name} is unavailable while a run is active.`;
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    if (parsedCommand.kind === "not_command" && runActive) {
+      statusMessage = "A run is active; use a local read-only command or Ctrl+C to abort.";
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "skills" &&
+      parsedCommand.argumentsText.length > 0 &&
+      parsedCommand.argumentsText !== "reload"
+    ) {
+      const skill = active.skills?.items.find(
+        (candidate) => candidate.qualifiedId === parsedCommand.argumentsText,
+      );
+      if (skill === undefined) {
+        statusMessage = `Skill ${safeTerminalText(parsedCommand.argumentsText)} is not available.`;
+        editor.disableSubmit = false;
+        renderState();
+        return;
+      }
+      const selected = !selectedSkills.delete(skill.qualifiedId);
+      if (selected) {
+        selectedSkills.add(skill.qualifiedId);
+      }
+      statusMessage = `${safeTerminalText(skill.qualifiedId)} ${selected ? "selected" : "cleared"} for the next prompt.`;
+      editor.setText("");
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      (parsedCommand.command.id === "help" || parsedCommand.command.id === "hotkeys")
+    ) {
+      const requestedTopic =
+        parsedCommand.command.id === "hotkeys" ? "hotkeys" : parsedCommand.argumentsText.trim();
+      const initialPage: HelpPage =
+        requestedTopic.length === 0
+          ? "root"
+          : (adamCommandRegistry.helpTopics().find((topic) => topic.id === requestedTopic)?.id ??
+            "root");
+      if (requestedTopic.length > 0 && initialPage === "root") {
+        const suggestions = adamCommandRegistry.suggestHelpTopics(requestedTopic);
+        statusMessage = `Unknown Help topic ${safeTerminalText(requestedTopic)}${
+          suggestions.length === 0
+            ? ""
+            : ` · Did you mean ${suggestions.map((topic) => topic.id).join(", ")}?`
+        }`;
+        editor.disableSubmit = false;
+        renderState();
+        return;
+      }
+      editor.setText("");
+      editor.disableSubmit = false;
+      helpNavigator?.hide();
+      let handle: { hide(): void } | undefined;
+      const close = () => {
+        handle?.hide();
+        helpNavigator = undefined;
+        tui.setFocus(editor);
+        tui.requestRender();
+      };
+      const navigator = new HelpNavigator({
+        commands: adamCommandRegistry.entries(),
+        initialPage,
+        keybindings: adamCommandRegistry.keybindings(),
+        onClose: close,
+        theme,
+        topics: adamCommandRegistry.helpTopics(),
+      });
+      handle = tui.showOverlay(navigator, {
+        width: "80%",
+        minWidth: 36,
+        maxHeight: "80%",
+        margin: 1,
+      });
+      helpNavigator = { close, hide: () => handle?.hide(), navigator };
+      tui.requestRender();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "name" &&
+      parsedCommand.argumentsText === "--clear"
+    ) {
       void options.presentation
         .dispatch({
           type: "clear_session_manual_name",
@@ -568,7 +748,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         })
         .then((receipt) => {
           if (receipt.status === "admitted") {
-            editor.addToHistory(text);
             editor.setText("");
           } else {
             editor.disableSubmit = false;
@@ -582,12 +761,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         });
       return;
     }
-    if (text.trim() === "/name --generate") {
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "name" &&
+      parsedCommand.argumentsText === "--generate"
+    ) {
       void options.presentation
         .dispatch({ type: "regenerate_session_title", sessionId: active.session.id })
         .then((receipt) => {
           if (receipt.status === "admitted") {
-            editor.addToHistory(text);
             editor.setText("");
           } else {
             editor.disableSubmit = false;
@@ -603,15 +785,22 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         });
       return;
     }
-    if (text.trim() === "/instructions") {
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "instructions" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
       statusMessage = repositoryStatusText(active.repositoryInstructions);
-      editor.addToHistory(text);
       editor.setText("");
       editor.disableSubmit = false;
       renderState();
       return;
     }
-    if (text.trim() === "/instructions reload") {
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "instructions" &&
+      parsedCommand.argumentsText === "reload"
+    ) {
       void options.presentation
         .dispatch({
           type: "reload_repository_instructions",
@@ -619,7 +808,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         })
         .then((receipt) => {
           if (receipt.status === "admitted") {
-            editor.addToHistory(text);
             editor.setText("");
             statusMessage = repositoryStatusText(
               options.presentation.getState().authoritative.active?.repositoryInstructions ?? null,
@@ -638,12 +826,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         });
       return;
     }
-    if (text.trim() === "/skills reload") {
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "skills" &&
+      parsedCommand.argumentsText === "reload"
+    ) {
       void options.presentation
         .dispatch({ type: "reload_skills", sessionId: active.session.id })
         .then((receipt) => {
           if (receipt.status === "admitted") {
-            editor.addToHistory(text);
             editor.setText("");
             const skills = options.presentation.getState().authoritative.active?.skills;
             statusMessage =
@@ -664,8 +855,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         });
       return;
     }
-    if (text.trim() === "/mcp") {
-      editor.addToHistory(text);
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "mcp" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
       editor.setText("");
       editor.disableSubmit = false;
       if (active.mcp === null) {
@@ -726,9 +920,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       tui.requestRender();
       return;
     }
-    if (text.trim() === "/skills") {
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "skills" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
       const catalog = active.skills;
-      editor.addToHistory(text);
       editor.setText("");
       editor.disableSubmit = false;
       if (catalog !== null) {
@@ -764,7 +961,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       tui.requestRender();
       return;
     }
-    if (text.trim() === "/history") {
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "history" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
       const before = active.transcript.olderCursor;
       if (before === null) {
         editor.disableSubmit = false;
@@ -775,7 +976,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         .dispatch({ type: "load_older_transcript", before })
         .then((receipt) => {
           if (receipt.status === "admitted") {
-            editor.addToHistory(text);
             editor.setText("");
           } else {
             editor.disableSubmit = false;
@@ -789,7 +989,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         });
       return;
     }
-    if (text.trim() === "/branch") {
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "fork" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
       const source = active.transcript.items.findLast(
         (item) => item.branchBoundary !== null,
       )?.branchBoundary;
@@ -807,7 +1011,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         })
         .then((receipt) => {
           if (receipt.status === "admitted") {
-            editor.addToHistory(text);
             editor.setText("");
           } else {
             editor.disableSubmit = false;
@@ -821,16 +1024,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         });
       return;
     }
-    if (text.startsWith("/name ") && text.slice("/name ".length).trim().length > 0) {
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "name" &&
+      parsedCommand.argumentsText.length > 0
+    ) {
       void options.presentation
         .dispatch({
           type: "set_session_manual_name",
           sessionId: active.session.id,
-          name: text.slice("/name ".length),
+          name: parsedCommand.argumentsText,
         })
         .then((receipt) => {
           if (receipt.status === "admitted") {
-            editor.addToHistory(text);
             editor.setText("");
           } else {
             editor.disableSubmit = false;
@@ -842,6 +1048,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         .finally(() => {
           tui.requestRender();
         });
+      return;
+    }
+    if (parsedCommand.kind === "known") {
+      statusMessage = `Usage: ${parsedCommand.command.usage}`;
+      editor.disableSubmit = false;
+      renderState();
       return;
     }
     void options.presentation
@@ -853,7 +1065,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       })
       .then((receipt) => {
         if (receipt.status === "admitted") {
-          editor.addToHistory(text);
           editor.setText("");
           selectedSkills.clear();
         } else {
@@ -867,6 +1078,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         tui.requestRender();
       });
   };
+  requestPolicyRender = renderState;
+  renderState();
+  const unsubscribe = options.presentation.subscribe(renderState);
   const exited = Promise.withResolvers<void>();
   let stopping = false;
   const stop = async (copyDraft: boolean) => {
@@ -880,6 +1094,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     skillPalette?.hide();
     pathPicker?.hide();
     mcpWizard?.hide();
+    helpNavigator?.hide();
     targetPicker?.hide();
     permission?.hide();
     working.stop();
@@ -904,11 +1119,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
   };
   tui.addInputListener((data) => {
-    if (matchesKey(data, Key.ctrl("q"))) {
+    if (adamCommandRegistry.matchesInput(data, "exit")) {
       void stop(true);
       return { consume: true };
     }
-    if (matchesKey(data, Key.ctrl("c"))) {
+    if (adamCommandRegistry.matchesInput(data, "interrupt")) {
       if (isKeyRepeat(data) || isKeyRelease(data)) {
         return { consume: true };
       }
@@ -916,11 +1131,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         return { consume: true };
       }
       const closeOverlay =
-        mcpWizard?.close ??
-        pathPicker?.close ??
-        skillPalette?.close ??
-        sessionPicker?.close ??
-        targetPicker?.close;
+        permission === undefined
+          ? (helpNavigator?.close ??
+            mcpWizard?.close ??
+            pathPicker?.close ??
+            skillPalette?.close ??
+            sessionPicker?.close ??
+            targetPicker?.close)
+          : undefined;
       if (closeOverlay !== undefined) {
         clearExitWindow();
         closeOverlay();
@@ -985,6 +1203,36 @@ function toolStatusText(
     return "failed";
   }
   return status === "running" || status === "requested" ? status : null;
+}
+
+function isProjectPathTrigger(draft: string): boolean {
+  if (!draft.endsWith("@")) {
+    return false;
+  }
+  const beforeTrigger = draft.at(-2);
+  return beforeTrigger === undefined || /\s/u.test(beforeTrigger);
+}
+
+function authoritativePromptHistory(active: ActiveSessionDisplay | null): readonly string[] {
+  const prompts =
+    active?.transcript.items.flatMap((item) => {
+      if (item.type !== "user_message") {
+        return [];
+      }
+      const prompt = safeTerminalText(item.text);
+      return prompt.trim().length > 0 ? [prompt] : [];
+    }) ?? [];
+  const collapsed: string[] = [];
+  for (const prompt of prompts) {
+    if (collapsed.at(-1) !== prompt) {
+      collapsed.push(prompt);
+    }
+  }
+  return collapsed.slice(-100);
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 function repositoryStatusText(instructions: RepositoryInstructionsDisplay | null): string {

@@ -15,6 +15,8 @@ import { fileURLToPath } from "node:url";
 
 import { afterEach, expect, test } from "vitest";
 
+import type { FixtureScenario } from "./fixture-scenario.js";
+
 const fixturePath = fileURLToPath(new URL("../dist/test-fixture.js", import.meta.url));
 const productionPath = fileURLToPath(new URL("../dist/main.js", import.meta.url));
 const mcpFixturePath = fileURLToPath(
@@ -68,6 +70,801 @@ test("the production TUI entry exposes its usage contract", async () => {
     expect(result.stdout).toContain(
       "Usage: adam-agent-tui [--target <exact-target-id> | --resume <session-id>]",
     );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the real TUI opens slash Help locally without submitting it to the model", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-interactive-help-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeHelp = fixture.output().length;
+    fixture.write("/help\r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Adam Help", beforeHelp).then(() => "help" as const),
+      fixture.waitForAfter("Skill selection complete.", beforeHelp).then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("help");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/help"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Escape closes the Help root and restores editor focus", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-escape-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/help\r");
+    await fixture.waitFor("Adam Help");
+    fixture.write("\u001b[27;1;27~draft after Help");
+    fixture.write("\u0011");
+    await waitForPath(join(controlRoot, "clipboard.txt"));
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("draft after Help");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Escape returns from a Help topic to the Help root", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-parent-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeTopic = fixture.output().length;
+    fixture.write("/help commands");
+    await fixture.waitForAfter("Command names, arguments, and aliases", beforeTopic);
+    fixture.write("\t\r");
+    const opened = await Promise.race([
+      fixture.waitForAfter("Command Reference", beforeTopic).then(() => "topic" as const),
+      fixture.waitForAfter("Adam Help", beforeTopic).then(() => "root" as const),
+    ]);
+    expect(opened).toBe("topic");
+    const beforeParent = fixture.output().length;
+    fixture.write("\u001b[27;1;27~");
+    await fixture.waitForAfter("Adam Help", beforeParent);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Enter opens the focused topic in the Help navigator", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-enter-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/help\r");
+    await fixture.waitFor("Adam Help");
+    const beforeTopic = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForAfter("Command Reference", beforeTopic);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout.slice(beforeTopic)).toContain("Command Reference");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Hotkeys opens the shared local Help navigator", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-hotkeys-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeHotkeys = fixture.output().length;
+    fixture.write("/hotkeys\r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Effective Hotkeys", beforeHotkeys).then(() => "hotkeys" as const),
+      fixture.waitForAfter("Skill selection complete.", beforeHotkeys).then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("hotkeys");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/hotkeys"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Ctrl+C closes the complete Help stack without arming idle exit", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-control-c-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/hotkeys\r");
+    await fixture.waitFor("Effective Hotkeys");
+    const beforeClose = fixture.output().length;
+    fixture.write("\u0003");
+    fixture.write("draft after Help");
+    fixture.write("\u0003");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("Clipboard unavailable; draft was not copied.");
+    expect(result.stdout.slice(beforeClose)).not.toContain(
+      "Press Ctrl+C again within two seconds to exit",
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("question mark remains ordinary editor input instead of a Help binding", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-question-mark-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforeDraft = fixture.output().length;
+    fixture.write("?");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("?");
+    expect(result.stdout.slice(beforeDraft)).not.toContain("Adam Help");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Tab completes a slash command from the local Registry", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-slash-completion-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeCompletion = fixture.output().length;
+    fixture.write("/hot");
+    await fixture.waitForAfter("Show the fixed effective keyboard map.", beforeCompletion);
+    fixture.write("\t\r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Effective Hotkeys", beforeCompletion).then(() => "completed" as const),
+      fixture
+        .waitForAfter("Skill selection complete.", beforeCompletion)
+        .then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("completed");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash completion exposes Registry usage as its argument hint", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-slash-usage-hint-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/he");
+    await fixture.waitFor("/help [topic]");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the idle footer exposes Registry-driven interaction hints", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-footer-hints-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    await fixture.waitFor("/help [topic] · /hotkeys · Tab complete");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Tab accepts a fuzzy slash-command suggestion from the Registry", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-fuzzy-slash-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/nme");
+    await fixture.waitFor("/name <text|--clear|--generate>");
+    fixture.write("\t");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("/name");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Tab completes an authoritative project path without reading the file", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tab-path-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(join(workspaceRoot, "src"), { recursive: true });
+  await mkdir(controlRoot);
+  await writeFile(join(workspaceRoot, "src", "alpha.ts"), "PRIVATE_ALPHA_BYTES\n", "utf8");
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("src/al");
+    await fixture.waitFor("src/al");
+    const beforeTab = fixture.output().length;
+    fixture.write("\t");
+    await fixture.waitForAfter("src/alpha.ts", beforeTab);
+    fixture.write("\u0011");
+    await waitForPath(join(controlRoot, "clipboard.txt"));
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("src/alpha.ts");
+    expect(result.stdout).not.toContain("PRIVATE_ALPHA_BYTES");
+    expect(await readFilesRecursively(stateRoot)).not.toContain("PRIVATE_ALPHA_BYTES");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Tab completes an authoritative project path on a later multiline draft line", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tab-multiline-path-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(join(workspaceRoot, "src"), { recursive: true });
+  await mkdir(controlRoot);
+  await writeFile(join(workspaceRoot, "src", "alpha.ts"), "private\n", "utf8");
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("first line\u000asrc/al");
+    await fixture.waitFor("src/al");
+    fixture.write("\t");
+    await fixture.waitFor("src/alpha.ts");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe(
+      "first line\nsrc/alpha.ts",
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Tab path completion renders terminal controls from filenames as inert text", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tab-path-controls-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  const unsafeSequence = "\u001b]52;c;c2NvcGU=\u0007";
+  await mkdir(join(workspaceRoot, "src"), { recursive: true });
+  await mkdir(controlRoot);
+  await writeFile(join(workspaceRoot, "src", `evil${unsafeSequence}.ts`), "private\n", "utf8");
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("src/ev");
+    await fixture.waitFor("src/ev");
+    fixture.write("\t");
+    await fixture.waitFor("src/evil.ts");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("src/evil.ts");
+    expect(result.stdout).not.toContain(unsafeSequence);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the at path selector opens only at a token boundary", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-at-boundary-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  await writeFile(join(workspaceRoot, "README.md"), "PRIVATE_README_BYTES\n", "utf8");
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforeDraft = fixture.output().length;
+    fixture.write("email@example@");
+    fixture.write("\u0011");
+    await waitForPath(join(controlRoot, "clipboard.txt"));
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("email@example@");
+    expect(result.stdout.slice(beforeDraft)).not.toContain("Select a project path");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Tab completes an exact qualified Skill argument from authoritative catalog metadata", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-completion-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(join(workspaceRoot, ".agents", "skills", "first"), { recursive: true });
+  await writeFile(
+    join(workspaceRoot, ".agents", "skills", "first", "SKILL.md"),
+    "---\nname: first\ndescription: First completion procedure.\n---\nFirst body.\n",
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/skills skill:v1:project:.:fir");
+    await fixture.waitFor("First completion procedure.");
+    fixture.write("\t\r");
+    const outcome = await Promise.race([
+      fixture.waitFor("1 Skill selected").then(() => "selected" as const),
+      fixture.waitFor("Skill selection complete.").then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("selected");
+    expect(await readFilesRecursively(stateRoot)).not.toContain(
+      '"text":"/skills skill:v1:project:.:first"',
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Tab completes a Help topic argument from the Registry", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-topic-completion-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeCompletion = fixture.output().length;
+    fixture.write("/help hot");
+    await fixture.waitForAfter("Fixed effective keyboard bindings", beforeCompletion);
+    fixture.write("\t\r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Effective Hotkeys", beforeCompletion).then(() => "hotkeys" as const),
+      fixture.waitForAfter("Adam Help", beforeCompletion).then(() => "root" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("hotkeys");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an unknown Help topic is rejected locally with a Registry suggestion", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-topic-unknown-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeTopic = fixture.output().length;
+    fixture.write("/help htokeys\r");
+    const outcome = await Promise.race([
+      fixture
+        .waitForAfter("Unknown Help topic htokeys · Did you mean hotkeys?", beforeTopic)
+        .then(() => "rejected" as const),
+      fixture.waitForAfter("Adam Help", beforeTopic).then(() => "root" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("rejected");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Help exposes the effective Pi Editor hotkeys on a dedicated topic", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-editor-hotkeys-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeTopic = fixture.output().length;
+    fixture.write("/help editor");
+    await fixture.waitFor("Pi Editor navigation and editing bindings");
+    fixture.write("\t\r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Editor Hotkeys", beforeTopic).then(() => "editor" as const),
+      fixture.waitForAfter("Unknown Help topic editor", beforeTopic).then(() => "unknown" as const),
+    ]);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("editor");
+    expect(result.stdout).toContain("Ctrl+W / Alt+Backspace");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("resume rebuilds prompt history from active authoritative chronology", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-prompt-history-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "history", stateRoot, workspaceRoot });
+    await fixture.waitFor("History prompt 3");
+    fixture.write("\u001b[A");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("History prompt 3");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("restored prompt history renders terminal controls as inert text", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unsafe-history-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  const unsafeSequence = "\u001b]52;c;c2NvcGU=\u0007";
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "unsafe-history",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Visible history");
+    fixture.write("\u001b[A");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("Visible history");
+    expect(result.stdout).not.toContain(unsafeSequence);
+    expect(result.stdout).not.toContain("\u202E");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("session selection rebuilds prompt history from the selected authoritative chronology", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-selected-history-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "session-selection-history",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select a project session");
+    const beforeSelection = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForAfter("Selected session prompt", beforeSelection);
+    fixture.write("\u001b[A");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe(
+      "Selected session prompt",
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("prompt history navigation restores the exact draft after returning past newest", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-history-draft-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "history", stateRoot, workspaceRoot });
+    await fixture.waitFor("History prompt 3");
+    fixture.write("unsent draft");
+    fixture.write("\u001b[A");
+    fixture.write("\u001b[B");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("unsent draft");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an unknown slash command is rejected locally with a fuzzy suggestion", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unknown-command-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeUnknown = fixture.output().length;
+    fixture.write("/hepl\r");
+    const outcome = await Promise.race([
+      fixture
+        .waitForAfter("Unknown command /hepl · Did you mean /help?", beforeUnknown)
+        .then(() => "rejected" as const),
+      fixture.waitForAfter("Skill selection complete.", beforeUnknown).then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("rejected");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/hepl"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("malformed slash input is rejected locally instead of reaching the model", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-malformed-command-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeMalformed = fixture.output().length;
+    fixture.write("/help!\r");
+    const outcome = await Promise.race([
+      fixture
+        .waitForAfter("Unknown command /help!", beforeMalformed)
+        .then(() => "rejected" as const),
+      fixture
+        .waitForAfter("Skill selection complete.", beforeMalformed)
+        .then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("rejected");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/help!"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("invalid arguments for a known command are rejected locally with Registry usage", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-command-usage-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeInvalid = fixture.output().length;
+    fixture.write("/mcp unexpected\r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Usage: /mcp", beforeInvalid).then(() => "usage" as const),
+      fixture.waitForAfter("Skill selection complete.", beforeInvalid).then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("usage");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/mcp unexpected"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Help remains locally available while a model run is active", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-active-help-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Start a held run\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await fixture.waitFor("Working");
+    const beforeHelp = fixture.output().length;
+    fixture.write("/help");
+    await fixture.waitForAfter("Browse Adam commands and interaction help.", beforeHelp);
+    fixture.write("\t\r");
+    await fixture.waitForAfter("Adam Help", beforeHelp);
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    fixture.write("\u001b[27;1;27~");
+    await fixture.waitFor("Streaming answer");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout.slice(beforeHelp)).toContain("Adam Help");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/help"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash completion exposes only Registry commands available during an active run", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-active-completion-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Start completion hold\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await fixture.waitFor("Working");
+    const beforeCompletion = fixture.output().length;
+    fixture.write("/");
+    await fixture.waitForAfter("Browse Adam commands and interaction help.", beforeCompletion);
+    fixture.write("\u001b[27;1;27~");
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitFor("Streaming answer");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout.slice(beforeCompletion)).not.toContain(
+      "Set, clear, or regenerate the active session name.",
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("permission preempts Help and restores its exact page after settlement", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-permission-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  await writeFile(join(workspaceRoot, "edit.txt"), "before", "utf8");
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "mutation-after-release",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Prepare a held edit\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    fixture.write("/hotkeys");
+    await fixture.waitFor("Show the fixed effective keyboard map.");
+    fixture.write("\t\r");
+    await fixture.waitFor("Effective Hotkeys");
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitFor("Permission required");
+    const beforeRestore = fixture.output().length;
+    fixture.write("\u001b[27;1;27~");
+    await fixture.waitForAfter("Effective Hotkeys", beforeRestore);
+    const beforeParent = fixture.output().length;
+    fixture.write("\u001b[27;1;27~");
+    await fixture.waitForAfter("Adam Help", beforeParent);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout.slice(beforeParent)).toContain("Adam Help");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -853,17 +1650,22 @@ test("the real TUI loads older authoritative chronology through the current opaq
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-history-paging-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
   await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
 
   try {
-    const fixture = startFixture({ scenario: "history", stateRoot, workspaceRoot });
+    const fixture = startFixture({ controlRoot, scenario: "history", stateRoot, workspaceRoot });
     await fixture.waitFor("History prompt 3");
     fixture.write("/history\r");
     await fixture.waitFor("History prompt 2");
     fixture.write("/history\r");
     await fixture.waitFor("History prompt 1");
+    fixture.write("\u001b[A\u001b[A\u001b[A");
     fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("History prompt 1");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -889,6 +1691,29 @@ test("the real TUI branches from the latest visible authoritative complete bound
     fixture.write("\u0011");
     await fixture.closed;
     expect(outcome).toBe("branch");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the Registry canonical fork command preserves the existing branch behavior", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-fork-alias-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "history", stateRoot, workspaceRoot });
+    await fixture.waitFor("History prompt 3");
+    const beforeFork = fixture.output().length;
+    fixture.write("/fork\r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Adam · Branch of ", beforeFork).then(() => "fork" as const),
+      fixture.waitForAfter("History answer.", beforeFork).then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await fixture.closed;
+    expect(outcome).toBe("fork");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -937,7 +1762,9 @@ test("the real TUI MCP wizard preserves every separate B8 authority step", async
     fixture.write("\r");
     await fixture.waitFor("MCP authority · tool selection required");
     await waitForPath(spawnMarker);
-    fixture.write("1\u001b[B1c");
+    fixture.write("1");
+    fixture.write("\u001b[B");
+    fixture.write("c");
     await fixture.waitFor("MCP authority · profile committed");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -986,7 +1813,9 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
     await seed.waitFor("MCP authority · activation required");
     seed.write("\r");
     await seed.waitFor("MCP authority · tool selection required");
-    seed.write("1c");
+    seed.write("1");
+    seed.write("\u001b[B");
+    seed.write("c");
     await seed.waitFor("MCP authority · profile committed");
     seed.write("\u0011");
     await expect(seed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -1440,21 +2269,7 @@ function startFixture(input: {
     readonly entrypoint: string;
     readonly environment?: Readonly<Record<string, string>>;
   };
-  readonly scenario?:
-    | "cancellation"
-    | "clipboard-timeout"
-    | "clipboard-success"
-    | "deadline"
-    | "history"
-    | "mcp-close-unconfirmed"
-    | "mutation"
-    | "mutation-delayed-preview"
-    | "read"
-    | "resume"
-    | "shell"
-    | "skill-selection"
-    | "streaming"
-    | "unsafe-output";
+  readonly scenario?: FixtureScenario;
   readonly stateRoot: string;
   readonly workspaceRoot: string;
 }): Fixture {
