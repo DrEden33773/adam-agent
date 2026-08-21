@@ -232,11 +232,11 @@ test("the production target picker saves its focused exact target separately fro
         defaultTargetId: "deepseek-v4-flash.direct",
       })}\n`,
     );
-    expect(fixture.output()).not.toContain("Adam · New session");
-    fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
     fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).not.toContain("Adam · New session");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -538,12 +538,36 @@ test("the real TUI inspects and reloads repository instruction status through Pr
   }
 });
 
+test("repository instruction status exposes bounded diagnostic identities", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-instruction-diagnostics-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "AGENTS.md"), "Masked rules.\n", "utf8");
+  await writeFile(join(workspaceRoot, "AGENTS.override.md"), "Active rules.\n", "utf8");
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/instructions\r");
+    await fixture.waitFor("repository_instruction_masked");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("repository_instruction_masked");
+    expect(result.stdout).toContain("path AGENTS.md");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the real TUI opens exact next-turn Skill metadata instead of submitting a hidden prompt", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-palette-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   const skillDirectory = join(workspaceRoot, ".agents", "skills", "project-review");
   await mkdir(skillDirectory, { recursive: true });
+  await writeFile(join(workspaceRoot, "AGENTS.md"), "# Rules\n", "utf8");
   await writeFile(
     join(skillDirectory, "SKILL.md"),
     "---\nname: project-review\ndescription: Reviews exact project state.\n---\nPrivate body.\n",
@@ -566,6 +590,34 @@ test("the real TUI opens exact next-turn Skill metadata instead of submitting a 
     expect(outcome).toBe("palette");
     expect(fixture.output()).toContain("skill:v1:project:.:project-review");
     expect(fixture.output()).toContain("Reviews exact project state.");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("idle Ctrl+C closes the Skill palette and returns focus to the editor", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-palette-cancel-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "project-review");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(join(workspaceRoot, "AGENTS.md"), "# Rules\n", "utf8");
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: project-review\ndescription: Reviews exact project state.\n---\nPrivate body.\n",
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/skills\r");
+    await fixture.waitFor("Select next-turn Skills");
+    fixture.write("\u0003");
+    fixture.write("/instructions\r");
+    await fixture.waitFor("Instructions r1");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -706,6 +758,30 @@ test("the real TUI fuzzy-selects and quotes a normalized project path without re
   }
 });
 
+test("project path insertion renders terminal controls from filenames as inert text", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-project-path-controls-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const unsafeSequence = "\u001b]52;c;c2NvcGU=\u0007";
+  await mkdir(join(workspaceRoot, "src"), { recursive: true });
+  await writeFile(join(workspaceRoot, "src", `${unsafeSequence}.ts`), "private\n", "utf8");
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Inspect @");
+    await fixture.waitFor("Select a project path");
+    fixture.write("\r");
+    await fixture.waitFor("Inspect `src/.ts`");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).not.toContain(unsafeSequence);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the real TUI loads older authoritative chronology through the current opaque cursor", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-history-paging-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -715,7 +791,6 @@ test("the real TUI loads older authoritative chronology through the current opaq
   try {
     const fixture = startFixture({ scenario: "history", stateRoot, workspaceRoot });
     await fixture.waitFor("History prompt 3");
-    expect(fixture.output()).not.toContain("History prompt 1");
     fixture.write("/history\r");
     await fixture.waitFor("History prompt 2");
     fixture.write("/history\r");

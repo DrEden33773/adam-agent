@@ -383,6 +383,30 @@ export async function createPresentationSession(
       };
       publishStateChange();
     };
+    const refreshActiveMcp = async (sessionId: string, throughSequence: number): Promise<void> => {
+      const active = state.authoritative.active;
+      if (active === null || active.session.id !== sessionId) {
+        throw new TypeError("The active session disappeared during MCP refresh.");
+      }
+      const inspected = await options.lifecycle.inspect({ sessionId });
+      if (inspected.schemaVersion !== 3) {
+        throw new TypeError("The active MCP session is no longer current.");
+      }
+      state = {
+        revision: state.revision + 1,
+        authoritative: {
+          ...state.authoritative,
+          continuity: {
+            status: "current",
+            sessionThroughSequence: Math.max(throughSequence, inspected.lastSequence),
+            operationThrough: [],
+          },
+          active: { ...active, mcp: projectMcp(inspected) },
+        },
+        transient: state.transient,
+      };
+      publishStateChange();
+    };
     let runtimeRefresh = Promise.resolve();
     const seenRuntimeNotificationIds = new Set<string>();
     const runtimeNotificationOrder: string[] = [];
@@ -546,7 +570,11 @@ export async function createPresentationSession(
       ) {
         return;
       }
-      await refreshActiveNaming(event.sessionId, event.throughSequence);
+      if (event.type === "session_naming_changed") {
+        await refreshActiveNaming(event.sessionId, event.throughSequence);
+      } else {
+        await refreshActiveMcp(event.sessionId, event.throughSequence);
+      }
     };
     for (const event of bufferedMetadata.splice(0)) {
       await handleMetadata(event);
@@ -1276,6 +1304,18 @@ export async function createPresentationSession(
           };
         }
         try {
+          const inspected = await options.lifecycle.inspect({ sessionId: command.sessionId });
+          if (
+            inspected.schemaVersion !== 3 ||
+            inspected.mcp?.status !== "catalog_stale" ||
+            inspected.mcp.activation?.generationId !== command.generationId
+          ) {
+            return {
+              status: "rejected",
+              code: "stale_interaction",
+              message: "The stale MCP generation is no longer current.",
+            };
+          }
           const result = await options.lifecycle.configureMcp({
             type: "revalidate_catalog",
             sessionId: command.sessionId,
@@ -1294,34 +1334,6 @@ export async function createPresentationSession(
             status: "rejected",
             code: "authority_rejected",
             message: "The stale MCP catalog could not be revalidated.",
-          };
-        }
-      }
-      if (command.type === "cancel_mcp_configuration") {
-        const active = state.authoritative.active;
-        if (
-          command.sessionId !== active?.session.id ||
-          active.mcp?.activation?.generationId !== command.generationId
-        ) {
-          return {
-            status: "rejected",
-            code: "stale_interaction",
-            message: "The MCP generation is no longer current.",
-          };
-        }
-        try {
-          const result = await options.lifecycle.configureMcp({
-            type: "cancel_configuration",
-            sessionId: command.sessionId,
-            generationId: command.generationId,
-          });
-          await activateSnapshot(result.snapshot);
-          return { status: "admitted", commandId: randomUUID(), resource: null };
-        } catch {
-          return {
-            status: "rejected",
-            code: "authority_rejected",
-            message: "The MCP generation could not be cancelled.",
           };
         }
       }

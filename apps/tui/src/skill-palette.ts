@@ -68,11 +68,22 @@ export class SkillPalette implements Component {
             "",
             safeTerminalText(selected.description),
             this.#theme.muted(
-              `${sourceLabel(selected.source)} · ${selected.active ? "active" : "available"}`,
+              safeTerminalText(
+                `${sourceLabel(selected.source)} · ${selected.active ? "active" : "available"}`,
+              ),
             ),
           ]),
       this.#theme.muted(
         `Catalog r${this.#catalog.revision} · ${this.#catalog.overflow.omittedCount} omitted · ${this.#catalog.overflow.shortenedCount} shortened · ${this.#catalog.diagnostics.length} diagnostics`,
+      ),
+      ...this.#catalog.diagnostics.map((diagnostic) =>
+        this.#theme.muted(
+          safeTerminalText(
+            `${diagnostic.code} · ${diagnostic.source}${
+              diagnostic.scope === undefined ? "" : `:${diagnostic.scope}`
+            } · ${diagnostic.packagePath}`,
+          ),
+        ),
       ),
       ...(this.#notice === null ? [] : ["", this.#theme.muted(this.#notice)]),
       "",

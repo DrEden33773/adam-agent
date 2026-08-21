@@ -483,11 +483,6 @@ export type PresentationCommand =
       readonly generationId: string;
     }
   | {
-      readonly type: "cancel_mcp_configuration";
-      readonly sessionId: string;
-      readonly generationId: string;
-    }
-  | {
       readonly type: "submit_prompt";
       readonly sessionId: string;
       readonly text: string;

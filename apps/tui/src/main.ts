@@ -14,6 +14,7 @@ import {
   selectModelTargetId,
 } from "@adam-agent/agent";
 
+import { McpShutdownUnconfirmedError, requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 import { runTui } from "./tui-app.js";
 
 class TuiConfigurationError extends Error {}
@@ -93,12 +94,13 @@ try {
         });
       }
     } finally {
-      await lifecycle.close();
+      requireConfirmedLifecycleClose(await lifecycle.close());
     }
   }
 } catch (error) {
   const message =
     error instanceof TuiConfigurationError ||
+    error instanceof McpShutdownUnconfirmedError ||
     error instanceof ModelTargetError ||
     error instanceof SessionLifecycleError
       ? error.message

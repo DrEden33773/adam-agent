@@ -347,11 +347,17 @@ export type ProjectSessionCatalogPage = {
   readonly nextCursor: string | null;
 };
 
-export type SessionMetadataEvent = {
-  readonly type: "session_naming_changed";
-  readonly sessionId: string;
-  readonly throughSequence: number;
-};
+export type SessionMetadataEvent =
+  | {
+      readonly type: "session_naming_changed";
+      readonly sessionId: string;
+      readonly throughSequence: number;
+    }
+  | {
+      readonly type: "mcp_configuration_changed";
+      readonly sessionId: string;
+      readonly throughSequence: number;
+    };
 
 export type SessionMetadataListener = (event: SessionMetadataEvent) => void | Promise<void>;
 
@@ -601,6 +607,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   let automaticTitlesEnabled = options[sessionAutomaticTitlesEnabled] ?? true;
   let lifecycleClosePromise: Promise<McpCloseResult> | undefined;
   const pendingMcpCatalogDurability = new Map<string, Promise<void>>();
+  const pendingMcpMetadataThrough = new Map<string, number>();
   let scheduleMcpCatalogFlush = (_sessionId: string) => {};
   const publishMetadata = async (event: SessionMetadataEvent): Promise<void> => {
     for (const listener of metadataListeners) {
@@ -1099,6 +1106,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
       options[mcpCatalogStaleDurableBarrier]?.committed(change);
       pendingMcpCatalogChanges.delete(key);
+    }
+    const throughSequence = nextSequence - 1;
+    if (activeSession === undefined) {
+      await publishMetadata({ type: "mcp_configuration_changed", sessionId, throughSequence });
+    } else {
+      pendingMcpMetadataThrough.set(
+        sessionId,
+        Math.max(pendingMcpMetadataThrough.get(sessionId) ?? 0, throughSequence),
+      );
     }
   };
   scheduleMcpCatalogFlush = (sessionId) => {
@@ -2375,6 +2391,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           }
           unsubscribe();
           unsubscribeNotifications();
+          const mcpThroughSequence = pendingMcpMetadataThrough.get(input.sessionId);
+          if (mcpThroughSequence !== undefined) {
+            pendingMcpMetadataThrough.delete(input.sessionId);
+            await publishMetadata({
+              type: "mcp_configuration_changed",
+              sessionId: input.sessionId,
+              throughSequence: mcpThroughSequence,
+            });
+          }
           const live = mcpHost.snapshot(input.sessionId);
           if (live?.profile !== undefined) {
             armMcpIdle(input.sessionId, live.activation.generationId);

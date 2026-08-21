@@ -25,6 +25,7 @@ import {
   LegacyDuplicateGuard,
   nodeDeadlineScheduler,
 } from "./exit-policy.js";
+import { mcpAdvanceCommand } from "./mcp-advance.js";
 import { McpWizard } from "./mcp-wizard.js";
 import { PermissionOverlay } from "./permission-overlay.js";
 import { ProjectPathPicker } from "./project-path-picker.js";
@@ -83,28 +84,33 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     | undefined;
   let targetPicker:
     | {
+        readonly close: () => void;
         readonly picker: TargetPicker;
         readonly hide: () => void;
       }
     | undefined;
   let sessionPicker:
     | {
+        readonly close: () => void;
         readonly picker: SessionPicker;
         readonly hide: () => void;
       }
     | undefined;
   let skillPalette:
     | {
+        readonly close: () => void;
         readonly hide: () => void;
       }
     | undefined;
   let pathPicker:
     | {
+        readonly close: () => void;
         readonly hide: () => void;
       }
     | undefined;
   let mcpWizard:
     | {
+        readonly close: () => void;
         readonly wizard: McpWizard;
         readonly hide: () => void;
       }
@@ -242,7 +248,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         maxHeight: "80%",
         margin: 1,
       });
-      sessionPicker = { picker, hide: () => handle.hide() };
+      const close = () => {
+        handle.hide();
+        sessionPicker = undefined;
+        tui.setFocus(editor);
+        tui.requestRender();
+      };
+      sessionPicker = { close, picker, hide: () => handle.hide() };
     } else if (
       active === null &&
       !needsSessionChoice &&
@@ -316,7 +328,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         maxHeight: "80%",
         margin: 1,
       });
-      targetPicker = { picker, hide: () => handle.hide() };
+      const close = () => {
+        handle.hide();
+        targetPicker = undefined;
+        tui.setFocus(editor);
+        tui.requestRender();
+      };
+      targetPicker = { close, picker, hide: () => handle.hide() };
     }
     header.setText(
       theme.primary(`Adam · ${safeTerminalText(active?.session.label ?? "No session")}`),
@@ -503,7 +521,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           const draft = editor.getExpandedText();
           const trigger = draft.lastIndexOf("@");
           if (trigger >= 0) {
-            editor.setText(`${draft.slice(0, trigger)}\`${path}\`${draft.slice(trigger + 1)}`);
+            editor.setText(
+              `${draft.slice(0, trigger)}\`${safeTerminalText(path)}\`${draft.slice(trigger + 1)}`,
+            );
           }
           close();
         },
@@ -515,7 +535,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         maxHeight: "80%",
         margin: 1,
       });
-      pathPicker = { hide: () => handle?.hide() };
+      pathPicker = { close, hide: () => handle?.hide() };
     }
   };
   editor.onSubmit = (text) => {
@@ -664,55 +684,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         theme,
         onClose: close,
         onAdvance(mcp) {
-          if (mcp.status === "workspace_confirmation_required") {
-            dispatchWizard({
-              type: "confirm_mcp_workspace",
-              sessionId: active.session.id,
-              sourceDigest: mcp.source.digest,
-            });
-            return;
-          }
-          if (mcp.status === "server_approval_required") {
-            const server = mcp.servers.find(
-              (candidate) => candidate.status === "approval_required",
-            );
-            if (server !== undefined) {
-              dispatchWizard({
-                type: "approve_mcp_server",
-                sessionId: active.session.id,
-                serverId: server.serverId,
-                definitionDigest: server.definitionDigest,
-              });
-            }
-            return;
-          }
-          if (mcp.status === "activation_required") {
-            dispatchWizard({
-              type: "activate_mcp_servers",
-              sessionId: active.session.id,
-              servers: mcp.servers
-                .filter((server) => server.status === "approved")
-                .map((server) => ({
-                  serverId: server.serverId,
-                  definitionDigest: server.definitionDigest,
-                })),
-            });
-            return;
-          }
-          if (mcp.status === "activation_failed" && mcp.activation !== null) {
-            dispatchWizard({
-              type: "retry_mcp_activation",
-              sessionId: active.session.id,
-              generationId: mcp.activation.generationId,
-            });
-            return;
-          }
-          if (mcp.status === "catalog_stale" && mcp.activation !== null) {
-            dispatchWizard({
-              type: "revalidate_mcp_catalog",
-              sessionId: active.session.id,
-              generationId: mcp.activation.generationId,
-            });
+          const command = mcpAdvanceCommand(active.session.id, mcp);
+          if (command !== null) {
+            dispatchWizard(command);
           }
         },
         onCommit(mcp, selections) {
@@ -733,7 +707,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         maxHeight: "90%",
         margin: 1,
       });
-      mcpWizard = { wizard, hide: () => handle?.hide() };
+      mcpWizard = { close, wizard, hide: () => handle?.hide() };
       tui.requestRender();
       return;
     }
@@ -744,15 +718,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       editor.disableSubmit = false;
       if (catalog !== null) {
         let handle: { hide(): void } | undefined;
+        const close = () => {
+          handle?.hide();
+          skillPalette = undefined;
+          tui.setFocus(editor);
+          tui.requestRender();
+        };
         const palette = new SkillPalette({
           catalog,
           theme,
-          onClose() {
-            handle?.hide();
-            skillPalette = undefined;
-            tui.setFocus(editor);
-            tui.requestRender();
-          },
+          onClose: close,
           onToggle(skill) {
             if (selectedSkills.delete(skill.qualifiedId)) {
               renderState();
@@ -769,7 +744,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           maxHeight: "80%",
           margin: 1,
         });
-        skillPalette = { hide: () => handle?.hide() };
+        skillPalette = { close, hide: () => handle?.hide() };
       }
       tui.requestRender();
       return;
@@ -925,6 +900,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       if (data === "\u0003" && !legacyDuplicateGuard.admit()) {
         return { consume: true };
       }
+      const closeOverlay =
+        mcpWizard?.close ??
+        pathPicker?.close ??
+        skillPalette?.close ??
+        sessionPicker?.close ??
+        targetPicker?.close;
+      if (closeOverlay !== undefined) {
+        clearExitWindow();
+        closeOverlay();
+        return { consume: true };
+      }
       const active = options.presentation.getState().authoritative.active;
       const runActive =
         options.presentation.getState().transient !== null ||
@@ -992,7 +978,15 @@ function repositoryStatusText(instructions: RepositoryInstructionsDisplay | null
   }
   const scopes = instructions.activeScopes.join(", ");
   const sources = instructions.sources.map((source) => source.path).join(", ") || "no files";
+  const diagnostics = instructions.diagnostics
+    .map(
+      (diagnostic) =>
+        `${diagnostic.code}${diagnostic.scope === undefined ? "" : ` · scope ${diagnostic.scope}`}${
+          diagnostic.path === undefined ? "" : ` · path ${diagnostic.path}`
+        }${diagnostic.candidate === undefined ? "" : ` · candidate ${diagnostic.candidate}`}`,
+    )
+    .join(" · ");
   return `Instructions r${instructions.revision} · scopes ${scopes} · ${sources} · ${
     instructions.reloadAvailable ? "reload available" : "reload unavailable"
-  }`;
+  }${diagnostics.length === 0 ? "" : ` · ${diagnostics}`}`;
 }
