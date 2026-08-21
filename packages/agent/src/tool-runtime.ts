@@ -175,6 +175,7 @@ type OrdinaryToolError = Exclude<
 type PreparedToolCall = {
   readonly status: "ready";
   readonly permissionSubject: PermissionSubject;
+  readonly changePreview?: { readonly text: string };
   validateBeforeDispatch?(): FailedToolResult | undefined;
   execute(context: ToolExecutionContext): Promise<ToolResult>;
 };
@@ -458,11 +459,54 @@ export function createReadToolRegistry(options: { readonly workspaceRoot: string
   };
 }
 
+function createFileChangePreview(path: string, content: string): string {
+  const lines = content.split("\n");
+  const additions = lines
+    .map((line, index) => (index === lines.length - 1 && line.length === 0 ? null : `+${line}`))
+    .filter((line): line is string => line !== null);
+  return [`--- /dev/null`, `+++ b/${path}`, ...additions, ""].join("\n");
+}
+
+function createPatchChangePreview(operations: readonly NormalizedPatchOperation[]): string {
+  return `${operations
+    .map((operation) => {
+      if (operation.kind === "create") {
+        return createFileChangePreview(operation.path, operation.content).trimEnd();
+      }
+      if (operation.kind === "delete") {
+        return [`--- a/${operation.path}`, "+++ /dev/null", "@@ delete file @@"].join("\n");
+      }
+      const edits = (operation.edits ?? []).flatMap((edit) => [
+        ...edit.oldText.split("\n").map((line) => `-${line}`),
+        ...edit.newText.split("\n").map((line) => `+${line}`),
+      ]);
+      return operation.kind === "move"
+        ? [
+            `--- a/${operation.from}`,
+            `+++ b/${operation.to}`,
+            `@@ move ${operation.from} -> ${operation.to} @@`,
+            ...edits,
+          ].join("\n")
+        : [`--- a/${operation.path}`, `+++ b/${operation.path}`, ...edits].join("\n");
+    })
+    .join("\n\n")}\n`;
+}
+
 export function createMutationToolRegistry(options: {
   readonly workspaceRoot: string;
   readonly stateRoot?: string;
 }): ToolRegistry {
   return createMutationToolRegistryInternal(options);
+}
+
+export function canonicalChangePreviewForToolCall(input: {
+  readonly workspaceRoot: string;
+  readonly call: ToolCall;
+}): string | undefined {
+  const prepared = createMutationToolRegistryInternal({ workspaceRoot: input.workspaceRoot })
+    .resolve(input.call.name)
+    ?.prepare(input.call.argumentsJson);
+  return prepared?.status === "ready" ? prepared.changePreview?.text : undefined;
 }
 
 function createMutationToolRegistryInternal(options: {
@@ -501,6 +545,9 @@ function createMutationToolRegistryInternal(options: {
         return {
           status: "ready",
           permissionSubject,
+          changePreview: {
+            text: createFileChangePreview(parsedArguments.data.path, parsedArguments.data.content),
+          },
           async execute() {
             return executeSafely(writeFileOutputSchema, async () => {
               const target = await openConfinedMutationTarget(
@@ -587,6 +634,7 @@ function createMutationToolRegistryInternal(options: {
             }),
             digest,
           },
+          changePreview: { text: createPatchChangePreview(normalized.operations) },
           async execute() {
             return executeSafely(editFileOutputSchema, async () => ({
               digest,

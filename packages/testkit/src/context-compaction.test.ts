@@ -11,7 +11,6 @@ import {
   createJsonlSessionStore,
   createPermissionPolicy,
   createReadToolRegistry,
-  createSessionLifecycle,
   type ModelDriver,
   ModelDriverError,
   type ModelRequest,
@@ -33,6 +32,7 @@ import {
   sessionDurableOutputLimits,
 } from "@adam-agent/agent/internal-testing";
 import { expect, expectTypeOf, test } from "vitest";
+import { createSessionLifecycleForTesting as createSessionLifecycle } from "./index.js";
 
 const { ADAM_AGENT_LARGE_OUTPUT_TESTS: largeOutputTests } = process.env;
 const largeOutputTest = test.skipIf(largeOutputTests !== "1");

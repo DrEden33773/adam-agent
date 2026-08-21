@@ -22,6 +22,7 @@ import {
   repositoryInstructionRevisionV1Schema,
   type Sha256Digest,
 } from "./prompt-assembly.js";
+import { normalizedSessionTitle, sessionTitleFallback } from "./session-naming.js";
 import { type SkillContextRecordV1, skillContextRecordV1Schema } from "./skills.js";
 import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from "./tool-runtime.js";
 
@@ -94,13 +95,25 @@ export type SessionGenesisRecord = {
     readonly sessionId: string;
     readonly projectId: string;
     readonly targetIdentity: ModelTargetIdentity;
+    readonly naming?: {
+      readonly profileVersion: 1;
+      readonly fallbackTitle: string;
+    };
     readonly promptContext?: PromptContextRecord;
     readonly skillContext?: SkillContextRecordV1;
-    readonly lineage?: {
-      readonly parentSessionId: string;
-      readonly parentEventPosition: number;
-      readonly prefixDigest: string;
-    };
+    readonly lineage?:
+      | {
+          readonly parentSessionId: string;
+          readonly parentEventPosition: number;
+          readonly prefixDigest: string;
+        }
+      | {
+          readonly recordVersion: 2;
+          readonly parentSessionId: string;
+          readonly sourceSessionId: string;
+          readonly sourceEventPosition: number;
+          readonly sourcePrefixDigest: string;
+        };
   };
 };
 
@@ -235,6 +248,10 @@ export type SessionLogicalRunStartedRecord = {
     readonly type: "logical_run_started";
     readonly runId: string;
     readonly userMessage: string;
+    readonly naming?: {
+      readonly profileVersion: 1;
+      readonly fallbackTitle: string;
+    };
     readonly skills?: readonly {
       readonly selection: string;
       readonly requestId: string;
@@ -243,6 +260,71 @@ export type SessionLogicalRunStartedRecord = {
       readonly maxTurns?: number;
       readonly maxTokens?: number;
     };
+  };
+};
+
+export type SessionManualNameSetRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "session_manual_name_set";
+    readonly recordVersion: 1;
+    readonly name: string;
+  };
+};
+
+export type SessionManualNameClearedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "session_manual_name_cleared";
+    readonly recordVersion: 1;
+  };
+};
+
+export type SessionTitleGenerationStartedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "session_title_generation_started";
+    readonly recordVersion: 1;
+    readonly generationId: string;
+    readonly reason: "automatic" | "regenerate";
+    readonly targetIdentity: ModelTargetIdentity;
+  };
+};
+
+export type SessionTitleGenerationCompletedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "session_title_generation_completed";
+    readonly recordVersion: 1;
+    readonly generationId: string;
+    readonly title: string;
+    readonly usage:
+      | { readonly status: "unknown" }
+      | { readonly status: "known"; readonly inputTokens: number; readonly outputTokens: number };
+  };
+};
+
+export type SessionTitleGenerationFailedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "session_title_generation_failed";
+    readonly recordVersion: 1;
+    readonly generationId: string;
+    readonly reason: "model_request_failed" | "invalid_title" | "process_restart";
+  };
+};
+
+export type SessionTitleGenerationSkippedManualRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "session_title_generation_skipped_manual";
+    readonly recordVersion: 1;
   };
 };
 
@@ -651,6 +733,12 @@ export type SessionV3Record =
   | SessionMcpToolProfileCommittedRecord
   | SessionMcpCatalogStateChangedRecord
   | SessionLogicalRunStartedRecord
+  | SessionManualNameSetRecord
+  | SessionManualNameClearedRecord
+  | SessionTitleGenerationStartedRecord
+  | SessionTitleGenerationCompletedRecord
+  | SessionTitleGenerationFailedRecord
+  | SessionTitleGenerationSkippedManualRecord
   | SessionSkillActivationBatchCommittedRecord
   | SessionSkillActivatedRecord
   | SessionSkillCatalogCommittedRecord
@@ -1030,6 +1118,26 @@ function isCanonicalPatchPath(path: string): boolean {
     path.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..")
   );
 }
+const changePreviewArtifactReferenceSchema = z.strictObject({
+  id: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  mediaType: z.literal("text/x-diff; charset=utf-8"),
+  byteCount: z
+    .number()
+    .int()
+    .positive()
+    .max(64 * 1024),
+  source: z.strictObject({
+    type: z.literal("change_preview"),
+    schemaVersion: z.literal(1),
+    projectId: z.string().min(1).max(256),
+    sessionId: z.string().min(1).max(128),
+    runId: z.uuid(),
+    callId: z.string().min(1).max(256),
+    toolName: z.enum(["write_file", "edit_file"]),
+    argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    provenance: z.literal("prepared_tool_change"),
+  }),
+});
 function createCanonicalRuntimeEventSchema(options: {
   readonly permissionSubject: z.ZodType;
   readonly runResult: z.ZodType;
@@ -1069,6 +1177,7 @@ function createCanonicalRuntimeEventSchema(options: {
       effect: z.enum(["read", "write", "execute", "network", "delegate", "administrative"]),
       scope: z.literal("call"),
       subject: options.permissionSubject,
+      changePreviewRef: changePreviewArtifactReferenceSchema.optional(),
     }),
     z.strictObject({
       type: z.literal("tool_permission_decided"),
@@ -1081,6 +1190,7 @@ function createCanonicalRuntimeEventSchema(options: {
         .optional(),
       scope: z.literal("call").optional(),
       subject: options.permissionSubject.optional(),
+      changePreviewRef: changePreviewArtifactReferenceSchema.optional(),
     }),
     z.strictObject({
       type: z.literal("tool_started"),
@@ -1303,14 +1413,33 @@ const sessionV3RecordSchema = z.union([
     sessionId: z.uuid(),
     projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
     targetIdentity: modelTargetIdentitySchema,
+    naming: z
+      .strictObject({
+        profileVersion: z.literal(1),
+        fallbackTitle: z
+          .string()
+          .min(1)
+          .max(1_024)
+          .refine((value) => sessionTitleFallback(value) === value),
+      })
+      .optional(),
     promptContext: promptContextRecordSchema.optional(),
     skillContext: skillContextRecordV1Schema.optional(),
     lineage: z
-      .strictObject({
-        parentSessionId: z.uuid(),
-        parentEventPosition: z.number().int().positive(),
-        prefixDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-      })
+      .union([
+        z.strictObject({
+          parentSessionId: z.uuid(),
+          parentEventPosition: z.number().int().positive(),
+          prefixDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+        }),
+        z.strictObject({
+          recordVersion: z.literal(2),
+          parentSessionId: z.uuid(),
+          sourceSessionId: z.uuid(),
+          sourceEventPosition: z.number().int().positive(),
+          sourcePrefixDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+        }),
+      ])
       .optional(),
   }),
   z.strictObject({
@@ -1483,6 +1612,16 @@ const sessionV3RecordSchema = z.union([
     type: z.literal("logical_run_started"),
     runId: z.uuid(),
     userMessage: z.string().max(512 * 1024),
+    naming: z
+      .strictObject({
+        profileVersion: z.literal(1),
+        fallbackTitle: z
+          .string()
+          .min(1)
+          .max(1_024)
+          .refine((value) => sessionTitleFallback(value) === value),
+      })
+      .optional(),
     skills: z
       .array(
         z.strictObject({
@@ -1497,6 +1636,54 @@ const sessionV3RecordSchema = z.union([
       .max(8)
       .optional(),
     limits: sessionRunLimitsSchema.optional(),
+  }),
+  z.strictObject({
+    type: z.literal("session_manual_name_set"),
+    recordVersion: z.literal(1),
+    name: z
+      .string()
+      .min(1)
+      .max(1_024)
+      .refine((value) => normalizedSessionTitle(value) === value),
+  }),
+  z.strictObject({
+    type: z.literal("session_manual_name_cleared"),
+    recordVersion: z.literal(1),
+  }),
+  z.strictObject({
+    type: z.literal("session_title_generation_started"),
+    recordVersion: z.literal(1),
+    generationId: z.uuid(),
+    reason: z.enum(["automatic", "regenerate"]),
+    targetIdentity: modelTargetIdentitySchema,
+  }),
+  z.strictObject({
+    type: z.literal("session_title_generation_completed"),
+    recordVersion: z.literal(1),
+    generationId: z.uuid(),
+    title: z
+      .string()
+      .min(1)
+      .max(1_024)
+      .refine((value) => normalizedSessionTitle(value) === value),
+    usage: z.union([
+      z.strictObject({ status: z.literal("unknown") }),
+      z.strictObject({
+        status: z.literal("known"),
+        inputTokens: z.number().int().nonnegative(),
+        outputTokens: z.number().int().nonnegative(),
+      }),
+    ]),
+  }),
+  z.strictObject({
+    type: z.literal("session_title_generation_failed"),
+    recordVersion: z.literal(1),
+    generationId: z.uuid(),
+    reason: z.enum(["model_request_failed", "invalid_title", "process_restart"]),
+  }),
+  z.strictObject({
+    type: z.literal("session_title_generation_skipped_manual"),
+    recordVersion: z.literal(1),
   }),
   z.strictObject({
     type: z.literal("skill_activation_batch_committed"),

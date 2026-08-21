@@ -6,6 +6,5 @@
     "outDir": "./dist",
     "rootDir": "./src"
   },
-  "include": ["src/**/*.ts"],
-  "references": [{ "path": "../extension-api" }, { "path": "../presentation" }]
+  "include": ["src/**/*.ts"]
 }

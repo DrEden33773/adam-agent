@@ -41,6 +41,9 @@ importers:
       '@adam-agent/extension-api':
         specifier: workspace:*
         version: link:../extension-api
+      '@adam-agent/presentation':
+        specifier: workspace:*
+        version: link:../presentation
       '@ai-sdk/deepseek':
         specifier: 3.0.28
         version: 3.0.28(zod@4.4.3)
@@ -80,6 +83,8 @@ importers:
       zod:
         specifier: 4.4.3
         version: 4.4.3
+
+  packages/presentation: {}
 
   packages/testkit:
     dependencies:

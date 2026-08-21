@@ -12,8 +12,8 @@ import {
   createModelTargets,
   createMutationToolRegistry,
   createPermissionPolicy,
+  createSessionLifecycle as createRawSessionLifecycle,
   createReadToolRegistry,
-  createSessionLifecycle,
   type ModelDriver,
   type ModelMessage,
   type ModelTargetIdentity,
@@ -26,6 +26,7 @@ import {
   openJsonlSessionStore,
   preparedDirectDeepSeekV2ContextProfile,
   type SessionRecord,
+  sessionAutomaticTitlesEnabled,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { FakeModelDriver } from "./index.js";
@@ -56,6 +57,12 @@ const skillUsagePrompt =
 const codingToolDefinitions = createCodingToolRegistry({
   workspaceRoot: "/tmp/adam-agent-session-lifecycle-tool-definitions",
 }).definitions();
+
+function createSessionLifecycle(
+  options: Parameters<typeof createRawSessionLifecycle>[0],
+): ReturnType<typeof createRawSessionLifecycle> {
+  return createRawSessionLifecycle({ ...options, [sessionAutomaticTitlesEnabled]: false });
+}
 
 function promptProjectionFor(
   snapshot: {
@@ -101,6 +108,51 @@ function promptProjectionFor(
       .digest("hex")}`,
   };
 }
+
+test("session metadata observers cannot overturn a durable naming mutation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-metadata-observer-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const releaseObserver = Promise.withResolvers<void>();
+  const unsubscribeFailure = lifecycle.subscribeMetadata(() => {
+    throw new Error("observer failed");
+  });
+  const unsubscribePending = lifecycle.subscribeMetadata(() => releaseObserver.promise);
+  let failureGuard: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const naming = lifecycle.setSessionManualName({
+      sessionId: created.sessionId,
+      name: "Durable name",
+    });
+    await expect(
+      Promise.race([
+        naming,
+        new Promise<never>((_resolve, reject) => {
+          failureGuard = setTimeout(
+            () => reject(new Error("A metadata observer blocked durable naming.")),
+            1_000,
+          );
+        }),
+      ]),
+    ).resolves.toMatchObject({ status: "updated" });
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      lastSequence: 2,
+    });
+  } finally {
+    if (failureGuard !== undefined) {
+      clearTimeout(failureGuard);
+    }
+    releaseObserver.resolve();
+    unsubscribeFailure();
+    unsubscribePending();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
 
 function canonicalFixtureJson(value: unknown): string {
   if (
@@ -3588,6 +3640,40 @@ test("SessionLifecycle rejects an incomplete canonical tool response from untrus
       `${await readFile(sessionPath, "utf8")}${JSON.stringify(incompleteRecord)}\n`,
       "utf8",
     );
+
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a title terminal record without its matching durable start", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-invalid-title-history-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+
+  try {
+    const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+    const created = await lifecycle.create({ targetIdentity });
+    const store = await openJsonlSessionStore<SessionRecord>({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    await store.append({
+      schemaVersion: 3,
+      sequence: 2,
+      record: {
+        type: "session_title_generation_completed",
+        recordVersion: 1,
+        generationId: "123e4567-e89b-42d3-a456-426614174512",
+        title: "Fabricated title",
+        usage: { status: "unknown" },
+      },
+    });
 
     await expect(lifecycle.inspect({ sessionId: created.sessionId })).rejects.toMatchObject({
       code: "session_invalid",

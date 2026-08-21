@@ -6,7 +6,6 @@ import {
   type ContextProfile,
   createExtensionHost,
   createPermissionPolicy,
-  createSessionLifecycle,
   type ModelDriver,
   type ModelRequest,
   type ModelTargetIdentity,
@@ -15,7 +14,10 @@ import {
 } from "@adam-agent/agent";
 import { openJsonlSessionStore, type SessionRecord } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
-import { FakeModelDriver } from "./index.js";
+import {
+  createSessionLifecycleForTesting as createSessionLifecycle,
+  FakeModelDriver,
+} from "./index.js";
 
 const targetIdentity: ModelTargetIdentity = {
   targetId: "deepseek-v4-flash.direct",

@@ -28,6 +28,15 @@ export {
 export { preparedDirectDeepSeekV2ContextProfile } from "./model-targets.js";
 export type { PatchFileSystem } from "./patch-transaction.js";
 export {
+  type PresentationHydrationBarrier,
+  type PresentationRuntimeRefreshBarrier,
+  presentationCatalogPageSize,
+  presentationHistoryPageSize,
+  presentationHydrationBarrier,
+  presentationRuntimeRefreshBarrier,
+} from "./presentation-session.js";
+export { assemblePromptMessagesV1, digestPromptRequestV1 } from "./prompt-assembly.js";
+export {
   sessionDurableContext,
   sessionDurableOutputLimits,
 } from "./session-durable-context.js";
@@ -38,6 +47,13 @@ export {
   mcpActivationSettlementBarrier,
   mcpCatalogStaleDurableBarrier,
   mcpCatalogStaleObservationBarrier,
+  type SessionLogicalRunStartedBarrier,
+  type SessionRuntimeNotificationTransform,
+  type SessionTitleDeadlineScheduler,
+  sessionAutomaticTitlesEnabled,
+  sessionLogicalRunStartedBarrier,
+  sessionRuntimeNotificationTransform,
+  sessionTitleDeadlineScheduler,
 } from "./session-lifecycle.js";
 export {
   openJsonlSessionStore,

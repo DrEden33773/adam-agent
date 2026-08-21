@@ -6,7 +6,9 @@ const {
   createReadToolRegistry,
   createSessionLifecycle,
 } = await import("@adam-agent/agent");
-const { createCodingToolRegistryForTesting } = await import("@adam-agent/agent/internal-testing");
+const { createCodingToolRegistryForTesting, sessionAutomaticTitlesEnabled } = await import(
+  "@adam-agent/agent/internal-testing"
+);
 
 const workspaceRoot = requiredEnvironment("ADAM_AGENT_FIXTURE_WORKSPACE_ROOT");
 const stateRoot = requiredEnvironment("ADAM_AGENT_FIXTURE_STATE_ROOT");
@@ -34,6 +36,7 @@ const modelTargets = createModelTargets({
 });
 
 const lifecycle = createSessionLifecycle({
+  [sessionAutomaticTitlesEnabled]: false,
   modelTargets,
   stateRoot,
   workspaceRoot,
