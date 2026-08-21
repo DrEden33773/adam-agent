@@ -13,6 +13,7 @@ const emptySnapshot: AuthoritativePresentationSnapshot = {
     operationThrough: [],
   },
   project: { id: "project-1", label: "adam-agent" },
+  targets: { items: [], defaultTargetId: null, diagnostic: null },
   sessions: {
     items: [
       {
@@ -47,6 +48,10 @@ const emptySnapshot: AuthoritativePresentationSnapshot = {
     },
     transcript: { items: [], olderCursor: null },
     pendingInteractions: [],
+    repositoryInstructions: null,
+    skills: null,
+    projectPaths: { items: [], omittedCount: 0, diagnostic: null },
+    mcp: null,
   },
 };
 
@@ -114,6 +119,10 @@ describe("presentation reconciliation", () => {
           olderCursor: null,
         },
         pendingInteractions: [],
+        repositoryInstructions: null,
+        skills: null,
+        projectPaths: { items: [], omittedCount: 0, diagnostic: null },
+        mcp: null,
       },
     };
 

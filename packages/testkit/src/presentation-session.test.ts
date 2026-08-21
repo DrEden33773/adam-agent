@@ -1,14 +1,16 @@
 import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   type ContextProfile,
   createCodingToolRegistry,
   createFileArtifactStore,
   createPermissionPolicy,
+  createPresentationPreferences,
   createPresentationSession,
   createReadToolRegistry,
   createSessionLifecycle,
@@ -53,6 +55,419 @@ const contextProfile: ContextProfile = {
   retainedTargetTokens: 20_000,
   estimatorVersion: 1,
 };
+const testEnvironment = process.env as NodeJS.ProcessEnv & { HOME?: string };
+const mcpServerFixturePath = fileURLToPath(
+  new URL("../dist/mcp-stdio-server.fixture.js", import.meta.url),
+);
+
+async function openActivatedMcpPresentationFixture(prefix: string) {
+  const testRoot = await mkdtemp(join(tmpdir(), prefix));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const spawnMarker = join(testRoot, "spawned");
+  const closeMarker = join(testRoot, "closed");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: {
+          command: process.execPath,
+          args: [mcpServerFixturePath, spawnMarker, closeMarker],
+        },
+      },
+    }),
+    "utf8",
+  );
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    const initial = presentation.getState().authoritative.active;
+    if (initial?.mcp === null || initial?.mcp === undefined) {
+      throw new Error("Expected MCP confirmation state.");
+    }
+    await presentation.dispatch({
+      type: "confirm_mcp_workspace",
+      sessionId: initial.session.id,
+      sourceDigest: initial.mcp.source.digest,
+    });
+    const server = presentation.getState().authoritative.active?.mcp?.servers[0];
+    if (server === undefined) {
+      throw new Error("Expected MCP server preview.");
+    }
+    await presentation.dispatch({
+      type: "approve_mcp_server",
+      sessionId: initial.session.id,
+      serverId: server.serverId,
+      definitionDigest: server.definitionDigest,
+    });
+    await presentation.dispatch({
+      type: "activate_mcp_servers",
+      sessionId: initial.session.id,
+      servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
+    });
+    return {
+      lifecycle,
+      presentation,
+      stateRoot,
+      testRoot,
+      workspaceRoot,
+      async close() {
+        await presentation.close();
+        await lifecycle.close();
+        await rm(testRoot, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+test("PresentationSession opens an empty project catalog without creating a session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-project-open-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+    });
+
+    const state = presentation.getState();
+    expect(state).toEqual({
+      revision: 1,
+      authoritative: {
+        schemaVersion: 1,
+        continuity: {
+          status: "current",
+          sessionThroughSequence: 0,
+          operationThrough: [],
+        },
+        project: { id: state.authoritative.project.id, label: "workspace" },
+        targets: { items: [], defaultTargetId: null, diagnostic: null },
+        sessions: { items: [], nextCursor: null },
+        active: null,
+      },
+      transient: null,
+    });
+    expect(state.authoritative.project.id).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession projects exact target identity and readiness for project launch", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-targets-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Target projection does not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+          },
+          {
+            identity: {
+              targetId: "poolside-laguna-s-2.1-free.gateway",
+              vendor: "poolside",
+              modelId: "poolside/laguna-s-2.1-free",
+              route: "vercel-ai-gateway",
+              upstreamProviderId: "poolside",
+              profileVersion: 1,
+              certification: "experimental",
+            },
+            readiness: { status: "missing", credentialSource: "AI_GATEWAY_API_KEY" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.targets).toEqual({
+      items: [
+        {
+          targetId: "deepseek-v4-flash.direct",
+          label: "deepseek-v4-flash",
+          route: "direct",
+          certification: "Certified",
+          readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+        },
+        {
+          targetId: "poolside-laguna-s-2.1-free.gateway",
+          label: "poolside/laguna-s-2.1-free",
+          route: "vercel-ai-gateway",
+          certification: "Experimental",
+          readiness: { status: "missing", credentialSource: "AI_GATEWAY_API_KEY" },
+        },
+      ],
+      defaultTargetId: null,
+      diagnostic: null,
+    });
+    expect(presentation.getState().authoritative.active).toBeNull();
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession projects one valid owner-only exact default target preference", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-default-target-"));
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(configDirectory, "config.json"),
+    JSON.stringify({ schemaVersion: 1, defaultTargetId: targetIdentity.targetId }),
+    { encoding: "utf8", mode: 0o600 },
+  );
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Target projection does not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      preferences: createPresentationPreferences({
+        environment: { XDG_CONFIG_HOME: configRoot },
+      }),
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.targets).toMatchObject({
+      defaultTargetId: targetIdentity.targetId,
+      diagnostic: null,
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession rejects a symlinked default-target directory without hiding exact targets", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-unsafe-target-config-"));
+  const configRoot = join(testRoot, "config");
+  const actualDirectory = join(testRoot, "actual-config");
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(configRoot);
+  await mkdir(actualDirectory, { mode: 0o700 });
+  await symlink(actualDirectory, join(configRoot, "adam-agent"));
+  await mkdir(workspaceRoot);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Target projection does not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      preferences: createPresentationPreferences({
+        environment: { XDG_CONFIG_HOME: configRoot },
+      }),
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.targets).toMatchObject({
+      items: [expect.objectContaining({ targetId: targetIdentity.targetId })],
+      defaultTargetId: null,
+      diagnostic: { code: "target_configuration_unsafe" },
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession saves one exact default target through a distinct semantic command", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-save-target-"));
+  const configRoot = join(testRoot, "config");
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(configRoot);
+  await mkdir(workspaceRoot);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Target preference does not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      preferences: createPresentationPreferences({
+        environment: { XDG_CONFIG_HOME: configRoot },
+      }),
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+    });
+
+    await expect(
+      presentation.dispatch({ type: "set_default_target", targetId: targetIdentity.targetId }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.targets).toMatchObject({
+      defaultTargetId: targetIdentity.targetId,
+      diagnostic: null,
+    });
+    const configurationPath = join(configRoot, "adam-agent", "config.json");
+    await expect(readFile(configurationPath, "utf8")).resolves.toBe(
+      `${JSON.stringify({ schemaVersion: 1, defaultTargetId: targetIdentity.targetId })}\n`,
+    );
+    expect((await stat(configurationPath)).mode & 0o777).toBe(0o600);
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession creates a session only from an exact available launch target", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-target-create-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Session creation does not resolve a model before the first turn.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+    });
+
+    await expect(
+      presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.active?.session).toMatchObject({
+      targetId: targetIdentity.targetId,
+      label: "New session",
+      status: "idle",
+    });
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({
+      items: [expect.objectContaining({ targetIdentity })],
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
 
 test("PresentationSession opens a real new session as authoritative empty project history", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-open-"));
@@ -81,6 +496,7 @@ test("PresentationSession opens a real new session as authoritative empty projec
           operationThrough: [],
         },
         project: { id: state.authoritative.project.id, label: "workspace" },
+        targets: { items: [], defaultTargetId: null, diagnostic: null },
         sessions: {
           items: [
             {
@@ -115,11 +531,931 @@ test("PresentationSession opens a real new session as authoritative empty projec
           },
           transcript: { items: [], olderCursor: null },
           pendingInteractions: [],
+          repositoryInstructions: {
+            revision: 1,
+            activeScopes: ["."],
+            sources: [],
+            diagnostics: [],
+            effectiveDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+            reloadAvailable: true,
+          },
+          skills: {
+            revision: 1,
+            items: [],
+            diagnostics: [],
+            overflow: { omittedCount: 0, shortenedCount: 0 },
+            reloadAvailable: true,
+          },
+          projectPaths: { items: [], omittedCount: 0, diagnostic: null },
+          mcp: null,
         },
       },
       transient: null,
     });
     expect(state.authoritative.project.id).toMatch(/^sha256:[0-9a-f]{64}$/u);
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession projects the frozen repository instruction revision without file contents", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-instructions-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "AGENTS.md"), "# Rules\n\nKeep tests causal.\n", "utf8");
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.repositoryInstructions).toEqual({
+      revision: 1,
+      activeScopes: ["."],
+      sources: [
+        {
+          scope: ".",
+          path: "AGENTS.md",
+          selectedName: "AGENTS.md",
+          loadReason: "root_eager",
+        },
+      ],
+      diagnostics: [],
+      effectiveDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      reloadAvailable: true,
+    });
+    expect(JSON.stringify(presentation.getState())).not.toContain("Keep tests causal.");
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession reloads repository instructions only through the lifecycle command", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-reload-instructions-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const instructionsPath = join(workspaceRoot, "AGENTS.md");
+  await writeFile(instructionsPath, "# Rules\n\nFirst revision.\n", "utf8");
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+    const originalDigest =
+      presentation.getState().authoritative.active?.repositoryInstructions?.effectiveDigest;
+    await writeFile(instructionsPath, "# Rules\n\nSecond revision.\n", "utf8");
+
+    await expect(
+      presentation.dispatch({ type: "reload_repository_instructions", sessionId }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.active?.repositoryInstructions).toMatchObject({
+      revision: 2,
+      activeScopes: ["."],
+      sources: [{ path: "AGENTS.md", loadReason: "explicit_reload" }],
+      reloadAvailable: true,
+    });
+    expect(
+      presentation.getState().authoritative.active?.repositoryInstructions?.effectiveDigest,
+    ).not.toBe(originalDigest);
+    expect(JSON.stringify(presentation.getState())).not.toContain("Second revision.");
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession projects exact qualified Skill metadata without Skill body bytes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-skills-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const isolatedHome = join(testRoot, "home");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "project-review");
+  const previousHome = testEnvironment.HOME;
+  await mkdir(skillDirectory, { recursive: true });
+  await mkdir(isolatedHome);
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: project-review\ndescription: Reviews the exact project state.\n---\nPRIVATE_SKILL_BODY\n",
+    "utf8",
+  );
+  testEnvironment.HOME = isolatedHome;
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.skills).toEqual({
+      revision: 1,
+      items: [
+        {
+          qualifiedId: "skill:v1:project:.:project-review",
+          name: "project-review",
+          description: "Reviews the exact project state.",
+          source: { type: "project", scope: "." },
+          active: false,
+        },
+      ],
+      diagnostics: [],
+      overflow: { omittedCount: 0, shortenedCount: 0 },
+      reloadAvailable: true,
+    });
+    expect(JSON.stringify(presentation.getState())).not.toContain("PRIVATE_SKILL_BODY");
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    if (previousHome === undefined) {
+      delete testEnvironment.HOME;
+    } else {
+      testEnvironment.HOME = previousHome;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession reloads the exact Skill catalog through lifecycle authority", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-reload-skills-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const isolatedHome = join(testRoot, "home");
+  const skillRoot = join(workspaceRoot, ".agents", "skills");
+  const previousHome = testEnvironment.HOME;
+  await mkdir(join(skillRoot, "first"), { recursive: true });
+  await mkdir(isolatedHome);
+  await writeFile(
+    join(skillRoot, "first", "SKILL.md"),
+    "---\nname: first\ndescription: First exact procedure.\n---\nFirst body.\n",
+    "utf8",
+  );
+  testEnvironment.HOME = isolatedHome;
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+    await mkdir(join(skillRoot, "second"));
+    await writeFile(
+      join(skillRoot, "second", "SKILL.md"),
+      "---\nname: second\ndescription: Second exact procedure.\n---\nSecond body.\n",
+      "utf8",
+    );
+
+    await expect(
+      presentation.dispatch({ type: "reload_skills", sessionId }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.active?.skills).toMatchObject({
+      revision: 2,
+      items: [
+        { qualifiedId: "skill:v1:project:.:first" },
+        { qualifiedId: "skill:v1:project:.:second" },
+      ],
+      reloadAvailable: true,
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    if (previousHome === undefined) {
+      delete testEnvironment.HOME;
+    } else {
+      testEnvironment.HOME = previousHome;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession projects bounded ordinary project paths without reading file bytes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-project-paths-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(join(workspaceRoot, "src"), { recursive: true });
+  await writeFile(join(workspaceRoot, "README.md"), "PRIVATE_README_BYTES\n", "utf8");
+  await writeFile(join(workspaceRoot, "src", "alpha.ts"), "PRIVATE_SOURCE_BYTES\n", "utf8");
+  await symlink(join(workspaceRoot, "README.md"), join(workspaceRoot, "linked-readme"));
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.projectPaths).toEqual({
+      items: ["README.md", "src/alpha.ts"],
+      omittedCount: 0,
+      diagnostic: null,
+    });
+    expect(JSON.stringify(presentation.getState())).not.toContain("PRIVATE_README_BYTES");
+    expect(JSON.stringify(presentation.getState())).not.toContain("PRIVATE_SOURCE_BYTES");
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession projects the initial inert MCP workspace-confirmation state", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-mcp-confirmation-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: { command: process.execPath, args: ["-e", "process.exit(0)"] },
+      },
+    }),
+    "utf8",
+  );
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.mcp).toEqual({
+      schemaVersion: 1,
+      status: "workspace_confirmation_required",
+      workspaceConfirmed: false,
+      source: {
+        path: ".mcp.json",
+        digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      },
+      servers: [],
+      activation: null,
+      catalog: null,
+      profile: null,
+      diagnostics: [],
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession confirms only the exact MCP workspace source digest", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-mcp-workspace-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: { command: process.execPath, args: ["-e", "process.exit(0)"] },
+      },
+    }),
+    "utf8",
+  );
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    const active = presentation.getState().authoritative.active;
+    if (active?.mcp === null || active?.mcp === undefined) {
+      throw new Error("Expected MCP confirmation state.");
+    }
+
+    await expect(
+      presentation.dispatch({
+        type: "confirm_mcp_workspace",
+        sessionId: active.session.id,
+        sourceDigest: active.mcp.source.digest,
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.active?.mcp).toMatchObject({
+      status: "server_approval_required",
+      workspaceConfirmed: true,
+      servers: [
+        {
+          serverId: "fixture",
+          status: "approval_required",
+          transport: "stdio",
+          command: { kind: "executable" },
+          definitionDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        },
+      ],
+      activation: null,
+      catalog: null,
+      profile: null,
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession approves only one exact MCP server definition", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-mcp-server-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: { command: process.execPath, args: ["-e", "process.exit(0)"] },
+      },
+    }),
+    "utf8",
+  );
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    const initial = presentation.getState().authoritative.active;
+    if (initial?.mcp === null || initial?.mcp === undefined) {
+      throw new Error("Expected MCP confirmation state.");
+    }
+    await presentation.dispatch({
+      type: "confirm_mcp_workspace",
+      sessionId: initial.session.id,
+      sourceDigest: initial.mcp.source.digest,
+    });
+    const confirmed = presentation.getState().authoritative.active;
+    const server = confirmed?.mcp?.servers[0];
+    if (confirmed?.mcp === null || confirmed?.mcp === undefined || server === undefined) {
+      throw new Error("Expected an exact MCP server preview.");
+    }
+
+    await expect(
+      presentation.dispatch({
+        type: "approve_mcp_server",
+        sessionId: confirmed.session.id,
+        serverId: server.serverId,
+        definitionDigest: server.definitionDigest,
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.active?.mcp).toMatchObject({
+      status: "activation_required",
+      servers: [
+        {
+          serverId: "fixture",
+          status: "approved",
+          definitionDigest: server.definitionDigest,
+        },
+      ],
+      activation: null,
+      catalog: null,
+      profile: null,
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession atomically activates approved MCP servers into one exact catalog", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-mcp-activation-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const spawnMarker = join(testRoot, "spawned");
+  const closeMarker = join(testRoot, "closed");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: {
+          command: process.execPath,
+          args: [mcpServerFixturePath, spawnMarker, closeMarker],
+        },
+      },
+    }),
+    "utf8",
+  );
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    const initial = presentation.getState().authoritative.active;
+    if (initial?.mcp === null || initial?.mcp === undefined) {
+      throw new Error("Expected MCP confirmation state.");
+    }
+    await presentation.dispatch({
+      type: "confirm_mcp_workspace",
+      sessionId: initial.session.id,
+      sourceDigest: initial.mcp.source.digest,
+    });
+    const server = presentation.getState().authoritative.active?.mcp?.servers[0];
+    if (server === undefined) {
+      throw new Error("Expected MCP server preview.");
+    }
+    await presentation.dispatch({
+      type: "approve_mcp_server",
+      sessionId: initial.session.id,
+      serverId: server.serverId,
+      definitionDigest: server.definitionDigest,
+    });
+
+    await expect(
+      presentation.dispatch({
+        type: "activate_mcp_servers",
+        sessionId: initial.session.id,
+        servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.active?.mcp).toMatchObject({
+      status: "tool_selection_required",
+      servers: [{ serverId: "fixture", status: "ready" }],
+      activation: { attempt: 1, status: "ready" },
+      catalog: {
+        status: "ready",
+        digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        tools: [
+          { serverId: "fixture", originalName: "echo" },
+          { serverId: "fixture", originalName: "uppercase" },
+        ],
+      },
+      profile: null,
+    });
+    await expect(readFile(spawnMarker, "utf8")).resolves.toMatch(/^\d+$/u);
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession commits one discovery-bound immutable MCP Tool Profile", async () => {
+  const fixture = await openActivatedMcpPresentationFixture("adam-agent-presentation-mcp-profile-");
+  try {
+    const active = fixture.presentation.getState().authoritative.active;
+    const tool = active?.mcp?.catalog?.tools.find((candidate) => candidate.originalName === "echo");
+    const generationId = active?.mcp?.activation?.generationId;
+    if (
+      active?.mcp === null ||
+      active?.mcp === undefined ||
+      tool === undefined ||
+      generationId === undefined
+    ) {
+      throw new Error("Expected an activated MCP catalog.");
+    }
+
+    await expect(
+      fixture.presentation.dispatch({
+        type: "commit_mcp_tool_profile",
+        sessionId: active.session.id,
+        generationId,
+        selections: [
+          {
+            qualifiedName: tool.qualifiedName,
+            definitionDigest: tool.definitionDigest,
+            effect: "read",
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(fixture.presentation.getState().authoritative.active?.mcp).toMatchObject({
+      status: "profile_committed",
+      profile: {
+        version: 1,
+        projectorVersion: 1,
+        digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        tools: [
+          {
+            serverId: "fixture",
+            originalName: "echo",
+            qualifiedName: tool.qualifiedName,
+            definitionDigest: tool.definitionDigest,
+            effect: "read",
+          },
+        ],
+      },
+    });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("PresentationSession explicitly reactivates one exact committed MCP profile after restart", async () => {
+  const fixture = await openActivatedMcpPresentationFixture(
+    "adam-agent-presentation-mcp-reactivation-",
+  );
+  let restarted: SessionLifecycle | undefined;
+  let reopened: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+  try {
+    const active = fixture.presentation.getState().authoritative.active;
+    const tool = active?.mcp?.catalog?.tools.find((candidate) => candidate.originalName === "echo");
+    const generationId = active?.mcp?.activation?.generationId;
+    if (
+      active?.mcp === null ||
+      active?.mcp === undefined ||
+      tool === undefined ||
+      generationId === undefined
+    ) {
+      throw new Error("Expected an activated MCP catalog.");
+    }
+    await fixture.presentation.dispatch({
+      type: "commit_mcp_tool_profile",
+      sessionId: active.session.id,
+      generationId,
+      selections: [
+        {
+          qualifiedName: tool.qualifiedName,
+          definitionDigest: tool.definitionDigest,
+          effect: "read",
+        },
+      ],
+    });
+    const profileDigest =
+      fixture.presentation.getState().authoritative.active?.mcp?.profile?.digest;
+    if (profileDigest === undefined) {
+      throw new Error("Expected one committed MCP Tool Profile.");
+    }
+    await fixture.presentation.close();
+    await fixture.lifecycle.close();
+
+    restarted = createSessionLifecycle({
+      stateRoot: fixture.stateRoot,
+      workspaceRoot: fixture.workspaceRoot,
+    });
+    reopened = await createPresentationSession({
+      lifecycle: restarted,
+      projectLabel: "workspace",
+      sessionId: active.session.id,
+      stateRoot: fixture.stateRoot,
+      workspaceRoot: fixture.workspaceRoot,
+    });
+    const reactivation = reopened.getState().authoritative.active;
+    const server = reactivation?.mcp?.servers[0];
+    expect(reactivation?.mcp).toMatchObject({ status: "profile_reactivation_required" });
+    if (server === undefined) {
+      throw new Error("Expected the exact approved MCP server.");
+    }
+
+    await expect(
+      reopened.dispatch({
+        type: "activate_mcp_servers",
+        sessionId: active.session.id,
+        servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(reopened.getState().authoritative.active?.mcp).toMatchObject({
+      status: "profile_committed",
+      profile: { digest: profileDigest },
+    });
+  } finally {
+    await reopened?.close();
+    await restarted?.close();
+    await fixture.presentation.close();
+    await fixture.lifecycle.close();
+    await rm(fixture.testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession refreshes and explicitly revalidates an asynchronously stale MCP catalog", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-mcp-revalidate-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const spawnMarker = join(testRoot, "spawned");
+  const closeMarker = join(testRoot, "closed");
+  const callMarker = join(testRoot, "called");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: {
+          command: process.execPath,
+          args: [mcpServerFixturePath, spawnMarker, closeMarker, "list-changed-once", callMarker],
+        },
+      },
+    }),
+    "utf8",
+  );
+  let qualifiedName: string | undefined;
+  let requestCount = 0;
+  const driver = new FakeModelDriver(() => {
+    requestCount += 1;
+    return requestCount === 1
+      ? [
+          { type: "tool_call_start", id: "observe-stale", name: qualifiedName as string } as const,
+          {
+            type: "tool_call_delta",
+            id: "observe-stale",
+            json: '{"value":"first"}',
+          } as const,
+          { type: "tool_call_end", id: "observe-stale" } as const,
+          { type: "finish", reason: "tool_calls" } as const,
+        ]
+      : [
+          { type: "text_delta", text: "Stale catalog recorded." } as const,
+          { type: "finish", reason: "stop" } as const,
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    try {
+      const initial = presentation.getState().authoritative.active;
+      if (initial?.mcp === null || initial?.mcp === undefined) {
+        throw new Error("Expected MCP confirmation state.");
+      }
+      await presentation.dispatch({
+        type: "confirm_mcp_workspace",
+        sessionId: initial.session.id,
+        sourceDigest: initial.mcp.source.digest,
+      });
+      const server = presentation.getState().authoritative.active?.mcp?.servers[0];
+      if (server === undefined) {
+        throw new Error("Expected MCP server preview.");
+      }
+      await presentation.dispatch({
+        type: "approve_mcp_server",
+        sessionId: initial.session.id,
+        serverId: server.serverId,
+        definitionDigest: server.definitionDigest,
+      });
+      await presentation.dispatch({
+        type: "activate_mcp_servers",
+        sessionId: initial.session.id,
+        servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
+      });
+      const activated = presentation.getState().authoritative.active?.mcp;
+      const tool = activated?.catalog?.tools.find((candidate) => candidate.originalName === "echo");
+      const generationId = activated?.activation?.generationId;
+      if (tool === undefined || generationId === undefined) {
+        throw new Error("Expected an activated MCP catalog.");
+      }
+      qualifiedName = tool.qualifiedName;
+      await presentation.dispatch({
+        type: "commit_mcp_tool_profile",
+        sessionId: initial.session.id,
+        generationId,
+        selections: [
+          {
+            qualifiedName: tool.qualifiedName,
+            definitionDigest: tool.definitionDigest,
+            effect: "read",
+          },
+        ],
+      });
+      const stale = Promise.withResolvers<void>();
+      const settled = Promise.withResolvers<void>();
+      let failureGuard: ReturnType<typeof setTimeout> | undefined;
+      const failed = new Promise<never>((_resolve, reject) => {
+        failureGuard = setTimeout(() => {
+          const current = presentation.getState();
+          reject(
+            new Error(
+              `Asynchronous MCP Presentation state did not settle: ${JSON.stringify({
+                mcp: current.authoritative.active?.mcp?.status,
+                naming: current.authoritative.active?.session.naming.generation.status,
+                transient: current.transient?.activity ?? null,
+                transcript: current.authoritative.active?.transcript.items.map((item) =>
+                  item.type === "assistant_message" ? item.text : item.type,
+                ),
+              })}`,
+            ),
+          );
+        }, 20_000);
+      });
+      const unsubscribe = presentation.subscribe(() => {
+        const current = presentation.getState();
+        if (current.authoritative.active?.mcp?.status === "catalog_stale") {
+          stale.resolve();
+        }
+        if (
+          current.transient === null &&
+          current.authoritative.active?.transcript.items.some(
+            (item) => item.type === "assistant_message" && item.text === "Stale catalog recorded.",
+          )
+        ) {
+          settled.resolve();
+        }
+      });
+      try {
+        await presentation.dispatch({
+          type: "submit_prompt",
+          sessionId: initial.session.id,
+          text: "Observe one list change",
+          skills: [],
+        });
+        await Promise.race([Promise.all([stale.promise, settled.promise]), failed]);
+      } finally {
+        if (failureGuard !== undefined) {
+          clearTimeout(failureGuard);
+        }
+        unsubscribe();
+      }
+      const staleMcp = presentation.getState().authoritative.active?.mcp;
+      expect(staleMcp).toMatchObject({ status: "catalog_stale", catalog: { status: "stale" } });
+      const staleGenerationId = staleMcp?.activation?.generationId;
+      if (staleGenerationId === undefined) {
+        throw new Error("Expected one stale MCP generation.");
+      }
+      const revalidated = await presentation.dispatch({
+        type: "revalidate_mcp_catalog",
+        sessionId: initial.session.id,
+        generationId: staleGenerationId,
+      });
+      const lifecycleAfterRevalidate = await lifecycle.inspect({ sessionId: initial.session.id });
+      expect({ revalidated, lifecycleAfterRevalidate }).toMatchObject({
+        revalidated: { status: "admitted", resource: null },
+        lifecycleAfterRevalidate: { mcp: { status: "profile_committed" } },
+      });
+      expect(presentation.getState().authoritative.active?.mcp).toMatchObject({
+        status: "profile_committed",
+        catalog: { status: "ready" },
+      });
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession exposes one failed MCP generation before explicit exact retry", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-mcp-retry-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const spawnMarker = join(testRoot, "spawned");
+  const closeMarker = join(testRoot, "closed");
+  const failedOnceMarker = join(testRoot, "failed-once");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: {
+          command: process.execPath,
+          args: [
+            mcpServerFixturePath,
+            spawnMarker,
+            closeMarker,
+            "fail-once-initialize",
+            failedOnceMarker,
+          ],
+        },
+      },
+    }),
+    "utf8",
+  );
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    const initial = presentation.getState().authoritative.active;
+    if (initial?.mcp === null || initial?.mcp === undefined) {
+      throw new Error("Expected MCP confirmation state.");
+    }
+    await presentation.dispatch({
+      type: "confirm_mcp_workspace",
+      sessionId: initial.session.id,
+      sourceDigest: initial.mcp.source.digest,
+    });
+    const server = presentation.getState().authoritative.active?.mcp?.servers[0];
+    if (server === undefined) {
+      throw new Error("Expected MCP server preview.");
+    }
+    await presentation.dispatch({
+      type: "approve_mcp_server",
+      sessionId: initial.session.id,
+      serverId: server.serverId,
+      definitionDigest: server.definitionDigest,
+    });
+    await expect(
+      presentation.dispatch({
+        type: "activate_mcp_servers",
+        sessionId: initial.session.id,
+        servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
+      }),
+    ).resolves.toMatchObject({ status: "rejected" });
+    const failed = presentation.getState().authoritative.active?.mcp;
+    expect(failed).toMatchObject({
+      status: "activation_failed",
+      activation: { attempt: 1, status: "failed" },
+      catalog: null,
+      profile: null,
+    });
+    const generationId = failed?.activation?.generationId;
+    if (generationId === undefined) {
+      throw new Error("Expected one failed MCP generation.");
+    }
+
+    await expect(
+      presentation.dispatch({
+        type: "retry_mcp_activation",
+        sessionId: initial.session.id,
+        generationId,
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.active?.mcp).toMatchObject({
+      status: "tool_selection_required",
+      activation: { attempt: 2, status: "ready" },
+      catalog: { status: "ready" },
+    });
 
     await presentation.close();
   } finally {
@@ -3308,9 +4644,27 @@ test("PresentationSession deduplicates notifications and repairs an impossible d
       workspaceRoot,
     });
     const repairing = Promise.withResolvers<void>();
+    const repaired = Promise.withResolvers<void>();
+    let repairingObserved = false;
+    let failureGuard: ReturnType<typeof setTimeout> | undefined;
+    const failed = new Promise<never>((_resolve, reject) => {
+      failureGuard = setTimeout(() => {
+        reject(
+          new Error(
+            repairingObserved
+              ? "Presentation entered repair but did not return to current state."
+              : "Presentation did not publish the injected repair state.",
+          ),
+        );
+      }, 10_000);
+    });
     const unsubscribe = presentation.subscribe(() => {
-      if (presentation.getState().authoritative.continuity.status === "repairing") {
+      const continuity = presentation.getState().authoritative.continuity;
+      if (continuity.status === "repairing") {
+        repairingObserved = true;
         repairing.resolve();
+      } else if (repairingObserved && continuity.status === "current") {
+        repaired.resolve();
       }
     });
     try {
@@ -3326,8 +4680,12 @@ test("PresentationSession deduplicates notifications and repairs an impossible d
           skills: [],
         }),
       ).resolves.toMatchObject({ status: "admitted", resource: null });
-      await repairing.promise;
+      await Promise.race([repairing.promise, failed]);
+      await Promise.race([repaired.promise, failed]);
     } finally {
+      if (failureGuard !== undefined) {
+        clearTimeout(failureGuard);
+      }
       unsubscribe();
       await presentation.close();
     }

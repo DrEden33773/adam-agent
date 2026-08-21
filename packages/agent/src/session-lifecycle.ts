@@ -342,15 +342,22 @@ export type SessionNamingResult = {
 };
 
 export type ProjectSessionCatalogPage = {
+  readonly projectId: string;
   readonly items: readonly SessionSnapshot[];
   readonly nextCursor: string | null;
 };
 
-export type SessionMetadataEvent = {
-  readonly type: "session_naming_changed";
-  readonly sessionId: string;
-  readonly throughSequence: number;
-};
+export type SessionMetadataEvent =
+  | {
+      readonly type: "session_naming_changed";
+      readonly sessionId: string;
+      readonly throughSequence: number;
+    }
+  | {
+      readonly type: "mcp_configuration_changed";
+      readonly sessionId: string;
+      readonly throughSequence: number;
+    };
 
 export type SessionMetadataListener = (event: SessionMetadataEvent) => void | Promise<void>;
 
@@ -600,6 +607,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   let automaticTitlesEnabled = options[sessionAutomaticTitlesEnabled] ?? true;
   let lifecycleClosePromise: Promise<McpCloseResult> | undefined;
   const pendingMcpCatalogDurability = new Map<string, Promise<void>>();
+  const pendingMcpMetadataThrough = new Map<string, number>();
   let scheduleMcpCatalogFlush = (_sessionId: string) => {};
   const publishMetadata = async (event: SessionMetadataEvent): Promise<void> => {
     for (const listener of metadataListeners) {
@@ -1098,6 +1106,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
       options[mcpCatalogStaleDurableBarrier]?.committed(change);
       pendingMcpCatalogChanges.delete(key);
+    }
+    const throughSequence = nextSequence - 1;
+    if (activeSession === undefined) {
+      await publishMetadata({ type: "mcp_configuration_changed", sessionId, throughSequence });
+    } else {
+      pendingMcpMetadataThrough.set(
+        sessionId,
+        Math.max(pendingMcpMetadataThrough.get(sessionId) ?? 0, throughSequence),
+      );
     }
   };
   scheduleMcpCatalogFlush = (sessionId) => {
@@ -2374,6 +2391,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           }
           unsubscribe();
           unsubscribeNotifications();
+          const mcpThroughSequence = pendingMcpMetadataThrough.get(input.sessionId);
+          if (mcpThroughSequence !== undefined) {
+            pendingMcpMetadataThrough.delete(input.sessionId);
+            await publishMetadata({
+              type: "mcp_configuration_changed",
+              sessionId: input.sessionId,
+              throughSequence: mcpThroughSequence,
+            });
+          }
           const live = mcpHost.snapshot(input.sessionId);
           if (live?.profile !== undefined) {
             armMcpIdle(input.sessionId, live.activation.generationId);
@@ -2509,8 +2535,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             },
           });
         } else if (command.type === "activate_servers") {
+          const reactivating = inspected.mcp?.status === "profile_reactivation_required";
           if (
-            inspected.mcp?.status !== "activation_required" ||
+            (inspected.mcp?.status !== "activation_required" && !reactivating) ||
             command.servers.length < 1 ||
             command.servers.length > 4 ||
             new Set(command.servers.map((server) => server.serverId)).size !==
@@ -2531,8 +2558,50 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             }
             return server;
           });
+          let reactivationProfile: McpToolProfileV1 | undefined;
+          let activationRecords: readonly SessionRecord[] = [];
+          if (reactivating) {
+            activationRecords = await readJsonlSessionRecords({
+              workspaceRoot: options.workspaceRoot,
+              sessionId: command.sessionId,
+              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+            });
+            const genesis = activationRecords[0];
+            if (genesis === undefined || !isGenesisRecord(genesis)) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+            const promptContext = promptContextRecordFromRecords(genesis, activationRecords);
+            if (promptContext?.recordVersion !== 3 || promptContext.mcp === undefined) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+            reactivationProfile = requireMcpCommittedProfile(
+              await mcpCommittedProfileFromLineage(options, genesis, activationRecords),
+              promptContext,
+            );
+            if (
+              reactivationProfile.servers.length !== selectedServers.length ||
+              reactivationProfile.servers.some(
+                (profileServer) =>
+                  !selectedServers.some(
+                    (server) =>
+                      server.serverId === profileServer.serverId &&
+                      server.definitionDigest === profileServer.definitionDigest,
+                  ),
+              )
+            ) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+          }
           const generationId = randomUUID();
-          const attempt = 1;
+          const attempt = reactivating
+            ? activationRecords.reduce(
+                (maximum, entry) =>
+                  entry.schemaVersion === 3 && entry.record.type === "mcp_activation_started"
+                    ? Math.max(maximum, entry.record.attempt)
+                    : maximum,
+                0,
+              ) + 1
+            : 1;
           await store.append({
             schemaVersion: 3,
             sequence: inspected.lastSequence + 1,
@@ -2541,7 +2610,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               recordVersion: 1,
               generationId,
               attempt,
-              reason: "initial",
+              reason: reactivating ? "idle_reactivate" : "initial",
               servers: selectedServers.map((server) => ({
                 serverId: server.serverId,
                 definitionDigest: server.definitionDigest,
@@ -2553,12 +2622,21 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           let activationPrepared = false;
           let readySettlementDurable = false;
           try {
-            const live = await mcpHost.activate({
-              sessionId: command.sessionId,
-              generationId,
-              attempt,
-              servers: selectedServers,
-            });
+            const live =
+              reactivationProfile === undefined
+                ? await mcpHost.activate({
+                    sessionId: command.sessionId,
+                    generationId,
+                    attempt,
+                    servers: selectedServers,
+                  })
+                : await mcpHost.reactivateToolProfile({
+                    sessionId: command.sessionId,
+                    generationId,
+                    attempt,
+                    servers: selectedServers,
+                    profile: reactivationProfile,
+                  });
             activationPrepared = true;
             await options[mcpActivationSettlementBarrier]?.beforeReadySettlement({
               sessionId: command.sessionId,
@@ -3038,7 +3116,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           .sort();
       } catch (error) {
         if (isNodeError(error) && error.code === "ENOENT") {
-          return { items: [], nextCursor: null };
+          return { projectId, items: [], nextCursor: null };
         }
         throw error;
       }
@@ -3053,6 +3131,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       );
       const lastSessionId = selectedIds.at(-1);
       return {
+        projectId,
         items,
         nextCursor:
           lastSessionId !== undefined && start + selectedIds.length < sessionIds.length

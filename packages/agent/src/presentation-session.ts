@@ -4,16 +4,21 @@ import { join } from "node:path";
 import type {
   AuthoritativePresentationSnapshot,
   CommandReceipt,
+  McpDisplay,
   PresentationCommand,
   PresentationDisplayState,
   PresentationSession,
+  RepositoryInstructionsDisplay,
   SessionSummary,
+  SkillCatalogDisplay,
   ToolCallDisplay,
   TranscriptItem,
 } from "@adam-agent/presentation";
 import { reconcilePresentationUpdate } from "@adam-agent/presentation";
 import { readFileArtifact } from "./artifact-store.js";
-import type { ModelTargetIdentity } from "./model-targets.js";
+import type { ModelTargetIdentity, ModelTargets } from "./model-targets.js";
+import type { PresentationPreferences } from "./presentation-preferences.js";
+import { listProjectPaths } from "./project-path-catalog.js";
 import type {
   CurrentSessionSnapshot,
   SessionLifecycle,
@@ -53,6 +58,8 @@ export type PresentationArtifactReadBarrier = {
 
 type PresentationSessionBaseOptions = {
   readonly lifecycle: SessionLifecycle;
+  readonly modelTargets?: ModelTargets;
+  readonly preferences?: PresentationPreferences;
   readonly projectLabel: string;
   readonly stateRoot?: string;
   readonly workspaceRoot: string;
@@ -65,8 +72,21 @@ type PresentationSessionBaseOptions = {
 
 export type CreatePresentationSessionOptions = PresentationSessionBaseOptions &
   (
-    | { readonly targetIdentity: ModelTargetIdentity; readonly sessionId?: never }
-    | { readonly sessionId: string; readonly targetIdentity?: never }
+    | {
+        readonly openProject: true;
+        readonly sessionId?: never;
+        readonly targetIdentity?: never;
+      }
+    | {
+        readonly targetIdentity: ModelTargetIdentity;
+        readonly openProject?: never;
+        readonly sessionId?: never;
+      }
+    | {
+        readonly sessionId: string;
+        readonly openProject?: never;
+        readonly targetIdentity?: never;
+      }
   );
 
 export async function createPresentationSession(
@@ -93,8 +113,10 @@ export async function createPresentationSession(
   });
 
   try {
-    let created: CurrentSessionSnapshot;
-    if (options.sessionId === undefined) {
+    let created: CurrentSessionSnapshot | undefined;
+    if (options.openProject === true) {
+      created = undefined;
+    } else if (options.sessionId === undefined) {
       created = await options.lifecycle.create({ targetIdentity: options.targetIdentity });
     } else {
       const inspected = await options.lifecycle.inspect({ sessionId: options.sessionId });
@@ -117,75 +139,147 @@ export async function createPresentationSession(
         created = resumed.snapshot;
       }
     }
-    if (created.schemaVersion !== 3) {
-      throw new TypeError("The Presentation Interface requires a current session schema.");
-    }
-    created = (await options.lifecycle.ensureAutomaticTitle({ sessionId: created.sessionId }))
-      .snapshot;
-    await options[presentationHydrationBarrier]?.afterHydrate({
-      sessionId: created.sessionId,
-      throughSequence: created.lastSequence,
-    });
-    if (bufferedEvents.length > 0) {
-      const caughtUp = await options.lifecycle.inspect({ sessionId: created.sessionId });
-      if (caughtUp.schemaVersion !== 3) {
+    if (created !== undefined) {
+      if (created.schemaVersion !== 3) {
         throw new TypeError("The Presentation Interface requires a current session schema.");
       }
-      created = caughtUp;
+      created = (await options.lifecycle.ensureAutomaticTitle({ sessionId: created.sessionId }))
+        .snapshot;
+      await options[presentationHydrationBarrier]?.afterHydrate({
+        sessionId: created.sessionId,
+        throughSequence: created.lastSequence,
+      });
+      if (bufferedEvents.length > 0) {
+        const caughtUp = await options.lifecycle.inspect({ sessionId: created.sessionId });
+        if (caughtUp.schemaVersion !== 3) {
+          throw new TypeError("The Presentation Interface requires a current session schema.");
+        }
+        created = caughtUp;
+      }
     }
-    const records = await readActiveBranchRecords(options, created.sessionId);
-    let transcript = projectTranscript(records);
+    const records =
+      created === undefined ? [] : await readActiveBranchRecords(options, created.sessionId);
+    let transcript: readonly TranscriptItem[] = projectTranscript(records);
     const historyPageSize = boundedHistoryPageSize(options[presentationHistoryPageSize]);
     let loadedTranscriptStart = Math.max(0, transcript.length - historyPageSize);
-    const naming = sessionNamingFromRecords(records, created.sessionId);
+    const naming =
+      created === undefined ? undefined : sessionNamingFromRecords(records, created.sessionId);
     const catalogPageSize = boundedCatalogPageSize(options[presentationCatalogPageSize]);
-    const activeSummary: SessionSummary = {
-      id: created.sessionId,
-      label: naming.displayLabel,
-      naming,
-      targetId: created.targetIdentity.targetId,
-      status: created.status,
-    };
+    const activeSummary: SessionSummary | undefined =
+      created === undefined || naming === undefined
+        ? undefined
+        : {
+            id: created.sessionId,
+            label: naming.displayLabel,
+            naming,
+            targetId: created.targetIdentity.targetId,
+            status: created.status,
+          };
+    const modelTargetSnapshot = await options.modelTargets?.snapshot({
+      discoverGateway: false,
+      signal: new AbortController().signal,
+    });
+    const configuredPreferences = await options.preferences?.load();
+    const configuredTarget = modelTargetSnapshot?.targets.find(
+      (target) => target.identity.targetId === configuredPreferences?.defaultTargetId,
+    );
+    const preferenceDiagnostic =
+      configuredPreferences === undefined
+        ? null
+        : (configuredPreferences.diagnostic ??
+          (configuredPreferences.defaultTargetId !== null && configuredTarget === undefined
+            ? {
+                code: "target_configuration_invalid",
+                message: "The saved default target is not in the current target catalog.",
+              }
+            : configuredTarget?.readiness.status === "missing"
+              ? {
+                  code: "target_configuration_invalid",
+                  message: "The saved default target is missing its required credential.",
+                }
+              : null));
+    const knownTargets = new Map<string, ModelTargetIdentity>();
+    for (const target of modelTargetSnapshot?.targets ?? []) {
+      if (target.readiness.status === "available") {
+        knownTargets.set(target.identity.targetId, target.identity);
+      }
+    }
+    if (created !== undefined) {
+      knownTargets.set(created.targetIdentity.targetId, created.targetIdentity);
+    }
     const catalogPage = await options.lifecycle.listProjectSessions({ limit: catalogPageSize });
+    const projectPaths = await listProjectPaths(options.workspaceRoot);
     const catalogItems = (
       await Promise.all(
-        catalogPage.items.map(async (snapshot) =>
-          snapshot.schemaVersion === 3
-            ? sessionSummaryFromSnapshot(
-                snapshot,
-                snapshot.sessionId === created.sessionId
-                  ? records
-                  : await readActiveBranchRecords(options, snapshot.sessionId),
-              )
-            : null,
-        ),
+        catalogPage.items.map(async (snapshot) => {
+          if (snapshot.schemaVersion !== 3) {
+            return null;
+          }
+          knownTargets.set(snapshot.targetIdentity.targetId, snapshot.targetIdentity);
+          return sessionSummaryFromSnapshot(
+            snapshot,
+            snapshot.sessionId === created?.sessionId
+              ? records
+              : await readActiveBranchRecords(options, snapshot.sessionId),
+          );
+        }),
       )
     ).filter((candidate): candidate is SessionSummary => candidate !== null);
     const summary =
-      catalogItems.find((candidate) => candidate.id === created.sessionId) ?? activeSummary;
-    const initialCatalogItems = catalogItems.some((candidate) => candidate.id === created.sessionId)
-      ? catalogItems
-      : [...catalogItems, activeSummary];
+      created === undefined
+        ? undefined
+        : (catalogItems.find((candidate) => candidate.id === created.sessionId) ?? activeSummary);
+    const initialCatalogItems =
+      created === undefined || activeSummary === undefined
+        ? catalogItems
+        : catalogItems.some((candidate) => candidate.id === created.sessionId)
+          ? catalogItems
+          : [...catalogItems, activeSummary];
     const authoritative: AuthoritativePresentationSnapshot = {
       schemaVersion: 1,
       continuity: {
         status: "current",
-        sessionThroughSequence: created.lastSequence,
+        sessionThroughSequence: created?.lastSequence ?? 0,
         operationThrough: [],
       },
-      project: { id: created.projectId, label: options.projectLabel },
-      sessions: { items: initialCatalogItems, nextCursor: catalogPage.nextCursor },
-      active: {
-        session: summary,
-        transcript: transcriptPage(transcript, loadedTranscriptStart, created.sessionId),
-        pendingInteractions: await projectPendingInteractions(records, options),
+      project: { id: catalogPage.projectId, label: options.projectLabel },
+      targets: {
+        items: (modelTargetSnapshot?.targets ?? []).map((target) => ({
+          targetId: target.identity.targetId,
+          label: target.identity.modelId,
+          route: target.identity.route,
+          certification:
+            target.identity.certification === "certified" ? "Certified" : "Experimental",
+          readiness: target.readiness,
+        })),
+        defaultTargetId:
+          preferenceDiagnostic === null ? (configuredPreferences?.defaultTargetId ?? null) : null,
+        diagnostic: preferenceDiagnostic,
       },
+      sessions: { items: initialCatalogItems, nextCursor: catalogPage.nextCursor },
+      active:
+        created === undefined || summary === undefined
+          ? null
+          : {
+              session: summary,
+              transcript: transcriptPage(transcript, loadedTranscriptStart, created.sessionId),
+              pendingInteractions: await projectPendingInteractions(records, options),
+              repositoryInstructions: projectRepositoryInstructions(created),
+              skills: projectSkills(created),
+              projectPaths,
+              mcp: projectMcp(created),
+            },
     };
     let state: PresentationDisplayState = {
       revision: 1,
       authoritative,
       transient: null,
     };
+    const metadataThrough = new Map<string, number>();
+    if (created !== undefined) {
+      metadataThrough.set(`session_naming_changed:${created.sessionId}`, created.lastSequence);
+      metadataThrough.set(`mcp_configuration_changed:${created.sessionId}`, created.lastSequence);
+    }
     const listeners = new Set<() => void>();
     const publishStateChange = (): void => {
       for (const listener of listeners) {
@@ -197,7 +291,6 @@ export async function createPresentationSession(
       }
     };
     let closed = false;
-    const knownTargets = new Map([[created.targetIdentity.targetId, created.targetIdentity]]);
     let activeRun:
       | {
           readonly sessionId: string;
@@ -249,6 +342,10 @@ export async function createPresentationSession(
             session: activatedSummary,
             transcript: transcriptPage(transcript, loadedTranscriptStart, snapshot.sessionId),
             pendingInteractions: await projectPendingInteractions(activatedRecords, options),
+            repositoryInstructions: projectRepositoryInstructions(snapshot),
+            skills: projectSkills(snapshot),
+            projectPaths,
+            mcp: projectMcp(snapshot),
           },
         },
         transient: null,
@@ -264,9 +361,13 @@ export async function createPresentationSession(
         throw new TypeError("The active session disappeared during naming.");
       }
       const refreshedRecords = await readActiveBranchRecords(options, sessionId);
+      const current = state.authoritative.active;
+      if (closed || current === null || current.session.id !== sessionId) {
+        return;
+      }
       const refreshedNaming = sessionNamingFromRecords(refreshedRecords, sessionId);
       const refreshedSummary: SessionSummary = {
-        ...active.session,
+        ...current.session,
         label: refreshedNaming.displayLabel,
         naming: refreshedNaming,
       };
@@ -276,7 +377,12 @@ export async function createPresentationSession(
           ...state.authoritative,
           continuity: {
             status: "current",
-            sessionThroughSequence: throughSequence,
+            sessionThroughSequence: Math.max(
+              throughSequence,
+              state.authoritative.continuity.status === "current"
+                ? state.authoritative.continuity.sessionThroughSequence
+                : 0,
+            ),
             operationThrough: [],
           },
           sessions: {
@@ -285,13 +391,42 @@ export async function createPresentationSession(
               session.id === sessionId ? refreshedSummary : session,
             ),
           },
-          active: { ...active, session: refreshedSummary },
+          active: { ...current, session: refreshedSummary },
+        },
+        transient: state.transient,
+      };
+      publishStateChange();
+    };
+    const refreshActiveMcp = async (sessionId: string, throughSequence: number): Promise<void> => {
+      const active = state.authoritative.active;
+      if (active === null || active.session.id !== sessionId) {
+        throw new TypeError("The active session disappeared during MCP refresh.");
+      }
+      const inspected = await options.lifecycle.inspect({ sessionId });
+      if (inspected.schemaVersion !== 3) {
+        throw new TypeError("The active MCP session is no longer current.");
+      }
+      const current = state.authoritative.active;
+      if (closed || current === null || current.session.id !== sessionId) {
+        return;
+      }
+      state = {
+        revision: state.revision + 1,
+        authoritative: {
+          ...state.authoritative,
+          continuity: {
+            status: "current",
+            sessionThroughSequence: Math.max(throughSequence, inspected.lastSequence),
+            operationThrough: [],
+          },
+          active: { ...current, mcp: projectMcp(inspected) },
         },
         transient: state.transient,
       };
       publishStateChange();
     };
     let runtimeRefresh = Promise.resolve();
+    let metadataRefresh = Promise.resolve();
     const seenRuntimeNotificationIds = new Set<string>();
     const runtimeNotificationOrder: string[] = [];
     handleRuntime = (notification) => {
@@ -365,7 +500,8 @@ export async function createPresentationSession(
             }
             await options[presentationRuntimeRefreshBarrier]?.beforeRead(notification);
             const refreshedRecords = await readActiveBranchRecords(options, active.session.id);
-            if (closed) {
+            const current = state.authoritative.active;
+            if (closed || current === null || current.session.id !== active.session.id) {
               return;
             }
             transcript = projectTranscript(refreshedRecords);
@@ -391,19 +527,28 @@ export async function createPresentationSession(
               };
               publishStateChange();
             }
+            const pendingInteractions = await projectPendingInteractions(refreshedRecords, options);
+            const latest = state.authoritative.active;
+            if (closed || latest === null || latest.session.id !== active.session.id) {
+              return;
+            }
+            const latestSequence =
+              state.authoritative.continuity.status === "current"
+                ? state.authoritative.continuity.sessionThroughSequence
+                : 0;
             state = {
               revision: state.revision + 1,
               authoritative: {
                 ...state.authoritative,
                 continuity: {
                   status: "current",
-                  sessionThroughSequence: activeSequence,
+                  sessionThroughSequence: Math.max(activeSequence, latestSequence),
                   operationThrough: [],
                 },
                 active: {
-                  ...active,
-                  transcript: transcriptPage(transcript, loadedTranscriptStart, active.session.id),
-                  pendingInteractions: await projectPendingInteractions(refreshedRecords, options),
+                  ...latest,
+                  transcript: transcriptPage(transcript, loadedTranscriptStart, current.session.id),
+                  pendingInteractions,
                 },
               },
               transient: isAssistantTerminalEvent(event) ? null : state.transient,
@@ -443,18 +588,52 @@ export async function createPresentationSession(
         handleRuntime(event);
       }
     }
-    handleMetadata = async (event) => {
-      const active = state.authoritative.active;
-      if (
-        closed ||
-        active === null ||
-        event.sessionId !== active.session.id ||
-        (state.authoritative.continuity.status === "current" &&
-          event.throughSequence <= state.authoritative.continuity.sessionThroughSequence)
-      ) {
-        return;
-      }
-      await refreshActiveNaming(event.sessionId, event.throughSequence);
+    handleMetadata = (event) => {
+      metadataRefresh = metadataRefresh.then(async () => {
+        const active = state.authoritative.active;
+        const metadataKey = `${event.type}:${event.sessionId}`;
+        if (
+          closed ||
+          active === null ||
+          event.sessionId !== active.session.id ||
+          event.throughSequence <= (metadataThrough.get(metadataKey) ?? 0)
+        ) {
+          return;
+        }
+        try {
+          if (event.type === "session_naming_changed") {
+            await refreshActiveNaming(event.sessionId, event.throughSequence);
+          } else {
+            await refreshActiveMcp(event.sessionId, event.throughSequence);
+          }
+          if (!closed && state.authoritative.active?.session.id === event.sessionId) {
+            metadataThrough.set(
+              metadataKey,
+              Math.max(event.throughSequence, metadataThrough.get(metadataKey) ?? 0),
+            );
+          }
+        } catch {
+          if (closed) {
+            return;
+          }
+          state = {
+            revision: state.revision + 1,
+            authoritative: {
+              ...state.authoritative,
+              continuity: {
+                status: "degraded",
+                fault: {
+                  code: "authoritative_state_unavailable",
+                  message: "The durable session view is temporarily unavailable.",
+                },
+              },
+            },
+            transient: null,
+          };
+          publishStateChange();
+        }
+      });
+      return metadataRefresh;
     };
     for (const event of bufferedMetadata.splice(0)) {
       await handleMetadata(event);
@@ -467,6 +646,42 @@ export async function createPresentationSession(
           code: "presentation_closed",
           message: "The presentation session is closed.",
         };
+      }
+      if (command.type === "set_default_target") {
+        const target = state.authoritative.targets.items.find(
+          (candidate) =>
+            candidate.targetId === command.targetId && candidate.readiness.status === "available",
+        );
+        if (target === undefined || options.preferences === undefined) {
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "The exact target cannot be saved as the default.",
+          };
+        }
+        try {
+          await options.preferences.setDefaultTarget(command.targetId);
+          state = {
+            revision: state.revision + 1,
+            authoritative: {
+              ...state.authoritative,
+              targets: {
+                ...state.authoritative.targets,
+                defaultTargetId: command.targetId,
+                diagnostic: null,
+              },
+            },
+            transient: state.transient,
+          };
+          publishStateChange();
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The exact default target could not be saved.",
+          };
+        }
       }
       if (command.type === "create_session") {
         const targetIdentity = knownTargets.get(command.targetId);
@@ -898,6 +1113,289 @@ export async function createPresentationSession(
           };
         }
       }
+      if (command.type === "reload_repository_instructions") {
+        if (command.sessionId !== state.authoritative.active?.session.id) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected session is no longer active.",
+          };
+        }
+        try {
+          const result = await options.lifecycle.reloadRepositoryInstructions(command);
+          await activateSnapshot(result.snapshot);
+          return result.status === "rejected"
+            ? {
+                status: "rejected",
+                code: "authority_rejected",
+                message: result.error.message,
+              }
+            : { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "Repository instructions could not be reloaded safely.",
+          };
+        }
+      }
+      if (command.type === "reload_skills") {
+        if (command.sessionId !== state.authoritative.active?.session.id) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected session is no longer active.",
+          };
+        }
+        try {
+          const result = await options.lifecycle.reloadSkills(command);
+          await activateSnapshot(result.snapshot);
+          return result.status === "rejected"
+            ? {
+                status: "rejected",
+                code: "authority_rejected",
+                message: result.error.message,
+              }
+            : { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "The Skill catalog could not be reloaded safely.",
+          };
+        }
+      }
+      if (command.type === "confirm_mcp_workspace") {
+        const mcp = state.authoritative.active?.mcp;
+        if (
+          command.sessionId !== state.authoritative.active?.session.id ||
+          mcp === null ||
+          mcp === undefined ||
+          command.sourceDigest !== mcp.source.digest
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The MCP workspace source is no longer current.",
+          };
+        }
+        try {
+          const result = await options.lifecycle.configureMcp({
+            type: "confirm_workspace",
+            sessionId: command.sessionId,
+            sourceDigest: command.sourceDigest,
+          });
+          await activateSnapshot(result.snapshot);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          const inspected = await options.lifecycle
+            .inspect({ sessionId: command.sessionId })
+            .catch(() => undefined);
+          if (inspected?.schemaVersion === 3) {
+            await activateSnapshot(inspected);
+          }
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "The MCP workspace source could not be confirmed.",
+          };
+        }
+      }
+      if (command.type === "approve_mcp_server") {
+        const active = state.authoritative.active;
+        const server = active?.mcp?.servers.find(
+          (candidate) =>
+            candidate.serverId === command.serverId &&
+            candidate.definitionDigest === command.definitionDigest,
+        );
+        if (command.sessionId !== active?.session.id || server === undefined) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The MCP server definition is no longer current.",
+          };
+        }
+        try {
+          const result = await options.lifecycle.configureMcp({
+            type: "approve_server",
+            sessionId: command.sessionId,
+            serverId: command.serverId,
+            definitionDigest: command.definitionDigest,
+          });
+          await activateSnapshot(result.snapshot);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "The exact MCP server definition could not be approved.",
+          };
+        }
+      }
+      if (command.type === "activate_mcp_servers") {
+        const active = state.authoritative.active;
+        const exactServers = command.servers.every((requested) =>
+          active?.mcp?.servers.some(
+            (server) =>
+              server.serverId === requested.serverId &&
+              server.definitionDigest === requested.definitionDigest &&
+              server.status === "approved",
+          ),
+        );
+        if (
+          command.sessionId !== active?.session.id ||
+          command.servers.length === 0 ||
+          !exactServers
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The approved MCP server set is no longer current.",
+          };
+        }
+        try {
+          const result = await options.lifecycle.configureMcp({
+            type: "activate_servers",
+            sessionId: command.sessionId,
+            servers: command.servers,
+          });
+          await activateSnapshot(result.snapshot);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          const inspected = await options.lifecycle
+            .inspect({ sessionId: command.sessionId })
+            .catch(() => undefined);
+          if (inspected?.schemaVersion === 3) {
+            await activateSnapshot(inspected);
+          }
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "The approved MCP server set could not be activated.",
+          };
+        }
+      }
+      if (command.type === "commit_mcp_tool_profile") {
+        const active = state.authoritative.active;
+        const mcp = active?.mcp;
+        const exactSelections = command.selections.every((selection) =>
+          mcp?.catalog?.tools.some(
+            (tool) =>
+              tool.qualifiedName === selection.qualifiedName &&
+              tool.definitionDigest === selection.definitionDigest,
+          ),
+        );
+        if (
+          command.sessionId !== active?.session.id ||
+          mcp?.activation?.generationId !== command.generationId ||
+          command.selections.length === 0 ||
+          !exactSelections
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The MCP catalog selection is no longer current.",
+          };
+        }
+        try {
+          const result = await options.lifecycle.configureMcp({
+            type: "commit_tool_profile",
+            sessionId: command.sessionId,
+            generationId: command.generationId,
+            selections: command.selections,
+          });
+          await activateSnapshot(result.snapshot);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "The exact MCP Tool Profile could not be committed.",
+          };
+        }
+      }
+      if (command.type === "retry_mcp_activation") {
+        const active = state.authoritative.active;
+        if (
+          command.sessionId !== active?.session.id ||
+          active.mcp?.status !== "activation_failed" ||
+          active.mcp.activation?.generationId !== command.generationId
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The failed MCP generation is no longer current.",
+          };
+        }
+        try {
+          const result = await options.lifecycle.configureMcp({
+            type: "retry_activation",
+            sessionId: command.sessionId,
+            generationId: command.generationId,
+          });
+          await activateSnapshot(result.snapshot);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          const inspected = await options.lifecycle
+            .inspect({ sessionId: command.sessionId })
+            .catch(() => undefined);
+          if (inspected?.schemaVersion === 3) {
+            await activateSnapshot(inspected);
+          }
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "The failed MCP generation could not be retried.",
+          };
+        }
+      }
+      if (command.type === "revalidate_mcp_catalog") {
+        const active = state.authoritative.active;
+        if (
+          command.sessionId !== active?.session.id ||
+          active.mcp?.status !== "catalog_stale" ||
+          active.mcp.activation?.generationId !== command.generationId
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The stale MCP generation is no longer current.",
+          };
+        }
+        try {
+          const inspected = await options.lifecycle.inspect({ sessionId: command.sessionId });
+          if (
+            inspected.schemaVersion !== 3 ||
+            inspected.mcp?.status !== "catalog_stale" ||
+            inspected.mcp.activation?.generationId !== command.generationId
+          ) {
+            return {
+              status: "rejected",
+              code: "stale_interaction",
+              message: "The stale MCP generation is no longer current.",
+            };
+          }
+          const result = await options.lifecycle.configureMcp({
+            type: "revalidate_catalog",
+            sessionId: command.sessionId,
+            generationId: command.generationId,
+          });
+          await activateSnapshot(result.snapshot);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          const inspected = await options.lifecycle
+            .inspect({ sessionId: command.sessionId })
+            .catch(() => undefined);
+          if (inspected?.schemaVersion === 3) {
+            await activateSnapshot(inspected);
+          }
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "The stale MCP catalog could not be revalidated.",
+          };
+        }
+      }
       return {
         status: "rejected",
         code: "not_available",
@@ -923,8 +1421,9 @@ export async function createPresentationSession(
         activeRun?.controller.abort();
         unsubscribeLifecycle();
         unsubscribeMetadata();
-        await runtimeRefresh;
         await activeRun?.settlement;
+        await runtimeRefresh;
+        await metadataRefresh;
         listeners.clear();
         state = { ...state, transient: null };
         bufferedEvents.length = 0;
@@ -1747,6 +2246,137 @@ function jsonRecord(value: JsonValue | undefined): KnownJsonRecord | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as KnownJsonRecord)
     : undefined;
+}
+
+function projectRepositoryInstructions(
+  snapshot: CurrentSessionSnapshot,
+): RepositoryInstructionsDisplay | null {
+  const repository = snapshot.promptContext?.repository;
+  if (repository === undefined) {
+    return null;
+  }
+  return {
+    revision: repository.revision,
+    activeScopes: repository.activeScopes,
+    sources: repository.sources.map((source) => ({
+      scope: source.scope,
+      path: source.lexicalPath,
+      selectedName: source.selectedName,
+      loadReason: source.loadReason,
+    })),
+    diagnostics: repository.diagnostics.map((diagnostic) => ({
+      code: diagnostic.code,
+      ...(diagnostic.scope === undefined ? {} : { scope: diagnostic.scope }),
+      ...(diagnostic.path === undefined ? {} : { path: diagnostic.path }),
+      ...(diagnostic.candidate === undefined ? {} : { candidate: diagnostic.candidate }),
+    })),
+    effectiveDigest: repository.effectiveDigest,
+    reloadAvailable: snapshot.status === "idle",
+  };
+}
+
+function projectSkills(snapshot: CurrentSessionSnapshot): SkillCatalogDisplay | null {
+  const skills = snapshot.skillContext;
+  if (skills === undefined) {
+    return null;
+  }
+  const activeQualifiedIds = new Set(
+    skills.active
+      .filter(
+        (activation) =>
+          !skills.revocations.some(
+            (revocation) => revocation.activationIndex === activation.activationIndex,
+          ),
+      )
+      .map((activation) => activation.qualifiedId),
+  );
+  return {
+    revision: skills.catalog.revision,
+    items: skills.catalog.entries.map((entry) => ({
+      qualifiedId: entry.qualifiedId,
+      name: entry.name,
+      description: entry.description,
+      source:
+        entry.locator.source === "project"
+          ? { type: "project", scope: entry.locator.scope }
+          : entry.locator.source === "user"
+            ? { type: "user" }
+            : {
+                type: "extension",
+                extensionId: entry.locator.extensionId,
+                packageName: entry.locator.packageName,
+                packageVersion: entry.locator.packageVersion,
+              },
+      active: activeQualifiedIds.has(entry.qualifiedId),
+    })),
+    diagnostics: skills.registry.diagnostics.map((diagnostic) => ({
+      code: diagnostic.code,
+      source: diagnostic.source,
+      ...(diagnostic.scope === undefined ? {} : { scope: diagnostic.scope }),
+      packagePath: diagnostic.packagePath,
+    })),
+    overflow: {
+      omittedCount: skills.catalog.omittedCount,
+      shortenedCount: skills.catalog.shortenedCount,
+    },
+    reloadAvailable: snapshot.status === "idle",
+  };
+}
+
+function projectMcp(snapshot: CurrentSessionSnapshot): McpDisplay | null {
+  const mcp = snapshot.mcp;
+  if (mcp === undefined) {
+    return null;
+  }
+  const activation = "activation" in mcp ? (mcp.activation ?? null) : null;
+  const catalog = "catalog" in mcp ? (mcp.catalog ?? null) : null;
+  const profile = "profile" in mcp ? (mcp.profile ?? null) : null;
+  return {
+    schemaVersion: 1,
+    status: mcp.status,
+    workspaceConfirmed: mcp.workspaceConfirmed,
+    source: mcp.source,
+    servers: mcp.servers.map((server) => ({
+      serverId: server.serverId,
+      status: server.status,
+      transport: server.transport,
+      command:
+        server.command.kind === "executable"
+          ? { kind: "executable", path: server.command.path }
+          : {
+              kind: "npm_package",
+              packageName: server.command.packageName,
+              version: server.command.version,
+            },
+      arguments: server.arguments,
+      cwd: server.cwd,
+      requestedEnvironmentNames: server.requestedEnvironmentNames,
+      startupEffects: server.startupEffects,
+      definitionDigest: server.definitionDigest,
+    })),
+    activation,
+    catalog:
+      catalog === null
+        ? null
+        : {
+            status: catalog.status,
+            digest: catalog.digest,
+            tools: catalog.tools.map((tool) => ({
+              serverId: tool.serverId,
+              originalName: tool.originalName,
+              qualifiedName: tool.qualifiedName,
+              description: tool.description,
+              rawSchemaDigest: tool.rawSchemaDigest,
+              modelProjectionDigest: tool.modelProjectionDigest,
+              definitionDigest: tool.definitionDigest,
+            })),
+          },
+    profile,
+    diagnostics: mcp.diagnostics.map((diagnostic) => ({
+      code: diagnostic.code,
+      ...(diagnostic.serverId === undefined ? {} : { serverId: diagnostic.serverId }),
+    })),
+  };
 }
 
 function sessionNamingFromRecords(
