@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { readdir, realpath } from "node:fs/promises";
+import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -74,6 +74,7 @@ import {
 } from "./model-targets.js";
 import {
   createProjectLifecycleOwner,
+  type ProjectLifecycleOwner,
   ProjectLifecycleOwnerError,
 } from "./project-lifecycle-owner.js";
 import {
@@ -106,9 +107,7 @@ import {
 } from "./session-durable-context.js";
 import { normalizedSessionTitle, sessionTitleFallback } from "./session-naming.js";
 import {
-  createJsonlSessionStore,
-  openJsonlSessionStore,
-  readJsonlSessionRecords,
+  createJsonlSessionStoreDirectory,
   type SessionContextCompactionCommittedRecord,
   type SessionContextCompactionFailedRecord,
   type SessionContextCompactionInterruptedRecord,
@@ -126,6 +125,7 @@ import {
   type SessionRecord,
   type SessionSkillActivationBatchCommittedRecord,
   type SessionStore,
+  type SessionStoreDirectory,
 } from "./session-store.js";
 import {
   createInitialSkillContextV1,
@@ -298,6 +298,12 @@ export type SessionLogicalRunStartedBarrier = {
 /** Tests only. Production lifecycle instances always default automatic titles on. */
 export const sessionAutomaticTitlesEnabled = Symbol("adam-agent.session-automatic-titles-enabled");
 
+/** Tests only. Production lifecycle instances use the OS-backed project owner. */
+export const sessionProjectLifecycleOwner = Symbol("adam-agent.session-project-lifecycle-owner");
+
+/** Tests only. Production lifecycle instances use the JSONL session directory. */
+export const sessionStoreDirectory = Symbol("adam-agent.session-store-directory");
+
 /** Tests only. Production publishes each exact runtime notification once. */
 export const sessionRuntimeNotificationTransform = Symbol(
   "adam-agent.session-runtime-notification-transform",
@@ -328,6 +334,8 @@ export type SessionLifecycleOptions = {
   readonly [sessionTitleDeadlineScheduler]?: SessionTitleDeadlineScheduler;
   readonly [sessionLogicalRunStartedBarrier]?: SessionLogicalRunStartedBarrier;
   readonly [sessionAutomaticTitlesEnabled]?: boolean;
+  readonly [sessionProjectLifecycleOwner]?: ProjectLifecycleOwner;
+  readonly [sessionStoreDirectory]?: SessionStoreDirectory<SessionRecord>;
   readonly [sessionRuntimeNotificationTransform]?: SessionRuntimeNotificationTransform;
 };
 
@@ -564,10 +572,6 @@ function decodeProjectSessionCatalogCursor(cursor: string | undefined): string |
   return sessionId;
 }
 
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
-  return error instanceof Error && "code" in error;
-}
-
 const nodeMcpIdleScheduler: McpIdleScheduler = {
   schedule(delayMilliseconds, task) {
     const timer = setTimeout(() => {
@@ -587,8 +591,15 @@ const nodeSessionTitleDeadlineScheduler: SessionTitleDeadlineScheduler = {
 };
 
 export function createSessionLifecycle(providedOptions: SessionLifecycleOptions): SessionLifecycle {
+  const storeDirectory =
+    providedOptions[sessionStoreDirectory] ??
+    createJsonlSessionStoreDirectory<SessionRecord>({
+      workspaceRoot: providedOptions.workspaceRoot,
+      ...(providedOptions.stateRoot === undefined ? {} : { stateRoot: providedOptions.stateRoot }),
+    });
   const options: SessionLifecycleOptions = {
     ...providedOptions,
+    [sessionStoreDirectory]: storeDirectory,
     tools:
       providedOptions.tools ??
       createCodingToolRegistry({
@@ -616,7 +627,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         .catch(() => undefined);
     }
   };
-  const owner = createProjectLifecycleOwner(options);
+  const owner = options[sessionProjectLifecycleOwner] ?? createProjectLifecycleOwner(options);
   const pendingMcpCatalogChanges = new Map<
     string,
     {
@@ -744,11 +755,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     reason: "model_request_failed" | "invalid_title",
   ): Promise<void> => {
     await runTitleWithOwner(async () => {
-      const records = await readJsonlSessionRecords({
-        workspaceRoot: options.workspaceRoot,
-        sessionId: input.sessionId,
-        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-      });
+      const records = await readSessionRecords(options, input.sessionId);
       if (
         records.some(
           (entry) =>
@@ -760,11 +767,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       ) {
         return;
       }
-      const store = await openJsonlSessionStore<SessionRecord>({
-        workspaceRoot: options.workspaceRoot,
-        sessionId: input.sessionId,
-        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-      });
+      const store = await openSessionStore(options, input.sessionId);
       const sequence = (records.at(-1)?.sequence ?? 0) + 1;
       await store.append({
         schemaVersion: 3,
@@ -854,11 +857,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         return;
       }
       await runTitleWithOwner(async () => {
-        const records = await readJsonlSessionRecords({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const records = await readSessionRecords(options, input.sessionId);
         const latestGeneration = records.findLast(
           (entry) =>
             entry.schemaVersion === 3 && entry.record.type === "session_title_generation_started",
@@ -877,11 +876,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ) {
           return;
         }
-        const store = await openJsonlSessionStore<SessionRecord>({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const store = await openSessionStore(options, input.sessionId);
         const sequence = (records.at(-1)?.sequence ?? 0) + 1;
         await store.append({
           schemaVersion: 3,
@@ -920,11 +915,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     }
     try {
       return await withOwner(async () => {
-        const records = await readJsonlSessionRecords({
-          workspaceRoot: options.workspaceRoot,
-          sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const records = await readSessionRecords(options, sessionId);
         if (
           records.some(
             (entry) =>
@@ -935,11 +926,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ) {
           return;
         }
-        const store = await openJsonlSessionStore<SessionRecord>({
-          workspaceRoot: options.workspaceRoot,
-          sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const store = await openSessionStore(options, sessionId);
         let manualNameActive = false;
         for (const entry of records) {
           if (entry.schemaVersion !== 3) {
@@ -1028,16 +1015,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     if (changes.length === 0) {
       return;
     }
-    const records = await readJsonlSessionRecords({
-      workspaceRoot: options.workspaceRoot,
-      sessionId,
-      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-    });
-    const store = await openJsonlSessionStore<SessionRecord>({
-      workspaceRoot: options.workspaceRoot,
-      sessionId,
-      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-    });
+    const records = await readSessionRecords(options, sessionId);
+    const store = await openSessionStore(options, sessionId);
     let nextSequence = (records.at(-1)?.sequence ?? 0) + 1;
     for (const [key, change] of changes) {
       const existingClosedServers = new Set(
@@ -1148,16 +1127,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   const closeIdleMcpGeneration = async (sessionId: string, generationId: string) => {
     await withOwner(async () => {
       const closed = await mcpHost.closeIdleSession({ sessionId, generationId });
-      const records = await readJsonlSessionRecords({
-        workspaceRoot: options.workspaceRoot,
-        sessionId,
-        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-      });
-      const store = await openJsonlSessionStore<SessionRecord>({
-        workspaceRoot: options.workspaceRoot,
-        sessionId,
-        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-      });
+      const records = await readSessionRecords(options, sessionId);
+      const store = await openSessionStore(options, sessionId);
       if (closed.status !== "closed") {
         for (const [index, server] of closed.servers.entries()) {
           await store.append({
@@ -1217,11 +1188,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     input: { readonly sessionId: string },
     artifactCache = createArtifactMaterializationCache(),
   ): Promise<SessionSnapshot> => {
-    const records = await readJsonlSessionRecords({
-      workspaceRoot: options.workspaceRoot,
-      sessionId: input.sessionId,
-      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-    });
+    const records = await storeDirectory.open(input.sessionId).then((store) => store?.read() ?? []);
     const first = records[0];
     if (first === undefined) {
       throw new SessionLifecycleError("session_not_found");
@@ -1370,11 +1337,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
     }
     if (snapshot.schemaVersion === 3) {
-      const promptRecords = await readJsonlSessionRecords({
-        workspaceRoot: options.workspaceRoot,
-        sessionId: input.sessionId,
-        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-      });
+      const promptRecords = await readSessionRecords(options, input.sessionId);
       const promptGenesis = promptRecords[0];
       const activePromptContext =
         promptGenesis !== undefined && isGenesisRecord(promptGenesis)
@@ -1496,11 +1459,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (parent.degradation !== undefined) {
           throw new SessionLifecycleError("session_invalid");
         }
-        let parentRecords = await readJsonlSessionRecords({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.parentSessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        let parentRecords = await readSessionRecords(options, input.parentSessionId);
         const requestedCurrentTail =
           input.sourceBoundary === undefined && input.atSequence === parentRecords.length;
         let normalizedCurrentTail = false;
@@ -1553,11 +1512,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             indeterminateEffect
           ) {
             normalizedCurrentTail = true;
-            parentRecords = await readJsonlSessionRecords({
-              workspaceRoot: options.workspaceRoot,
-              sessionId: input.parentSessionId,
-              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-            });
+            parentRecords = await readSessionRecords(options, input.parentSessionId);
           }
         }
         const sourceSessionId = input.sourceBoundary?.sessionId ?? input.parentSessionId;
@@ -1584,11 +1539,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         const sourceRecords =
           sourceSessionId === input.parentSessionId
             ? parentRecords
-            : await readJsonlSessionRecords({
-                workspaceRoot: options.workspaceRoot,
-                sessionId: sourceSessionId,
-                ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-              });
+            : await readSessionRecords(options, sourceSessionId);
         if (sourceEventPosition > sourceRecords.length) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
         }
@@ -1632,11 +1583,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           targetIdentity = target.identity;
         }
         const sessionId = randomUUID();
-        const store = await createJsonlSessionStore<SessionRecord>({
-          workspaceRoot: options.workspaceRoot,
-          sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const store = await sessionStoreDirectoryFrom(options).create(sessionId);
         const prefix = `${parentPrefix.map((record) => JSON.stringify(record)).join("\n")}\n`;
         const branchFallback = sessionTitleFallback(
           `Branch of ${sessionDisplayLabelFromRecords(parentRecords)}`,
@@ -1745,11 +1692,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           await runWithOwner(async () => {
             for (const closedSession of hostResult.closedSessions) {
               await flushPendingMcpCatalogChanges(closedSession.sessionId);
-              const records = await readJsonlSessionRecords({
-                workspaceRoot: options.workspaceRoot,
-                sessionId: closedSession.sessionId,
-                ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-              });
+              const records = await readSessionRecords(options, closedSession.sessionId);
               const existing = new Set(
                 records.flatMap((entry) =>
                   entry.schemaVersion === 3 &&
@@ -1765,11 +1708,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               if (missing.length === 0) {
                 continue;
               }
-              const store = await openJsonlSessionStore<SessionRecord>({
-                workspaceRoot: options.workspaceRoot,
-                sessionId: closedSession.sessionId,
-                ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-              });
+              const store = await openSessionStore(options, closedSession.sessionId);
               for (const [index, server] of missing.entries()) {
                 await store.append({
                   schemaVersion: 3,
@@ -1790,11 +1729,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               if (unconfirmed.catalogDigest === undefined || unconfirmed.servers.length === 0) {
                 continue;
               }
-              const records = await readJsonlSessionRecords({
-                workspaceRoot: options.workspaceRoot,
-                sessionId: unconfirmed.sessionId,
-                ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-              });
+              const records = await readSessionRecords(options, unconfirmed.sessionId);
               const existing = new Set(
                 records.flatMap((entry) =>
                   entry.schemaVersion === 3 &&
@@ -1811,11 +1746,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               if (missing.length === 0) {
                 continue;
               }
-              const store = await openJsonlSessionStore<SessionRecord>({
-                workspaceRoot: options.workspaceRoot,
-                sessionId: unconfirmed.sessionId,
-                ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-              });
+              const store = await openSessionStore(options, unconfirmed.sessionId);
               for (const [index, server] of missing.entries()) {
                 await store.append({
                   schemaVersion: 3,
@@ -1861,11 +1792,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         const repository = await loadInitialRepositoryInstructions({
           workspaceRoot: options.workspaceRoot,
         });
-        const store = await createJsonlSessionStore<SessionRecord>({
-          workspaceRoot: options.workspaceRoot,
-          sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const store = await storeDirectory.create(sessionId);
         const skillBudgetContext = await resolveSkillBudgetContext(options, input.targetIdentity);
         const extensionSources = await resolveExtensionSkillSources(options);
         const skillContext = await createInitialSkillContextV1({
@@ -1955,11 +1882,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ) {
           throw new SessionLifecycleError("session_model_target_incompatible");
         }
-        let records = await readJsonlSessionRecords({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        let records = await readSessionRecords(options, input.sessionId);
         const first = records[0];
         if (first === undefined || !isGenesisRecord(first)) {
           throw new SessionLifecycleError("session_invalid");
@@ -1998,11 +1921,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                     : maximum,
                 0,
               ) + 1;
-            const reactivationStore = await openJsonlSessionStore<SessionRecord>({
-              workspaceRoot: options.workspaceRoot,
-              sessionId: input.sessionId,
-              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-            });
+            const reactivationStore = await openSessionStore(options, input.sessionId);
             const nextSequence = (records.at(-1)?.sequence ?? 0) + 1;
             await reactivationStore.append({
               schemaVersion: 3,
@@ -2112,11 +2031,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               });
               throw new SessionLifecycleError(failure.code);
             }
-            records = await readJsonlSessionRecords({
-              workspaceRoot: options.workspaceRoot,
-              sessionId: input.sessionId,
-              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-            });
+            records = await readSessionRecords(options, input.sessionId);
           }
         }
         const artifactInspection = await materializeModelResponseArtifacts(
@@ -2140,11 +2055,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               activePromptContext,
               reconciled.context,
             );
-            const reconciliationStore = await openJsonlSessionStore<SessionRecord>({
-              workspaceRoot: options.workspaceRoot,
-              sessionId: input.sessionId,
-              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-            });
+            const reconciliationStore = await openSessionStore(options, input.sessionId);
             let nextSequence = (records.at(-1)?.sequence ?? 0) + 1;
             const catalogRecord: SessionRecord = {
               schemaVersion: 3,
@@ -2238,11 +2149,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (resumeState === undefined && input.input === undefined) {
           throw new SessionLifecycleError("session_invalid");
         }
-        const store = await openJsonlSessionStore<SessionRecord>({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const store = await openSessionStore(options, input.sessionId);
         const durableOutputLimits = (
           options as SessionLifecycleOptions & {
             readonly [sessionDurableOutputLimits]?: AgentSessionDurableOutputLimits;
@@ -2445,11 +2352,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             throw new SessionLifecycleError("session_invalid");
           }
           if (closed.servers.length > 0) {
-            const store = await openJsonlSessionStore<SessionRecord>({
-              workspaceRoot: options.workspaceRoot,
-              sessionId: command.sessionId,
-              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-            });
+            const store = await openSessionStore(options, command.sessionId);
             for (const [index, server] of closed.servers.entries()) {
               await store.append({
                 schemaVersion: 3,
@@ -2487,11 +2390,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ) {
           throw new SessionLifecycleError("session_invalid");
         }
-        const store = await openJsonlSessionStore<SessionRecord>({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: command.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const store = await openSessionStore(options, command.sessionId);
         if (command.type === "confirm_workspace") {
           if (
             inspected.mcp === undefined ||
@@ -2561,11 +2460,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           let reactivationProfile: McpToolProfileV1 | undefined;
           let activationRecords: readonly SessionRecord[] = [];
           if (reactivating) {
-            activationRecords = await readJsonlSessionRecords({
-              workspaceRoot: options.workspaceRoot,
-              sessionId: command.sessionId,
-              ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-            });
+            activationRecords = await readSessionRecords(options, command.sessionId);
             const genesis = activationRecords[0];
             if (genesis === undefined || !isGenesisRecord(genesis)) {
               throw new SessionLifecycleError("session_invalid");
@@ -2756,11 +2651,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ) {
             throw new SessionLifecycleError("session_invalid");
           }
-          const records = await readJsonlSessionRecords({
-            workspaceRoot: options.workspaceRoot,
-            sessionId: command.sessionId,
-            ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-          });
+          const records = await readSessionRecords(options, command.sessionId);
           const failedStart = records.findLast(
             (entry) =>
               entry.schemaVersion === 3 &&
@@ -2932,11 +2823,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ) {
             throw new SessionLifecycleError("session_invalid");
           }
-          const records = await readJsonlSessionRecords({
-            workspaceRoot: options.workspaceRoot,
-            sessionId: command.sessionId,
-            ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-          });
+          const records = await readSessionRecords(options, command.sessionId);
           const genesis = records[0];
           if (genesis === undefined || !isGenesisRecord(genesis)) {
             throw new SessionLifecycleError("session_invalid");
@@ -3011,11 +2898,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           } catch {
             throw new SessionLifecycleError("mcp_catalog_invalid");
           }
-          const records = await readJsonlSessionRecords({
-            workspaceRoot: options.workspaceRoot,
-            sessionId: command.sessionId,
-            ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-          });
+          const records = await readSessionRecords(options, command.sessionId);
           const genesis = records[0];
           if (genesis === undefined || !isGenesisRecord(genesis)) {
             throw new SessionLifecycleError("session_invalid");
@@ -3069,11 +2952,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       if (snapshot.schemaVersion !== 3) {
         throw new SessionLifecycleError("session_invalid");
       }
-      const records = await readJsonlSessionRecords({
-        workspaceRoot: options.workspaceRoot,
-        sessionId: input.sessionId,
-        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-      });
+      const records = await readSessionRecords(options, input.sessionId);
       const titleSnapshot = await startAutomaticTitle(
         input.sessionId,
         snapshot,
@@ -3102,24 +2981,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
       const afterSessionId = decodeProjectSessionCatalogCursor(input.cursor);
       const projectId = await canonicalProjectId(options.workspaceRoot);
-      const sessionsDirectory = join(
-        effectiveSessionStateRoot(options.stateRoot),
-        "projects",
-        projectId.replace(/^sha256:/u, ""),
-        "sessions",
-      );
-      let sessionIds: string[];
-      try {
-        sessionIds = (await readdir(sessionsDirectory, { withFileTypes: true }))
-          .filter((entry) => entry.isFile() && /^[0-9a-f-]{36}\.jsonl$/u.test(entry.name))
-          .map((entry) => entry.name.slice(0, -".jsonl".length))
-          .sort();
-      } catch (error) {
-        if (isNodeError(error) && error.code === "ENOENT") {
-          return { projectId, items: [], nextCursor: null };
-        }
-        throw error;
-      }
+      const sessionIds = [...(await storeDirectory.listSessionIds())].sort();
       const afterIndex =
         afterSessionId === undefined
           ? 0
@@ -3152,11 +3014,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ) {
           throw new SessionLifecycleError("session_invalid");
         }
-        const records = await readJsonlSessionRecords({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const records = await readSessionRecords(options, input.sessionId);
         const genesis = records[0];
         if (genesis === undefined || !isGenesisRecord(genesis)) {
           throw new SessionLifecycleError("session_invalid");
@@ -3165,11 +3023,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (context === undefined) {
           throw new SessionLifecycleError("session_invalid");
         }
-        const store = await openJsonlSessionStore<SessionRecord>({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const store = await openSessionStore(options, input.sessionId);
         let repository: PromptContextRecordV1["repository"];
         try {
           repository = await loadRepositoryInstructions({
@@ -3255,11 +3109,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             },
           };
         }
-        const records = await readJsonlSessionRecords({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const records = await readSessionRecords(options, input.sessionId);
         const genesis = records[0];
         if (genesis === undefined || !isGenesisRecord(genesis)) {
           throw new SessionLifecycleError("session_invalid");
@@ -3283,11 +3133,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             extensionSources: await resolveExtensionSkillSources(options),
           });
         } catch {
-          const store = await openJsonlSessionStore<SessionRecord>({
-            workspaceRoot: options.workspaceRoot,
-            sessionId: input.sessionId,
-            ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-          });
+          const store = await openSessionStore(options, input.sessionId);
           await store.append({
             schemaVersion: 3,
             sequence: records.length + 1,
@@ -3316,11 +3162,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           return { status: "unchanged", snapshot: inspected };
         }
         const nextPromptContext = replacePromptSkillsV2(promptContext, nextSkillContext);
-        const store = await openJsonlSessionStore<SessionRecord>({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const store = await openSessionStore(options, input.sessionId);
         await store.append({
           schemaVersion: 3,
           sequence: records.length + 1,
@@ -3349,11 +3191,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (inspected.schemaVersion !== 3 || options.modelTargets === undefined) {
           throw new SessionLifecycleError("session_invalid");
         }
-        const records = await readJsonlSessionRecords({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const records = await readSessionRecords(options, input.sessionId);
         const firstRun = records.find(
           (entry) => entry.schemaVersion === 3 && entry.record.type === "logical_run_started",
         );
@@ -3381,11 +3219,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           }
         }
         const generationId = randomUUID();
-        const store = await openJsonlSessionStore<SessionRecord>({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const store = await openSessionStore(options, input.sessionId);
         const sequence = (records.at(-1)?.sequence ?? 0) + 1;
         await store.append({
           schemaVersion: 3,
@@ -3447,11 +3281,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (resumed.status === "rejected") {
           return resumed;
         }
-        const records = await readJsonlSessionRecords({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const records = await readSessionRecords(options, input.sessionId);
         const started = records.findLast(
           (entry) =>
             entry.schemaVersion === 3 && entry.record.type === "session_title_generation_started",
@@ -3471,11 +3301,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           if (terminalExists) {
             return resumed;
           }
-          const store = await openJsonlSessionStore<SessionRecord>({
-            workspaceRoot: options.workspaceRoot,
-            sessionId: input.sessionId,
-            ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-          });
+          const store = await openSessionStore(options, input.sessionId);
           const sequence = (records.at(-1)?.sequence ?? 0) + 1;
           await store.append({
             schemaVersion: 3,
@@ -3510,16 +3336,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (inspected.schemaVersion !== 3) {
           throw new SessionLifecycleError("session_invalid");
         }
-        const records = await readJsonlSessionRecords({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
-        const store = await openJsonlSessionStore<SessionRecord>({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const records = await readSessionRecords(options, input.sessionId);
+        const store = await openSessionStore(options, input.sessionId);
         const sequence = (records.at(-1)?.sequence ?? 0) + 1;
         await store.append({
           schemaVersion: 3,
@@ -3551,16 +3369,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (inspected.schemaVersion !== 3) {
           throw new SessionLifecycleError("session_invalid");
         }
-        const records = await readJsonlSessionRecords({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
-        const store = await openJsonlSessionStore<SessionRecord>({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: input.sessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+        const records = await readSessionRecords(options, input.sessionId);
+        const store = await openSessionStore(options, input.sessionId);
         const sequence = (records.at(-1)?.sequence ?? 0) + 1;
         await store.append({
           schemaVersion: 3,
@@ -5603,11 +5413,7 @@ async function validateSessionLineage(
   }
   await validateInheritedContextEvidence(options, parentGenesis, prefixRecords);
   if ("recordVersion" in lineage) {
-    const declaredParentRecords = await readJsonlSessionRecords({
-      workspaceRoot: options.workspaceRoot,
-      sessionId: lineage.parentSessionId,
-      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-    });
+    const declaredParentRecords = await readSessionRecords(options, lineage.parentSessionId);
     const declaredParentGenesis = declaredParentRecords[0];
     if (declaredParentGenesis === undefined || !isGenesisRecord(declaredParentGenesis)) {
       throw new SessionLifecycleError("session_invalid");
@@ -5637,11 +5443,7 @@ async function sessionInheritsSourceBoundary(
     return false;
   }
   if (sessionGenesis.record.sessionId === sourceSessionId) {
-    const ownRecords = await readJsonlSessionRecords({
-      workspaceRoot: options.workspaceRoot,
-      sessionId: sourceSessionId,
-      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-    });
+    const ownRecords = await readSessionRecords(options, sourceSessionId);
     return sourceEventPosition <= ownRecords.length;
   }
   const lineage = sessionGenesis.record.lineage;
@@ -5655,11 +5457,7 @@ async function sessionInheritsSourceBoundary(
   if (sourceSessionId === inheritedSessionId) {
     return sourceEventPosition <= inheritedEventPosition;
   }
-  const inheritedRecords = await readJsonlSessionRecords({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: inheritedSessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const inheritedRecords = await readSessionRecords(options, inheritedSessionId);
   const inheritedGenesis = inheritedRecords[0];
   if (inheritedGenesis === undefined || !isGenesisRecord(inheritedGenesis)) {
     return false;
@@ -5896,11 +5694,7 @@ async function readValidatedLineagePrefix(
   }
   let declaredParentRecords: readonly SessionRecord[];
   try {
-    declaredParentRecords = await readJsonlSessionRecords({
-      workspaceRoot: options.workspaceRoot,
-      sessionId: lineage.parentSessionId,
-      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-    });
+    declaredParentRecords = await readSessionRecords(options, lineage.parentSessionId);
   } catch {
     throw new SessionLifecycleError("session_invalid");
   }
@@ -5931,11 +5725,7 @@ async function readValidatedLineagePrefix(
   const parentRecords =
     sourceSessionId === lineage.parentSessionId
       ? declaredParentRecords
-      : await readJsonlSessionRecords({
-          workspaceRoot: options.workspaceRoot,
-          sessionId: sourceSessionId,
-          ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-        });
+      : await readSessionRecords(options, sourceSessionId);
   const parentGenesis = parentRecords[0];
   if (
     parentGenesis === undefined ||
@@ -6824,11 +6614,7 @@ async function appendDanglingAttemptInterruption(
   options: SessionLifecycleOptions,
   snapshot: CurrentSessionSnapshot,
 ): Promise<boolean> {
-  const records = await readJsonlSessionRecords({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const records = await readSessionRecords(options, snapshot.sessionId);
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
   const latestRun = currentRecords.findLast(
     (record) => record.record.type === "logical_run_started",
@@ -6846,11 +6632,7 @@ async function appendDanglingAttemptInterruption(
   ) {
     return false;
   }
-  const store = await openJsonlSessionStore<SessionRecord>({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const store = await openSessionStore(options, snapshot.sessionId);
   await store.append({
     schemaVersion: 3,
     sequence: records.length + 1,
@@ -6869,11 +6651,7 @@ async function appendDanglingContextCompactionInterruption(
   options: SessionLifecycleOptions,
   snapshot: CurrentSessionSnapshot,
 ): Promise<boolean> {
-  const records = await readJsonlSessionRecords({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const records = await readSessionRecords(options, snapshot.sessionId);
   const started = records.findLast(
     (record) => record.schemaVersion === 3 && record.record.type === "context_compaction_started",
   );
@@ -6893,11 +6671,7 @@ async function appendDanglingContextCompactionInterruption(
   if (hasTerminal) {
     return false;
   }
-  const store = await openJsonlSessionStore<SessionRecord>({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const store = await openSessionStore(options, snapshot.sessionId);
   await store.append({
     schemaVersion: 3,
     sequence: records.length + 1,
@@ -6921,11 +6695,7 @@ async function appendMissingUserMessage(
   options: SessionLifecycleOptions,
   snapshot: CurrentSessionSnapshot,
 ): Promise<boolean> {
-  const records = await readJsonlSessionRecords({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const records = await readSessionRecords(options, snapshot.sessionId);
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
   const run = currentRecords.findLast((record) => record.record.type === "logical_run_started");
   if (run?.record.type !== "logical_run_started") {
@@ -6941,11 +6711,7 @@ async function appendMissingUserMessage(
   if (hasUserMessage) {
     return false;
   }
-  const store = await openJsonlSessionStore<SessionRecord>({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const store = await openSessionStore(options, snapshot.sessionId);
   await store.append({
     schemaVersion: 3,
     sequence: records.length + 1,
@@ -6962,11 +6728,7 @@ async function settleRunTerminalIntent(
   options: SessionLifecycleOptions,
   snapshot: CurrentSessionSnapshot,
 ): Promise<boolean> {
-  const records = await readJsonlSessionRecords({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const records = await readSessionRecords(options, snapshot.sessionId);
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
   const run = currentRecords.findLast((record) => record.record.type === "logical_run_started");
   if (run?.record.type !== "logical_run_started") {
@@ -6991,11 +6753,7 @@ async function settleRunTerminalIntent(
   ) {
     return false;
   }
-  const store = await openJsonlSessionStore<SessionRecord>({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const store = await openSessionStore(options, snapshot.sessionId);
   let nextSequence = records.length + 1;
   const hasCancellationEvent = currentRecords.some(
     (record) =>
@@ -7031,11 +6789,7 @@ async function settleIndeterminateToolEffects(
   options: SessionLifecycleOptions,
   snapshot: CurrentSessionSnapshot,
 ): Promise<boolean> {
-  const records = await readJsonlSessionRecords({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const records = await readSessionRecords(options, snapshot.sessionId);
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
   const latestRun = currentRecords.findLast(
     (record) => record.record.type === "logical_run_started",
@@ -7095,11 +6849,7 @@ async function settleIndeterminateToolEffects(
   if (first === undefined) {
     return false;
   }
-  const store = await openJsonlSessionStore<SessionRecord>({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const store = await openSessionStore(options, snapshot.sessionId);
   let nextSequence = records.length + 1;
   for (const call of indeterminateCalls) {
     if (!call.requested) {
@@ -7161,11 +6911,7 @@ async function settleInterruptedCancellation(
   options: SessionLifecycleOptions,
   snapshot: CurrentSessionSnapshot,
 ): Promise<boolean> {
-  const records = await readJsonlSessionRecords({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const records = await readSessionRecords(options, snapshot.sessionId);
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
   const run = currentRecords.findLast((record) => record.record.type === "logical_run_started");
   if (run?.record.type !== "logical_run_started") {
@@ -7188,11 +6934,7 @@ async function settleInterruptedCancellation(
   if (cancellation === undefined || settled) {
     return false;
   }
-  const store = await openJsonlSessionStore<SessionRecord>({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const store = await openSessionStore(options, snapshot.sessionId);
   await store.append({
     schemaVersion: 3,
     sequence: records.length + 1,
@@ -7216,11 +6958,7 @@ async function settleCompletedResponseTerminal(
   snapshot: CurrentSessionSnapshot,
   artifactCache: ModelResponseArtifactCache,
 ): Promise<boolean> {
-  const records = await readJsonlSessionRecords({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const records = await readSessionRecords(options, snapshot.sessionId);
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
   const run = currentRecords.findLast((record) => record.record.type === "logical_run_started");
   if (run?.record.type !== "logical_run_started") {
@@ -7336,11 +7074,7 @@ async function settleCompletedResponseTerminal(
             },
           }
         : { status: "completed", answer: responseText };
-  const store = await openJsonlSessionStore<SessionRecord>({
-    workspaceRoot: options.workspaceRoot,
-    sessionId: snapshot.sessionId,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const store = await openSessionStore(options, snapshot.sessionId);
   let nextSequence = records.length + 1;
   const responseWasPublished = currentRecords.some(
     (record) =>
@@ -8256,6 +7990,35 @@ function effectiveSessionStateRoot(configured: string | undefined): string {
   return xdgStateHome === undefined || xdgStateHome.length === 0
     ? join(homedir(), ".local", "state", "adam-agent")
     : join(xdgStateHome, "adam-agent");
+}
+
+function sessionStoreDirectoryFrom(
+  options: SessionLifecycleOptions,
+): SessionStoreDirectory<SessionRecord> {
+  const directory = options[sessionStoreDirectory];
+  if (directory === undefined) {
+    throw new TypeError("The normalized Session Lifecycle requires a session store directory.");
+  }
+  return directory;
+}
+
+async function readSessionRecords(
+  options: SessionLifecycleOptions,
+  sessionId: string,
+): Promise<readonly SessionRecord[]> {
+  const store = await sessionStoreDirectoryFrom(options).open(sessionId);
+  return store?.read() ?? [];
+}
+
+async function openSessionStore(
+  options: SessionLifecycleOptions,
+  sessionId: string,
+): Promise<SessionStore<SessionRecord>> {
+  const store = await sessionStoreDirectoryFrom(options).open(sessionId);
+  if (store === undefined) {
+    throw new SessionLifecycleError("session_not_found");
+  }
+  return store;
 }
 
 function inlineModelResponseField(field: string | SessionModelResponseField): string {
