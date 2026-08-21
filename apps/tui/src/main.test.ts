@@ -1165,6 +1165,7 @@ test("Enter cannot allow a mutation while its canonical preview is still loading
     fixture.write("Edit before preview\r");
     await fixture.waitFor("Loading canonical preview");
     await fixture.waitFor("Allow unavailable");
+    await waitForPath(join(controlRoot, "preview-requested"));
     fixture.write("\r");
     await writeFile(join(controlRoot, "release-preview"), "release\n", "utf8");
     await waitForPath(join(controlRoot, "preview-read-complete"));

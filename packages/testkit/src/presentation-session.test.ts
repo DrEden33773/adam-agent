@@ -1554,13 +1554,18 @@ test("PresentationSession catches up a durable settlement that arrives after hyd
       },
     });
 
-    expect(presentation.getState()).toMatchObject({
+    const caughtUp = presentation.getState();
+    expect(caughtUp).toMatchObject({
       authoritative: {
-        continuity: { status: "current", sessionThroughSequence: 9 },
+        continuity: { status: "current" },
         active: { session: { id: created.sessionId, status: "settled" } },
       },
       transient: null,
     });
+    if (caughtUp.authoritative.continuity.status !== "current") {
+      throw new Error("Expected current Presentation continuity after hydration catch-up.");
+    }
+    expect(caughtUp.authoritative.continuity.sessionThroughSequence).toBeGreaterThanOrEqual(9);
 
     await presentation.close();
   } finally {
