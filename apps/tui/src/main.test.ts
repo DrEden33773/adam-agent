@@ -197,6 +197,10 @@ test("slash Hotkeys opens the shared local Help navigator", async () => {
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(outcome).toBe("hotkeys");
+    expect(fixture.output().slice(beforeHotkeys)).toContain("Ctrl+R");
+    expect(fixture.output().slice(beforeHotkeys)).toContain("Ctrl+N");
+    expect(fixture.output().slice(beforeHotkeys)).toContain("Ctrl+F");
+    expect(fixture.output().slice(beforeHotkeys)).toContain("Ctrl+S");
     expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/hotkeys"');
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -651,6 +655,8 @@ test("session selection rebuilds prompt history from the selected authoritative 
       workspaceRoot,
     });
     await fixture.waitFor("Select a project session");
+    fixture.write("Selected");
+    await fixture.waitFor("Search: Selected");
     const beforeSelection = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForAfter("Selected session prompt", beforeSelection);
@@ -661,6 +667,110 @@ test("session selection rebuilds prompt history from the selected authoritative 
     expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe(
       "Selected session prompt",
     );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Resume opens the project session catalog from an active session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-active-resume-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeResume = fixture.output().length;
+    fixture.write("/resume\r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Select a project session", beforeResume).then(() => "catalog" as const),
+      fixture.waitForAfter("Skill selection complete.", beforeResume).then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("catalog");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/resume"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash New requires an exact target before creating another session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-active-new-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeNew = fixture.output().length;
+    fixture.write("/new \r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Select an exact model target", beforeNew).then(() => "target" as const),
+      fixture.waitForAfter("Skill selection complete.", beforeNew).then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("target");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/new"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Session opens bounded authoritative session and context facts", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-session-facts-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "history", stateRoot, workspaceRoot });
+    await fixture.waitFor("History prompt 3");
+    const beforeSession = fixture.output().length;
+    fixture.write("/session \r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Session facts", beforeSession).then(() => "facts" as const),
+      fixture.waitForAfter("History answer.", beforeSession).then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("facts");
+    expect(result.stdout.slice(beforeSession)).toContain("Target  fake.local");
+    expect(result.stdout.slice(beforeSession)).toContain("Status  settled");
+    expect(result.stdout.slice(beforeSession)).toContain("Chronology");
+    expect(result.stdout.slice(beforeSession)).toContain("Context");
+    expect(result.stdout.slice(beforeSession)).toContain("Usage");
+    expect(result.stdout.slice(beforeSession)).toContain("Compaction");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/session"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Tree opens a read-only browser over visible complete chronology boundaries", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tree-browser-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "history", stateRoot, workspaceRoot });
+    await fixture.waitFor("History prompt 3");
+    const beforeTree = fixture.output().length;
+    fixture.write("/tree \r");
+    await fixture.waitForAfter("Active chronology · read only", beforeTree);
+    fixture.write("prompt3");
+    await fixture.waitForAfter("Search: prompt3", beforeTree);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout.slice(beforeTree)).toContain("History prompt 3");
+    expect(result.stdout.slice(beforeTree)).toContain("complete boundary");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/tree"');
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -794,6 +904,37 @@ test("Help remains locally available while a model run is active", async () => {
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout.slice(beforeHelp)).toContain("Adam Help");
     expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/help"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Session remains read-only and available while a model run is active", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-active-session-facts-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Start a held run\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await fixture.waitFor("Working");
+    const beforeSession = fixture.output().length;
+    fixture.write("/session\r");
+    await fixture.waitForAfter("Session facts", beforeSession);
+    await fixture.waitForAfter("Run     working", beforeSession);
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/session"');
+    const beforeClose = fixture.output().length;
+    fixture.write("\u0003");
+    await fixture.waitForAfter("Working", beforeClose);
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitFor("Streaming answer");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -945,7 +1086,7 @@ test("the production TUI selects an exact available target before creating an em
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select a model target");
+    await fixture.waitFor("Select an exact model target");
     await fixture.waitFor("deepseek-v4-flash.direct");
     await fixture.waitFor("deepseek-v4-pro.direct");
     fixture.write("\r");
@@ -975,7 +1116,7 @@ test("Escape closes the target picker before idle Ctrl+C can arm exit", async ()
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select a model target");
+    await fixture.waitFor("Select an exact model target");
     fixture.write("\u001b[27;1;27~");
     fixture.write("\u0003");
     await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
@@ -1019,7 +1160,7 @@ test("the production TUI creates from one valid saved exact default without open
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).toContain("Adam · New session");
-    expect(result.stdout).not.toContain("Select a model target");
+    expect(result.stdout).not.toContain("Select an exact model target");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -1046,8 +1187,8 @@ test("the production target picker saves its focused exact target separately fro
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select a model target");
-    fixture.write("d");
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\u0013");
     await fixture.waitFor("Saved deepseek-v4-flash.direct as the default");
     const configurationPath = join(configRoot, "adam-agent", "config.json");
     await waitForPath(configurationPath);
@@ -1145,7 +1286,7 @@ test("the production TUI shows the project session picker before any target reso
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).toContain("Select a project session");
     expect(result.stdout).toContain("New Session");
-    expect(result.stdout).not.toContain("Select a model target");
+    expect(result.stdout).not.toContain("Select an exact model target");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -1269,7 +1410,7 @@ test("the production session picker requires explicit New Session before target 
     await fixture.waitFor("Select a project session");
     const beforeNewSession = fixture.output().length;
     fixture.write("\u001b[B\r");
-    await fixture.waitForAfter("Select a model target", beforeNewSession);
+    await fixture.waitForAfter("Select an exact model target", beforeNewSession);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -1362,6 +1503,31 @@ test("the real TUI inspects and reloads repository instruction status through Pr
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(fixture.output()).not.toContain("Second revision.");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Reload selects one existing resource authority explicitly", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-resource-reload-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const instructionsPath = join(workspaceRoot, "AGENTS.md");
+  await mkdir(workspaceRoot);
+  await writeFile(instructionsPath, "# Rules\n\nFirst revision.\n", "utf8");
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    await writeFile(instructionsPath, "# Rules\n\nSecond revision.\n", "utf8");
+    const beforeReload = fixture.output().length;
+    fixture.write("/reload \r");
+    await fixture.waitForAfter("Reload project resources", beforeReload);
+    fixture.write("\r");
+    await fixture.waitForAfter("Reloaded repository instructions.", beforeReload);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/reload"');
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -1671,7 +1837,7 @@ test("the real TUI loads older authoritative chronology through the current opaq
   }
 });
 
-test("the real TUI branches from the latest visible authoritative complete boundary", async () => {
+test("the branch compatibility alias selects an authoritative complete boundary", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-branch-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -1680,13 +1846,14 @@ test("the real TUI branches from the latest visible authoritative complete bound
   try {
     const fixture = startFixture({ scenario: "history", stateRoot, workspaceRoot });
     await fixture.waitFor("History prompt 3");
-    fixture.write("/branch");
-    await fixture.waitFor("/branch");
     const afterTyping = fixture.output().length;
+    fixture.write("/branch \r");
+    await fixture.waitForAfter("Fork from a boundary", afterTyping);
+    const beforeSelection = fixture.output().length;
     fixture.write("\r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Adam · Branch of ", afterTyping).then(() => "branch" as const),
-      fixture.waitForAfter("Working", afterTyping).then(() => "prompt" as const),
+      fixture.waitForAfter("Adam · Branch of ", beforeSelection).then(() => "branch" as const),
+      fixture.waitForAfter("Working", beforeSelection).then(() => "prompt" as const),
     ]);
     fixture.write("\u0011");
     await fixture.closed;
@@ -1696,24 +1863,108 @@ test("the real TUI branches from the latest visible authoritative complete bound
   }
 });
 
-test("the Registry canonical fork command preserves the existing branch behavior", async () => {
+test("slash Fork restores the selected boundary prompt in the child editor", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-fork-alias-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "history", stateRoot, workspaceRoot });
+    await fixture.waitFor("History prompt 3");
+    const beforeFork = fixture.output().length;
+    fixture.write("/fork \r");
+    await fixture.waitForAfter("Fork from a boundary", beforeFork);
+    for (let page = 0; page < 2; page += 1) {
+      for (let step = 0; step <= page; step += 1) {
+        const beforeMove = fixture.output().length;
+        fixture.write("\u001b[B");
+        await fixture.waitForAfter("Load Older", beforeMove);
+      }
+      const beforeLoad = fixture.output().length;
+      fixture.write("\r");
+      const result = await Promise.race([
+        fixture.waitForAfter("Fork from a boundary", beforeLoad).then(() => "loaded" as const),
+        fixture.waitForAfter("Adam · Branch of ", beforeLoad).then(() => "forked" as const),
+      ]);
+      expect(result).toBe("loaded");
+    }
+    const beforeSearch = fixture.output().length;
+    fixture.write("prompt1");
+    await fixture.waitForAfter("Search: prompt1", beforeSearch);
+    await fixture.waitForAfter("History prompt 1", beforeSearch);
+    const beforeSelection = fixture.output().length;
+    fixture.write("\r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Adam · Branch of ", beforeSelection).then(() => "fork" as const),
+      fixture.waitForAfter("History answer.", beforeSelection).then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await fixture.closed;
+    expect(outcome).toBe("fork");
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("History prompt 1");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Clone branches at the latest complete boundary with an empty editor", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-clone-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "history", stateRoot, workspaceRoot });
+    await fixture.waitFor("History prompt 3");
+    const beforeClone = fixture.output().length;
+    fixture.write("/clone \r");
+    await fixture.waitForAfter("Adam · Branch of ", beforeClone);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(access(join(controlRoot, "clipboard.txt"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/clone"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Model and Target share an immutable-target transition page", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-target-navigation-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
 
   try {
-    const fixture = startFixture({ scenario: "history", stateRoot, workspaceRoot });
-    await fixture.waitFor("History prompt 3");
-    const beforeFork = fixture.output().length;
-    fixture.write("/fork\r");
-    const outcome = await Promise.race([
-      fixture.waitForAfter("Adam · Branch of ", beforeFork).then(() => "fork" as const),
-      fixture.waitForAfter("History answer.", beforeFork).then(() => "model" as const),
-    ]);
+    const fixture = startFixture({ scenario: "target-navigation", stateRoot, workspaceRoot });
+    await fixture.waitFor("Target navigation answer.");
+    const beforeModel = fixture.output().length;
+    fixture.write("/model \r");
+    await fixture.waitForAfter("Select an exact model target", beforeModel);
+    await fixture.waitForAfter(
+      "Current target fake.local · existing session target is immutable",
+      beforeModel,
+    );
+    fixture.write("other");
+    await fixture.waitFor("Search: other");
+    fixture.write("\u0006");
+    await fixture.waitFor("fake.other · Experimental");
+    const beforeTarget = fixture.output().length;
+    fixture.write("/target \r");
+    await fixture.waitForAfter("Select an exact model target", beforeTarget);
     fixture.write("\u0011");
-    await fixture.closed;
-    expect(outcome).toBe("fork");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const durableState = await readFilesRecursively(stateRoot);
+    expect(durableState).toContain('"targetId":"fake.local"');
+    expect(durableState).toContain('"targetId":"fake.other"');
+    expect(durableState).not.toContain('"text":"/model"');
+    expect(durableState).not.toContain('"text":"/target"');
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -1744,7 +1995,9 @@ test("the real TUI MCP wizard preserves every separate B8 authority step", async
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
-    fixture.write("/mcp");
+    fixture.write("/mc");
+    await fixture.waitFor("/mc");
+    fixture.write("\t");
     await fixture.waitFor("/mcp");
     const afterTyping = fixture.output().length;
     fixture.write("\r");
@@ -1802,10 +2055,14 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
 
   try {
     const seed = startFixture({ program, stateRoot, workspaceRoot });
-    await seed.waitFor("Select a model target");
+    await seed.waitFor("Select an exact model target");
     seed.write("\r");
     await seed.waitFor("Adam · New session");
-    seed.write("/mcp\r");
+    seed.write("/mc");
+    await seed.waitFor("/mc");
+    seed.write("\t");
+    await seed.waitFor("/mcp");
+    seed.write("\r");
     await seed.waitFor("MCP authority · workspace confirmation required");
     seed.write("\r");
     await seed.waitFor("MCP authority · server approval required");
@@ -1824,7 +2081,11 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
     await resumed.waitFor("Select a project session");
     resumed.write("\r");
     await resumed.waitFor("Adam · New session");
-    resumed.write("/mcp\r");
+    resumed.write("/mc");
+    await resumed.waitFor("/mc");
+    resumed.write("\t");
+    await resumed.waitFor("/mcp");
+    resumed.write("\r");
     await resumed.waitFor("MCP authority · profile reactivation required");
     resumed.write("\r");
     await resumed.waitFor("MCP authority · profile committed");
@@ -1862,7 +2123,11 @@ test("the TUI process fails visibly when MCP shutdown cannot be confirmed", asyn
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
-    fixture.write("/mcp\r");
+    fixture.write("/mc");
+    await fixture.waitFor("/mc");
+    fixture.write("\t");
+    await fixture.waitFor("/mcp");
+    fixture.write("\r");
     await fixture.waitFor("MCP authority · workspace confirmation required");
     fixture.write("\r");
     await fixture.waitFor("MCP authority · server approval required");

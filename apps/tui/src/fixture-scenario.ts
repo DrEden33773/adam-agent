@@ -14,6 +14,7 @@ export const fixtureScenarios = [
   "shell",
   "skill-selection",
   "streaming",
+  "target-navigation",
   "unsafe-history",
   "unsafe-output",
 ] as const;

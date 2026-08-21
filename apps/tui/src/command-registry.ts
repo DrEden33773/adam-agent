@@ -6,14 +6,40 @@ import { getKeybindings, type Keybinding, type KeyId, matchesKey } from "@earend
 export type AdamCommandDefinition = {
   readonly aliases: readonly string[];
   readonly availability: "always" | "idle";
-  readonly id: "fork" | "help" | "history" | "hotkeys" | "instructions" | "mcp" | "name" | "skills";
+  readonly id:
+    | "clone"
+    | "fork"
+    | "help"
+    | "history"
+    | "hotkeys"
+    | "instructions"
+    | "mcp"
+    | "model"
+    | "name"
+    | "new"
+    | "reload"
+    | "resume"
+    | "session"
+    | "skills"
+    | "target"
+    | "tree";
   readonly name: string;
   readonly summary: string;
   readonly usage: string;
 };
 
+export type AdamKeybindingAction =
+  | "back"
+  | "exit"
+  | "fork_from_target"
+  | "interrupt"
+  | "new_session_from_target"
+  | "rename_session"
+  | "save_default_target"
+  | "submit";
+
 export type AdamKeybindingDefinition = {
-  readonly action: "back" | "exit" | "interrupt" | "submit" | null;
+  readonly action: AdamKeybindingAction | null;
   readonly description: string;
   readonly inputs: readonly KeyId[];
   readonly keys: string;
@@ -102,6 +128,14 @@ class AdamCommandRegistry {
     );
   }
 
+  keybinding(action: AdamKeybindingAction): AdamKeybindingDefinition {
+    const binding = this.keybindings().find((candidate) => candidate.action === action);
+    if (binding === undefined) {
+      throw new TypeError(`The ${action} keybinding must exist.`);
+    }
+    return binding;
+  }
+
   suggest(name: string, limit = 3): readonly AdamCommandDefinition[] {
     return rankSuggestions(this.#commands, name, (command) => command.name, limit);
   }
@@ -127,6 +161,62 @@ export const adamCommandRegistry = new AdamCommandRegistry([
   {
     aliases: [],
     availability: "idle",
+    id: "new",
+    name: "new",
+    summary: "Choose an exact target and create a new session.",
+    usage: "/new",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "reload",
+    name: "reload",
+    summary: "Select one eligible project resource authority to reload.",
+    usage: "/reload",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "resume",
+    name: "resume",
+    summary: "Search and open an existing project session.",
+    usage: "/resume",
+  },
+  {
+    aliases: [],
+    availability: "always",
+    id: "session",
+    name: "session",
+    summary: "Inspect authoritative session, chronology, context, and usage facts.",
+    usage: "/session",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "tree",
+    name: "tree",
+    summary: "Browse complete active-chronology boundaries without mutation.",
+    usage: "/tree",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "model",
+    name: "model",
+    summary: "Choose a new-session or fork target without mutating this session.",
+    usage: "/model",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "target",
+    name: "target",
+    summary: "Open the same immutable exact-target transition page as /model.",
+    usage: "/target",
+  },
+  {
+    aliases: [],
+    availability: "idle",
     id: "name",
     name: "name",
     summary: "Set, clear, or regenerate the active session name.",
@@ -147,6 +237,14 @@ export const adamCommandRegistry = new AdamCommandRegistry([
     name: "fork",
     summary: "Create a child session from an authoritative boundary.",
     usage: "/fork",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "clone",
+    name: "clone",
+    summary: "Create a child at the latest complete boundary with an empty editor.",
+    usage: "/clone",
   },
   {
     aliases: [],
@@ -221,6 +319,34 @@ const keybindingProjections: readonly KeybindingProjection[] = [
     action: null,
     description: "Open or accept autocomplete",
     piBindings: ["tui.input.tab"],
+    section: "application",
+  },
+  {
+    action: "rename_session",
+    adamInputs: ["ctrl+r"],
+    keys: "Ctrl+R",
+    description: "Rename the focused session in the session picker",
+    section: "application",
+  },
+  {
+    action: "new_session_from_target",
+    adamInputs: ["ctrl+n"],
+    keys: "Ctrl+N",
+    description: "Create a new session from the focused transition target",
+    section: "application",
+  },
+  {
+    action: "fork_from_target",
+    adamInputs: ["ctrl+f"],
+    keys: "Ctrl+F",
+    description: "Fork the current boundary onto the focused target",
+    section: "application",
+  },
+  {
+    action: "save_default_target",
+    adamInputs: ["ctrl+s"],
+    keys: "Ctrl+S",
+    description: "Save the focused exact target as the project default",
     section: "application",
   },
   {

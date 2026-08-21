@@ -28,6 +28,14 @@ const targetIdentity: ModelTargetIdentity = {
   profileVersion: 1,
   certification: "certified",
 };
+const alternateTargetIdentity: ModelTargetIdentity = {
+  targetId: "fake.other",
+  vendor: "adam",
+  modelId: "fake-other",
+  route: "direct",
+  profileVersion: 1,
+  certification: "experimental",
+};
 const contextProfile: ContextProfile = {
   version: 1,
   contextWindowTokens: 32_768,
@@ -68,6 +76,7 @@ try {
   const resumedSessionId =
     options.scenario === "resume" ||
     options.scenario === "history" ||
+    options.scenario === "target-navigation" ||
     options.scenario === "unsafe-history"
       ? await lifecycle.create({ targetIdentity }).then(async (created) => {
           if (options.scenario === "history") {
@@ -82,6 +91,11 @@ try {
               sessionId: created.sessionId,
               input: { text: "Resume transcript" },
             });
+          } else if (options.scenario === "target-navigation") {
+            await lifecycle.continue({
+              sessionId: created.sessionId,
+              input: { text: "Keep historical target identity" },
+            });
           } else {
             await lifecycle.continue({
               sessionId: created.sessionId,
@@ -95,6 +109,7 @@ try {
     options.scenario === "session-selection-history"
       ? {
           lifecycle,
+          ...(modelTargets === undefined ? {} : { modelTargets }),
           openProject: true,
           projectLabel: "workspace",
           stateRoot: options.stateRoot,
@@ -103,6 +118,7 @@ try {
       : resumedSessionId === undefined
         ? {
             lifecycle,
+            ...(modelTargets === undefined ? {} : { modelTargets }),
             projectLabel: "workspace",
             stateRoot: options.stateRoot,
             targetIdentity,
@@ -113,6 +129,7 @@ try {
           }
         : {
             lifecycle,
+            ...(modelTargets === undefined ? {} : { modelTargets }),
             projectLabel: "workspace",
             sessionId: resumedSessionId,
             stateRoot: options.stateRoot,
@@ -247,6 +264,8 @@ function createFixtureModelTargets(options: {
         yield { type: "text_delta", text: "History answer." };
       } else if (options.scenario === "resume") {
         yield { type: "text_delta", text: "Previous answer." };
+      } else if (options.scenario === "target-navigation") {
+        yield { type: "text_delta", text: "Target navigation answer." };
       } else if (options.scenario === "shell") {
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {
@@ -277,8 +296,12 @@ function createFixtureModelTargets(options: {
     },
   };
   return {
-    async resolve() {
-      return { identity: targetIdentity, driver: model, contextProfile };
+    async resolve(input) {
+      const identity =
+        input.targetId === alternateTargetIdentity.targetId
+          ? alternateTargetIdentity
+          : targetIdentity;
+      return { identity, driver: model, contextProfile };
     },
     async snapshot() {
       return {
@@ -288,6 +311,18 @@ function createFixtureModelTargets(options: {
             readiness: { status: "available", credentialSource: "deterministic TUI fixture" },
             contextProfile,
           },
+          ...(options.scenario === "target-navigation"
+            ? [
+                {
+                  identity: alternateTargetIdentity,
+                  readiness: {
+                    status: "available" as const,
+                    credentialSource: "deterministic alternate TUI fixture",
+                  },
+                  contextProfile,
+                },
+              ]
+            : []),
         ],
       };
     },

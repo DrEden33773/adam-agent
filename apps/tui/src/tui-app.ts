@@ -2,6 +2,7 @@ import type {
   ActiveSessionDisplay,
   PresentationSession,
   RepositoryInstructionsDisplay,
+  TargetDisplay,
 } from "@adam-agent/presentation";
 import {
   Box,
@@ -18,6 +19,7 @@ import {
   type TUI,
   TuiMainScreen,
 } from "@earendil-works/pi-tui";
+import { ChronologyPicker, completeChronologyBoundaries } from "./chronology-picker.js";
 import { AdamAutocompleteProvider } from "./command-autocomplete.js";
 import { adamCommandRegistry } from "./command-registry.js";
 import {
@@ -33,7 +35,9 @@ import { mcpAdvanceCommand } from "./mcp-advance.js";
 import { McpWizard } from "./mcp-wizard.js";
 import { PermissionOverlay } from "./permission-overlay.js";
 import { ProjectPathPicker } from "./project-path-picker.js";
+import { ResourceReloadPicker } from "./resource-reload-picker.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
+import { SessionInspector, type SessionRunStatus } from "./session-inspector.js";
 import { SessionPicker } from "./session-picker.js";
 import { SkillPalette } from "./skill-palette.js";
 import { TargetPicker } from "./target-picker.js";
@@ -130,6 +134,27 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly hide: () => void;
       }
     | undefined;
+  let sessionInspector:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+        readonly inspector: SessionInspector;
+      }
+    | undefined;
+  let chronologyPicker:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+        readonly picker: ChronologyPicker;
+      }
+    | undefined;
+  let resourceReloadPicker:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+        readonly picker: ResourceReloadPicker;
+      }
+    | undefined;
   let skillPalette:
     | {
         readonly close: () => void;
@@ -159,7 +184,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const selectedSkills = new Set<string>();
   let previousActiveSessionId = options.presentation.getState().authoritative.active?.session.id;
   let sessionPickerDismissed = false;
+  let sessionPickerRequested = false;
   let targetPickerDismissed = false;
+  let targetPickerIntent: "create" | "transition" = "create";
+  let targetPickerRequested = false;
   let defaultTargetAttempted = false;
   let defaultTargetRejected = false;
   let startupTargetFailure: string | null = null;
@@ -221,6 +249,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       pathPicker = undefined;
       mcpWizard?.hide();
       mcpWizard = undefined;
+      sessionInspector?.hide();
+      sessionInspector = undefined;
+      chronologyPicker?.hide();
+      chronologyPicker = undefined;
+      resourceReloadPicker?.hide();
+      resourceReloadPicker = undefined;
       if (active !== null) {
         sessionPickerDismissed = false;
         targetPickerDismissed = false;
@@ -229,6 +263,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     if (active?.mcp !== null && active?.mcp !== undefined && mcpWizard !== undefined) {
       mcpWizard.wizard.setState(active.mcp);
+    }
+    if (active !== null && sessionInspector !== undefined) {
+      const continuity = state.authoritative.continuity;
+      sessionInspector.inspector.setState({
+        active,
+        runStatus: sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling),
+        throughSequence: continuity.status === "current" ? continuity.sessionThroughSequence : null,
+      });
     }
     const needsSessionChoice =
       active === null && state.authoritative.sessions.items.length > 0 && !newSessionSelected;
@@ -254,20 +296,25 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           renderState();
         });
     }
-    if (active !== null && targetPicker !== undefined) {
+    if (active !== null && targetPicker !== undefined && !targetPickerRequested) {
       targetPicker.hide();
       targetPicker = undefined;
       tui.setFocus(editor);
     }
-    if (active !== null && sessionPicker !== undefined) {
+    if (active !== null && sessionPicker !== undefined && !sessionPickerRequested) {
       sessionPicker.hide();
       sessionPicker = undefined;
       tui.setFocus(editor);
-    } else if (needsSessionChoice && sessionPicker === undefined && !sessionPickerDismissed) {
+    } else if (
+      (needsSessionChoice || sessionPickerRequested) &&
+      sessionPicker === undefined &&
+      !sessionPickerDismissed
+    ) {
       let handle: { hide(): void } | undefined;
       const close = () => {
         handle?.hide();
         sessionPicker = undefined;
+        sessionPickerRequested = false;
         sessionPickerDismissed = true;
         statusMessage = "Session selection closed.";
         tui.setFocus(editor);
@@ -280,15 +327,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         onClose: close,
         onNewSession() {
           newSessionSelected = true;
+          sessionPickerRequested = false;
           sessionPicker?.hide();
           sessionPicker = undefined;
+          targetPickerDismissed = false;
+          targetPickerIntent = "create";
+          targetPickerRequested = true;
           renderState();
         },
         onSelect(session) {
           void options.presentation
             .dispatch({ type: "select_session", sessionId: session.id })
             .then((receipt) => {
-              if (receipt.status === "rejected" && sessionPicker?.picker === picker) {
+              if (receipt.status === "admitted") {
+                close();
+              } else if (sessionPicker?.picker === picker) {
                 picker.setNotice(receipt.message);
                 tui.requestRender();
               }
@@ -340,17 +393,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       });
       sessionPicker = { close, picker, hide: () => handle?.hide() };
     } else if (
-      active === null &&
-      !needsSessionChoice &&
       targetPicker === undefined &&
       !targetPickerDismissed &&
-      (startupTargetId === null || startupTargetId === undefined || defaultTargetRejected) &&
+      (targetPickerRequested ||
+        (active === null &&
+          !needsSessionChoice &&
+          (startupTargetId === null || startupTargetId === undefined || defaultTargetRejected))) &&
       state.authoritative.targets.items.length > 0
     ) {
       let handle: { hide(): void } | undefined;
       const close = () => {
         handle?.hide();
         targetPicker = undefined;
+        targetPickerRequested = false;
         targetPickerDismissed = true;
         statusMessage = "Target selection closed.";
         tui.setFocus(editor);
@@ -359,6 +414,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       const picker = new TargetPicker({
         targets: state.authoritative.targets.items,
         theme,
+        mode: targetPickerIntent,
+        ...(targetPickerIntent === "transition" && active !== null
+          ? { currentTargetId: active.session.targetId }
+          : {}),
         onClose: close,
         ...(state.authoritative.targets.diagnostic !== null
           ? { initialNotice: state.authoritative.targets.diagnostic.message }
@@ -366,6 +425,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             ? {}
             : { initialNotice: startupTargetFailure }),
         onSelect(target) {
+          if (targetPickerIntent === "transition") {
+            picker.setNotice(
+              `Selected ${target.targetId} · press Ctrl+N for New Session or Ctrl+F to Fork the current complete boundary.`,
+            );
+            tui.requestRender();
+            return;
+          }
+          createSessionFromTarget(target);
+        },
+        onCreate(target) {
+          createSessionFromTarget(target, () => editor.setText(""));
+        },
+        onFork(target) {
           if (target.readiness.status !== "available") {
             picker.setNotice(
               `The exact target ${target.targetId} is missing its required credential.`,
@@ -373,17 +445,34 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             tui.requestRender();
             return;
           }
+          const source =
+            active === null
+              ? undefined
+              : completeChronologyBoundaries(active.transcript.items).at(-1);
+          if (active === null || source === undefined) {
+            picker.setNotice("No complete authoritative chronology boundary is visible.");
+            tui.requestRender();
+            return;
+          }
           void options.presentation
-            .dispatch({ type: "create_session", targetId: target.targetId })
+            .dispatch({
+              type: "branch_session",
+              parentSessionId: active.session.id,
+              sourceBoundary: source.boundary,
+              targetId: target.targetId,
+            })
             .then((receipt) => {
-              if (receipt.status === "rejected" && targetPicker?.picker === picker) {
+              if (receipt.status === "admitted") {
+                close();
+                editor.setText("");
+              } else if (targetPicker?.picker === picker) {
                 picker.setNotice(receipt.message);
                 tui.requestRender();
               }
             })
             .catch(() => {
               if (targetPicker?.picker === picker) {
-                picker.setNotice("The session could not be created.");
+                picker.setNotice("The exact target fork could not be created.");
                 tui.requestRender();
               }
             });
@@ -417,6 +506,32 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             });
         },
       });
+      function createSessionFromTarget(target: TargetDisplay, afterAdmission?: () => void): void {
+        if (target.readiness.status !== "available") {
+          picker.setNotice(
+            `The exact target ${target.targetId} is missing its required credential.`,
+          );
+          tui.requestRender();
+          return;
+        }
+        void options.presentation
+          .dispatch({ type: "create_session", targetId: target.targetId })
+          .then((receipt) => {
+            if (receipt.status === "admitted") {
+              close();
+              afterAdmission?.();
+            } else if (targetPicker?.picker === picker) {
+              picker.setNotice(receipt.message);
+              tui.requestRender();
+            }
+          })
+          .catch(() => {
+            if (targetPicker?.picker === picker) {
+              picker.setNotice("The session could not be created.");
+              tui.requestRender();
+            }
+          });
+      }
       handle = tui.showOverlay(picker, {
         width: "80%",
         minWidth: 36,
@@ -624,6 +739,107 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       pathPicker = { close, hide: () => handle?.hide() };
     }
   };
+  const showChronologyPicker = (mode: "fork" | "read_only"): void => {
+    const state = options.presentation.getState();
+    const active = state.authoritative.active;
+    if (active === null) {
+      return;
+    }
+    const boundaries = completeChronologyBoundaries(active.transcript.items);
+    if (boundaries.length === 0 && active.transcript.olderCursor === null) {
+      statusMessage = "No complete authoritative chronology boundary is available.";
+      renderState();
+      return;
+    }
+    chronologyPicker?.hide();
+    let handle: { hide(): void } | undefined;
+    const close = () => {
+      handle?.hide();
+      chronologyPicker = undefined;
+      tui.setFocus(editor);
+      tui.requestRender();
+    };
+    const picker = new ChronologyPicker({
+      boundaries,
+      hasOlder: active.transcript.olderCursor !== null,
+      mode,
+      onClose: close,
+      onLoadOlder() {
+        const current = options.presentation.getState().authoritative.active;
+        const before = current?.transcript.olderCursor;
+        if (current?.session.id !== active.session.id || before === null || before === undefined) {
+          picker.setNotice("The older chronology cursor is no longer current.");
+          tui.requestRender();
+          return;
+        }
+        void options.presentation
+          .dispatch({ type: "load_older_transcript", before })
+          .then((receipt) => {
+            if (receipt.status === "admitted") {
+              if (chronologyPicker?.picker === picker) {
+                chronologyPicker.hide();
+                chronologyPicker = undefined;
+                showChronologyPicker(mode);
+              }
+            } else if (chronologyPicker?.picker === picker) {
+              picker.setNotice(receipt.message);
+              tui.requestRender();
+            }
+          })
+          .catch(() => {
+            if (chronologyPicker?.picker === picker) {
+              picker.setNotice("The older chronology page could not be loaded.");
+              tui.requestRender();
+            }
+          });
+      },
+      onSelect(source) {
+        if (mode === "read_only") {
+          return;
+        }
+        const current = options.presentation.getState().authoritative.active;
+        if (current?.session.id !== active.session.id) {
+          picker.setNotice("The active session changed before fork admission.");
+          tui.requestRender();
+          return;
+        }
+        void options.presentation
+          .dispatch({
+            type: "branch_session",
+            parentSessionId: current.session.id,
+            sourceBoundary: source.boundary,
+            targetId: null,
+          })
+          .then((receipt) => {
+            if (receipt.status === "admitted") {
+              close();
+              editor.setText(safeTerminalText(source.prompt ?? ""));
+              editor.disableSubmit = false;
+              renderState();
+            } else if (chronologyPicker?.picker === picker) {
+              picker.setNotice(receipt.message);
+              tui.requestRender();
+            }
+          })
+          .catch(() => {
+            if (chronologyPicker?.picker === picker) {
+              picker.setNotice("The exact branch boundary could not be opened.");
+              tui.requestRender();
+            }
+          });
+      },
+      theme,
+    });
+    handle = tui.showOverlay(picker, {
+      width: "90%",
+      minWidth: 36,
+      maxHeight: "80%",
+      margin: 1,
+    });
+    chronologyPicker = { close, hide: () => handle?.hide(), picker };
+    tui.setFocus(picker);
+    tui.requestRender();
+  };
   editor.onSubmit = (text) => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
@@ -734,6 +950,199 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       });
       helpNavigator = { close, hide: () => handle?.hide(), navigator };
       tui.requestRender();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "tree" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
+      editor.setText("");
+      editor.disableSubmit = false;
+      showChronologyPicker("read_only");
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "session" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
+      editor.setText("");
+      editor.disableSubmit = false;
+      sessionInspector?.hide();
+      let handle: { hide(): void } | undefined;
+      const close = () => {
+        handle?.hide();
+        sessionInspector = undefined;
+        tui.setFocus(editor);
+        tui.requestRender();
+      };
+      const continuity = state.authoritative.continuity;
+      const inspector = new SessionInspector({
+        active,
+        onClose: close,
+        runStatus: sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling),
+        theme,
+        throughSequence: continuity.status === "current" ? continuity.sessionThroughSequence : null,
+      });
+      handle = tui.showOverlay(inspector, {
+        width: "90%",
+        minWidth: 36,
+        maxHeight: "80%",
+        margin: 1,
+      });
+      sessionInspector = { close, hide: () => handle?.hide(), inspector };
+      tui.requestRender();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "reload" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
+      editor.setText("");
+      editor.disableSubmit = false;
+      const resources = [
+        ...(active.repositoryInstructions?.reloadAvailable === true
+          ? [
+              {
+                id: "instructions" as const,
+                label: "Repository instructions",
+                description: "Reload active AGENTS.md scopes through SessionLifecycle",
+              },
+            ]
+          : []),
+        ...(active.skills?.reloadAvailable === true
+          ? [
+              {
+                id: "skills" as const,
+                label: "Skills",
+                description: "Reload the bounded active Skill catalog",
+              },
+            ]
+          : []),
+        ...(active.mcp?.status === "catalog_stale" && active.mcp.activation !== null
+          ? [
+              {
+                id: "mcp" as const,
+                label: "MCP catalog",
+                description: "Revalidate the exact stale MCP generation",
+              },
+            ]
+          : []),
+      ];
+      if (resources.length === 0) {
+        statusMessage = "No project resource authority is currently eligible for reload.";
+        renderState();
+        return;
+      }
+      resourceReloadPicker?.hide();
+      let handle: { hide(): void } | undefined;
+      const close = () => {
+        handle?.hide();
+        resourceReloadPicker = undefined;
+        tui.setFocus(editor);
+        tui.requestRender();
+      };
+      const picker = new ResourceReloadPicker({
+        onClose: close,
+        onSelect(resource) {
+          const current = options.presentation.getState().authoritative.active;
+          if (current === null || current.session.id !== active.session.id) {
+            picker.setNotice("The active session changed before reload admission.");
+            tui.requestRender();
+            return;
+          }
+          const command: Parameters<PresentationSession["dispatch"]>[0] | null =
+            resource.id === "instructions"
+              ? { type: "reload_repository_instructions", sessionId: current.session.id }
+              : resource.id === "skills"
+                ? { type: "reload_skills", sessionId: current.session.id }
+                : current.mcp?.status === "catalog_stale" && current.mcp.activation !== null
+                  ? {
+                      type: "revalidate_mcp_catalog",
+                      sessionId: current.session.id,
+                      generationId: current.mcp.activation.generationId,
+                    }
+                  : null;
+          if (command === null) {
+            picker.setNotice("That resource authority is no longer eligible for reload.");
+            tui.requestRender();
+            return;
+          }
+          void options.presentation
+            .dispatch(command)
+            .then((receipt) => {
+              if (receipt.status === "admitted") {
+                statusMessage =
+                  resource.id === "instructions"
+                    ? "Reloaded repository instructions."
+                    : resource.id === "skills"
+                      ? "Reloaded Skills."
+                      : "Revalidated the MCP catalog.";
+                close();
+                renderState();
+              } else if (resourceReloadPicker?.picker === picker) {
+                picker.setNotice(receipt.message);
+                tui.requestRender();
+              }
+            })
+            .catch(() => {
+              if (resourceReloadPicker?.picker === picker) {
+                picker.setNotice("The selected resource authority could not be reloaded.");
+                tui.requestRender();
+              }
+            });
+        },
+        resources,
+        theme,
+      });
+      handle = tui.showOverlay(picker, {
+        width: "90%",
+        minWidth: 36,
+        maxHeight: "80%",
+        margin: 1,
+      });
+      resourceReloadPicker = { close, hide: () => handle?.hide(), picker };
+      tui.requestRender();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      (parsedCommand.command.id === "model" || parsedCommand.command.id === "target") &&
+      parsedCommand.argumentsText.length === 0
+    ) {
+      editor.setText("");
+      editor.disableSubmit = false;
+      targetPickerDismissed = false;
+      targetPickerIntent = "transition";
+      targetPickerRequested = true;
+      renderState();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "new" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
+      editor.setText("");
+      editor.disableSubmit = false;
+      targetPickerDismissed = false;
+      targetPickerIntent = "create";
+      targetPickerRequested = true;
+      renderState();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "resume" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
+      editor.setText("");
+      editor.disableSubmit = false;
+      sessionPickerDismissed = false;
+      sessionPickerRequested = true;
+      renderState();
       return;
     }
     if (
@@ -991,37 +1400,49 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     if (
       parsedCommand.kind === "known" &&
-      parsedCommand.command.id === "fork" &&
+      parsedCommand.command.id === "clone" &&
       parsedCommand.argumentsText.length === 0
     ) {
-      const source = active.transcript.items.findLast(
-        (item) => item.branchBoundary !== null,
-      )?.branchBoundary;
-      if (source === null || source === undefined) {
+      const source = completeChronologyBoundaries(active.transcript.items).at(-1);
+      if (source === undefined) {
+        statusMessage = "No complete authoritative chronology boundary is visible.";
         editor.disableSubmit = false;
-        tui.requestRender();
+        renderState();
         return;
       }
       void options.presentation
         .dispatch({
           type: "branch_session",
           parentSessionId: active.session.id,
-          sourceBoundary: source,
+          sourceBoundary: source.boundary,
           targetId: null,
         })
         .then((receipt) => {
           if (receipt.status === "admitted") {
             editor.setText("");
+            editor.disableSubmit = false;
           } else {
+            statusMessage = receipt.message;
             editor.disableSubmit = false;
           }
         })
         .catch(() => {
+          statusMessage = "The latest complete boundary could not be cloned.";
           editor.disableSubmit = false;
         })
         .finally(() => {
-          tui.requestRender();
+          renderState();
         });
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "fork" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
+      editor.setText("");
+      editor.disableSubmit = false;
+      showChronologyPicker("fork");
       return;
     }
     if (
@@ -1091,6 +1512,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     clearExitWindow();
     unsubscribe();
     sessionPicker?.hide();
+    sessionInspector?.hide();
+    chronologyPicker?.hide();
+    resourceReloadPicker?.hide();
     skillPalette?.hide();
     pathPicker?.hide();
     mcpWizard?.hide();
@@ -1136,6 +1560,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             mcpWizard?.close ??
             pathPicker?.close ??
             skillPalette?.close ??
+            sessionInspector?.close ??
+            chronologyPicker?.close ??
+            resourceReloadPicker?.close ??
             sessionPicker?.close ??
             targetPicker?.close)
           : undefined;
@@ -1203,6 +1630,20 @@ function toolStatusText(
     return "failed";
   }
   return status === "running" || status === "requested" ? status : null;
+}
+
+function sessionRunStatus(
+  activity: "replying" | "using_tool" | "working" | null,
+  active: ActiveSessionDisplay,
+  cancelSettling: boolean,
+): SessionRunStatus {
+  if (cancelSettling) {
+    return "cancelling";
+  }
+  if (active.pendingInteractions.length > 0) {
+    return "permission required";
+  }
+  return activity === "using_tool" ? "using tool" : (activity ?? "idle");
 }
 
 function isProjectPathTrigger(draft: string): boolean {

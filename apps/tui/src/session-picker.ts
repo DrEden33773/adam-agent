@@ -1,14 +1,16 @@
 import type { SessionSummary } from "@adam-agent/presentation";
-import { type Component, type SelectItem, SelectList } from "@earendil-works/pi-tui";
+import type { Component, SelectItem } from "@earendil-works/pi-tui";
 
+import { adamCommandRegistry } from "./command-registry.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
+import { SearchableSelectList } from "./searchable-select-list.js";
 import type { AdamTuiTheme } from "./theme.js";
 
 const newSessionValue = "new-session";
 const loadMoreValue = "load-more";
 
 export class SessionPicker implements Component {
-  readonly #list: SelectList;
+  readonly #list: SearchableSelectList;
   readonly #onNewSession: () => void;
   readonly #onRename: (session: SessionSummary) => void;
   readonly #onSelect: (session: SessionSummary) => void;
@@ -31,12 +33,13 @@ export class SessionPicker implements Component {
     this.#onSelect = options.onSelect;
     this.#sessions = new Map(options.sessions.map((session) => [session.id, session]));
     this.#theme = options.theme;
+    const sessionItems: SelectItem[] = options.sessions.map((session) => ({
+      value: session.id,
+      label: safeTerminalText(session.naming.displayLabel),
+      description: safeTerminalText(`${session.targetId} · ${session.status}`),
+    }));
     const items: SelectItem[] = [
-      ...options.sessions.map((session) => ({
-        value: session.id,
-        label: safeTerminalText(session.naming.displayLabel),
-        description: safeTerminalText(`${session.targetId} · ${session.status}`),
-      })),
+      ...sessionItems,
       ...(options.hasMore
         ? [
             {
@@ -48,22 +51,33 @@ export class SessionPicker implements Component {
         : []),
       { value: newSessionValue, label: "New Session", description: "Choose an exact target" },
     ];
-    this.#list = new SelectList(items, 8, options.theme.editor.selectList);
-    this.#list.onCancel = options.onClose;
-    this.#list.onSelect = (item) => {
-      if (item.value === newSessionValue) {
-        this.#onNewSession();
-        return;
-      }
-      if (item.value === loadMoreValue) {
-        options.onLoadMore();
-        return;
-      }
-      const session = this.#sessions.get(item.value);
-      if (session !== undefined) {
-        this.#onSelect(session);
-      }
-    };
+    this.#list = new SearchableSelectList({
+      items: items.map((item) => ({
+        item,
+        searchText:
+          item.value === newSessionValue || item.value === loadMoreValue
+            ? ""
+            : `${item.label ?? ""} ${item.description ?? ""} ${item.value}`,
+        alwaysVisible: item.value === newSessionValue || item.value === loadMoreValue,
+      })),
+      maxVisible: 8,
+      onCancel: options.onClose,
+      onSelect: (item) => {
+        if (item.value === newSessionValue) {
+          this.#onNewSession();
+          return;
+        }
+        if (item.value === loadMoreValue) {
+          options.onLoadMore();
+          return;
+        }
+        const session = this.#sessions.get(item.value);
+        if (session !== undefined) {
+          this.#onSelect(session);
+        }
+      },
+      theme: options.theme.editor.selectList,
+    });
   }
 
   setNotice(notice: string): void {
@@ -71,7 +85,7 @@ export class SessionPicker implements Component {
   }
 
   handleInput(data: string): void {
-    if (data === "r") {
+    if (adamCommandRegistry.matchesInput(data, "rename_session")) {
       const selected = this.#list.getSelectedItem();
       const session = selected === null ? undefined : this.#sessions.get(selected.value);
       if (session !== undefined) {
@@ -93,7 +107,9 @@ export class SessionPicker implements Component {
       ...this.#list.render(width),
       ...(this.#notice === null ? [] : ["", this.#theme.muted(this.#notice)]),
       "",
-      this.#theme.muted("Enter open · r rename · ↑/↓ move · Esc close · Ctrl+Q exit"),
+      this.#theme.muted(
+        `Enter open · ${adamCommandRegistry.keybinding("rename_session").keys} rename · type search · ↑/↓ move · Esc close · Ctrl+Q exit`,
+      ),
     ];
   }
 }
