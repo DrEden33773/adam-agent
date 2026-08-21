@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { appendFileSync, existsSync, readFileSync, watch, writeFileSync } from "node:fs";
-import { basename, dirname } from "node:path";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const spawnMarker = process.argv[2];
@@ -94,26 +94,20 @@ function respond(request: JsonRpcRequest): void {
       process.exit(1);
     }
     if (mode === "fail-initialize-after-gate" && callMarker !== undefined) {
-      if (existsSync(callMarker)) {
+      gateWatcher ??= watchForFile(callMarker, () => {
+        gateWatcher = undefined;
         process.exit(1);
-      }
-      gateWatcher ??= watch(dirname(callMarker), (_event, filename) => {
-        if (filename === basename(callMarker) && existsSync(callMarker)) {
-          gateWatcher?.close();
-          gateWatcher = undefined;
-          process.exit(1);
-        }
       });
       return;
     }
-    if (mode === "gated-initialize" && callMarker !== undefined && !existsSync(callMarker)) {
-      gateWatcher ??= watch(dirname(callMarker), (_event, filename) => {
-        if (filename === basename(callMarker) && existsSync(callMarker)) {
-          gateWatcher?.close();
-          gateWatcher = undefined;
-          writeInitializeResult(request);
-        }
+    if (mode === "gated-initialize" && callMarker !== undefined) {
+      gateWatcher ??= watchForFile(callMarker, () => {
+        gateWatcher = undefined;
+        writeInitializeResult(request);
       });
+      if (notificationGate !== undefined) {
+        writeFileSync(notificationGate, "received");
+      }
       return;
     }
     writeInitializeResult(request);
@@ -122,12 +116,9 @@ function respond(request: JsonRpcRequest): void {
   if (request.method === "tools/list") {
     toolListRequestCount += 1;
     if (mode === "exit-after-gate" && callMarker !== undefined && gateWatcher === undefined) {
-      gateWatcher = watch(dirname(callMarker), (_event, filename) => {
-        if (filename === basename(callMarker) && existsSync(callMarker)) {
-          gateWatcher?.close();
-          gateWatcher = undefined;
-          process.exit(0);
-        }
+      gateWatcher = watchForFile(callMarker, () => {
+        gateWatcher = undefined;
+        process.exit(0);
       });
     }
     if (mode === "malformed-tools-list") {
@@ -207,6 +198,20 @@ function respond(request: JsonRpcRequest): void {
           inputSchema: { type: "object", properties: {} },
         })),
       });
+      return;
+    }
+    if (mode === "projection-suite") {
+      const tools = projectionSuiteTools();
+      if (request.params?.cursor === "projection-page-2") {
+        writeResult(request, {
+          tools: tools.filter((tool) => tool.name === "projection_recursive_healthy"),
+        });
+      } else {
+        writeResult(request, {
+          tools: tools.filter((tool) => tool.name !== "projection_recursive_healthy"),
+          nextCursor: "projection-page-2",
+        });
+      }
       return;
     }
     if (mode === "schema-reference-admission") {
@@ -510,22 +515,35 @@ function writeInitializeResult(request: JsonRpcRequest): void {
         return;
       }
       listChangedSent = true;
-      gateWatcher?.close();
       gateWatcher = undefined;
       process.stdout.write(
         `${JSON.stringify({ jsonrpc: "2.0", method: "notifications/tools/list_changed" })}\n`,
       );
     };
-    if (existsSync(notificationGate)) {
-      notify();
-    } else {
-      gateWatcher ??= watch(dirname(notificationGate), (_event, filename) => {
-        if (filename === basename(notificationGate) && existsSync(notificationGate)) {
-          notify();
-        }
-      });
-    }
+    gateWatcher ??= watchForFile(notificationGate, notify);
   }
+}
+
+function watchForFile(path: string, onFile: () => void): ReturnType<typeof watch> | undefined {
+  let settled = false;
+  let watcher: ReturnType<typeof watch> | undefined;
+  const finish = () => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    watcher?.close();
+    onFile();
+  };
+  watcher = watch(dirname(path), () => {
+    if (existsSync(path)) {
+      finish();
+    }
+  });
+  if (existsSync(path)) {
+    finish();
+  }
+  return settled ? undefined : watcher;
 }
 
 function referenceDepthSchema(referenceCount: number): Readonly<Record<string, unknown>> {
@@ -541,6 +559,116 @@ function referenceDepthSchema(referenceCount: number): Readonly<Record<string, u
     required: ["value"],
     additionalProperties: false,
   };
+}
+
+type ProjectionSuiteFixtureTool = Readonly<Record<string, unknown>> & {
+  readonly name: string;
+};
+
+function projectionSuiteTools(): readonly ProjectionSuiteFixtureTool[] {
+  const plainSchema = {
+    type: "object",
+    properties: { value: { type: "string" } },
+    required: ["value"],
+    additionalProperties: false,
+  };
+  return [
+    {
+      name: "projection_order_äther",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "projection_order_zeta",
+      inputSchema: { type: "object", properties: {} },
+    },
+    {
+      name: "projection_allof",
+      inputSchema: {
+        type: "object",
+        $defs: {
+          left: {
+            type: "object",
+            properties: { left: { type: "string" } },
+            required: ["left"],
+          },
+          right: {
+            type: "object",
+            properties: { right: { type: "integer" } },
+            required: ["right"],
+          },
+        },
+        allOf: [{ $ref: "#/$defs/left" }, { $ref: "#/$defs/right" }],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "projection_recursive_bad",
+      inputSchema: {
+        type: "object",
+        properties: { next: { $ref: "#" } },
+        additionalProperties: false,
+      },
+    },
+    { name: "projection_recursive_healthy", inputSchema: plainSchema },
+    {
+      name: "projection_ref_bounded",
+      inputSchema: {
+        type: "object",
+        $defs: {
+          payload: {
+            type: "object",
+            properties: { value: { type: "string" } },
+            required: ["value"],
+            additionalProperties: false,
+          },
+        },
+        properties: { payload: { $ref: "#/$defs/payload" } },
+        required: ["payload"],
+        additionalProperties: false,
+      },
+    },
+    { name: "projection_ref_plain", inputSchema: plainSchema },
+    {
+      name: "projection_ref_cyclic",
+      inputSchema: {
+        type: "object",
+        $defs: {
+          node: {
+            type: "object",
+            properties: { next: { $ref: "#/$defs/node" } },
+          },
+        },
+        properties: { node: { $ref: "#/$defs/node" } },
+      },
+    },
+    {
+      name: "projection_ref_remote",
+      inputSchema: {
+        type: "object",
+        properties: { value: { $ref: "https://example.invalid/schema.json" } },
+      },
+    },
+    { name: "projection_depth_within", inputSchema: referenceDepthSchema(16) },
+    { name: "projection_depth_over", inputSchema: referenceDepthSchema(17) },
+    { name: "projection_depth_healthy", inputSchema: plainSchema },
+    {
+      name: "projection_oneof",
+      description: "Choose one projection branch.",
+      inputSchema: {
+        type: "object",
+        oneOf: [
+          {
+            properties: { kind: { const: "left" }, left: { type: "string" } },
+            required: ["kind", "left"],
+          },
+          {
+            properties: { kind: { const: "right" }, right: { type: "integer" } },
+            required: ["kind", "right"],
+          },
+        ],
+      },
+    },
+  ];
 }
 
 function streamOversizedFrame(totalBytes: number): void {

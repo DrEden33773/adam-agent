@@ -39,7 +39,7 @@ import {
   mcpPackageRegistryUrl,
   mcpRequestScheduler,
 } from "@adam-agent/agent/internal-testing";
-import { expect, test } from "vitest";
+import { beforeAll, describe, expect, test } from "vitest";
 
 import {
   createSessionLifecycleForTesting as createSessionLifecycle,
@@ -83,6 +83,20 @@ type PersistedRecordProjection = Readonly<Record<string, unknown>> & {
 
 type PersistedRecordEnvelope = {
   readonly record?: PersistedRecordProjection;
+};
+
+type ProjectionSuiteTool = {
+  readonly description: string;
+  readonly inputSchema: Readonly<Record<string, unknown>>;
+  readonly modelProjectionDigest: string;
+  readonly originalName: string;
+  readonly rawSchemaDigest: string;
+  readonly serverId: string;
+};
+
+type ProjectionSuiteSnapshot = {
+  readonly diagnostics: readonly unknown[];
+  readonly tools: readonly ProjectionSuiteTool[];
 };
 
 function observeFileCreation(path: string): Promise<void> {
@@ -129,6 +143,69 @@ function withFailureGuard<T>(
       },
     );
   });
+}
+
+async function discoverProjectionSuiteCatalog(): Promise<ProjectionSuiteSnapshot> {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-projection-suite-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const spawnMarker = join(testRoot, "spawned");
+  const closeMarker = join(testRoot, "closed");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: {
+          command: process.execPath,
+          args: [mcpServerFixturePath, spawnMarker, closeMarker, "projection-suite"],
+        },
+      },
+    }),
+  );
+
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    if (created.mcp === undefined) {
+      throw new Error("The projection suite requires an MCP configuration snapshot.");
+    }
+    const confirmed = await lifecycle.configureMcp({
+      type: "confirm_workspace",
+      sessionId: created.sessionId,
+      sourceDigest: created.mcp.source.digest,
+    });
+    const preview = confirmed.snapshot.mcp?.servers[0];
+    if (preview === undefined) {
+      throw new Error("The projection suite requires one MCP server preview.");
+    }
+    await lifecycle.configureMcp({
+      type: "approve_server",
+      sessionId: created.sessionId,
+      serverId: preview.serverId,
+      definitionDigest: preview.definitionDigest,
+    });
+    const activated = await lifecycle.configureMcp({
+      type: "activate_servers",
+      sessionId: created.sessionId,
+      servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
+    });
+    const activeMcp = activated.snapshot.mcp;
+    if (activeMcp?.status !== "tool_selection_required" || activeMcp.catalog === undefined) {
+      throw new Error("The projection suite requires one ready MCP catalog.");
+    }
+    return structuredClone({
+      diagnostics: activeMcp.diagnostics,
+      tools: activeMcp.catalog.tools,
+    });
+  } finally {
+    try {
+      const closed = await lifecycle.close();
+      expect(closed).toEqual({ status: "closed" });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  }
 }
 
 function bestEffortKillProcess(pid: number): void {
@@ -2604,6 +2681,7 @@ test("SessionLifecycle atomically fails one MCP generation and causally closes e
   const blockedSpawn = join(testRoot, "blocked-spawned");
   const blockedClose = join(testRoot, "blocked-closed");
   const blockedGate = join(testRoot, "blocked-gate");
+  const blockedInitializeReceived = join(testRoot, "blocked-initialize-received");
   const failingSpawn = join(testRoot, "failing-spawned");
   const failingClose = join(testRoot, "failing-closed");
   await mkdir(workspaceRoot);
@@ -2613,7 +2691,14 @@ test("SessionLifecycle atomically fails one MCP generation and causally closes e
       mcpServers: {
         blocked: {
           command: process.execPath,
-          args: [mcpServerFixturePath, blockedSpawn, blockedClose, "gated-initialize", blockedGate],
+          args: [
+            mcpServerFixturePath,
+            blockedSpawn,
+            blockedClose,
+            "gated-initialize",
+            blockedGate,
+            blockedInitializeReceived,
+          ],
         },
         failing: {
           command: process.execPath,
@@ -2622,7 +2707,7 @@ test("SessionLifecycle atomically fails one MCP generation and causally closes e
             failingSpawn,
             failingClose,
             "fail-initialize-after-gate",
-            blockedSpawn,
+            blockedInitializeReceived,
           ],
         },
       },
@@ -2859,6 +2944,7 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
   const spawnMarker = join(testRoot, "spawned");
   const closeMarker = join(testRoot, "closed");
   const initializeGate = join(testRoot, "initialize-gate");
+  const initializeReceivedMarker = join(testRoot, "initialize-received");
   await mkdir(workspaceRoot);
   await writeFile(
     join(workspaceRoot, ".mcp.json"),
@@ -2872,6 +2958,7 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
             closeMarker,
             "gated-initialize",
             initializeGate,
+            initializeReceivedMarker,
           ],
         },
       },
@@ -2900,7 +2987,7 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
       definitionDigest: preview.definitionDigest,
     });
 
-    const spawned = observeFileCreation(spawnMarker);
+    const initializeReceived = observeFileCreation(initializeReceivedMarker);
     const activation = lifecycle.configureMcp({
       type: "activate_servers",
       sessionId: created.sessionId,
@@ -2910,7 +2997,7 @@ test("SessionLifecycle cancels an activation blocked in initialize without waiti
       (value) => ({ status: "resolved" as const, value }),
       (error: unknown) => ({ status: "rejected" as const, error }),
     );
-    await spawned;
+    await initializeReceived;
     const activating = await lifecycle.inspect({ sessionId: created.sessionId });
     const activatingMcp = activating.schemaVersion === 3 ? activating.mcp : undefined;
     if (
@@ -2981,6 +3068,7 @@ test("SessionLifecycle bounds initialize and discovery with a deterministic tota
   const spawnMarker = join(testRoot, "spawned");
   const closeMarker = join(testRoot, "closed");
   const initializeGate = join(testRoot, "initialize-gate");
+  const initializeReceivedMarker = join(testRoot, "initialize-received");
   await mkdir(workspaceRoot);
   await writeFile(
     join(workspaceRoot, ".mcp.json"),
@@ -2994,6 +3082,7 @@ test("SessionLifecycle bounds initialize and discovery with a deterministic tota
             closeMarker,
             "gated-initialize",
             initializeGate,
+            initializeReceivedMarker,
           ],
         },
       },
@@ -3026,7 +3115,7 @@ test("SessionLifecycle bounds initialize and discovery with a deterministic tota
       serverId: preview.serverId,
       definitionDigest: preview.definitionDigest,
     });
-    const spawned = observeFileCreation(spawnMarker);
+    const initializeReceived = observeFileCreation(initializeReceivedMarker);
     const activation = lifecycle.configureMcp({
       type: "activate_servers",
       sessionId: created.sessionId,
@@ -3037,7 +3126,7 @@ test("SessionLifecycle bounds initialize and discovery with a deterministic tota
       (error: unknown) => ({ status: "rejected" as const, error }),
     );
 
-    await spawned;
+    await initializeReceived;
     const fixturePid = Number.parseInt(await readFile(spawnMarker, "utf8"), 10);
     await manualDiscoveryDeadline.advanceBy(30_000);
     const outcome = await observedActivation;
@@ -3114,62 +3203,6 @@ test("SessionLifecycle rejects an oversized MCP tool definition without truncati
   }
 });
 
-test("SessionLifecycle orders MCP catalog identity by code unit rather than host locale", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-canonical-order-"));
-  const stateRoot = join(testRoot, "state");
-  const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "unicode-tool-order"],
-        },
-      },
-    }),
-  );
-
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
-  try {
-    const created = await lifecycle.create({ targetIdentity });
-    if (created.mcp === undefined) {
-      throw new Error("The fixture requires an MCP configuration snapshot.");
-    }
-    const confirmed = await lifecycle.configureMcp({
-      type: "confirm_workspace",
-      sessionId: created.sessionId,
-      sourceDigest: created.mcp.source.digest,
-    });
-    const preview = confirmed.snapshot.mcp?.servers[0];
-    if (preview === undefined) {
-      throw new Error("The fixture requires one MCP server preview.");
-    }
-    await lifecycle.configureMcp({
-      type: "approve_server",
-      sessionId: created.sessionId,
-      serverId: preview.serverId,
-      definitionDigest: preview.definitionDigest,
-    });
-    const activated = await lifecycle.configureMcp({
-      type: "activate_servers",
-      sessionId: created.sessionId,
-      servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
-    });
-    const activeMcp = activated.snapshot.mcp;
-    if (activeMcp?.status !== "tool_selection_required") {
-      throw new Error("The fixture requires one ready MCP catalog.");
-    }
-    expect(activeMcp.catalog?.tools.map((tool) => tool.originalName)).toEqual(["zeta", "äther"]);
-  } finally {
-    await lifecycle.close();
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
 test("SessionLifecycle classifies an MCP catalog over 256 tools as too large", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-catalog-tool-limit-"));
   const stateRoot = join(testRoot, "state");
@@ -3225,58 +3258,27 @@ test("SessionLifecycle classifies an MCP catalog over 256 tools as too large", a
   }
 });
 
-test("SessionLifecycle projects root allOf local references without narrowing the raw MCP schema", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-allof-projection-"));
-  const stateRoot = join(testRoot, "state");
-  const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "allof-schema"],
-        },
-      },
-    }),
-  );
+describe("SessionLifecycle projects a discovered MCP catalog", () => {
+  let projectionSuiteSnapshot: ProjectionSuiteSnapshot;
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
-  try {
-    const created = await lifecycle.create({ targetIdentity });
-    if (created.mcp === undefined) {
-      throw new Error("The fixture requires an MCP configuration snapshot.");
-    }
-    const confirmed = await lifecycle.configureMcp({
-      type: "confirm_workspace",
-      sessionId: created.sessionId,
-      sourceDigest: created.mcp.source.digest,
-    });
-    const preview = confirmed.snapshot.mcp?.servers[0];
-    if (preview === undefined) {
-      throw new Error("The fixture requires one MCP server preview.");
-    }
-    await lifecycle.configureMcp({
-      type: "approve_server",
-      sessionId: created.sessionId,
-      serverId: preview.serverId,
-      definitionDigest: preview.definitionDigest,
-    });
-    const activated = await lifecycle.configureMcp({
-      type: "activate_servers",
-      sessionId: created.sessionId,
-      servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
-    });
-    const activeMcp = activated.snapshot.mcp;
-    if (activeMcp?.status !== "tool_selection_required") {
-      throw new Error("The fixture requires a discovered MCP catalog.");
-    }
-    const echo = activeMcp.catalog?.tools.find((tool) => tool.originalName === "echo");
+  beforeAll(async () => {
+    projectionSuiteSnapshot = await discoverProjectionSuiteCatalog();
+  });
 
-    expect(echo).toMatchObject({
+  test("orders MCP catalog identity by code unit rather than host locale", () => {
+    expect(
+      projectionSuiteSnapshot.tools
+        .filter((tool) => tool.originalName.startsWith("projection_order_"))
+        .map((tool) => tool.originalName),
+    ).toEqual(["projection_order_zeta", "projection_order_äther"]);
+  });
+
+  test("projects root allOf local references without narrowing the raw MCP schema", () => {
+    const projected = projectionSuiteSnapshot.tools.find(
+      (tool) => tool.originalName === "projection_allof",
+    );
+
+    expect(projected).toMatchObject({
       inputSchema: {
         type: "object",
         $defs: {
@@ -3296,127 +3298,27 @@ test("SessionLifecycle projects root allOf local references without narrowing th
         additionalProperties: false,
       },
     });
-    expect(echo?.inputSchema).not.toHaveProperty("allOf");
-    expect(echo?.rawSchemaDigest).not.toBe(echo?.modelProjectionDigest);
-  } finally {
-    await lifecycle.close();
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
+    expect(projected?.inputSchema).not.toHaveProperty("allOf");
+    expect(projected?.rawSchemaDigest).not.toBe(projected?.modelProjectionDigest);
+  });
 
-test("SessionLifecycle quarantines a recursive MCP schema without hiding its healthy sibling", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-recursive-schema-"));
-  const stateRoot = join(testRoot, "state");
-  const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "recursive-schema"],
-        },
-      },
-    }),
-  );
+  test("quarantines a recursive MCP schema without hiding its healthy sibling", () => {
+    expect(
+      projectionSuiteSnapshot.tools
+        .filter((tool) => tool.originalName.startsWith("projection_recursive_"))
+        .map((tool) => ({ originalName: tool.originalName, serverId: tool.serverId })),
+    ).toEqual([{ originalName: "projection_recursive_healthy", serverId: "fixture" }]);
+  });
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
-  try {
-    const created = await lifecycle.create({ targetIdentity });
-    if (created.mcp === undefined) {
-      throw new Error("The fixture requires an MCP configuration snapshot.");
-    }
-    const confirmed = await lifecycle.configureMcp({
-      type: "confirm_workspace",
-      sessionId: created.sessionId,
-      sourceDigest: created.mcp.source.digest,
-    });
-    const preview = confirmed.snapshot.mcp?.servers[0];
-    if (preview === undefined) {
-      throw new Error("The fixture requires one MCP server preview.");
-    }
-    await lifecycle.configureMcp({
-      type: "approve_server",
-      sessionId: created.sessionId,
-      serverId: preview.serverId,
-      definitionDigest: preview.definitionDigest,
-    });
-    const activated = await lifecycle.configureMcp({
-      type: "activate_servers",
-      sessionId: created.sessionId,
-      servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
-    });
-
-    expect(activated.snapshot.mcp).toMatchObject({
-      status: "tool_selection_required",
-      catalog: {
-        tools: [{ serverId: "fixture", originalName: "uppercase" }],
-      },
-    });
-  } finally {
-    await lifecycle.close();
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("SessionLifecycle admits bounded local schema references while quarantining cyclic and remote siblings", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-schema-references-"));
-  const stateRoot = join(testRoot, "state");
-  const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "schema-reference-admission"],
-        },
-      },
-    }),
-  );
-
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
-  try {
-    const created = await lifecycle.create({ targetIdentity });
-    if (created.mcp === undefined) {
-      throw new Error("The fixture requires an MCP configuration snapshot.");
-    }
-    const confirmed = await lifecycle.configureMcp({
-      type: "confirm_workspace",
-      sessionId: created.sessionId,
-      sourceDigest: created.mcp.source.digest,
-    });
-    const preview = confirmed.snapshot.mcp?.servers[0];
-    if (preview === undefined) {
-      throw new Error("The fixture requires one MCP server preview.");
-    }
-    await lifecycle.configureMcp({
-      type: "approve_server",
-      sessionId: created.sessionId,
-      serverId: preview.serverId,
-      definitionDigest: preview.definitionDigest,
-    });
-    const activated = await lifecycle.configureMcp({
-      type: "activate_servers",
-      sessionId: created.sessionId,
-      servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
-    });
-    const activeMcp = activated.snapshot.mcp;
-    if (activeMcp?.status !== "tool_selection_required" || activeMcp.catalog === undefined) {
-      throw new Error("The fixture requires an admitted MCP catalog.");
-    }
-
-    expect(activeMcp.catalog.tools.map((tool) => tool.originalName)).toEqual([
-      "bounded_local_ref",
-      "plain_good",
+  test("admits bounded local schema references while quarantining cyclic and remote siblings", () => {
+    const referenceTools = projectionSuiteSnapshot.tools.filter((tool) =>
+      tool.originalName.startsWith("projection_ref_"),
+    );
+    expect(referenceTools.map((tool) => tool.originalName)).toEqual([
+      "projection_ref_bounded",
+      "projection_ref_plain",
     ]);
-    expect(activeMcp.catalog.tools[0]?.inputSchema).toEqual({
+    expect(referenceTools[0]?.inputSchema).toEqual({
       type: "object",
       $defs: {
         payload: {
@@ -3430,125 +3332,23 @@ test("SessionLifecycle admits bounded local schema references while quarantining
       required: ["payload"],
       additionalProperties: false,
     });
-    expect(activeMcp.diagnostics).toEqual([]);
-  } finally {
-    await lifecycle.close();
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
+    expect(projectionSuiteSnapshot.diagnostics).toEqual([]);
+  });
 
-test("SessionLifecycle enforces the MCP local reference-chain depth at the 16/17 boundary", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-schema-reference-depth-"));
-  const stateRoot = join(testRoot, "state");
-  const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "schema-reference-depth"],
-        },
-      },
-    }),
-  );
+  test("enforces the MCP local reference-chain depth at the 16/17 boundary", () => {
+    expect(
+      projectionSuiteSnapshot.tools
+        .filter((tool) => tool.originalName.startsWith("projection_depth_"))
+        .map((tool) => tool.originalName),
+    ).toEqual(["projection_depth_healthy", "projection_depth_within"]);
+  });
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
-  try {
-    const created = await lifecycle.create({ targetIdentity });
-    if (created.mcp === undefined) {
-      throw new Error("The fixture requires an MCP configuration snapshot.");
-    }
-    const confirmed = await lifecycle.configureMcp({
-      type: "confirm_workspace",
-      sessionId: created.sessionId,
-      sourceDigest: created.mcp.source.digest,
-    });
-    const preview = confirmed.snapshot.mcp?.servers[0];
-    if (preview === undefined) {
-      throw new Error("The fixture requires one MCP server preview.");
-    }
-    await lifecycle.configureMcp({
-      type: "approve_server",
-      sessionId: created.sessionId,
-      serverId: preview.serverId,
-      definitionDigest: preview.definitionDigest,
-    });
-    const activated = await lifecycle.configureMcp({
-      type: "activate_servers",
-      sessionId: created.sessionId,
-      servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
-    });
-    const activeMcp = activated.snapshot.mcp;
-    if (activeMcp?.status !== "tool_selection_required" || activeMcp.catalog === undefined) {
-      throw new Error("The fixture requires one admitted MCP catalog.");
-    }
+  test("broadens a root oneOf projection and labels its branch requirements", () => {
+    const projected = projectionSuiteSnapshot.tools.find(
+      (tool) => tool.originalName === "projection_oneof",
+    );
 
-    expect(activeMcp.catalog.tools.map((tool) => tool.originalName)).toEqual([
-      "plain_good",
-      "within_limit",
-    ]);
-  } finally {
-    await lifecycle.close();
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("SessionLifecycle broadens a root oneOf projection and labels its branch requirements", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-oneof-schema-"));
-  const stateRoot = join(testRoot, "state");
-  const workspaceRoot = join(testRoot, "workspace");
-  const spawnMarker = join(testRoot, "spawned");
-  const closeMarker = join(testRoot, "closed");
-  await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpServerFixturePath, spawnMarker, closeMarker, "oneof-schema"],
-        },
-      },
-    }),
-  );
-
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
-  try {
-    const created = await lifecycle.create({ targetIdentity });
-    if (created.mcp === undefined) {
-      throw new Error("The fixture requires an MCP configuration snapshot.");
-    }
-    const confirmed = await lifecycle.configureMcp({
-      type: "confirm_workspace",
-      sessionId: created.sessionId,
-      sourceDigest: created.mcp.source.digest,
-    });
-    const preview = confirmed.snapshot.mcp?.servers[0];
-    if (preview === undefined) {
-      throw new Error("The fixture requires one MCP server preview.");
-    }
-    await lifecycle.configureMcp({
-      type: "approve_server",
-      sessionId: created.sessionId,
-      serverId: preview.serverId,
-      definitionDigest: preview.definitionDigest,
-    });
-    const activated = await lifecycle.configureMcp({
-      type: "activate_servers",
-      sessionId: created.sessionId,
-      servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
-    });
-    const activeMcp = activated.snapshot.mcp;
-    if (activeMcp?.status !== "tool_selection_required") {
-      throw new Error("The fixture requires a discovered MCP catalog.");
-    }
-    const echo = activeMcp.catalog?.tools.find((tool) => tool.originalName === "echo");
-
-    expect(echo?.inputSchema).toEqual({
+    expect(projected?.inputSchema).toEqual({
       type: "object",
       properties: {
         kind: {},
@@ -3557,13 +3357,10 @@ test("SessionLifecycle broadens a root oneOf projection and labels its branch re
       },
       required: ["kind"],
     });
-    expect(echo?.description).toContain(
+    expect(projected?.description).toContain(
       "Compatibility hint: oneOf branches require [kind, left] or [kind, right].",
     );
-  } finally {
-    await lifecycle.close();
-    await rm(testRoot, { recursive: true, force: true });
-  }
+  });
 });
 
 test("SessionLifecycle treats malformed MCP stdout as fatal and reaps the server", async () => {
@@ -7952,6 +7749,7 @@ test("SessionLifecycle close interrupts an in-progress activation and waits for 
   const spawnMarker = join(testRoot, "spawned");
   const closeMarker = join(testRoot, "closed");
   const initializeGate = join(testRoot, "initialize-gate");
+  const initializeReceivedMarker = join(testRoot, "initialize-received");
   await mkdir(workspaceRoot);
   await writeFile(
     join(workspaceRoot, ".mcp.json"),
@@ -7965,6 +7763,7 @@ test("SessionLifecycle close interrupts an in-progress activation and waits for 
             closeMarker,
             "gated-initialize",
             initializeGate,
+            initializeReceivedMarker,
           ],
         },
       },
@@ -7993,7 +7792,7 @@ test("SessionLifecycle close interrupts an in-progress activation and waits for 
       definitionDigest: preview.definitionDigest,
     });
 
-    const spawned = observeFileCreation(spawnMarker);
+    const initializeReceived = observeFileCreation(initializeReceivedMarker);
     const activation = lifecycle.configureMcp({
       type: "activate_servers",
       sessionId: created.sessionId,
@@ -8003,7 +7802,7 @@ test("SessionLifecycle close interrupts an in-progress activation and waits for 
       () => "fulfilled" as const,
       () => "rejected" as const,
     );
-    await spawned;
+    await initializeReceived;
     const fixturePid = Number.parseInt(await readFile(spawnMarker, "utf8"), 10);
     const firstClose = await lifecycle.close();
     let processAbsentBeforeGate = false;
