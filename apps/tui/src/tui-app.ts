@@ -7,12 +7,14 @@ import type {
 } from "@adam-agent/presentation";
 import {
   Box,
+  type Component,
   Container,
   Editor,
   isKeyRelease,
   isKeyRepeat,
   Loader,
   Markdown,
+  type OverlayOptions,
   ProcessTerminal,
   Spacer,
   type Terminal,
@@ -43,6 +45,12 @@ import { McpWizard } from "./mcp-wizard.js";
 import { PermissionOverlay } from "./permission-overlay.js";
 import { ProjectPathPicker } from "./project-path-picker.js";
 import { ResourceReloadPicker } from "./resource-reload-picker.js";
+import {
+  ResponsiveLine,
+  ResponsiveRoot,
+  ResponsiveText,
+  terminalSizeIsSupported,
+} from "./responsive-root.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { SessionInspector, type SessionRunStatus } from "./session-inspector.js";
 import { SessionPicker } from "./session-picker.js";
@@ -75,8 +83,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let newSessionSelected =
     options.presentation.getState().authoritative.sessions.items.length === 0;
   const tui: TUI = new TuiMainScreen(terminal, true);
+  const showOverlay = (component: Component, overlayOptions: OverlayOptions) =>
+    tui.showOverlay(component, {
+      ...overlayOptions,
+      visible: (columns, rows) => terminalSizeIsSupported(columns, rows),
+    });
   const theme = createAdamTuiTheme();
-  const root = new Container();
+  const root = new ResponsiveRoot(() => terminal.rows);
   const header = new Text();
   const transcript = new Container();
   const editorSlot = new Container();
@@ -111,7 +124,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   );
   let projectedHistorySessionId = options.presentation.getState().authoritative.active?.session.id;
   const statusLine = new Text();
-  const footer = new Text();
+  const footer = new ResponsiveText();
   const working = new Loader(tui, theme.toolTitle, theme.muted, "Working", { intervalMs: 80 });
   let workingVisible = false;
   let cancelSettling = false;
@@ -401,7 +414,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             });
         },
       });
-      handle = tui.showOverlay(picker, {
+      handle = showOverlay(picker, {
         width: "80%",
         minWidth: 36,
         maxHeight: "80%",
@@ -548,7 +561,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             }
           });
       }
-      handle = tui.showOverlay(picker, {
+      handle = showOverlay(picker, {
         width: "80%",
         minWidth: 36,
         maxHeight: "80%",
@@ -598,10 +611,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             : subject === undefined
               ? label
               : `${label} ${safeTerminalText(subject)}`;
-        tool.addChild(new Text(theme.toolTitle(title)));
+        tool.addChild(new ResponsiveLine(theme.toolTitle(title)));
         const detail = item.resultSummary ?? toolStatusText(item.status, item.outcome?.status);
         if (detail !== null) {
-          tool.addChild(new Text(theme.toolOutput(safeTerminalText(detail))));
+          tool.addChild(new ResponsiveLine(theme.toolOutput(safeTerminalText(detail))));
         }
         if (toolDetailsExpanded) {
           const replay = item.source?.replay ?? "unavailable";
@@ -694,7 +707,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       clearExitWindow();
       permission.hide();
       permission = undefined;
-      tui.setFocus(helpNavigator?.navigator ?? editor);
+      tui.requestRender(true);
     } else if (pending !== undefined && permission?.requestId !== pending.requestId) {
       clearExitWindow();
       permission?.hide();
@@ -709,7 +722,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           });
         },
       });
-      const handle = tui.showOverlay(overlay, {
+      const handle = showOverlay(overlay, {
         width: "80%",
         minWidth: 36,
         maxHeight: "80%",
@@ -739,29 +752,42 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     } else {
       editor.disableSubmit = false;
     }
-    footer.setText(
-      exitArm.armed
-        ? theme.muted(
-            `Press Ctrl+C again within two seconds to exit${
-              editor.getExpandedText().length === 0 ? "" : " · draft will be copied"
-            }`,
-          )
-        : active === null
-          ? theme.muted("Choose an exact model target to create a session")
-          : theme.muted(
-              `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling)}\n${safeTerminalText(active.session.targetId)} · ${
-                state.authoritative.targets.items.find(
-                  (target) => target.targetId === active.session.targetId,
-                )?.certification ??
-                options.targetStatus?.certification ??
-                "Experimental"
-              }${
-                selectedSkills.size === 0
-                  ? ""
-                  : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`
-              }${active.transcript.olderCursor === null ? "" : " · older history available"} · ${adamCommandRegistry.footerHint()}`,
-            ),
-    );
+    if (exitArm.armed) {
+      footer.setText(
+        theme.muted(
+          `Press Ctrl+C again within two seconds to exit${
+            editor.getExpandedText().length === 0 ? "" : " · draft will be copied"
+          }`,
+        ),
+      );
+    } else if (active === null) {
+      footer.setText(theme.muted("Choose an exact model target to create a session"));
+    } else {
+      const runStatus = sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling);
+      const targetCertification =
+        state.authoritative.targets.items.find(
+          (target) => target.targetId === active.session.targetId,
+        )?.certification ??
+        options.targetStatus?.certification ??
+        "Experimental";
+      const selectedSkillSummary =
+        selectedSkills.size === 0
+          ? ""
+          : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`;
+      const olderHistorySummary =
+        active.transcript.olderCursor === null ? "" : " · older history available";
+      footer.setText({
+        wide: theme.muted(
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${selectedSkillSummary}${olderHistorySummary} · ${adamCommandRegistry.footerHint()}`,
+        ),
+        standard: theme.muted(
+          `${safeTerminalText(state.authoritative.project.label)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
+        ),
+        narrow: theme.muted(
+          `${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}\n/help · Tab complete`,
+        ),
+      });
+    }
     statusLine.setText(statusMessage === null ? "" : theme.muted(safeTerminalText(statusMessage)));
     tui.requestRender();
   };
@@ -799,7 +825,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         },
         theme,
       });
-      handle = tui.showOverlay(picker, {
+      handle = showOverlay(picker, {
         width: "90%",
         minWidth: 36,
         maxHeight: "80%",
@@ -899,7 +925,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       },
       theme,
     });
-    handle = tui.showOverlay(picker, {
+    handle = showOverlay(picker, {
       width: "90%",
       minWidth: 36,
       maxHeight: "80%",
@@ -982,7 +1008,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       },
       theme,
     });
-    handle = tui.showOverlay(navigator, {
+    handle = showOverlay(navigator, {
       width: "90%",
       minWidth: 36,
       maxHeight: "80%",
@@ -1138,7 +1164,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         theme,
         topics: adamCommandRegistry.helpTopics(),
       });
-      handle = tui.showOverlay(navigator, {
+      handle = showOverlay(navigator, {
         width: "80%",
         minWidth: 36,
         maxHeight: "80%",
@@ -1181,7 +1207,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         theme,
         throughSequence: continuity.status === "current" ? continuity.sessionThroughSequence : null,
       });
-      handle = tui.showOverlay(inspector, {
+      handle = showOverlay(inspector, {
         width: "90%",
         minWidth: 36,
         maxHeight: "80%",
@@ -1293,7 +1319,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         resources,
         theme,
       });
-      handle = tui.showOverlay(picker, {
+      handle = showOverlay(picker, {
         width: "90%",
         minWidth: 36,
         maxHeight: "80%",
@@ -1515,7 +1541,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           }
         },
       });
-      handle = tui.showOverlay(wizard, {
+      handle = showOverlay(wizard, {
         width: "95%",
         minWidth: 36,
         maxHeight: "90%",
@@ -1555,7 +1581,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             return true;
           },
         });
-        handle = tui.showOverlay(palette, {
+        handle = showOverlay(palette, {
           width: "90%",
           minWidth: 36,
           maxHeight: "80%",
@@ -1700,26 +1726,39 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const unsubscribe = options.presentation.subscribe(renderState);
   const exited = Promise.withResolvers<void>();
   let stopping = false;
+  const removeTerminationListeners = () => {
+    process.removeListener("SIGHUP", handleSighup);
+    process.removeListener("SIGTERM", handleSigterm);
+  };
   const stop = async (copyDraft: boolean) => {
     if (stopping) {
       return;
     }
     stopping = true;
-    clearExitWindow();
-    unsubscribe();
-    sessionPicker?.hide();
-    sessionInspector?.hide();
-    chronologyPicker?.hide();
-    resourceReloadPicker?.hide();
-    skillPalette?.hide();
-    pathPicker?.hide();
-    mcpWizard?.hide();
-    helpNavigator?.hide();
-    artifactNavigator?.hide();
-    targetPicker?.hide();
-    permission?.hide();
-    working.stop();
-    tui.stop();
+    const failures: unknown[] = [];
+    const attempt = (operation: () => void) => {
+      try {
+        operation();
+      } catch (error) {
+        failures.push(error);
+      }
+    };
+    attempt(removeTerminationListeners);
+    attempt(clearExitWindow);
+    attempt(unsubscribe);
+    attempt(() => sessionPicker?.hide());
+    attempt(() => sessionInspector?.hide());
+    attempt(() => chronologyPicker?.hide());
+    attempt(() => resourceReloadPicker?.hide());
+    attempt(() => skillPalette?.hide());
+    attempt(() => pathPicker?.hide());
+    attempt(() => mcpWizard?.hide());
+    attempt(() => helpNavigator?.hide());
+    attempt(() => artifactNavigator?.hide());
+    attempt(() => targetPicker?.hide());
+    attempt(() => permission?.hide());
+    attempt(() => working.stop());
+    attempt(() => tui.stop());
     try {
       if (copyDraft) {
         const clipboardResult = await copyDraftToClipboard(
@@ -1733,15 +1772,59 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           terminal.write("\r\nClipboard copy failed; draft was not copied.\r\n");
         }
       }
-      await options.presentation.close();
-      exited.resolve();
     } catch (error) {
-      exited.reject(error);
+      failures.push(error);
+    }
+    try {
+      await options.presentation.close();
+    } catch (error) {
+      failures.push(error);
+    }
+    if (failures.length === 0) {
+      exited.resolve();
+    } else if (failures.length === 1) {
+      exited.reject(failures[0]);
+    } else {
+      exited.reject(new AggregateError(failures, "The TUI could not close every owned resource."));
     }
   };
+  const handleTerminationSignal = (signal: "SIGHUP" | "SIGTERM") => {
+    process.exitCode = signal === "SIGHUP" ? 129 : 143;
+    void stop(false);
+  };
+  function handleSighup(): void {
+    handleTerminationSignal("SIGHUP");
+  }
+  function handleSigterm(): void {
+    handleTerminationSignal("SIGTERM");
+  }
   tui.addInputListener((data) => {
     if (adamCommandRegistry.matchesInput(data, "exit")) {
       void stop(true);
+      return { consume: true };
+    }
+    if (
+      !terminalSizeIsSupported(terminal.columns, terminal.rows) &&
+      !adamCommandRegistry.matchesInput(data, "interrupt")
+    ) {
+      if (adamCommandRegistry.matchesInput(data, "back")) {
+        if (permission !== undefined) {
+          permission.overlay.handleInput(data);
+        } else {
+          const closeOverlay =
+            helpNavigator?.close ??
+            artifactNavigator?.close ??
+            mcpWizard?.close ??
+            pathPicker?.close ??
+            skillPalette?.close ??
+            sessionInspector?.close ??
+            chronologyPicker?.close ??
+            resourceReloadPicker?.close ??
+            sessionPicker?.close ??
+            targetPicker?.close;
+          closeOverlay?.();
+        }
+      }
       return { consume: true };
     }
     if (adamCommandRegistry.matchesInput(data, "toggle_tool_details")) {
@@ -1812,8 +1895,29 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     return undefined;
   });
-  tui.start();
-  await exited.promise;
+  process.once("SIGHUP", handleSighup);
+  process.once("SIGTERM", handleSigterm);
+  try {
+    tui.start();
+    await exited.promise;
+  } catch (error) {
+    if (!stopping) {
+      await stop(false);
+      const cleanupError = await exited.promise.then(
+        () => undefined,
+        (failure: unknown) => failure,
+      );
+      if (cleanupError !== undefined) {
+        throw new AggregateError(
+          [error, cleanupError],
+          "The TUI failed during startup and cleanup.",
+        );
+      }
+    }
+    throw error;
+  } finally {
+    removeTerminationListeners();
+  }
 }
 
 function clipboardAssistantStatus(result: "copied" | "failed" | "unsupported" | null): string {

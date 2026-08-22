@@ -66,15 +66,26 @@ export class PermissionOverlay implements Component, Focusable {
           this.#selection === "deny" ? ">" : " "
         } Deny`
       : "  Allow unavailable    > Deny";
-    const content = [
-      this.#theme.toolTitle("Permission required"),
-      `${this.#interaction.effect} · ${subject}`,
-      "",
-      ...this.#preview.split("\n"),
-      "",
-      options,
-      "Enter confirm · ←/→ select · Esc deny · Ctrl+C abort",
-    ].map((line) => padLine(truncateToWidth(line, innerWidth), innerWidth));
+    const content = (
+      width < 60
+        ? [
+            this.#theme.toolTitle("Permission required"),
+            `${this.#interaction.effect} · ${subject}`,
+            options,
+            "Enter · Esc deny · Ctrl+C abort",
+            "",
+            ...this.#preview.split("\n"),
+          ]
+        : [
+            this.#theme.toolTitle("Permission required"),
+            `${this.#interaction.effect} · ${subject}`,
+            "",
+            ...this.#preview.split("\n"),
+            "",
+            options,
+            "Enter confirm · ←/→ select · Esc deny · Ctrl+C abort",
+          ]
+    ).map((line) => padLine(truncateToWidth(line, innerWidth), innerWidth));
     return [
       `┌${"─".repeat(Math.max(0, width - 2))}┐`,
       ...content.map((line) => `│ ${line} │`),

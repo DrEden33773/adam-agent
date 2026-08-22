@@ -42,6 +42,43 @@ test("real TUI starts on an authoritative empty session and restores the termina
   }
 });
 
+test.each([
+  { code: 143, signal: "SIGTERM" as const },
+  { code: 129, signal: "SIGHUP" as const },
+])(
+  "$signal closes authoritative state and restores the real terminal before exit",
+  async ({ code, signal }) => {
+    const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-tui-${signal.toLowerCase()}-`));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const controlRoot = join(testRoot, "control");
+    const terminalProcessMarker = join(testRoot, "terminal-process");
+    await mkdir(workspaceRoot);
+    await mkdir(controlRoot);
+
+    try {
+      const fixture = startFixture({
+        controlRoot,
+        external: true,
+        stateRoot,
+        terminalProcessMarker,
+        workspaceRoot,
+      });
+      await fixture.waitFor("Adam · New session");
+      await fixture.terminate(signal);
+      const result = await fixture.closed;
+      expect(result).toMatchObject({ code, signal: null, stderr: "" });
+      await expect(readFile(join(controlRoot, "tui-fixture-closed"), "utf8")).resolves.toBe(
+        "closed\n",
+      );
+      expect(result.stdout).toContain("\u001b[?2004l");
+      expect(result.stdout).toContain("\u001b[?25h");
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
 test("a real tool output artifact opens through the active chronology picker", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tool-artifact-page-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -501,13 +538,17 @@ test("the real terminal delivers Ctrl+C interruption without arming exit", async
     await rm(testRoot, { recursive: true, force: true });
   }
 });
-test("the real terminal preserves one bracketed multiline paste as editor input", async () => {
+test("the real terminal preserves one large bracketed multiline paste as editor input", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-bracketed-paste-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   const controlRoot = join(testRoot, "control");
   await mkdir(workspaceRoot);
   await mkdir(controlRoot);
+  const pasted = Array.from(
+    { length: 24 },
+    (_, index) => `line ${index + 1} · 中文 · e\u0301 · 👩🏽‍💻`,
+  ).join("\n");
 
   try {
     const fixture = startFixture({
@@ -518,19 +559,40 @@ test("the real terminal preserves one bracketed multiline paste as editor input"
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
-    fixture.write("\u001b[200~first pasted line\n第二行\u001b[201~");
-    await fixture.waitFor("第二行");
+    fixture.write(`\u001b[200~${pasted}\u001b[201~`);
+    await fixture.waitFor("[paste #1 +24 lines]");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(
-      "first pasted line\n第二行",
-    );
+    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(pasted);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
 });
 
-test("the real terminal redraws after a pseudo-terminal resize", async () => {
+test("the real terminal positions the IME cursor on CJK and grapheme cell boundaries", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-ime-cursor-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ external: true, stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("A中e\u0301👩🏽‍💻Z");
+    await fixture.waitFor("A中e");
+    for (const expectedColumn of [8, 6, 5, 3]) {
+      const beforeMove = fixture.output().length;
+      fixture.write("\u001b[D");
+      await fixture.waitForAfter(`\u001b[${expectedColumn}G`, beforeMove);
+    }
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the real terminal redraws through 40, 80, 120, and minimum-size layouts", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-resize-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -545,9 +607,18 @@ test("the real terminal redraws after a pseudo-terminal resize", async () => {
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
-    const beforeResize = fixture.output().length;
-    await fixture.resize(52, 18);
-    await fixture.waitForAfter("Adam · New session", beforeResize);
+    let beforeResize = fixture.output().length;
+    await fixture.resize(120, 40);
+    await fixture.waitForCompleteFrameAfter("context unavailable", beforeResize);
+    beforeResize = fixture.output().length;
+    await fixture.resize(40, 12);
+    await fixture.waitForCompleteFrameAfter("/help · Tab complete", beforeResize);
+    beforeResize = fixture.output().length;
+    await fixture.resize(39, 11);
+    await fixture.waitForCompleteFrameAfter("Terminal too small", beforeResize);
+    beforeResize = fixture.output().length;
+    await fixture.resize(80, 24);
+    await fixture.waitForCompleteFrameAfter("workspace · idle", beforeResize);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {

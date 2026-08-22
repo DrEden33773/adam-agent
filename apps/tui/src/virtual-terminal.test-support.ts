@@ -21,10 +21,25 @@ export class VirtualTerminal implements Terminal {
   #resizeHandler: (() => void) | undefined;
   #rows: number;
   #state: "new" | "started" | "stopped" = "new";
+  readonly #throwAfterStart: boolean;
+  readonly #throwAfterStop: boolean;
+  readonly #throwOnHideCursorAfterInput: string | undefined;
+  #throwOnNextHideCursor = false;
 
-  constructor(options: { readonly columns?: number; readonly rows?: number } = {}) {
+  constructor(
+    options: {
+      readonly columns?: number;
+      readonly rows?: number;
+      readonly throwAfterStart?: boolean;
+      readonly throwAfterStop?: boolean;
+      readonly throwOnHideCursorAfterInput?: string;
+    } = {},
+  ) {
     this.#columns = options.columns ?? 80;
     this.#rows = options.rows ?? 24;
+    this.#throwAfterStart = options.throwAfterStart ?? false;
+    this.#throwAfterStop = options.throwAfterStop ?? false;
+    this.#throwOnHideCursorAfterInput = options.throwOnHideCursorAfterInput;
     this.#input.on("data", (sequence) => this.#inputHandler?.(sequence));
     this.#input.on("paste", (content) => this.#inputHandler?.(`\u001b[200~${content}\u001b[201~`));
   }
@@ -50,6 +65,9 @@ export class VirtualTerminal implements Terminal {
     this.#inputHandler = onInput;
     this.#resizeHandler = onResize;
     this.#started.resolve();
+    if (this.#throwAfterStart) {
+      throw new Error("Injected terminal start failure after acquisition.");
+    }
   }
 
   stop(): void {
@@ -70,6 +88,9 @@ export class VirtualTerminal implements Terminal {
       );
     }
     this.#waiters.clear();
+    if (this.#throwAfterStop) {
+      throw new Error("Injected terminal stop failure after restoration.");
+    }
   }
 
   async drainInput(): Promise<void> {}
@@ -88,6 +109,9 @@ export class VirtualTerminal implements Terminal {
   input(data: string): void {
     if (this.#state !== "started" || this.#inputHandler === undefined) {
       throw new Error("VirtualTerminal accepts input only while started.");
+    }
+    if (data === this.#throwOnHideCursorAfterInput) {
+      this.#throwOnNextHideCursor = true;
     }
     this.#input.process(data);
   }
@@ -148,6 +172,12 @@ export class VirtualTerminal implements Terminal {
     });
   }
 
+  async nextSynchronizedFrameContaining(text: string, offset = 0): Promise<void> {
+    await this.nextOutputContaining(text, offset);
+    const occurrence = this.#output.indexOf(text, offset);
+    await this.nextOutputContaining("\u001b[?2026l", occurrence + text.length);
+  }
+
   moveBy(lines: number): void {
     if (lines > 0) {
       this.write(`\u001b[${lines}B`);
@@ -157,6 +187,10 @@ export class VirtualTerminal implements Terminal {
   }
 
   hideCursor(): void {
+    if (this.#throwOnNextHideCursor) {
+      this.#throwOnNextHideCursor = false;
+      throw new Error("Injected overlay cleanup failure before terminal restoration.");
+    }
     this.write("\u001b[?25l");
   }
 
