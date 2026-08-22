@@ -1,9 +1,11 @@
 import { access, watch, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   type ContextProfile,
   createPermissionPolicy,
+  createPresentationPreferences,
   createPresentationSession,
   createSessionLifecycle,
   type ModelDriver,
@@ -17,6 +19,7 @@ import {
   presentationHistoryPageSize,
 } from "@adam-agent/agent/internal-testing";
 import type { PresentationSession } from "@adam-agent/presentation";
+import type { Terminal } from "@earendil-works/pi-tui";
 import { type FixtureScenario, isFixtureScenario } from "./fixture-scenario.js";
 import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 import { type ClipboardAdapter, type DeadlineScheduler, runTui } from "./tui-app.js";
@@ -37,6 +40,24 @@ const alternateTargetIdentity: ModelTargetIdentity = {
   profileVersion: 1,
   certification: "experimental",
 };
+const launchTargetIdentities: readonly ModelTargetIdentity[] = [
+  {
+    targetId: "deepseek-v4-flash.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash",
+    route: "direct",
+    profileVersion: 2,
+    certification: "certified",
+  },
+  {
+    targetId: "deepseek-v4-pro.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-pro",
+    route: "direct",
+    profileVersion: 2,
+    certification: "certified",
+  },
+];
 const contextProfile: ContextProfile = {
   version: 1,
   contextWindowTokens: 32_768,
@@ -47,111 +68,159 @@ const contextProfile: ContextProfile = {
   estimatorVersion: 1,
 };
 
-const options = parseArguments(process.argv.slice(2));
-const modelTargets = createFixtureModelTargets(options);
-const lifecycle = createSessionLifecycle({
-  ...(options.scenario === "mcp-close-unconfirmed"
-    ? {
-        [mcpCloseConfirmation]: {
-          async confirm() {
-            throw new Error("Fixture close confirmation failed.");
-          },
-        },
-      }
-    : {}),
-  ...(modelTargets === undefined ? {} : { modelTargets }),
-  permissions: createPermissionPolicy({ allowedEffects: ["read"], askedEffects: ["write"] }),
-  stateRoot: options.stateRoot,
-  workspaceRoot: options.workspaceRoot,
-});
+export type TuiFixtureOptions = {
+  readonly controlRoot?: string;
+  readonly launch?: {
+    readonly configRoot?: string;
+    readonly seedTargetIds?: readonly string[];
+    readonly startupTargetId?: string;
+  };
+  readonly scenario?: FixtureScenario;
+  readonly stateRoot: string;
+  readonly terminal?: Terminal;
+  readonly terminalProcessMarker?: string;
+  readonly workspaceRoot: string;
+};
 
-try {
-  const previewBarrier = previewReadBarrier(options);
-  if (options.scenario === "session-selection-history") {
-    const selectable = await lifecycle.create({ targetIdentity });
-    await lifecycle.continue({
-      sessionId: selectable.sessionId,
-      input: { text: "Selected session prompt" },
-    });
+export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
+  if (options.terminalProcessMarker !== undefined) {
+    await writeFile(options.terminalProcessMarker, `${process.pid}\n`, "utf8");
   }
-  const resumedSessionId =
-    options.scenario === "resume" ||
-    options.scenario === "history" ||
-    options.scenario === "target-navigation" ||
-    options.scenario === "unsafe-history"
-      ? await lifecycle.create({ targetIdentity }).then(async (created) => {
-          if (options.scenario === "history") {
-            for (let index = 1; index <= 3; index += 1) {
+  const modelTargets = createFixtureModelTargets(options);
+  const lifecycle = createSessionLifecycle({
+    ...(options.scenario === "mcp-close-unconfirmed"
+      ? {
+          [mcpCloseConfirmation]: {
+            async confirm() {
+              throw new Error("Fixture close confirmation failed.");
+            },
+          },
+        }
+      : {}),
+    ...(modelTargets === undefined ? {} : { modelTargets }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"], askedEffects: ["write"] }),
+    stateRoot: options.stateRoot,
+    workspaceRoot: options.workspaceRoot,
+  });
+
+  try {
+    const previewBarrier = previewReadBarrier(options);
+    for (const seedTargetId of options.launch?.seedTargetIds ?? []) {
+      await lifecycle.create({ targetIdentity: requireLaunchTargetIdentity(seedTargetId) });
+    }
+    if (options.scenario === "session-selection-history") {
+      const selectable = await lifecycle.create({ targetIdentity });
+      await lifecycle.continue({
+        sessionId: selectable.sessionId,
+        input: { text: "Selected session prompt" },
+      });
+    }
+    const resumedSessionId =
+      options.scenario === "resume" ||
+      options.scenario === "history" ||
+      options.scenario === "target-navigation" ||
+      options.scenario === "unsafe-history"
+        ? await lifecycle.create({ targetIdentity }).then(async (created) => {
+            if (options.scenario === "history") {
+              for (let index = 1; index <= 3; index += 1) {
+                await lifecycle.continue({
+                  sessionId: created.sessionId,
+                  input: { text: `History prompt ${index}` },
+                });
+              }
+            } else if (options.scenario === "resume") {
               await lifecycle.continue({
                 sessionId: created.sessionId,
-                input: { text: `History prompt ${index}` },
+                input: { text: "Resume transcript" },
+              });
+            } else if (options.scenario === "target-navigation") {
+              await lifecycle.continue({
+                sessionId: created.sessionId,
+                input: { text: "Keep historical target identity" },
+              });
+            } else {
+              await lifecycle.continue({
+                sessionId: created.sessionId,
+                input: { text: "\u001b]52;c;c2NvcGU=\u0007Visible history\u202E" },
               });
             }
-          } else if (options.scenario === "resume") {
-            await lifecycle.continue({
-              sessionId: created.sessionId,
-              input: { text: "Resume transcript" },
-            });
-          } else if (options.scenario === "target-navigation") {
-            await lifecycle.continue({
-              sessionId: created.sessionId,
-              input: { text: "Keep historical target identity" },
-            });
-          } else {
-            await lifecycle.continue({
-              sessionId: created.sessionId,
-              input: { text: "\u001b]52;c;c2NvcGU=\u0007Visible history\u202E" },
-            });
-          }
-          return created.sessionId;
-        })
-      : undefined;
-  const presentation = await createPresentationSession(
-    options.scenario === "session-selection-history"
-      ? {
-          lifecycle,
-          ...(modelTargets === undefined ? {} : { modelTargets }),
-          openProject: true,
-          projectLabel: "workspace",
-          stateRoot: options.stateRoot,
-          workspaceRoot: options.workspaceRoot,
-        }
-      : resumedSessionId === undefined
+            return created.sessionId;
+          })
+        : undefined;
+    const presentation = await createPresentationSession(
+      options.launch !== undefined
         ? {
             lifecycle,
             ...(modelTargets === undefined ? {} : { modelTargets }),
+            openProject: true,
+            preferences: createPresentationPreferences({
+              environment: {
+                ...process.env,
+                ...(options.launch.configRoot === undefined
+                  ? {}
+                  : { XDG_CONFIG_HOME: options.launch.configRoot }),
+              },
+            }),
             projectLabel: "workspace",
             stateRoot: options.stateRoot,
-            targetIdentity,
             workspaceRoot: options.workspaceRoot,
-            ...(previewBarrier === undefined
-              ? {}
-              : { [presentationArtifactReadBarrier]: previewBarrier }),
           }
-        : {
-            lifecycle,
-            ...(modelTargets === undefined ? {} : { modelTargets }),
-            projectLabel: "workspace",
-            sessionId: resumedSessionId,
-            stateRoot: options.stateRoot,
-            workspaceRoot: options.workspaceRoot,
-            ...(options.scenario === "history" ? { [presentationHistoryPageSize]: 2 } : {}),
-            ...(previewBarrier === undefined
-              ? {}
-              : { [presentationArtifactReadBarrier]: previewBarrier }),
-          },
-  );
-  const clipboard = clipboardAdapter(options);
-  const deadlineScheduler = controlledDeadlineScheduler(options);
-  const tuiPresentation = observePermissionDecision(presentation, options);
-  await runTui({
-    ...(clipboard === undefined ? {} : { clipboard }),
-    ...(deadlineScheduler === undefined ? {} : { deadlineScheduler }),
-    presentation: tuiPresentation,
-    targetStatus: { targetId: targetIdentity.targetId, certification: "Certified" },
-  });
-} finally {
-  requireConfirmedLifecycleClose(await lifecycle.close());
+        : options.scenario === "session-selection-history"
+          ? {
+              lifecycle,
+              ...(modelTargets === undefined ? {} : { modelTargets }),
+              openProject: true,
+              projectLabel: "workspace",
+              stateRoot: options.stateRoot,
+              workspaceRoot: options.workspaceRoot,
+            }
+          : resumedSessionId === undefined
+            ? {
+                lifecycle,
+                ...(modelTargets === undefined ? {} : { modelTargets }),
+                projectLabel: "workspace",
+                stateRoot: options.stateRoot,
+                targetIdentity,
+                workspaceRoot: options.workspaceRoot,
+                ...(previewBarrier === undefined
+                  ? {}
+                  : { [presentationArtifactReadBarrier]: previewBarrier }),
+              }
+            : {
+                lifecycle,
+                ...(modelTargets === undefined ? {} : { modelTargets }),
+                projectLabel: "workspace",
+                sessionId: resumedSessionId,
+                stateRoot: options.stateRoot,
+                workspaceRoot: options.workspaceRoot,
+                ...(options.scenario === "history" ? { [presentationHistoryPageSize]: 2 } : {}),
+                ...(previewBarrier === undefined
+                  ? {}
+                  : { [presentationArtifactReadBarrier]: previewBarrier }),
+              },
+    );
+    const clipboard = clipboardAdapter(options);
+    const deadlineScheduler = controlledDeadlineScheduler(options);
+    const tuiPresentation = observePermissionDecision(presentation, options);
+    await runTui({
+      ...(clipboard === undefined ? {} : { clipboard }),
+      ...(deadlineScheduler === undefined ? {} : { deadlineScheduler }),
+      presentation: tuiPresentation,
+      ...(options.launch === undefined
+        ? {
+            targetStatus: {
+              targetId: targetIdentity.targetId,
+              certification: "Certified" as const,
+            },
+          }
+        : options.launch.startupTargetId === undefined
+          ? {}
+          : { startupTargetId: options.launch.startupTargetId }),
+      ...(options.terminal === undefined ? {} : { terminal: options.terminal }),
+    });
+  } finally {
+    requireConfirmedLifecycleClose(await lifecycle.close());
+  }
 }
 
 function observePermissionDecision(
@@ -187,6 +256,7 @@ function parseArguments(arguments_: readonly string[]): {
   readonly controlRoot?: string;
   readonly scenario?: FixtureScenario;
   readonly stateRoot: string;
+  readonly terminalProcessMarker?: string;
   readonly workspaceRoot: string;
 } {
   const stateRoot = optionValue(arguments_, "--state-root");
@@ -199,12 +269,18 @@ function parseArguments(arguments_: readonly string[]): {
     throw new TypeError("The TUI fixture scenario is invalid.");
   }
   const controlRoot = optionValue(arguments_, "--control-root");
+  const terminalProcessMarker = optionValue(arguments_, "--terminal-process-marker");
   return {
     ...(controlRoot === undefined ? {} : { controlRoot }),
     ...(scenario === undefined ? {} : { scenario }),
     stateRoot,
+    ...(terminalProcessMarker === undefined ? {} : { terminalProcessMarker }),
     workspaceRoot,
   };
+}
+
+if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
+  await runTuiFixture(parseArguments(process.argv.slice(2)));
 }
 
 function optionValue(arguments_: readonly string[], option: string): string | undefined {
@@ -214,13 +290,15 @@ function optionValue(arguments_: readonly string[], option: string): string | un
 
 function createFixtureModelTargets(options: {
   readonly controlRoot?: string;
+  readonly launch?: TuiFixtureOptions["launch"];
   readonly scenario?: FixtureScenario;
 }): ModelTargets | undefined {
   if (
-    options.scenario === undefined ||
-    options.scenario === "clipboard-success" ||
-    options.scenario === "clipboard-timeout" ||
-    options.scenario === "deadline"
+    options.launch === undefined &&
+    (options.scenario === undefined ||
+      options.scenario === "clipboard-success" ||
+      options.scenario === "clipboard-timeout" ||
+      options.scenario === "deadline")
   ) {
     return undefined;
   }
@@ -329,12 +407,25 @@ function createFixtureModelTargets(options: {
   return {
     async resolve(input) {
       const identity =
-        input.targetId === alternateTargetIdentity.targetId
+        launchTargetIdentities.find((candidate) => candidate.targetId === input.targetId) ??
+        (input.targetId === alternateTargetIdentity.targetId
           ? alternateTargetIdentity
-          : targetIdentity;
+          : targetIdentity);
       return { identity, driver: model, contextProfile };
     },
     async snapshot() {
+      if (options.launch !== undefined) {
+        return {
+          targets: launchTargetIdentities.map((identity) => ({
+            identity,
+            readiness: {
+              status: "available" as const,
+              credentialSource: "deterministic launch fixture",
+            },
+            contextProfile,
+          })),
+        };
+      }
       return {
         targets: [
           {
@@ -358,6 +449,14 @@ function createFixtureModelTargets(options: {
       };
     },
   };
+}
+
+function requireLaunchTargetIdentity(targetId: string): ModelTargetIdentity {
+  const identity = launchTargetIdentities.find((candidate) => candidate.targetId === targetId);
+  if (identity === undefined) {
+    throw new TypeError(`The launch fixture target ${targetId} is unavailable.`);
+  }
+  return identity;
 }
 
 function previewReadBarrier(options: {

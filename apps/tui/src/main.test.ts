@@ -1,36 +1,246 @@
-import { spawn } from "node:child_process";
-import {
-  access,
-  mkdir,
-  mkdtemp,
-  readdir,
-  readFile,
-  rm as remove,
-  watch,
-  writeFile,
-} from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { afterEach, expect, test } from "vitest";
-
-import type { FixtureScenario } from "./fixture-scenario.js";
-
-const fixturePath = fileURLToPath(new URL("../dist/test-fixture.js", import.meta.url));
-const productionPath = fileURLToPath(new URL("../dist/main.js", import.meta.url));
-const mcpFixturePath = fileURLToPath(
-  new URL("../../../packages/testkit/dist/mcp-stdio-server.fixture.js", import.meta.url),
-);
-const fixtureFailureMilliseconds = 30_000;
-const activeFixtures = new Set<Fixture>();
+import {
+  readFilesRecursively,
+  removeTuiFixtureRoot as rm,
+  waitForPath,
+} from "./tui-filesystem.test-support.js";
+import {
+  cleanupActiveTuiFixtures,
+  startTuiFixture as startFixture,
+} from "./tui-fixture.test-support.js";
 
 afterEach(async () => {
-  await cleanupActiveFixtures();
+  await cleanupActiveTuiFixtures();
 });
 
-test("real TUI starts on an authoritative empty session and restores the terminal on exit", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-startup-"));
+test("the production TUI selects an exact available target before creating an empty-project session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-target-picker-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    await fixture.waitFor("deepseek-v4-flash.direct");
+    await fixture.waitFor("deepseek-v4-pro.direct");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    await fixture.waitFor("deepseek-v4-flash.direct · Certified");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Escape closes the target picker before idle Ctrl+C can arm exit", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-target-picker-escape-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\u001b[27;1;27~");
+    fixture.write("\u0003");
+    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI creates from one valid saved exact default without opening the target picker", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-default-target-"));
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(configDirectory, "config.json"),
+    JSON.stringify({ schemaVersion: 1, defaultTargetId: "deepseek-v4-flash.direct" }),
+    { encoding: "utf8", mode: 0o600 },
+  );
+
+  try {
+    const fixture = startFixture({ launch: { configRoot }, stateRoot, workspaceRoot });
+    await fixture.waitFor("deepseek-v4-flash.direct · Certified");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("Adam · New session");
+    expect(result.stdout).not.toContain("Select an exact model target");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production target picker saves its focused exact target separately from session creation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-save-target-"));
+  const configRoot = join(testRoot, "config");
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ launch: { configRoot }, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\u0013");
+    await fixture.waitFor("Saved deepseek-v4-flash.direct as the default");
+    const configurationPath = join(configRoot, "adam-agent", "config.json");
+    await waitForPath(configurationPath);
+    expect(await readFile(configurationPath, "utf8")).toBe(
+      `${JSON.stringify({
+        schemaVersion: 1,
+        defaultTargetId: "deepseek-v4-flash.direct",
+      })}\n`,
+    );
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).not.toContain("Adam · New session");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production target picker shows malformed configuration diagnostics without losing direct targets", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-invalid-target-config-"));
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+  await mkdir(workspaceRoot);
+  await writeFile(join(configDirectory, "config.json"), "{not-json\n", {
+    encoding: "utf8",
+    mode: 0o600,
+  });
+
+  try {
+    const fixture = startFixture({ launch: { configRoot }, stateRoot, workspaceRoot });
+    await fixture.waitFor("deepseek-v4-flash.direct");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("The saved default target configuration is invalid.");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI shows the project session picker before any target resolution", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-session-picker-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: { seedTargetIds: ["deepseek-v4-flash.direct"] },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("deepseek-v4-flash.direct");
+    await fixture.waitFor("Select a project session");
+    fixture.write("\u001b[27;1;27~");
+    fixture.write("\u0003");
+    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("Select a project session");
+    expect(result.stdout).toContain("New Session");
+    expect(result.stdout).not.toContain("Select an exact model target");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an explicit target still waits for explicit New Session when project sessions exist", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-explicit-target-session-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: {
+        seedTargetIds: ["deepseek-v4-flash.direct"],
+        startupTargetId: "deepseek-v4-pro.direct",
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("deepseek-v4-");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result.stdout).toContain("Select a project session");
+    expect(result.stdout).not.toContain("Adam · New session");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production session picker opens the exact focused existing session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-select-session-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: { seedTargetIds: ["deepseek-v4-flash.direct"] },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select a project session");
+    const beforeSelection = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForAfter("Adam · New session", beforeSelection);
+    await fixture.waitForAfter("deepseek-v4-flash.direct · Certified", beforeSelection);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production session picker requires explicit New Session before target selection", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-new-session-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: { seedTargetIds: ["deepseek-v4-flash.direct"] },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select a project session");
+    const beforeNewSession = fixture.output().length;
+    fixture.write("\u001b[B\r");
+    await fixture.waitForAfter("Select an exact model target", beforeNewSession);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production editor renames the active session through canonical Presentation truth", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-name-session-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
@@ -38,38 +248,13 @@ test("real TUI starts on an authoritative empty session and restores the termina
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
+    const beforeRename = fixture.output().length;
+    fixture.write("/name Release triage\r");
+    await fixture.waitForAfter("Release triage", beforeRename);
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).toContain("Adam · New session");
-    expect(result.stdout).toContain("fake.local · Certified");
-    expect(result.stdout).toContain("\u001b[?2004h");
-    expect(result.stdout).toContain("\u001b[?2004l");
-    expect(result.stdout).toContain("\u001b[?2026h");
-    expect(result.stdout).toContain("\u001b[?2026l");
-    expect(result.stdout).toContain("\u001b[?25h");
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI entry exposes its usage contract", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-help-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({
-      program: { arguments: ["--help"], cwd: workspaceRoot, entrypoint: productionPath },
-      stateRoot,
-      workspaceRoot,
-    });
-    const result = await fixture.closed;
-    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).toContain(
-      "Usage: adam-agent-tui [--target <exact-target-id> | --resume <session-id>]",
-    );
+    expect(result.stdout).toContain("Adam · Release triage");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -598,7 +783,12 @@ test("resume rebuilds prompt history from active authoritative chronology", asyn
   await mkdir(controlRoot);
 
   try {
-    const fixture = startFixture({ controlRoot, scenario: "history", stateRoot, workspaceRoot });
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "history",
+      stateRoot,
+      workspaceRoot,
+    });
     await fixture.waitFor("History prompt 3");
     fixture.write("\u001b[A");
     fixture.write("\u0011");
@@ -909,6 +1099,40 @@ test("Help remains locally available while a model run is active", async () => {
   }
 });
 
+test("editor submission renders Working then a streamed Markdown answer from real Presentation truth", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-streaming-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  const testEnvironment = process.env as NodeJS.ProcessEnv & { NO_COLOR?: string };
+  const inheritedNoColor = testEnvironment.NO_COLOR;
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  Reflect.deleteProperty(testEnvironment, "NO_COLOR");
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Explain streaming\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await fixture.waitFor("Working");
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitFor("Streaming answer");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("\u001b[48;2;49;50;68m");
+    expect(result.stdout).toContain("\u001b[38;2;243;139;168m");
+  } finally {
+    if (inheritedNoColor === undefined) {
+      Reflect.deleteProperty(testEnvironment, "NO_COLOR");
+    } else {
+      testEnvironment.NO_COLOR = inheritedNoColor;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("slash Session remains read-only and available while a model run is active", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-active-session-facts-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -1006,443 +1230,6 @@ test("permission preempts Help and restores its exact page after settlement", as
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout.slice(beforeParent)).toContain("Adam Help");
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI entry rejects conflicting target and resume arguments", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-invalid-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({
-      program: {
-        arguments: [
-          "--resume",
-          "session-id",
-          "--target",
-          "deepseek-v4-flash.direct",
-          "--state-root",
-          stateRoot,
-        ],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    const result = await fixture.closed;
-    expect(result).toMatchObject({ code: 1, signal: null, stderr: "" });
-    expect(result.stdout).toContain("--resume and --target cannot be combined.");
-    expect(result.stdout).toContain("Usage: adam-agent-tui");
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI entry reaches a credentialed exact-target session without a model call", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-startup-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({
-      program: {
-        arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Adam · New session");
-    await fixture.waitFor("deepseek-v4-flash.direct · Certified");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI selects an exact available target before creating an empty-project session", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-target-picker-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({
-      program: {
-        arguments: ["--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Select an exact model target");
-    await fixture.waitFor("deepseek-v4-flash.direct");
-    await fixture.waitFor("deepseek-v4-pro.direct");
-    fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
-    await fixture.waitFor("deepseek-v4-flash.direct · Certified");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("Escape closes the target picker before idle Ctrl+C can arm exit", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-target-picker-escape-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({
-      program: {
-        arguments: ["--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Select an exact model target");
-    fixture.write("\u001b[27;1;27~");
-    fixture.write("\u0003");
-    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI creates from one valid saved exact default without opening the target picker", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-default-target-"));
-  const configRoot = join(testRoot, "config");
-  const configDirectory = join(configRoot, "adam-agent");
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
-  await mkdir(workspaceRoot);
-  await writeFile(
-    join(configDirectory, "config.json"),
-    JSON.stringify({ schemaVersion: 1, defaultTargetId: "deepseek-v4-flash.direct" }),
-    { encoding: "utf8", mode: 0o600 },
-  );
-
-  try {
-    const fixture = startFixture({
-      program: {
-        arguments: ["--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: {
-          DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
-          XDG_CONFIG_HOME: configRoot,
-        },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("deepseek-v4-flash.direct · Certified");
-    fixture.write("\u0011");
-    const result = await fixture.closed;
-    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).toContain("Adam · New session");
-    expect(result.stdout).not.toContain("Select an exact model target");
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production target picker saves its focused exact target separately from session creation", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-save-target-"));
-  const configRoot = join(testRoot, "config");
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({
-      program: {
-        arguments: ["--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: {
-          DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
-          XDG_CONFIG_HOME: configRoot,
-        },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Select an exact model target");
-    fixture.write("\u0013");
-    await fixture.waitFor("Saved deepseek-v4-flash.direct as the default");
-    const configurationPath = join(configRoot, "adam-agent", "config.json");
-    await waitForPath(configurationPath);
-    expect(await readFile(configurationPath, "utf8")).toBe(
-      `${JSON.stringify({
-        schemaVersion: 1,
-        defaultTargetId: "deepseek-v4-flash.direct",
-      })}\n`,
-    );
-    fixture.write("\u0011");
-    const result = await fixture.closed;
-    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).not.toContain("Adam · New session");
-    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production target picker shows malformed configuration diagnostics without losing direct targets", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-invalid-target-config-"));
-  const configRoot = join(testRoot, "config");
-  const configDirectory = join(configRoot, "adam-agent");
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
-  await mkdir(workspaceRoot);
-  await writeFile(join(configDirectory, "config.json"), "{not-json\n", {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-
-  try {
-    const fixture = startFixture({
-      program: {
-        arguments: ["--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: {
-          DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
-          XDG_CONFIG_HOME: configRoot,
-        },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("deepseek-v4-flash.direct");
-    fixture.write("\u0011");
-    const result = await fixture.closed;
-    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).toContain("The saved default target configuration is invalid.");
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI shows the project session picker before any target resolution", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-session-picker-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const seed = startFixture({
-      program: {
-        arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await seed.waitFor("Adam · New session");
-    seed.write("\u0011");
-    await expect(seed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-
-    const fixture = startFixture({
-      program: {
-        arguments: ["--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("deepseek-v4-flash.direct");
-    await fixture.waitFor("Select a project session");
-    fixture.write("\u001b[27;1;27~");
-    fixture.write("\u0003");
-    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
-    fixture.write("\u0011");
-    const result = await fixture.closed;
-    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).toContain("Select a project session");
-    expect(result.stdout).toContain("New Session");
-    expect(result.stdout).not.toContain("Select an exact model target");
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("an explicit target still waits for explicit New Session when project sessions exist", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-explicit-target-session-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const seed = startFixture({
-      program: {
-        arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await seed.waitFor("Adam · New session");
-    seed.write("\u0011");
-    await seed.closed;
-
-    const fixture = startFixture({
-      program: {
-        arguments: ["--target", "deepseek-v4-pro.direct", "--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("deepseek-v4-");
-    fixture.write("\u0011");
-    const result = await fixture.closed;
-    expect(result.stdout).toContain("Select a project session");
-    expect(result.stdout).not.toContain("Adam · New session");
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production session picker opens the exact focused existing session", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-select-session-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const seed = startFixture({
-      program: {
-        arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await seed.waitFor("Adam · New session");
-    seed.write("\u0011");
-    await seed.closed;
-
-    const fixture = startFixture({
-      program: {
-        arguments: ["--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Select a project session");
-    const beforeSelection = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForAfter("Adam · New session", beforeSelection);
-    await fixture.waitForAfter("deepseek-v4-flash.direct · Certified", beforeSelection);
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production session picker requires explicit New Session before target selection", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-new-session-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const seed = startFixture({
-      program: {
-        arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await seed.waitFor("Adam · New session");
-    seed.write("\u0011");
-    await seed.closed;
-
-    const fixture = startFixture({
-      program: {
-        arguments: ["--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Select a project session");
-    const beforeNewSession = fixture.output().length;
-    fixture.write("\u001b[B\r");
-    await fixture.waitForAfter("Select an exact model target", beforeNewSession);
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production editor renames the active session through canonical Presentation truth", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-name-session-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({
-      program: {
-        arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
-        cwd: workspaceRoot,
-        entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-      },
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Adam · New session");
-    const beforeRename = fixture.output().length;
-    fixture.write("/name Release triage\r");
-    await fixture.waitForAfter("Release triage", beforeRename);
-    fixture.write("\u0011");
-    const result = await fixture.closed;
-    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).toContain("Adam · Release triage");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -1863,74 +1650,6 @@ test("the branch compatibility alias selects an authoritative complete boundary"
   }
 });
 
-test("slash Fork restores the selected boundary prompt in the child editor", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-fork-alias-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({ controlRoot, scenario: "history", stateRoot, workspaceRoot });
-    await fixture.waitFor("History prompt 3");
-    const beforeFork = fixture.output().length;
-    fixture.write("/fork \r");
-    await fixture.waitForAfter("Fork from a boundary", beforeFork);
-    for (const [page, newlyLoadedPrompt] of ["History prompt 2", "History prompt 1"].entries()) {
-      for (let step = 0; step <= page; step += 1) {
-        const beforeMove = fixture.output().length;
-        fixture.write("\u001b[B");
-        await fixture.waitForAfter("Load Older", beforeMove);
-      }
-      const beforeLoad = fixture.output().length;
-      fixture.write("\r");
-      await fixture.waitForAfter(newlyLoadedPrompt, beforeLoad);
-    }
-    const beforeSearch = fixture.output().length;
-    fixture.write("prompt1");
-    await fixture.waitForAfter("Search: prompt1", beforeSearch);
-    await fixture.waitForAfter("History prompt 1", beforeSearch);
-    const beforeSelection = fixture.output().length;
-    fixture.write("\r");
-    const outcome = await Promise.race([
-      fixture.waitForAfter("Adam · Branch of ", beforeSelection).then(() => "fork" as const),
-      fixture.waitForAfter("History answer.", beforeSelection).then(() => "model" as const),
-    ]);
-    fixture.write("\u0011");
-    await fixture.closed;
-    expect(outcome).toBe("fork");
-    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("History prompt 1");
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("slash Clone branches at the latest complete boundary with an empty editor", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-clone-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({ controlRoot, scenario: "history", stateRoot, workspaceRoot });
-    await fixture.waitFor("History prompt 3");
-    const beforeClone = fixture.output().length;
-    fixture.write("/clone \r");
-    await fixture.waitForAfter("Adam · Branch of ", beforeClone);
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-    await expect(access(join(controlRoot, "clipboard.txt"))).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/clone"');
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
 test("slash Model and Target share an immutable-target transition page", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-target-navigation-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -1961,212 +1680,6 @@ test("slash Model and Target share an immutable-target transition page", async (
     expect(durableState).toContain('"targetId":"fake.other"');
     expect(durableState).not.toContain('"text":"/model"');
     expect(durableState).not.toContain('"text":"/target"');
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the real TUI MCP wizard preserves every separate B8 authority step", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-mcp-wizard-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  const spawnMarker = join(testRoot, "mcp-spawned");
-  const closeMarker = join(testRoot, "mcp-closed");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-    "utf8",
-  );
-
-  try {
-    const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
-    fixture.write("/mc");
-    await fixture.waitFor("/mc");
-    fixture.write("\t");
-    await fixture.waitFor("/mcp");
-    const afterTyping = fixture.output().length;
-    fixture.write("\r");
-    const outcome = await Promise.race([
-      fixture
-        .waitForAfter("MCP authority · workspace confirmation required", afterTyping)
-        .then(() => "wizard" as const),
-      fixture.waitForAfter("Working", afterTyping).then(() => "prompt" as const),
-    ]);
-    expect(outcome).toBe("wizard");
-    fixture.write("\r");
-    await fixture.waitFor("MCP authority · server approval required");
-    fixture.write("\r");
-    await fixture.waitFor("MCP authority · activation required");
-    fixture.write("\r");
-    await fixture.waitFor("MCP authority · tool selection required");
-    await waitForPath(spawnMarker);
-    fixture.write("1");
-    fixture.write("\u001b[B");
-    fixture.write("c");
-    await fixture.waitFor("MCP authority · profile committed");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-    await waitForPath(closeMarker);
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI resumes and explicitly reactivates one committed MCP profile", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-mcp-reactivation-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const spawnMarker = join(testRoot, "mcp-spawned");
-  const closeMarker = join(testRoot, "mcp-closed");
-  await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-    "utf8",
-  );
-  const program = {
-    arguments: ["--state-root", stateRoot],
-    cwd: workspaceRoot,
-    entrypoint: productionPath,
-    environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
-  } as const;
-
-  try {
-    const seed = startFixture({ program, stateRoot, workspaceRoot });
-    await seed.waitFor("Select an exact model target");
-    seed.write("\r");
-    await seed.waitFor("Adam · New session");
-    seed.write("/mc");
-    await seed.waitFor("/mc");
-    seed.write("\t");
-    await seed.waitFor("/mcp");
-    seed.write("\r");
-    await seed.waitFor("MCP authority · workspace confirmation required");
-    seed.write("\r");
-    await seed.waitFor("MCP authority · server approval required");
-    seed.write("\r");
-    await seed.waitFor("MCP authority · activation required");
-    seed.write("\r");
-    await seed.waitFor("MCP authority · tool selection required");
-    seed.write("1");
-    seed.write("\u001b[B");
-    seed.write("c");
-    await seed.waitFor("MCP authority · profile committed");
-    seed.write("\u0011");
-    await expect(seed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-
-    const resumed = startFixture({ program, stateRoot, workspaceRoot });
-    await resumed.waitFor("Select a project session");
-    resumed.write("\r");
-    await resumed.waitFor("Adam · New session");
-    resumed.write("/mc");
-    await resumed.waitFor("/mc");
-    resumed.write("\t");
-    await resumed.waitFor("/mcp");
-    resumed.write("\r");
-    await resumed.waitFor("MCP authority · profile reactivation required");
-    resumed.write("\r");
-    await resumed.waitFor("MCP authority · profile committed");
-    resumed.write("\u0011");
-    await expect(resumed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the TUI process fails visibly when MCP shutdown cannot be confirmed", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-mcp-close-unconfirmed-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const spawnMarker = join(testRoot, "mcp-spawned");
-  const closeMarker = join(testRoot, "mcp-closed");
-  await mkdir(workspaceRoot);
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: process.execPath,
-          args: [mcpFixturePath, spawnMarker, closeMarker],
-        },
-      },
-    }),
-    "utf8",
-  );
-
-  try {
-    const fixture = startFixture({
-      scenario: "mcp-close-unconfirmed",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Adam · New session");
-    fixture.write("/mc");
-    await fixture.waitFor("/mc");
-    fixture.write("\t");
-    await fixture.waitFor("/mcp");
-    fixture.write("\r");
-    await fixture.waitFor("MCP authority · workspace confirmation required");
-    fixture.write("\r");
-    await fixture.waitFor("MCP authority · server approval required");
-    fixture.write("\r");
-    await fixture.waitFor("MCP authority · activation required");
-    fixture.write("\r");
-    await fixture.waitFor("MCP authority · tool selection required");
-    fixture.write("\u0011");
-    const result = await fixture.closed;
-    expect(result).toMatchObject({ code: 1, signal: null });
-    expect(`${result.stdout}${result.stderr}`).toContain("MCP shutdown could not be confirmed.");
-    await waitForPath(closeMarker);
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("editor submission renders Working then a streamed Markdown answer from real Presentation truth", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-streaming-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      scenario: "streaming",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Adam · New session");
-    fixture.write("Explain streaming\r");
-    await fixture.waitFor("Explain streaming");
-    await fixture.waitFor("Working");
-    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await fixture.waitFor("Streaming answer");
-    fixture.write("\u0011");
-    const result = await fixture.closed;
-    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).toContain("\u001b[48;2;49;50;68m");
-    expect(result.stdout).toContain("\u001b[38;2;243;139;168m");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -2290,69 +1803,6 @@ test("Ctrl+C cancels one active run and repeated input cannot arm exit while set
   }
 });
 
-test("idle Ctrl+C preserves a CJK draft and copies it only on the confirming press", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-retained-draft-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-  const draft = "保留草稿 🚀";
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      scenario: "clipboard-success",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Adam · New session");
-    fixture.write(draft);
-    await fixture.waitFor(draft);
-    fixture.write("\u001b[99;5:1u");
-    await fixture.waitFor("Press Ctrl+C again within two seconds to exit · draft will be copied");
-    expect(fixture.output()).not.toContain("clipboard copied");
-    fixture.write("\u0003");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(draft);
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("Kitty Ctrl+C repeat and release phases cannot confirm an armed exit", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-kitty-phases-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      scenario: "clipboard-success",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Adam · New session");
-    fixture.write("草稿");
-    await fixture.waitFor("草稿");
-    fixture.write("\u001b[99;5:1u");
-    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
-    fixture.write("\u001b[99;5:2u\u001b[99;5:3ux");
-    await fixture.waitFor("草稿x");
-    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).rejects.toMatchObject({
-      code: "ENOENT",
-    });
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe("草稿x");
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
 test("the injected deadline causally expires an idle Ctrl+C exit arm", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-exit-expiry-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -2436,29 +1886,6 @@ test("a pending clipboard adapter fails closed from the injected deadline", asyn
   }
 });
 
-test("unsupported clipboard is reported after terminal restoration without blocking exit", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-clipboard-unsupported-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
-    fixture.write("draft without clipboard");
-    await fixture.waitFor("draft without clipboard");
-    fixture.write("\u0011");
-    const result = await fixture.closed;
-    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).toContain("Clipboard unavailable; draft was not copied.");
-    expect(result.stdout.indexOf("\u001b[?2004l")).toBeLessThan(
-      result.stdout.indexOf("Clipboard unavailable; draft was not copied."),
-    );
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
 test("a restarted TUI resumes an existing authoritative transcript", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-resume-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -2505,269 +1932,66 @@ test("untrusted model terminal controls are rendered as inert text", async () =>
     await rm(testRoot, { recursive: true, force: true });
   }
 });
+test("slash Fork restores the selected boundary prompt in the child editor", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-fork-alias-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
 
-type FixtureResult = {
-  readonly code: number | null;
-  readonly signal: NodeJS.Signals | null;
-  readonly stderr: string;
-  readonly stdout: string;
-};
-
-type Fixture = {
-  readonly cleanup: () => Promise<void>;
-  readonly closed: Promise<FixtureResult>;
-  readonly output: () => string;
-  readonly waitFor: (text: string) => Promise<void>;
-  readonly waitForAfter: (text: string, offset: number) => Promise<void>;
-  readonly write: (text: string) => void;
-};
-
-function startFixture(input: {
-  readonly controlRoot?: string;
-  readonly noColor?: boolean;
-  readonly program?: {
-    readonly arguments: readonly string[];
-    readonly cwd: string;
-    readonly entrypoint: string;
-    readonly environment?: Readonly<Record<string, string>>;
-  };
-  readonly scenario?: FixtureScenario;
-  readonly stateRoot: string;
-  readonly workspaceRoot: string;
-}): Fixture {
-  const arguments_ =
-    input.program === undefined
-      ? [
-          process.execPath,
-          fixturePath,
-          "--state-root",
-          input.stateRoot,
-          "--workspace-root",
-          input.workspaceRoot,
-          ...(input.controlRoot === undefined ? [] : ["--control-root", input.controlRoot]),
-          ...(input.scenario === undefined ? [] : ["--scenario", input.scenario]),
-        ]
-      : [process.execPath, input.program.entrypoint, ...input.program.arguments];
-  const command = arguments_.map(shellQuote).join(" ");
-  const { NO_COLOR: _noColor, ...environment } = process.env;
-  const child = spawn("script", ["-qfec", command, "/dev/null"], {
-    ...(input.program === undefined ? {} : { cwd: input.program.cwd }),
-    detached: true,
-    env: {
-      ...environment,
-      ...input.program?.environment,
-      ...(input.noColor === true ? { NO_COLOR: "1" } : {}),
-      TERM: "xterm-256color",
-    },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  child.stdout.setEncoding("utf8");
-  child.stderr.setEncoding("utf8");
-  let stdout = "";
-  let stderr = "";
-  let processClosed = false;
-  const outputWaiters = new Set<{
-    readonly offset: number;
-    readonly text: string;
-    readonly resolve: () => void;
-    readonly reject: (error: Error) => void;
-    readonly guard: ReturnType<typeof setTimeout>;
-  }>();
-  let failureGuard: ReturnType<typeof setTimeout> | undefined;
-  const processResult = Promise.withResolvers<{
-    readonly code: number | null;
-    readonly signal: NodeJS.Signals | null;
-  }>();
-  child.stdout.on("data", (chunk: string) => {
-    stdout += chunk;
-    for (const waiter of outputWaiters) {
-      if (stdout.indexOf(waiter.text, waiter.offset) >= 0) {
-        clearTimeout(waiter.guard);
-        outputWaiters.delete(waiter);
-        waiter.resolve();
-      }
-    }
-  });
-  child.stderr.on("data", (chunk: string) => {
-    stderr += chunk;
-  });
-  child.once("close", (code, signal) => {
-    processClosed = true;
-    processResult.resolve({ code, signal });
-  });
-  child.once("error", (error) => processResult.reject(error));
-
-  const signalProcessGroup = (signal: NodeJS.Signals): void => {
-    if (child.pid === undefined || processClosed) {
-      return;
-    }
-    try {
-      process.kill(-child.pid, signal);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
-        child.kill(signal);
-      }
-    }
-  };
-  const awaitCloseWithGuard = async (milliseconds: number): Promise<boolean> => {
-    if (processClosed) {
-      return true;
-    }
-    const guard = Promise.withResolvers<boolean>();
-    const timeout = setTimeout(() => guard.resolve(false), milliseconds);
-    timeout.unref();
-    try {
-      return await Promise.race([processResult.promise.then(() => true), guard.promise]);
-    } finally {
-      clearTimeout(timeout);
-    }
-  };
-  const cleanup = async (): Promise<void> => {
-    if (!processClosed) {
-      signalProcessGroup("SIGTERM");
-      if (!(await awaitCloseWithGuard(1_000))) {
-        signalProcessGroup("SIGKILL");
-      }
-    }
-    await processResult.promise.catch(() => undefined);
-  };
-  let timedOut = false;
-  const result = new Promise<FixtureResult>((resolve, reject) => {
-    processResult.promise.then(
-      (settled) => {
-        if (timedOut) {
-          reject(new Error("The real TUI process did not reach startup and causal close."));
-        } else {
-          resolve({ ...settled, stderr, stdout });
-        }
-      },
-      (error: unknown) => reject(error),
-    );
-    failureGuard = setTimeout(() => {
-      timedOut = true;
-      void cleanup();
-    }, fixtureFailureMilliseconds);
-    failureGuard.unref();
-  });
-  void result.then(
-    () => {
-      activeFixtures.delete(fixture);
-    },
-    () => {
-      activeFixtures.delete(fixture);
-    },
-  );
-  const settleOutputWaiters = () => {
-    if (failureGuard !== undefined) {
-      clearTimeout(failureGuard);
-    }
-    for (const waiter of outputWaiters) {
-      clearTimeout(waiter.guard);
-      waiter.reject(new Error(`The TUI process closed before rendering ${waiter.text}.`));
-    }
-    outputWaiters.clear();
-  };
-  void processResult.promise.then(settleOutputWaiters, settleOutputWaiters);
-  const fixture: Fixture = {
-    cleanup,
-    closed: result,
-    output: () => stdout,
-    waitFor(text) {
-      return waitForAfter(text, 0);
-    },
-    waitForAfter,
-    write(text) {
-      child.stdin.write(text);
-    },
-  };
-  function waitForAfter(text: string, offset: number): Promise<void> {
-    if (stdout.indexOf(text, offset) >= 0) {
-      return Promise.resolve();
-    }
-    return new Promise<void>((resolve, reject) => {
-      const waiter = {
-        offset,
-        text,
-        resolve,
-        reject,
-        guard: setTimeout(() => {
-          outputWaiters.delete(waiter);
-          void cleanup().then(
-            () => reject(new Error(`The real TUI process did not render ${text}.`)),
-            () => reject(new Error(`The real TUI process did not render ${text}.`)),
-          );
-        }, fixtureFailureMilliseconds),
-      };
-      outputWaiters.add(waiter);
-    });
-  }
-  activeFixtures.add(fixture);
-  return fixture;
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", `'"'"'`)}'`;
-}
-
-async function cleanupActiveFixtures(): Promise<void> {
-  await Promise.all([...activeFixtures].map((fixture) => fixture.cleanup()));
-  activeFixtures.clear();
-}
-
-async function rm(path: string, options: { readonly force: boolean; readonly recursive: boolean }) {
-  await cleanupActiveFixtures();
-  await remove(path, options);
-}
-
-async function waitForPath(path: string): Promise<void> {
-  const directory = join(path, "..");
-  const filename = path.slice(directory.length + 1);
-  const watcher = watch(directory);
-  const failure = Promise.withResolvers<never>();
-  const guard = setTimeout(
-    () => failure.reject(new Error(`The fixture did not create ${filename}.`)),
-    fixtureFailureMilliseconds,
-  );
   try {
-    if (
-      await access(path).then(
-        () => true,
-        () => false,
-      )
-    ) {
-      return;
-    }
-    await Promise.race([
-      (async () => {
-        for await (const event of watcher) {
-          if (
-            event.filename === filename &&
-            (await access(path).then(
-              () => true,
-              () => false,
-            ))
-          ) {
-            return;
-          }
-        }
-      })(),
-      failure.promise,
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "history",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("History prompt 3");
+    const beforeFork = fixture.output().length;
+    fixture.write("/fork \r");
+    await fixture.waitForAfter("Fork from a boundary", beforeFork);
+    const beforeSelection = fixture.output().length;
+    fixture.write("\r");
+    const outcome = await Promise.race([
+      fixture.waitForAfter("Adam · Branch of ", beforeSelection).then(() => "fork" as const),
+      fixture.waitForAfter("History answer.", beforeSelection).then(() => "model" as const),
     ]);
+    fixture.write("\u0011");
+    await fixture.closed;
+    expect(outcome).toBe("fork");
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("History prompt 3");
   } finally {
-    clearTimeout(guard);
-    await watcher.return?.();
+    await rm(testRoot, { recursive: true, force: true });
   }
-}
+});
 
-async function readFilesRecursively(root: string): Promise<string> {
-  const contents: string[] = [];
-  for (const entry of await readdir(root, { withFileTypes: true })) {
-    const path = join(root, entry.name);
-    if (entry.isDirectory()) {
-      contents.push(await readFilesRecursively(path));
-    } else if (entry.isFile()) {
-      contents.push(await readFile(path, "utf8"));
-    }
+test("slash Clone branches at the latest complete boundary with an empty editor", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-clone-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "history",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("History prompt 3");
+    const beforeClone = fixture.output().length;
+    fixture.write("/clone \r");
+    await fixture.waitForAfter("Adam · Branch of ", beforeClone);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(access(join(controlRoot, "clipboard.txt"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/clone"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
   }
-  return contents.join("\n");
-}
+});
