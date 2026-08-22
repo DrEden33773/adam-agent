@@ -606,6 +606,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     tools:
       providedOptions.tools ??
       createCodingToolRegistry({
+        artifactStore: createLazyArtifactStore(
+          join(effectiveSessionStateRoot(providedOptions.stateRoot), "artifacts"),
+        ),
         workspaceRoot: providedOptions.workspaceRoot,
         ...(providedOptions.stateRoot === undefined
           ? {}

@@ -84,6 +84,14 @@ export async function copyDraftToClipboard(
   scheduler: DeadlineScheduler,
 ): Promise<"copied" | "failed" | "unsupported" | null> {
   const text = boundedUtf8(draft, 64 * 1024);
+  return copyTextToClipboard(text, adapter, scheduler);
+}
+
+export async function copyTextToClipboard(
+  text: string,
+  adapter: ClipboardAdapter | undefined,
+  scheduler: DeadlineScheduler,
+): Promise<"copied" | "failed" | "unsupported" | null> {
   if (text.length === 0) {
     return null;
   }

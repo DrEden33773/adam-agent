@@ -509,6 +509,33 @@ test("the idle footer exposes Registry-driven interaction hints", async () => {
   }
 });
 
+test("the footer exposes authoritative project context and run facts", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-footer-facts-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      scenario: "artifact-backed-assistant",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Produce an artifact-backed answer\r");
+    await fixture.waitFor("Adam · Streaming session");
+    const beforeCompaction = fixture.output().length;
+    fixture.write("Continue after the large answer\r");
+    await fixture.waitForAfter("Context compacted · window 1", beforeCompaction);
+    await fixture.waitForAfter("context · estimated · idle", beforeCompaction);
+    expect(fixture.output()).toMatch(/workspace · \d+\/32768 context · estimated · idle/u);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("Tab accepts a fuzzy slash-command suggestion from the Registry", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-fuzzy-slash-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -1698,6 +1725,167 @@ test("a real read tool is rendered as a bounded Pi-style tool card", async () =>
   }
 });
 
+test("Ctrl+O toggles bounded authoritative tool details", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tool-details-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "README.md"), "alpha\nbeta\n", "utf8");
+
+  try {
+    const fixture = startFixture({ scenario: "read", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Read the README\r");
+    await fixture.waitFor("Read complete");
+    expect(fixture.output()).not.toContain("provider model response");
+    const beforeExpand = fixture.output().length;
+    fixture.write("\u000f");
+    await fixture.waitForAfter("read_file · read · completed · replay safe", beforeExpand);
+    await fixture.waitForAfter("provider model response", beforeExpand);
+    await fixture.waitForAfter("duration unavailable", beforeExpand);
+    const beforeCollapse = fixture.output().length;
+    fixture.write("\u000f");
+    await fixture.waitForAfter("11 bytes", beforeCollapse);
+    expect(fixture.output().slice(beforeCollapse)).not.toContain("provider model response");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Copy copies the last inline assistant response without persisting a prompt", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-copy-assistant-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  await writeFile(join(workspaceRoot, "README.md"), "copy fixture\n", "utf8");
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "read", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Read the README\r");
+    await fixture.waitFor("Read complete");
+    const beforeCopy = fixture.output().length;
+    fixture.write("/copy \r");
+    const outcome = await Promise.race([
+      waitForPath(join(controlRoot, "clipboard.txt")).then(() => "copied" as const),
+      fixture.waitForAfter("Unknown command /copy", beforeCopy).then(() => "unknown" as const),
+    ]);
+    expect(outcome).toBe("copied");
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("Read complete.");
+    await fixture.waitForAfter("Copied last assistant response.", beforeCopy);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/copy"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Copy never truncates a large inline assistant response", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-copy-large-assistant-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "copy-large-assistant",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Produce a large inline response\r");
+    await fixture.waitFor("Exact copy tail.");
+    fixture.write("/copy \r");
+    await waitForPath(join(controlRoot, "clipboard.txt"));
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe(
+      `${"c".repeat(65 * 1024)}\nExact copy tail.`,
+    );
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Copy reads and copies the complete last artifact-backed assistant response", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-copy-artifact-assistant-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "artifact-backed-assistant",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Produce an artifact-backed answer\r");
+    await fixture.waitFor("Assistant response stored as artifact");
+    fixture.write("/copy \r");
+    await waitForPath(join(controlRoot, "clipboard.txt"));
+    const copied = await readFile(join(controlRoot, "clipboard.txt"), "utf8");
+    expect(Buffer.byteLength(copied, "utf8")).toBe(270_057);
+    expect(copied).toMatch(/^Assistant artifact page one/u);
+    expect(copied).toContain("Assistant artifact page two");
+    expect(copied.endsWith("b")).toBe(true);
+    expect(await readFile(join(controlRoot, "artifact-read-1"), "utf8")).toBe("0\n");
+    await expect(access(join(controlRoot, "artifact-read-2"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Copy loads older active chronology to find the last assistant response", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-copy-older-assistant-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "copy-older-assistant",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Later copy prompt two");
+    expect(fixture.output()).not.toContain("Older copy answer.");
+    const beforeCopy = fixture.output().length;
+    fixture.write("/copy \r");
+    const outcome = await Promise.race([
+      waitForPath(join(controlRoot, "clipboard.txt")).then(() => "copied" as const),
+      fixture
+        .waitForAfter("No assistant response is available to copy.", beforeCopy)
+        .then(() => "missing" as const),
+    ]);
+    expect(outcome).toBe("copied");
+    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("Older copy answer.");
+    await fixture.waitForAfter("Copied last assistant response.", beforeCopy);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("a shell tool card uses the accepted dollar-command grammar", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-shell-card-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -1709,6 +1897,196 @@ test("a shell tool card uses the accepted dollar-command grammar", async () => {
     await fixture.waitFor("Adam · New session");
     fixture.write("Show shell card\r");
     await fixture.waitFor("$ printf shell-card-fixture");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an artifact-backed assistant response remains visible in the transcript", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-assistant-artifact-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      scenario: "artifact-backed-assistant",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Produce an artifact-backed answer\r");
+    await fixture.waitFor("Adam · Streaming session");
+    expect(fixture.output()).toContain("Assistant response stored as artifact");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Artifacts opens one bounded assistant artifact page", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-assistant-artifact-page-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      scenario: "artifact-backed-assistant",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Produce an artifact-backed answer\r");
+    await fixture.waitFor("Adam · Streaming session");
+    const beforeArtifacts = fixture.output().length;
+    fixture.write("/artifacts \r");
+    const opened = await Promise.race([
+      fixture.waitForAfter("Session artifacts", beforeArtifacts).then(() => "opened" as const),
+      fixture
+        .waitForAfter("Unknown command /artifacts", beforeArtifacts)
+        .then(() => "unknown" as const),
+    ]);
+    expect(opened).toBe("opened");
+    await fixture.waitForAfter("assistant response", beforeArtifacts);
+    fixture.write("\r");
+    await fixture.waitForAfter("Artifact detail", beforeArtifacts);
+    const detailOutput = fixture.output().slice(beforeArtifacts);
+    expect(detailOutput).toContain("Assistant artifact page one");
+    expect(detailOutput).not.toContain("Assistant artifact page two");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Artifacts loads artifact references from older active chronology", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-artifact-history-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "artifact-history", stateRoot, workspaceRoot });
+    await fixture.waitFor("Later history answer.");
+    fixture.write("/artifacts \r");
+    await fixture.waitFor("Session artifacts");
+    await fixture.waitFor("Load older chronology");
+    const beforeFirstPage = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForAfter("Load older chronology", beforeFirstPage);
+    fixture.write("\r");
+    await fixture.waitFor("assistant response");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PageDown reads the next bounded assistant artifact page", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-assistant-artifact-next-page-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "artifact-backed-assistant",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Produce an artifact-backed answer\r");
+    await fixture.waitFor("Assistant response stored as artifact");
+    fixture.write("/artifacts \r");
+    await fixture.waitFor("Session artifacts");
+    fixture.write("\r");
+    await waitForPath(join(controlRoot, "artifact-read-1"));
+    await fixture.waitFor("1-16384 of 270057 bytes");
+    const beforeNextPage = fixture.output().length;
+    fixture.write("\u001b[6~");
+    await waitForPath(join(controlRoot, "artifact-read-2"));
+    expect(await readFile(join(controlRoot, "artifact-read-2"), "utf8")).toBe("16384\n");
+    await fixture.waitForAfter("16385-32768 of 270057 bytes", beforeNextPage);
+    await fixture.waitForAfter("Assistant artifact page two", beforeNextPage);
+    const beforePreviousPage = fixture.output().length;
+    fixture.write("\u001b[5~");
+    await waitForPath(join(controlRoot, "artifact-read-3"));
+    expect(await readFile(join(controlRoot, "artifact-read-3"), "utf8")).toBe("0\n");
+    await fixture.waitForAfter("1-16384 of 270057 bytes", beforePreviousPage);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Escape keeps a late artifact page response from restoring stale detail", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-artifact-page-race-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "artifact-page-race",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Produce an artifact-backed answer\r");
+    await fixture.waitFor("Assistant response stored as artifact");
+    fixture.write("/artifacts \r");
+    await fixture.waitFor("Session artifacts");
+    fixture.write("\r");
+    await fixture.waitFor("Artifact detail");
+    fixture.write("\u001b[6~");
+    await waitForPath(join(controlRoot, "page-read-pending"));
+    const beforeEscape = fixture.output().length;
+    fixture.write("\u001b");
+    await fixture.waitForAfter("type search · Enter inspect", beforeEscape);
+    await writeFile(join(controlRoot, "release-page-read"), "release\n", "utf8");
+    await waitForPath(join(controlRoot, "artifact-read-2-settled"));
+    fixture.write("no-such-artifact");
+    await fixture.waitFor("Search: no-such-artifact");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("completed durable-context compaction renders an explicit chronology marker", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-compaction-marker-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      scenario: "artifact-backed-assistant",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Produce an artifact-backed answer\r");
+    await fixture.waitFor("Assistant response stored as artifact");
+    await fixture.waitFor("Adam · Streaming session");
+    const beforeCompaction = fixture.output().length;
+    fixture.write("Continue after the large answer\r");
+    await fixture.waitForAfter("Context compacted · window 1", beforeCompaction);
+    await fixture.waitForAfter("Assistant response stored as artifact", beforeCompaction);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -1733,6 +2111,39 @@ test("a mutation permission shows its canonical diff and Enter allows the exact 
     fixture.write("\r");
     await fixture.waitFor("Edit complete");
     await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("after\n");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Diffs reopens a settled mutation preview from authoritative chronology", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-settled-diff-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "edit.txt"), "before\n", "utf8");
+
+  try {
+    const fixture = startFixture({ scenario: "mutation", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Edit the file\r");
+    await fixture.waitFor("Permission required");
+    fixture.write("\r");
+    await fixture.waitFor("Edit complete");
+    const beforeDiffs = fixture.output().length;
+    fixture.write("/diffs \r");
+    const opened = await Promise.race([
+      fixture.waitForAfter("Settled diffs", beforeDiffs).then(() => "opened" as const),
+      fixture.waitForAfter("Unknown command /diffs", beforeDiffs).then(() => "unknown" as const),
+    ]);
+    expect(opened).toBe("opened");
+    await fixture.waitForAfter("edit change preview", beforeDiffs);
+    fixture.write("\r");
+    await fixture.waitForAfter("Diff detail", beforeDiffs);
+    await fixture.waitForAfter("-before", beforeDiffs);
+    await fixture.waitForAfter("+after", beforeDiffs);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {

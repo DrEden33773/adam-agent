@@ -1,7 +1,12 @@
 export const fixtureScenarios = [
+  "artifact-backed-assistant",
+  "artifact-page-race",
+  "artifact-history",
   "cancellation",
   "clipboard-timeout",
   "clipboard-success",
+  "copy-large-assistant",
+  "copy-older-assistant",
   "deadline",
   "history",
   "mcp-close-unconfirmed",
@@ -15,6 +20,7 @@ export const fixtureScenarios = [
   "skill-selection",
   "streaming",
   "target-navigation",
+  "tool-artifact",
   "unsafe-history",
   "unsafe-output",
 ] as const;

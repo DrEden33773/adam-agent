@@ -184,6 +184,91 @@ export async function readFileArtifact(options: {
   }
 }
 
+export async function readFileArtifactRange(options: {
+  readonly root: string;
+  readonly id: string;
+  readonly expectedByteCount: number;
+  readonly offset: number;
+  readonly maximumBytes: number;
+}): Promise<
+  | {
+      readonly bytes: Uint8Array;
+      readonly totalByteCount: number;
+      readonly eof: boolean;
+    }
+  | undefined
+> {
+  const root = resolve(options.root);
+  if (!root.startsWith("/")) {
+    throw new TypeError("The artifact root must resolve to an absolute path.");
+  }
+  if (
+    !Number.isSafeInteger(options.expectedByteCount) ||
+    options.expectedByteCount < 0 ||
+    !Number.isSafeInteger(options.offset) ||
+    options.offset < 0 ||
+    !Number.isSafeInteger(options.maximumBytes) ||
+    options.maximumBytes <= 0
+  ) {
+    throw new RangeError("The artifact range must use bounded nonnegative safe integers.");
+  }
+  const digest = parseArtifactId(options.id);
+  let file: Awaited<ReturnType<typeof open>>;
+  try {
+    file = await open(join(root, digest), "r");
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") {
+      return undefined;
+    }
+    throw error;
+  }
+  try {
+    const { size } = await file.stat();
+    if (
+      !Number.isSafeInteger(size) ||
+      size !== options.expectedByteCount ||
+      options.offset > size
+    ) {
+      throw new Error("The artifact size does not match its reference.");
+    }
+    const hash = createHash("sha256");
+    const retained: Buffer[] = [];
+    const retainedEnd = Math.min(size, options.offset + options.maximumBytes);
+    const readBuffer = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    while (position < size) {
+      const { bytesRead } = await file.read(
+        readBuffer,
+        0,
+        Math.min(readBuffer.length, size - position),
+        position,
+      );
+      if (bytesRead === 0) {
+        throw new Error("The artifact ended before its recorded byte count.");
+      }
+      const bytes = readBuffer.subarray(0, bytesRead);
+      hash.update(bytes);
+      const overlapStart = Math.max(position, options.offset);
+      const overlapEnd = Math.min(position + bytesRead, retainedEnd);
+      if (overlapStart < overlapEnd) {
+        retained.push(Buffer.from(bytes.subarray(overlapStart - position, overlapEnd - position)));
+      }
+      position += bytesRead;
+    }
+    if (hash.digest("hex") !== digest) {
+      throw new Error("The content-addressed artifact does not match its ID.");
+    }
+    const bytes = Buffer.concat(retained);
+    return {
+      bytes,
+      totalByteCount: size,
+      eof: options.offset + bytes.byteLength >= size,
+    };
+  } finally {
+    await file.close();
+  }
+}
+
 async function readFileWithinLimit(path: string, maximumBytes: number): Promise<Buffer> {
   if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
     throw new RangeError("The artifact read limit must be a nonnegative safe integer.");

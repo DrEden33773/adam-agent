@@ -1,5 +1,6 @@
 import type {
   ActiveSessionDisplay,
+  ArtifactReference,
   PresentationSession,
   RepositoryInstructionsDisplay,
   TargetDisplay,
@@ -19,12 +20,18 @@ import {
   type TUI,
   TuiMainScreen,
 } from "@earendil-works/pi-tui";
+import {
+  ArtifactNavigator,
+  activeChronologyArtifacts,
+  activeChronologyDiffs,
+} from "./artifact-navigator.js";
 import { ChronologyPicker, completeChronologyBoundaries } from "./chronology-picker.js";
 import { AdamAutocompleteProvider } from "./command-autocomplete.js";
 import { adamCommandRegistry } from "./command-registry.js";
 import {
   type ClipboardAdapter,
   copyDraftToClipboard,
+  copyTextToClipboard,
   type DeadlineScheduler,
   ExitArm,
   LegacyDuplicateGuard,
@@ -112,6 +119,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const exitArm = new ExitArm(deadlineScheduler, () => requestPolicyRender());
   const legacyDuplicateGuard = new LegacyDuplicateGuard(deadlineScheduler);
   let previousRunActive: boolean | undefined;
+  let toolDetailsExpanded = false;
   let statusMessage: string | null = null;
   let permission:
     | {
@@ -179,6 +187,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly close: () => void;
         readonly hide: () => void;
         readonly navigator: HelpNavigator;
+      }
+    | undefined;
+  let artifactNavigator:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
       }
     | undefined;
   const selectedSkills = new Set<string>();
@@ -255,6 +269,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       chronologyPicker = undefined;
       resourceReloadPicker?.hide();
       resourceReloadPicker = undefined;
+      artifactNavigator?.hide();
+      artifactNavigator = undefined;
       if (active !== null) {
         sessionPickerDismissed = false;
         targetPickerDismissed = false;
@@ -556,9 +572,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         );
         transcript.addChild(user);
         previousWasAssistant = false;
-      } else if (item.type === "assistant_message" && item.text !== null) {
+      } else if (item.type === "assistant_message") {
         transcript.addChild(new Spacer(1));
-        transcript.addChild(new Markdown(safeTerminalText(item.text), 0, 0, theme.markdown));
+        if (item.text !== null) {
+          transcript.addChild(new Markdown(safeTerminalText(item.text), 0, 0, theme.markdown));
+        } else if (item.artifact !== null) {
+          transcript.addChild(
+            new Text(
+              theme.muted(
+                `Assistant response stored as artifact · ${item.artifact.byteCount} bytes · /artifacts to inspect`,
+              ),
+            ),
+          );
+        }
         previousWasAssistant = true;
       } else if (item.type === "tool_call") {
         const tool = new Box(1, 1, theme.toolBackground);
@@ -577,8 +603,51 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         if (detail !== null) {
           tool.addChild(new Text(theme.toolOutput(safeTerminalText(detail))));
         }
+        if (toolDetailsExpanded) {
+          const replay = item.source?.replay ?? "unavailable";
+          tool.addChild(
+            new Text(theme.muted(safeTerminalText(`safe summary · ${detail ?? "unavailable"}`))),
+          );
+          tool.addChild(
+            new Text(
+              theme.muted(
+                safeTerminalText(
+                  `${item.qualifiedName} · ${item.effect ?? "effect unknown"} · ${item.status} · replay ${replay} · duration ${item.durationMs === null ? "unavailable" : `${item.durationMs} ms`}`,
+                ),
+              ),
+            ),
+          );
+          if (item.source !== null) {
+            tool.addChild(
+              new Text(
+                theme.muted(
+                  safeTerminalText(
+                    `provider model response · response ${item.source.responseSequence} · arguments ${item.source.argumentsDigest} · definition ${item.source.definitionDigest ?? "unknown"}`,
+                  ),
+                ),
+              ),
+            );
+          }
+          tool.addChild(
+            new Text(
+              theme.muted(
+                `${item.artifacts.length} artifact${item.artifacts.length === 1 ? "" : "s"} · change preview ${item.changePreviewRef === null ? "none" : "available"}`,
+              ),
+            ),
+          );
+        }
         transcript.addChild(new Spacer(1));
         transcript.addChild(tool);
+        previousWasAssistant = false;
+      } else if (item.type === "compaction_marker") {
+        transcript.addChild(new Spacer(1));
+        transcript.addChild(
+          new Text(
+            theme.muted(
+              `Context compacted · window ${item.windowNumber} · through ${item.sourceThrough} · retained from ${item.retainedFrom}`,
+            ),
+          ),
+        );
         previousWasAssistant = false;
       } else if (item.type === "session_notice") {
         const message =
@@ -680,7 +749,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         : active === null
           ? theme.muted("Choose an exact model target to create a session")
           : theme.muted(
-              `${safeTerminalText(active.session.targetId)} · ${
+              `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling)}\n${safeTerminalText(active.session.targetId)} · ${
                 state.authoritative.targets.items.find(
                   (target) => target.targetId === active.session.targetId,
                 )?.certification ??
@@ -840,6 +909,96 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     tui.setFocus(picker);
     tui.requestRender();
   };
+  const showArtifactNavigator = (diffs: boolean, expectedSessionId: string): void => {
+    const current = options.presentation.getState().authoritative.active;
+    if (current?.session.id !== expectedSessionId) {
+      statusMessage = "The active session changed before its output picker opened.";
+      renderState();
+      return;
+    }
+    const entries = diffs
+      ? activeChronologyDiffs(current.transcript.items)
+      : activeChronologyArtifacts(current.transcript.items);
+    const olderCursor = current.transcript.olderCursor;
+    if (entries.length === 0 && olderCursor === null) {
+      statusMessage = diffs
+        ? "No settled diffs are visible in the active chronology."
+        : "No artifacts are visible in the active chronology.";
+      renderState();
+      return;
+    }
+    artifactNavigator?.hide();
+    let handle: { hide(): void } | undefined;
+    const close = () => {
+      navigator.cancelPendingRead();
+      handle?.hide();
+      artifactNavigator = undefined;
+      tui.setFocus(editor);
+      tui.requestRender();
+    };
+    const navigator = new ArtifactNavigator({
+      ...(diffs ? { detailTitle: "Diff detail", title: "Settled diffs" } : {}),
+      entries,
+      onChange: () => tui.requestRender(),
+      onClose: close,
+      ...(olderCursor === null
+        ? {}
+        : {
+            onLoadOlder() {
+              navigator.setNotice("Loading one older authoritative chronology page…");
+              void options.presentation
+                .dispatch({ type: "load_older_transcript", before: olderCursor })
+                .then((receipt) => {
+                  if (artifactNavigator?.close !== close) {
+                    return;
+                  }
+                  if (receipt.status === "rejected") {
+                    navigator.setNotice(receipt.message);
+                    return;
+                  }
+                  artifactNavigator.hide();
+                  artifactNavigator = undefined;
+                  showArtifactNavigator(diffs, expectedSessionId);
+                })
+                .catch(() => {
+                  if (artifactNavigator?.close === close) {
+                    navigator.setNotice("The older chronology page could not be loaded.");
+                  }
+                });
+            },
+          }),
+      async onRead(artifact, range) {
+        const receipt = await options.presentation.dispatch({
+          type: "read_artifact",
+          artifact,
+          range,
+        });
+        if (receipt.status === "rejected" || receipt.resource === null) {
+          throw new Error(
+            receipt.status === "rejected" ? receipt.message : "The artifact page is unavailable.",
+          );
+        }
+        return receipt.resource;
+      },
+      theme,
+    });
+    handle = tui.showOverlay(navigator, {
+      width: "90%",
+      minWidth: 36,
+      maxHeight: "80%",
+      margin: 1,
+    });
+    artifactNavigator = {
+      close,
+      hide: () => {
+        navigator.cancelPendingRead();
+        handle?.hide();
+      },
+    };
+    statusMessage = null;
+    tui.setFocus(navigator);
+    tui.requestRender();
+  };
   editor.onSubmit = (text) => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
@@ -900,6 +1059,43 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       editor.setText("");
       editor.disableSubmit = false;
       renderState();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "copy" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
+      editor.setText("");
+      editor.disableSubmit = false;
+      statusMessage = "Finding last assistant response for copy…";
+      renderState();
+      void copyLastAssistantResponse({
+        clipboard: options.clipboard,
+        deadlineScheduler,
+        presentation: options.presentation,
+        sessionId: active.session.id,
+      }).then(
+        (resultMessage) => {
+          statusMessage = resultMessage;
+          renderState();
+        },
+        () => {
+          statusMessage = "The last assistant response could not be read safely for copy.";
+          renderState();
+        },
+      );
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      (parsedCommand.command.id === "artifacts" || parsedCommand.command.id === "diffs") &&
+      parsedCommand.argumentsText.length === 0
+    ) {
+      editor.setText("");
+      editor.disableSubmit = false;
+      const diffs = parsedCommand.command.id === "diffs";
+      showArtifactNavigator(diffs, active.session.id);
       return;
     }
     if (
@@ -1519,6 +1715,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     pathPicker?.hide();
     mcpWizard?.hide();
     helpNavigator?.hide();
+    artifactNavigator?.hide();
     targetPicker?.hide();
     permission?.hide();
     working.stop();
@@ -1547,6 +1744,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       void stop(true);
       return { consume: true };
     }
+    if (adamCommandRegistry.matchesInput(data, "toggle_tool_details")) {
+      toolDetailsExpanded = !toolDetailsExpanded;
+      renderState();
+      return { consume: true };
+    }
     if (adamCommandRegistry.matchesInput(data, "interrupt")) {
       if (isKeyRepeat(data) || isKeyRelease(data)) {
         return { consume: true };
@@ -1557,6 +1759,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       const closeOverlay =
         permission === undefined
           ? (helpNavigator?.close ??
+            artifactNavigator?.close ??
             mcpWizard?.close ??
             pathPicker?.close ??
             skillPalette?.close ??
@@ -1611,6 +1814,102 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   });
   tui.start();
   await exited.promise;
+}
+
+function clipboardAssistantStatus(result: "copied" | "failed" | "unsupported" | null): string {
+  return result === "copied"
+    ? "Copied last assistant response."
+    : result === "unsupported"
+      ? "Clipboard unavailable; assistant response was not copied."
+      : "Clipboard copy failed; assistant response was not copied.";
+}
+
+async function copyLastAssistantResponse(options: {
+  readonly clipboard: ClipboardAdapter | undefined;
+  readonly deadlineScheduler: DeadlineScheduler;
+  readonly presentation: PresentationSession;
+  readonly sessionId: string;
+}): Promise<string> {
+  const assistant = await findLastAssistantResponse(options.presentation, options.sessionId);
+  if (assistant === undefined) {
+    return "No assistant response is available to copy.";
+  }
+  if (assistant.text !== null) {
+    return clipboardAssistantStatus(
+      await copyTextToClipboard(assistant.text, options.clipboard, options.deadlineScheduler),
+    );
+  }
+  if (assistant.artifact === null) {
+    return "The last assistant response is unavailable to copy.";
+  }
+  const text = await readCompleteArtifact(options.presentation, assistant.artifact);
+  return clipboardAssistantStatus(
+    await copyTextToClipboard(text, options.clipboard, options.deadlineScheduler),
+  );
+}
+
+async function findLastAssistantResponse(
+  presentation: PresentationSession,
+  sessionId: string,
+): Promise<
+  | Extract<
+      ActiveSessionDisplay["transcript"]["items"][number],
+      { readonly type: "assistant_message" }
+    >
+  | undefined
+> {
+  while (true) {
+    const active = presentation.getState().authoritative.active;
+    if (active?.session.id !== sessionId) {
+      throw new TypeError("The active session changed while locating its last assistant response.");
+    }
+    const assistant = active.transcript.items.findLast((item) => item.type === "assistant_message");
+    if (assistant !== undefined) {
+      return assistant;
+    }
+    const before = active.transcript.olderCursor;
+    if (before === null) {
+      return undefined;
+    }
+    const receipt = await presentation.dispatch({ type: "load_older_transcript", before });
+    if (receipt.status === "rejected") {
+      throw new TypeError("The older transcript page is unavailable.");
+    }
+    const refreshed = presentation.getState().authoritative.active;
+    if (refreshed?.session.id !== sessionId || refreshed.transcript.olderCursor === before) {
+      throw new TypeError("The older transcript page did not advance.");
+    }
+  }
+}
+
+async function readCompleteArtifact(
+  presentation: PresentationSession,
+  artifact: ArtifactReference,
+): Promise<string> {
+  const receipt = await presentation.dispatch({ type: "read_artifact", artifact, range: null });
+  if (
+    receipt.status === "rejected" ||
+    receipt.resource === null ||
+    receipt.resource.offset !== 0 ||
+    receipt.resource.byteCount !== artifact.byteCount ||
+    receipt.resource.totalByteCount !== artifact.byteCount ||
+    !receipt.resource.eof ||
+    receipt.resource.nextRange !== null
+  ) {
+    throw new TypeError("The complete artifact is unavailable for copy.");
+  }
+  return receipt.resource.text;
+}
+
+function footerContextText(active: ActiveSessionDisplay): string {
+  const context = active.context;
+  if (context === null) {
+    return "context unavailable";
+  }
+  if (context.active.source === "unknown") {
+    return `?/${context.profile.contextWindowTokens} context · unknown`;
+  }
+  return `${context.active.tokens}/${context.profile.contextWindowTokens} context · ${context.active.source}`;
 }
 
 function toolStatusText(
