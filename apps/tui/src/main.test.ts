@@ -1323,7 +1323,7 @@ test("session selection rebuilds prompt history from the selected authoritative 
     await fixture.waitFor("Search: Selected");
     const beforeSelection = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitForAfter("Selected session prompt", beforeSelection);
+    await fixture.waitForCompleteFrameAfter("Selected session prompt", beforeSelection);
     fixture.write("\u001b[A");
     fixture.write("\u0011");
     const result = await fixture.closed;

@@ -12,6 +12,7 @@ import {
   stat,
   writeFile,
 } from "node:fs/promises";
+import { createServer, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1493,43 +1494,63 @@ test("SessionLifecycle causally reaps a package-bootstrap process group after it
   const workspaceRoot = join(testRoot, "workspace");
   const packageManagerCliPath = join(testRoot, "package-manager.cjs");
   const descendantMarker = join(testRoot, "descendant.pid");
-  await mkdir(workspaceRoot);
-  await writeFile(
-    packageManagerCliPath,
-    [
-      'const { spawn } = require("node:child_process");',
-      `const descendant = spawn(process.execPath, ["-e", ${JSON.stringify(
-        `process.on("SIGTERM", () => {}); require("node:fs").writeFileSync(${JSON.stringify(
-          descendantMarker,
-        )}, String(process.pid)); setInterval(() => undefined, 60000);`,
-      )}], { stdio: "ignore" });`,
-      "if (descendant.pid === undefined) process.exit(2);",
-      'process.on("SIGTERM", () => process.exit(0));',
-      "setInterval(() => undefined, 60000);",
-    ].join("\n"),
-  );
-  await writeFile(
-    join(workspaceRoot, ".mcp.json"),
-    JSON.stringify({
-      mcpServers: {
-        fixture: {
-          command: "npx",
-          args: ["-y", "@adam-agent/mcp-fixture@1.2.3"],
-        },
-      },
-    }),
-  );
-
-  const manualBootstrapDeadline = createManualMcpIdleScheduler();
-  const lifecycle = createSessionLifecycle({
-    [mcpBootstrapScheduler]: manualBootstrapDeadline.scheduler,
-    [mcpPackageManagerCliPath]: packageManagerCliPath,
-    [mcpPackageRegistryUrl]: "http://127.0.0.1:1",
-    stateRoot,
-    workspaceRoot,
+  const descendantSocketPath = join(testRoot, "descendant.sock");
+  const descendantConnected = Promise.withResolvers<void>();
+  const descendantClosed = Promise.withResolvers<"closed">();
+  let descendantConnection: Socket | undefined;
+  const descendantServer = createServer((socket) => {
+    descendantConnection = socket;
+    descendantConnected.resolve();
+    socket.once("close", () => descendantClosed.resolve("closed"));
   });
+  let lifecycle: ReturnType<typeof createSessionLifecycle> | undefined;
   let descendantPid: number | undefined;
-  try {
+  const bodyOutcome = await (async () => {
+    await mkdir(workspaceRoot);
+    await new Promise<void>((resolve, reject) => {
+      const rejectListen = (error: Error) => reject(error);
+      descendantServer.once("error", rejectListen);
+      descendantServer.listen(descendantSocketPath, () => {
+        descendantServer.off("error", rejectListen);
+        resolve();
+      });
+    });
+    await writeFile(
+      packageManagerCliPath,
+      [
+        'const { spawn } = require("node:child_process");',
+        `const descendant = spawn(process.execPath, ["-e", ${JSON.stringify(
+          `const socket = require("node:net").createConnection(${JSON.stringify(
+            descendantSocketPath,
+          )}, () => require("node:fs").writeFileSync(${JSON.stringify(
+            descendantMarker,
+          )}, String(process.pid))); socket.on("error", () => {}); process.on("SIGTERM", () => {}); setInterval(() => undefined, 60000);`,
+        )}], { stdio: "ignore" });`,
+        "if (descendant.pid === undefined) process.exit(2);",
+        'process.on("SIGTERM", () => process.exit(0));',
+        "setInterval(() => undefined, 60000);",
+      ].join("\n"),
+    );
+    await writeFile(
+      join(workspaceRoot, ".mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          fixture: {
+            command: "npx",
+            args: ["-y", "@adam-agent/mcp-fixture@1.2.3"],
+          },
+        },
+      }),
+    );
+
+    const manualBootstrapDeadline = createManualMcpIdleScheduler();
+    lifecycle = createSessionLifecycle({
+      [mcpBootstrapScheduler]: manualBootstrapDeadline.scheduler,
+      [mcpPackageManagerCliPath]: packageManagerCliPath,
+      [mcpPackageRegistryUrl]: "http://127.0.0.1:1",
+      stateRoot,
+      workspaceRoot,
+    });
     const created = await lifecycle.create({ targetIdentity });
     if (created.mcp === undefined) {
       throw new Error("The fixture requires an MCP configuration snapshot.");
@@ -1561,26 +1582,59 @@ test("SessionLifecycle causally reaps a package-bootstrap process group after it
       (error: unknown) => ({ status: "rejected" as const, error }),
     );
     await descendantSpawned;
+    await descendantConnected.promise;
     descendantPid = Number.parseInt(await readFile(descendantMarker, "utf8"), 10);
     await manualBootstrapDeadline.advanceBy(120_000);
     const outcome = await observedActivation;
-    let descendantAbsent = false;
-    try {
-      process.kill(descendantPid, 0);
-    } catch (error) {
-      descendantAbsent = error instanceof Error && "code" in error && error.code === "ESRCH";
-    }
+    const descendantState = await withFailureGuard(
+      descendantClosed.promise,
+      5_000,
+      "The package-bootstrap descendant did not close its causal connection.",
+    );
 
-    expect({ outcome, descendantAbsent }).toMatchObject({
+    expect({ outcome, descendantState }).toMatchObject({
       outcome: { status: "rejected", error: { code: "mcp_bootstrap_failed" } },
-      descendantAbsent: true,
+      descendantState: "closed",
     });
-  } finally {
+  })().then(
+    () => ({ status: "fulfilled" as const }),
+    (error: unknown) => ({ status: "rejected" as const, error }),
+  );
+
+  const failures: unknown[] = bodyOutcome.status === "rejected" ? [bodyOutcome.error] : [];
+  const attemptCleanup = async (operation: () => void | Promise<void>): Promise<void> => {
+    try {
+      await operation();
+    } catch (error) {
+      failures.push(error);
+    }
+  };
+  await attemptCleanup(async () => {
+    await lifecycle?.close();
+  });
+  await attemptCleanup(() => {
     if (descendantPid !== undefined) {
       bestEffortKillProcess(descendantPid);
     }
-    await lifecycle.close();
-    await rm(testRoot, { recursive: true, force: true });
+    descendantConnection?.destroy();
+  });
+  await attemptCleanup(async () => {
+    if (descendantServer.listening) {
+      await new Promise<void>((resolve, reject) => {
+        descendantServer.close((error) => (error === undefined ? resolve() : reject(error)));
+      });
+    }
+  });
+  await attemptCleanup(() => rm(testRoot, { recursive: true, force: true }));
+
+  if (failures.length === 1) {
+    throw failures[0];
+  }
+  if (failures.length > 1) {
+    throw new AggregateError(
+      failures,
+      "The package-bootstrap descendant fixture had multiple causal failures.",
+    );
   }
 });
 

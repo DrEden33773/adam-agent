@@ -609,16 +609,16 @@ test("the real terminal redraws through 40, 80, 120, and minimum-size layouts", 
     await fixture.waitFor("Adam · New session");
     let beforeResize = fixture.output().length;
     await fixture.resize(120, 40);
-    await fixture.waitForAfter("context unavailable", beforeResize);
+    await fixture.waitForCompleteFrameAfter("context unavailable", beforeResize);
     beforeResize = fixture.output().length;
     await fixture.resize(40, 12);
-    await fixture.waitForAfter("/help · Tab complete", beforeResize);
+    await fixture.waitForCompleteFrameAfter("/help · Tab complete", beforeResize);
     beforeResize = fixture.output().length;
     await fixture.resize(39, 11);
-    await fixture.waitForAfter("Terminal too small", beforeResize);
+    await fixture.waitForCompleteFrameAfter("Terminal too small", beforeResize);
     beforeResize = fixture.output().length;
     await fixture.resize(80, 24);
-    await fixture.waitForAfter("workspace · idle", beforeResize);
+    await fixture.waitForCompleteFrameAfter("workspace · idle", beforeResize);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
