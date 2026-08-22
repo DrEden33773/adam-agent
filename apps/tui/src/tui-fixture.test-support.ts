@@ -67,14 +67,16 @@ export async function cleanupActiveTuiFixtures(): Promise<void> {
 
 function startInProcessTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
   const terminal = new VirtualTerminal();
-  const execution = runTuiFixture({
-    ...(input.controlRoot === undefined ? {} : { controlRoot: input.controlRoot }),
-    ...(input.launch === undefined ? {} : { launch: input.launch }),
-    ...(input.scenario === undefined ? {} : { scenario: input.scenario }),
-    stateRoot: input.stateRoot,
-    terminal,
-    workspaceRoot: input.workspaceRoot,
-  });
+  const execution = withTuiColorEnvironment(input.noColor === true, () =>
+    runTuiFixture({
+      ...(input.controlRoot === undefined ? {} : { controlRoot: input.controlRoot }),
+      ...(input.launch === undefined ? {} : { launch: input.launch }),
+      ...(input.scenario === undefined ? {} : { scenario: input.scenario }),
+      stateRoot: input.stateRoot,
+      terminal,
+      workspaceRoot: input.workspaceRoot,
+    }),
+  );
   const closed = execution.then(
     (): TuiFixtureResult => ({ code: 0, signal: null, stderr: "", stdout: terminal.output() }),
   );
@@ -105,6 +107,28 @@ function startInProcessTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
   };
   trackFixture(fixture);
   return fixture;
+}
+
+async function withTuiColorEnvironment<T>(
+  noColor: boolean,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const environment = process.env as NodeJS.ProcessEnv & { NO_COLOR?: string };
+  const inheritedNoColor = environment.NO_COLOR;
+  if (noColor) {
+    environment.NO_COLOR = "1";
+  } else {
+    Reflect.deleteProperty(environment, "NO_COLOR");
+  }
+  try {
+    return await operation();
+  } finally {
+    if (inheritedNoColor === undefined) {
+      Reflect.deleteProperty(environment, "NO_COLOR");
+    } else {
+      environment.NO_COLOR = inheritedNoColor;
+    }
+  }
 }
 
 function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {

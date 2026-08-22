@@ -1104,11 +1104,8 @@ test("editor submission renders Working then a streamed Markdown answer from rea
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   const controlRoot = join(testRoot, "control");
-  const testEnvironment = process.env as NodeJS.ProcessEnv & { NO_COLOR?: string };
-  const inheritedNoColor = testEnvironment.NO_COLOR;
   await mkdir(workspaceRoot);
   await mkdir(controlRoot);
-  Reflect.deleteProperty(testEnvironment, "NO_COLOR");
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
@@ -1124,11 +1121,6 @@ test("editor submission renders Working then a streamed Markdown answer from rea
     expect(result.stdout).toContain("\u001b[48;2;49;50;68m");
     expect(result.stdout).toContain("\u001b[38;2;243;139;168m");
   } finally {
-    if (inheritedNoColor === undefined) {
-      Reflect.deleteProperty(testEnvironment, "NO_COLOR");
-    } else {
-      testEnvironment.NO_COLOR = inheritedNoColor;
-    }
     await rm(testRoot, { recursive: true, force: true });
   }
 });
