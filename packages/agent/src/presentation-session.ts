@@ -14,8 +14,12 @@ import type {
   ToolCallDisplay,
   TranscriptItem,
 } from "@adam-agent/presentation";
-import { reconcilePresentationUpdate } from "@adam-agent/presentation";
-import { readFileArtifact } from "./artifact-store.js";
+import {
+  presentationArtifactPageMaximumBytes,
+  reconcilePresentationUpdate,
+} from "@adam-agent/presentation";
+import { readFileArtifact, readFileArtifactRange } from "./artifact-store.js";
+import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
 import type { ModelTargetIdentity, ModelTargets } from "./model-targets.js";
 import type { PresentationPreferences } from "./presentation-preferences.js";
 import { listProjectPaths } from "./project-path-catalog.js";
@@ -1005,18 +1009,29 @@ export async function createPresentationSession(
       }
       if (command.type === "read_artifact") {
         const active = state.authoritative.active;
-        if (
-          active === null ||
-          command.artifact.source !== "change_preview" ||
-          !isKnownArtifact(active, command.artifact)
-        ) {
+        if (active === null || !isKnownArtifact(active, command.artifact)) {
           return {
             status: "rejected",
             code: "stale_interaction",
             message: "The requested artifact is no longer part of the active presentation.",
           };
         }
-        if (options.stateRoot === undefined || command.artifact.byteCount > 64 * 1024) {
+        const range = command.range;
+        const completeReadAvailable =
+          (command.artifact.source === "change_preview" &&
+            command.artifact.byteCount <= 64 * 1024) ||
+          (command.artifact.source === "model_response" &&
+            command.artifact.byteCount <= maximumModelResponseContentBytes);
+        if (
+          options.stateRoot === undefined ||
+          (range === null && !completeReadAvailable) ||
+          (range !== null &&
+            (!Number.isSafeInteger(range.offset) ||
+              range.offset < 0 ||
+              !Number.isSafeInteger(range.maximumBytes) ||
+              range.maximumBytes <= 0 ||
+              range.maximumBytes > presentationArtifactPageMaximumBytes))
+        ) {
           return {
             status: "rejected",
             code: "not_available",
@@ -1025,26 +1040,54 @@ export async function createPresentationSession(
         }
         try {
           await options[presentationArtifactReadBarrier]?.beforeRead();
-          const bytes = await readFileArtifact({
-            root: join(options.stateRoot, "artifacts"),
-            id: command.artifact.id,
-            maximumBytes: command.artifact.byteCount,
-          });
-          if (bytes === undefined || bytes.byteLength !== command.artifact.byteCount) {
+          const page =
+            range === null
+              ? await readFileArtifact({
+                  root: join(options.stateRoot, "artifacts"),
+                  id: command.artifact.id,
+                  maximumBytes: command.artifact.byteCount,
+                }).then((bytes) =>
+                  bytes === undefined
+                    ? undefined
+                    : {
+                        bytes,
+                        totalByteCount: bytes.byteLength,
+                        eof: true,
+                      },
+                )
+              : await readFileArtifactRange({
+                  root: join(options.stateRoot, "artifacts"),
+                  id: command.artifact.id,
+                  expectedByteCount: command.artifact.byteCount,
+                  offset: range.offset,
+                  maximumBytes: range.maximumBytes,
+                });
+          if (page === undefined || page.totalByteCount !== command.artifact.byteCount) {
             throw new TypeError("The artifact bytes are unavailable.");
           }
-          const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          const decoded = decodeArtifactPage(page.bytes, page.eof);
+          const eof = page.eof && decoded.byteCount === page.bytes.byteLength;
+          if (!eof && decoded.byteCount === 0) {
+            throw new TypeError("The artifact page did not make UTF-8 progress.");
+          }
           await options[presentationArtifactReadBarrier]?.afterRead?.();
           return {
             status: "admitted",
             commandId: randomUUID(),
             resource: {
               mediaType: command.artifact.mediaType,
-              offset: 0,
-              byteCount: bytes.byteLength,
-              totalByteCount: bytes.byteLength,
-              eof: true,
-              text,
+              offset: range?.offset ?? 0,
+              byteCount: decoded.byteCount,
+              totalByteCount: page.totalByteCount,
+              eof,
+              nextRange:
+                range === null || eof
+                  ? null
+                  : {
+                      offset: range.offset + decoded.byteCount,
+                      maximumBytes: presentationArtifactPageMaximumBytes,
+                    },
+              text: decoded.text,
             },
           };
         } catch {
@@ -1436,6 +1479,25 @@ export async function createPresentationSession(
     unsubscribeMetadata();
     throw error;
   }
+}
+
+function decodeArtifactPage(
+  bytes: Uint8Array,
+  eof: boolean,
+): { readonly byteCount: number; readonly text: string } {
+  const maximumTrim = eof ? 0 : Math.min(3, bytes.byteLength);
+  for (let trim = 0; trim <= maximumTrim; trim += 1) {
+    const candidate = bytes.subarray(0, bytes.byteLength - trim);
+    try {
+      return {
+        byteCount: candidate.byteLength,
+        text: new TextDecoder("utf-8", { fatal: true }).decode(candidate),
+      };
+    } catch {
+      // A bounded non-final page may end inside one UTF-8 scalar; retry without its partial bytes.
+    }
+  }
+  throw new TypeError("The artifact page is not valid UTF-8.");
 }
 
 function isKnownArtifact(
@@ -2190,18 +2252,41 @@ function safeToolSubject(
 function toolResultSummary(name: string, output: JsonValue | undefined): string | null {
   const outputRecord = jsonRecord(output);
   if (name === "read_file" && typeof outputRecord?.content === "string") {
-    return `${Buffer.byteLength(outputRecord.content, "utf8")} bytes`;
+    return `${Buffer.byteLength(outputRecord.content, "utf8")} bytes${
+      outputRecord.truncated === true ? " · output truncated" : ""
+    }`;
   }
   if (name === "run_shell") {
     const termination = jsonRecord(outputRecord?.termination);
     const stdout = jsonRecord(outputRecord?.stdout);
+    const stderr = jsonRecord(outputRecord?.stderr);
     if (
       termination?.type === "exited" &&
       typeof termination.exitCode === "number" &&
-      typeof stdout?.totalBytes === "number"
+      typeof stdout?.totalBytes === "number" &&
+      typeof stderr?.totalBytes === "number"
     ) {
-      return `exit ${termination.exitCode} · ${stdout.totalBytes} stdout bytes`;
+      const streamSummaries = [
+        ...(stdout.totalBytes > 0 || stderr.totalBytes === 0
+          ? [`${stdout.totalBytes} stdout bytes`]
+          : []),
+        ...(stderr.totalBytes > 0 ? [`${stderr.totalBytes} stderr bytes`] : []),
+      ];
+      const outputTruncated =
+        (typeof stdout.omittedBytes === "number" && stdout.omittedBytes > 0) ||
+        (typeof stderr.omittedBytes === "number" && stderr.omittedBytes > 0);
+      return `exit ${termination.exitCode} · ${streamSummaries.join(" · ")}${
+        outputTruncated ? " · output truncated" : ""
+      }`;
     }
+  }
+  if (name.startsWith("mcp__")) {
+    const content = outputRecord?.content;
+    const outputTruncated =
+      (Array.isArray(content) && content.some((block) => jsonRecord(block)?.truncated === true)) ||
+      (typeof outputRecord?.omittedContentBlocks === "number" &&
+        outputRecord.omittedContentBlocks > 0);
+    return output === undefined ? null : `Completed${outputTruncated ? " · output truncated" : ""}`;
   }
   return output === undefined ? null : "Completed";
 }
@@ -2231,6 +2316,7 @@ function toolArtifacts(
 ): readonly ToolCallDisplay["artifacts"][number][] {
   const outputRecord = jsonRecord(output);
   const candidates = [
+    jsonRecord(outputRecord?.artifact),
     jsonRecord(jsonRecord(outputRecord?.stdout)?.artifact),
     jsonRecord(jsonRecord(outputRecord?.stderr)?.artifact),
   ];
@@ -2254,6 +2340,9 @@ type KnownJsonRecord = Readonly<Record<string, JsonValue>> & {
   readonly type?: JsonValue;
   readonly exitCode?: JsonValue;
   readonly totalBytes?: JsonValue;
+  readonly omittedBytes?: JsonValue;
+  readonly omittedContentBlocks?: JsonValue;
+  readonly truncated?: JsonValue;
   readonly id?: JsonValue;
   readonly mediaType?: JsonValue;
   readonly byteCount?: JsonValue;

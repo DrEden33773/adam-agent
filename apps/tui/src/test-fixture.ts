@@ -98,7 +98,10 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
         }
       : {}),
     ...(modelTargets === undefined ? {} : { modelTargets }),
-    permissions: createPermissionPolicy({ allowedEffects: ["read"], askedEffects: ["write"] }),
+    permissions: createPermissionPolicy({
+      allowedEffects: options.scenario === "tool-artifact" ? ["read", "execute"] : ["read"],
+      askedEffects: ["write"],
+    }),
     stateRoot: options.stateRoot,
     workspaceRoot: options.workspaceRoot,
   });
@@ -118,6 +121,8 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     const resumedSessionId =
       options.scenario === "resume" ||
       options.scenario === "history" ||
+      options.scenario === "artifact-history" ||
+      options.scenario === "copy-older-assistant" ||
       options.scenario === "target-navigation" ||
       options.scenario === "unsafe-history"
         ? await lifecycle.create({ targetIdentity }).then(async (created) => {
@@ -127,6 +132,25 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
                   sessionId: created.sessionId,
                   input: { text: `History prompt ${index}` },
                 });
+              }
+            } else if (options.scenario === "artifact-history") {
+              for (const text of [
+                "Artifact history prompt",
+                "Later history prompt one",
+                "Later history prompt two",
+              ]) {
+                await lifecycle.continue({
+                  sessionId: created.sessionId,
+                  input: { text },
+                });
+              }
+            } else if (options.scenario === "copy-older-assistant") {
+              for (const text of [
+                "Older copy prompt",
+                "Later copy prompt one",
+                "Later copy prompt two",
+              ]) {
+                await lifecycle.continue({ sessionId: created.sessionId, input: { text } });
               }
             } else if (options.scenario === "resume") {
               await lifecycle.continue({
@@ -193,7 +217,11 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
                 sessionId: resumedSessionId,
                 stateRoot: options.stateRoot,
                 workspaceRoot: options.workspaceRoot,
-                ...(options.scenario === "history" ? { [presentationHistoryPageSize]: 2 } : {}),
+                ...(options.scenario === "history" ||
+                options.scenario === "artifact-history" ||
+                options.scenario === "copy-older-assistant"
+                  ? { [presentationHistoryPageSize]: 2 }
+                  : {}),
                 ...(previewBarrier === undefined
                   ? {}
                   : { [presentationArtifactReadBarrier]: previewBarrier }),
@@ -201,7 +229,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     );
     const clipboard = clipboardAdapter(options);
     const deadlineScheduler = controlledDeadlineScheduler(options);
-    const tuiPresentation = observePermissionDecision(presentation, options);
+    const tuiPresentation = observeTuiDispatch(presentation, options);
     await runTui({
       ...(clipboard === undefined ? {} : { clipboard }),
       ...(deadlineScheduler === undefined ? {} : { deadlineScheduler }),
@@ -223,7 +251,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
   }
 }
 
-function observePermissionDecision(
+function observeTuiDispatch(
   presentation: PresentationSession,
   options: {
     readonly controlRoot?: string;
@@ -231,9 +259,16 @@ function observePermissionDecision(
   },
 ): PresentationSession {
   const controlRoot = options.controlRoot;
-  if (options.scenario !== "mutation-delayed-preview" || controlRoot === undefined) {
+  if (
+    (options.scenario !== "mutation-delayed-preview" &&
+      options.scenario !== "tool-artifact" &&
+      options.scenario !== "artifact-backed-assistant" &&
+      options.scenario !== "artifact-page-race") ||
+    controlRoot === undefined
+  ) {
     return presentation;
   }
+  let artifactReadCount = 0;
   return {
     close: () => presentation.close(),
     dispatch: async (command) => {
@@ -244,6 +279,24 @@ function observePermissionDecision(
           `${command.decision}\n`,
           "utf8",
         );
+      }
+      if (command.type === "read_artifact") {
+        artifactReadCount += 1;
+        await writeFile(
+          join(controlRoot, `artifact-read-${artifactReadCount}`),
+          `${command.range?.offset ?? 0}\n`,
+          "utf8",
+        );
+        const settled = await receipt;
+        await writeFile(
+          join(controlRoot, `artifact-read-${artifactReadCount}-settled`),
+          "settled\n",
+          "utf8",
+        );
+        return settled;
+      }
+      if (command.type === "submit_prompt") {
+        await writeFile(join(controlRoot, "prompt-submitted"), `${command.text}\n`, "utf8");
       }
       return receipt;
     },
@@ -308,7 +361,22 @@ function createFixtureModelTargets(options: {
   const model: ModelDriver = {
     async *stream(request) {
       if (request.tools.length === 0) {
-        yield { type: "text_delta", text: "Streaming session" };
+        yield {
+          type: "text_delta",
+          text:
+            request.maximumOutputTokens === 64
+              ? "Streaming session"
+              : JSON.stringify({
+                  schemaVersion: 1,
+                  objective: "Preserve the active TUI fixture task.",
+                  constraints: [],
+                  progress: ["The shell tool completed and preserved its bounded output."],
+                  unresolvedQuestions: [],
+                  failures: [],
+                  remainingVerification: [],
+                  nextSafeAction: "Continue the active model turn.",
+                }),
+        };
         yield { type: "finish", reason: "stop" };
         return;
       }
@@ -371,6 +439,17 @@ function createFixtureModelTargets(options: {
         options.scenario === "unsafe-history"
       ) {
         yield { type: "text_delta", text: "History answer." };
+      } else if (options.scenario === "artifact-history") {
+        const latestUser = [...request.messages]
+          .reverse()
+          .find((message) => message.role === "user");
+        yield {
+          type: "text_delta",
+          text:
+            latestUser?.role === "user" && latestUser.content === "Artifact history prompt"
+              ? `Older artifact page\n${"h".repeat(270_000)}`
+              : "Later history answer.",
+        };
       } else if (options.scenario === "resume") {
         yield { type: "text_delta", text: "Previous answer." };
       } else if (options.scenario === "target-navigation") {
@@ -389,8 +468,53 @@ function createFixtureModelTargets(options: {
           return;
         }
         yield { type: "text_delta", text: "Shell card complete." };
+      } else if (options.scenario === "tool-artifact") {
+        const latest = request.messages.at(-1);
+        if (latest?.role === "user") {
+          await writeFile(
+            join(options.controlRoot as string, "tool-artifact-requested"),
+            "requested\n",
+            "utf8",
+          );
+          const command = "yes x | head -c 70000";
+          yield { type: "tool_call_start", id: "shell-artifact", name: "run_shell" };
+          yield {
+            type: "tool_call_delta",
+            id: "shell-artifact",
+            json: JSON.stringify({ command }),
+          };
+          yield { type: "tool_call_end", id: "shell-artifact" };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        await writeFile(
+          join(options.controlRoot as string, "tool-artifact-result"),
+          JSON.stringify(latest),
+          "utf8",
+        );
+        yield { type: "text_delta", text: "Tool artifact complete." };
       } else if (options.scenario === "skill-selection") {
         yield { type: "text_delta", text: "Skill selection complete." };
+      } else if (
+        options.scenario === "artifact-backed-assistant" ||
+        options.scenario === "artifact-page-race"
+      ) {
+        yield {
+          type: "text_delta",
+          text: `Assistant artifact page one\n${"a".repeat(20_000)}\nAssistant artifact page two\n${"b".repeat(250_000)}`,
+        };
+      } else if (options.scenario === "copy-large-assistant") {
+        yield {
+          type: "text_delta",
+          text: `${"c".repeat(65 * 1024)}\nExact copy tail.`,
+        };
+      } else if (options.scenario === "copy-older-assistant") {
+        const latestUser = [...request.messages]
+          .reverse()
+          .find((message) => message.role === "user");
+        if (latestUser?.role === "user" && latestUser.content === "Older copy prompt") {
+          yield { type: "text_delta", text: "Older copy answer." };
+        }
       } else if (options.scenario === "unsafe-output") {
         yield {
           type: "text_delta",
@@ -463,15 +587,32 @@ function previewReadBarrier(options: {
   readonly controlRoot?: string;
   readonly scenario?: string;
 }): PresentationArtifactReadBarrier | undefined {
-  if (options.scenario !== "mutation-delayed-preview" || options.controlRoot === undefined) {
+  if (
+    (options.scenario !== "mutation-delayed-preview" &&
+      options.scenario !== "artifact-page-race") ||
+    options.controlRoot === undefined
+  ) {
     return undefined;
   }
+  let readCount = 0;
   return {
     async beforeRead() {
+      readCount += 1;
+      if (options.scenario === "artifact-page-race") {
+        if (readCount === 1) {
+          return;
+        }
+        await writeFile(join(options.controlRoot as string, "page-read-pending"), "pending\n");
+        await waitForFile(options.controlRoot as string, "release-page-read");
+        return;
+      }
       await writeFile(join(options.controlRoot as string, "preview-requested"), "requested\n");
       await waitForFile(options.controlRoot as string, "release-preview");
     },
     async afterRead() {
+      if (options.scenario === "artifact-page-race") {
+        return;
+      }
       await writeFile(join(options.controlRoot as string, "preview-read-complete"), "complete\n");
     },
   };
@@ -494,6 +635,10 @@ function clipboardAdapter(options: {
   }
   if (
     options.scenario !== "clipboard-success" &&
+    options.scenario !== "copy-large-assistant" &&
+    options.scenario !== "copy-older-assistant" &&
+    options.scenario !== "artifact-backed-assistant" &&
+    options.scenario !== "read" &&
     options.scenario !== "history" &&
     options.scenario !== "session-selection-history" &&
     options.scenario !== "unsafe-history"

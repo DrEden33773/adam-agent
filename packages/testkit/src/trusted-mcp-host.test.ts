@@ -20,6 +20,7 @@ import {
   type ContextProfile,
   createCodingToolRegistry,
   createPermissionPolicy,
+  createPresentationSession,
   type ModelRequest,
   type ModelTargetIdentity,
   type ModelTargets,
@@ -6037,9 +6038,13 @@ test("SessionLifecycle spills a complete MCP result above 64 KiB before publishi
   await mkdir(workspaceRoot);
   await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
 
-  const fullText = "x".repeat(70_000);
+  const envelopePrefix = '{"content":[{"text":"';
+  const unicodePrefixBytes = 16 * 1024 - Buffer.byteLength(envelopePrefix, "utf8") - 2;
+  const fullText = `${"x".repeat(unicodePrefixBytes)}😀${"x".repeat(
+    70_000 - unicodePrefixBytes - Buffer.byteLength("😀", "utf8"),
+  )}`;
   const fullEnvelopeBytes = Buffer.from(
-    `{"content":[{"text":"${fullText}","type":"text"}],"isError":false,"version":1}`,
+    `${envelopePrefix}${fullText}","type":"text"}],"isError":false,"version":1}`,
     "utf8",
   );
   const expectedArtifactId = `sha256:${createHash("sha256")
@@ -6108,24 +6113,23 @@ test("SessionLifecycle spills a complete MCP result above 64 KiB before publishi
       };
     },
   };
-  const { lifecycle } = createScriptedMcpLifecycle(
-    {
-      modelTargets,
-      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-      stateRoot,
-      workspaceRoot,
-    },
-    {
-      fixture: {
-        ...ordinaryScriptedMcpServer(),
-        respond(request, defaultReply) {
-          return request.method === "tools/call"
-            ? { kind: "result", result: { content: [{ type: "text", text: fullText }] } }
-            : defaultReply;
-        },
+  const peer = createScriptedMcpTransportFactory({
+    fixture: {
+      ...ordinaryScriptedMcpServer(),
+      respond(request, defaultReply) {
+        return request.method === "tools/call"
+          ? { kind: "result", result: { content: [{ type: "text", text: fullText }] } }
+          : defaultReply;
       },
     },
-  );
+  });
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+    [mcpTransportFactory]: peer,
+  });
   const events: RuntimeEvent[] = [];
   lifecycle.subscribe((event) => events.push(event));
 
@@ -6206,6 +6210,75 @@ test("SessionLifecycle spills a complete MCP result above 64 KiB before publishi
     await expect(
       readFile(join(stateRoot, "artifacts", expectedArtifactId.slice("sha256:".length))),
     ).resolves.toEqual(fullEnvelopeBytes);
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    while (presentation.getState().authoritative.active?.transcript.olderCursor !== null) {
+      const before = presentation.getState().authoritative.active?.transcript.olderCursor;
+      if (typeof before !== "string") {
+        break;
+      }
+      await presentation.dispatch({ type: "load_older_transcript", before });
+    }
+    const transcriptItems = presentation.getState().authoritative.active?.transcript.items;
+    const tool = transcriptItems?.find(
+      (item) => item.type === "tool_call" && item.callId === "mcp-large",
+    );
+    if (tool === undefined) {
+      throw new Error(`Projected transcript: ${JSON.stringify(transcriptItems)}`);
+    }
+    expect(tool).toMatchObject({
+      type: "tool_call",
+      resultSummary: "Completed · output truncated",
+      artifacts: [
+        {
+          id: expectedArtifactId,
+          mediaType: "application/json",
+          byteCount: fullEnvelopeBytes.byteLength,
+          source: "tool_output",
+        },
+      ],
+    });
+    if (tool?.type !== "tool_call" || tool.artifacts[0] === undefined) {
+      throw new Error("The Presentation fixture requires one MCP tool artifact.");
+    }
+    const firstPage = await presentation.dispatch({
+      type: "read_artifact",
+      artifact: tool.artifacts[0],
+      range: { offset: 0, maximumBytes: 16 * 1024 },
+    });
+    expect(firstPage).toMatchObject({
+      status: "admitted",
+      resource: {
+        offset: 0,
+        byteCount: 16 * 1024 - 2,
+        totalByteCount: fullEnvelopeBytes.byteLength,
+      },
+    });
+    if (
+      firstPage.status !== "admitted" ||
+      firstPage.resource === null ||
+      firstPage.resource.nextRange === null
+    ) {
+      throw new Error("The Presentation fixture requires a second MCP artifact page.");
+    }
+    expect(firstPage.resource.text).not.toContain("�");
+    const secondPage = await presentation.dispatch({
+      type: "read_artifact",
+      artifact: tool.artifacts[0],
+      range: firstPage.resource.nextRange,
+    });
+    expect(secondPage).toMatchObject({ status: "admitted" });
+    if (secondPage.status !== "admitted" || secondPage.resource === null) {
+      throw new Error("The Presentation fixture requires the second MCP artifact page.");
+    }
+    expect(secondPage.resource.text.startsWith("😀")).toBe(true);
+    expect(secondPage.resource.text).not.toContain("�");
+    await presentation.close();
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });

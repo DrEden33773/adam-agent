@@ -42,6 +42,62 @@ test("real TUI starts on an authoritative empty session and restores the termina
   }
 });
 
+test("a real tool output artifact opens through the active chronology picker", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tool-artifact-page-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      external: true,
+      scenario: "tool-artifact",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Produce tool output\r");
+    await waitForPath(join(controlRoot, "prompt-submitted"));
+    const modelRequest = await Promise.race([
+      waitForPath(join(controlRoot, "tool-artifact-requested")).then(() => "requested" as const),
+      fixture.waitFor("The model run failed.").then(() => "failed" as const),
+    ]);
+    expect(modelRequest).toBe("requested");
+    const toolSettlement = await Promise.race([
+      waitForPath(join(controlRoot, "tool-artifact-result")).then(() => "completed" as const),
+      fixture.waitFor("artifact_store_failed").then(() => "artifact_failed" as const),
+    ]);
+    expect(toolSettlement).toBe("completed");
+    await fixture.waitFor("Tool artifact complete");
+    expect(fixture.output()).toContain("output truncated");
+    fixture.write("/artifacts \r");
+    const artifactList = await Promise.race([
+      fixture.waitFor("shell output").then(() => "listed" as const),
+      fixture
+        .waitFor("No artifacts are visible in the active chronology")
+        .then(() => "empty" as const),
+    ]);
+    expect(artifactList).toBe("listed");
+    fixture.write("\r");
+    await waitForPath(join(controlRoot, "artifact-read-1"));
+    const firstPage = await Promise.race([
+      fixture.waitFor("1-16384 of 70000 bytes").then(() => "opened" as const),
+      fixture.waitFor("The artifact could not be read safely").then(() => "unsafe" as const),
+      fixture
+        .waitFor("The artifact is not available through this Presentation session")
+        .then(() => "unavailable" as const),
+    ]);
+    expect(firstPage).toBe("opened");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the production TUI entry exposes its usage contract", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-help-"));
   const workspaceRoot = join(testRoot, "workspace");

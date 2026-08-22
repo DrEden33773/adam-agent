@@ -1694,7 +1694,8 @@ test("PresentationSession links an artifact-backed assistant response without em
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const answer = "a".repeat(256 * 1024 + 1);
+  const answer = `${"a".repeat(16_383)}😀${"b".repeat(256 * 1024)}`;
+  const answerByteCount = Buffer.byteLength(answer, "utf8");
   const driver = new FakeModelDriver([
     { type: "text_delta", text: answer },
     { type: "finish", reason: "stop" },
@@ -1731,7 +1732,12 @@ test("PresentationSession links an artifact-backed assistant response without em
       workspaceRoot,
     });
 
-    expect(presentation.getState().authoritative.active?.transcript.items).toContainEqual({
+    const assistant = presentation
+      .getState()
+      .authoritative.active?.transcript.items.find(
+        (item) => item.type === "assistant_message" && item.artifact !== null,
+      );
+    expect(assistant).toMatchObject({
       type: "assistant_message",
       id: expect.stringMatching(new RegExp(`^${created.sessionId}:[0-9]+$`, "u")),
       sequence: expect.any(Number),
@@ -1741,13 +1747,116 @@ test("PresentationSession links an artifact-backed assistant response without em
       artifact: {
         id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
         mediaType: "text/plain; charset=utf-8",
-        byteCount: 256 * 1024 + 1,
+        byteCount: answerByteCount,
         source: "model_response",
       },
     });
     expect(JSON.stringify(presentation.getState())).not.toContain(answer.slice(0, 4_096));
-
+    if (assistant?.type !== "assistant_message" || assistant.artifact === null) {
+      throw new Error("Expected an artifact-backed assistant response.");
+    }
+    const firstPage = await presentation.dispatch({
+      type: "read_artifact",
+      artifact: assistant.artifact,
+      range: { offset: 0, maximumBytes: 16 * 1024 },
+    });
+    expect(firstPage).toMatchObject({
+      status: "admitted",
+      resource: {
+        offset: 0,
+        totalByteCount: answerByteCount,
+      },
+    });
+    if (firstPage.status !== "admitted" || firstPage.resource === null) {
+      throw new Error("Expected the first bounded assistant artifact page.");
+    }
+    expect(firstPage.resource.text).not.toContain("�");
+    const secondPage = await presentation.dispatch({
+      type: "read_artifact",
+      artifact: assistant.artifact,
+      range: {
+        offset: firstPage.resource.byteCount,
+        maximumBytes: 16 * 1024,
+      },
+    });
+    expect(secondPage).toMatchObject({ status: "admitted" });
+    if (secondPage.status !== "admitted" || secondPage.resource === null) {
+      throw new Error("Expected the second bounded assistant artifact page.");
+    }
+    expect(`${firstPage.resource.text}${secondPage.resource.text}`).toBe(
+      answer.slice(0, firstPage.resource.text.length + secondPage.resource.text.length),
+    );
+    await expect(
+      presentation.dispatch({
+        type: "read_artifact",
+        artifact: assistant.artifact,
+        range: { offset: 0, maximumBytes: 16 * 1024 + 1 },
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "not_available" });
+    await expect(
+      presentation.dispatch({
+        type: "read_artifact",
+        artifact: { ...assistant.artifact, source: "tool_output" },
+        range: { offset: 0, maximumBytes: 16 * 1024 },
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "stale_interaction" });
+    const artifactPath = join(
+      stateRoot,
+      "artifacts",
+      assistant.artifact.id.replace(/^sha256:/u, ""),
+    );
+    await chmod(artifactPath, 0o600);
+    await writeFile(artifactPath, Buffer.alloc(answerByteCount, 0x78));
+    await expect(
+      presentation.dispatch({
+        type: "read_artifact",
+        artifact: assistant.artifact,
+        range: { offset: 0, maximumBytes: 16 * 1024 },
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "not_available" });
+    await writeFile(artifactPath, answer, "utf8");
     await presentation.close();
+
+    const projectId = createHash("sha256").update(workspaceRoot).digest("hex");
+    const sessionPath = join(
+      stateRoot,
+      "projects",
+      projectId,
+      "sessions",
+      `${created.sessionId}.jsonl`,
+    );
+    const durableLog = await readFile(sessionPath, "utf8");
+    const forgedLog = durableLog.replaceAll(
+      `"byteCount":${answerByteCount}`,
+      `"byteCount":${answerByteCount + 1}`,
+    );
+    expect(forgedLog).not.toBe(durableLog);
+    await writeFile(sessionPath, forgedLog, "utf8");
+    const forgedPresentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    const forgedAssistant = forgedPresentation
+      .getState()
+      .authoritative.active?.transcript.items.find(
+        (item) => item.type === "assistant_message" && item.artifact !== null,
+      );
+    if (forgedAssistant?.type !== "assistant_message" || forgedAssistant.artifact === null) {
+      throw new Error("Expected a forged artifact-backed assistant response.");
+    }
+    expect(forgedAssistant.artifact.byteCount).toBe(answerByteCount + 1);
+    await expect(
+      forgedPresentation.dispatch({
+        type: "read_artifact",
+        artifact: forgedAssistant.artifact,
+        range: null,
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "not_available" });
+
+    await forgedPresentation.close();
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -3250,7 +3359,7 @@ test("PresentationSession normalizes a real read call without exposing raw argum
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  await writeFile(join(workspaceRoot, "notes.txt"), "hello read\n");
+  await writeFile(join(workspaceRoot, "notes.txt"), "r".repeat(70_000));
   let call = 0;
   const model: ModelDriver = {
     async *stream(request) {
@@ -3323,12 +3432,12 @@ test("PresentationSession normalizes a real read call without exposing raw argum
       label: "read",
       subject: { type: "path", value: "notes.txt" },
       status: "completed",
-      resultSummary: "11 bytes",
+      resultSummary: "65536 bytes · output truncated",
       artifacts: [],
       changePreviewRef: null,
     });
     expect(JSON.stringify(tool)).not.toContain('{"path":"notes.txt"}');
-    expect(JSON.stringify(tool)).not.toContain("hello read");
+    expect(JSON.stringify(tool)).not.toContain("r".repeat(1_024));
 
     await presentation.close();
   } finally {
@@ -3342,7 +3451,8 @@ test("PresentationSession exposes a bounded shell summary and durable overflow a
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const command = "yes x | head -c 70000";
+  const command =
+    "{ printf '%*s' 16382 '' | tr ' ' x; printf '😀'; printf '%*s' 53614 '' | tr ' ' x; } >&2";
   let call = 0;
   const model: ModelDriver = {
     async *stream(request) {
@@ -3421,7 +3531,7 @@ test("PresentationSession exposes a bounded shell summary and durable overflow a
       label: "shell",
       subject: { type: "command", value: command },
       status: "completed",
-      resultSummary: "exit 0 · 70000 stdout bytes",
+      resultSummary: "exit 0 · 70000 stderr bytes · output truncated",
       artifacts: [
         {
           id: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
@@ -3431,6 +3541,37 @@ test("PresentationSession exposes a bounded shell summary and durable overflow a
         },
       ],
     });
+    if (tool?.type !== "tool_call" || tool.artifacts[0] === undefined) {
+      throw new Error("Expected one shell output artifact.");
+    }
+    const firstPage = await presentation.dispatch({
+      type: "read_artifact",
+      artifact: tool.artifacts[0],
+      range: { offset: 0, maximumBytes: 16 * 1024 },
+    });
+    expect(firstPage).toMatchObject({
+      status: "admitted",
+      resource: { byteCount: 16 * 1024 - 2, offset: 0, totalByteCount: 70_000 },
+    });
+    if (
+      firstPage.status !== "admitted" ||
+      firstPage.resource === null ||
+      firstPage.resource.nextRange === null
+    ) {
+      throw new Error("Expected a second shell output artifact page.");
+    }
+    expect(firstPage.resource.text).not.toContain("�");
+    const secondPage = await presentation.dispatch({
+      type: "read_artifact",
+      artifact: tool.artifacts[0],
+      range: firstPage.resource.nextRange,
+    });
+    expect(secondPage).toMatchObject({ status: "admitted" });
+    if (secondPage.status !== "admitted" || secondPage.resource === null) {
+      throw new Error("Expected the second shell output artifact page.");
+    }
+    expect(secondPage.resource.text.startsWith("😀")).toBe(true);
+    expect(secondPage.resource.text).not.toContain("�");
 
     await presentation.close();
   } finally {

@@ -7,7 +7,10 @@ export type AdamCommandDefinition = {
   readonly aliases: readonly string[];
   readonly availability: "always" | "idle";
   readonly id:
+    | "artifacts"
     | "clone"
+    | "copy"
+    | "diffs"
     | "fork"
     | "help"
     | "history"
@@ -36,7 +39,8 @@ export type AdamKeybindingAction =
   | "new_session_from_target"
   | "rename_session"
   | "save_default_target"
-  | "submit";
+  | "submit"
+  | "toggle_tool_details";
 
 export type AdamKeybindingDefinition = {
   readonly action: AdamKeybindingAction | null;
@@ -142,6 +146,30 @@ class AdamCommandRegistry {
 }
 
 export const adamCommandRegistry = new AdamCommandRegistry([
+  {
+    aliases: [],
+    availability: "always",
+    id: "artifacts",
+    name: "artifacts",
+    summary: "Browse bounded artifacts from the active chronology.",
+    usage: "/artifacts",
+  },
+  {
+    aliases: [],
+    availability: "always",
+    id: "diffs",
+    name: "diffs",
+    summary: "Reopen settled change previews from the active chronology.",
+    usage: "/diffs",
+  },
+  {
+    aliases: [],
+    availability: "always",
+    id: "copy",
+    name: "copy",
+    summary: "Copy the last assistant response.",
+    usage: "/copy",
+  },
   {
     aliases: [],
     availability: "always",
@@ -313,6 +341,13 @@ const keybindingProjections: readonly KeybindingProjection[] = [
     adamInputs: ["ctrl+q"],
     keys: "Ctrl+Q",
     description: "Exit Adam",
+    section: "application",
+  },
+  {
+    action: "toggle_tool_details",
+    adamInputs: ["ctrl+o"],
+    keys: "Ctrl+O",
+    description: "Toggle bounded authoritative tool details in the transcript",
     section: "application",
   },
   {

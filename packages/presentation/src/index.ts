@@ -85,8 +85,16 @@ export type ArtifactChunk = {
   readonly byteCount: number;
   readonly totalByteCount: number;
   readonly eof: boolean;
+  readonly nextRange: ArtifactRange | null;
   readonly text: string;
 };
+
+export type ArtifactRange = {
+  readonly offset: number;
+  readonly maximumBytes: number;
+};
+
+export const presentationArtifactPageMaximumBytes = 16 * 1024;
 
 export type UserMessageDisplay = {
   readonly type: "user_message";
@@ -446,7 +454,7 @@ export type PresentationCommand =
   | {
       readonly type: "read_artifact";
       readonly artifact: ArtifactReference;
-      readonly range: null;
+      readonly range: ArtifactRange | null;
     }
   | {
       readonly type: "set_session_manual_name";
