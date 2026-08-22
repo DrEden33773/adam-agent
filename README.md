@@ -105,6 +105,17 @@ The synthetic approximately 46.875 MiB model-response durability path is intenti
 pnpm test:large-output
 ```
 
+## Test topology
+
+TUI semantic behavior runs in-process through real Presentation, real `runTui`, and a harness-owned `VirtualTerminal`; `apps/tui/src/main.os.test.ts` retains only distinct Linux process, MCP stdio, PTY, signal, resize, paste, and terminal-restoration contracts. Both layers remain part of the single required `pnpm quality:check` regression gate with no changed-path skip; the split changes fixture ownership, not coverage authority. Run them separately while diagnosing with:
+
+```bash
+pnpm test:tui:behavior
+pnpm test:tui:os
+```
+
+Tests synchronize success on rendered output, lifecycle events, filesystem notification, and process closure. Direct timeouts live only in centralized failure or cleanup guards, and test duration is diagnostic telemetry rather than a correctness threshold.
+
 Use `pnpm quality:fix` only when an intentional formatting rewrite is desired. The pre-commit hook is check-only.
 
 See [`AGENTS.md`](AGENTS.md) for the authoritative engineering contract.
