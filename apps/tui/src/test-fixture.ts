@@ -69,12 +69,14 @@ const contextProfile: ContextProfile = {
 };
 
 export type TuiFixtureOptions = {
+  readonly clipboard?: ClipboardAdapter;
   readonly controlRoot?: string;
   readonly launch?: {
     readonly configRoot?: string;
     readonly seedTargetIds?: readonly string[];
     readonly startupTargetId?: string;
   };
+  readonly presentationCloseMarker?: string;
   readonly scenario?: FixtureScenario;
   readonly stateRoot: string;
   readonly terminal?: Terminal;
@@ -227,7 +229,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
                   : { [presentationArtifactReadBarrier]: previewBarrier }),
               },
     );
-    const clipboard = clipboardAdapter(options);
+    const clipboard = options.clipboard ?? clipboardAdapter(options);
     const deadlineScheduler = controlledDeadlineScheduler(options);
     const tuiPresentation = observeTuiDispatch(presentation, options);
     await runTui({
@@ -248,6 +250,9 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     });
   } finally {
     requireConfirmedLifecycleClose(await lifecycle.close());
+    if (options.controlRoot !== undefined) {
+      await writeFile(join(options.controlRoot, "tui-fixture-closed"), "closed\n", "utf8");
+    }
   }
 }
 
@@ -255,27 +260,36 @@ function observeTuiDispatch(
   presentation: PresentationSession,
   options: {
     readonly controlRoot?: string;
+    readonly presentationCloseMarker?: string;
     readonly scenario?: FixtureScenario;
   },
 ): PresentationSession {
   const controlRoot = options.controlRoot;
-  if (
-    (options.scenario !== "mutation-delayed-preview" &&
-      options.scenario !== "tool-artifact" &&
-      options.scenario !== "artifact-backed-assistant" &&
-      options.scenario !== "artifact-page-race") ||
-    controlRoot === undefined
-  ) {
+  const observeDispatch =
+    controlRoot !== undefined &&
+    (options.scenario === "mutation-delayed-preview" ||
+      options.scenario === "tool-artifact" ||
+      options.scenario === "artifact-backed-assistant" ||
+      options.scenario === "artifact-page-race");
+  if (!observeDispatch && options.presentationCloseMarker === undefined) {
     return presentation;
   }
   let artifactReadCount = 0;
   return {
-    close: () => presentation.close(),
+    async close() {
+      await presentation.close();
+      if (options.presentationCloseMarker !== undefined) {
+        await writeFile(options.presentationCloseMarker, "closed\n", "utf8");
+      }
+    },
     dispatch: async (command) => {
       const receipt = presentation.dispatch(command);
+      if (!observeDispatch) {
+        return receipt;
+      }
       if (command.type === "decide_permission") {
         await writeFile(
-          join(controlRoot, "permission-decision-submitted"),
+          join(controlRoot as string, "permission-decision-submitted"),
           `${command.decision}\n`,
           "utf8",
         );
@@ -283,20 +297,24 @@ function observeTuiDispatch(
       if (command.type === "read_artifact") {
         artifactReadCount += 1;
         await writeFile(
-          join(controlRoot, `artifact-read-${artifactReadCount}`),
+          join(controlRoot as string, `artifact-read-${artifactReadCount}`),
           `${command.range?.offset ?? 0}\n`,
           "utf8",
         );
         const settled = await receipt;
         await writeFile(
-          join(controlRoot, `artifact-read-${artifactReadCount}-settled`),
+          join(controlRoot as string, `artifact-read-${artifactReadCount}-settled`),
           "settled\n",
           "utf8",
         );
         return settled;
       }
       if (command.type === "submit_prompt") {
-        await writeFile(join(controlRoot, "prompt-submitted"), `${command.text}\n`, "utf8");
+        await writeFile(
+          join(controlRoot as string, "prompt-submitted"),
+          `${command.text}\n`,
+          "utf8",
+        );
       }
       return receipt;
     },
@@ -461,7 +479,9 @@ function createFixtureModelTargets(options: {
           yield {
             type: "tool_call_delta",
             id: "shell-card",
-            json: JSON.stringify({ command: "printf shell-card-fixture" }),
+            json: JSON.stringify({
+              command: "printf shell-card-fixture-with-bounded-secondary-provenance-and-wide-tail",
+            }),
           };
           yield { type: "tool_call_end", id: "shell-card" };
           yield { type: "finish", reason: "tool_calls" };

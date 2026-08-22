@@ -21,8 +21,10 @@ export type TuiFixture = {
   readonly closed: Promise<TuiFixtureResult>;
   readonly output: () => string;
   readonly resize: (columns: number, rows: number) => Promise<void>;
+  readonly terminate: (signal: "SIGHUP" | "SIGTERM") => Promise<void>;
   readonly waitFor: (text: string) => Promise<void>;
   readonly waitForAfter: (text: string, offset: number) => Promise<void>;
+  readonly waitForCompleteFrameAfter: (text: string, offset: number) => Promise<void>;
   readonly write: (text: string) => void;
 };
 
@@ -98,11 +100,17 @@ function startInProcessTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
     closed,
     output: () => terminal.output(),
     resize(columns, rows) {
+      const offset = terminal.output().length;
       terminal.resize(columns, rows);
-      return Promise.resolve();
+      return terminal.nextOutputContaining("\u001b[?2026l", offset);
+    },
+    terminate() {
+      return Promise.reject(new Error("Only an external TUI fixture accepts process signals."));
     },
     waitFor: (text) => terminal.nextOutputContaining(text),
     waitForAfter: (text, offset) => terminal.nextOutputContaining(text, offset),
+    waitForCompleteFrameAfter: (text, offset) =>
+      terminal.nextSynchronizedFrameContaining(text, offset),
     write: (text) => terminal.input(text),
   };
   trackFixture(fixture);
@@ -318,8 +326,23 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
       }
       await resizeTerminalProcess(processId, columns, rows);
     },
+    async terminate(signal) {
+      if (input.terminalProcessMarker === undefined) {
+        throw new Error("The external TUI fixture requires a terminal process marker to signal.");
+      }
+      const processId = Number.parseInt(await readFile(input.terminalProcessMarker, "utf8"), 10);
+      if (!Number.isSafeInteger(processId) || processId <= 0) {
+        throw new Error("The external TUI fixture recorded an invalid terminal process identity.");
+      }
+      process.kill(processId, signal);
+    },
     waitFor: (text) => waitForAfter(text, 0),
     waitForAfter,
+    async waitForCompleteFrameAfter(text, offset) {
+      await waitForAfter(text, offset);
+      const occurrence = stdout.indexOf(text, offset);
+      await waitForAfter("\u001b[?2026l", occurrence + text.length);
+    },
     write: (text) => child.stdin.write(text),
   };
   trackFixture(fixture, processClose.promise);

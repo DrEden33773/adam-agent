@@ -1,8 +1,9 @@
 import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, expect, test } from "vitest";
+import { runTuiFixture } from "./test-fixture.js";
 import {
   readFilesRecursively,
   removeTuiFixtureRoot as rm,
@@ -12,10 +13,454 @@ import {
   cleanupActiveTuiFixtures,
   startTuiFixture as startFixture,
 } from "./tui-fixture.test-support.js";
+import { VirtualTerminal } from "./virtual-terminal.test-support.js";
 
 afterEach(async () => {
   await cleanupActiveTuiFixtures();
 });
+
+test("minimum-size rendering preserves the draft and returns to the supported layout", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-minimum-size-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("保留 draft 👩🏽‍💻");
+    await fixture.waitFor("保留 draft");
+    const beforeMinimum = fixture.output().length;
+    await fixture.resize(39, 11);
+    const minimumFrame = latestSynchronizedFrame(fixture.output().slice(beforeMinimum));
+    expect(minimumFrame.join("\n")).toContain("Terminal too small");
+    expect(minimumFrame.join("\n")).toContain("Ctrl+C abort/exit");
+    expect(minimumFrame.every((line) => visibleWidth(line) <= 39)).toBe(true);
+
+    const beforeRestore = fixture.output().length;
+    await fixture.resize(80, 24);
+    await fixture.waitForAfter("保留 draft", beforeRestore);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("minimum-size mode consumes ordinary editor input while preserving safe exit", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-minimum-input-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("exact draft");
+    await fixture.waitFor("exact draft");
+    await fixture.resize(39, 11);
+    fixture.write(" must not enter the editor");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe("exact draft");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the 40, 80, and 120 column layouts expose progressively bounded footer facts", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-responsive-footer-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+
+    let beforeResize = fixture.output().length;
+    await fixture.resize(120, 40);
+    let frameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+    let frame = frameLines.join("\n");
+    expect(frame).toContain("workspace · context unavailable · idle");
+    expect(frame).toContain("/help [topic] · /hotkeys · Tab complete");
+    expect(frameLines.every((line) => visibleWidth(line) <= 120)).toBe(true);
+
+    beforeResize = fixture.output().length;
+    await fixture.resize(80, 24);
+    frameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+    frame = frameLines.join("\n");
+    expect(frame).toContain("workspace · idle");
+    expect(frame).not.toContain("context unavailable");
+    expect(frame).toContain("fake.local · Certified · /help · Tab complete");
+    expect(frameLines.every((line) => visibleWidth(line) <= 80)).toBe(true);
+
+    beforeResize = fixture.output().length;
+    await fixture.resize(40, 12);
+    frameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+    frame = frameLines.join("\n");
+    expect(frame).toContain("idle");
+    expect(frame).toContain("fake.local · Certified");
+    expect(frame).toContain("/help · Tab complete");
+    expect(frame).not.toContain("workspace");
+    expect(frame).not.toContain("context unavailable");
+    expect(frameLines.every((line) => visibleWidth(line) <= 40)).toBe(true);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Help keeps its exact page and focus across minimum-size resize", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-resize-focus-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/help\r\r");
+    await fixture.waitFor("Command Reference");
+
+    let beforeResize = fixture.output().length;
+    await fixture.resize(39, 11);
+    let frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("Terminal too small");
+    expect(frame).not.toContain("Command Reference");
+
+    beforeResize = fixture.output().length;
+    await fixture.resize(80, 24);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("Command Reference");
+    fixture.write("\u0003focus restored");
+    await fixture.waitFor("focus restored");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a permission remains authoritative across narrow and minimum-size focus repair", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-permission-resize-focus-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "edit.txt"), "before\n", "utf8");
+
+  try {
+    const fixture = startFixture({ scenario: "mutation", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Edit after resize\r");
+    await fixture.waitFor("+after");
+
+    let beforeResize = fixture.output().length;
+    await fixture.resize(40, 12);
+    let frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("Permission required");
+    expect(frame).toContain("Allow");
+    expect(frame).toContain("Deny");
+
+    beforeResize = fixture.output().length;
+    await fixture.resize(39, 11);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("Terminal too small");
+    expect(frame).not.toContain("Permission required");
+    fixture.write("\u001b[27;1;27~");
+    await fixture.resize(80, 24);
+    await fixture.waitFor("denied");
+    await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("before\n");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Shift+Enter and Ctrl+J preserve one exact multiline draft", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-multiline-draft-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("first\u001b[13;2usecond\n第三行");
+    await fixture.waitFor("第三行");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(
+      "first\nsecond\n第三行",
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a chunked large bracketed paste remains one exact expandable editor value", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-large-paste-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const pasted = Array.from(
+    { length: 24 },
+    (_, index) => `line ${index + 1} · 中文 · e\u0301 · 👩🏽‍💻`,
+  ).join("\n");
+  const split = Math.floor(pasted.length / 2);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write(`\u001b[200~${pasted.slice(0, split)}`);
+    fixture.write(`${pasted.slice(split)}\u001b[201~`);
+    await fixture.waitFor("[paste #1 +24 lines]");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(pasted);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the focused editor positions the IME hardware cursor on grapheme cell boundaries", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-ime-cursor-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("A中e\u0301👩🏽‍💻Z");
+    await fixture.waitFor("A中e");
+
+    for (const expectedColumn of [8, 6, 5, 3]) {
+      const beforeMove = fixture.output().length;
+      fixture.write("\u001b[D");
+      await fixture.resize(80, 24);
+      expect(lastAbsoluteCursorColumn(fixture.output().slice(beforeMove))).toBe(expectedColumn);
+    }
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("minimum-size Ctrl+C still aborts one active run without arming exit", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-minimum-abort-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "cancellation", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Cancel from minimum mode\r");
+    await fixture.waitFor("Working");
+    await fixture.resize(39, 11);
+    fixture.write("\u0003");
+    const beforeRestore = fixture.output().length;
+    await fixture.resize(80, 24);
+    await fixture.waitForAfter("cancelled", beforeRestore);
+    expect(fixture.output().slice(beforeRestore)).not.toContain("Press Ctrl+C again");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a terminal start failure after acquisition still restores the terminal", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-start-failure-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const terminal = new VirtualTerminal({ throwAfterStart: true });
+  await mkdir(workspaceRoot);
+
+  try {
+    await expect(runTuiFixture({ stateRoot, terminal, workspaceRoot })).rejects.toThrow(
+      "Injected terminal start failure after acquisition.",
+    );
+    expect(terminal.lifecycle()).toEqual(["started", "stopped"]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a terminal stop failure cannot skip Presentation close", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-stop-failure-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  const terminal = new VirtualTerminal({ throwAfterStop: true });
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const execution = runTuiFixture({
+      controlRoot,
+      presentationCloseMarker: join(controlRoot, "presentation-closed"),
+      stateRoot,
+      terminal,
+      workspaceRoot,
+    });
+    await terminal.whenStarted();
+    terminal.input("\u0011");
+    await expect(execution).rejects.toThrow("Injected terminal stop failure after restoration.");
+    await expect(readFile(join(controlRoot, "presentation-closed"), "utf8")).resolves.toBe(
+      "closed\n",
+    );
+    expect(terminal.lifecycle()).toEqual(["started", "stopped"]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("terminal and clipboard failures remain independent and cannot skip Presentation close", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-multiple-close-failures-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  const terminal = new VirtualTerminal({ throwAfterStop: true });
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const execution = runTuiFixture({
+      clipboard: {
+        writeText() {
+          throw new Error("Injected clipboard failure.");
+        },
+      },
+      controlRoot,
+      presentationCloseMarker: join(controlRoot, "presentation-closed"),
+      stateRoot,
+      terminal,
+      workspaceRoot,
+    });
+    await terminal.whenStarted();
+    terminal.input("preserve this exact draft");
+    await terminal.nextOutputContaining("preserve this exact draft");
+    terminal.input("\u0011");
+    const failure = await execution.catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      expect.objectContaining({
+        message: "Injected terminal stop failure after restoration.",
+      }),
+      expect.objectContaining({ message: "Injected clipboard failure." }),
+    ]);
+    await expect(readFile(join(controlRoot, "presentation-closed"), "utf8")).resolves.toBe(
+      "closed\n",
+    );
+    expect(terminal.lifecycle()).toEqual(["started", "stopped"]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an overlay cleanup failure cannot skip terminal restoration or Presentation close", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-overlay-close-failure-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  const terminal = new VirtualTerminal({ throwOnHideCursorAfterInput: "\u0011" });
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const execution = runTuiFixture({
+      controlRoot,
+      presentationCloseMarker: join(controlRoot, "presentation-closed"),
+      stateRoot,
+      terminal,
+      workspaceRoot,
+    });
+    await terminal.whenStarted();
+    terminal.input("/help\r");
+    await terminal.nextOutputContaining("Adam Help");
+    terminal.input("\u0011");
+    await expect(execution).rejects.toThrow(
+      "Injected overlay cleanup failure before terminal restoration.",
+    );
+    await expect(readFile(join(controlRoot, "presentation-closed"), "utf8")).resolves.toBe(
+      "closed\n",
+    );
+    expect(terminal.lifecycle()).toEqual(["started", "stopped"]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("startup and cleanup failures preserve both causal errors", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-start-cleanup-failures-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const terminal = new VirtualTerminal({ throwAfterStart: true, throwAfterStop: true });
+  await mkdir(workspaceRoot);
+
+  try {
+    const failure = await runTuiFixture({ stateRoot, terminal, workspaceRoot }).catch(
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      expect.objectContaining({
+        message: "Injected terminal start failure after acquisition.",
+      }),
+      expect.objectContaining({
+        message: "Injected terminal stop failure after restoration.",
+      }),
+    ]);
+    expect(terminal.lifecycle()).toEqual(["started", "stopped"]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+function latestSynchronizedFrame(output: string): readonly string[] {
+  const start = output.lastIndexOf("\u001b[?2026h");
+  const end = output.indexOf("\u001b[?2026l", start);
+  if (start < 0 || end < 0) {
+    throw new Error("The TUI did not emit one complete synchronized frame.");
+  }
+  return output
+    .slice(start + "\u001b[?2026h".length, end)
+    .replace("\u001b[2J\u001b[H\u001b[3J", "")
+    .split("\r\n");
+}
+
+function lastAbsoluteCursorColumn(output: string): number | undefined {
+  const absoluteColumn = new RegExp(`${String.fromCharCode(27)}\\[(\\d+)G`, "gu");
+  return [...output.matchAll(absoluteColumn)]
+    .map((match) => Number.parseInt(match[1] as string, 10))
+    .at(-1);
+}
 
 test("the production TUI selects an exact available target before creating an empty-project session", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-target-picker-"));
@@ -501,6 +946,7 @@ test("the idle footer exposes Registry-driven interaction hints", async () => {
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
     await fixture.waitFor("/help [topic] · /hotkeys · Tab complete");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -522,6 +968,7 @@ test("the footer exposes authoritative project context and run facts", async () 
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
     fixture.write("Produce an artifact-backed answer\r");
     await fixture.waitFor("Adam · Streaming session");
     const beforeCompaction = fixture.output().length;
@@ -1254,6 +1701,53 @@ test("permission preempts Help and restores its exact page after settlement", as
   }
 });
 
+test("permission settlement restores an existing ordinary overlay as the exact focus owner", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-session-permission-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  await writeFile(join(workspaceRoot, "edit.txt"), "before", "utf8");
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "mutation-after-release",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Prepare an inspector-held edit\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    fixture.write("/session\r");
+    await fixture.waitFor("Session facts");
+    expect(fixture.output()).toContain("Run     working");
+
+    const beforePermission = fixture.output().length;
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitForCompleteFrameAfter("Permission required", beforePermission);
+    const beforeRestore = fixture.output().length;
+    fixture.write("\u001b[27;1;27~");
+    await fixture.waitForCompleteFrameAfter("Session facts", beforeRestore);
+    const restoredOutput = fixture.output().slice(beforeRestore);
+    expect(restoredOutput.lastIndexOf("\u001b[?25l")).toBeGreaterThan(
+      restoredOutput.lastIndexOf("\u001b[?25h"),
+    );
+
+    fixture.write("\u001b[27;1;27~");
+    const beforeResize = fixture.output().length;
+    await fixture.resize(120, 40);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).not.toContain("Session facts");
+    expect(frame).toContain("Adam · New session");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the production editor clears a manual session name through canonical Presentation truth", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-clear-name-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -1743,6 +2237,10 @@ test("Ctrl+O toggles bounded authoritative tool details", async () => {
     await fixture.waitForAfter("read_file · read · completed · replay safe", beforeExpand);
     await fixture.waitForAfter("provider model response", beforeExpand);
     await fixture.waitForAfter("duration unavailable", beforeExpand);
+    await fixture.resize(39, 11);
+    const beforeRestore = fixture.output().length;
+    await fixture.resize(80, 24);
+    await fixture.waitForAfter("provider model response", beforeRestore);
     const beforeCollapse = fixture.output().length;
     fixture.write("\u000f");
     await fixture.waitForAfter("11 bytes", beforeCollapse);
@@ -1897,6 +2395,35 @@ test("a shell tool card uses the accepted dollar-command grammar", async () => {
     await fixture.waitFor("Adam · New session");
     fixture.write("Show shell card\r");
     await fixture.waitFor("$ printf shell-card-fixture");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("tool subjects keep their full bounded value only in the 120-column layout", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-responsive-tool-card-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "shell", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Show responsive shell card\r");
+    await fixture.waitFor("Shell card complete.");
+
+    let beforeResize = fixture.output().length;
+    await fixture.resize(120, 40);
+    let frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("bounded-secondary-provenance-and-wide-tail");
+
+    beforeResize = fixture.output().length;
+    await fixture.resize(80, 24);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("$ printf shell-card-fixture");
+    expect(frame).not.toContain("bounded-secondary-provenance-and-wide-tail");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
