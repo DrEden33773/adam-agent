@@ -61,6 +61,7 @@ describe("presentation reconciliation", () => {
     const initial: PresentationDisplayState = {
       revision: 1,
       authoritative: emptySnapshot,
+      draft: null,
       transient: null,
     };
 
@@ -74,6 +75,7 @@ describe("presentation reconciliation", () => {
     expect(streaming).toEqual({
       revision: 2,
       authoritative: emptySnapshot,
+      draft: null,
       transient: {
         activity: "replying",
         assistant: {
@@ -136,6 +138,7 @@ describe("presentation reconciliation", () => {
     ).toEqual({
       revision: 3,
       authoritative: completedSnapshot,
+      draft: null,
       transient: null,
     });
   });
@@ -144,6 +147,7 @@ describe("presentation reconciliation", () => {
     const initial: PresentationDisplayState = {
       revision: 7,
       authoritative: emptySnapshot,
+      draft: null,
       transient: null,
     };
 
@@ -160,6 +164,7 @@ describe("presentation reconciliation", () => {
         ...emptySnapshot,
         continuity: { status: "repairing", reason: "gap" },
       },
+      draft: null,
       transient: null,
     });
   });

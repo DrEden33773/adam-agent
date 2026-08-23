@@ -15,6 +15,7 @@ import {
 import {
   mcpCloseConfirmation,
   type PresentationArtifactReadBarrier,
+  preparedDirectDeepSeekV2ContextProfile,
   presentationArtifactReadBarrier,
   presentationHistoryPageSize,
 } from "@adam-agent/agent/internal-testing";
@@ -111,13 +112,23 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
   try {
     const previewBarrier = previewReadBarrier(options);
     for (const seedTargetId of options.launch?.seedTargetIds ?? []) {
-      await lifecycle.create({ targetIdentity: requireLaunchTargetIdentity(seedTargetId) });
+      const seeded = await lifecycle.create({
+        targetIdentity: requireLaunchTargetIdentity(seedTargetId),
+      });
+      await lifecycle.continue({
+        sessionId: seeded.sessionId,
+        input: { text: `Seeded project session for ${seedTargetId}` },
+      });
     }
     if (options.scenario === "session-selection-history") {
       const selectable = await lifecycle.create({ targetIdentity });
       await lifecycle.continue({
         sessionId: selectable.sessionId,
         input: { text: "Selected session prompt" },
+      });
+      await lifecycle.setSessionManualName({
+        sessionId: selectable.sessionId,
+        name: "Selected project session",
       });
     }
     const resumedSessionId =
@@ -172,7 +183,9 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
             }
             return created.sessionId;
           })
-        : undefined;
+        : options.launch === undefined && options.scenario !== "session-selection-history"
+          ? await lifecycle.create({ targetIdentity }).then((created) => created.sessionId)
+          : undefined;
     const presentation = await createPresentationSession(
       options.launch !== undefined
         ? {
@@ -376,6 +389,7 @@ function createFixtureModelTargets(options: {
   if (options.scenario === "streaming" && options.controlRoot === undefined) {
     throw new TypeError("The streaming fixture requires --control-root.");
   }
+  let artifactResponseOrdinal = 0;
   const model: ModelDriver = {
     async *stream(request) {
       if (request.tools.length === 0) {
@@ -395,6 +409,15 @@ function createFixtureModelTargets(options: {
                   nextSafeAction: "Continue the active model turn.",
                 }),
         };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      const latestUser = [...request.messages].reverse().find((message) => message.role === "user");
+      if (
+        latestUser?.role === "user" &&
+        latestUser.content.startsWith("Seeded project session for ")
+      ) {
+        yield { type: "text_delta", text: "Seeded project session ready." };
         yield { type: "finish", reason: "stop" };
         return;
       }
@@ -524,9 +547,14 @@ function createFixtureModelTargets(options: {
         options.scenario === "artifact-backed-assistant" ||
         options.scenario === "artifact-page-race"
       ) {
+        artifactResponseOrdinal += 1;
+        const responseIdentity =
+          options.scenario === "artifact-backed-assistant" && artifactResponseOrdinal === 2
+            ? "c"
+            : "";
         yield {
           type: "text_delta",
-          text: `Assistant artifact page one\n${"a".repeat(20_000)}\nAssistant artifact page two\n${"b".repeat(250_000)}`,
+          text: `Assistant artifact page one\n${"a".repeat(20_000)}\nAssistant artifact page two\n${"b".repeat(250_000)}${responseIdentity}`,
         };
       } else if (options.scenario === "copy-large-assistant") {
         yield {
@@ -555,12 +583,26 @@ function createFixtureModelTargets(options: {
   };
   return {
     async resolve(input) {
+      if (
+        options.scenario === "draft-admission-cancellation" &&
+        options.controlRoot !== undefined
+      ) {
+        await writeFile(join(options.controlRoot, "model-resolve-pending"), "pending\n", "utf8");
+        if (!(await waitForFile(options.controlRoot, "release-model-resolve", input.signal))) {
+          throw new Error("The draft admission target resolution was cancelled.");
+        }
+      }
       const identity =
         launchTargetIdentities.find((candidate) => candidate.targetId === input.targetId) ??
         (input.targetId === alternateTargetIdentity.targetId
           ? alternateTargetIdentity
           : targetIdentity);
-      return { identity, driver: model, contextProfile };
+      return {
+        identity,
+        driver: model,
+        contextProfile:
+          identity.profileVersion === 2 ? preparedDirectDeepSeekV2ContextProfile : contextProfile,
+      };
     },
     async snapshot() {
       if (options.launch !== undefined) {
@@ -571,7 +613,7 @@ function createFixtureModelTargets(options: {
               status: "available" as const,
               credentialSource: "deterministic launch fixture",
             },
-            contextProfile,
+            contextProfile: preparedDirectDeepSeekV2ContextProfile,
           })),
         };
       }

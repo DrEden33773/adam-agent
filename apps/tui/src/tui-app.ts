@@ -104,7 +104,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     created.setAutocompleteProvider(
       new AdamAutocompleteProvider({
         getProjectPaths: () =>
-          options.presentation.getState().authoritative.active?.projectPaths.items ?? [],
+          options.presentation.getState().authoritative.active?.projectPaths.items ??
+          options.presentation.getState().draft?.projectPaths.items ??
+          [],
         getRunActive: () => {
           const state = options.presentation.getState();
           return (
@@ -432,6 +434,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       !targetPickerDismissed &&
       (targetPickerRequested ||
         (active === null &&
+          state.draft === null &&
           !needsSessionChoice &&
           (startupTargetId === null || startupTargetId === undefined || defaultTargetRejected))) &&
       state.authoritative.targets.items.length > 0
@@ -549,11 +552,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           tui.requestRender();
           return;
         }
+        const previousDraftTargetId = options.presentation.getState().draft?.targetId;
         void options.presentation
           .dispatch({ type: "create_session", targetId: target.targetId })
           .then((receipt) => {
             if (receipt.status === "admitted") {
+              const targetChanged =
+                previousDraftTargetId !== undefined && previousDraftTargetId !== target.targetId;
+              if (targetChanged) {
+                selectedSkills.clear();
+              }
               close();
+              if (targetChanged) {
+                renderState();
+              }
               afterAdmission?.();
             } else if (targetPicker?.picker === picker) {
               picker.setNotice(receipt.message);
@@ -576,7 +588,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       targetPicker = { close, picker, hide: () => handle?.hide() };
     }
     header.setText(
-      theme.primary(`Adam · ${safeTerminalText(active?.session.label ?? "No session")}`),
+      theme.primary(
+        `Adam · ${safeTerminalText(
+          active?.session.label ?? (state.draft === null ? "No session" : "New session"),
+        )}`,
+      ),
     );
     transcript.clear();
     let previousWasAssistant = false;
@@ -699,8 +715,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (
       cancelSettling &&
       state.transient === null &&
-      active?.pendingInteractions.length === 0 &&
-      active.session.status !== "idle"
+      (active === null ||
+        (active.pendingInteractions.length === 0 && active.session.status !== "idle"))
     ) {
       cancelSettling = false;
     }
@@ -753,7 +769,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           });
       }
     }
-    if (active === null) {
+    if (active === null && state.draft === null) {
       editor.disableSubmit = true;
     } else {
       editor.disableSubmit = false;
@@ -766,9 +782,29 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           }`,
         ),
       );
-    } else if (active === null) {
+    } else if (active === null && state.draft === null) {
       footer.setText(theme.muted("Choose an exact model target to create a session"));
-    } else {
+    } else if (active === null && state.draft !== null) {
+      const draft = state.draft;
+      const target = state.authoritative.targets.items.find(
+        (candidate) => candidate.targetId === draft.targetId,
+      );
+      const selectedSkillSummary =
+        selectedSkills.size === 0
+          ? ""
+          : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`;
+      footer.setText({
+        wide: theme.muted(
+          `${safeTerminalText(state.authoritative.project.label)} · New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${selectedSkillSummary} · /help · Tab complete`,
+        ),
+        standard: theme.muted(
+          `New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${selectedSkillSummary} · /help · Tab complete`,
+        ),
+        narrow: theme.muted(
+          `draft · idle\n${safeTerminalText(draft.targetId)}\n/help · Tab complete`,
+        ),
+      });
+    } else if (active !== null) {
       const runStatus = sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling);
       const targetCertification =
         state.authoritative.targets.items.find(
@@ -802,11 +838,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       clearExitWindow();
       renderState();
     }
-    const active = options.presentation.getState().authoritative.active;
+    const state = options.presentation.getState();
+    const active = state.authoritative.active;
+    const projectPaths = active?.projectPaths ?? state.draft?.projectPaths;
     if (
       pathPicker === undefined &&
-      active !== null &&
-      active.projectPaths.items.length > 0 &&
+      projectPaths !== undefined &&
+      projectPaths.items.length > 0 &&
       isProjectPathTrigger(editor.getExpandedText())
     ) {
       let handle: { hide(): void } | undefined;
@@ -817,7 +855,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         tui.requestRender();
       };
       const picker = new ProjectPathPicker({
-        catalog: active.projectPaths,
+        catalog: projectPaths,
         onClose: close,
         onSelect(path) {
           const draft = editor.getExpandedText();
@@ -1029,10 +1067,177 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     statusMessage = null;
     tui.requestRender();
   };
+  const showHelpNavigator = (commandId: "help" | "hotkeys", argumentsText: string): void => {
+    const requestedTopic = commandId === "hotkeys" ? "hotkeys" : argumentsText.trim();
+    const initialPage: HelpPage =
+      requestedTopic.length === 0
+        ? "root"
+        : (adamCommandRegistry.helpTopics().find((topic) => topic.id === requestedTopic)?.id ??
+          "root");
+    if (requestedTopic.length > 0 && initialPage === "root") {
+      const suggestions = adamCommandRegistry.suggestHelpTopics(requestedTopic);
+      statusMessage = `Unknown Help topic ${safeTerminalText(requestedTopic)}${
+        suggestions.length === 0
+          ? ""
+          : ` · Did you mean ${suggestions.map((topic) => topic.id).join(", ")}?`
+      }`;
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    editor.setText("");
+    editor.disableSubmit = false;
+    helpNavigator?.hide();
+    let handle: { hide(): void } | undefined;
+    const close = () => {
+      handle?.hide();
+      helpNavigator = undefined;
+      tui.setFocus(editor);
+      tui.requestRender();
+    };
+    const navigator = new HelpNavigator({
+      commands: adamCommandRegistry.entries(),
+      initialPage,
+      keybindings: adamCommandRegistry.keybindings(),
+      onClose: close,
+      theme,
+      topics: adamCommandRegistry.helpTopics(),
+    });
+    handle = showOverlay(navigator, {
+      width: "80%",
+      minWidth: 36,
+      maxHeight: "80%",
+      margin: 1,
+    });
+    helpNavigator = { close, hide: () => handle?.hide(), navigator };
+    tui.requestRender();
+  };
   editor.onSubmit = (text) => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
-    if (active === null || text.trim().length === 0) {
+    if (text.trim().length === 0) {
+      return;
+    }
+    if (active === null) {
+      if (state.draft === null) {
+        return;
+      }
+      const parsedDraft = adamCommandRegistry.parse(text);
+      if (
+        parsedDraft.kind === "known" &&
+        (parsedDraft.command.id === "help" || parsedDraft.command.id === "hotkeys")
+      ) {
+        showHelpNavigator(parsedDraft.command.id, parsedDraft.argumentsText);
+        return;
+      }
+      if (
+        parsedDraft.kind === "known" &&
+        parsedDraft.command.id === "resume" &&
+        parsedDraft.argumentsText.length === 0
+      ) {
+        editor.setText("");
+        editor.disableSubmit = false;
+        sessionPickerDismissed = false;
+        sessionPickerRequested = true;
+        renderState();
+        return;
+      }
+      if (
+        parsedDraft.kind === "known" &&
+        (parsedDraft.command.id === "model" ||
+          parsedDraft.command.id === "target" ||
+          parsedDraft.command.id === "new") &&
+        parsedDraft.argumentsText.length === 0
+      ) {
+        editor.setText("");
+        editor.disableSubmit = false;
+        targetPickerDismissed = false;
+        targetPickerIntent = "create";
+        targetPickerRequested = true;
+        renderState();
+        return;
+      }
+      if (
+        parsedDraft.kind === "known" &&
+        parsedDraft.command.id === "skills" &&
+        parsedDraft.argumentsText.length === 0
+      ) {
+        editor.setText("");
+        editor.disableSubmit = false;
+        let handle: { hide(): void } | undefined;
+        const close = () => {
+          handle?.hide();
+          skillPalette = undefined;
+          tui.setFocus(editor);
+          tui.requestRender();
+        };
+        const palette = new SkillPalette({
+          catalog: state.draft.skills,
+          theme,
+          onClose: close,
+          onToggle(skill) {
+            if (selectedSkills.delete(skill.qualifiedId)) {
+              renderState();
+              return false;
+            }
+            selectedSkills.add(skill.qualifiedId);
+            renderState();
+            return true;
+          },
+        });
+        handle = showOverlay(palette, {
+          width: "90%",
+          minWidth: 36,
+          maxHeight: "80%",
+          margin: 1,
+        });
+        skillPalette = { close, hide: () => handle?.hide() };
+        tui.requestRender();
+        return;
+      }
+      if (parsedDraft.kind === "unknown") {
+        const suggestions = adamCommandRegistry.suggest(parsedDraft.name);
+        statusMessage = `Unknown command /${parsedDraft.name}${
+          suggestions.length === 0
+            ? ""
+            : ` · Did you mean ${suggestions.map((command) => `/${command.name}`).join(", ")}?`
+        }`;
+        editor.disableSubmit = false;
+        renderState();
+        return;
+      }
+      if (parsedDraft.kind === "known") {
+        statusMessage = `/${parsedDraft.command.name} needs a session. Submit the first prompt or use /resume.`;
+        editor.disableSubmit = false;
+        renderState();
+        return;
+      }
+      clearExitWindow();
+      editor.disableSubmit = true;
+      void options.presentation
+        .dispatch({
+          type: "submit_draft_prompt",
+          text,
+          skills: [...selectedSkills],
+        })
+        .then((receipt) => {
+          if (receipt.status === "admitted") {
+            editor.setText("");
+            selectedSkills.clear();
+          } else {
+            editor.setText(text);
+            statusMessage = receipt.message;
+            editor.disableSubmit = false;
+          }
+        })
+        .catch(() => {
+          editor.setText(text);
+          statusMessage = "The first prompt could not be admitted to a durable session.";
+          editor.disableSubmit = false;
+        })
+        .finally(() => {
+          renderState();
+        });
       return;
     }
     const runActive =
@@ -1132,50 +1337,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       parsedCommand.kind === "known" &&
       (parsedCommand.command.id === "help" || parsedCommand.command.id === "hotkeys")
     ) {
-      const requestedTopic =
-        parsedCommand.command.id === "hotkeys" ? "hotkeys" : parsedCommand.argumentsText.trim();
-      const initialPage: HelpPage =
-        requestedTopic.length === 0
-          ? "root"
-          : (adamCommandRegistry.helpTopics().find((topic) => topic.id === requestedTopic)?.id ??
-            "root");
-      if (requestedTopic.length > 0 && initialPage === "root") {
-        const suggestions = adamCommandRegistry.suggestHelpTopics(requestedTopic);
-        statusMessage = `Unknown Help topic ${safeTerminalText(requestedTopic)}${
-          suggestions.length === 0
-            ? ""
-            : ` · Did you mean ${suggestions.map((topic) => topic.id).join(", ")}?`
-        }`;
-        editor.disableSubmit = false;
-        renderState();
-        return;
-      }
-      editor.setText("");
-      editor.disableSubmit = false;
-      helpNavigator?.hide();
-      let handle: { hide(): void } | undefined;
-      const close = () => {
-        handle?.hide();
-        helpNavigator = undefined;
-        tui.setFocus(editor);
-        tui.requestRender();
-      };
-      const navigator = new HelpNavigator({
-        commands: adamCommandRegistry.entries(),
-        initialPage,
-        keybindings: adamCommandRegistry.keybindings(),
-        onClose: close,
-        theme,
-        topics: adamCommandRegistry.helpTopics(),
-      });
-      handle = showOverlay(navigator, {
-        width: "80%",
-        minWidth: 36,
-        maxHeight: "80%",
-        margin: 1,
-      });
-      helpNavigator = { close, hide: () => handle?.hide(), navigator };
-      tui.requestRender();
+      showHelpNavigator(parsedCommand.command.id, parsedCommand.argumentsText);
       return;
     }
     if (
@@ -1871,18 +2033,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         options.presentation.getState().transient !== null ||
         (active?.pendingInteractions.length ?? 0) > 0;
       if (runActive || cancelSettling) {
-        if (!cancelSettling && active !== null) {
+        if (!cancelSettling) {
           cancelSettling = true;
           void options.presentation
-            .dispatch({ type: "cancel_run", sessionId: active.session.id })
+            .dispatch({ type: "cancel_run", sessionId: active?.session.id ?? null })
             .then((receipt) => {
               const state = options.presentation.getState();
               const current = state.authoritative.active;
               if (
                 receipt.status === "rejected" ||
                 (state.transient === null &&
-                  current?.pendingInteractions.length === 0 &&
-                  current.session.status !== "idle")
+                  (current === null ||
+                    (current.pendingInteractions.length === 0 &&
+                      current.session.status !== "idle")))
               ) {
                 cancelSettling = false;
                 renderState();

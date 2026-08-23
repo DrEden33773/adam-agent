@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import {
   type ArtifactReference,
+  type ArtifactSource,
   type ArtifactStore,
   type ChangePreviewArtifactSource,
   createFileArtifactStore,
@@ -130,6 +131,7 @@ import {
   type SessionStoreDirectory,
 } from "./session-store.js";
 import {
+  buildSkillResourceManifestV1,
   createInitialSkillContextV1,
   type ExtensionSkillSourceV1,
   isSkillContextRecordV1Valid,
@@ -137,6 +139,7 @@ import {
   reloadSkillContextV1,
   type SkillContextRecordV1,
   type SkillContextSnapshot,
+  type SkillResourceManifestV1,
   skillContextSnapshot,
 } from "./skills.js";
 import {
@@ -352,6 +355,17 @@ export type SessionContinueResult = {
   readonly snapshot: CurrentSessionSnapshot;
 };
 
+export type NewSessionDraftSnapshot = {
+  readonly targetIdentity: ModelTargetIdentity;
+  readonly skillContext: SkillContextSnapshot;
+};
+
+export type SessionAdmissionReceipt = {
+  readonly sessionId: string;
+  readonly runId: string;
+  readonly sequence: number;
+};
+
 export type SessionNamingResult = {
   readonly status: "updated";
   readonly snapshot: CurrentSessionSnapshot;
@@ -497,6 +511,14 @@ export type SessionCommand =
   | McpConfigurationCommand;
 
 export interface SessionLifecycle {
+  admit(input: {
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly input: UserInput;
+    readonly limits?: RunOptions["limits"];
+    readonly runId?: string;
+    readonly signal?: AbortSignal;
+    readonly onAdmitted?: (receipt: SessionAdmissionReceipt) => void;
+  }): Promise<SessionContinueResult>;
   branch(input: SessionBranchInput): Promise<CurrentSessionSnapshot>;
   close(): Promise<McpCloseResult>;
   continue(input: {
@@ -519,6 +541,10 @@ export interface SessionLifecycle {
     readonly cursor?: string;
     readonly limit?: number;
   }): Promise<ProjectSessionCatalogPage>;
+  previewNewSession(input: {
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly signal?: AbortSignal;
+  }): Promise<NewSessionDraftSnapshot>;
   reloadRepositoryInstructions(input: {
     readonly sessionId: string;
   }): Promise<RepositoryInstructionsReloadResult>;
@@ -541,6 +567,10 @@ export class SessionLifecycleError extends Error {
     | "session_invalid"
     | "session_model_target_incompatible"
     | "session_model_target_unavailable"
+    | "session_persistence_failed"
+    | "session_skill_confirmation_required"
+    | "session_skill_policy_rejected"
+    | "session_skill_unavailable"
     | "session_not_found"
     | "session_project_mismatch"
     | "mcp_config_invalid"
@@ -632,6 +662,16 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   let automaticTitlesEnabled = options[sessionAutomaticTitlesEnabled] ?? true;
   let lifecycleClosePromise: Promise<McpCloseResult> | undefined;
   const pendingMcpCatalogDurability = new Map<string, Promise<void>>();
+  const preparedAdmissionTargets = new Map<
+    string,
+    {
+      readonly runId: string;
+      readonly resolved: Awaited<ReturnType<ModelTargets["resolve"]>>;
+      readonly skillManifests: ReadonlyMap<string, SkillResourceManifestV1>;
+      readonly skillPolicies: ReadonlyMap<string, "allow">;
+      readonly onAdmitted?: (receipt: SessionAdmissionReceipt) => void;
+    }
+  >();
   const pendingMcpMetadataThrough = new Map<string, number>();
   let scheduleMcpCatalogFlush = (_sessionId: string) => {};
   const publishMetadata = async (event: SessionMetadataEvent): Promise<void> => {
@@ -1509,7 +1549,204 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     }
   };
 
+  const prepareSessionCreation = async (input: {
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly runId?: string;
+    readonly signal?: AbortSignal;
+    readonly skills?: readonly string[];
+    readonly resolved?: Awaited<ReturnType<ModelTargets["resolve"]>>;
+  }): Promise<{
+    readonly genesis: SessionGenesisRecord;
+    readonly mcp: McpSessionSnapshot | undefined;
+    readonly skillManifests: ReadonlyMap<string, SkillResourceManifestV1>;
+    readonly skillPolicies: ReadonlyMap<string, "allow">;
+    readonly selectedSkills?: readonly string[];
+  }> => {
+    input.signal?.throwIfAborted();
+    let mcp: McpSessionSnapshot | undefined;
+    try {
+      mcp = await inspectMcpConfiguration(options.workspaceRoot);
+    } catch (error) {
+      if (error instanceof McpConfigurationError) {
+        throw new SessionLifecycleError("mcp_config_invalid");
+      }
+      throw error;
+    }
+    const sessionId = randomUUID();
+    const projectId = await canonicalProjectId(options.workspaceRoot);
+    const repository = await loadInitialRepositoryInstructions({
+      workspaceRoot: options.workspaceRoot,
+    });
+    const skillBudgetContext =
+      input.resolved === undefined
+        ? await resolveSkillBudgetContext(options, input.targetIdentity)
+        : {
+            effectiveContextTokens: input.resolved.contextProfile.contextWindowTokens,
+            estimatorVersion: input.resolved.contextProfile.estimatorVersion,
+          };
+    const extensionSources = await resolveExtensionSkillSources(options);
+    const stagedArtifactStore = createStagedArtifactStore();
+    const skillContext = await createInitialSkillContextV1({
+      artifactStore: stagedArtifactStore,
+      ...skillBudgetContext,
+      projectId,
+      sessionId,
+      userHome: homedir(),
+      workspaceRoot: options.workspaceRoot,
+      extensionSources,
+    });
+    const selectedSkills: string[] = [];
+    const skillManifests = new Map<string, SkillResourceManifestV1>();
+    const skillPolicies = new Map<string, "allow">();
+    if (input.skills !== undefined) {
+      if (input.runId === undefined || !draftSkillSelectionsAreValid(input.skills)) {
+        throw new SessionLifecycleError("session_skill_unavailable");
+      }
+      for (const [index, selection] of input.skills.entries()) {
+        const exactCandidate = skillContext.registry.candidates.find(
+          (entry) => entry.qualifiedId === selection,
+        );
+        const shortCandidates = skillContext.registry.candidates.filter(
+          (entry) => entry.name === selection,
+        );
+        const candidate =
+          exactCandidate ?? (shortCandidates.length === 1 ? shortCandidates[0] : undefined);
+        if (candidate === undefined) {
+          throw new SessionLifecycleError("session_skill_unavailable");
+        }
+        const requestId = `${input.runId}:skill:${index + 1}`;
+        selectedSkills.push(candidate.qualifiedId);
+        const manifest = await buildSkillResourceManifestV1({
+          candidate,
+          workspaceRoot: options.workspaceRoot,
+          userHome: homedir(),
+          userHomeDigest: skillContext.userHomeDigest,
+          ...(extensionSources.length === 0 ? {} : { extensionSources }),
+        });
+        const policy =
+          options.permissions?.decide({
+            callId: requestId,
+            name: "activate_skill",
+            effect: "read",
+            scope: "call",
+            subject: {
+              type: "skill",
+              operation: "activate",
+              qualifiedId: candidate.qualifiedId,
+            },
+          }) ?? "deny";
+        if (policy === "deny") {
+          throw new SessionLifecycleError("session_skill_policy_rejected");
+        }
+        if (policy === "ask") {
+          throw new SessionLifecycleError("session_skill_confirmation_required");
+        }
+        skillManifests.set(requestId, manifest);
+        skillPolicies.set(requestId, policy);
+      }
+    }
+    if (options.tools === undefined) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    input.signal?.throwIfAborted();
+    await stagedArtifactStore.flushTo(
+      createLazyArtifactStore(join(effectiveSessionStateRoot(options.stateRoot), "artifacts")),
+    );
+    input.signal?.throwIfAborted();
+    return {
+      genesis: {
+        schemaVersion: 3,
+        sequence: 1,
+        record: {
+          type: "session_genesis",
+          sessionId,
+          projectId,
+          targetIdentity: input.targetIdentity,
+          promptContext: createPromptContextV3(options.tools, repository, skillContext),
+          skillContext,
+        },
+      },
+      mcp,
+      skillManifests,
+      skillPolicies,
+      ...(input.skills === undefined ? {} : { selectedSkills }),
+    };
+  };
+
+  const persistPreparedSession = async (prepared: {
+    readonly genesis: SessionGenesisRecord;
+    readonly mcp: McpSessionSnapshot | undefined;
+  }): Promise<CurrentSessionSnapshot> => {
+    const store = await storeDirectory.create(prepared.genesis.record.sessionId);
+    await store.append(prepared.genesis);
+    const snapshot = snapshotFromGenesis(prepared.genesis, 1);
+    return prepared.mcp === undefined ? snapshot : { ...snapshot, mcp: prepared.mcp };
+  };
+
   return {
+    async admit(input) {
+      const runId = input.runId ?? randomUUID();
+      if (
+        !z.uuid().safeParse(runId).success ||
+        input.input.text.trim().length === 0 ||
+        !draftRunLimitsAreValid(input.limits) ||
+        options.modelTargets === undefined
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const created = await withOwner(async () => {
+        const resolved = await options.modelTargets?.resolve({
+          targetId: input.targetIdentity.targetId,
+          targetIdentity: input.targetIdentity,
+          allowExperimental: input.targetIdentity.certification === "experimental",
+          signal: input.signal ?? new AbortController().signal,
+        });
+        if (
+          resolved === undefined ||
+          !sameModelTargetIdentity(resolved.identity, input.targetIdentity) ||
+          resolved.contextProfile.version !== input.targetIdentity.profileVersion ||
+          !isContextProfileSupported(resolved.contextProfile)
+        ) {
+          throw new SessionLifecycleError("session_model_target_incompatible");
+        }
+        const prepared = await prepareSessionCreation({
+          targetIdentity: input.targetIdentity,
+          runId,
+          ...(input.signal === undefined ? {} : { signal: input.signal }),
+          ...(input.input.skills === undefined ? {} : { skills: input.input.skills }),
+          resolved,
+        });
+        input.signal?.throwIfAborted();
+        let snapshot: CurrentSessionSnapshot;
+        try {
+          snapshot = await persistPreparedSession(prepared);
+        } catch {
+          throw new SessionLifecycleError("session_persistence_failed");
+        }
+        preparedAdmissionTargets.set(snapshot.sessionId, {
+          runId,
+          resolved,
+          skillManifests: prepared.skillManifests,
+          skillPolicies: prepared.skillPolicies,
+          ...(input.onAdmitted === undefined ? {} : { onAdmitted: input.onAdmitted }),
+        });
+        return { snapshot, selectedSkills: prepared.selectedSkills };
+      });
+      try {
+        return await this.continue({
+          sessionId: created.snapshot.sessionId,
+          input:
+            created.selectedSkills === undefined
+              ? input.input
+              : { ...input.input, skills: created.selectedSkills },
+          runId,
+          ...(input.limits === undefined ? {} : { limits: input.limits }),
+          ...(input.signal === undefined ? {} : { signal: input.signal }),
+        });
+      } finally {
+        preparedAdmissionTargets.delete(created.snapshot.sessionId);
+      }
+    },
     async branch(input) {
       return withOwner(async () => {
         const artifactCache = createArtifactMaterializationCache();
@@ -1846,54 +2083,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       return lifecycleClosePromise;
     },
     async create(input) {
-      return withOwner(async () => {
-        let mcp: McpSessionSnapshot | undefined;
-        try {
-          mcp = await inspectMcpConfiguration(options.workspaceRoot);
-        } catch (error) {
-          if (error instanceof McpConfigurationError) {
-            throw new SessionLifecycleError("mcp_config_invalid");
-          }
-          throw error;
-        }
-        const sessionId = randomUUID();
-        const projectId = await canonicalProjectId(options.workspaceRoot);
-        const repository = await loadInitialRepositoryInstructions({
-          workspaceRoot: options.workspaceRoot,
-        });
-        const store = await storeDirectory.create(sessionId);
-        const skillBudgetContext = await resolveSkillBudgetContext(options, input.targetIdentity);
-        const extensionSources = await resolveExtensionSkillSources(options);
-        const skillContext = await createInitialSkillContextV1({
-          artifactStore: createLazyArtifactStore(
-            join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
-          ),
-          ...skillBudgetContext,
-          projectId,
-          sessionId,
-          userHome: homedir(),
-          workspaceRoot: options.workspaceRoot,
-          extensionSources,
-        });
-        if (options.tools === undefined) {
-          throw new SessionLifecycleError("session_invalid");
-        }
-        const genesis: SessionGenesisRecord = {
-          schemaVersion: 3,
-          sequence: 1,
-          record: {
-            type: "session_genesis",
-            sessionId,
-            projectId,
-            targetIdentity: input.targetIdentity,
-            promptContext: createPromptContextV3(options.tools, repository, skillContext),
-            skillContext,
-          },
-        };
-        await store.append(genesis);
-        const snapshot = snapshotFromGenesis(genesis, 1);
-        return mcp === undefined ? snapshot : { ...snapshot, mcp };
-      });
+      return withOwner(async () =>
+        persistPreparedSession(
+          await prepareSessionCreation({ targetIdentity: input.targetIdentity }),
+        ),
+      );
     },
     async continue(input) {
       if (input.runId !== undefined && !z.uuid().safeParse(input.runId).success) {
@@ -1938,12 +2132,16 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (options.modelTargets === undefined) {
           throw new SessionLifecycleError("session_model_target_unavailable");
         }
-        const resolved = await options.modelTargets.resolve({
-          targetId: resumed.snapshot.targetIdentity.targetId,
-          targetIdentity: resumed.snapshot.targetIdentity,
-          allowExperimental: resumed.snapshot.targetIdentity.certification === "experimental",
-          signal: input.signal ?? new AbortController().signal,
-        });
+        const preparedAdmission = preparedAdmissionTargets.get(input.sessionId);
+        const resolved =
+          preparedAdmission !== undefined && preparedAdmission.runId === input.runId
+            ? preparedAdmission.resolved
+            : await options.modelTargets.resolve({
+                targetId: resumed.snapshot.targetIdentity.targetId,
+                targetIdentity: resumed.snapshot.targetIdentity,
+                allowExperimental: resumed.snapshot.targetIdentity.certification === "experimental",
+                signal: input.signal ?? new AbortController().signal,
+              });
         if (
           !sameModelTargetIdentity(resolved.identity, resumed.snapshot.targetIdentity) ||
           resolved.contextProfile.version !== resumed.snapshot.targetIdentity.profileVersion ||
@@ -2250,21 +2448,33 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               ? {}
               : { repositoryWorkspaceRoot: options.workspaceRoot }),
             sessionId: resumed.snapshot.sessionId,
-            ...(options[sessionLogicalRunStartedBarrier] === undefined
+            ...(options[sessionLogicalRunStartedBarrier] === undefined &&
+            preparedAdmission?.onAdmitted === undefined
               ? {}
               : {
-                  afterLogicalRunStarted: (started: {
+                  afterLogicalRunStarted: async (started: {
                     readonly sessionId: string;
                     readonly runId: string;
                     readonly sequence: number;
-                  }) =>
-                    options[sessionLogicalRunStartedBarrier]?.afterDurableRecord(started) ??
-                    Promise.resolve(),
+                  }) => {
+                    try {
+                      preparedAdmission?.onAdmitted?.(started);
+                    } catch {
+                      // Admission observers cannot change an already durable logical input.
+                    }
+                    await options[sessionLogicalRunStartedBarrier]?.afterDurableRecord(started);
+                  },
                 }),
             targetIdentity: resumed.snapshot.targetIdentity,
             ...(activePromptContext === undefined ? {} : { promptContext: activePromptContext }),
             ...(activeSkillContext === undefined ? {} : { skillContext: activeSkillContext }),
             ...(extensionSources.length === 0 ? {} : { extensionSkillSources: extensionSources }),
+            ...(preparedAdmission === undefined
+              ? {}
+              : {
+                  preparedExplicitSkillManifests: preparedAdmission.skillManifests,
+                  preparedExplicitSkillPolicies: preparedAdmission.skillPolicies,
+                }),
             ...(options.extensionHost === undefined
               ? {}
               : {
@@ -3044,7 +3254,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
       const afterSessionId = decodeProjectSessionCatalogCursor(input.cursor);
       const projectId = await canonicalProjectId(options.workspaceRoot);
-      const sessionIds = [...(await storeDirectory.listSessionIds())].sort();
+      const sessionIds: string[] = [];
+      for (const sessionId of [...(await storeDirectory.listSessionIds())].sort()) {
+        const records = await readSessionRecords(options, sessionId);
+        if (
+          records.some((entry) =>
+            entry.schemaVersion === 3
+              ? entry.record.type === "logical_run_started"
+              : entry.event.type === "user_message",
+          )
+        ) {
+          sessionIds.push(sessionId);
+        }
+      }
       const afterIndex =
         afterSessionId === undefined
           ? 0
@@ -3063,6 +3285,45 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             ? encodeProjectSessionCatalogCursor(lastSessionId)
             : null,
       };
+    },
+    async previewNewSession(input) {
+      return withOwner(async () => {
+        if (options.modelTargets === undefined) {
+          throw new SessionLifecycleError("session_model_target_unavailable");
+        }
+        const targets = await options.modelTargets.snapshot({
+          includeHistoricalProfiles: true,
+          signal: input.signal ?? new AbortController().signal,
+        });
+        const target = targets.targets.find((candidate) =>
+          sameModelTargetIdentity(candidate.identity, input.targetIdentity),
+        );
+        if (target === undefined || target.readiness.status !== "available") {
+          throw new SessionLifecycleError("session_model_target_unavailable");
+        }
+        if (
+          target.contextProfile.version !== input.targetIdentity.profileVersion ||
+          !isContextProfileSupported(target.contextProfile)
+        ) {
+          throw new SessionLifecycleError("session_model_target_incompatible");
+        }
+        const projectId = await canonicalProjectId(options.workspaceRoot);
+        const extensionSources = await resolveExtensionSkillSources(options);
+        const skillContext = await createInitialSkillContextV1({
+          artifactStore: createStagedArtifactStore(),
+          effectiveContextTokens: target.contextProfile.contextWindowTokens,
+          estimatorVersion: target.contextProfile.estimatorVersion,
+          projectId,
+          sessionId: randomUUID(),
+          userHome: homedir(),
+          workspaceRoot: options.workspaceRoot,
+          extensionSources,
+        });
+        return {
+          targetIdentity: input.targetIdentity,
+          skillContext: skillContextSnapshot(skillContext),
+        };
+      });
     },
     async reloadRepositoryInstructions(input) {
       if (activeSession !== undefined) {
@@ -7860,6 +8121,50 @@ function createLazyArtifactStore(root: string): ArtifactStore {
   };
 }
 
+function createStagedArtifactStore(): ArtifactStore & {
+  readonly flushTo: (store: ArtifactStore) => Promise<void>;
+} {
+  const artifacts = new Map<
+    string,
+    {
+      readonly bytes: Uint8Array;
+      readonly mediaType: string;
+      readonly source: ArtifactSource;
+    }
+  >();
+  return {
+    async write(input) {
+      const bytes = Uint8Array.from(input.bytes);
+      const id = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+      artifacts.set(id, { bytes, mediaType: input.mediaType, source: input.source });
+      return {
+        id,
+        mediaType: input.mediaType,
+        byteCount: bytes.byteLength,
+        source: input.source,
+      };
+    },
+    async read(id, options) {
+      const bytes = artifacts.get(id)?.bytes;
+      if (
+        bytes === undefined ||
+        (options?.maximumBytes !== undefined && bytes.byteLength > options.maximumBytes)
+      ) {
+        return undefined;
+      }
+      return Uint8Array.from(bytes);
+    },
+    async flushTo(store) {
+      for (const [id, artifact] of artifacts) {
+        const persisted = await store.write(artifact);
+        if (persisted.id !== id) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+      }
+    },
+  };
+}
+
 async function materializeActiveSkillContents(
   options: SessionLifecycleOptions,
   context: SkillContextRecordV1 | undefined,
@@ -8188,6 +8493,27 @@ function inlineModelResponseField(field: string | SessionModelResponseField): st
   throw new SessionLifecycleError("session_invalid");
 }
 
+function draftSkillSelectionsAreValid(selections: readonly string[]): boolean {
+  return (
+    selections.length <= 8 &&
+    selections.every(
+      (selection) =>
+        selection.length > 0 &&
+        Buffer.byteLength(selection, "utf8") <= 16_384 &&
+        /^[\x20-\x7e]+$/u.test(selection),
+    )
+  );
+}
+
+function draftRunLimitsAreValid(limits: RunOptions["limits"]): boolean {
+  return (
+    (limits?.maxTurns === undefined ||
+      (Number.isSafeInteger(limits.maxTurns) && limits.maxTurns > 0)) &&
+    (limits?.maxTokens === undefined ||
+      (Number.isSafeInteger(limits.maxTokens) && limits.maxTokens > 0))
+  );
+}
+
 function sessionLifecycleErrorMessage(code: SessionLifecycleError["code"]): string {
   switch (code) {
     case "mcp_bootstrap_failed":
@@ -8220,6 +8546,14 @@ function sessionLifecycleErrorMessage(code: SessionLifecycleError["code"]): stri
       return "The requested exact model target is not compatible with this session boundary.";
     case "session_model_target_unavailable":
       return "The requested exact model target is not ready in this runtime.";
+    case "session_persistence_failed":
+      return "The new session could not be persisted.";
+    case "session_skill_unavailable":
+      return "One selected Agent Skill is unavailable for draft admission.";
+    case "session_skill_confirmation_required":
+      return "One selected Agent Skill requires confirmation before draft admission.";
+    case "session_skill_policy_rejected":
+      return "One selected Agent Skill is denied by the draft admission policy.";
     case "session_not_found":
       return "The session does not exist in this project.";
     case "session_project_mismatch":

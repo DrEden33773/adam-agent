@@ -10,7 +10,7 @@ import {
   createFileArtifactStore,
   createPermissionPolicy,
   createPresentationPreferences,
-  createPresentationSession,
+  createPresentationSession as createProductPresentationSession,
   createReadToolRegistry,
   createSessionLifecycle,
   type ModelDriver,
@@ -21,19 +21,25 @@ import {
 } from "@adam-agent/agent";
 import {
   assemblePromptMessagesV1,
+  createInMemorySessionStoreDirectory,
   digestPromptRequestV1,
   mcpCatalogStaleDurableBarrier,
   mcpTransportFactory,
   openJsonlSessionStore,
+  preparedDirectDeepSeekV2ContextProfile,
   presentationCatalogPageSize,
   presentationHistoryPageSize,
   presentationHydrationBarrier,
   presentationRuntimeRefreshBarrier,
+  presentationSessionRecordReader,
   resolvePresentationTerminalContext,
   type SessionRecord,
+  type SessionStore,
+  type SessionStoreDirectory,
   sessionAutomaticTitlesEnabled,
   sessionLogicalRunStartedBarrier,
   sessionRuntimeNotificationTransform,
+  sessionStoreDirectory,
   sessionTitleDeadlineScheduler,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
@@ -62,6 +68,48 @@ const contextProfile: ContextProfile = {
   retainedTargetTokens: 20_000,
   estimatorVersion: 1,
 };
+
+async function createPresentationSession(
+  options: Parameters<typeof createProductPresentationSession>[0],
+) {
+  if ("targetIdentity" in options && options.targetIdentity !== undefined) {
+    const { lifecycle, targetIdentity: fixtureTargetIdentity, ...base } = options;
+    const created = await lifecycle.create({ targetIdentity: fixtureTargetIdentity });
+    return createProductPresentationSession({
+      ...base,
+      lifecycle,
+      sessionId: created.sessionId,
+    });
+  }
+  return createProductPresentationSession(options);
+}
+function settledModelTargets(answer = "Presentation fixture answer."): ModelTargets {
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: answer },
+    { type: "finish", reason: "stop" },
+  ]);
+  return {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+}
+
+function readInMemoryPresentationRecords(directory: SessionStoreDirectory<SessionRecord>) {
+  return async (sessionId: string): Promise<readonly SessionRecord[]> =>
+    (await directory.open(sessionId))?.read() ?? [];
+}
 const testEnvironment = process.env as NodeJS.ProcessEnv & { HOME?: string };
 async function writeScriptedMcpConfiguration(
   testRoot: string,
@@ -193,6 +241,7 @@ test("PresentationSession opens an empty project catalog without creating a sess
         sessions: { items: [], nextCursor: null },
         active: null,
       },
+      draft: null,
       transient: null,
     });
     expect(state.authoritative.project.id).toMatch(/^sha256:[0-9a-f]{64}$/u);
@@ -240,7 +289,8 @@ test("PresentationSession projects exact target identity and readiness for proje
     },
   };
 
-  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
   try {
     const presentation = await createPresentationSession({
       lifecycle,
@@ -249,6 +299,7 @@ test("PresentationSession projects exact target identity and readiness for proje
       projectLabel: "workspace",
       stateRoot,
       workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
     });
 
     expect(presentation.getState().authoritative.targets).toEqual({
@@ -272,6 +323,509 @@ test("PresentationSession projects exact target identity and readiness for proje
       diagnostic: null,
     });
     expect(presentation.getState().authoritative.active).toBeNull();
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession begins a new-session draft without creating durable session identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-session-draft-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Draft target selection does not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+
+    await expect(
+      presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+
+    expect(presentation.getState()).toMatchObject({
+      draft: { targetId: targetIdentity.targetId },
+      authoritative: {
+        active: null,
+        sessions: { items: [] },
+      },
+    });
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession previews the draft Skill catalog without creating durable session identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-skills-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "draft-review");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: draft-review\ndescription: Reviews the first draft prompt.\n---\nDraft-only preview body.\n",
+    "utf8",
+  );
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Draft catalog preview does not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+
+    expect(presentation.getState().draft).toMatchObject({
+      targetId: targetIdentity.targetId,
+      skills: {
+        items: [
+          {
+            qualifiedId: "skill:v1:project:.:draft-review",
+            name: "draft-review",
+            active: false,
+          },
+        ],
+        reloadAvailable: false,
+      },
+    });
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession freezes the current exact target identity against historical catalog entries", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-exact-target-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const currentIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 2 };
+  const observedAdmissionProfiles: number[] = [];
+  const modelTargets: ModelTargets = {
+    async resolve(input) {
+      const exact = (input as typeof input & { readonly targetIdentity?: ModelTargetIdentity })
+        .targetIdentity;
+      const identity = exact?.profileVersion === 1 ? targetIdentity : currentIdentity;
+      observedAdmissionProfiles.push(identity.profileVersion);
+      return {
+        identity,
+        driver: new FakeModelDriver([
+          { type: "text_delta", text: `Profile ${identity.profileVersion} admitted.` },
+          { type: "finish", reason: "stop" },
+        ]),
+        contextProfile:
+          identity.profileVersion === 1 ? contextProfile : preparedDirectDeepSeekV2ContextProfile,
+      };
+    },
+    async snapshot(input) {
+      const current = {
+        identity: currentIdentity,
+        readiness: { status: "available" as const, credentialSource: "current profile" },
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+      };
+      const historical = {
+        identity: targetIdentity,
+        readiness: { status: "available" as const, credentialSource: "historical profile" },
+        contextProfile,
+      };
+      return {
+        targets: input.includeHistoricalProfiles ? [current, historical] : [current],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const historical = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: historical.sessionId,
+      input: { text: "Persist the historical exact profile" },
+    });
+    observedAdmissionProfiles.length = 0;
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({ type: "create_session", targetId: currentIdentity.targetId });
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Use the current exact profile",
+        skills: [],
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    const admittedSessionId = presentation.getState().authoritative.active?.session.id;
+    if (admittedSessionId === undefined) {
+      throw new Error("Expected the current exact target draft to be admitted.");
+    }
+    await expect(lifecycle.inspect({ sessionId: admittedSessionId })).resolves.toMatchObject({
+      targetIdentity: currentIdentity,
+    });
+    expect(observedAdmissionProfiles[0]).toBe(2);
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession admits the first non-empty draft prompt as one durable session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-admission-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Draft admitted." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    const completed = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      const items = presentation.getState().authoritative.active?.transcript.items ?? [];
+      if (
+        items.some((item) => item.type === "assistant_message" && item.text === "Draft admitted.")
+      ) {
+        completed.resolve();
+      }
+    });
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Persist this first prompt",
+        skills: [],
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    await completed.promise;
+    unsubscribe();
+
+    const state = presentation.getState();
+    expect(state).toMatchObject({
+      draft: null,
+      authoritative: {
+        active: {
+          session: { targetId: targetIdentity.targetId },
+          transcript: {
+            items: [
+              { type: "user_message", text: "Persist this first prompt" },
+              { type: "assistant_message", text: "Draft admitted." },
+            ],
+          },
+        },
+        sessions: { items: [{ targetId: targetIdentity.targetId }] },
+      },
+    });
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({
+      items: [{ sessionId: state.authoritative.active?.session.id }],
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps the draft unpersisted when target resolution rejects admission", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-target-reject-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("The exact target became unavailable.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Do not partially persist this prompt",
+        skills: [],
+      }),
+    ).resolves.toMatchObject({ status: "rejected" });
+
+    expect(presentation.getState()).toMatchObject({
+      draft: { targetId: targetIdentity.targetId },
+      authoritative: { active: null, sessions: { items: [] } },
+    });
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps an admitted draft durable when the provider fails", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-provider-failure-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver: ModelDriver = {
+    async *stream() {
+      yield await Promise.reject(
+        new ModelDriverError("transport", "private provider failure", {
+          cause: new Error("fixture transport failure"),
+        }),
+      );
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    const failed = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation
+          .getState()
+          .authoritative.active?.transcript.items.some(
+            (item) => item.type === "session_notice" && item.status === "failed",
+          ) === true
+      ) {
+        failed.resolve();
+      }
+    });
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Persist before provider failure",
+        skills: [],
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    await failed.promise;
+    unsubscribe();
+
+    const state = presentation.getState();
+    expect(state).toMatchObject({
+      draft: null,
+      authoritative: {
+        active: {
+          transcript: {
+            items: [
+              { type: "user_message", text: "Persist before provider failure" },
+              { type: "session_notice", status: "failed", code: "model_request_failed" },
+            ],
+          },
+        },
+        sessions: { items: [{ id: state.authoritative.active?.session.id }] },
+      },
+    });
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({
+      items: [{ sessionId: state.authoritative.active?.session.id }],
+    });
+
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps its draft when logical input persistence fails", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-input-failure-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const backing = createInMemorySessionStoreDirectory<SessionRecord>();
+  const wrappedStores = new Map<string, SessionStore<SessionRecord>>();
+  const failingDirectory: SessionStoreDirectory<SessionRecord> = {
+    async create(sessionId) {
+      const store = await backing.create(sessionId);
+      const wrapped: SessionStore<SessionRecord> = {
+        async append(record) {
+          if (record.schemaVersion === 3 && record.record.type === "logical_run_started") {
+            throw new Error("Injected logical-input persistence failure.");
+          }
+          await store.append(record);
+        },
+        read: () => store.read(),
+      };
+      wrappedStores.set(sessionId, wrapped);
+      return wrapped;
+    },
+    listSessionIds: () => backing.listSessionIds(),
+    async open(sessionId) {
+      return (await backing.open(sessionId)) === undefined
+        ? undefined
+        : wrappedStores.get(sessionId);
+    },
+  };
+  const modelTargets = settledModelTargets("The model must not run after persistence failure.");
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    workspaceRoot,
+    [sessionStoreDirectory]: failingDirectory,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      workspaceRoot,
+    });
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Keep this draft after persistence failure",
+        skills: [],
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "persistence_failed" });
+    expect(presentation.getState()).toMatchObject({
+      draft: { targetId: targetIdentity.targetId },
+      authoritative: { active: null, sessions: { items: [] } },
+    });
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
 
     await presentation.close();
   } finally {
@@ -448,7 +1002,7 @@ test("PresentationSession saves one exact default target through a distinct sema
   }
 });
 
-test("PresentationSession creates a session only from an exact available launch target", async () => {
+test("PresentationSession begins a draft only from an exact available launch target", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-target-create-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -484,14 +1038,11 @@ test("PresentationSession creates a session only from an exact available launch 
     await expect(
       presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId }),
     ).resolves.toMatchObject({ status: "admitted", resource: null });
-    expect(presentation.getState().authoritative.active?.session).toMatchObject({
-      targetId: targetIdentity.targetId,
-      label: "New session",
-      status: "idle",
+    expect(presentation.getState()).toMatchObject({
+      draft: { targetId: targetIdentity.targetId },
+      authoritative: { active: null, sessions: { items: [] } },
     });
-    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({
-      items: [expect.objectContaining({ targetIdentity })],
-    });
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
 
     await presentation.close();
   } finally {
@@ -500,16 +1051,33 @@ test("PresentationSession creates a session only from an exact available launch 
   }
 });
 
-test("PresentationSession opens a real new session as authoritative empty project history", async () => {
+test("PresentationSession opens an exact target as a process-local draft", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-open-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
 
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Opening an exact target draft must not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
   try {
-    const presentation = await createPresentationSession({
+    const presentation = await createProductPresentationSession({
       lifecycle,
+      modelTargets,
       projectLabel: "workspace",
       stateRoot,
       targetIdentity,
@@ -523,68 +1091,27 @@ test("PresentationSession opens a real new session as authoritative empty projec
         schemaVersion: 1,
         continuity: {
           status: "current",
-          sessionThroughSequence: 1,
+          sessionThroughSequence: 0,
           operationThrough: [],
         },
         project: { id: state.authoritative.project.id, label: "workspace" },
-        targets: { items: [], defaultTargetId: null, diagnostic: null },
-        sessions: {
-          items: [
-            {
-              id: state.authoritative.active?.session.id,
-              label: "New session",
-              targetId: "deepseek-v4-flash.direct",
-              status: "idle",
-              naming: {
-                manualName: null,
-                generatedTitle: null,
-                fallbackTitle: null,
-                displayLabel: "New session",
-                generation: { status: "not_started" },
-              },
-            },
-          ],
-          nextCursor: null,
+        targets: {
+          items: [expect.objectContaining({ targetId: targetIdentity.targetId })],
+          defaultTargetId: null,
+          diagnostic: null,
         },
-        active: {
-          session: {
-            id: state.authoritative.active?.session.id,
-            label: "New session",
-            targetId: "deepseek-v4-flash.direct",
-            status: "idle",
-            naming: {
-              manualName: null,
-              generatedTitle: null,
-              fallbackTitle: null,
-              displayLabel: "New session",
-              generation: { status: "not_started" },
-            },
-          },
-          transcript: { items: [], olderCursor: null },
-          context: null,
-          pendingInteractions: [],
-          repositoryInstructions: {
-            revision: 1,
-            activeScopes: ["."],
-            sources: [],
-            diagnostics: [],
-            effectiveDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
-            reloadAvailable: true,
-          },
-          skills: {
-            revision: 1,
-            items: [],
-            diagnostics: [],
-            overflow: { omittedCount: 0, shortenedCount: 0 },
-            reloadAvailable: true,
-          },
-          projectPaths: { items: [], omittedCount: 0, diagnostic: null },
-          mcp: null,
-        },
+        sessions: { items: [], nextCursor: null },
+        active: null,
+      },
+      draft: {
+        targetId: targetIdentity.targetId,
+        projectPaths: expect.objectContaining({ items: [], omittedCount: 0 }),
+        skills: expect.objectContaining({ items: [], reloadAvailable: false }),
       },
       transient: null,
     });
     expect(state.authoritative.project.id).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
 
     await presentation.close();
   } finally {
@@ -4371,25 +4898,28 @@ test("SessionLifecycle rejects a preview reference whose provenance no longer ma
   }
 });
 
-test("PresentationSession creates and selects sessions through semantic commands", async () => {
+test("PresentationSession starts a draft and selects admitted sessions through semantic commands", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-create-select-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const modelTargets = settledModelTargets();
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
 
   try {
+    const first = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: first.sessionId,
+      input: { text: "First admitted project session" },
+    });
     const presentation = await createPresentationSession({
       lifecycle,
+      modelTargets,
+      openProject: true,
       projectLabel: "workspace",
-      targetIdentity,
       stateRoot,
       workspaceRoot,
     });
-    const firstSessionId = presentation.getState().authoritative.active?.session.id;
-    if (firstSessionId === undefined) {
-      throw new Error("Expected an initial session.");
-    }
 
     await expect(
       presentation.dispatch({
@@ -4397,22 +4927,29 @@ test("PresentationSession creates and selects sessions through semantic commands
         targetId: "deepseek-v4-flash.direct",
       }),
     ).resolves.toMatchObject({ status: "admitted", resource: null });
-    const secondSessionId = presentation.getState().authoritative.active?.session.id;
-    expect(secondSessionId).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
-    );
-    expect(secondSessionId).not.toBe(firstSessionId);
-    expect(presentation.getState().authoritative.sessions.items).toHaveLength(2);
+    expect(presentation.getState()).toMatchObject({
+      draft: { targetId: targetIdentity.targetId },
+      authoritative: {
+        active: null,
+        sessions: { items: [{ id: first.sessionId }] },
+      },
+    });
 
     await expect(
-      presentation.dispatch({ type: "select_session", sessionId: firstSessionId }),
+      presentation.dispatch({ type: "select_session", sessionId: first.sessionId }),
     ).resolves.toMatchObject({ status: "admitted", resource: null });
     expect(presentation.getState()).toMatchObject({
+      draft: null,
       authoritative: {
-        continuity: { status: "current", sessionThroughSequence: 1 },
         active: {
-          session: { id: firstSessionId, label: "New session" },
-          transcript: { items: [], olderCursor: null },
+          session: { id: first.sessionId },
+          transcript: {
+            items: [
+              { type: "user_message", text: "First admitted project session" },
+              { type: "assistant_message", text: "Presentation fixture answer." },
+            ],
+            olderCursor: null,
+          },
         },
       },
     });
@@ -4429,11 +4966,14 @@ test("PresentationSession discovers and selects cold sibling project sessions", 
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const modelTargets = settledModelTargets("Cold catalog answer.");
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
 
   try {
     const first = await lifecycle.create({ targetIdentity });
     const second = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({ sessionId: first.sessionId, input: { text: "Cold first" } });
+    await lifecycle.continue({ sessionId: second.sessionId, input: { text: "Cold second" } });
     const presentation = await createPresentationSession({
       lifecycle,
       projectLabel: "workspace",
@@ -4466,13 +5006,21 @@ test("PresentationSession consumes the opaque project catalog cursor", async () 
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const modelTargets = settledModelTargets("Catalog page answer.");
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
 
   try {
     const created = [
       await lifecycle.create({ targetIdentity }),
       await lifecycle.create({ targetIdentity }),
-    ].sort((left, right) => left.sessionId.localeCompare(right.sessionId));
+    ];
+    for (const [index, session] of created.entries()) {
+      await lifecycle.continue({
+        sessionId: session.sessionId,
+        input: { text: `Catalog page ${index + 1}` },
+      });
+    }
+    created.sort((left, right) => left.sessionId.localeCompare(right.sessionId));
     const first = created[0];
     if (first === undefined) {
       throw new Error("Expected a project session.");
@@ -4512,11 +5060,20 @@ test("PresentationSession rejects a failed catalog page inside CommandReceipt", 
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const modelTargets = settledModelTargets("Catalog failure answer.");
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
 
   try {
     const first = await lifecycle.create({ targetIdentity });
-    await lifecycle.create({ targetIdentity });
+    const second = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: first.sessionId,
+      input: { text: "Catalog failure first" },
+    });
+    await lifecycle.continue({
+      sessionId: second.sessionId,
+      input: { text: "Catalog failure second" },
+    });
     const presentationLifecycle: SessionLifecycle = {
       ...lifecycle,
       async listProjectSessions(input) {
@@ -5300,6 +5857,9 @@ test("PresentationSession keeps an active run bound to its source session", asyn
       await modelStarted.promise;
       await expect(
         presentation.dispatch({ type: "select_session", sessionId: sibling.sessionId }),
+      ).resolves.toMatchObject({ status: "rejected", code: "conflict" });
+      await expect(
+        presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId }),
       ).resolves.toMatchObject({ status: "rejected", code: "conflict" });
       expect(presentation.getState().authoritative.active?.session.id).toBe(source.sessionId);
       await expect(

@@ -368,6 +368,12 @@ export type PresentationFault = {
   readonly message: string;
 };
 
+export type NewSessionDraftDisplay = {
+  readonly targetId: string;
+  readonly skills: SkillCatalogDisplay;
+  readonly projectPaths: ProjectPathCatalogDisplay;
+};
+
 export type AuthoritativePresentationSnapshot = {
   readonly schemaVersion: 1;
   readonly continuity:
@@ -396,6 +402,7 @@ export type PresentationTransientState = {
 export type PresentationDisplayState = {
   readonly revision: number;
   readonly authoritative: AuthoritativePresentationSnapshot;
+  readonly draft: NewSessionDraftDisplay | null;
   readonly transient: PresentationTransientState | null;
 };
 
@@ -523,8 +530,13 @@ export type PresentationCommand =
       readonly skills: readonly string[];
     }
   | {
+      readonly type: "submit_draft_prompt";
+      readonly text: string;
+      readonly skills: readonly string[];
+    }
+  | {
       readonly type: "cancel_run";
-      readonly sessionId: string;
+      readonly sessionId: string | null;
     }
   | {
       readonly type: "decide_permission";
@@ -555,6 +567,7 @@ export function reconcilePresentationUpdate(
     return {
       revision: state.revision + 1,
       authoritative: update.snapshot,
+      draft: update.snapshot.active === null ? state.draft : null,
       transient: null,
     };
   }
@@ -569,6 +582,7 @@ export function reconcilePresentationUpdate(
         ...state.authoritative,
         continuity: { status: "repairing", reason: "gap" },
       },
+      draft: state.draft,
       transient: null,
     };
   }
@@ -576,6 +590,7 @@ export function reconcilePresentationUpdate(
   return {
     revision: state.revision + 1,
     authoritative: state.authoritative,
+    draft: state.draft,
     transient: {
       activity: "replying",
       assistant: {

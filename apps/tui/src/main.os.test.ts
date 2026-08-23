@@ -384,10 +384,42 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
   } as const;
 
   try {
-    const seed = startFixture({ program, stateRoot, workspaceRoot });
-    await seed.waitFor("Select an exact model target");
-    seed.write("\r");
-    await seed.waitFor("Adam · New session");
+    const modelTargets = createModelTargets({
+      environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+      fetch: async () =>
+        new Response(
+          'data: {"id":"mcp-seed","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"MCP seed ready."},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+          { headers: { "content-type": "text/event-stream" }, status: 200 },
+        ),
+    });
+    const targets = await modelTargets.snapshot({ signal: new AbortController().signal });
+    const targetIdentity = targets.targets.find(
+      ({ identity }) => identity.targetId === "deepseek-v4-flash.direct",
+    )?.identity;
+    if (targetIdentity === undefined) {
+      throw new Error("The MCP reactivation fixture requires the DeepSeek Flash target.");
+    }
+    const seedLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const created = await seedLifecycle.create({ targetIdentity });
+    await seedLifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Create the durable MCP reactivation session." },
+    });
+    await seedLifecycle.setSessionManualName({
+      sessionId: created.sessionId,
+      name: "MCP reactivation session",
+    });
+    await seedLifecycle.close();
+
+    const seed = startFixture({
+      program: {
+        ...program,
+        arguments: ["--resume", created.sessionId, "--state-root", stateRoot],
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await seed.waitForCompleteFrameAfter("Adam · MCP reactivation session", 0);
     seed.write("/mc");
     await seed.waitFor("/mc");
     seed.write("\t");
@@ -419,9 +451,10 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
     await resumed.waitFor("Select a project session");
     const beforeSessionSelection = resumed.output().length;
     resumed.write("\u001b[B");
-    await resumed.waitForCompleteFrameAfter("New session", beforeSessionSelection);
+    await resumed.waitForCompleteFrameAfter("MCP reactivation session", beforeSessionSelection);
+    const beforeOpen = resumed.output().length;
     resumed.write("\r");
-    await resumed.waitFor("Adam · New session");
+    await resumed.waitForCompleteFrameAfter("Adam · MCP reactivation session", beforeOpen);
     resumed.write("/mc");
     await resumed.waitFor("/mc");
     resumed.write("\t");

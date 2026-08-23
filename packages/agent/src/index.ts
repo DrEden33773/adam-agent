@@ -1951,15 +1951,17 @@ export class AgentSession {
         if (candidate === undefined || this.#repositoryWorkspaceRoot === undefined) {
           return skillActivationFailure("Explicit Agent Skill content is unavailable.");
         }
-        const manifest = await buildSkillResourceManifestV1({
-          candidate,
-          workspaceRoot: this.#repositoryWorkspaceRoot,
-          userHome: homedir(),
-          userHomeDigest: stagedContext.userHomeDigest,
-          ...(this.#durableContext?.extensionSkillSources === undefined
-            ? {}
-            : { extensionSources: this.#durableContext.extensionSkillSources }),
-        });
+        const manifest =
+          this.#durableContext?.preparedExplicitSkillManifests?.get(selection.requestId) ??
+          (await buildSkillResourceManifestV1({
+            candidate,
+            workspaceRoot: this.#repositoryWorkspaceRoot,
+            userHome: homedir(),
+            userHomeDigest: stagedContext.userHomeDigest,
+            ...(this.#durableContext?.extensionSkillSources === undefined
+              ? {}
+              : { extensionSources: this.#durableContext.extensionSkillSources }),
+          }));
         activation = activateSkillContextV1({
           context: stagedContext,
           qualifiedId: selection.qualifiedId,
@@ -2014,7 +2016,10 @@ export class AgentSession {
           qualifiedId: selection.qualifiedId,
         },
       };
-      const policyDecision = this.#permissions?.decide(permissionInput) ?? "deny";
+      const policyDecision =
+        this.#durableContext?.preparedExplicitSkillPolicies?.get(selection.requestId) ??
+        this.#permissions?.decide(permissionInput) ??
+        "deny";
       let decision: "allow" | "deny";
       const reusableDecision = reusablePermissions.get(selection.requestId);
       if (reusableDecision !== undefined && policyDecision !== "deny") {
