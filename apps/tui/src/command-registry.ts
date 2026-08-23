@@ -25,6 +25,7 @@ export type AdamCommandDefinition = {
     | "session"
     | "skills"
     | "target"
+    | "thinking"
     | "tree";
   readonly name: string;
   readonly summary: string;
@@ -185,6 +186,14 @@ export const adamCommandRegistry = new AdamCommandRegistry([
     name: "hotkeys",
     summary: "Show the fixed effective keyboard map.",
     usage: "/hotkeys",
+  },
+  {
+    aliases: [],
+    availability: "always",
+    id: "thinking",
+    name: "thinking",
+    summary: "Choose the exact thinking level for the next prompt.",
+    usage: "/thinking [level]",
   },
   {
     aliases: [],

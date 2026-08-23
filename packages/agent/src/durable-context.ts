@@ -284,6 +284,7 @@ export async function generateContextSummary(input: {
       messages: requestMessages,
       tools: [],
       maximumOutputTokens,
+      purpose: "compaction",
       signal: input.signal,
     })) {
       if (event.type === "text_delta") {

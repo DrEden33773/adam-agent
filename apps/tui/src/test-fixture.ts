@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { access, watch, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -59,6 +60,55 @@ const launchTargetIdentities: readonly ModelTargetIdentity[] = [
     certification: "certified",
   },
 ];
+const fixtureThinkingCapabilities = new Map(
+  [...launchTargetIdentities, targetIdentity].map((identity) => {
+    const capability = {
+      schemaVersion: 1 as const,
+      capabilityId: `deepseek-chat-thinking:${identity.targetId}:target-profile-${identity.profileVersion}`,
+      capabilityVersion: 1 as const,
+      targetIdentity: identity,
+      providerProfile: {
+        id: "@ai-sdk/deepseek/chat" as const,
+        version: "3.0.28" as const,
+        requestPath: "provider_options.deepseek" as const,
+      },
+      supportsOff: true as const,
+      defaultLevelId: "high",
+      providerDefault: { effectiveLevelId: "high", mutable: true as const },
+      levels: [
+        {
+          id: "off",
+          label: "Off",
+          effectiveLevelId: "off",
+          mapping: {
+            requestPath: "provider_options.deepseek" as const,
+            thinkingType: "disabled" as const,
+          },
+        },
+        ...(["low", "high", "max"] as const).map((level) => ({
+          id: level,
+          label: `${level.charAt(0).toUpperCase()}${level.slice(1)}`,
+          effectiveLevelId: level,
+          mapping: {
+            requestPath: "provider_options.deepseek" as const,
+            thinkingType: "enabled" as const,
+            reasoningEffort: level,
+          },
+        })),
+      ],
+      reasoningArtifact: "provider_reasoning" as const,
+    };
+    return [
+      identity.targetId,
+      {
+        ...capability,
+        capabilityDigest: `sha256:${createHash("sha256")
+          .update(JSON.stringify(capability), "utf8")
+          .digest("hex")}` as const,
+      },
+    ] as const;
+  }),
+);
 const contextProfile: ContextProfile = {
   version: 1,
   contextWindowTokens: 32_768,
@@ -576,7 +626,10 @@ function createFixtureModelTargets(options: {
       } else {
         await writeFile(join(options.controlRoot as string, "model-started"), "started\n", "utf8");
         await waitForFile(options.controlRoot as string, "release-model");
-        yield { type: "text_delta", text: "# Streaming answer\n\n**Markdown ready.**" };
+        yield {
+          type: "text_delta",
+          text: `# Streaming answer\n\n**Markdown ready.**\n\nThinking policy: ${request.thinkingPolicy?.requestedLevelId ?? "none"}.`,
+        };
       }
       yield { type: "finish", reason: "stop" };
     },
@@ -597,11 +650,16 @@ function createFixtureModelTargets(options: {
         (input.targetId === alternateTargetIdentity.targetId
           ? alternateTargetIdentity
           : targetIdentity);
+      const thinkingCapability =
+        options.launch !== undefined || options.scenario === "streaming"
+          ? fixtureThinkingCapabilities.get(identity.targetId)
+          : undefined;
       return {
         identity,
         driver: model,
         contextProfile:
           identity.profileVersion === 2 ? preparedDirectDeepSeekV2ContextProfile : contextProfile,
+        ...(thinkingCapability === undefined ? {} : { thinkingCapability }),
       };
     },
     async snapshot() {
@@ -614,6 +672,7 @@ function createFixtureModelTargets(options: {
               credentialSource: "deterministic launch fixture",
             },
             contextProfile: preparedDirectDeepSeekV2ContextProfile,
+            thinkingCapability: requireFixtureThinkingCapability(identity.targetId),
           })),
         };
       }
@@ -623,6 +682,9 @@ function createFixtureModelTargets(options: {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "deterministic TUI fixture" },
             contextProfile,
+            ...(options.scenario === "streaming"
+              ? { thinkingCapability: requireFixtureThinkingCapability(targetIdentity.targetId) }
+              : {}),
           },
           ...(options.scenario === "target-navigation"
             ? [
@@ -648,6 +710,14 @@ function requireLaunchTargetIdentity(targetId: string): ModelTargetIdentity {
     throw new TypeError(`The launch fixture target ${targetId} is unavailable.`);
   }
   return identity;
+}
+
+function requireFixtureThinkingCapability(targetId: string) {
+  const capability = fixtureThinkingCapabilities.get(targetId);
+  if (capability === undefined) {
+    throw new TypeError(`The launch fixture thinking capability ${targetId} is unavailable.`);
+  }
+  return capability;
 }
 
 function previewReadBarrier(options: {

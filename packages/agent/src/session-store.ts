@@ -24,6 +24,7 @@ import {
 } from "./prompt-assembly.js";
 import { normalizedSessionTitle, sessionTitleFallback } from "./session-naming.js";
 import { type SkillContextRecordV1, skillContextRecordV1Schema } from "./skills.js";
+import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from "./tool-runtime.js";
 
 export type CanonicalRuntimeEvent = Exclude<
@@ -260,6 +261,7 @@ export type SessionLogicalRunStartedRecord = {
       readonly maxTurns?: number;
       readonly maxTokens?: number;
     };
+    readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
   };
 };
 
@@ -1279,6 +1281,29 @@ const sessionRunLimitsSchema = z.strictObject({
   maxTurns: z.number().int().positive().optional(),
   maxTokens: z.number().int().positive().optional(),
 });
+const thinkingPolicyMappingV1Schema = z.union([
+  z.strictObject({
+    requestPath: z.literal("provider_options.deepseek"),
+    thinkingType: z.literal("disabled"),
+  }),
+  z.strictObject({
+    requestPath: z.literal("provider_options.deepseek"),
+    thinkingType: z.literal("enabled"),
+    reasoningEffort: z.enum(["low", "high", "max"]),
+  }),
+]);
+const thinkingPolicySnapshotV1Schema = z.strictObject({
+  schemaVersion: z.literal(1),
+  requestedLevelId: z.string().min(1).max(64),
+  effectiveLevelId: z.string().min(1).max(64),
+  capability: z.strictObject({
+    id: z.string().min(1).max(256),
+    version: z.literal(1),
+    digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  }),
+  mapping: thinkingPolicyMappingV1Schema,
+  reasoningArtifact: z.literal("provider_reasoning"),
+});
 const toolCallSchema: z.ZodType<ToolCall> = z.strictObject({
   id: z.string().min(1).max(256),
   name: z.string().min(1).max(256),
@@ -1642,6 +1667,7 @@ const sessionV3RecordSchema = z.union([
       .max(8)
       .optional(),
     limits: sessionRunLimitsSchema.optional(),
+    thinkingPolicy: thinkingPolicySnapshotV1Schema.optional(),
   }),
   z.strictObject({
     type: z.literal("session_manual_name_set"),

@@ -79,6 +79,7 @@ test("every production overlay family enters Pi through the shared Adam frame", 
     "ResourceReloadPicker",
     "McpWizard",
     "HelpNavigator",
+    "ThinkingPicker",
   ]) {
     expect(source).toContain(`new ${family}`);
   }

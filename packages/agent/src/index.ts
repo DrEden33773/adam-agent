@@ -65,6 +65,7 @@ import {
   SkillResourceError,
   SkillsError,
 } from "./skills.js";
+import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 
 export {
   type ArtifactReference,
@@ -144,6 +145,14 @@ export {
   type CreatePresentationSessionOptions,
   createPresentationSession,
 } from "./presentation-session.js";
+export {
+  resolveThinkingPolicy,
+  type ThinkingCapabilityV1,
+  ThinkingPolicyError,
+  type ThinkingPolicyMappingV1,
+  type ThinkingPolicySelectionV1,
+  type ThinkingPolicySnapshotV1,
+} from "./thinking-policy.js";
 
 import {
   type CanonicalRuntimeEvent,
@@ -251,7 +260,9 @@ export type ModelRequest = {
   readonly messages: readonly ModelMessage[];
   readonly tools: readonly ModelToolDefinition[];
   readonly maximumOutputTokens: number;
+  readonly purpose?: "ordinary" | "title" | "compaction";
   readonly signal: AbortSignal;
+  readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
 };
 
 export type ModelEvent =
@@ -775,6 +786,9 @@ export class AgentSession {
                 : {}),
               ...(explicitSkills.length === 0 ? {} : { skills: explicitSkills }),
               ...(options.limits === undefined ? {} : { limits: options.limits }),
+              ...(this.#durableContext.thinkingPolicy === undefined
+                ? {}
+                : { thinkingPolicy: this.#durableContext.thinkingPolicy }),
             },
           });
           const sessionId = this.#durableContext.sessionId;
@@ -1085,7 +1099,11 @@ export class AgentSession {
           messages: requestMessages,
           tools: requestTools,
           maximumOutputTokens,
+          purpose: "ordinary",
           signal,
+          ...(this.#durableContext?.thinkingPolicy === undefined
+            ? {}
+            : { thinkingPolicy: this.#durableContext.thinkingPolicy }),
         })) {
           if (signal.aborted) {
             break;

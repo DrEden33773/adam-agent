@@ -11,8 +11,10 @@ import {
   ModelDriverError,
   type ModelEvent,
   ModelTargetError,
+  type ModelTargetIdentity,
   OpenAICompatibleModelDriver,
   type RuntimeEvent,
+  resolveThinkingPolicy,
   selectModelTargetId,
 } from "@adam-agent/agent";
 import { AiSdkModelDriverForTesting } from "@adam-agent/agent/internal-testing";
@@ -75,6 +77,174 @@ test("an exact Direct DeepSeek target returns a public answer-only model driver"
     ],
   });
 });
+
+test("an exact Direct DeepSeek target exposes only its real thinking policy choices", async () => {
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+  });
+
+  const snapshot = await targets.snapshot({
+    signal: new AbortController().signal,
+  });
+  const target = snapshot.targets.find(
+    (candidate) => candidate.identity.targetId === "deepseek-v4-flash.direct",
+  );
+  if (target?.thinkingCapability === undefined) {
+    throw new Error("Expected the exact Direct DeepSeek thinking capability.");
+  }
+
+  expect(target.thinkingCapability).toMatchObject({
+    schemaVersion: 1,
+    capabilityId: "deepseek-chat-thinking:deepseek-v4-flash.direct:target-profile-2",
+    capabilityVersion: 1,
+    targetIdentity: target.identity,
+    providerProfile: {
+      id: "@ai-sdk/deepseek/chat",
+      version: "3.0.28",
+      requestPath: "provider_options.deepseek",
+    },
+    supportsOff: true,
+    defaultLevelId: "high",
+    providerDefault: { effectiveLevelId: "high", mutable: true },
+    levels: [
+      { id: "off", label: "Off", effectiveLevelId: "off" },
+      { id: "low", label: "Low", effectiveLevelId: "low" },
+      { id: "high", label: "High", effectiveLevelId: "high" },
+      { id: "max", label: "Max", effectiveLevelId: "max" },
+    ],
+    reasoningArtifact: "provider_reasoning",
+    capabilityDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+  });
+  expect(target.thinkingCapability.levels.map((level) => level.id)).not.toEqual(
+    expect.arrayContaining(["medium", "xhigh"]),
+  );
+
+  expect(resolveThinkingPolicy(target.thinkingCapability, "max")).toEqual({
+    schemaVersion: 1,
+    requestedLevelId: "max",
+    effectiveLevelId: "max",
+    capability: {
+      id: target.thinkingCapability.capabilityId,
+      version: 1,
+      digest: target.thinkingCapability.capabilityDigest,
+    },
+    mapping: {
+      requestPath: "provider_options.deepseek",
+      thinkingType: "enabled",
+      reasoningEffort: "max",
+    },
+    reasoningArtifact: "provider_reasoning",
+  });
+});
+
+test.each([
+  {
+    levelId: "off",
+    expected: { thinking: { type: "disabled" } },
+    unexpectedEffort: true,
+  },
+  {
+    levelId: "low",
+    expected: { thinking: { type: "enabled" }, reasoning_effort: "low" },
+    unexpectedEffort: false,
+  },
+  {
+    levelId: "high",
+    expected: { thinking: { type: "enabled" }, reasoning_effort: "high" },
+    unexpectedEffort: false,
+  },
+  {
+    levelId: "max",
+    expected: { thinking: { type: "enabled" }, reasoning_effort: "max" },
+    unexpectedEffort: false,
+  },
+] as const)(
+  "the Direct DeepSeek $levelId policy uses the exact provider-specific request path",
+  async ({ levelId, expected, unexpectedEffort }) => {
+    const requests: unknown[] = [];
+    const targets = createModelTargets({
+      environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+      fetch: async (_input, init) => {
+        requests.push(JSON.parse(String(init?.body)));
+        return new Response(answerOnlyDeepSeekStream, {
+          headers: { "content-type": "text/event-stream" },
+          status: 200,
+        });
+      },
+    });
+    const resolved = await targets.resolve({
+      targetId: "deepseek-v4-flash.direct",
+      allowExperimental: false,
+      signal: new AbortController().signal,
+    });
+    if (resolved.thinkingCapability === undefined) {
+      throw new Error("Expected the exact Direct DeepSeek thinking capability.");
+    }
+
+    await collect(
+      resolved.driver.stream({
+        messages: [{ role: "user", content: "Answer with the selected policy." }],
+        tools: [],
+        maximumOutputTokens: 4_096,
+        signal: new AbortController().signal,
+        thinkingPolicy: resolveThinkingPolicy(resolved.thinkingCapability, levelId),
+      }),
+    );
+
+    expect(requests).toEqual([expect.objectContaining(expected)]);
+    expect((requests[0] as { reasoning?: unknown }).reasoning).toBeUndefined();
+    if (unexpectedEffort) {
+      expect((requests[0] as { reasoning_effort?: unknown }).reasoning_effort).toBeUndefined();
+    }
+  },
+);
+
+test.each([
+  {
+    purpose: "title",
+    expected: { thinking: { type: "disabled" } },
+  },
+  {
+    purpose: "compaction",
+    expected: { thinking: { type: "enabled" }, reasoning_effort: "high" },
+  },
+] as const)(
+  "the Direct DeepSeek $purpose side call uses its code-owned thinking policy",
+  async ({ purpose, expected }) => {
+    const requests: unknown[] = [];
+    const targets = createModelTargets({
+      environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+      fetch: async (_input, init) => {
+        requests.push(JSON.parse(String(init?.body)));
+        return new Response(answerOnlyDeepSeekStream, {
+          headers: { "content-type": "text/event-stream" },
+          status: 200,
+        });
+      },
+    });
+    const resolved = await targets.resolve({
+      targetId: "deepseek-v4-flash.direct",
+      allowExperimental: false,
+      signal: new AbortController().signal,
+    });
+    if (resolved.thinkingCapability === undefined) {
+      throw new Error("Expected the exact Direct DeepSeek thinking capability.");
+    }
+
+    await collect(
+      resolved.driver.stream({
+        messages: [{ role: "user", content: "Perform one bounded side call." }],
+        tools: [],
+        maximumOutputTokens: 4_096,
+        purpose,
+        signal: new AbortController().signal,
+        thinkingPolicy: resolveThinkingPolicy(resolved.thinkingCapability, "max"),
+      }),
+    );
+
+    expect(requests).toEqual([expect.objectContaining(expected)]);
+  },
+);
 
 test("the unified driver preserves DeepSeek reasoning and cache usage details", async () => {
   const targets = createModelTargets({
@@ -1072,6 +1242,14 @@ test("the target snapshot reports exact Certified identities and safe credential
           retainedTargetTokens: 20_000,
           estimatorVersion: 1,
         },
+        thinkingCapability: expectedDirectDeepSeekThinkingCapability({
+          targetId: "deepseek-v4-flash.direct",
+          vendor: "deepseek",
+          modelId: "deepseek-v4-flash",
+          route: "direct",
+          profileVersion: 2,
+          certification: "certified",
+        }),
       },
       {
         identity: {
@@ -1094,6 +1272,14 @@ test("the target snapshot reports exact Certified identities and safe credential
           retainedTargetTokens: 20_000,
           estimatorVersion: 1,
         },
+        thinkingCapability: expectedDirectDeepSeekThinkingCapability({
+          targetId: "deepseek-v4-pro.direct",
+          vendor: "deepseek",
+          modelId: "deepseek-v4-pro",
+          route: "direct",
+          profileVersion: 2,
+          certification: "certified",
+        }),
       },
       {
         identity: {
@@ -1121,6 +1307,66 @@ test("the target snapshot reports exact Certified identities and safe credential
   expect(JSON.stringify(snapshot)).not.toContain("test-secret-key");
   expect(snapshot.targets.every(({ identity }) => Object.isFrozen(identity))).toBe(true);
 });
+
+function expectedDirectDeepSeekThinkingCapability(targetIdentity: ModelTargetIdentity) {
+  return {
+    schemaVersion: 1,
+    capabilityId: `deepseek-chat-thinking:${targetIdentity.targetId}:target-profile-${targetIdentity.profileVersion}`,
+    capabilityVersion: 1,
+    capabilityDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+    targetIdentity,
+    providerProfile: {
+      id: "@ai-sdk/deepseek/chat",
+      version: "3.0.28",
+      requestPath: "provider_options.deepseek",
+    },
+    supportsOff: true,
+    defaultLevelId: "high",
+    providerDefault: { effectiveLevelId: "high", mutable: true },
+    levels: [
+      {
+        id: "off",
+        label: "Off",
+        effectiveLevelId: "off",
+        mapping: {
+          requestPath: "provider_options.deepseek",
+          thinkingType: "disabled",
+        },
+      },
+      {
+        id: "low",
+        label: "Low",
+        effectiveLevelId: "low",
+        mapping: {
+          requestPath: "provider_options.deepseek",
+          thinkingType: "enabled",
+          reasoningEffort: "low",
+        },
+      },
+      {
+        id: "high",
+        label: "High",
+        effectiveLevelId: "high",
+        mapping: {
+          requestPath: "provider_options.deepseek",
+          thinkingType: "enabled",
+          reasoningEffort: "high",
+        },
+      },
+      {
+        id: "max",
+        label: "Max",
+        effectiveLevelId: "max",
+        mapping: {
+          requestPath: "provider_options.deepseek",
+          thinkingType: "enabled",
+          reasoningEffort: "max",
+        },
+      },
+    ],
+    reasoningArtifact: "provider_reasoning",
+  };
+}
 
 test("current Direct DeepSeek v2 selection retains exact historical v1 resolution", async () => {
   const targets = createModelTargets({

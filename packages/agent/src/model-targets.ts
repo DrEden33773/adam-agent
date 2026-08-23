@@ -4,6 +4,10 @@ import { createGateway } from "@ai-sdk/gateway";
 import { AiSdkModelDriver } from "./ai-sdk-model-driver.js";
 import type { ContextProfile } from "./context-profile.js";
 import type { ModelDriver } from "./index.js";
+import {
+  createDirectDeepSeekThinkingCapability,
+  type ThinkingCapabilityV1,
+} from "./thinking-policy.js";
 
 export type ModelTargetIdentity = {
   readonly targetId: string;
@@ -25,6 +29,7 @@ export type ModelTargetSnapshot = {
     readonly identity: ModelTargetIdentity;
     readonly readiness: ModelTargetReadiness;
     readonly contextProfile: ContextProfile;
+    readonly thinkingCapability?: ThinkingCapabilityV1;
   }[];
 };
 
@@ -114,6 +119,7 @@ export interface ModelTargets {
     readonly identity: ModelTargetIdentity;
     readonly driver: ModelDriver;
     readonly contextProfile: ContextProfile;
+    readonly thinkingCapability?: ThinkingCapabilityV1;
   }>;
   snapshot(input: {
     readonly discoverGateway?: boolean | undefined;
@@ -278,10 +284,22 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
       return {
         identity,
         contextProfile,
+        thinkingCapability: createDirectDeepSeekThinkingCapability(identity),
         driver: new AiSdkModelDriver({
           model: provider(identity.modelId),
           maximumOutputTokens: contextProfile.maximumOutputTokens,
           deadlineMs,
+          sideCallThinkingPolicies: {
+            title: {
+              requestPath: "provider_options.deepseek",
+              thinkingType: "disabled",
+            },
+            compaction: {
+              requestPath: "provider_options.deepseek",
+              thinkingType: "enabled",
+              reasoningEffort: "high",
+            },
+          },
           sensitiveValues:
             options.environment.DEEPSEEK_API_KEY === undefined
               ? []
@@ -309,6 +327,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
             identity,
             readiness: { status, credentialSource: "DEEPSEEK_API_KEY" },
             contextProfile: directDeepSeekContextProfileFor(identity),
+            thinkingCapability: createDirectDeepSeekThinkingCapability(identity),
           })),
           {
             identity: experimentalGatewayTarget,
