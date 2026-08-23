@@ -417,6 +417,9 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
 
     const resumed = startFixture({ program, stateRoot, workspaceRoot });
     await resumed.waitFor("Select a project session");
+    const beforeSessionSelection = resumed.output().length;
+    resumed.write("\u001b[B");
+    await resumed.waitForCompleteFrameAfter("New session", beforeSessionSelection);
     resumed.write("\r");
     await resumed.waitFor("Adam · New session");
     resumed.write("/mc");
