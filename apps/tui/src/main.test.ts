@@ -2098,6 +2098,109 @@ test("Help remains locally available while a model run is active", async () => {
   }
 });
 
+test("thinking selection changed during a run applies only to the next prompt", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-thinking-policy-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "streaming",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/thinking max\r");
+    await fixture.waitFor("Thinking Max selected for the next prompt.");
+    fixture.write("First held prompt\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await fixture.waitFor("Working");
+
+    const beforeNextSelection = fixture.output().length;
+    fixture.write("/thinking off\r");
+    await fixture.waitForAfter("Thinking Off selected for the next prompt.", beforeNextSelection);
+    await fixture.waitForAfter("Next thinking Off", beforeNextSelection);
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitFor("Thinking policy: max.");
+    await fixture.waitFor("Adam · Streaming session");
+    const beforeSecondPrompt = fixture.output().length;
+    fixture.write("Second prompt\r");
+    await fixture.waitForAfter("Thinking policy: off.", beforeSecondPrompt);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash Thinking opens the framed exact-level selector without admitting a prompt", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-thinking-picker-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforePicker = fixture.output().length;
+    fixture.write("/thinking\r");
+    await fixture.waitForCompleteFrameAfter("Thinking level for the next prompt", beforePicker);
+    expectFramedOverlay(fixture.output(), "Thinking level for the next prompt");
+    await fixture.waitFor("Off");
+    await fixture.waitFor("Low");
+    await fixture.waitFor("High");
+    await fixture.waitFor("Max");
+    fixture.write("\u001b[B\r");
+    await fixture.waitFor("Thinking Max selected for the next prompt.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(access(join(controlRoot, "model-started"))).rejects.toThrow();
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Thinking selector keeps keyboard focus visible without color", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-thinking-no-color-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      noColor: true,
+      scenario: "streaming",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforePicker = fixture.output().length;
+    fixture.write("/thinking\r");
+    await fixture.waitForCompleteFrameAfter("Thinking level for the next prompt", beforePicker);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforePicker)).join("\n");
+    expect(frame).toContain("> High");
+    expect(frame).not.toContain("\u001b[38;2;");
+    expect(frame).not.toContain("\u001b[48;2;");
+
+    const beforeClose = fixture.output().length;
+    fixture.write("\u001b");
+    await fixture.waitForAfter("Next thinking High", beforeClose);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("editor submission renders Working then a streamed Markdown answer from real Presentation truth", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-streaming-"));
   const workspaceRoot = join(testRoot, "workspace");

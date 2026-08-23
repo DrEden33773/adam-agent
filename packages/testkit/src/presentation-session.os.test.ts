@@ -87,6 +87,7 @@ test("PresentationSession publishes admission only after the durable logical-inp
         type: "submit_draft_prompt",
         text: "Keep the durable logical input",
         skills: [],
+        thinkingSelection: null,
       }),
     ).resolves.toMatchObject({ status: "admitted", resource: null });
 

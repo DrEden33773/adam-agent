@@ -4,6 +4,8 @@ import type {
   PresentationSession,
   RepositoryInstructionsDisplay,
   TargetDisplay,
+  ThinkingCapabilityDisplay,
+  ThinkingPolicySelectionDisplay,
 } from "@adam-agent/presentation";
 import {
   Box,
@@ -58,6 +60,7 @@ import { SessionPicker } from "./session-picker.js";
 import { SkillPalette } from "./skill-palette.js";
 import { TargetPicker } from "./target-picker.js";
 import { createAdamTuiTheme } from "./theme.js";
+import { ThinkingPicker } from "./thinking-picker.js";
 
 export type { ClipboardAdapter, DeadlineScheduler } from "./exit-policy.js";
 
@@ -161,6 +164,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly hide: () => void;
       }
     | undefined;
+  let thinkingPicker:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+      }
+    | undefined;
   let sessionPicker:
     | {
         readonly close: () => void;
@@ -222,6 +231,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
     | undefined;
   const selectedSkills = new Set<string>();
+  const selectedThinkingLevels = new Map<string, string>();
   let previousActiveSessionId = options.presentation.getState().authoritative.active?.session.id;
   let sessionPickerDismissed = false;
   let sessionPickerRequested = false;
@@ -277,6 +287,48 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     legacyDuplicateGuard.reset();
   };
 
+  const targetForState = (
+    state: ReturnType<PresentationSession["getState"]>,
+  ): TargetDisplay | undefined => {
+    const targetId = state.authoritative.active?.session.targetId ?? state.draft?.targetId;
+    return state.authoritative.targets.items.find((target) => target.targetId === targetId);
+  };
+  const selectedThinkingLevel = (
+    target: TargetDisplay | undefined,
+  ): ThinkingCapabilityDisplay["levels"][number] | undefined => {
+    const capability = target?.thinking;
+    if (capability === null || capability === undefined) {
+      return undefined;
+    }
+    const selectedId = selectedThinkingLevels.get(capability.capabilityId);
+    const selected = capability.levels.find((level) => level.id === selectedId);
+    if (selected !== undefined) {
+      return selected;
+    }
+    const defaultLevel = capability.levels.find((level) => level.id === capability.defaultLevelId);
+    if (defaultLevel !== undefined) {
+      selectedThinkingLevels.set(capability.capabilityId, defaultLevel.id);
+    }
+    return defaultLevel;
+  };
+  const thinkingSelectionFor = (
+    target: TargetDisplay | undefined,
+    level: ThinkingCapabilityDisplay["levels"][number] | undefined,
+  ): ThinkingPolicySelectionDisplay | null => {
+    const capability = target?.thinking;
+    if (capability === null || capability === undefined || level === undefined) {
+      return null;
+    }
+    return {
+      requestedLevelId: level.id,
+      capability: {
+        id: capability.capabilityId,
+        version: capability.capabilityVersion,
+        digest: capability.capabilityDigest,
+      },
+    };
+  };
+
   const renderState = () => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
@@ -297,6 +349,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       resourceReloadPicker = undefined;
       artifactNavigator?.hide();
       artifactNavigator = undefined;
+      thinkingPicker?.hide();
+      thinkingPicker = undefined;
       if (active !== null) {
         sessionPickerDismissed = false;
         targetPickerDismissed = false;
@@ -794,16 +848,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       const target = state.authoritative.targets.items.find(
         (candidate) => candidate.targetId === draft.targetId,
       );
+      const thinkingLevel = selectedThinkingLevel(target);
+      const thinkingSummary =
+        thinkingLevel === undefined
+          ? ""
+          : ` · Next thinking ${safeTerminalText(thinkingLevel.label)}`;
       const selectedSkillSummary =
         selectedSkills.size === 0
           ? ""
           : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`;
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${selectedSkillSummary} · /help · Tab complete`,
+          `${safeTerminalText(state.authoritative.project.label)} · New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
         ),
         standard: theme.muted(
-          `New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${selectedSkillSummary} · /help · Tab complete`,
+          `New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
         ),
         narrow: theme.muted(
           `draft · idle\n${safeTerminalText(draft.targetId)}\n/help · Tab complete`,
@@ -811,12 +870,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       });
     } else if (active !== null) {
       const runStatus = sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling);
+      const activeTarget = state.authoritative.targets.items.find(
+        (target) => target.targetId === active.session.targetId,
+      );
       const targetCertification =
-        state.authoritative.targets.items.find(
-          (target) => target.targetId === active.session.targetId,
-        )?.certification ??
-        options.targetStatus?.certification ??
-        "Experimental";
+        activeTarget?.certification ?? options.targetStatus?.certification ?? "Experimental";
+      const thinkingLevel = selectedThinkingLevel(activeTarget);
+      const thinkingSummary =
+        thinkingLevel === undefined
+          ? ""
+          : ` · Next thinking ${safeTerminalText(thinkingLevel.label)}`;
       const selectedSkillSummary =
         selectedSkills.size === 0
           ? ""
@@ -825,10 +888,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         active.transcript.olderCursor === null ? "" : " · older history available";
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${selectedSkillSummary}${olderHistorySummary} · ${adamCommandRegistry.footerHint()}`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${adamCommandRegistry.footerHint()}`,
         ),
         standard: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
         ),
         narrow: theme.muted(
           `${runStatus} · ${footerContextCompactText(active)}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}\n/help · Tab complete`,
@@ -836,6 +899,74 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       });
     }
     statusLine.setText(statusMessage === null ? "" : theme.muted(safeTerminalText(statusMessage)));
+    tui.requestRender();
+  };
+  const handleThinkingCommand = (argumentsText: string): void => {
+    const state = options.presentation.getState();
+    const target = targetForState(state);
+    const capability = target?.thinking;
+    editor.setText("");
+    editor.disableSubmit = false;
+    if (capability === null || capability === undefined) {
+      statusMessage = "Thinking policy is unavailable for this exact target.";
+      renderState();
+      return;
+    }
+    const requested = argumentsText.trim().toLocaleLowerCase();
+    if (requested.length > 0) {
+      const level = capability.levels.find(
+        (candidate) =>
+          candidate.id.toLocaleLowerCase() === requested ||
+          candidate.label.toLocaleLowerCase() === requested,
+      );
+      if (level === undefined) {
+        statusMessage = `Thinking level ${safeTerminalText(argumentsText)} is unavailable · choose ${capability.levels.map((candidate) => candidate.id).join(", ")}.`;
+        renderState();
+        return;
+      }
+      selectedThinkingLevels.set(capability.capabilityId, level.id);
+      statusMessage = `Thinking ${safeTerminalText(level.label)} selected for the next prompt.`;
+      renderState();
+      return;
+    }
+    const selected = selectedThinkingLevel(target);
+    if (selected === undefined) {
+      statusMessage = "The exact target has no valid default thinking level.";
+      renderState();
+      return;
+    }
+    thinkingPicker?.hide();
+    let handle: { hide(): void } | undefined;
+    const close = () => {
+      handle?.hide();
+      thinkingPicker = undefined;
+      tui.setFocus(editor);
+      tui.requestRender();
+    };
+    const picker = new ThinkingPicker({
+      capability,
+      selectedLevelId: selected.id,
+      onClose: close,
+      onSelect(levelId) {
+        const level = capability.levels.find((candidate) => candidate.id === levelId);
+        if (level === undefined) {
+          return;
+        }
+        selectedThinkingLevels.set(capability.capabilityId, level.id);
+        statusMessage = `Thinking ${safeTerminalText(level.label)} selected for the next prompt.`;
+        close();
+        renderState();
+      },
+      theme,
+    });
+    handle = showOverlay(picker, {
+      width: "70%",
+      minWidth: 36,
+      maxHeight: "80%",
+      margin: 1,
+    });
+    thinkingPicker = { close, hide: () => handle?.hide() };
+    statusMessage = null;
     tui.requestRender();
   };
   editor.onChange = () => {
@@ -1128,6 +1259,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         return;
       }
       const parsedDraft = adamCommandRegistry.parse(text);
+      if (parsedDraft.kind === "known" && parsedDraft.command.id === "thinking") {
+        handleThinkingCommand(parsedDraft.argumentsText);
+        return;
+      }
       if (
         parsedDraft.kind === "known" &&
         (parsedDraft.command.id === "help" || parsedDraft.command.id === "hotkeys")
@@ -1219,11 +1354,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       clearExitWindow();
       editor.disableSubmit = true;
+      const draftTarget = targetForState(state);
+      const draftThinkingLevel = selectedThinkingLevel(draftTarget);
       void options.presentation
         .dispatch({
           type: "submit_draft_prompt",
           text,
           skills: [...selectedSkills],
+          thinkingSelection: thinkingSelectionFor(draftTarget, draftThinkingLevel),
         })
         .then((receipt) => {
           if (receipt.status === "admitted") {
@@ -1274,6 +1412,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       statusMessage = "A run is active; use a local read-only command or Ctrl+C to abort.";
       editor.disableSubmit = false;
       renderState();
+      return;
+    }
+    if (parsedCommand.kind === "known" && parsedCommand.command.id === "thinking") {
+      handleThinkingCommand(parsedCommand.argumentsText);
       return;
     }
     if (
@@ -1870,12 +2012,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       renderState();
       return;
     }
+    const nextTarget = targetForState(state);
+    const nextThinkingLevel = selectedThinkingLevel(nextTarget);
     void options.presentation
       .dispatch({
         type: "submit_prompt",
         sessionId: active.session.id,
         text,
         skills: [...selectedSkills],
+        thinkingSelection: thinkingSelectionFor(nextTarget, nextThinkingLevel),
       })
       .then((receipt) => {
         if (receipt.status === "admitted") {
@@ -1928,6 +2073,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     attempt(() => helpNavigator?.hide());
     attempt(() => artifactNavigator?.hide());
     attempt(() => targetPicker?.hide());
+    attempt(() => thinkingPicker?.hide());
     attempt(() => permission?.hide());
     attempt(() => working.stop());
     attempt(() => tui.stop());
@@ -1998,7 +2144,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             chronologyPicker?.close ??
             resourceReloadPicker?.close ??
             sessionPicker?.close ??
-            targetPicker?.close;
+            targetPicker?.close ??
+            thinkingPicker?.close;
           closeOverlay?.();
         }
       }
@@ -2027,7 +2174,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             chronologyPicker?.close ??
             resourceReloadPicker?.close ??
             sessionPicker?.close ??
-            targetPicker?.close)
+            targetPicker?.close ??
+            thinkingPicker?.close)
           : undefined;
       if (closeOverlay !== undefined) {
         clearExitWindow();

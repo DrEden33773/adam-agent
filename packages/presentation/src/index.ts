@@ -3,6 +3,27 @@ export type ProjectDisplay = {
   readonly label: string;
 };
 
+export type ThinkingCapabilityDisplay = {
+  readonly capabilityId: string;
+  readonly capabilityVersion: 1;
+  readonly capabilityDigest: `sha256:${string}`;
+  readonly defaultLevelId: string;
+  readonly levels: readonly {
+    readonly id: string;
+    readonly label: string;
+    readonly effectiveLevelId: string;
+  }[];
+};
+
+export type ThinkingPolicySelectionDisplay = {
+  readonly requestedLevelId: string;
+  readonly capability: {
+    readonly id: string;
+    readonly version: 1;
+    readonly digest: `sha256:${string}`;
+  };
+};
+
 export type TargetDisplay = {
   readonly targetId: string;
   readonly label: string;
@@ -12,6 +33,7 @@ export type TargetDisplay = {
     readonly status: "available" | "missing";
     readonly credentialSource: string;
   };
+  readonly thinking: ThinkingCapabilityDisplay | null;
 };
 
 export type TargetCatalogDisplay = {
@@ -506,6 +528,12 @@ export type CommandReceipt =
         | "persistence_failed"
         | "presentation_closed";
       readonly message: string;
+    }
+  | {
+      readonly status: "rejected";
+      readonly code: "thinking_policy_unsupported";
+      readonly message: string;
+      readonly supportedLevelIds: readonly string[];
     };
 
 export type PresentationCommand =
@@ -599,11 +627,13 @@ export type PresentationCommand =
       readonly sessionId: string;
       readonly text: string;
       readonly skills: readonly string[];
+      readonly thinkingSelection: ThinkingPolicySelectionDisplay | null;
     }
   | {
       readonly type: "submit_draft_prompt";
       readonly text: string;
       readonly skills: readonly string[];
+      readonly thinkingSelection: ThinkingPolicySelectionDisplay | null;
     }
   | {
       readonly type: "cancel_run";

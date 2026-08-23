@@ -143,6 +143,12 @@ import {
   skillContextSnapshot,
 } from "./skills.js";
 import {
+  resolveThinkingPolicy,
+  ThinkingPolicyError,
+  type ThinkingPolicySelectionV1,
+  type ThinkingPolicySnapshotV1,
+} from "./thinking-policy.js";
+import {
   canonicalChangePreviewForToolCall,
   createCodingToolRegistry,
   type PermissionPolicy,
@@ -502,6 +508,7 @@ export type SessionCommand =
       readonly limits?: RunOptions["limits"];
       readonly runId?: string;
       readonly signal?: AbortSignal;
+      readonly thinkingSelection?: ThinkingPolicySelectionV1;
     }
   | ({
       readonly type: "branch";
@@ -517,6 +524,7 @@ export interface SessionLifecycle {
     readonly limits?: RunOptions["limits"];
     readonly runId?: string;
     readonly signal?: AbortSignal;
+    readonly thinkingSelection?: ThinkingPolicySelectionV1;
     readonly onAdmitted?: (receipt: SessionAdmissionReceipt) => void;
   }): Promise<SessionContinueResult>;
   branch(input: SessionBranchInput): Promise<CurrentSessionSnapshot>;
@@ -527,6 +535,7 @@ export interface SessionLifecycle {
     readonly limits?: RunOptions["limits"];
     readonly runId?: string;
     readonly signal?: AbortSignal;
+    readonly thinkingSelection?: ThinkingPolicySelectionV1;
   }): Promise<SessionContinueResult>;
   configureMcp(command: McpConfigurationCommand): Promise<McpConfigurationResult>;
   create(input: { readonly targetIdentity: ModelTargetIdentity }): Promise<CurrentSessionSnapshot>;
@@ -567,6 +576,7 @@ export class SessionLifecycleError extends Error {
     | "session_invalid"
     | "session_model_target_incompatible"
     | "session_model_target_unavailable"
+    | "session_thinking_policy_unsupported"
     | "session_persistence_failed"
     | "session_skill_confirmation_required"
     | "session_skill_policy_rejected"
@@ -584,12 +594,80 @@ export class SessionLifecycleError extends Error {
     | "mcp_shutdown_unconfirmed"
     | "project_in_use"
     | "project_owner_unavailable";
+  readonly supportedLevelIds?: readonly string[];
 
-  constructor(code: SessionLifecycleError["code"]) {
-    super(sessionLifecycleErrorMessage(code));
+  constructor(code: SessionLifecycleError["code"], supportedLevelIds: readonly string[] = []) {
+    super(
+      code === "session_thinking_policy_unsupported" && supportedLevelIds.length > 0
+        ? `${sessionLifecycleErrorMessage(code)} Choose ${supportedLevelIds.join(", ")}.`
+        : sessionLifecycleErrorMessage(code),
+    );
     this.name = "SessionLifecycleError";
     this.code = code;
+    if (supportedLevelIds.length > 0) {
+      this.supportedLevelIds = supportedLevelIds;
+    }
   }
+}
+
+function resolveRunThinkingPolicy(
+  resolved: Awaited<ReturnType<ModelTargets["resolve"]>>,
+  selection: ThinkingPolicySelectionV1 | undefined,
+): ThinkingPolicySnapshotV1 | undefined {
+  if (resolved.thinkingCapability === undefined) {
+    if (selection === undefined) {
+      return undefined;
+    }
+    throw new SessionLifecycleError("session_thinking_policy_unsupported");
+  }
+  const supportedLevelIds = resolved.thinkingCapability.levels.map((level) => level.id);
+  if (
+    selection !== undefined &&
+    (selection.capability.id !== resolved.thinkingCapability.capabilityId ||
+      selection.capability.version !== resolved.thinkingCapability.capabilityVersion ||
+      selection.capability.digest !== resolved.thinkingCapability.capabilityDigest)
+  ) {
+    throw new SessionLifecycleError("session_thinking_policy_unsupported", supportedLevelIds);
+  }
+  try {
+    return resolveThinkingPolicy(
+      resolved.thinkingCapability,
+      selection?.requestedLevelId,
+      resolved.identity,
+    );
+  } catch (error) {
+    if (error instanceof ThinkingPolicyError) {
+      throw new SessionLifecycleError(
+        "session_thinking_policy_unsupported",
+        error.supportedLevelIds,
+      );
+    }
+    throw error;
+  }
+}
+
+function requireRecoveredThinkingPolicy(
+  resolved: Awaited<ReturnType<ModelTargets["resolve"]>>,
+  snapshot: ThinkingPolicySnapshotV1,
+): ThinkingPolicySnapshotV1 {
+  const capability = resolved.thinkingCapability;
+  const supportedLevelIds = capability?.levels.map((level) => level.id) ?? [];
+  if (
+    capability === undefined ||
+    capability.capabilityId !== snapshot.capability.id ||
+    capability.capabilityVersion !== snapshot.capability.version ||
+    capability.capabilityDigest !== snapshot.capability.digest
+  ) {
+    throw new SessionLifecycleError("session_thinking_policy_unsupported", supportedLevelIds);
+  }
+  const current = resolveRunThinkingPolicy(resolved, {
+    requestedLevelId: snapshot.requestedLevelId,
+    capability: snapshot.capability,
+  });
+  if (current === undefined || !isDeepStrictEqual(current, snapshot)) {
+    throw new SessionLifecycleError("session_thinking_policy_unsupported", supportedLevelIds);
+  }
+  return snapshot;
 }
 
 function encodeProjectSessionCatalogCursor(sessionId: string): string {
@@ -667,6 +745,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     {
       readonly runId: string;
       readonly resolved: Awaited<ReturnType<ModelTargets["resolve"]>>;
+      readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
       readonly skillManifests: ReadonlyMap<string, SkillResourceManifestV1>;
       readonly skillPolicies: ReadonlyMap<string, "allow">;
       readonly onAdmitted?: (receipt: SessionAdmissionReceipt) => void;
@@ -887,6 +966,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ],
         tools: [],
         maximumOutputTokens: 64,
+        purpose: "title",
         signal,
       })) {
         if (event.type === "text_delta") {
@@ -1709,6 +1789,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ) {
           throw new SessionLifecycleError("session_model_target_incompatible");
         }
+        const thinkingPolicy = resolveRunThinkingPolicy(resolved, input.thinkingSelection);
         const prepared = await prepareSessionCreation({
           targetIdentity: input.targetIdentity,
           runId,
@@ -1726,6 +1807,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         preparedAdmissionTargets.set(snapshot.sessionId, {
           runId,
           resolved,
+          ...(thinkingPolicy === undefined ? {} : { thinkingPolicy }),
           skillManifests: prepared.skillManifests,
           skillPolicies: prepared.skillPolicies,
           ...(input.onAdmitted === undefined ? {} : { onAdmitted: input.onAdmitted }),
@@ -1742,6 +1824,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           runId,
           ...(input.limits === undefined ? {} : { limits: input.limits }),
           ...(input.signal === undefined ? {} : { signal: input.signal }),
+          ...(input.thinkingSelection === undefined
+            ? {}
+            : { thinkingSelection: input.thinkingSelection }),
         });
       } finally {
         preparedAdmissionTargets.delete(created.snapshot.sessionId);
@@ -2149,6 +2234,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ) {
           throw new SessionLifecycleError("session_model_target_incompatible");
         }
+        if (input.input === undefined && input.thinkingSelection !== undefined) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const newRunThinkingPolicy =
+          input.input === undefined
+            ? undefined
+            : preparedAdmission !== undefined && preparedAdmission.runId === input.runId
+              ? preparedAdmission.thinkingPolicy
+              : resolveRunThinkingPolicy(resolved, input.thinkingSelection);
         let records = await readSessionRecords(options, input.sessionId);
         const first = records[0];
         if (first === undefined || !isGenesisRecord(first)) {
@@ -2385,6 +2479,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           resumed.snapshot.status === "interrupted"
             ? createAgentResumeState(replayRecords, options, resumed.snapshot)
             : undefined;
+        const recoveredThinkingPolicy =
+          resumeState?.thinkingPolicy === undefined
+            ? undefined
+            : requireRecoveredThinkingPolicy(resolved, resumeState.thinkingPolicy);
         if (
           input.runId !== undefined &&
           (input.input === undefined ||
@@ -2466,6 +2564,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                   },
                 }),
             targetIdentity: resumed.snapshot.targetIdentity,
+            ...((recoveredThinkingPolicy ?? newRunThinkingPolicy) === undefined
+              ? {}
+              : { thinkingPolicy: recoveredThinkingPolicy ?? newRunThinkingPolicy }),
             ...(activePromptContext === undefined ? {} : { promptContext: activePromptContext }),
             ...(activeSkillContext === undefined ? {} : { skillContext: activeSkillContext }),
             ...(extensionSources.length === 0 ? {} : { extensionSkillSources: extensionSources }),
@@ -7647,6 +7748,7 @@ function createAgentResumeState(
 ): {
   readonly userMessage: string;
   readonly limits: { readonly maxTurns?: number; readonly maxTokens?: number } | undefined;
+  readonly thinkingPolicy: ThinkingPolicySnapshotV1 | undefined;
   readonly agentState: NonNullable<AgentSessionDurableContext["resume"]>;
 } {
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
@@ -7927,6 +8029,7 @@ function createAgentResumeState(
   return {
     userMessage: run.record.userMessage,
     limits: run.record.limits,
+    thinkingPolicy: run.record.thinkingPolicy,
     agentState: {
       runId,
       ...(explicitSkills.length === 0 || explicitSkillBatchCommitted
@@ -8546,6 +8649,8 @@ function sessionLifecycleErrorMessage(code: SessionLifecycleError["code"]): stri
       return "The requested exact model target is not compatible with this session boundary.";
     case "session_model_target_unavailable":
       return "The requested exact model target is not ready in this runtime.";
+    case "session_thinking_policy_unsupported":
+      return "The requested thinking level is unavailable for this exact model target.";
     case "session_persistence_failed":
       return "The new session could not be persisted.";
     case "session_skill_unavailable":

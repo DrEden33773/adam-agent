@@ -8,6 +8,7 @@ import {
   type ContextProfile,
   createCodingToolRegistry,
   createFileArtifactStore,
+  createModelTargets,
   createPermissionPolicy,
   createPresentationPreferences,
   createPresentationSession as createProductPresentationSession,
@@ -102,6 +103,134 @@ function settledModelTargets(answer = "Presentation fixture answer."): ModelTarg
           },
         ],
       };
+    },
+  };
+}
+
+async function createThinkingPolicyPresentationFixture(prefix: string) {
+  const testRoot = await mkdtemp(join(tmpdir(), prefix));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const policyTargetIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 2 };
+  const productionTargets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+  });
+  const productionSnapshot = await productionTargets.snapshot({
+    signal: new AbortController().signal,
+  });
+  const thinkingCapability = productionSnapshot.targets.find(
+    (target) =>
+      target.identity.targetId === policyTargetIdentity.targetId &&
+      target.identity.profileVersion === policyTargetIdentity.profileVersion,
+  )?.thinkingCapability;
+  if (thinkingCapability === undefined) {
+    throw new Error("Expected the exact Direct DeepSeek thinking capability.");
+  }
+  let resolvedThinkingCapability = thinkingCapability;
+  const requestPolicies: Array<unknown> = [];
+  const driver = new FakeModelDriver((request) => {
+    requestPolicies.push(request.thinkingPolicy);
+    const latestUser = request.messages.findLast((message) => message.role === "user")?.content;
+    const text =
+      latestUser === "Use low thinking."
+        ? "Low thinking response."
+        : latestUser === "Use max thinking next."
+          ? "Max thinking response."
+          : "Thinking policy session";
+    return [
+      { type: "text_delta", text },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: policyTargetIdentity,
+        driver,
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+        thinkingCapability: resolvedThinkingCapability,
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: policyTargetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: preparedDirectDeepSeekV2ContextProfile,
+            thinkingCapability,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const open = (sessionId?: string) =>
+    createPresentationSession({
+      lifecycle,
+      modelTargets,
+      ...(sessionId === undefined ? { openProject: true } : { sessionId }),
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+  return {
+    close: async () => {
+      await lifecycle.close();
+      await rm(testRoot, { recursive: true, force: true });
+    },
+    harness,
+    open,
+    policyTargetIdentity,
+    replaceResolvedThinkingCapability(capability: typeof thinkingCapability) {
+      resolvedThinkingCapability = capability;
+    },
+    requestPolicies,
+    thinkingCapability,
+  };
+}
+
+function waitForAssistantMessage(
+  presentation: Awaited<ReturnType<typeof createPresentationSession>>,
+  text: string,
+): Promise<void> {
+  const completed = Promise.withResolvers<void>();
+  const observed = () =>
+    presentation
+      .getState()
+      .authoritative.active?.transcript.items.some(
+        (item) => item.type === "assistant_message" && item.text === text,
+      ) === true;
+  const unsubscribe = presentation.subscribe(() => {
+    if (observed()) {
+      unsubscribe();
+      completed.resolve();
+    }
+  });
+  if (observed()) {
+    unsubscribe();
+    completed.resolve();
+  }
+  return completed.promise;
+}
+
+function presentationThinkingSelection(
+  capability: {
+    readonly capabilityId: string;
+    readonly capabilityVersion: 1;
+    readonly capabilityDigest: `sha256:${string}`;
+  },
+  requestedLevelId: string,
+) {
+  return {
+    requestedLevelId,
+    capability: {
+      id: capability.capabilityId,
+      version: capability.capabilityVersion,
+      digest: capability.capabilityDigest,
     },
   };
 }
@@ -259,6 +388,43 @@ test("PresentationSession projects exact target identity and readiness for proje
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
+  const thinkingCapability = {
+    schemaVersion: 1 as const,
+    capabilityId: "deepseek-thinking:test-profile",
+    capabilityVersion: 1 as const,
+    capabilityDigest: `sha256:${"2".repeat(64)}` as const,
+    targetIdentity,
+    providerProfile: {
+      id: "@ai-sdk/deepseek/chat" as const,
+      version: "3.0.28" as const,
+      requestPath: "provider_options.deepseek" as const,
+    },
+    supportsOff: true as const,
+    defaultLevelId: "high",
+    providerDefault: { effectiveLevelId: "high", mutable: true as const },
+    levels: [
+      {
+        id: "off",
+        label: "Off",
+        effectiveLevelId: "off",
+        mapping: {
+          requestPath: "provider_options.deepseek" as const,
+          thinkingType: "disabled" as const,
+        },
+      },
+      ...(["low", "high", "max"] as const).map((level) => ({
+        id: level,
+        label: `${level[0]?.toUpperCase()}${level.slice(1)}`,
+        effectiveLevelId: level,
+        mapping: {
+          requestPath: "provider_options.deepseek" as const,
+          thinkingType: "enabled" as const,
+          reasoningEffort: level,
+        },
+      })),
+    ],
+    reasoningArtifact: "provider_reasoning" as const,
+  };
   const modelTargets: ModelTargets = {
     async resolve() {
       throw new Error("Target projection does not resolve a model driver.");
@@ -270,6 +436,7 @@ test("PresentationSession projects exact target identity and readiness for proje
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
             contextProfile,
+            thinkingCapability,
           },
           {
             identity: {
@@ -314,6 +481,18 @@ test("PresentationSession projects exact target identity and readiness for proje
           route: "direct",
           certification: "Certified",
           readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+          thinking: {
+            capabilityId: "deepseek-thinking:test-profile",
+            capabilityVersion: 1,
+            capabilityDigest: `sha256:${"2".repeat(64)}`,
+            defaultLevelId: "high",
+            levels: [
+              { id: "off", label: "Off", effectiveLevelId: "off" },
+              { id: "low", label: "Low", effectiveLevelId: "low" },
+              { id: "high", label: "High", effectiveLevelId: "high" },
+              { id: "max", label: "Max", effectiveLevelId: "max" },
+            ],
+          },
         },
         {
           targetId: "poolside-laguna-s-2.1-free.gateway",
@@ -321,6 +500,7 @@ test("PresentationSession projects exact target identity and readiness for proje
           route: "vercel-ai-gateway",
           certification: "Experimental",
           readiness: { status: "missing", credentialSource: "AI_GATEWAY_API_KEY" },
+          thinking: null,
         },
       ],
       defaultTargetId: null,
@@ -332,6 +512,193 @@ test("PresentationSession projects exact target identity and readiness for proje
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession admits exact thinking choices for draft and active prompts", async () => {
+  const fixture = await createThinkingPolicyPresentationFixture(
+    "adam-agent-presentation-thinking-policy-",
+  );
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+
+  try {
+    presentation = await fixture.open();
+    await presentation.dispatch({
+      type: "create_session",
+      targetId: fixture.policyTargetIdentity.targetId,
+    });
+    const firstResponse = waitForAssistantMessage(presentation, "Low thinking response.");
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Use low thinking.",
+        skills: [],
+        thinkingSelection: presentationThinkingSelection(fixture.thinkingCapability, "low"),
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await firstResponse;
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected the draft prompt to admit one active session.");
+    }
+    await presentation.close();
+    presentation = await fixture.open(sessionId);
+    const secondResponse = waitForAssistantMessage(presentation, "Max thinking response.");
+    await expect(
+      presentation.dispatch({
+        type: "submit_prompt",
+        sessionId,
+        text: "Use max thinking next.",
+        skills: [],
+        thinkingSelection: presentationThinkingSelection(fixture.thinkingCapability, "max"),
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await secondResponse;
+
+    const records = await readInMemoryPresentationRecords(fixture.harness.sessions)(sessionId);
+    expect(
+      records.flatMap((record) =>
+        record.schemaVersion === 3 && record.record.type === "logical_run_started"
+          ? [record.record.thinkingPolicy]
+          : [],
+      ),
+    ).toMatchObject([
+      { requestedLevelId: "low", effectiveLevelId: "low" },
+      { requestedLevelId: "max", effectiveLevelId: "max" },
+    ]);
+    expect(
+      fixture.requestPolicies.filter(
+        (policy): policy is { readonly requestedLevelId: string } => policy !== undefined,
+      ),
+    ).toMatchObject([{ requestedLevelId: "low" }, { requestedLevelId: "max" }]);
+    expect(fixture.requestPolicies).toContain(undefined);
+  } finally {
+    await presentation?.close();
+    await fixture.close();
+  }
+});
+
+test("PresentationSession returns actionable choices for an unsupported draft thinking level", async () => {
+  const fixture = await createThinkingPolicyPresentationFixture(
+    "adam-agent-presentation-thinking-draft-rejection-",
+  );
+  const presentation = await fixture.open();
+
+  try {
+    await presentation.dispatch({
+      type: "create_session",
+      targetId: fixture.policyTargetIdentity.targetId,
+    });
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Reject an unsupported draft level.",
+        skills: [],
+        thinkingSelection: presentationThinkingSelection(fixture.thinkingCapability, "medium"),
+      }),
+    ).resolves.toEqual({
+      status: "rejected",
+      code: "thinking_policy_unsupported",
+      message: "The requested thinking policy is unavailable. Choose off, low, high, max.",
+      supportedLevelIds: ["off", "low", "high", "max"],
+    });
+    expect(fixture.requestPolicies).toEqual([]);
+  } finally {
+    await presentation.close();
+    await fixture.close();
+  }
+});
+
+test("PresentationSession rejects a changed thinking capability between display and draft admission", async () => {
+  const fixture = await createThinkingPolicyPresentationFixture(
+    "adam-agent-presentation-thinking-capability-race-",
+  );
+  const presentation = await fixture.open();
+
+  try {
+    await presentation.dispatch({
+      type: "create_session",
+      targetId: fixture.policyTargetIdentity.targetId,
+    });
+    const { capabilityDigest: _digest, ...changedProfile } = {
+      ...fixture.thinkingCapability,
+      capabilityId: `${fixture.thinkingCapability.capabilityId}:refreshed`,
+    };
+    const changedCapability = {
+      ...changedProfile,
+      capabilityDigest: `sha256:${createHash("sha256")
+        .update(JSON.stringify(changedProfile), "utf8")
+        .digest("hex")}` as const,
+    };
+    fixture.replaceResolvedThinkingCapability(changedCapability);
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Do not reinterpret the displayed thinking choice.",
+        skills: [],
+        thinkingSelection: presentationThinkingSelection(fixture.thinkingCapability, "low"),
+      }),
+    ).resolves.toEqual({
+      status: "rejected",
+      code: "thinking_policy_unsupported",
+      message: "The requested thinking policy is unavailable. Choose off, low, high, max.",
+      supportedLevelIds: ["off", "low", "high", "max"],
+    });
+    expect(fixture.requestPolicies).toEqual([]);
+  } finally {
+    await presentation.close();
+    await fixture.close();
+  }
+});
+
+test("PresentationSession returns actionable choices for an unsupported active thinking level", async () => {
+  const fixture = await createThinkingPolicyPresentationFixture(
+    "adam-agent-presentation-thinking-active-rejection-",
+  );
+  let presentation = await fixture.open();
+
+  try {
+    await presentation.dispatch({
+      type: "create_session",
+      targetId: fixture.policyTargetIdentity.targetId,
+    });
+    const firstResponse = waitForAssistantMessage(presentation, "Low thinking response.");
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Use low thinking.",
+        skills: [],
+        thinkingSelection: presentationThinkingSelection(fixture.thinkingCapability, "low"),
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await firstResponse;
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected the draft prompt to admit one active session.");
+    }
+    await presentation.close();
+    presentation = await fixture.open(sessionId);
+    const providerCallsBeforeRejection = fixture.requestPolicies.length;
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_prompt",
+        sessionId,
+        text: "Reject an unsupported active-session level.",
+        skills: [],
+        thinkingSelection: presentationThinkingSelection(fixture.thinkingCapability, "medium"),
+      }),
+    ).resolves.toEqual({
+      status: "rejected",
+      code: "thinking_policy_unsupported",
+      message: "The requested thinking policy is unavailable. Choose off, low, high, max.",
+      supportedLevelIds: ["off", "low", "high", "max"],
+    });
+    expect(fixture.requestPolicies).toHaveLength(providerCallsBeforeRejection);
+  } finally {
+    await presentation.close();
+    await fixture.close();
   }
 });
 
@@ -505,7 +872,12 @@ test("PresentationSession resolves a first-prompt Skill mention through atomic d
     const text = "Use $draft-review before answering.";
     try {
       await expect(
-        presentation.dispatch({ type: "submit_draft_prompt", text, skills: [] }),
+        presentation.dispatch({
+          type: "submit_draft_prompt",
+          text,
+          skills: [],
+          thinkingSelection: null,
+        }),
       ).resolves.toMatchObject({ status: "admitted" });
       await completed.promise;
     } finally {
@@ -606,7 +978,13 @@ test("PresentationSession resolves a Skill mention for an existing session throu
     const text = "Use $active-review before answering this follow-up.";
     try {
       await expect(
-        presentation.dispatch({ type: "submit_prompt", sessionId, text, skills: [] }),
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId,
+          text,
+          skills: [],
+          thinkingSelection: null,
+        }),
       ).resolves.toMatchObject({ status: "admitted" });
       await completed.promise;
     } finally {
@@ -707,6 +1085,7 @@ test("PresentationSession rejects an ambiguous Skill mention before extending an
         sessionId,
         text: "Use $shared-name without guessing.",
         skills: [],
+        thinkingSelection: null,
       }),
     ).resolves.toMatchObject({
       status: "rejected",
@@ -783,7 +1162,12 @@ test("PresentationSession keeps an ambiguous first-prompt Skill mention outside 
     const text = "Use $shared-name without guessing.";
 
     await expect(
-      presentation.dispatch({ type: "submit_draft_prompt", text, skills: [] }),
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text,
+        skills: [],
+        thinkingSelection: null,
+      }),
     ).resolves.toMatchObject({
       status: "rejected",
       code: "invalid_command",
@@ -869,6 +1253,7 @@ test("PresentationSession freezes the current exact target identity against hist
         type: "submit_draft_prompt",
         text: "Use the current exact profile",
         skills: [],
+        thinkingSelection: null,
       }),
     ).resolves.toMatchObject({ status: "admitted" });
     const admittedSessionId = presentation.getState().authoritative.active?.session.id;
@@ -941,6 +1326,7 @@ test("PresentationSession admits the first non-empty draft prompt as one durable
         type: "submit_draft_prompt",
         text: "Persist this first prompt",
         skills: [],
+        thinkingSelection: null,
       }),
     ).resolves.toMatchObject({ status: "admitted", resource: null });
     await completed.promise;
@@ -1014,6 +1400,7 @@ test("PresentationSession keeps the draft unpersisted when target resolution rej
         type: "submit_draft_prompt",
         text: "Do not partially persist this prompt",
         skills: [],
+        thinkingSelection: null,
       }),
     ).resolves.toMatchObject({ status: "rejected" });
 
@@ -1092,6 +1479,7 @@ test("PresentationSession keeps an admitted draft durable when the provider fail
         type: "submit_draft_prompt",
         text: "Persist before provider failure",
         skills: [],
+        thinkingSelection: null,
       }),
     ).resolves.toMatchObject({ status: "admitted", resource: null });
     await failed.promise;
@@ -1173,6 +1561,7 @@ test("PresentationSession keeps its draft when logical input persistence fails",
         type: "submit_draft_prompt",
         text: "Keep this draft after persistence failure",
         skills: [],
+        thinkingSelection: null,
       }),
     ).resolves.toMatchObject({ status: "rejected", code: "persistence_failed" });
     expect(presentation.getState()).toMatchObject({
@@ -5525,6 +5914,7 @@ test("PresentationSession admits one submit and cancellation without retrying th
         sessionId,
         text: "Cancel this run",
         skills: [],
+        thinkingSelection: null,
       }),
     ).resolves.toMatchObject({ status: "admitted", resource: null });
     await modelStarted.promise;
@@ -5614,6 +6004,7 @@ test("PresentationSession rejects submit when lifecycle admission fails before d
           sessionId,
           text: "This cannot be admitted",
           skills: [],
+          thinkingSelection: null,
         }),
       ).resolves.toMatchObject({ status: "rejected", code: "not_available" });
       expect(presentation.getState().authoritative.active?.transcript.items).toEqual([]);
@@ -5677,6 +6068,7 @@ test("PresentationSession binds a submit receipt to its exact durable run", asyn
         sessionId,
         text: "Bind this exact run",
         skills: [],
+        thinkingSelection: null,
       });
       expect(receipt).toMatchObject({ status: "admitted", resource: null });
       if (receipt.status !== "admitted") {
@@ -5772,6 +6164,7 @@ test("PresentationSession publishes live assistant progress and replaces it with
             sessionId,
             text: "Stream one answer",
             skills: [],
+            thinkingSelection: null,
           }),
         ).resolves.toMatchObject({ status: "admitted", resource: null });
         await Promise.race([transientVisible.promise, failed]);
@@ -5886,6 +6279,7 @@ test("PresentationSession deduplicates notifications and repairs an impossible d
           sessionId,
           text: "Repair one notification gap",
           skills: [],
+          thinkingSelection: null,
         }),
       ).resolves.toMatchObject({ status: "admitted", resource: null });
       await Promise.race([repairing.promise, failed]);
@@ -5988,6 +6382,7 @@ test("PresentationSession repairs a lower-sequence runtime notification regressi
           sessionId,
           text: "Repair one lower notification",
           skills: [],
+          thinkingSelection: null,
         }),
       ).resolves.toMatchObject({ status: "admitted", resource: null });
       await repairing.promise;
@@ -6077,6 +6472,7 @@ test("PresentationSession recovers after one authoritative runtime refresh failu
           sessionId,
           text: "Recover one failed refresh",
           skills: [],
+          thinkingSelection: null,
         }),
       ).resolves.toMatchObject({ status: "admitted", resource: null });
       await degraded.promise;
@@ -6142,6 +6538,7 @@ test("PresentationSession subscriber failures cannot poison runtime settlement o
           sessionId,
           text: "Keep observer failures isolated",
           skills: [],
+          thinkingSelection: null,
         }),
       ).resolves.toMatchObject({ status: "admitted", resource: null });
       await subscriberCalled.promise;
@@ -6206,6 +6603,7 @@ test("PresentationSession keeps an active run bound to its source session", asyn
           sessionId: source.sessionId,
           text: "Remain bound to this session",
           skills: [],
+          thinkingSelection: null,
         }),
       ).resolves.toMatchObject({ status: "admitted", resource: null });
       await modelStarted.promise;
@@ -6294,6 +6692,7 @@ test("PresentationSession preserves failed and output-limited run notices", asyn
             sessionId,
             text: `Project the ${scenario} outcome`,
             skills: [],
+            thinkingSelection: null,
           }),
         ).resolves.toMatchObject({ status: "admitted", resource: null });
         await noticeVisible.promise;
@@ -6398,6 +6797,7 @@ test("PresentationSession preserves a bounded tool failure cause", async () => {
         sessionId,
         text: "Read one missing file",
         skills: [],
+        thinkingSelection: null,
       });
       await failedToolVisible.promise;
       expect(
@@ -6703,6 +7103,7 @@ test("PresentationSession admits one exact permission decision and rejects its d
       sessionId,
       text: "Read allow.txt once",
       skills: [],
+      thinkingSelection: null,
     });
     const pending = Promise.withResolvers<string>();
     const unsubscribePresentation = presentation.subscribe(() => {

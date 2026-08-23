@@ -7,6 +7,7 @@ import type {
   SkillContextRecordV1,
   SkillResourceManifestV1,
 } from "./skills.js";
+import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import type { PermissionPolicyInput, ToolCall, ToolResult } from "./tool-runtime.js";
 
 export const sessionDurableContext = Symbol("adam-agent.session-durable-context");
@@ -52,6 +53,7 @@ export type AgentSessionDurableContext = {
       }) => Promise<void>)
     | undefined;
   readonly targetIdentity: ModelTargetIdentity;
+  readonly thinkingPolicy?: ThinkingPolicySnapshotV1 | undefined;
   readonly resume?: {
     readonly runId: string;
     readonly pendingExplicitSkills?: readonly {

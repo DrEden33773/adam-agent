@@ -287,6 +287,20 @@ export async function createPresentationSession(
           certification:
             target.identity.certification === "certified" ? "Certified" : "Experimental",
           readiness: target.readiness,
+          thinking:
+            target.thinkingCapability === undefined
+              ? null
+              : {
+                  capabilityId: target.thinkingCapability.capabilityId,
+                  capabilityVersion: target.thinkingCapability.capabilityVersion,
+                  capabilityDigest: target.thinkingCapability.capabilityDigest,
+                  defaultLevelId: target.thinkingCapability.defaultLevelId,
+                  levels: target.thinkingCapability.levels.map((level) => ({
+                    id: level.id,
+                    label: level.label,
+                    effectiveLevelId: level.effectiveLevelId,
+                  })),
+                },
         })),
         defaultTargetId:
           preferenceDiagnostic === null ? (configuredPreferences?.defaultTargetId ?? null) : null,
@@ -930,6 +944,7 @@ export async function createPresentationSession(
             admission.resolve();
           }
         });
+        let admissionFailure: unknown;
         const continuation = options.lifecycle.continue({
           sessionId: command.sessionId,
           input: {
@@ -940,6 +955,9 @@ export async function createPresentationSession(
           },
           runId: commandId,
           signal: controller.signal,
+          ...(command.thinkingSelection === null
+            ? {}
+            : { thinkingSelection: command.thinkingSelection }),
         });
         const settlement = continuation
           .then(async (continued) => {
@@ -969,18 +987,27 @@ export async function createPresentationSession(
         const admitted = await Promise.race([
           admission.promise.then(() => ({ status: "admitted" as const })),
           continuation.then(
-            () => ({ status: "rejected" as const }),
-            () => ({ status: "rejected" as const }),
+            (continued) => {
+              admissionFailure =
+                continued.result.status === "failed" ? continued.result.error.code : null;
+              return { status: "rejected" as const };
+            },
+            (error) => {
+              admissionFailure = error;
+              return { status: "rejected" as const };
+            },
           ),
         ]);
         unsubscribeAdmission();
         if (admitted.status === "rejected") {
           await settlement;
-          return {
-            status: "rejected",
-            code: "not_available",
-            message: "The prompt could not be admitted to durable session history.",
-          };
+          return (
+            thinkingPolicyAdmissionRejection(admissionFailure) ?? {
+              status: "rejected",
+              code: "not_available",
+              message: "The prompt could not be admitted to durable session history.",
+            }
+          );
         }
         return { status: "admitted", commandId, resource: null };
       }
@@ -1036,6 +1063,9 @@ export async function createPresentationSession(
           },
           runId: commandId,
           signal: controller.signal,
+          ...(command.thinkingSelection === null
+            ? {}
+            : { thinkingSelection: command.thinkingSelection }),
           onAdmitted(receipt) {
             if (receipt.runId !== commandId) {
               return;
@@ -2780,6 +2810,10 @@ function ambiguousSkillMentionRejection(
 function draftAdmissionRejection(
   failure: unknown,
 ): Extract<CommandReceipt, { readonly status: "rejected" }> {
+  const thinkingPolicyRejection = thinkingPolicyAdmissionRejection(failure);
+  if (thinkingPolicyRejection !== null) {
+    return thinkingPolicyRejection;
+  }
   const code =
     failure instanceof SessionLifecycleError
       ? failure.code
@@ -2832,6 +2866,27 @@ function draftAdmissionRejection(
     status: "rejected",
     code: "not_available",
     message: "The exact target or draft resources are no longer available.",
+  };
+}
+
+function thinkingPolicyAdmissionRejection(
+  failure: unknown,
+): Extract<CommandReceipt, { readonly code: "thinking_policy_unsupported" }> | null {
+  if (
+    !(failure instanceof SessionLifecycleError) ||
+    failure.code !== "session_thinking_policy_unsupported"
+  ) {
+    return null;
+  }
+  const supportedLevelIds = failure.supportedLevelIds ?? [];
+  return {
+    status: "rejected",
+    code: "thinking_policy_unsupported",
+    message:
+      supportedLevelIds.length === 0
+        ? "The requested thinking policy is unavailable for the exact target."
+        : `The requested thinking policy is unavailable. Choose ${supportedLevelIds.join(", ")}.`,
+    supportedLevelIds,
   };
 }
 

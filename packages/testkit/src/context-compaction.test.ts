@@ -1320,9 +1320,27 @@ test("AgentSession keeps the v2 compaction summary budget separate from ordinary
     estimatorVersion: 1,
   };
   const observedBudgets: Array<number | undefined> = [];
+  const thinkingPolicy = {
+    schemaVersion: 1 as const,
+    requestedLevelId: "max",
+    effectiveLevelId: "max",
+    capability: {
+      id: "test:deepseek-thinking",
+      version: 1 as const,
+      digest: `sha256:${"1".repeat(64)}` as const,
+    },
+    mapping: {
+      requestPath: "provider_options.deepseek" as const,
+      thinkingType: "enabled" as const,
+      reasoningEffort: "max" as const,
+    },
+    reasoningArtifact: "provider_reasoning" as const,
+  };
+  const observedThinkingPolicies: Array<ModelRequest["thinkingPolicy"]> = [];
   const model: ModelDriver = {
     async *stream(request) {
       observedBudgets.push(request.maximumOutputTokens);
+      observedThinkingPolicies.push(request.thinkingPolicy);
       if (
         request.messages.some(
           (message) => message.role === "system" && message.content.startsWith("Compact this"),
@@ -1343,6 +1361,7 @@ test("AgentSession keeps the v2 compaction summary budget separate from ordinary
     [sessionDurableContext]: {
       nextSequence: 1,
       targetIdentity: { ...targetIdentity, profileVersion: 2 },
+      thinkingPolicy,
       initialMessages: [{ role: "system" as const, content: "large active context ".repeat(120) }],
     },
     contextProfile: v2Profile,
@@ -1353,6 +1372,7 @@ test("AgentSession keeps the v2 compaction summary budget separate from ordinary
     answer: "Separate budgets observed.",
   });
   expect(observedBudgets).toEqual([32_768, 384_000]);
+  expect(observedThinkingPolicies).toEqual([undefined, thinkingPolicy]);
 });
 
 test("AgentSession fails closed before sending a non-positive output budget", async () => {

@@ -10,6 +10,7 @@ import { APICallError } from "@ai-sdk/provider";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
 import type { ModelDriver, ModelEvent, ModelRequest } from "./index.js";
 import { ModelDriverError } from "./model-driver-error.js";
+import type { ThinkingPolicyMappingV1 } from "./thinking-policy.js";
 
 const maximumToolArgumentBytes = 2 * 1024 * 1024;
 const maximumToolCallCount = 128;
@@ -30,6 +31,9 @@ export class AiSdkModelDriver implements ModelDriver {
   readonly #maximumOutputTokens: number;
   readonly #model: LanguageModelV4;
   readonly #providerOptions: SharedV4ProviderOptions | undefined;
+  readonly #sideCallThinkingPolicies:
+    | Readonly<Partial<Record<"title" | "compaction", ThinkingPolicyMappingV1>>>
+    | undefined;
   readonly #sensitiveValues: readonly string[];
 
   constructor(options: {
@@ -37,12 +41,16 @@ export class AiSdkModelDriver implements ModelDriver {
     readonly maximumOutputTokens: number;
     readonly deadlineMs: number;
     readonly providerOptions?: SharedV4ProviderOptions | undefined;
+    readonly sideCallThinkingPolicies?: Readonly<
+      Partial<Record<"title" | "compaction", ThinkingPolicyMappingV1>>
+    >;
     readonly sensitiveValues: readonly string[];
   }) {
     this.#deadlineMs = options.deadlineMs;
     this.#model = options.model;
     this.#maximumOutputTokens = options.maximumOutputTokens;
     this.#providerOptions = options.providerOptions;
+    this.#sideCallThinkingPolicies = options.sideCallThinkingPolicies;
     this.#sensitiveValues = options.sensitiveValues;
   }
 
@@ -67,11 +75,16 @@ export class AiSdkModelDriver implements ModelDriver {
     };
     armDeadline();
     try {
+      const providerOptions = providerOptionsForRequest(
+        this.#providerOptions,
+        request,
+        this.#sideCallThinkingPolicies,
+      );
       const result = await this.#model.doStream({
         prompt: mapPrompt(request),
         maxOutputTokens: Math.min(request.maximumOutputTokens, this.#maximumOutputTokens),
         abortSignal: attemptController.signal,
-        ...(this.#providerOptions === undefined ? {} : { providerOptions: this.#providerOptions }),
+        ...(providerOptions === undefined ? {} : { providerOptions }),
         ...(request.tools.length === 0
           ? {}
           : {
@@ -137,6 +150,39 @@ export class AiSdkModelDriver implements ModelDriver {
       request.signal.removeEventListener("abort", abortFromCaller);
     }
   }
+}
+
+function providerOptionsForRequest(
+  configured: SharedV4ProviderOptions | undefined,
+  request: ModelRequest,
+  sideCallThinkingPolicies:
+    | Readonly<Partial<Record<"title" | "compaction", ThinkingPolicyMappingV1>>>
+    | undefined,
+): SharedV4ProviderOptions | undefined {
+  const sideCallMapping =
+    request.purpose === "title" || request.purpose === "compaction"
+      ? sideCallThinkingPolicies?.[request.purpose]
+      : undefined;
+  const mapping = sideCallMapping ?? request.thinkingPolicy?.mapping;
+  if (mapping === undefined) {
+    return configured;
+  }
+  const { deepseek: configuredDeepSeek } = configured ?? {};
+  const deepSeekRecord =
+    configuredDeepSeek !== null &&
+    typeof configuredDeepSeek === "object" &&
+    !Array.isArray(configuredDeepSeek)
+      ? configuredDeepSeek
+      : {};
+  const { thinking: _thinking, reasoningEffort: _reasoningEffort, ...preserved } = deepSeekRecord;
+  return {
+    ...configured,
+    deepseek: {
+      ...preserved,
+      thinking: { type: mapping.thinkingType },
+      ...(mapping.thinkingType === "disabled" ? {} : { reasoningEffort: mapping.reasoningEffort }),
+    },
+  };
 }
 
 function isIgnoredStructuralPart(part: LanguageModelV4StreamPart): boolean {
