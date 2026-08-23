@@ -325,7 +325,15 @@ export type SkillCatalogDisplay = {
     readonly code: string;
     readonly source: "project" | "user" | "extension";
     readonly scope?: string;
+    readonly extensionId?: string;
+    readonly packageName?: string;
+    readonly packageVersion?: string;
     readonly packagePath: string;
+    readonly field?: string;
+    readonly bound?: {
+      readonly maximum: number;
+      readonly unit: "bytes" | "estimated_tokens" | "fields";
+    };
   }[];
   readonly overflow: {
     readonly omittedCount: number;
@@ -333,6 +341,69 @@ export type SkillCatalogDisplay = {
   };
   readonly reloadAvailable: boolean;
 };
+
+export type SkillMentionResolution =
+  | {
+      readonly status: "resolved";
+      readonly text: string;
+      readonly qualifiedIds: readonly string[];
+    }
+  | {
+      readonly status: "ambiguous";
+      readonly text: string;
+      readonly name: string;
+      readonly candidateQualifiedIds: readonly string[];
+    };
+
+export function resolveSkillMentions(input: {
+  readonly text: string;
+  readonly explicitQualifiedIds: readonly string[];
+  readonly catalog: SkillCatalogDisplay | null;
+}): SkillMentionResolution {
+  const resolved = [...new Set(input.explicitQualifiedIds)];
+  if (input.catalog === null) {
+    return { status: "resolved", text: input.text, qualifiedIds: resolved };
+  }
+  const candidatesByName = Map.groupBy(input.catalog.items, (item) => item.name);
+  for (const match of input.text.matchAll(/\$([a-z0-9]+(?:-[a-z0-9]+)*)/gu)) {
+    const name = match[1];
+    const offset = match.index;
+    const preceding = offset === 0 ? undefined : input.text[offset - 1];
+    const following = input.text[offset + match[0].length];
+    if (
+      name === undefined ||
+      (preceding !== undefined && /[A-Za-z0-9_$\\]/u.test(preceding)) ||
+      (following !== undefined && /[A-Za-z0-9_-]/u.test(following))
+    ) {
+      continue;
+    }
+    const candidates = candidatesByName.get(name) ?? [];
+    if (candidates.length === 0) {
+      continue;
+    }
+    const explicitlySelected = candidates.filter((candidate) =>
+      resolved.includes(candidate.qualifiedId),
+    );
+    const selected =
+      candidates.length === 1
+        ? candidates[0]
+        : explicitlySelected.length === 1
+          ? explicitlySelected[0]
+          : undefined;
+    if (selected === undefined) {
+      return {
+        status: "ambiguous",
+        text: input.text,
+        name,
+        candidateQualifiedIds: candidates.map((candidate) => candidate.qualifiedId),
+      };
+    }
+    if (!resolved.includes(selected.qualifiedId)) {
+      resolved.push(selected.qualifiedId);
+    }
+  }
+  return { status: "resolved", text: input.text, qualifiedIds: resolved };
+}
 
 export type RepositoryInstructionsDisplay = {
   readonly revision: number;

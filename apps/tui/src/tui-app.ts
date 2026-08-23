@@ -115,10 +115,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           );
         },
         getSkills: () =>
-          options.presentation.getState().authoritative.active?.skills?.items.map((skill) => ({
+          (
+            options.presentation.getState().authoritative.active?.skills?.items ??
+            options.presentation.getState().draft?.skills.items ??
+            []
+          ).map((skill) => ({
             description: skill.description,
+            name: skill.name,
             qualifiedId: skill.qualifiedId,
-          })) ?? [],
+          })),
       }),
     );
     for (const prompt of authoritativePromptHistory(active)) {
@@ -1877,6 +1882,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           editor.setText("");
           selectedSkills.clear();
         } else {
+          statusMessage = receipt.message;
           editor.disableSubmit = false;
         }
       })

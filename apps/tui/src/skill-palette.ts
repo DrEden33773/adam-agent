@@ -76,20 +76,51 @@ export class SkillPalette implements Component {
       this.#theme.muted(
         `Catalog r${this.#catalog.revision} · ${this.#catalog.overflow.omittedCount} omitted · ${this.#catalog.overflow.shortenedCount} shortened · ${this.#catalog.diagnostics.length} diagnostics`,
       ),
-      ...this.#catalog.diagnostics.map((diagnostic) =>
-        this.#theme.muted(
-          safeTerminalText(
-            `${diagnostic.code} · ${diagnostic.source}${
-              diagnostic.scope === undefined ? "" : `:${diagnostic.scope}`
-            } · ${diagnostic.packagePath}`,
+      ...this.#catalog.diagnostics.flatMap((diagnostic) => {
+        const detail = [
+          diagnostic.field === undefined ? undefined : `field ${diagnostic.field}`,
+          diagnostic.bound === undefined
+            ? undefined
+            : `maximum ${diagnostic.bound.maximum} ${diagnosticBoundUnit(diagnostic.bound.unit)}`,
+        ].filter((part): part is string => part !== undefined);
+        return [
+          this.#theme.muted(
+            safeTerminalText(
+              `${diagnostic.code} · ${diagnosticSourceLabel(diagnostic)}${
+                diagnostic.scope === undefined ? "" : `:${diagnostic.scope}`
+              } · ${diagnostic.packagePath}`,
+            ),
           ),
-        ),
-      ),
+          ...(detail.length === 0
+            ? []
+            : [this.#theme.muted(safeTerminalText(`  ${detail.join(" · ")}`))]),
+        ];
+      }),
       ...(this.#notice === null ? [] : ["", this.#theme.muted(this.#notice)]),
       "",
       this.#theme.muted("Enter toggle · Esc close · exact qualified IDs only"),
     ];
   }
+}
+
+function diagnosticSourceLabel(diagnostic: SkillCatalogDisplay["diagnostics"][number]): string {
+  if (diagnostic.source !== "extension") {
+    return diagnostic.source;
+  }
+  const identity = diagnostic.extensionId ?? "unknown-extension";
+  const packageIdentity =
+    diagnostic.packageName === undefined
+      ? ""
+      : `:${diagnostic.packageName}${
+          diagnostic.packageVersion === undefined ? "" : `@${diagnostic.packageVersion}`
+        }`;
+  return `extension:${identity}${packageIdentity}`;
+}
+
+function diagnosticBoundUnit(
+  unit: NonNullable<SkillCatalogDisplay["diagnostics"][number]["bound"]>["unit"],
+): string {
+  return unit === "estimated_tokens" ? "estimated tokens" : unit;
 }
 
 function sourceLabel(source: SkillDisplay["source"]): string {

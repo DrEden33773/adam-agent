@@ -3,6 +3,7 @@ import {
   type AuthoritativePresentationSnapshot,
   type PresentationDisplayState,
   reconcilePresentationUpdate,
+  resolveSkillMentions,
 } from "./index.js";
 
 const emptySnapshot: AuthoritativePresentationSnapshot = {
@@ -166,6 +167,140 @@ describe("presentation reconciliation", () => {
       },
       draft: null,
       transient: null,
+    });
+  });
+});
+
+describe("Skill mention resolution", () => {
+  it("keeps canonical prompt text while resolving one exact Skill mention", () => {
+    const text = "Please use $project-review before changing the code.";
+
+    expect(
+      resolveSkillMentions({
+        text,
+        explicitQualifiedIds: [],
+        catalog: {
+          revision: 1,
+          items: [
+            {
+              qualifiedId: "skill:v1:project:.:project-review",
+              name: "project-review",
+              description: "Reviews exact project state.",
+              source: { type: "project", scope: "." },
+              active: false,
+            },
+          ],
+          diagnostics: [],
+          overflow: { omittedCount: 0, shortenedCount: 0 },
+          reloadAvailable: false,
+        },
+      }),
+    ).toEqual({
+      status: "resolved",
+      text,
+      qualifiedIds: ["skill:v1:project:.:project-review"],
+    });
+  });
+
+  it("recognizes token boundaries while leaving escaped dollar text literal", () => {
+    const text = String.raw`Keep \$escaped-skill and prefix$embedded-skill literal; use $valid-skill.`;
+    const item = (name: string) => ({
+      qualifiedId: `skill:v1:user:${name}`,
+      name,
+      description: `${name} fixture.`,
+      source: { type: "user" as const },
+      active: false,
+    });
+
+    expect(
+      resolveSkillMentions({
+        text,
+        explicitQualifiedIds: [],
+        catalog: {
+          revision: 1,
+          items: [item("escaped-skill"), item("embedded-skill"), item("valid-skill")],
+          diagnostics: [],
+          overflow: { omittedCount: 0, shortenedCount: 0 },
+          reloadAvailable: false,
+        },
+      }),
+    ).toEqual({
+      status: "resolved",
+      text,
+      qualifiedIds: ["skill:v1:user:valid-skill"],
+    });
+  });
+
+  it("requires one explicit qualified choice for an ambiguous short mention", () => {
+    const text = "Use $shared-name.";
+    const catalog: Parameters<typeof resolveSkillMentions>[0]["catalog"] = {
+      revision: 1,
+      items: [
+        {
+          qualifiedId: "skill:v1:project:.:shared-name",
+          name: "shared-name",
+          description: "Project procedure.",
+          source: { type: "project", scope: "." },
+          active: false,
+        },
+        {
+          qualifiedId: "skill:v1:user:shared-name",
+          name: "shared-name",
+          description: "User procedure.",
+          source: { type: "user" },
+          active: false,
+        },
+      ],
+      diagnostics: [],
+      overflow: { omittedCount: 0, shortenedCount: 0 },
+      reloadAvailable: false,
+    };
+
+    expect(resolveSkillMentions({ text, explicitQualifiedIds: [], catalog })).toEqual({
+      status: "ambiguous",
+      text,
+      name: "shared-name",
+      candidateQualifiedIds: ["skill:v1:project:.:shared-name", "skill:v1:user:shared-name"],
+    });
+    expect(
+      resolveSkillMentions({
+        text,
+        explicitQualifiedIds: ["skill:v1:user:shared-name"],
+        catalog,
+      }),
+    ).toEqual({
+      status: "resolved",
+      text,
+      qualifiedIds: ["skill:v1:user:shared-name"],
+    });
+  });
+
+  it("deduplicates multiple exact mentions in first-appearance order", () => {
+    const text = "$alpha then $beta then $alpha.";
+    const item = (name: string) => ({
+      qualifiedId: `skill:v1:user:${name}`,
+      name,
+      description: `${name} fixture.`,
+      source: { type: "user" as const },
+      active: false,
+    });
+
+    expect(
+      resolveSkillMentions({
+        text,
+        explicitQualifiedIds: [],
+        catalog: {
+          revision: 1,
+          items: [item("alpha"), item("beta")],
+          diagnostics: [],
+          overflow: { omittedCount: 0, shortenedCount: 0 },
+          reloadAvailable: false,
+        },
+      }),
+    ).toEqual({
+      status: "resolved",
+      text,
+      qualifiedIds: ["skill:v1:user:alpha", "skill:v1:user:beta"],
     });
   });
 });
