@@ -572,6 +572,334 @@ test("the production target picker saves its focused exact target separately fro
   }
 });
 
+test("the production TUI keeps an edited new-session draft out of persistence until submit", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-session-draft-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    const beforeTarget = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForAfter("Adam · New session", beforeTarget);
+    fixture.write("temporary unsent draft");
+    await fixture.waitForAfter("temporary unsent draft", beforeTarget);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("deepseek-v4-flash.direct · Certified");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI selects a draft Skill without creating durable session identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-draft-skill-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "draft-review");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: draft-review\ndescription: Reviews a draft before admission.\n---\nDraft Skill body.\n",
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({
+      launch: {},
+      scenario: "skill-selection",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/skills\r");
+    await fixture.waitFor("Select next-turn Skills");
+    fixture.write("\r");
+    await fixture.waitFor("1 Skill selected");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("skill:v1:project:.:draft-review");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI admits one selected draft Skill with the first prompt", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-draft-skill-admission-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "draft-review");
+  const qualifiedId = "skill:v1:project:.:draft-review";
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: draft-review\ndescription: Reviews a draft before admission.\n---\nDraft Skill body.\n",
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({
+      launch: {},
+      scenario: "skill-selection",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/skills\r");
+    await fixture.waitFor("Select next-turn Skills");
+    fixture.write("\r");
+    await fixture.waitFor("1 Skill selected");
+    fixture.write("Apply the draft procedure\r");
+    await fixture.waitFor("Skill selection complete.");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    const durable = await readFilesRecursively(stateRoot);
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(durable).toContain(`"qualifiedId":"${qualifiedId}"`);
+    expect(durable).toContain('"reason":"user_explicit"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI opens command Help from a draft without creating durable session identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-draft-help-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/help commands\r");
+    await fixture.waitFor("Command Reference");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI reopens the project session picker from a draft without admitting it", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-draft-resume-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: { seedTargetIds: ["deepseek-v4-flash.direct"] },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select a project session");
+    fixture.write("\r");
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    const beforeResume = fixture.output().length;
+    fixture.write("/resume\r");
+    await fixture.waitForAfter("Select a project session", beforeResume);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    const durable = await readFilesRecursively(stateRoot);
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(durable.match(/"type":"session_genesis"/gu)).toHaveLength(1);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI switches an exact draft target without creating durable session identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-draft-target-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("deepseek-v4-flash.direct · Certified");
+    const beforeTarget = fixture.output().length;
+    fixture.write("/target\r");
+    await fixture.waitForAfter("Select an exact model target", beforeTarget);
+    fixture.write("\u001b[B");
+    fixture.write("\r");
+    await fixture.waitForAfter("deepseek-v4-pro.direct · Certified", beforeTarget);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI clears draft Skill selections when the exact target changes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-draft-target-skills-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "draft-review");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: draft-review\ndescription: Must not remain selected across exact targets.\n---\nDraft Skill body.\n",
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/skills\r");
+    await fixture.waitFor("Select next-turn Skills");
+    fixture.write("\r");
+    await fixture.waitFor("1 Skill selected");
+    const beforeTarget = fixture.output().length;
+    fixture.write("/target\r");
+    await fixture.waitForAfter("Select an exact model target", beforeTarget);
+    fixture.write("\u001b[B\r");
+    await fixture.waitForCompleteFrameAfter("deepseek-v4-pro.direct · Certified", beforeTarget);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeTarget)).join("\n");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(frame).not.toContain("1 Skill selected");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI explains durable-identity commands without admitting a draft", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-draft-identity-command-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    const beforeName = fixture.output().length;
+    fixture.write("/name Draft name\r");
+    const outcome = await Promise.race([
+      fixture
+        .waitForAfter("/name needs a session. Submit the first prompt or use /resume.", beforeName)
+        .then(() => "actionable" as const),
+      fixture
+        .waitForAfter(
+          "This command is not available before the first prompt is admitted.",
+          beforeName,
+        )
+        .then(() => "generic" as const),
+    ]);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("actionable");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI admits the first draft prompt before showing its durable answer", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-draft-admission-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: {},
+      scenario: "skill-selection",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    const beforePrompt = fixture.output().length;
+    fixture.write("Admit this first draft prompt\r");
+    await fixture.waitForAfter("Skill selection complete.", beforePrompt);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    const durable = await readFilesRecursively(stateRoot);
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(durable).toContain('"type":"session_genesis"');
+    expect(durable).toContain('"type":"logical_run_started"');
+    expect(durable).toContain('"userMessage":"Admit this first draft prompt"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Ctrl+C cancels draft admission preflight without persisting or arming exit", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-draft-admission-cancel-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      launch: {},
+      scenario: "draft-admission-cancellation",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Cancel this draft admission\r");
+    await waitForPath(join(controlRoot, "model-resolve-pending"));
+    const beforeCancel = fixture.output().length;
+    fixture.write("\u0003");
+    await fixture.waitForCompleteFrameAfter(
+      "The exact target or draft resources are no longer available.",
+      beforeCancel,
+    );
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeCancel)).join("\n");
+
+    expect(frame).toContain("Cancel this draft admission");
+    expect(frame).not.toContain("Press Ctrl+C again");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the production target picker shows malformed configuration diagnostics without losing direct targets", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-invalid-target-config-"));
   const configRoot = join(testRoot, "config");
@@ -713,7 +1041,7 @@ test("the production session picker opens the exact focused existing session", a
     await fixture.waitFor("Select a project session");
     const beforeSelection = fixture.output().length;
     fixture.write("\u001b[B\r");
-    await fixture.waitForAfter("Adam · New session", beforeSelection);
+    await fixture.waitForAfter("Adam · Streaming session", beforeSelection);
     await fixture.waitForAfter("deepseek-v4-flash.direct · Certified", beforeSelection);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -1042,8 +1370,13 @@ test("the footer exposes authoritative project context and run facts", async () 
     await fixture.waitFor("Adam · Streaming session");
     const beforeCompaction = fixture.output().length;
     fixture.write("Continue after the large answer\r");
+    await fixture.waitForCompleteFrameAfter("Working", beforeCompaction);
+    const afterWorking = fixture.output().length;
     await fixture.waitForAfter("Context compacted · window 1", beforeCompaction);
-    await fixture.waitForAfter("context · estimated · idle", beforeCompaction);
+    const secondAssistantSummary = "· 270058 bytes · /artifacts to inspect";
+    await fixture.waitForAfter(secondAssistantSummary, afterWorking);
+    const afterAssistant = fixture.output().lastIndexOf(secondAssistantSummary);
+    await fixture.waitForCompleteFrameAfter("context · estimated · idle", afterAssistant);
     expect(fixture.output()).toMatch(/workspace · \d+\/32768 context · estimated · idle/u);
 
     let beforeResize = fixture.output().length;
@@ -1054,7 +1387,7 @@ test("the footer exposes authoritative project context and run facts", async () 
 
     beforeResize = fixture.output().length;
     await fixture.resize(40, 12);
-    await fixture.waitForAfter(" est", beforeResize);
+    await fixture.waitForCompleteFrameAfter("32.8k est", beforeResize);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
     expect(frame).toMatch(/idle · ctx [\d.]+(?:k|m)?\/32\.8k est/u);
     fixture.write("\u0011");

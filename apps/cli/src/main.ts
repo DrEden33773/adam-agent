@@ -444,9 +444,8 @@ async function runCliCommand(activeCommand: CliCommand): Promise<void> {
         allowExperimental: false,
         signal: new AbortController().signal,
       });
-      const created = await lifecycle.create({ targetIdentity: resolved.identity });
-      await continueAndPresent(lifecycle, {
-        sessionId: created.sessionId,
+      await admitAndPresent(lifecycle, {
+        targetIdentity: resolved.identity,
         input: {
           text: activeCommand.prompt,
           ...(activeCommand.skills === undefined ? {} : { skills: activeCommand.skills }),
@@ -506,6 +505,20 @@ async function continueAndPresent(
   lifecycle: SessionLifecycle,
   input: Parameters<SessionLifecycle["continue"]>[0],
 ): Promise<void> {
+  return runAndPresent(lifecycle, (signal) => lifecycle.continue({ ...input, signal }));
+}
+
+async function admitAndPresent(
+  lifecycle: SessionLifecycle,
+  input: Parameters<SessionLifecycle["admit"]>[0],
+): Promise<void> {
+  return runAndPresent(lifecycle, (signal) => lifecycle.admit({ ...input, signal }));
+}
+
+async function runAndPresent(
+  lifecycle: SessionLifecycle,
+  run: (signal: AbortSignal) => ReturnType<SessionLifecycle["continue"]>,
+): Promise<void> {
   const permissionInput = new PermissionLineReader(process.stdin);
   const pendingPermissionHandlers = new Set<Promise<void>>();
   const unsubscribe = lifecycle.subscribe((event) => {
@@ -527,7 +540,7 @@ async function continueAndPresent(
   };
   process.once("SIGINT", handleInterrupt);
   try {
-    const continued = await lifecycle.continue({ ...input, signal: abortController.signal });
+    const continued = await run(abortController.signal);
     if (continued.result.status === "completed" || continued.result.status === "incomplete") {
       writeText(1, `${continued.result.answer}\n`);
       if (continued.result.status === "incomplete") {

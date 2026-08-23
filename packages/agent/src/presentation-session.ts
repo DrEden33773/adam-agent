@@ -28,12 +28,13 @@ import {
 } from "./model-targets.js";
 import type { PresentationPreferences } from "./presentation-preferences.js";
 import { listProjectPaths } from "./project-path-catalog.js";
-import type {
-  CurrentSessionSnapshot,
-  SessionContextUsageSnapshot,
-  SessionLifecycle,
-  SessionMetadataEvent,
-  SessionRuntimeNotification,
+import {
+  type CurrentSessionSnapshot,
+  type SessionContextUsageSnapshot,
+  type SessionLifecycle,
+  SessionLifecycleError,
+  type SessionMetadataEvent,
+  type SessionRuntimeNotification,
 } from "./session-lifecycle.js";
 import { sessionTitleFallback } from "./session-naming.js";
 import { readJsonlSessionRecords, type SessionRecord } from "./session-store.js";
@@ -48,6 +49,9 @@ export const presentationRuntimeRefreshBarrier = Symbol(
 );
 export const presentationArtifactReadBarrier = Symbol(
   "adam-agent.presentation-artifact-read-barrier",
+);
+export const presentationSessionRecordReader = Symbol(
+  "adam-agent.presentation-session-record-reader",
 );
 
 export type PresentationHydrationBarrier = {
@@ -66,6 +70,10 @@ export type PresentationArtifactReadBarrier = {
   afterRead?(): Promise<void>;
 };
 
+export type PresentationSessionRecordReader = (
+  sessionId: string,
+) => Promise<readonly SessionRecord[]>;
+
 type PresentationSessionBaseOptions = {
   readonly lifecycle: SessionLifecycle;
   readonly modelTargets?: ModelTargets;
@@ -76,9 +84,15 @@ type PresentationSessionBaseOptions = {
   readonly [presentationHydrationBarrier]?: PresentationHydrationBarrier;
   readonly [presentationRuntimeRefreshBarrier]?: PresentationRuntimeRefreshBarrier;
   readonly [presentationArtifactReadBarrier]?: PresentationArtifactReadBarrier;
+  readonly [presentationSessionRecordReader]?: PresentationSessionRecordReader;
   readonly [presentationHistoryPageSize]?: number;
   readonly [presentationCatalogPageSize]?: number;
 };
+
+type PresentationSessionRecordOptions = Pick<
+  PresentationSessionBaseOptions,
+  "stateRoot" | "workspaceRoot" | typeof presentationSessionRecordReader
+>;
 
 export type CreatePresentationSessionOptions = PresentationSessionBaseOptions &
   (
@@ -124,17 +138,11 @@ export async function createPresentationSession(
 
   try {
     let created: CurrentSessionSnapshot | undefined;
-    if (options.openProject === true) {
+    if (options.sessionId === undefined) {
       created = undefined;
-    } else if (options.sessionId === undefined) {
-      created = await options.lifecycle.create({ targetIdentity: options.targetIdentity });
     } else {
       const inspected = await options.lifecycle.inspect({ sessionId: options.sessionId });
-      const existingRecords = await readJsonlSessionRecords({
-        sessionId: options.sessionId,
-        workspaceRoot: options.workspaceRoot,
-        ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-      });
+      const existingRecords = await readPresentationSessionRecords(options, options.sessionId);
       if (
         inspected.schemaVersion === 3 &&
         inspected.status !== "interrupted" &&
@@ -218,8 +226,15 @@ export async function createPresentationSession(
         knownTargets.set(target.identity.targetId, target.identity);
       }
     }
-    if (created !== undefined) {
+    if (created !== undefined && !knownTargets.has(created.targetIdentity.targetId)) {
       knownTargets.set(created.targetIdentity.targetId, created.targetIdentity);
+    }
+    if (
+      "targetIdentity" in options &&
+      options.targetIdentity !== undefined &&
+      !knownTargets.has(options.targetIdentity.targetId)
+    ) {
+      knownTargets.set(options.targetIdentity.targetId, options.targetIdentity);
     }
     const catalogPage = await options.lifecycle.listProjectSessions({ limit: catalogPageSize });
     const projectPaths = await listProjectPaths(options.workspaceRoot);
@@ -229,7 +244,9 @@ export async function createPresentationSession(
           if (snapshot.schemaVersion !== 3) {
             return null;
           }
-          knownTargets.set(snapshot.targetIdentity.targetId, snapshot.targetIdentity);
+          if (!knownTargets.has(snapshot.targetIdentity.targetId)) {
+            knownTargets.set(snapshot.targetIdentity.targetId, snapshot.targetIdentity);
+          }
           return sessionSummaryFromSnapshot(
             snapshot,
             snapshot.sessionId === created?.sessionId
@@ -249,6 +266,10 @@ export async function createPresentationSession(
         : catalogItems.some((candidate) => candidate.id === created.sessionId)
           ? catalogItems
           : [...catalogItems, activeSummary];
+    const initialDraft =
+      "targetIdentity" in options && options.targetIdentity !== undefined
+        ? await options.lifecycle.previewNewSession({ targetIdentity: options.targetIdentity })
+        : null;
     const authoritative: AuthoritativePresentationSnapshot = {
       schemaVersion: 1,
       continuity: {
@@ -288,8 +309,17 @@ export async function createPresentationSession(
     let state: PresentationDisplayState = {
       revision: 1,
       authoritative,
+      draft:
+        initialDraft === null
+          ? null
+          : {
+              targetId: initialDraft.targetIdentity.targetId,
+              skills: projectSkillContext(initialDraft.skillContext, false),
+              projectPaths,
+            },
       transient: null,
     };
+    let draftTargetIdentity: ModelTargetIdentity | null = initialDraft?.targetIdentity ?? null;
     const metadataThrough = new Map<string, number>();
     if (created !== undefined) {
       metadataThrough.set(`session_naming_changed:${created.sessionId}`, created.lastSequence);
@@ -308,12 +338,13 @@ export async function createPresentationSession(
     let closed = false;
     let activeRun:
       | {
-          readonly sessionId: string;
+          sessionId: string | null;
           readonly controller: AbortController;
           readonly settlement: Promise<void>;
         }
       | undefined;
-    const activateSnapshot = async (snapshot: CurrentSessionSnapshot): Promise<void> => {
+    let snapshotActivationQueue = Promise.resolve();
+    const activateSnapshotNow = async (snapshot: CurrentSessionSnapshot): Promise<void> => {
       const activatedRecords = await readActiveBranchRecords(options, snapshot.sessionId);
       const activatedContextUsage = await options.lifecycle.inspectContextUsage({
         sessionId: snapshot.sessionId,
@@ -328,7 +359,9 @@ export async function createPresentationSession(
         targetId: snapshot.targetIdentity.targetId,
         status: snapshot.status,
       };
-      knownTargets.set(snapshot.targetIdentity.targetId, snapshot.targetIdentity);
+      if (!knownTargets.has(snapshot.targetIdentity.targetId)) {
+        knownTargets.set(snapshot.targetIdentity.targetId, snapshot.targetIdentity);
+      }
       const catalogItems = state.authoritative.sessions.items.some(
         (session) => session.id === snapshot.sessionId,
       )
@@ -367,9 +400,19 @@ export async function createPresentationSession(
             mcp: projectMcp(snapshot),
           },
         },
+        draft: null,
         transient: null,
       };
+      draftTargetIdentity = null;
       publishStateChange();
+    };
+    const activateSnapshot = (snapshot: CurrentSessionSnapshot): Promise<void> => {
+      const activation = snapshotActivationQueue.then(() => activateSnapshotNow(snapshot));
+      snapshotActivationQueue = activation.then(
+        () => undefined,
+        () => undefined,
+      );
+      return activation;
     };
     const refreshActiveNaming = async (
       sessionId: string,
@@ -412,6 +455,7 @@ export async function createPresentationSession(
           },
           active: { ...current, session: refreshedSummary },
         },
+        draft: state.draft,
         transient: state.transient,
       };
       publishStateChange();
@@ -440,6 +484,7 @@ export async function createPresentationSession(
           },
           active: { ...current, mcp: projectMcp(inspected) },
         },
+        draft: state.draft,
         transient: state.transient,
       };
       publishStateChange();
@@ -473,6 +518,7 @@ export async function createPresentationSession(
               state = {
                 revision: state.revision + 1,
                 authoritative: state.authoritative,
+                draft: state.draft,
                 transient: { activity: "working", assistant: null },
               };
               publishStateChange();
@@ -480,6 +526,7 @@ export async function createPresentationSession(
               state = {
                 revision: state.revision + 1,
                 authoritative: state.authoritative,
+                draft: state.draft,
                 transient: { activity: "using_tool", assistant: null },
               };
               publishStateChange();
@@ -525,6 +572,7 @@ export async function createPresentationSession(
                       },
                     },
                   },
+                  draft: state.draft,
                   transient: state.transient,
                 };
                 publishStateChange();
@@ -544,6 +592,7 @@ export async function createPresentationSession(
                   ...state.authoritative,
                   continuity: { status: "repairing", reason: "gap" },
                 },
+                draft: state.draft,
                 transient: null,
               };
               publishStateChange();
@@ -573,6 +622,7 @@ export async function createPresentationSession(
                   ...state.authoritative,
                   continuity: { status: "repairing", reason: "gap" },
                 },
+                draft: state.draft,
                 transient: null,
               };
               publishStateChange();
@@ -612,6 +662,7 @@ export async function createPresentationSession(
                   pendingInteractions,
                 },
               },
+              draft: state.draft,
               transient: isAssistantTerminalEvent(event) ? null : state.transient,
             };
             publishStateChange();
@@ -631,6 +682,7 @@ export async function createPresentationSession(
                   },
                 },
               },
+              draft: state.draft,
               transient: null,
             };
             publishStateChange();
@@ -689,6 +741,7 @@ export async function createPresentationSession(
                 },
               },
             },
+            draft: state.draft,
             transient: null,
           };
           publishStateChange();
@@ -732,6 +785,7 @@ export async function createPresentationSession(
                 diagnostic: null,
               },
             },
+            draft: state.draft,
             transient: state.transient,
           };
           publishStateChange();
@@ -745,6 +799,13 @@ export async function createPresentationSession(
         }
       }
       if (command.type === "create_session") {
+        if (activeRun !== undefined) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "A new session cannot be drafted while a run is active.",
+          };
+        }
         const targetIdentity = knownTargets.get(command.targetId);
         if (targetIdentity === undefined) {
           return {
@@ -753,17 +814,37 @@ export async function createPresentationSession(
             message: "The exact target is not available in this Presentation session.",
           };
         }
+        let preview: Awaited<ReturnType<SessionLifecycle["previewNewSession"]>>;
         try {
-          const snapshot = await options.lifecycle.create({ targetIdentity });
-          await activateSnapshot(snapshot);
-          return { status: "admitted", commandId: randomUUID(), resource: null };
+          preview = await options.lifecycle.previewNewSession({ targetIdentity });
         } catch {
           return {
             status: "rejected",
-            code: "authority_rejected",
-            message: "The session could not be created.",
+            code: "not_available",
+            message: "The exact target and draft Skill catalog could not be prepared.",
           };
         }
+        state = {
+          revision: state.revision + 1,
+          authoritative: {
+            ...state.authoritative,
+            continuity: {
+              status: "current",
+              sessionThroughSequence: 0,
+              operationThrough: [],
+            },
+            active: null,
+          },
+          draft: {
+            targetId: targetIdentity.targetId,
+            skills: projectSkillContext(preview.skillContext, false),
+            projectPaths,
+          },
+          transient: null,
+        };
+        draftTargetIdentity = targetIdentity;
+        publishStateChange();
+        return { status: "admitted", commandId: randomUUID(), resource: null };
       }
       if (command.type === "select_session") {
         if (activeRun !== undefined) {
@@ -892,6 +973,125 @@ export async function createPresentationSession(
         }
         return { status: "admitted", commandId, resource: null };
       }
+      if (command.type === "submit_draft_prompt") {
+        const draft = state.draft;
+        if (draft === null || command.text.trim().length === 0) {
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "A non-empty prompt and exact draft target are required.",
+          };
+        }
+        if (activeRun !== undefined) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "The active session already has a running command.",
+          };
+        }
+        const targetIdentity = draftTargetIdentity;
+        if (targetIdentity === null || targetIdentity.targetId !== draft.targetId) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "The exact draft target is no longer available.",
+          };
+        }
+        const controller = new AbortController();
+        const commandId = randomUUID();
+        const admission = Promise.withResolvers<string>();
+        let admittedSessionId: string | null = null;
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          transient: { activity: "working", assistant: null },
+        };
+        publishStateChange();
+        const continuation = options.lifecycle.admit({
+          targetIdentity,
+          input: {
+            text: command.text,
+            ...(command.skills.length === 0 ? {} : { skills: command.skills }),
+          },
+          runId: commandId,
+          signal: controller.signal,
+          onAdmitted(receipt) {
+            if (receipt.runId !== commandId) {
+              return;
+            }
+            admittedSessionId = receipt.sessionId;
+            admission.resolve(receipt.sessionId);
+          },
+        });
+        const settlement = continuation
+          .then(async (continued) => {
+            if (!closed && admittedSessionId !== null) {
+              await activateSnapshot(continued.snapshot);
+            }
+          })
+          .catch(async () => {
+            const sessionId = admittedSessionId;
+            if (closed || sessionId === null) {
+              return;
+            }
+            const inspected = await options.lifecycle.inspect({ sessionId });
+            if (inspected.schemaVersion === 3) {
+              await activateSnapshot(inspected);
+            }
+          })
+          .finally(() => {
+            if (activeRun?.settlement === settlement) {
+              activeRun = undefined;
+            }
+            if (
+              !closed &&
+              admittedSessionId === null &&
+              state.authoritative.active === null &&
+              state.transient !== null
+            ) {
+              state = { ...state, revision: state.revision + 1, transient: null };
+              publishStateChange();
+            }
+          });
+        activeRun = {
+          sessionId: null,
+          controller,
+          settlement,
+        };
+        let admissionFailure: unknown;
+        const admitted = await Promise.race([
+          admission.promise.then((sessionId) => ({ status: "admitted" as const, sessionId })),
+          continuation.then(
+            (continued) => {
+              admissionFailure =
+                continued.result.status === "failed" ? continued.result.error.code : null;
+              return { status: "rejected" as const };
+            },
+            (error) => {
+              admissionFailure = error;
+              return { status: "rejected" as const };
+            },
+          ),
+        ]);
+        if (admitted.status === "rejected") {
+          await settlement;
+          return draftAdmissionRejection(admissionFailure);
+        }
+        if (activeRun?.settlement === settlement) {
+          activeRun.sessionId = admitted.sessionId;
+        }
+        const admittedSnapshot = await options.lifecycle.inspect({ sessionId: admitted.sessionId });
+        if (admittedSnapshot.schemaVersion !== 3) {
+          await settlement;
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The admitted draft session could not be read from durable history.",
+          };
+        }
+        await activateSnapshot(admittedSnapshot);
+        return { status: "admitted", commandId, resource: null };
+      }
       if (command.type === "branch_session") {
         if (command.parentSessionId !== state.authoritative.active?.session.id) {
           return {
@@ -1005,6 +1205,7 @@ export async function createPresentationSession(
               transcript: transcriptPage(transcript, loadedTranscriptStart, active.session.id),
             },
           },
+          draft: state.draft,
           transient: state.transient,
         };
         publishStateChange();
@@ -1050,6 +1251,7 @@ export async function createPresentationSession(
                 nextCursor: page.nextCursor,
               },
             },
+            draft: state.draft,
             transient: state.transient,
           };
           publishStateChange();
@@ -1711,18 +1913,14 @@ function sessionSummaryFromSnapshot(
 }
 
 async function readActiveBranchRecords(
-  options: Pick<CreatePresentationSessionOptions, "stateRoot" | "workspaceRoot">,
+  options: PresentationSessionRecordOptions,
   sessionId: string,
   visited: ReadonlySet<string> = new Set(),
 ): Promise<readonly SourcedSessionRecord[]> {
   if (visited.has(sessionId) || visited.size >= 64) {
     throw new TypeError("The presentation lineage is recursive or too deep.");
   }
-  const records = await readJsonlSessionRecords({
-    sessionId,
-    workspaceRoot: options.workspaceRoot,
-    ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
-  });
+  const records = await readPresentationSessionRecords(options, sessionId);
   const own = records.map((entry) => ({ sessionId, entry }));
   const genesis = records[0];
   if (
@@ -1747,6 +1945,20 @@ async function readActiveBranchRecords(
     ),
     ...own,
   ];
+}
+
+async function readPresentationSessionRecords(
+  options: PresentationSessionRecordOptions,
+  sessionId: string,
+): Promise<readonly SessionRecord[]> {
+  return (
+    options[presentationSessionRecordReader]?.(sessionId) ??
+    readJsonlSessionRecords({
+      sessionId,
+      workspaceRoot: options.workspaceRoot,
+      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+    })
+  );
 }
 
 function projectTranscript(records: readonly SourcedSessionRecord[]): readonly TranscriptItem[] {
@@ -2257,7 +2469,10 @@ async function isActionableChangePreview(
 }
 
 async function isCurrentActionableChangePreview(
-  options: Pick<CreatePresentationSessionOptions, "lifecycle" | "stateRoot" | "workspaceRoot">,
+  options: Pick<
+    PresentationSessionBaseOptions,
+    "lifecycle" | "stateRoot" | "workspaceRoot" | typeof presentationSessionRecordReader
+  >,
   sessionId: string,
   requestId: string,
 ): Promise<boolean> {
@@ -2470,6 +2685,13 @@ function projectSkills(snapshot: CurrentSessionSnapshot): SkillCatalogDisplay | 
   if (skills === undefined) {
     return null;
   }
+  return projectSkillContext(skills, snapshot.status === "idle");
+}
+
+function projectSkillContext(
+  skills: NonNullable<CurrentSessionSnapshot["skillContext"]>,
+  reloadAvailable: boolean,
+): SkillCatalogDisplay {
   const activeQualifiedIds = new Set(
     skills.active
       .filter(
@@ -2509,7 +2731,65 @@ function projectSkills(snapshot: CurrentSessionSnapshot): SkillCatalogDisplay | 
       omittedCount: skills.catalog.omittedCount,
       shortenedCount: skills.catalog.shortenedCount,
     },
-    reloadAvailable: snapshot.status === "idle",
+    reloadAvailable,
+  };
+}
+
+function draftAdmissionRejection(
+  failure: unknown,
+): Extract<CommandReceipt, { readonly status: "rejected" }> {
+  const code =
+    failure instanceof SessionLifecycleError
+      ? failure.code
+      : typeof failure === "string"
+        ? failure
+        : null;
+  if (code === "session_skill_policy_rejected") {
+    return {
+      status: "rejected",
+      code: "authority_rejected",
+      message: "One selected Agent Skill is denied by the draft admission policy.",
+    };
+  }
+  if (code === "session_skill_confirmation_required") {
+    return {
+      status: "rejected",
+      code: "authority_rejected",
+      message: "One selected Agent Skill requires confirmation before draft admission.",
+    };
+  }
+  if (code === "session_persistence_failed") {
+    return {
+      status: "rejected",
+      code: "persistence_failed",
+      message: "The first prompt could not be persisted as a durable session.",
+    };
+  }
+  if (code === "project_in_use") {
+    return {
+      status: "rejected",
+      code: "conflict",
+      message: "Another process is changing this project session state.",
+    };
+  }
+  if (code === "session_invalid" || code === "invalid_run_limits") {
+    return {
+      status: "rejected",
+      code: "invalid_command",
+      message: "The first prompt contains invalid draft admission input.",
+    };
+  }
+  if (code === "session_skill_unavailable") {
+    return {
+      status: "rejected",
+      code: "not_available",
+      message: "One selected Agent Skill is no longer available for the first prompt.",
+    };
+  }
+  return {
+    status: "rejected",
+    code: "not_available",
+    message: "The exact target or draft resources are no longer available.",
   };
 }
 

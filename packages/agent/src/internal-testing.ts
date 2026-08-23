@@ -35,11 +35,13 @@ export {
   type PresentationArtifactReadBarrier,
   type PresentationHydrationBarrier,
   type PresentationRuntimeRefreshBarrier,
+  type PresentationSessionRecordReader,
   presentationArtifactReadBarrier,
   presentationCatalogPageSize,
   presentationHistoryPageSize,
   presentationHydrationBarrier,
   presentationRuntimeRefreshBarrier,
+  presentationSessionRecordReader,
   resolvePresentationTerminalContext,
 } from "./presentation-session.js";
 export type {
@@ -83,6 +85,7 @@ export {
   type SessionProviderAttemptStartedRecord,
   type SessionRecord,
   type SessionRuntimeEventRecord,
+  type SessionStore,
   type SessionStoreDirectory,
   type SessionToolIntent,
   type SessionV3Record,

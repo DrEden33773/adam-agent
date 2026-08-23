@@ -26,6 +26,7 @@ import {
   preparedDirectDeepSeekV2ContextProfile,
   type SessionRecord,
   sessionAutomaticTitlesEnabled,
+  sessionLogicalRunStartedBarrier,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
@@ -274,18 +275,377 @@ test("SessionLifecycle creates durable new-schema genesis for an exact project a
   }
 });
 
-test("SessionLifecycle catalogs shared in-memory sessions through public pagination", async () => {
+test("SessionLifecycle rejects an unavailable draft Skill before allocating durable session identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-draft-skill-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "available-sibling");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: available-sibling\ndescription: Proves rejected admission leaves discovered Skills staged.\n---\nDo not persist this sibling before admission.\n",
+    "utf8",
+  );
+  const harness = createInMemorySessionLifecycleHarness();
+  const driver = new FakeModelDriver(() => {
+    throw new Error("The model must not run when draft Skill resolution fails.");
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Use a missing Skill", skills: ["skill:v1:user:missing"] },
+      }),
+    ).rejects.toMatchObject({ code: "session_skill_unavailable" });
+    await expect(harness.sessions.listSessionIds()).resolves.toEqual([]);
+    await expect(stat(join(stateRoot, "artifacts"))).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects denied draft Skill policy before allocating durable session identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-draft-policy-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "draft-policy");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: draft-policy\ndescription: Exercises draft admission policy.\n---\nUse only after read permission is admitted.\n",
+    "utf8",
+  );
+  const harness = createInMemorySessionLifecycleHarness();
+  const driver = new FakeModelDriver(() => {
+    throw new Error("The model must not run when draft Skill policy denies admission.");
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [] }),
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: {
+          text: "Use the policy Skill",
+          skills: ["skill:v1:project:.:draft-policy"],
+        },
+      }),
+    ).rejects.toMatchObject({ code: "session_skill_policy_rejected" });
+    await expect(harness.sessions.listSessionIds()).resolves.toEqual([]);
+    await expect(stat(join(stateRoot, "artifacts"))).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects asked draft Skill policy before allocating durable session identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-draft-ask-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "draft-ask");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: draft-ask\ndescription: Requires confirmation before admission.\n---\nDo not admit this draft before confirmation.\n",
+    "utf8",
+  );
+  const harness = createInMemorySessionLifecycleHarness();
+  const driver = new FakeModelDriver(() => {
+    throw new Error("The model must not run when draft Skill policy needs confirmation.");
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Use the asked Skill", skills: ["skill:v1:project:.:draft-ask"] },
+      }),
+    ).rejects.toMatchObject({ code: "session_skill_confirmation_required" });
+    await expect(harness.sessions.listSessionIds()).resolves.toEqual([]);
+    await expect(stat(join(stateRoot, "artifacts"))).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle cancels after target resolution before persisting draft resources", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-draft-cancel-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "draft-cancel");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: draft-cancel\ndescription: Must remain staged when admission is cancelled.\n---\nNever persist this cancelled draft.\n",
+    "utf8",
+  );
+  const harness = createInMemorySessionLifecycleHarness();
+  const controller = new AbortController();
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      controller.abort();
+      return {
+        identity: targetIdentity,
+        driver: new FakeModelDriver(() => {
+          throw new Error("The model must not run after draft admission cancellation.");
+        }),
+        contextProfile: testContextProfile,
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: {
+          text: "Cancel after resolving the target",
+          skills: ["skill:v1:project:.:draft-cancel"],
+        },
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    await expect(harness.sessions.listSessionIds()).resolves.toEqual([]);
+    await expect(stat(join(stateRoot, "artifacts"))).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle freezes draft Skill resources before allocating durable session identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-draft-resource-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "draft-resource");
+  const resourcePath = join(skillDirectory, "references", "guide.txt");
+  await mkdir(join(skillDirectory, "references"), { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: draft-resource\ndescription: Freezes resources before admission.\n---\nRead references/guide.txt.\n",
+    "utf8",
+  );
+  await writeFile(resourcePath, "before admission\n", "utf8");
+  const originalSize = (await stat(resourcePath, { bigint: true })).size.toString();
+  const harness = createInMemorySessionLifecycleHarness();
+  const driver = new FakeModelDriver(() => [
+    { type: "text_delta", text: "Draft resource admitted." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  let policyDecision: "allow" | "deny" = "allow";
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: {
+      decide() {
+        return policyDecision;
+      },
+    },
+    workspaceRoot,
+    [sessionLogicalRunStartedBarrier]: {
+      async afterDurableRecord() {
+        await writeFile(resourcePath, "changed after durable logical input\n", "utf8");
+        policyDecision = "deny";
+      },
+    },
+  });
+
+  try {
+    const admitted = await lifecycle.admit({
+      targetIdentity,
+      input: {
+        text: "Use the frozen resource Skill",
+        skills: ["skill:v1:project:.:draft-resource"],
+      },
+    });
+    const manifestEntry = admitted.snapshot.skillContext?.active[0]?.manifest.entries.find(
+      (entry) => entry.path === "references/guide.txt",
+    );
+
+    expect(admitted.result).toMatchObject({ status: "completed" });
+    expect(manifestEntry?.identity.size).toBe(originalSize);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects invalid draft run limits before allocating durable session identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-draft-limits-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: targetIdentity,
+        driver: new FakeModelDriver([]),
+        contextProfile: testContextProfile,
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = harness.createLifecycle({ modelTargets, workspaceRoot });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Reject invalid limits before genesis" },
+        limits: { maxTurns: 0 },
+      }),
+    ).rejects.toMatchObject({ code: "session_invalid" });
+    await expect(harness.sessions.listSessionIds()).resolves.toEqual([]);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle paginates prompt-admitted sessions while hiding genesis-only history", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-memory-catalog-"));
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
   const harness = createInMemorySessionLifecycleHarness();
-  const lifecycle = harness.createLifecycle({ workspaceRoot });
+  const driver = new FakeModelDriver(() => [
+    { type: "text_delta", text: "Cataloged answer." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = harness.createLifecycle({ modelTargets, workspaceRoot });
 
   try {
-    const created = [
+    const genesisOnly = await lifecycle.create({ targetIdentity });
+    const admitted = [
       await lifecycle.create({ targetIdentity }),
       await lifecycle.create({ targetIdentity }),
     ];
+    for (const [index, session] of admitted.entries()) {
+      await lifecycle.continue({
+        sessionId: session.sessionId,
+        input: { text: `Catalog prompt ${index + 1}` },
+      });
+    }
     const firstPage = await lifecycle.listProjectSessions({ limit: 1 });
     if (firstPage.nextCursor === null) {
       throw new Error("The first in-memory catalog page requires a continuation cursor.");
@@ -296,7 +656,10 @@ test("SessionLifecycle catalogs shared in-memory sessions through public paginat
     });
 
     expect([...firstPage.items, ...secondPage.items].map((item) => item.sessionId)).toEqual(
-      created.map((item) => item.sessionId).sort(),
+      admitted.map((item) => item.sessionId).sort(),
+    );
+    expect([...firstPage.items, ...secondPage.items]).not.toContainEqual(
+      expect.objectContaining({ sessionId: genesisOnly.sessionId }),
     );
     expect({ first: firstPage.nextCursor, second: secondPage.nextCursor }).toEqual({
       first: expect.any(String),

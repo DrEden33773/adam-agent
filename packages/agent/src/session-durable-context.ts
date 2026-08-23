@@ -2,7 +2,11 @@ import type { ContextEvidenceV1 } from "./durable-context.js";
 import type { ModelMessage } from "./index.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import type { PromptContextRecord } from "./prompt-assembly.js";
-import type { ExtensionSkillSourceV1, SkillContextRecordV1 } from "./skills.js";
+import type {
+  ExtensionSkillSourceV1,
+  SkillContextRecordV1,
+  SkillResourceManifestV1,
+} from "./skills.js";
 import type { PermissionPolicyInput, ToolCall, ToolResult } from "./tool-runtime.js";
 
 export const sessionDurableContext = Symbol("adam-agent.session-durable-context");
@@ -25,6 +29,8 @@ export type AgentSessionDurableContext = {
   readonly skillContext?: SkillContextRecordV1 | undefined;
   readonly activeSkillContents?: ReadonlyMap<string, string> | undefined;
   readonly extensionSkillSources?: readonly ExtensionSkillSourceV1[] | undefined;
+  readonly preparedExplicitSkillManifests?: ReadonlyMap<string, SkillResourceManifestV1>;
+  readonly preparedExplicitSkillPolicies?: ReadonlyMap<string, "allow">;
   readonly withCurrentExtensionSkillSources?:
     | (<T>(
         sources: readonly ExtensionSkillSourceV1[],

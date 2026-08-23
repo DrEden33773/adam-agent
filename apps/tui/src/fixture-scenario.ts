@@ -8,6 +8,7 @@ export const fixtureScenarios = [
   "copy-large-assistant",
   "copy-older-assistant",
   "deadline",
+  "draft-admission-cancellation",
   "history",
   "mcp-close-unconfirmed",
   "mutation",

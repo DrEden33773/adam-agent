@@ -230,6 +230,27 @@ describe("one-shot CLI", () => {
     }
   });
 
+  test("rejects an unavailable first-prompt Skill before creating a session log", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-skill-unavailable-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(workspaceRoot);
+
+    try {
+      const result = await runCliArguments({
+        args: ["--skill", "skill:v1:user:missing", "Do not create a partial session"],
+        cwd: workspaceRoot,
+        stateRoot,
+      });
+      const stateEntries = await readdir(stateRoot, { recursive: true }).catch(() => []);
+
+      expect(result).toMatchObject({ exitCode: 1, signal: null });
+      expect(stateEntries.filter((entry) => entry.endsWith(".jsonl"))).toEqual([]);
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
   test("rejects a non-ASCII Agent Skill selection before creating session state", async () => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-skill-ascii-"));
     const workspaceRoot = join(testRoot, "workspace");
