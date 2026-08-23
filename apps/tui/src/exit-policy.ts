@@ -5,6 +5,7 @@ export type DeadlineScheduler = {
 };
 
 export type ClipboardAdapter = {
+  close?(): Promise<void>;
   writeText(text: string): Promise<"copied" | "failed" | "unsupported">;
 };
 

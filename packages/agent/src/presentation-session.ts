@@ -20,11 +20,17 @@ import {
 } from "@adam-agent/presentation";
 import { readFileArtifact, readFileArtifactRange } from "./artifact-store.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
-import type { ModelTargetIdentity, ModelTargets } from "./model-targets.js";
+import {
+  type ModelTargetIdentity,
+  type ModelTargetSnapshot,
+  type ModelTargets,
+  sameModelTargetIdentity,
+} from "./model-targets.js";
 import type { PresentationPreferences } from "./presentation-preferences.js";
 import { listProjectPaths } from "./project-path-catalog.js";
 import type {
   CurrentSessionSnapshot,
+  SessionContextUsageSnapshot,
   SessionLifecycle,
   SessionMetadataEvent,
   SessionRuntimeNotification,
@@ -183,6 +189,10 @@ export async function createPresentationSession(
       discoverGateway: false,
       signal: new AbortController().signal,
     });
+    const initialContextUsage =
+      created === undefined
+        ? null
+        : await options.lifecycle.inspectContextUsage({ sessionId: created.sessionId });
     const configuredPreferences = await options.preferences?.load();
     const configuredTarget = modelTargetSnapshot?.targets.find(
       (target) => target.identity.targetId === configuredPreferences?.defaultTargetId,
@@ -267,7 +277,7 @@ export async function createPresentationSession(
           : {
               session: summary,
               transcript: transcriptPage(transcript, loadedTranscriptStart, created.sessionId),
-              context: projectSessionContext(created),
+              context: projectSessionContext(created, initialContextUsage, modelTargetSnapshot),
               pendingInteractions: await projectPendingInteractions(records, options),
               repositoryInstructions: projectRepositoryInstructions(created),
               skills: projectSkills(created),
@@ -305,6 +315,9 @@ export async function createPresentationSession(
       | undefined;
     const activateSnapshot = async (snapshot: CurrentSessionSnapshot): Promise<void> => {
       const activatedRecords = await readActiveBranchRecords(options, snapshot.sessionId);
+      const activatedContextUsage = await options.lifecycle.inspectContextUsage({
+        sessionId: snapshot.sessionId,
+      });
       transcript = projectTranscript(activatedRecords);
       loadedTranscriptStart = Math.max(0, transcript.length - historyPageSize);
       const activatedNaming = sessionNamingFromRecords(activatedRecords, snapshot.sessionId);
@@ -346,7 +359,7 @@ export async function createPresentationSession(
           active: {
             session: activatedSummary,
             transcript: transcriptPage(transcript, loadedTranscriptStart, snapshot.sessionId),
-            context: projectSessionContext(snapshot),
+            context: projectSessionContext(snapshot, activatedContextUsage, modelTargetSnapshot),
             pendingInteractions: await projectPendingInteractions(activatedRecords, options),
             repositoryInstructions: projectRepositoryInstructions(snapshot),
             skills: projectSkills(snapshot),
@@ -486,6 +499,37 @@ export async function createPresentationSession(
               publishStateChange();
               return;
             }
+            if (event.type === "context_usage") {
+              const activeIdentity = knownTargets.get(active.session.targetId);
+              const profile = modelTargetSnapshot?.targets.find(
+                (target) =>
+                  activeIdentity !== undefined &&
+                  sameModelTargetIdentity(target.identity, activeIdentity),
+              )?.contextProfile;
+              const current = state.authoritative.active;
+              if (profile !== undefined && current?.session.id === active.session.id) {
+                state = {
+                  revision: state.revision + 1,
+                  authoritative: {
+                    ...state.authoritative,
+                    active: {
+                      ...current,
+                      context: {
+                        profile,
+                        ordinaryUsage: event.ordinary,
+                        compactionUsage: event.compaction,
+                        active:
+                          event.active.source === "unknown"
+                            ? { source: "unknown" }
+                            : { source: event.active.source, tokens: event.active.tokens },
+                      },
+                    },
+                  },
+                  transient: state.transient,
+                };
+                publishStateChange();
+              }
+            }
             const previousSequence =
               state.authoritative.continuity.status === "current"
                 ? state.authoritative.continuity.sessionThroughSequence
@@ -534,6 +578,9 @@ export async function createPresentationSession(
               publishStateChange();
             }
             const pendingInteractions = await projectPendingInteractions(refreshedRecords, options);
+            const terminalContextUsage = isAssistantTerminalEvent(event)
+              ? await options.lifecycle.inspectContextUsage({ sessionId: active.session.id })
+              : null;
             const latest = state.authoritative.active;
             if (closed || latest === null || latest.session.id !== active.session.id) {
               return;
@@ -554,6 +601,14 @@ export async function createPresentationSession(
                 active: {
                   ...latest,
                   transcript: transcriptPage(transcript, loadedTranscriptStart, current.session.id),
+                  context: resolvePresentationTerminalContext(
+                    latest.context,
+                    projectSessionContextUsage(
+                      knownTargets.get(latest.session.targetId),
+                      terminalContextUsage,
+                      modelTargetSnapshot,
+                    ),
+                  ),
                   pendingInteractions,
                 },
               },
@@ -1532,17 +1587,46 @@ function isKnownArtifact(
 
 function projectSessionContext(
   snapshot: CurrentSessionSnapshot,
+  usage: SessionContextUsageSnapshot | null,
+  targets: ModelTargetSnapshot | undefined,
 ): import("@adam-agent/presentation").SessionContextDisplay | null {
   const context = snapshot.context;
-  if (context === undefined) {
+  if (context !== undefined) {
+    return {
+      profile: context.profile,
+      ordinaryUsage: context.ordinaryUsage,
+      compactionUsage: context.compactionUsage,
+      active: context.active,
+    };
+  }
+  return projectSessionContextUsage(snapshot.targetIdentity, usage, targets);
+}
+
+function projectSessionContextUsage(
+  identity: ModelTargetIdentity | undefined,
+  usage: SessionContextUsageSnapshot | null,
+  targets: ModelTargetSnapshot | undefined,
+): import("@adam-agent/presentation").SessionContextDisplay | null {
+  const profile = targets?.targets.find(
+    (target) => identity !== undefined && sameModelTargetIdentity(target.identity, identity),
+  )?.contextProfile;
+  if (profile === undefined || usage === null) {
     return null;
   }
   return {
-    profile: context.profile,
-    ordinaryUsage: context.ordinaryUsage,
-    compactionUsage: context.compactionUsage,
-    active: context.active,
+    profile,
+    ordinaryUsage: usage.ordinaryUsage,
+    compactionUsage: usage.compactionUsage,
+    active: usage.active,
   };
+}
+
+/** Tests only through the internal-testing entry; production uses this for terminal refreshes. */
+export function resolvePresentationTerminalContext(
+  latest: import("@adam-agent/presentation").SessionContextDisplay | null,
+  terminal: import("@adam-agent/presentation").SessionContextDisplay | null,
+): import("@adam-agent/presentation").SessionContextDisplay | null {
+  return terminal ?? latest;
 }
 
 function boundedHistoryPageSize(value: number | undefined): number {

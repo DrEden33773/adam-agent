@@ -15,6 +15,7 @@ import {
 } from "@adam-agent/agent";
 
 import { McpShutdownUnconfirmedError, requireConfirmedLifecycleClose } from "./lifecycle-close.js";
+import { createLinuxClipboardAdapter } from "./linux-clipboard.js";
 import { runTui } from "./tui-app.js";
 
 class TuiConfigurationError extends Error {}
@@ -30,6 +31,7 @@ try {
       command.stateRoot ?? configuredStateRoot ?? join(homedir(), ".local", "state", "adam-agent");
     const modelTargets = createModelTargets({ environment: process.env });
     const preferences = createPresentationPreferences({ environment: process.env });
+    const clipboard = createLinuxClipboardAdapter();
     const lifecycle = createSessionLifecycle({
       modelTargets,
       permissions: createPermissionPolicy({
@@ -58,6 +60,7 @@ try {
           workspaceRoot,
         });
         await runTui({
+          clipboard,
           presentation,
           targetStatus: {
             targetId: snapshot.targetIdentity.targetId,
@@ -89,6 +92,7 @@ try {
           workspaceRoot,
         });
         await runTui({
+          clipboard,
           presentation,
           ...(startupTargetId === undefined ? {} : { startupTargetId }),
         });

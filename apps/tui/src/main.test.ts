@@ -97,8 +97,7 @@ test("the 40, 80, and 120 column layouts expose progressively bounded footer fac
     await fixture.resize(80, 24);
     frameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
     frame = frameLines.join("\n");
-    expect(frame).toContain("workspace · idle");
-    expect(frame).not.toContain("context unavailable");
+    expect(frame).toContain("workspace · context unavailable · idle");
     expect(frame).toContain("fake.local · Certified · /help · Tab complete");
     expect(frameLines.every((line) => visibleWidth(line) <= 80)).toBe(true);
 
@@ -106,11 +105,10 @@ test("the 40, 80, and 120 column layouts expose progressively bounded footer fac
     await fixture.resize(40, 12);
     frameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
     frame = frameLines.join("\n");
-    expect(frame).toContain("idle");
+    expect(frame).toContain("idle · ctx unavailable");
     expect(frame).toContain("fake.local · Certified");
     expect(frame).toContain("/help · Tab complete");
     expect(frame).not.toContain("workspace");
-    expect(frame).not.toContain("context unavailable");
     expect(frameLines.every((line) => visibleWidth(line) <= 40)).toBe(true);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -455,6 +453,20 @@ function latestSynchronizedFrame(output: string): readonly string[] {
     .split("\r\n");
 }
 
+function expectFramedOverlay(output: string, title: string): void {
+  const lines = latestSynchronizedFrame(output);
+  const titleIndex = lines.findIndex((line) => line.includes(title));
+  const topIndex = lines.findLastIndex(
+    (line, index) => index < titleIndex && line.includes("┌") && line.includes("┐"),
+  );
+  const bottomIndex = lines.findIndex(
+    (line, index) => index > titleIndex && line.includes("└") && line.includes("┘"),
+  );
+  expect(titleIndex).toBeGreaterThan(topIndex);
+  expect(bottomIndex).toBeGreaterThan(titleIndex);
+  expect([...(lines[titleIndex] ?? "").matchAll(/│/gu)]).toHaveLength(2);
+}
+
 function lastAbsoluteCursorColumn(output: string): number | undefined {
   const absoluteColumn = new RegExp(`${String.fromCharCode(27)}\\[(\\d+)G`, "gu");
   return [...output.matchAll(absoluteColumn)]
@@ -470,7 +482,8 @@ test("the production TUI selects an exact available target before creating an em
 
   try {
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForCompleteFrameAfter("Select an exact model target", 0);
+    expectFramedOverlay(fixture.output(), "Select an exact model target");
     await fixture.waitFor("deepseek-v4-flash.direct");
     await fixture.waitFor("deepseek-v4-pro.direct");
     fixture.write("\r");
@@ -597,12 +610,60 @@ test("the production TUI shows the project session picker before any target reso
       workspaceRoot,
     });
     await fixture.waitFor("deepseek-v4-flash.direct");
-    await fixture.waitFor("Select a project session");
-    fixture.write("\u001b[27;1;27~");
-    fixture.write("\u0003");
-    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
+    await fixture.waitForCompleteFrameAfter("Select a project session", 0);
+    expectFramedOverlay(fixture.output(), "Select a project session");
+    const frame = latestSynchronizedFrame(fixture.output()).join("\n");
+    const titleIndex = frame.indexOf("Select a project session");
+    const newSessionIndex = frame.indexOf("New Session");
+    const searchIndex = frame.indexOf("Search:");
+    const existingSessionIndex = frame.indexOf("deepseek-v4-flash.direct");
+    expect(titleIndex).toBeGreaterThanOrEqual(0);
+    expect(newSessionIndex).toBeGreaterThan(titleIndex);
+    expect(searchIndex).toBeGreaterThan(newSessionIndex);
+    expect(existingSessionIndex).toBeGreaterThan(searchIndex);
+    expect(frame).toContain("┌");
+    expect(frame).toContain("└");
+    const inverseStart = "\u001b[48;2;205;214;244m\u001b[38;2;17;17;27m";
+    const inverseEnd = "\u001b[39m\u001b[49m";
+    const pinnedLine = frame.split("\n").find((line) => line.includes("→ New Session"));
+    expect(pinnedLine).toBeDefined();
+    const pinnedStart = pinnedLine?.indexOf(inverseStart) ?? -1;
+    const pinnedEnd = pinnedLine?.indexOf(inverseEnd, pinnedStart + inverseStart.length) ?? -1;
+    expect(pinnedStart).toBeGreaterThanOrEqual(0);
+    expect(pinnedEnd).toBeGreaterThan(pinnedStart);
+    const pinnedContent = pinnedLine?.slice(pinnedStart + inverseStart.length, pinnedEnd) ?? "";
+    expect(pinnedContent).toContain("→ New Session");
+    expect(pinnedContent).toContain("Choose an exact target");
+    expect(pinnedContent.endsWith("  ")).toBe(true);
+    expect(visibleWidth(pinnedContent)).toBe(60);
+    const resizedFrames: Array<{ readonly columns: number; readonly lines: readonly string[] }> =
+      [];
+    for (const [columns, rows] of [
+      [120, 40],
+      [40, 12],
+    ] as const) {
+      const beforeResize = fixture.output().length;
+      await Promise.race([
+        fixture.resize(columns, rows),
+        fixture.closed.then(() => {
+          throw new Error("The session picker closed while resizing.");
+        }),
+      ]);
+      resizedFrames.push({
+        columns,
+        lines: latestSynchronizedFrame(fixture.output().slice(beforeResize)),
+      });
+    }
     fixture.write("\u0011");
     const result = await fixture.closed;
+    for (const { columns, lines } of resizedFrames) {
+      const resizedFrame = lines.join("\n");
+      expect(resizedFrame).toContain("New Session");
+      expect(resizedFrame).toContain("Search:");
+      expect(resizedFrame).toContain("┌");
+      expect(resizedFrame).toContain("└");
+      expect(lines.every((line) => visibleWidth(line) <= columns)).toBe(true);
+    }
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).toContain("Select a project session");
     expect(result.stdout).toContain("New Session");
@@ -651,7 +712,7 @@ test("the production session picker opens the exact focused existing session", a
     });
     await fixture.waitFor("Select a project session");
     const beforeSelection = fixture.output().length;
-    fixture.write("\r");
+    fixture.write("\u001b[B\r");
     await fixture.waitForAfter("Adam · New session", beforeSelection);
     await fixture.waitForAfter("deepseek-v4-flash.direct · Certified", beforeSelection);
     fixture.write("\u0011");
@@ -675,7 +736,7 @@ test("the production session picker requires explicit New Session before target 
     });
     await fixture.waitFor("Select a project session");
     const beforeNewSession = fixture.output().length;
-    fixture.write("\u001b[B\r");
+    fixture.write("\u001b[B\u001b[A\r");
     await fixture.waitForAfter("Select an exact model target", beforeNewSession);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -717,9 +778,10 @@ test("the real TUI opens slash Help locally without submitting it to the model",
     const beforeHelp = fixture.output().length;
     fixture.write("/help\r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Adam Help", beforeHelp).then(() => "help" as const),
+      fixture.waitForCompleteFrameAfter("Adam Help", beforeHelp).then(() => "help" as const),
       fixture.waitForAfter("Skill selection complete.", beforeHelp).then(() => "model" as const),
     ]);
+    expectFramedOverlay(fixture.output().slice(beforeHelp), "Adam Help");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(outcome).toBe("help");
@@ -799,7 +861,11 @@ test("Enter opens the focused topic in the Help navigator", async () => {
     await fixture.waitFor("Adam Help");
     const beforeTopic = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitForAfter("Command Reference", beforeTopic);
+    await fixture.waitForCompleteFrameAfter("Command Reference", beforeTopic);
+    expectFramedOverlay(fixture.output().slice(beforeTopic), "Command Reference");
+    expect(fixture.output().slice(beforeTopic)).toContain(
+      "\u001b[1m\u001b[38;2;203;166;247m/help [topic]\u001b[39m\u001b[22m",
+    );
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -821,9 +887,12 @@ test("slash Hotkeys opens the shared local Help navigator", async () => {
     const beforeHotkeys = fixture.output().length;
     fixture.write("/hotkeys\r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Effective Hotkeys", beforeHotkeys).then(() => "hotkeys" as const),
+      fixture
+        .waitForCompleteFrameAfter("Effective Hotkeys", beforeHotkeys)
+        .then(() => "hotkeys" as const),
       fixture.waitForAfter("Skill selection complete.", beforeHotkeys).then(() => "model" as const),
     ]);
+    expectFramedOverlay(fixture.output().slice(beforeHotkeys), "Effective Hotkeys");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(outcome).toBe("hotkeys");
@@ -976,6 +1045,92 @@ test("the footer exposes authoritative project context and run facts", async () 
     await fixture.waitForAfter("Context compacted · window 1", beforeCompaction);
     await fixture.waitForAfter("context · estimated · idle", beforeCompaction);
     expect(fixture.output()).toMatch(/workspace · \d+\/32768 context · estimated · idle/u);
+
+    let beforeResize = fixture.output().length;
+    await fixture.resize(80, 24);
+    await fixture.waitForAfter("context · estimated · idle", beforeResize);
+    let frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toMatch(/workspace · \d+\/32768 context · estimated · idle/u);
+
+    beforeResize = fixture.output().length;
+    await fixture.resize(40, 12);
+    await fixture.waitForAfter(" est", beforeResize);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toMatch(/idle · ctx [\d.]+(?:k|m)?\/32\.8k est/u);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the footer distinguishes provider-reported context occupancy at every width", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-footer-provider-context-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "provider-usage", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforePrompt = fixture.output().length;
+    fixture.write("Report exact usage\r");
+    await fixture.waitFor("Provider usage answer.");
+    await fixture.waitForAfter(" · idle", beforePrompt);
+    expect(await readFilesRecursively(stateRoot)).toContain('"inputTokens":12345');
+
+    let beforeResize = fixture.output().length;
+    await fixture.resize(120, 40);
+    let frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("workspace · 12345/32768 context · provider reported · idle");
+
+    beforeResize = fixture.output().length;
+    await fixture.resize(80, 24);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("workspace · 12345/32768 context · provider reported · idle");
+
+    beforeResize = fixture.output().length;
+    await fixture.resize(40, 12);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("idle · ctx 12.3k/32.8k reported");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the footer distinguishes unknown context occupancy at every width", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-footer-unknown-context-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "provider-no-usage", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforePrompt = fixture.output().length;
+    fixture.write("Report usage availability\r");
+    await fixture.waitForAfter("Provider usage unavailable.", beforePrompt);
+    await fixture.waitForAfter("context · unknown · idle", beforePrompt);
+
+    let beforeResize = fixture.output().length;
+    await fixture.resize(120, 40);
+    await fixture.waitForCompleteFrameAfter("context · unknown · idle", beforeResize);
+    let frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("workspace · ?/32768 context · unknown · idle");
+
+    beforeResize = fixture.output().length;
+    await fixture.resize(80, 24);
+    await fixture.waitForCompleteFrameAfter("context · unknown · idle", beforeResize);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("workspace · ?/32768 context · unknown · idle");
+
+    beforeResize = fixture.output().length;
+    await fixture.resize(40, 12);
+    await fixture.waitForCompleteFrameAfter("ctx ?/32.8k unknown", beforeResize);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(frame).toContain("idle · ctx ?/32.8k unknown");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -1396,9 +1551,12 @@ test("slash Session opens bounded authoritative session and context facts", asyn
     const beforeSession = fixture.output().length;
     fixture.write("/session \r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Session facts", beforeSession).then(() => "facts" as const),
+      fixture
+        .waitForCompleteFrameAfter("Session facts", beforeSession)
+        .then(() => "facts" as const),
       fixture.waitForAfter("History answer.", beforeSession).then(() => "model" as const),
     ]);
+    expectFramedOverlay(fixture.output().slice(beforeSession), "Session facts");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -1426,7 +1584,8 @@ test("slash Tree opens a read-only browser over visible complete chronology boun
     await fixture.waitFor("History prompt 3");
     const beforeTree = fixture.output().length;
     fixture.write("/tree \r");
-    await fixture.waitForAfter("Active chronology · read only", beforeTree);
+    await fixture.waitForCompleteFrameAfter("Active chronology · read only", beforeTree);
+    expectFramedOverlay(fixture.output().slice(beforeTree), "Active chronology · read only");
     fixture.write("prompt3");
     await fixture.waitForAfter("Search: prompt3", beforeTree);
     fixture.write("\u0011");
@@ -1822,7 +1981,8 @@ test("slash Reload selects one existing resource authority explicitly", async ()
     await writeFile(instructionsPath, "# Rules\n\nSecond revision.\n", "utf8");
     const beforeReload = fixture.output().length;
     fixture.write("/reload \r");
-    await fixture.waitForAfter("Reload project resources", beforeReload);
+    await fixture.waitForCompleteFrameAfter("Reload project resources", beforeReload);
+    expectFramedOverlay(fixture.output().slice(beforeReload), "Reload project resources");
     fixture.write("\r");
     await fixture.waitForAfter("Reloaded repository instructions.", beforeReload);
     fixture.write("\u0011");
@@ -1877,9 +2037,12 @@ test("the real TUI opens exact next-turn Skill metadata instead of submitting a 
     const afterTyping = fixture.output().length;
     fixture.write("\r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Select next-turn Skills", afterTyping).then(() => "palette" as const),
+      fixture
+        .waitForCompleteFrameAfter("Select next-turn Skills", afterTyping)
+        .then(() => "palette" as const),
       fixture.waitForAfter("Working", afterTyping).then(() => "prompt" as const),
     ]);
+    expectFramedOverlay(fixture.output().slice(afterTyping), "Select next-turn Skills");
     fixture.write("\u0011");
     await fixture.closed;
     expect(outcome).toBe("palette");
@@ -2047,7 +2210,8 @@ test("the real TUI opens the bounded project path selector from the at trigger",
     const fixture = startFixture({ stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     fixture.write("Open @");
-    await fixture.waitFor("Open @");
+    await fixture.waitForCompleteFrameAfter("Select a project path", 0);
+    expectFramedOverlay(fixture.output(), "Select a project path");
     fixture.write("\u0011");
     await fixture.closed;
     expect(fixture.output()).toContain("Select a project path");
@@ -2171,12 +2335,13 @@ test("slash Model and Target share an immutable-target transition page", async (
 
   try {
     const fixture = startFixture({ scenario: "target-navigation", stateRoot, workspaceRoot });
-    await fixture.waitFor("Target navigation answer.");
+    await fixture.waitForCompleteFrameAfter("Target navigation answer.", 0);
+    await fixture.waitForCompleteFrameAfter(" · idle", 0);
     const beforeModel = fixture.output().length;
     fixture.write("/model \r");
     await fixture.waitForAfter("Select an exact model target", beforeModel);
     await fixture.waitForAfter(
-      "Current target fake.local · existing session target is immutable",
+      "Current fake.local · existing session target immutable",
       beforeModel,
     );
     fixture.write("other");
@@ -2207,7 +2372,8 @@ test("a real read tool is rendered as a bounded Pi-style tool card", async () =>
 
   try {
     const fixture = startFixture({ scenario: "read", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForCompleteFrameAfter("Adam · New session", 0);
+    await fixture.waitForCompleteFrameAfter(" · idle", 0);
     fixture.write("Read README\r");
     await fixture.waitFor("read README.md");
     await fixture.waitFor("29 bytes");
@@ -2472,11 +2638,14 @@ test("slash Artifacts opens one bounded assistant artifact page", async () => {
     const beforeArtifacts = fixture.output().length;
     fixture.write("/artifacts \r");
     const opened = await Promise.race([
-      fixture.waitForAfter("Session artifacts", beforeArtifacts).then(() => "opened" as const),
+      fixture
+        .waitForCompleteFrameAfter("Session artifacts", beforeArtifacts)
+        .then(() => "opened" as const),
       fixture
         .waitForAfter("Unknown command /artifacts", beforeArtifacts)
         .then(() => "unknown" as const),
     ]);
+    expectFramedOverlay(fixture.output().slice(beforeArtifacts), "Session artifacts");
     expect(opened).toBe("opened");
     await fixture.waitForAfter("assistant response", beforeArtifacts);
     fixture.write("\r");
@@ -2631,13 +2800,57 @@ test("a mutation permission shows its canonical diff and Enter allows the exact 
   try {
     const fixture = startFixture({ scenario: "mutation", stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
+    const beforePermission = fixture.output().length;
     fixture.write("Edit the file\r");
     await fixture.waitFor("Permission required");
     await fixture.waitFor("-before");
-    await fixture.waitFor("+after");
+    await fixture.waitForCompleteFrameAfter("+after", beforePermission);
+    expectFramedOverlay(fixture.output().slice(beforePermission), "Permission required");
+    const permissionOutput = fixture.output().slice(beforePermission);
+    expect(permissionOutput).toContain(
+      "\u001b[1m\u001b[38;2;203;166;247mAction\u001b[39m\u001b[22m",
+    );
+    expect(permissionOutput).toContain("\u001b[38;2;243;139;168mwrite\u001b[39m");
+    expect(permissionOutput).toContain("\u001b[38;2;137;180;250mpatch\u001b[39m");
+    expect(permissionOutput).toContain("\u001b[38;2;166;227;161mAllow\u001b[39m");
+    expect(permissionOutput).toContain("\u001b[38;2;243;139;168mDeny\u001b[39m");
     fixture.write("\r");
     await fixture.waitFor("Edit complete");
     await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("after\n");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("permission semantics remain explicit without color", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-permission-no-color-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "edit.txt"), "before\n", "utf8");
+
+  try {
+    const fixture = startFixture({
+      noColor: true,
+      scenario: "mutation",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforePermission = fixture.output().length;
+    fixture.write("Edit without color\r");
+    await fixture.waitForCompleteFrameAfter("+after", beforePermission);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforePermission)).join("\n");
+    expect(frame).toContain("Action write · Subject patch");
+    expect(frame).toContain("> Allow");
+    expect(frame).toContain("Deny");
+    expect(frame).not.toContain("\u001b[38;2;");
+    expect(frame).not.toContain("\u001b[48;2;");
+    fixture.write("\u001b[27;1;27~");
+    await fixture.waitFor("denied");
+    await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("before\n");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -2662,9 +2875,10 @@ test("slash Diffs reopens a settled mutation preview from authoritative chronolo
     const beforeDiffs = fixture.output().length;
     fixture.write("/diffs \r");
     const opened = await Promise.race([
-      fixture.waitForAfter("Settled diffs", beforeDiffs).then(() => "opened" as const),
+      fixture.waitForCompleteFrameAfter("Settled diffs", beforeDiffs).then(() => "opened" as const),
       fixture.waitForAfter("Unknown command /diffs", beforeDiffs).then(() => "unknown" as const),
     ]);
+    expectFramedOverlay(fixture.output().slice(beforeDiffs), "Settled diffs");
     expect(opened).toBe("opened");
     await fixture.waitForAfter("edit change preview", beforeDiffs);
     fixture.write("\r");
@@ -2695,9 +2909,10 @@ test("Enter cannot allow a mutation while its canonical preview is still loading
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
+    const beforePrompt = fixture.output().length;
     fixture.write("Edit before preview\r");
-    await fixture.waitFor("Loading canonical preview");
-    await fixture.waitFor("Allow unavailable");
+    await fixture.waitForCompleteFrameAfter("Loading canonical preview", beforePrompt);
+    expect(fixture.output().slice(beforePrompt)).toContain("unavailable");
     await waitForPath(join(controlRoot, "preview-requested"));
     fixture.write("\r");
     await waitForPath(join(controlRoot, "permission-decision-submitted"));
@@ -2811,6 +3026,7 @@ test("a pending clipboard adapter fails closed from the injected deadline", asyn
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).toContain("Clipboard copy failed; draft was not copied.");
+    await waitForPath(join(controlRoot, "clipboard-closed"));
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

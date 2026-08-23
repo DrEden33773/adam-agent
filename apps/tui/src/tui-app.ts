@@ -42,6 +42,7 @@ import {
 import { HelpNavigator, type HelpPage } from "./help-navigator.js";
 import { mcpAdvanceCommand } from "./mcp-advance.js";
 import { McpWizard } from "./mcp-wizard.js";
+import { OverlayFrame } from "./overlay-frame.js";
 import { PermissionOverlay } from "./permission-overlay.js";
 import { ProjectPathPicker } from "./project-path-picker.js";
 import { ResourceReloadPicker } from "./resource-reload-picker.js";
@@ -83,12 +84,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let newSessionSelected =
     options.presentation.getState().authoritative.sessions.items.length === 0;
   const tui: TUI = new TuiMainScreen(terminal, true);
-  const showOverlay = (component: Component, overlayOptions: OverlayOptions) =>
-    tui.showOverlay(component, {
-      ...overlayOptions,
-      visible: (columns, rows) => terminalSizeIsSupported(columns, rows),
-    });
   const theme = createAdamTuiTheme();
+  const showOverlay = (component: Component, overlayOptions: OverlayOptions) =>
+    tui.showOverlay(
+      new OverlayFrame(component, theme, () =>
+        resolveOverlayMaximumHeight(overlayOptions, terminal.rows),
+      ),
+      {
+        ...overlayOptions,
+        visible: (columns, rows) => terminalSizeIsSupported(columns, rows),
+      },
+    );
   const root = new ResponsiveRoot(() => terminal.rows);
   const header = new Text();
   const transcript = new Container();
@@ -781,10 +787,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${selectedSkillSummary}${olderHistorySummary} · ${adamCommandRegistry.footerHint()}`,
         ),
         standard: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
         ),
         narrow: theme.muted(
-          `${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}\n/help · Tab complete`,
+          `${runStatus} · ${footerContextCompactText(active)}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}\n/help · Tab complete`,
         ),
       });
     }
@@ -932,7 +938,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       margin: 1,
     });
     chronologyPicker = { close, hide: () => handle?.hide(), picker };
-    tui.setFocus(picker);
     tui.requestRender();
   };
   const showArtifactNavigator = (diffs: boolean, expectedSessionId: string): void => {
@@ -1022,7 +1027,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       },
     };
     statusMessage = null;
-    tui.setFocus(navigator);
     tui.requestRender();
   };
   editor.onSubmit = (text) => {
@@ -1776,6 +1780,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       failures.push(error);
     }
     try {
+      await options.clipboard?.close?.();
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
       await options.presentation.close();
     } catch (error) {
       failures.push(error);
@@ -1920,6 +1929,30 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   }
 }
 
+function resolveOverlayMaximumHeight(
+  options: OverlayOptions,
+  terminalRows: number,
+): number | undefined {
+  let requested: number | undefined;
+  if (typeof options.maxHeight === "number") {
+    requested = options.maxHeight;
+  } else if (options.maxHeight !== undefined) {
+    const match = options.maxHeight.match(/^(\d+(?:\.\d+)?)%$/u);
+    requested =
+      match === null
+        ? undefined
+        : Math.floor((terminalRows * Number.parseFloat(match[1] as string)) / 100);
+  }
+  if (requested === undefined) {
+    return undefined;
+  }
+  const margin = options.margin;
+  const top = typeof margin === "number" ? margin : (margin?.top ?? 0);
+  const bottom = typeof margin === "number" ? margin : (margin?.bottom ?? 0);
+  const available = Math.max(1, terminalRows - Math.max(0, top) - Math.max(0, bottom));
+  return Math.max(1, Math.min(requested, available));
+}
+
 function clipboardAssistantStatus(result: "copied" | "failed" | "unsupported" | null): string {
   return result === "copied"
     ? "Copied last assistant response."
@@ -2013,7 +2046,31 @@ function footerContextText(active: ActiveSessionDisplay): string {
   if (context.active.source === "unknown") {
     return `?/${context.profile.contextWindowTokens} context · unknown`;
   }
-  return `${context.active.tokens}/${context.profile.contextWindowTokens} context · ${context.active.source}`;
+  const source = context.active.source === "provider_reported" ? "provider reported" : "estimated";
+  return `${context.active.tokens}/${context.profile.contextWindowTokens} context · ${source}`;
+}
+
+function footerContextCompactText(active: ActiveSessionDisplay): string {
+  const context = active.context;
+  if (context === null) {
+    return "ctx unavailable";
+  }
+  const maximum = compactTokenCount(context.profile.contextWindowTokens);
+  if (context.active.source === "unknown") {
+    return `ctx ?/${maximum} unknown`;
+  }
+  const source = context.active.source === "provider_reported" ? "reported" : "est";
+  return `ctx ${compactTokenCount(context.active.tokens)}/${maximum} ${source}`;
+}
+
+function compactTokenCount(tokens: number): string {
+  if (tokens >= 999_950) {
+    return `${Number((tokens / 1_000_000).toFixed(1))}m`;
+  }
+  if (tokens >= 1_000) {
+    return `${Number((tokens / 1_000).toFixed(1))}k`;
+  }
+  return String(tokens);
 }
 
 function toolStatusText(

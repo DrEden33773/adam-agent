@@ -513,6 +513,11 @@ function createFixtureModelTargets(options: {
           "utf8",
         );
         yield { type: "text_delta", text: "Tool artifact complete." };
+      } else if (options.scenario === "provider-usage") {
+        yield { type: "text_delta", text: "Provider usage answer." };
+        yield { type: "usage", inputTokens: 12_345, outputTokens: 99 };
+      } else if (options.scenario === "provider-no-usage") {
+        yield { type: "text_delta", text: "Provider usage unavailable." };
       } else if (options.scenario === "skill-selection") {
         yield { type: "text_delta", text: "Skill selection complete." };
       } else if (
@@ -647,6 +652,9 @@ function clipboardAdapter(options: {
   }
   if (options.scenario === "clipboard-timeout") {
     return {
+      async close() {
+        await writeFile(join(options.controlRoot as string, "clipboard-closed"), "closed\n");
+      },
       async writeText() {
         await writeFile(join(options.controlRoot as string, "clipboard-started"), "started\n");
         return new Promise(() => undefined);

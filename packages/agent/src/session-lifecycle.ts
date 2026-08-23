@@ -218,6 +218,11 @@ export type SessionContextSnapshot = {
     | { readonly source: "unknown" };
 };
 
+export type SessionContextUsageSnapshot = Pick<
+  SessionContextSnapshot,
+  "active" | "compactionUsage" | "ordinaryUsage"
+>;
+
 export type LegacySessionSnapshot = {
   readonly schemaVersion: 1 | 2;
   readonly sessionId: string;
@@ -507,6 +512,9 @@ export interface SessionLifecycle {
   enableAutomaticTitles(): void;
   ensureAutomaticTitle(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
   inspect(input: { readonly sessionId: string }): Promise<SessionSnapshot>;
+  inspectContextUsage(input: {
+    readonly sessionId: string;
+  }): Promise<SessionContextUsageSnapshot | null>;
   listProjectSessions(input?: {
     readonly cursor?: string;
     readonly limit?: number;
@@ -1279,6 +1287,47 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     };
   };
 
+  const inspectSessionContextUsage = async (
+    input: { readonly sessionId: string },
+    artifactCache = createArtifactMaterializationCache(),
+  ): Promise<SessionContextUsageSnapshot | null> => {
+    const records = await storeDirectory.open(input.sessionId).then((store) => store?.read() ?? []);
+    const first = records[0];
+    if (first === undefined) {
+      throw new SessionLifecycleError("session_not_found");
+    }
+    if (first.schemaVersion === 1 || first.schemaVersion === 2) {
+      return null;
+    }
+    const projectId = await canonicalProjectId(options.workspaceRoot);
+    if (!isGenesisRecord(first) || first.record.sessionId !== input.sessionId) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    if (first.record.projectId !== projectId) {
+      throw new SessionLifecycleError("session_project_mismatch");
+    }
+    validateCurrentSessionHistory(first, records, options.workspaceRoot);
+    await validateSessionLineage(options, first, new Set([input.sessionId]));
+    await validateInheritedContextEvidence(options, first, records);
+    const artifactInspection = await inspectModelResponseArtifactLineage(
+      options,
+      first,
+      records,
+      artifactCache,
+    );
+    if (artifactInspection.degradation !== undefined) {
+      return null;
+    }
+    return (
+      (await contextUsageSnapshotFromLineage(
+        options,
+        first,
+        artifactInspection.records,
+        artifactCache,
+      )) ?? null
+    );
+  };
+
   const resumeSession = async (
     input: { readonly sessionId: string },
     artifactCache = createArtifactMaterializationCache(),
@@ -1447,6 +1496,17 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         message: "Legacy session history can be inspected but cannot be resumed safely.",
       },
     };
+  };
+
+  const prepareSessionInspection = async (sessionId: string): Promise<void> => {
+    await waitForMcpIdleOperation(sessionId);
+    if (activeSession !== undefined) {
+      return;
+    }
+    await pendingMcpCatalogDurability.get(sessionId);
+    if ([...pendingMcpCatalogChanges.values()].some((change) => change.sessionId === sessionId)) {
+      await runWithOwner(() => flushPendingMcpCatalogChanges(sessionId));
+    }
   };
 
   return {
@@ -2970,18 +3030,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       return { status: "updated", snapshot: titleSnapshot ?? snapshot };
     },
     async inspect(input) {
-      await waitForMcpIdleOperation(input.sessionId);
-      if (activeSession === undefined) {
-        await pendingMcpCatalogDurability.get(input.sessionId);
-        if (
-          [...pendingMcpCatalogChanges.values()].some(
-            (change) => change.sessionId === input.sessionId,
-          )
-        ) {
-          await runWithOwner(() => flushPendingMcpCatalogChanges(input.sessionId));
-        }
-      }
+      await prepareSessionInspection(input.sessionId);
       return inspectSession(input);
+    },
+    async inspectContextUsage(input) {
+      await prepareSessionInspection(input.sessionId);
+      return inspectSessionContextUsage(input);
     },
     async listProjectSessions(input = {}) {
       const limit = input.limit ?? 100;
@@ -5526,6 +5580,46 @@ async function contextSnapshotFromLineage(
   );
 }
 
+async function contextUsageSnapshotFromLineage(
+  options: SessionLifecycleOptions,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+  artifactCache: ModelResponseArtifactCache,
+): Promise<SessionContextUsageSnapshot | undefined> {
+  const ownUsage = contextUsageSnapshotFromRecords(records);
+  if (genesis.record.lineage === undefined) {
+    return ownUsage;
+  }
+  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  const artifactInspection = await materializeModelResponseArtifacts(
+    options,
+    parentGenesis,
+    prefixRecords,
+    { allowDegraded: false },
+    artifactCache,
+  );
+  const inheritedUsage = await contextUsageSnapshotFromLineage(
+    options,
+    parentGenesis,
+    artifactInspection.records,
+    artifactCache,
+  );
+  if (ownUsage === undefined) {
+    return inheritedUsage;
+  }
+  if (inheritedUsage === undefined) {
+    return ownUsage;
+  }
+  return {
+    ordinaryUsage: addContextUsageTotals(inheritedUsage.ordinaryUsage, ownUsage.ordinaryUsage),
+    compactionUsage: addContextUsageTotals(
+      inheritedUsage.compactionUsage,
+      ownUsage.compactionUsage,
+    ),
+    active: ownUsage.active,
+  };
+}
+
 async function createBranchMessages(
   options: SessionLifecycleOptions,
   records: readonly SessionRecord[],
@@ -6330,40 +6424,7 @@ function contextSnapshotFromRecords(
   if (checkpointRecord === undefined && startedRecord === undefined) {
     return undefined;
   }
-  const compactionUsage: ContextUsageTotals = currentRecords.reduce<ContextUsageTotals>(
-    (totals, entry) => {
-      if (
-        entry.record.type !== "context_compaction_committed" &&
-        entry.record.type !== "context_compaction_failed" &&
-        entry.record.type !== "context_compaction_interrupted"
-      ) {
-        return totals;
-      }
-      const usage = entry.record.usage;
-      if (usage === undefined) {
-        return incrementUnknownContextUsage(totals);
-      }
-      if ("status" in usage) {
-        return incrementUnknownContextUsage(totals);
-      }
-      return {
-        inputTokens: totals.inputTokens + usage.inputTokens,
-        outputTokens: totals.outputTokens + usage.outputTokens,
-        reasoningTokens: totals.reasoningTokens + (usage.reasoningTokens ?? 0),
-        cachedInputTokens: totals.cachedInputTokens + (usage.cachedInputTokens ?? 0),
-        cacheMissInputTokens: totals.cacheMissInputTokens + (usage.cacheMissInputTokens ?? 0),
-        unknownCalls: totals.unknownCalls,
-      };
-    },
-    {
-      inputTokens: 0,
-      outputTokens: 0,
-      reasoningTokens: 0,
-      cachedInputTokens: 0,
-      cacheMissInputTokens: 0,
-      unknownCalls: 0,
-    },
-  );
+  const compactionUsage = compactionContextUsageFromRecords(currentRecords);
   const ordinaryUsage = ordinaryContextUsageFromRecords(currentRecords);
   const lastTerminal =
     startedRecord === undefined
@@ -6458,6 +6519,93 @@ function contextSnapshotFromRecords(
     ordinaryUsage,
     compactionUsage,
     active,
+  };
+}
+
+function contextUsageSnapshotFromRecords(
+  records: readonly SessionRecord[],
+): SessionContextUsageSnapshot | undefined {
+  const currentRecords = records.filter((record) => record.schemaVersion === 3);
+  if (
+    !currentRecords.some(
+      ({ record }) =>
+        record.type === "provider_attempt_started" ||
+        record.type === "context_compaction_started" ||
+        record.type === "context_compaction_committed" ||
+        record.type === "context_compaction_failed" ||
+        record.type === "context_compaction_interrupted",
+    )
+  ) {
+    return undefined;
+  }
+  const latestAttemptBoundary = currentRecords.findLast(
+    ({ record }) =>
+      record.type === "provider_attempt_started" ||
+      record.type === "model_response_completed" ||
+      record.type === "provider_attempt_interrupted",
+  );
+  return {
+    ordinaryUsage: ordinaryContextUsageFromRecords(currentRecords),
+    compactionUsage: compactionContextUsageFromRecords(currentRecords),
+    active:
+      latestAttemptBoundary?.record.type === "model_response_completed" &&
+      latestAttemptBoundary.record.response.usage !== undefined
+        ? {
+            source: "provider_reported",
+            tokens: latestAttemptBoundary.record.response.usage.inputTokens,
+          }
+        : { source: "unknown" },
+  };
+}
+
+function compactionContextUsageFromRecords(
+  records: readonly Extract<SessionRecord, { readonly schemaVersion: 3 }>[],
+): ContextUsageTotals {
+  return records.reduce<ContextUsageTotals>((totals, entry) => {
+    if (
+      entry.record.type !== "context_compaction_committed" &&
+      entry.record.type !== "context_compaction_failed" &&
+      entry.record.type !== "context_compaction_interrupted"
+    ) {
+      return totals;
+    }
+    const usage = entry.record.usage;
+    if (usage === undefined || "status" in usage) {
+      return incrementUnknownContextUsage(totals);
+    }
+    return {
+      inputTokens: totals.inputTokens + usage.inputTokens,
+      outputTokens: totals.outputTokens + usage.outputTokens,
+      reasoningTokens: totals.reasoningTokens + (usage.reasoningTokens ?? 0),
+      cachedInputTokens: totals.cachedInputTokens + (usage.cachedInputTokens ?? 0),
+      cacheMissInputTokens: totals.cacheMissInputTokens + (usage.cacheMissInputTokens ?? 0),
+      unknownCalls: totals.unknownCalls,
+    };
+  }, emptyContextUsageTotals());
+}
+
+function addContextUsageTotals(
+  left: ContextUsageTotals,
+  right: ContextUsageTotals,
+): ContextUsageTotals {
+  return {
+    inputTokens: left.inputTokens + right.inputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
+    reasoningTokens: left.reasoningTokens + right.reasoningTokens,
+    cachedInputTokens: left.cachedInputTokens + right.cachedInputTokens,
+    cacheMissInputTokens: left.cacheMissInputTokens + right.cacheMissInputTokens,
+    unknownCalls: left.unknownCalls + right.unknownCalls,
+  };
+}
+
+function emptyContextUsageTotals(): ContextUsageTotals {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    reasoningTokens: 0,
+    cachedInputTokens: 0,
+    cacheMissInputTokens: 0,
+    unknownCalls: 0,
   };
 }
 

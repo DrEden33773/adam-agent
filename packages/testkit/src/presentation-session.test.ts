@@ -29,6 +29,7 @@ import {
   presentationHistoryPageSize,
   presentationHydrationBarrier,
   presentationRuntimeRefreshBarrier,
+  resolvePresentationTerminalContext,
   type SessionRecord,
   sessionAutomaticTitlesEnabled,
   sessionLogicalRunStartedBarrier,
@@ -37,6 +38,7 @@ import {
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import {
+  createInMemorySessionLifecycleHarness,
   createScriptedMcpTransportFactory,
   FakeModelDriver,
   type ScriptedMcpServer,
@@ -1604,6 +1606,195 @@ test("PresentationSession projects one settled run as stable user and assistant 
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }
+});
+
+test("PresentationSession restores provider-reported context occupancy after restart", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-provider-context-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Provider usage answer." },
+    { type: "usage", inputTokens: 12_345, outputTokens: 99 },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Persist exact provider usage" },
+    });
+    await lifecycle.close();
+
+    const restarted = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const presentation = await createPresentationSession({
+      lifecycle: restarted,
+      modelTargets,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.context).toEqual({
+      profile: contextProfile,
+      ordinaryUsage: {
+        inputTokens: 12_345,
+        outputTokens: 99,
+        reasoningTokens: 0,
+        cachedInputTokens: 0,
+        cacheMissInputTokens: 0,
+        unknownCalls: 0,
+      },
+      compactionUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        cachedInputTokens: 0,
+        cacheMissInputTokens: 0,
+        unknownCalls: 0,
+      },
+      active: { source: "provider_reported", tokens: 12_345 },
+    });
+
+    await presentation.close();
+    await restarted.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession restores inherited provider context for a fresh child", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-branch-context-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Inherited provider usage answer." },
+    { type: "usage", inputTokens: 23_456, outputTokens: 101 },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const parent = await lifecycle.create({ targetIdentity });
+    const completed = await lifecycle.continue({
+      sessionId: parent.sessionId,
+      input: { text: "Persist usage before branching" },
+    });
+    const child = await lifecycle.branch({
+      parentSessionId: parent.sessionId,
+      atSequence: completed.snapshot.lastSequence,
+    });
+    await lifecycle.close();
+
+    const restarted = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const presentation = await createPresentationSession({
+      lifecycle: restarted,
+      modelTargets,
+      projectLabel: "workspace",
+      sessionId: child.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.context).toEqual({
+      profile: contextProfile,
+      ordinaryUsage: {
+        inputTokens: 23_456,
+        outputTokens: 101,
+        reasoningTokens: 0,
+        cachedInputTokens: 0,
+        cacheMissInputTokens: 0,
+        unknownCalls: 0,
+      },
+      compactionUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        cachedInputTokens: 0,
+        cacheMissInputTokens: 0,
+        unknownCalls: 0,
+      },
+      active: { source: "provider_reported", tokens: 23_456 },
+    });
+
+    await presentation.close();
+    await restarted.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession prefers terminal lifecycle context over stale Presentation context", () => {
+  const latest = {
+    profile: contextProfile,
+    ordinaryUsage: {
+      inputTokens: 12_345,
+      outputTokens: 99,
+      reasoningTokens: 0,
+      cachedInputTokens: 0,
+      cacheMissInputTokens: 0,
+      unknownCalls: 0,
+    },
+    compactionUsage: {
+      inputTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      cachedInputTokens: 0,
+      cacheMissInputTokens: 0,
+      unknownCalls: 0,
+    },
+    active: { source: "provider_reported" as const, tokens: 12_345 },
+  };
+  const terminal = {
+    ...latest,
+    ordinaryUsage: { ...latest.ordinaryUsage, unknownCalls: 1 },
+    active: { source: "unknown" as const },
+  };
+
+  expect({
+    terminal: resolvePresentationTerminalContext(latest, terminal),
+    fallback: resolvePresentationTerminalContext(latest, null),
+  }).toEqual({ terminal, fallback: latest });
 });
 
 test("PresentationSession loads older chronology through an opaque tail cursor", async () => {

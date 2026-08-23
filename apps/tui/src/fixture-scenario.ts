@@ -13,6 +13,8 @@ export const fixtureScenarios = [
   "mutation",
   "mutation-after-release",
   "mutation-delayed-preview",
+  "provider-no-usage",
+  "provider-usage",
   "read",
   "resume",
   "session-selection-history",

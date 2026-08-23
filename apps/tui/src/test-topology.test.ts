@@ -5,6 +5,7 @@ import { expect, test } from "vitest";
 
 const behaviorSuitePath = fileURLToPath(new URL("./main.test.ts", import.meta.url));
 const operatingSystemSuitePath = fileURLToPath(new URL("./main.os.test.ts", import.meta.url));
+const productionTuiPath = fileURLToPath(new URL("./tui-app.ts", import.meta.url));
 const packagePath = fileURLToPath(new URL("../../../package.json", import.meta.url));
 const qualityWorkflowPath = fileURLToPath(
   new URL("../../../.github/workflows/quality.yml", import.meta.url),
@@ -58,6 +59,29 @@ test("Quality keeps every semantic and OS suite in one required Linux regression
   expect([...qualityWorkflow.matchAll(/^ {2}([a-z][a-z0-9_-]*):\n {4}runs-on:/gmu)]).toHaveLength(
     1,
   );
+});
+
+test("every production overlay family enters Pi through the shared Adam frame", async () => {
+  const source = await readFile(productionTuiPath, "utf8");
+
+  expect([...source.matchAll(/\btui\.showOverlay\(/gu)]).toHaveLength(1);
+  expect(source).toContain("new OverlayFrame(component, theme");
+  expect([...source.matchAll(/\bshowOverlay\(/gu)].length).toBeGreaterThanOrEqual(12);
+  for (const family of [
+    "SessionPicker",
+    "TargetPicker",
+    "PermissionOverlay",
+    "SkillPalette",
+    "ProjectPathPicker",
+    "ArtifactNavigator",
+    "ChronologyPicker",
+    "SessionInspector",
+    "ResourceReloadPicker",
+    "McpWizard",
+    "HelpNavigator",
+  ]) {
+    expect(source).toContain(`new ${family}`);
+  }
 });
 
 function topLevelTestBlocks(source: string): readonly string[] {

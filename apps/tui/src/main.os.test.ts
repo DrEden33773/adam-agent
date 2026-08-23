@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createModelTargets, createSessionLifecycle } from "@adam-agent/agent";
 import { afterEach, expect, test } from "vitest";
 import { removeTuiFixtureRoot as rm, waitForPath } from "./tui-filesystem.test-support.js";
 import {
@@ -189,6 +190,77 @@ test("the production TUI entry rejects conflicting target and resume arguments",
   }
 });
 
+test("the production TUI composes the Linux clipboard adapter for copy commands", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-clipboard-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const helperPath = join(testRoot, "wl-copy");
+  const clipboardMarker = join(testRoot, "clipboard.txt");
+  const assistantText = "Production clipboard response.";
+  await mkdir(workspaceRoot);
+  await writeFile(helperPath, '#!/bin/sh\n/bin/cat > "$ADAM_TEST_CLIPBOARD_MARKER"\n', {
+    mode: 0o755,
+  });
+
+  try {
+    const modelTargets = createModelTargets({
+      environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+      fetch: async () =>
+        new Response(
+          `data: {"id":"clipboard-answer","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":${JSON.stringify(assistantText)}},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n`,
+          { headers: { "content-type": "text/event-stream" }, status: 200 },
+        ),
+    });
+    const targets = await modelTargets.snapshot({
+      signal: AbortSignal.timeout(5_000),
+    });
+    const targetIdentity = targets.targets.find(
+      ({ identity }) => identity.targetId === "deepseek-v4-flash.direct",
+    )?.identity;
+    if (targetIdentity === undefined) {
+      throw new Error("The production clipboard fixture requires the DeepSeek Flash target.");
+    }
+    const seedLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const created = await seedLifecycle.create({ targetIdentity });
+    await seedLifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Create a response for the production clipboard tracer." },
+    });
+    await seedLifecycle.close();
+    const { PATH: inheritedPath = "" } = process.env;
+
+    const fixture = startFixture({
+      program: {
+        arguments: ["--resume", created.sessionId, "--state-root", stateRoot],
+        cwd: workspaceRoot,
+        entrypoint: productionPath,
+        environment: {
+          ADAM_TEST_CLIPBOARD_MARKER: clipboardMarker,
+          DEEPSEEK_API_KEY: "test-deepseek-key",
+          PATH: `${testRoot}:${inheritedPath}`,
+        },
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor(assistantText);
+    fixture.write("/copy\r");
+    const copyStatus = await Promise.race([
+      fixture.waitFor("Copied last assistant response.").then(() => "copied" as const),
+      fixture
+        .waitFor("Clipboard unavailable; assistant response was not copied.")
+        .then(() => "unavailable" as const),
+    ]);
+    expect(copyStatus).toBe("copied");
+    await waitForPath(clipboardMarker);
+    await expect(readFile(clipboardMarker, "utf8")).resolves.toBe(assistantText);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the production TUI entry reaches a credentialed exact-target session without a model call", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-startup-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -254,24 +326,31 @@ test("the real TUI MCP wizard preserves every separate B8 authority step", async
     fixture.write("\r");
     const outcome = await Promise.race([
       fixture
-        .waitForAfter("MCP authority · workspace confirmation required", afterTyping)
+        .waitForCompleteFrameAfter("MCP authority · workspace confirmation required", afterTyping)
         .then(() => "wizard" as const),
       fixture.waitForAfter("Working", afterTyping).then(() => "prompt" as const),
     ]);
     expect(outcome).toBe("wizard");
+    let beforeStep = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitFor("MCP authority · server approval required");
+    await fixture.waitForCompleteFrameAfter("MCP authority · server approval required", beforeStep);
+    beforeStep = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitFor("MCP authority · activation required");
+    await fixture.waitForCompleteFrameAfter("MCP authority · activation required", beforeStep);
+    beforeStep = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitFor("MCP authority · tool selection required");
     await waitForPath(spawnMarker);
+    await fixture.waitForCompleteFrameAfter("MCP authority · tool selection required", beforeStep);
     fixture.write("1");
     fixture.write("\u001b[B");
+    beforeStep = fixture.output().length;
     fixture.write("c");
-    await fixture.waitFor("MCP authority · profile committed");
+    await fixture.waitForCompleteFrameAfter("MCP authority · profile committed", beforeStep);
     fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout.slice(afterTyping)).toContain("┌");
+    expect(result.stdout.slice(afterTyping)).toContain("└");
     await waitForPath(closeMarker);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -313,18 +392,26 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
     await seed.waitFor("/mc");
     seed.write("\t");
     await seed.waitFor("/mcp");
+    let beforeStep = seed.output().length;
     seed.write("\r");
-    await seed.waitFor("MCP authority · workspace confirmation required");
+    await seed.waitForCompleteFrameAfter(
+      "MCP authority · workspace confirmation required",
+      beforeStep,
+    );
+    beforeStep = seed.output().length;
     seed.write("\r");
-    await seed.waitFor("MCP authority · server approval required");
+    await seed.waitForCompleteFrameAfter("MCP authority · server approval required", beforeStep);
+    beforeStep = seed.output().length;
     seed.write("\r");
-    await seed.waitFor("MCP authority · activation required");
+    await seed.waitForCompleteFrameAfter("MCP authority · activation required", beforeStep);
+    beforeStep = seed.output().length;
     seed.write("\r");
-    await seed.waitFor("MCP authority · tool selection required");
+    await seed.waitForCompleteFrameAfter("MCP authority · tool selection required", beforeStep);
     seed.write("1");
     seed.write("\u001b[B");
+    beforeStep = seed.output().length;
     seed.write("c");
-    await seed.waitFor("MCP authority · profile committed");
+    await seed.waitForCompleteFrameAfter("MCP authority · profile committed", beforeStep);
     seed.write("\u0011");
     await expect(seed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
@@ -336,10 +423,15 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
     await resumed.waitFor("/mc");
     resumed.write("\t");
     await resumed.waitFor("/mcp");
+    beforeStep = resumed.output().length;
     resumed.write("\r");
-    await resumed.waitFor("MCP authority · profile reactivation required");
+    await resumed.waitForCompleteFrameAfter(
+      "MCP authority · profile reactivation required",
+      beforeStep,
+    );
+    beforeStep = resumed.output().length;
     resumed.write("\r");
-    await resumed.waitFor("MCP authority · profile committed");
+    await resumed.waitForCompleteFrameAfter("MCP authority · profile committed", beforeStep);
     resumed.write("\u0011");
     await expect(resumed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -379,14 +471,21 @@ test("the TUI process fails visibly when MCP shutdown cannot be confirmed", asyn
     await fixture.waitFor("/mc");
     fixture.write("\t");
     await fixture.waitFor("/mcp");
+    let beforeStep = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitFor("MCP authority · workspace confirmation required");
+    await fixture.waitForCompleteFrameAfter(
+      "MCP authority · workspace confirmation required",
+      beforeStep,
+    );
+    beforeStep = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitFor("MCP authority · server approval required");
+    await fixture.waitForCompleteFrameAfter("MCP authority · server approval required", beforeStep);
+    beforeStep = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitFor("MCP authority · activation required");
+    await fixture.waitForCompleteFrameAfter("MCP authority · activation required", beforeStep);
+    beforeStep = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitFor("MCP authority · tool selection required");
+    await fixture.waitForCompleteFrameAfter("MCP authority · tool selection required", beforeStep);
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 1, signal: null });
@@ -618,7 +717,7 @@ test("the real terminal redraws through 40, 80, 120, and minimum-size layouts", 
     await fixture.waitForCompleteFrameAfter("Terminal too small", beforeResize);
     beforeResize = fixture.output().length;
     await fixture.resize(80, 24);
-    await fixture.waitForCompleteFrameAfter("workspace · idle", beforeResize);
+    await fixture.waitForCompleteFrameAfter("workspace · context unavailable · idle", beforeResize);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {

@@ -5,7 +5,6 @@ import {
   Key,
   matchesKey,
   truncateToWidth,
-  visibleWidth,
 } from "@earendil-works/pi-tui";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import type { AdamTuiTheme } from "./theme.js";
@@ -56,21 +55,24 @@ export class PermissionOverlay implements Component, Focusable {
   invalidate(): void {}
 
   render(width: number): string[] {
-    if (width < 4) {
-      return [truncateToWidth("Permission required", Math.max(0, width))];
-    }
-    const innerWidth = width - 4;
-    const subject = truncateToWidth(safeTerminalText(this.#interaction.subject.value), innerWidth);
+    const subject = truncateToWidth(safeTerminalText(this.#interaction.subject.value), width);
+    const effect =
+      this.#interaction.effect === "read"
+        ? this.#theme.keyword(this.#interaction.effect)
+        : this.#theme.danger(this.#interaction.effect);
+    const actionLine = `${this.#theme.keyword("Action")} ${effect} · ${this.#theme.keyword(
+      "Subject",
+    )} ${this.#theme.subject(subject)}`;
     const options = this.#allowEnabled
-      ? `${this.#selection === "allow" ? ">" : " "} Allow    ${
+      ? `${this.#selection === "allow" ? ">" : " "} ${this.#theme.allow("Allow")}    ${
           this.#selection === "deny" ? ">" : " "
-        } Deny`
-      : "  Allow unavailable    > Deny";
-    const content = (
+        } ${this.#theme.deny("Deny")}`
+      : `  ${this.#theme.allow("Allow")} unavailable    > ${this.#theme.deny("Deny")}`;
+    return (
       width < 60
         ? [
             this.#theme.toolTitle("Permission required"),
-            `${this.#interaction.effect} · ${subject}`,
+            actionLine,
             options,
             "Enter · Esc deny · Ctrl+C abort",
             "",
@@ -78,22 +80,13 @@ export class PermissionOverlay implements Component, Focusable {
           ]
         : [
             this.#theme.toolTitle("Permission required"),
-            `${this.#interaction.effect} · ${subject}`,
+            actionLine,
             "",
             ...this.#preview.split("\n"),
             "",
             options,
             "Enter confirm · ←/→ select · Esc deny · Ctrl+C abort",
           ]
-    ).map((line) => padLine(truncateToWidth(line, innerWidth), innerWidth));
-    return [
-      `┌${"─".repeat(Math.max(0, width - 2))}┐`,
-      ...content.map((line) => `│ ${line} │`),
-      `└${"─".repeat(Math.max(0, width - 2))}┘`,
-    ];
+    ).map((line) => truncateToWidth(line, Math.max(0, width)));
   }
-}
-
-function padLine(line: string, width: number): string {
-  return `${line}${" ".repeat(Math.max(0, width - visibleWidth(line)))}`;
 }
