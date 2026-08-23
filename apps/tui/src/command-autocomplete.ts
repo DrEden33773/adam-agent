@@ -9,10 +9,12 @@ import { safeTerminalText } from "./safe-terminal-text.js";
 
 type SkillCompletion = {
   readonly description: string;
+  readonly name: string;
   readonly qualifiedId: string;
 };
 
 export class AdamAutocompleteProvider implements AutocompleteProvider {
+  readonly triggerCharacters = ["$"];
   readonly #getProjectPaths: () => readonly string[];
   readonly #getRunActive: () => boolean;
   readonly #getSkills: () => readonly SkillCompletion[];
@@ -94,6 +96,21 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
         }));
       return Promise.resolve(
         skillItems.length === 0 ? null : { items: skillItems, prefix: skillPrefix },
+      );
+    }
+    const mention = /(?:^|[^A-Za-z0-9_$\\])(\$([a-z0-9-]*))$/u.exec(beforeCursor);
+    const mentionPrefix = mention?.[1];
+    const mentionNamePrefix = mention?.[2];
+    if (mentionPrefix !== undefined && mentionNamePrefix !== undefined) {
+      const skillItems = this.#getSkills()
+        .filter((skill) => skill.name.startsWith(mentionNamePrefix))
+        .map<AutocompleteItem>((skill) => ({
+          value: `$${skill.name}`,
+          label: `$${skill.name}`,
+          description: safeTerminalText(`${skill.qualifiedId} · ${skill.description}`),
+        }));
+      return Promise.resolve(
+        skillItems.length === 0 ? null : { items: skillItems, prefix: mentionPrefix },
       );
     }
     if (options.force !== true) {

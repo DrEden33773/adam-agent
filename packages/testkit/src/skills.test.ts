@@ -629,6 +629,68 @@ test("SessionLifecycle bounds unknown frontmatter fields and reports allowed-too
   }
 });
 
+test("SessionLifecycle admits audited Skill metadata arrays without granting listed tools", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-skill-common-frontmatter-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const isolatedHome = join(testRoot, "home");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "common-frontmatter");
+  const previousHome = testEnvironment.HOME;
+  await mkdir(skillDirectory, { recursive: true });
+  await mkdir(isolatedHome);
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    '---\nname: common-frontmatter\ndescription: Uses common skills.sh-compatible frontmatter collections.\nmetadata:\n  version: "3.2.0"\n  related_skills:\n    - deep-research\n    - academic-paper-reviewer\nallowed-tools:\n  - Read\n  - Bash\n---\nCommon body.\n',
+    "utf8",
+  );
+  testEnvironment.HOME = isolatedHome;
+
+  try {
+    const created = await createSessionLifecycle({ stateRoot, workspaceRoot }).create({
+      targetIdentity,
+    });
+
+    expect(created.skillContext).toMatchObject({
+      registry: {
+        candidateCount: 1,
+        diagnostics: [
+          {
+            code: "skill_allowed_tools_ignored",
+            packagePath: "common-frontmatter",
+            field: "allowed-tools",
+          },
+        ],
+      },
+      catalog: {
+        totalCount: 1,
+        entries: [
+          {
+            qualifiedId: "skill:v1:project:.:common-frontmatter",
+            name: "common-frontmatter",
+          },
+        ],
+      },
+    });
+    expect(
+      created.promptContext?.toolProfile.definitions.map((definition) => definition.name),
+    ).toEqual([
+      "read_file",
+      "write_file",
+      "edit_file",
+      "run_shell",
+      "activate_skill",
+      "read_skill_resource",
+    ]);
+  } finally {
+    if (previousHome === undefined) {
+      delete testEnvironment.HOME;
+    } else {
+      testEnvironment.HOME = previousHome;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle persists an unknown frontmatter field bounded by Unicode scalar values", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-skill-scalar-unknown-field-"));
   const stateRoot = join(testRoot, "state");

@@ -17,6 +17,7 @@ import type {
 import {
   presentationArtifactPageMaximumBytes,
   reconcilePresentationUpdate,
+  resolveSkillMentions,
 } from "@adam-agent/presentation";
 import { readFileArtifact, readFileArtifactRange } from "./artifact-store.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
@@ -903,6 +904,14 @@ export async function createPresentationSession(
             message: "The active session already has a running command.",
           };
         }
+        const skillResolution = resolveSkillMentions({
+          text: command.text,
+          explicitQualifiedIds: command.skills,
+          catalog: state.authoritative.active.skills,
+        });
+        if (skillResolution.status === "ambiguous") {
+          return ambiguousSkillMentionRejection(skillResolution);
+        }
         const controller = new AbortController();
         const commandId = randomUUID();
         const admission = Promise.withResolvers<void>();
@@ -925,7 +934,9 @@ export async function createPresentationSession(
           sessionId: command.sessionId,
           input: {
             text: command.text,
-            ...(command.skills.length === 0 ? {} : { skills: command.skills }),
+            ...(skillResolution.qualifiedIds.length === 0
+              ? {}
+              : { skills: skillResolution.qualifiedIds }),
           },
           runId: commandId,
           signal: controller.signal,
@@ -997,6 +1008,14 @@ export async function createPresentationSession(
             message: "The exact draft target is no longer available.",
           };
         }
+        const skillResolution = resolveSkillMentions({
+          text: command.text,
+          explicitQualifiedIds: command.skills,
+          catalog: draft.skills,
+        });
+        if (skillResolution.status === "ambiguous") {
+          return ambiguousSkillMentionRejection(skillResolution);
+        }
         const controller = new AbortController();
         const commandId = randomUUID();
         const admission = Promise.withResolvers<string>();
@@ -1011,7 +1030,9 @@ export async function createPresentationSession(
           targetIdentity,
           input: {
             text: command.text,
-            ...(command.skills.length === 0 ? {} : { skills: command.skills }),
+            ...(skillResolution.qualifiedIds.length === 0
+              ? {}
+              : { skills: skillResolution.qualifiedIds }),
           },
           runId: commandId,
           signal: controller.signal,
@@ -2725,13 +2746,34 @@ function projectSkillContext(
       code: diagnostic.code,
       source: diagnostic.source,
       ...(diagnostic.scope === undefined ? {} : { scope: diagnostic.scope }),
+      ...(diagnostic.extensionId === undefined ? {} : { extensionId: diagnostic.extensionId }),
+      ...(diagnostic.packageName === undefined ? {} : { packageName: diagnostic.packageName }),
+      ...(diagnostic.packageVersion === undefined
+        ? {}
+        : { packageVersion: diagnostic.packageVersion }),
       packagePath: diagnostic.packagePath,
+      ...(diagnostic.field === undefined ? {} : { field: diagnostic.field }),
+      ...(diagnostic.bound === undefined ? {} : { bound: diagnostic.bound }),
     })),
     overflow: {
       omittedCount: skills.catalog.omittedCount,
       shortenedCount: skills.catalog.shortenedCount,
     },
     reloadAvailable,
+  };
+}
+
+function ambiguousSkillMentionRejection(
+  resolution: Extract<ReturnType<typeof resolveSkillMentions>, { readonly status: "ambiguous" }>,
+): Extract<CommandReceipt, { readonly status: "rejected" }> {
+  const candidates = resolution.candidateQualifiedIds
+    .slice(0, 3)
+    .map((qualifiedId) => qualifiedId.slice(0, 160))
+    .join(", ");
+  return {
+    status: "rejected",
+    code: "invalid_command",
+    message: `Skill $${resolution.name} is ambiguous. Select one exact qualified ID with /skills: ${candidates}`,
   };
 }
 

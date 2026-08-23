@@ -60,6 +60,12 @@ export type SkillDiagnosticV1 = {
   readonly packageVersion?: string | undefined;
   readonly packagePath: string;
   readonly field?: string | undefined;
+  readonly bound?:
+    | {
+        readonly maximum: number;
+        readonly unit: "bytes" | "estimated_tokens" | "fields";
+      }
+    | undefined;
 };
 
 export type SkillCandidateRecordV1 = {
@@ -284,6 +290,16 @@ const diagnosticSchema = z.strictObject({
     .string()
     .min(1)
     .refine((value) => scalarLength(value) <= 128)
+    .optional(),
+  bound: z
+    .strictObject({
+      maximum: z
+        .number()
+        .int()
+        .positive()
+        .max(64 * 1024 * 1024),
+      unit: z.enum(["bytes", "estimated_tokens", "fields"]),
+    })
     .optional(),
 }) as z.ZodType<SkillDiagnosticV1>;
 const catalogEntrySchema = z.strictObject({
@@ -1350,17 +1366,25 @@ async function loadCandidate(
       return quarantine(input, packagePath, "skill_symlink_escape");
     }
     const metadata = await stat(resolvedSkillPath);
-    if (
-      !metadata.isFile() ||
-      metadata.size <= 0 ||
-      metadata.size > skillLimitsV1.maximumSkillMdBytes
-    ) {
+    if (!metadata.isFile() || metadata.size <= 0) {
       return quarantine(input, packagePath, "skill_file_invalid");
+    }
+    if (metadata.size > skillLimitsV1.maximumSkillMdBytes) {
+      return quarantine(input, packagePath, "skill_file_too_large", "SKILL.md", {
+        maximum: skillLimitsV1.maximumSkillMdBytes,
+        unit: "bytes",
+      });
     }
     const bytes = await readFile(resolvedSkillPath);
     const parsed = parseSkillMd(bytes, basename(directory));
     if (!parsed.success) {
-      return quarantine(input, packagePath, parsed.code, parsed.field);
+      return quarantine(
+        input,
+        packagePath,
+        parsed.code,
+        parsed.field,
+        skillDiagnosticBound(parsed.code, parsed.field),
+      );
     }
     const qualifiedId = qualifiedIdFor(input.locator, parsed.name);
     if (!isAscii(qualifiedId) || Buffer.byteLength(qualifiedId, "utf8") > 16_384) {
@@ -1368,11 +1392,13 @@ async function loadCandidate(
     }
     const skillMdDigest = digestBytes(bytes);
     for (const diagnostic of parsed.diagnostics) {
+      const bound = skillDiagnosticBound(diagnostic.code, diagnostic.field);
       input.diagnostics.push({
         code: diagnostic.code,
         ...diagnosticLocator(input.locator),
         packagePath,
         field: diagnostic.field,
+        ...(bound === undefined ? {} : { bound }),
       });
     }
     const artifact = await input.artifactStore.write({
@@ -1501,7 +1527,7 @@ function parseSkillMd(bytes: Uint8Array, directoryName: string): ParsedSkillMd {
     return { success: false, code: "skill_body_too_large" };
   }
   const diagnostics = unknownFields.map((field) => ({ code: "skill_unknown_field", field }));
-  if (typeof value["allowed-tools"] === "string") {
+  if (value["allowed-tools"] !== undefined) {
     diagnostics.push({ code: "skill_allowed_tools_ignored", field: "allowed-tools" });
   }
   return { success: true, name, description, metadata: value, bodyBytes, diagnostics };
@@ -1539,7 +1565,6 @@ function validateOptionalFields(value: Readonly<Record<string, unknown>>): strin
   for (const [field, maximum] of [
     ["license", 1_024],
     ["compatibility", 500],
-    ["allowed-tools", 4_096],
   ] as const) {
     const entry = value[field];
     if (
@@ -1548,6 +1573,17 @@ function validateOptionalFields(value: Readonly<Record<string, unknown>>): strin
     ) {
       return field;
     }
+  }
+  const allowedTools = value["allowed-tools"];
+  if (
+    allowedTools !== undefined &&
+    !isBoundedStringOrStringList(allowedTools, {
+      maximumEntries: 64,
+      maximumEntryScalars: 256,
+      maximumTotalScalars: 4_096,
+    })
+  ) {
+    return "allowed-tools";
   }
   const metadata = (value as RawSkillFrontmatter).metadata;
   if (metadata === undefined) {
@@ -1559,14 +1595,42 @@ function validateOptionalFields(value: Readonly<Record<string, unknown>>): strin
   for (const [key, entry] of Object.entries(metadata)) {
     if (
       scalarLength(key) > 128 ||
-      typeof entry !== "string" ||
-      scalarLength(entry) < 1 ||
-      scalarLength(entry) > 1_024
+      !isBoundedStringOrStringList(entry, {
+        maximumEntries: 64,
+        maximumEntryScalars: 1_024,
+        maximumTotalScalars: 4_096,
+      })
     ) {
-      return "metadata";
+      return `metadata.${key}`;
     }
   }
   return Buffer.byteLength(canonicalJson(metadata), "utf8") > 16 * 1024 ? "metadata" : undefined;
+}
+
+function isBoundedStringOrStringList(
+  value: unknown,
+  bounds: {
+    readonly maximumEntries: number;
+    readonly maximumEntryScalars: number;
+    readonly maximumTotalScalars: number;
+  },
+): boolean {
+  const entries = typeof value === "string" ? [value] : Array.isArray(value) ? value : undefined;
+  return (
+    entries !== undefined &&
+    entries.length > 0 &&
+    entries.length <= bounds.maximumEntries &&
+    entries.every(
+      (entry) =>
+        typeof entry === "string" &&
+        scalarLength(entry) > 0 &&
+        scalarLength(entry) <= bounds.maximumEntryScalars,
+    ) &&
+    entries.reduce(
+      (total, entry) => total + (typeof entry === "string" ? scalarLength(entry) : 0),
+      0,
+    ) <= bounds.maximumTotalScalars
+  );
 }
 
 interface RawSkillFrontmatter extends Readonly<Record<string, unknown>> {
@@ -1580,15 +1644,33 @@ function quarantine(
   packagePath: string,
   code: string,
   field?: string,
+  bound?: NonNullable<SkillDiagnosticV1["bound"]>,
 ): undefined {
   input.diagnostics.push({
     code,
     ...diagnosticLocator(input.locator),
     packagePath,
     ...(field === undefined ? {} : { field }),
+    ...(bound === undefined ? {} : { bound }),
   });
   if (input.diagnostics.length > skillLimitsV1.maximumDiagnostics) {
     throw new SkillsError("skill_catalog_unavailable");
+  }
+  return undefined;
+}
+
+function skillDiagnosticBound(
+  code: string,
+  field: string | undefined,
+): NonNullable<SkillDiagnosticV1["bound"]> | undefined {
+  if (code === "skill_frontmatter_too_large") {
+    return { maximum: skillLimitsV1.maximumFrontmatterBytes, unit: "bytes" };
+  }
+  if (code === "skill_body_too_large") {
+    return { maximum: skillLimitsV1.maximumSkillMdTokens, unit: "estimated_tokens" };
+  }
+  if (code === "skill_unknown_field_invalid" && field === "unknown-fields") {
+    return { maximum: 64, unit: "fields" };
   }
   return undefined;
 }
@@ -1913,7 +1995,7 @@ function resolveIdentityCollisions(
 
 function diagnosticLocator(
   locator: SkillLocatorV1,
-): Omit<SkillDiagnosticV1, "code" | "packagePath" | "field"> {
+): Omit<SkillDiagnosticV1, "code" | "packagePath" | "field" | "bound"> {
   if (locator.source === "project") {
     return { source: "project", scope: locator.scope };
   }

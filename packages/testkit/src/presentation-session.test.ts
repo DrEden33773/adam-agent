@@ -290,7 +290,11 @@ test("PresentationSession projects exact target identity and readiness for proje
   };
 
   const harness = createInMemorySessionLifecycleHarness();
-  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+  });
   try {
     const presentation = await createPresentationSession({
       lifecycle,
@@ -446,6 +450,356 @@ test("PresentationSession previews the draft Skill catalog without creating dura
     await presentation.close();
   } finally {
     await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession resolves a first-prompt Skill mention through atomic draft admission", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-skill-mention-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const isolatedHome = join(testRoot, "home");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "draft-review");
+  const previousHome = testEnvironment.HOME;
+  await mkdir(skillDirectory, { recursive: true });
+  await mkdir(isolatedHome);
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: draft-review\ndescription: Reviews the first mentioned draft.\n---\nMENTIONED_DRAFT_SKILL\n",
+    "utf8",
+  );
+  testEnvironment.HOME = isolatedHome;
+  const modelTargets = settledModelTargets("Mention admission complete.");
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    const completed = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation
+          .getState()
+          .authoritative.active?.transcript.items.some(
+            (item) =>
+              item.type === "assistant_message" && item.text === "Mention admission complete.",
+          )
+      ) {
+        completed.resolve();
+      }
+    });
+    const text = "Use $draft-review before answering.";
+    try {
+      await expect(
+        presentation.dispatch({ type: "submit_draft_prompt", text, skills: [] }),
+      ).resolves.toMatchObject({ status: "admitted" });
+      await completed.promise;
+    } finally {
+      unsubscribe();
+    }
+
+    const listed = await lifecycle.listProjectSessions();
+    expect(listed.items).toHaveLength(1);
+    const sessionId = listed.items[0]?.sessionId;
+    if (sessionId === undefined) {
+      throw new Error("Expected one admitted session.");
+    }
+    const records = await readInMemoryPresentationRecords(harness.sessions)(sessionId);
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          record: expect.objectContaining({
+            type: "skill_activation_batch_committed",
+            outcomes: [
+              expect.objectContaining({
+                qualifiedId: "skill:v1:project:.:draft-review",
+              }),
+            ],
+            skillContext: expect.objectContaining({
+              active: [expect.objectContaining({ reason: "user_explicit" })],
+            }),
+          }),
+        }),
+        expect.objectContaining({
+          record: expect.objectContaining({ type: "logical_run_started", userMessage: text }),
+        }),
+      ]),
+    );
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    if (previousHome === undefined) {
+      delete testEnvironment.HOME;
+    } else {
+      testEnvironment.HOME = previousHome;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession resolves a Skill mention for an existing session through durable admission", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-active-skill-mention-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const isolatedHome = join(testRoot, "home");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "active-review");
+  const previousHome = testEnvironment.HOME;
+  await mkdir(skillDirectory, { recursive: true });
+  await mkdir(isolatedHome);
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: active-review\ndescription: Reviews a mentioned active-session prompt.\n---\nACTIVE_MENTION_SKILL\n",
+    "utf8",
+  );
+  testEnvironment.HOME = isolatedHome;
+  const modelTargets = settledModelTargets("Active mention admission complete.");
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an existing active session.");
+    }
+    const completed = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation
+          .getState()
+          .authoritative.active?.transcript.items.some(
+            (item) =>
+              item.type === "assistant_message" &&
+              item.text === "Active mention admission complete.",
+          )
+      ) {
+        completed.resolve();
+      }
+    });
+    const text = "Use $active-review before answering this follow-up.";
+    try {
+      await expect(
+        presentation.dispatch({ type: "submit_prompt", sessionId, text, skills: [] }),
+      ).resolves.toMatchObject({ status: "admitted" });
+      await completed.promise;
+    } finally {
+      unsubscribe();
+    }
+
+    const records = await readInMemoryPresentationRecords(harness.sessions)(sessionId);
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          record: expect.objectContaining({
+            type: "skill_activation_batch_committed",
+            outcomes: [
+              expect.objectContaining({
+                qualifiedId: "skill:v1:project:.:active-review",
+              }),
+            ],
+            skillContext: expect.objectContaining({
+              active: [expect.objectContaining({ reason: "user_explicit" })],
+            }),
+          }),
+        }),
+        expect.objectContaining({
+          record: expect.objectContaining({ type: "logical_run_started", userMessage: text }),
+        }),
+      ]),
+    );
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    if (previousHome === undefined) {
+      delete testEnvironment.HOME;
+    } else {
+      testEnvironment.HOME = previousHome;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession rejects an ambiguous Skill mention before extending an existing session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-active-skill-collision-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const userHome = join(testRoot, "home");
+  const previousHome = testEnvironment.HOME;
+  for (const directory of [
+    join(workspaceRoot, ".agents", "skills", "shared-name"),
+    join(userHome, ".agents", "skills", "shared-name"),
+  ]) {
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      join(directory, "SKILL.md"),
+      "---\nname: shared-name\ndescription: Collides across exact Skill scopes.\n---\nCollision body.\n",
+      "utf8",
+    );
+  }
+  testEnvironment.HOME = userHome;
+  let providerResolutions = 0;
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      providerResolutions += 1;
+      throw new Error("An ambiguous Skill mention must fail before target resolution.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an existing active session.");
+    }
+    const before = await readInMemoryPresentationRecords(harness.sessions)(sessionId);
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_prompt",
+        sessionId,
+        text: "Use $shared-name without guessing.",
+        skills: [],
+      }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      code: "invalid_command",
+      message: expect.stringContaining("skill:v1:project:.:shared-name"),
+    });
+
+    expect(providerResolutions).toBe(0);
+    await expect(readInMemoryPresentationRecords(harness.sessions)(sessionId)).resolves.toEqual(
+      before,
+    );
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    if (previousHome === undefined) {
+      delete testEnvironment.HOME;
+    } else {
+      testEnvironment.HOME = previousHome;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps an ambiguous first-prompt Skill mention outside persistence", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-skill-collision-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const userHome = join(testRoot, "home");
+  const previousHome = testEnvironment.HOME;
+  for (const directory of [
+    join(workspaceRoot, ".agents", "skills", "shared-name"),
+    join(userHome, ".agents", "skills", "shared-name"),
+  ]) {
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      join(directory, "SKILL.md"),
+      "---\nname: shared-name\ndescription: Collides across exact Skill scopes.\n---\nCollision body.\n",
+      "utf8",
+    );
+  }
+  testEnvironment.HOME = userHome;
+  let providerResolutions = 0;
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      providerResolutions += 1;
+      throw new Error("An ambiguous Skill mention must fail before target resolution.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    const text = "Use $shared-name without guessing.";
+
+    await expect(
+      presentation.dispatch({ type: "submit_draft_prompt", text, skills: [] }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      code: "invalid_command",
+      message: expect.stringContaining("skill:v1:project:.:shared-name"),
+    });
+    expect(presentation.getState()).toMatchObject({ draft: { targetId: targetIdentity.targetId } });
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
+    expect(providerResolutions).toBe(0);
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    if (previousHome === undefined) {
+      delete testEnvironment.HOME;
+    } else {
+      testEnvironment.HOME = previousHome;
+    }
     await rm(testRoot, { recursive: true, force: true });
   }
 });

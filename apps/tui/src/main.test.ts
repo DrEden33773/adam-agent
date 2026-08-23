@@ -1659,6 +1659,39 @@ test("Tab completes an exact qualified Skill argument from authoritative catalog
   }
 });
 
+test("Tab completes and admits a Skill mention from the current first-draft catalog", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-draft-skill-mention-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "first");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: first\ndescription: First mention completion procedure.\n---\nFIRST_MENTION_BODY\n",
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Use $fir");
+    await fixture.waitFor("$first");
+    fixture.write("\t");
+    await fixture.waitFor("Use $first");
+    fixture.write("\r");
+    await fixture.waitFor("Skill selection complete.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    const durableState = await readFilesRecursively(stateRoot);
+    expect(durableState).toContain('"qualifiedId":"skill:v1:project:.:first"');
+    expect(durableState).toContain('"reason":"user_explicit"');
+    expect(durableState).toContain('"userMessage":"Use $first"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("Tab completes a Help topic argument from the Registry", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-topic-completion-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -2392,9 +2425,13 @@ test("the Skill palette renders untrusted metadata and diagnostic identities as 
   const stateRoot = join(testRoot, "state");
   const validDirectory = join(workspaceRoot, ".agents", "skills", "safe-name");
   const invalidDirectory = join(workspaceRoot, ".agents", "skills", "wrong-file");
+  const oversizedDirectory = join(workspaceRoot, ".agents", "skills", "oversized-frontmatter");
+  const oversizedFileDirectory = join(workspaceRoot, ".agents", "skills", "oversized-file");
   const unsafeSequence = "\u001b]52;c;c2NvcGU=\u0007";
   await mkdir(validDirectory, { recursive: true });
   await mkdir(invalidDirectory, { recursive: true });
+  await mkdir(oversizedDirectory, { recursive: true });
+  await mkdir(oversizedFileDirectory, { recursive: true });
   await writeFile(
     join(validDirectory, "SKILL.md"),
     `---\nname: safe-name\ndescription: Safe ${unsafeSequence} description.\n---\nPrivate body.\n`,
@@ -2405,6 +2442,12 @@ test("the Skill palette renders untrusted metadata and diagnostic identities as 
     "---\nname: wrong-file\ndescription: Wrong filename.\n---\n",
     "utf8",
   );
+  await writeFile(
+    join(oversizedDirectory, "SKILL.md"),
+    `---\nname: oversized-frontmatter\ndescription: Must expose its rejected frontmatter bound.\nvendor: ${"x".repeat(16_400)}\n---\n`,
+    "utf8",
+  );
+  await writeFile(join(oversizedFileDirectory, "SKILL.md"), "x".repeat(65_537), "utf8");
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
@@ -2415,6 +2458,10 @@ test("the Skill palette renders untrusted metadata and diagnostic identities as 
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).toContain("wrong-file");
+    expect(result.stdout).toContain("field skill.md");
+    expect(result.stdout).toContain("maximum 16384 bytes");
+    expect(result.stdout).toContain("oversized-file");
+    expect(result.stdout).toContain("maximum 65536 bytes");
     expect(result.stdout).not.toContain(unsafeSequence);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
