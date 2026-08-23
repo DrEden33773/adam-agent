@@ -6,10 +6,16 @@ import type { EditorTheme, MarkdownTheme } from "@earendil-works/pi-tui";
  */
 
 export type AdamTuiTheme = {
+  readonly allow: (text: string) => string;
+  readonly danger: (text: string) => string;
+  readonly deny: (text: string) => string;
   readonly editor: EditorTheme;
+  readonly inverseSelection: (text: string) => string;
+  readonly keyword: (text: string) => string;
   readonly markdown: MarkdownTheme;
   readonly muted: (text: string) => string;
   readonly primary: (text: string) => string;
+  readonly subject: (text: string) => string;
   readonly toolBackground: (text: string) => string;
   readonly toolOutput: (text: string) => string;
   readonly toolTitle: (text: string) => string;
@@ -39,10 +45,17 @@ export function createAdamTuiTheme(noColor = noColorRequested()): AdamTuiTheme {
   const teal = color(148, 226, 213);
   const overlay = color(108, 112, 134);
   const subtext = color(186, 194, 222);
+  const crust = color(17, 17, 27);
 
   return {
     primary: text,
     muted,
+    keyword: bold(mauve),
+    subject: blue,
+    danger: red,
+    allow: green,
+    deny: red,
+    inverseSelection: (value) => background(205, 214, 244)(crust(value)),
     userText: text,
     userBackground: background(49, 50, 68),
     userMarker: noColor ? "› " : "",

@@ -1378,6 +1378,251 @@ test("SessionLifecycle durably completes a canonical provider response while kee
   }
 });
 
+test("SessionLifecycle projects provider context usage through a cold child lineage", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-context-lineage-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Lineage answer." },
+    { type: "usage", inputTokens: 23_456, outputTokens: 101 },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+
+  try {
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const parent = await lifecycle.create({ targetIdentity });
+    const completed = await lifecycle.continue({
+      sessionId: parent.sessionId,
+      input: { text: "Record context before branching" },
+    });
+    const child = await lifecycle.branch({
+      parentSessionId: parent.sessionId,
+      atSequence: completed.snapshot.lastSequence,
+    });
+    await lifecycle.close();
+
+    const cold = harness.createLifecycle({ stateRoot, workspaceRoot });
+    await expect(cold.inspectContextUsage({ sessionId: child.sessionId })).resolves.toEqual({
+      ordinaryUsage: {
+        inputTokens: 23_456,
+        outputTokens: 101,
+        reasoningTokens: 0,
+        cachedInputTokens: 0,
+        cacheMissInputTokens: 0,
+        unknownCalls: 0,
+      },
+      compactionUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        cachedInputTokens: 0,
+        cacheMissInputTokens: 0,
+        unknownCalls: 0,
+      },
+      active: { source: "provider_reported", tokens: 23_456 },
+    });
+    await cold.close();
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle counts an ordinary provider attempt without usage as unknown", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-context-unknown-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "Usage unavailable." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+
+  try {
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Return no usage event" },
+    });
+
+    await expect(lifecycle.inspectContextUsage({ sessionId: created.sessionId })).resolves.toEqual({
+      ordinaryUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        cachedInputTokens: 0,
+        cacheMissInputTokens: 0,
+        unknownCalls: 1,
+      },
+      compactionUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        cachedInputTokens: 0,
+        cacheMissInputTokens: 0,
+        unknownCalls: 0,
+      },
+      active: { source: "unknown" },
+    });
+    await lifecycle.close();
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle does not retain provider usage after a later interrupted attempt", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-context-stale-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "First answer." },
+    { type: "usage", inputTokens: 12_345, outputTokens: 99 },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+
+  try {
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const created = await lifecycle.create({ targetIdentity });
+    const completed = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Return provider usage" },
+    });
+    const runId = "123e4567-e89b-42d3-a456-426614174098";
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
+    const records: readonly Omit<
+      Extract<SessionRecord, { readonly schemaVersion: 3 }>,
+      "sequence"
+    >[] = [
+      {
+        schemaVersion: 3,
+        record: { type: "logical_run_started", runId, userMessage: "Interrupt later" },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "user_message", text: "Interrupt later" },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "provider_attempt_started",
+          runId,
+          turn: 1,
+          attempt: 1,
+          targetIdentity,
+          promptProjection: promptProjectionFor(created, [
+            { role: "user", content: "Return provider usage" },
+            { role: "assistant", content: "First answer.", toolCalls: [] },
+            { role: "user", content: "Interrupt later" },
+          ]),
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: { type: "runtime_event", runId, event: { type: "model_message_started" } },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "session_interrupted", reason: "cancelled" },
+        },
+      },
+    ];
+    for (const [index, record] of records.entries()) {
+      await store.append({
+        ...record,
+        sequence: completed.snapshot.lastSequence + index + 1,
+      } as SessionRecord);
+    }
+
+    await lifecycle.resume({ sessionId: created.sessionId });
+
+    await expect(lifecycle.inspectContextUsage({ sessionId: created.sessionId })).resolves.toEqual({
+      ordinaryUsage: {
+        inputTokens: 12_345,
+        outputTokens: 99,
+        reasoningTokens: 0,
+        cachedInputTokens: 0,
+        cacheMissInputTokens: 0,
+        unknownCalls: 1,
+      },
+      compactionUsage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        reasoningTokens: 0,
+        cachedInputTokens: 0,
+        cacheMissInputTokens: 0,
+        unknownCalls: 0,
+      },
+      active: { source: "unknown" },
+    });
+    await lifecycle.close();
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle continues a run that crashed before its first provider attempt", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-pre-attempt-recovery-"));
   const stateRoot = join(testRoot, "state");
@@ -1604,8 +1849,33 @@ test("SessionLifecycle terminalizes a durable cancellation instead of reopening 
       code: "session_invalid",
     });
     const durableRecords = await store.read();
+    const contextUsage = await lifecycle.inspectContextUsage({ sessionId: created.sessionId });
 
-    expect({ resumed, modelRequests, terminalRecords: durableRecords.slice(-2) }).toEqual({
+    expect({
+      contextUsage,
+      resumed,
+      modelRequests,
+      terminalRecords: durableRecords.slice(-2),
+    }).toEqual({
+      contextUsage: {
+        ordinaryUsage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheMissInputTokens: 0,
+          unknownCalls: 1,
+        },
+        compactionUsage: {
+          inputTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          cachedInputTokens: 0,
+          cacheMissInputTokens: 0,
+          unknownCalls: 0,
+        },
+        active: { source: "unknown" },
+      },
       resumed: {
         status: "ready",
         snapshot: {

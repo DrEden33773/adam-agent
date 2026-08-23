@@ -37,7 +37,7 @@ export class TargetPicker implements Component {
         ? options.currentTargetId === undefined
           ? null
           : safeTerminalText(
-              `Current target ${options.currentTargetId} · existing session target is immutable`,
+              `Current ${options.currentTargetId} · existing session target immutable`,
             )
         : safeTerminalText(options.initialNotice);
     this.#onSaveDefault = options.onSaveDefault;

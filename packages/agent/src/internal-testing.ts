@@ -40,6 +40,7 @@ export {
   presentationHistoryPageSize,
   presentationHydrationBarrier,
   presentationRuntimeRefreshBarrier,
+  resolvePresentationTerminalContext,
 } from "./presentation-session.js";
 export type {
   ProjectLifecycleOwner,

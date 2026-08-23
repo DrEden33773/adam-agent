@@ -4,7 +4,6 @@ import {
   Key,
   matchesKey,
   truncateToWidth,
-  visibleWidth,
 } from "@earendil-works/pi-tui";
 
 import {
@@ -81,26 +80,14 @@ export class HelpNavigator implements Component, Focusable {
   invalidate(): void {}
 
   render(width: number): string[] {
-    if (width < 4) {
-      return [truncateToWidth("Adam Help", Math.max(0, width))];
-    }
-    const innerWidth = width - 4;
-    const content = helpContent(
+    return helpContent(
       this.#page,
       this.#commands,
       this.#keybindings,
       this.#topics,
       this.#selectedTopicIndex,
       this.#theme,
-    ).map((line) => padLine(truncateToWidth(line, innerWidth), innerWidth));
-    return [
-      this.#theme.editor.borderColor(`┌${"─".repeat(Math.max(0, width - 2))}┐`),
-      ...content.map(
-        (line) =>
-          `${this.#theme.editor.borderColor("│")} ${line} ${this.#theme.editor.borderColor("│")}`,
-      ),
-      this.#theme.editor.borderColor(`└${"─".repeat(Math.max(0, width - 2))}┘`),
-    ];
+    ).map((line) => truncateToWidth(line, Math.max(0, width)));
   }
 }
 
@@ -130,7 +117,7 @@ function helpContent(
       "",
       ...commands.map(
         (command) =>
-          `${command.usage}${
+          `${theme.keyword(command.usage)}${
             command.aliases.length === 0
               ? ""
               : ` · alias ${command.aliases.map((alias) => `/${alias}`).join(", ")}`
@@ -162,8 +149,4 @@ function helpContent(
     "",
     theme.muted("Esc back"),
   ];
-}
-
-function padLine(line: string, width: number): string {
-  return `${line}${" ".repeat(Math.max(0, width - visibleWidth(line)))}`;
 }
