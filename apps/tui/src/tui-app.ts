@@ -58,6 +58,7 @@ import {
   ResponsiveText,
   terminalSizeIsSupported,
 } from "./responsive-root.js";
+import { RightEdgeGuardTerminal } from "./right-edge-guard-terminal.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { SessionInspector, type SessionRunStatus } from "./session-inspector.js";
 import { SessionPicker } from "./session-picker.js";
@@ -85,7 +86,8 @@ export type RunTuiOptions = {
 };
 
 export async function runTui(options: RunTuiOptions): Promise<void> {
-  const terminal = options.terminal ?? new ProcessTerminal();
+  const physicalTerminal = options.terminal ?? new ProcessTerminal();
+  const terminal = new RightEdgeGuardTerminal(physicalTerminal);
   const deadlineScheduler = options.deadlineScheduler ?? nodeDeadlineScheduler;
   const commandRegistry = options.commandRegistry ?? adamCommandRegistry;
   const startupTargetId =
@@ -95,17 +97,26 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     options.presentation.getState().authoritative.sessions.items.length === 0;
   const tui: TUI = new TuiMainScreen(terminal, true);
   const theme = createAdamTuiTheme();
-  const showOverlay = (component: Component, overlayOptions: OverlayOptions) =>
-    tui.showOverlay(
+  const showOverlay = (component: Component, overlayOptions: OverlayOptions) => {
+    const renderOptions = resolvePhysicalOverlayWidth(
+      overlayOptions,
+      physicalTerminal.columns,
+      terminal.columns,
+    );
+    return tui.showOverlay(
       new OverlayFrame(component, theme, () =>
         resolveOverlayMaximumHeight(overlayOptions, terminal.rows),
       ),
       {
-        ...overlayOptions,
-        visible: (columns, rows) => terminalSizeIsSupported(columns, rows),
+        ...renderOptions,
+        visible: () => terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows),
       },
     );
-  const root = new ResponsiveRoot(() => terminal.rows);
+  };
+  const root = new ResponsiveRoot(
+    () => physicalTerminal.rows,
+    () => physicalTerminal.columns,
+  );
   const header = new Text();
   const transcript = new Container();
   const editorSlot = new Container();
@@ -148,7 +159,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   );
   let projectedHistorySessionId = options.presentation.getState().authoritative.active?.session.id;
   const statusLine = new Text();
-  const footer = new ResponsiveText();
+  const footer = new ResponsiveText(() => physicalTerminal.columns);
   const working = new Loader(tui, theme.toolTitle, theme.muted, "Working", { intervalMs: 80 });
   const thinking = new Loader(tui, theme.keyword, theme.muted, "Thinking", { intervalMs: 80 });
   thinking.stop();
@@ -2316,7 +2327,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return { consume: true };
     }
     if (
-      !terminalSizeIsSupported(terminal.columns, terminal.rows) &&
+      !terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows) &&
       !commandRegistry.matchesInput(data, "interrupt")
     ) {
       if (commandRegistry.matchesInput(data, "back")) {
@@ -2593,6 +2604,22 @@ function operationActionText(operation: OperationDisplay): string {
         : []),
   ];
   return actions.join(" · ");
+}
+
+function resolvePhysicalOverlayWidth(
+  options: OverlayOptions,
+  physicalColumns: number,
+  renderColumns: number,
+): OverlayOptions {
+  if (typeof options.width !== "string") {
+    return options;
+  }
+  const match = options.width.match(/^(\d+(?:\.\d+)?)%$/u);
+  if (match === null) {
+    return options;
+  }
+  const requested = Math.floor((physicalColumns * Number.parseFloat(match[1] as string)) / 100);
+  return { ...options, width: Math.max(1, Math.min(requested, renderColumns)) };
 }
 
 function resolveOverlayMaximumHeight(

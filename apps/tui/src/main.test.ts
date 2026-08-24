@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, expect, test } from "vitest";
+import { AppliedViewportTerminal } from "./applied-viewport-terminal.test-support.js";
 import { runTuiFixture } from "./test-fixture.js";
 import {
   readFilesRecursively,
@@ -447,10 +448,35 @@ function latestSynchronizedFrame(output: string): readonly string[] {
   if (start < 0 || end < 0) {
     throw new Error("The TUI did not emit one complete synchronized frame.");
   }
-  return output
+  const frame = output
     .slice(start + "\u001b[?2026h".length, end)
-    .replace("\u001b[2J\u001b[H\u001b[3J", "")
-    .split("\r\n");
+    .replace("\u001b[2J\u001b[H\u001b[3J", "");
+  const absoluteRows = [...frame.matchAll(new RegExp(`${"\u001b"}\\[(\\d+);1H`, "gu"))];
+  if (absoluteRows.length === 0) {
+    return frame.split("\r\n");
+  }
+  const lines: string[] = [];
+  for (const [index, match] of absoluteRows.entries()) {
+    const row = Number(match[1]) - 1;
+    const contentStart = (match.index ?? 0) + match[0].length;
+    const contentEnd = absoluteRows[index + 1]?.index ?? frame.length;
+    const content = frame.slice(contentStart, contentEnd);
+    if (content === "\u001b[2K") {
+      lines[row] = "";
+    } else if (content.length > 0) {
+      lines[row] = content.startsWith("\u001b[2K") ? content.slice("\u001b[2K".length) : content;
+    }
+  }
+  return lines.map((line) => line ?? "");
+}
+
+async function inputAndWaitForPhysicalFrame(
+  terminal: AppliedViewportTerminal,
+  input: string,
+): Promise<void> {
+  const frame = terminal.frame;
+  terminal.input(input);
+  await terminal.nextFrame(frame);
 }
 
 function expectFramedOverlay(output: string, title: string): void {
@@ -1387,7 +1413,7 @@ test("an active operation card keeps its status, action, identity, and draft thr
     let operationId: string | undefined;
     for (const columns of [120, 80, 40]) {
       const beforeResize = fixture.output().length;
-      await fixture.resize(columns, 24);
+      await fixture.resize(columns, 40);
       await fixture.waitForCompleteFrameAfter("Ctrl+C cancel", beforeResize);
       const lines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
       const frame = lines.join("\n");
@@ -1432,7 +1458,7 @@ test("a 40-column operation card keeps exact long provenance identities reachabl
     fixture.write("/review\r");
     await fixture.waitFor("Ctrl+C cancel");
     const beforeResize = fixture.output().length;
-    await fixture.resize(40, 24);
+    await fixture.resize(40, 60);
     await fixture.waitForCompleteFrameAfter("Ctrl+C cancel", beforeResize);
     const lines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
     const compactFrame = lines
@@ -2968,6 +2994,83 @@ test("the real TUI opens exact next-turn Skill metadata instead of submitting a 
     expect(fixture.output()).toContain("skill:v1:project:.:project-review");
     expect(fixture.output()).toContain("Reviews exact project state.");
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("repeated Skill navigation leaves the physical viewport and the next overlay clean", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-viewport-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillRoot = join(workspaceRoot, ".agents", "skills");
+  await mkdir(skillRoot, { recursive: true });
+  await Promise.all(
+    Array.from({ length: 64 }, async (_, index) => {
+      const name = `viewport-${String(index).padStart(2, "0")}`;
+      const directory = join(skillRoot, name);
+      await mkdir(directory);
+      await writeFile(
+        join(directory, "SKILL.md"),
+        `---\nname: ${name}\ndescription: Deterministic viewport Skill ${index}.\n---\nBody.\n`,
+        "utf8",
+      );
+    }),
+  );
+  const terminal = new AppliedViewportTerminal({
+    columns: 120,
+    commitPendingWrapAtFrameEnd: true,
+    rows: 30,
+  });
+  const execution = runTuiFixture({
+    scenario: "history",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    const interactionOutputOffset = terminal.output().length;
+    await inputAndWaitForPhysicalFrame(terminal, "/skills");
+    await inputAndWaitForPhysicalFrame(terminal, "\r");
+    expect(terminal.lines().join("\n")).toContain("Select next-turn Skills");
+    let maximumSkillRows = 0;
+    let minimumUniqueSkillRows = Number.POSITIVE_INFINITY;
+    for (let step = 0; step < 56; step += 1) {
+      await inputAndWaitForPhysicalFrame(terminal, "\u001b[B");
+      const skillRows = terminal.lines().filter((line) => line.includes("skill:v1:"));
+      maximumSkillRows = Math.max(maximumSkillRows, skillRows.length);
+      minimumUniqueSkillRows = Math.min(minimumUniqueSkillRows, new Set(skillRows).size);
+    }
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b");
+    const afterSkills = terminal.lines().join("\n");
+    await inputAndWaitForPhysicalFrame(terminal, "/tree");
+    await inputAndWaitForPhysicalFrame(terminal, "\r");
+    const treeViewport = terminal.lines().join("\n");
+
+    expect({
+      maximumSkillRows,
+      minimumUniqueSkillRows,
+      skillsRemainAfterClose:
+        afterSkills.includes("Select next-turn Skills") || afterSkills.includes("skill:v1:"),
+      treeOpened: treeViewport.includes("Active chronology"),
+      skillsLeakIntoTree:
+        treeViewport.includes("Select next-turn Skills") || treeViewport.includes("skill:v1:"),
+      scrollbackWasCleared: terminal.output().slice(interactionOutputOffset).includes("\u001b[3J"),
+    }).toEqual({
+      maximumSkillRows: 8,
+      minimumUniqueSkillRows: 8,
+      skillsRemainAfterClose: false,
+      treeOpened: true,
+      skillsLeakIntoTree: false,
+      scrollbackWasCleared: false,
+    });
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
     await rm(testRoot, { recursive: true, force: true });
   }
 });

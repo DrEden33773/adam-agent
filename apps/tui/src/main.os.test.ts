@@ -546,11 +546,11 @@ test("the production TUI reviews real Git changes through the exact public Eve a
 
     let beforeResize = fixture.output().length;
     await fixture.resize(40, 24);
-    await fixture.waitForCompleteFrameAfter("Completed", beforeResize);
+    await fixture.waitForCompleteFrameAfter("/artifacts inspect report", beforeResize);
     expect(fixture.output().slice(beforeResize)).toContain("/artifacts inspect report");
     beforeResize = fixture.output().length;
     await fixture.resize(80, 24);
-    await fixture.waitForCompleteFrameAfter("Completed", beforeResize);
+    await fixture.waitForCompleteFrameAfter("/artifacts inspect report", beforeResize);
     beforeResize = fixture.output().length;
     await fixture.resize(120, 40);
     await fixture.waitForCompleteFrameAfter("eve-reviewer.local-worktree-review@1", beforeResize);
@@ -746,6 +746,7 @@ test("the production TUI rehydrates and explicitly recovers one operation after 
     const resumed = startFixture({ program, stateRoot, terminalProcessMarker, workspaceRoot });
     await resumed.waitFor("Recovery required");
     await resumed.waitFor("Ctrl+R recover");
+    await resumed.resize(120, 40);
     const beforeRecovery = resumed.output().length;
     resumed.write("\u0012");
     await resumed.waitForCompleteFrameAfter("Completed", beforeRecovery);
