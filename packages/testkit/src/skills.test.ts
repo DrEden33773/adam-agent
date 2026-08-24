@@ -2858,7 +2858,7 @@ test("SessionLifecycle discovers and activates a Skill only after its configured
       type: "module",
       adamAgent: {
         id: "fixture.skill-extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -3001,7 +3001,7 @@ test("extension disable during explicit Skill approval prevents activation commi
       type: "module",
       adamAgent: {
         id: "fixture.approval-race-extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -3137,7 +3137,7 @@ test("extension disable revokes inherited Skills before provider and re-enable r
       type: "module",
       adamAgent: {
         id: "fixture.revoked-skill-extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],

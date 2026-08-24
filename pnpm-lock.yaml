@@ -103,6 +103,9 @@ importers:
       '@adam-agent/agent':
         specifier: workspace:*
         version: link:../agent
+      '@adam-agent/extension-api':
+        specifier: workspace:*
+        version: link:../extension-api
 
 packages:
 

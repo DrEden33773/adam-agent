@@ -759,6 +759,54 @@ test("ExtensionHost rejects domain-invalid input before reserving its idempotenc
   }
 });
 
+test("ExtensionHost preserves a successful codec result whose decoded value is undefined", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-undefined-input-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(
+      packageRoot,
+      "return { accepted: input === undefined };",
+      "return { ok: true, value: undefined };",
+    );
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+
+    const started = await host.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "review-undefined-input-1",
+      input: { revision: "decoded-away" },
+    });
+
+    for await (const _record of host.operations.events({ operationId: started.operationId })) {
+      // Draining through the terminal fact is the causal execution boundary.
+    }
+    await expect(host.operations.query(started.operationId)).resolves.toMatchObject({
+      output: { accepted: true },
+      status: "completed",
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("ExtensionHost rejects input above 12,000,000 encoded bytes before durable start", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-input-limit-host-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -3215,7 +3263,7 @@ async function writeOperationExtension(
       type: "module",
       adamAgent: {
         id: "fixture.extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./runtime.js" },
         capabilities: { required: [], optional: [] },
         contributions: [
@@ -3273,7 +3321,7 @@ async function writeRecoverableOperationExtension(
       type: "module",
       adamAgent: {
         id: "fixture.extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./runtime.js" },
         capabilities: {
           required: [
@@ -3526,7 +3574,7 @@ async function writeInvalidRecoveryHandlerExtension(packageRoot: string): Promis
       type: "module",
       adamAgent: {
         id: "fixture.extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./runtime.js" },
         capabilities: { required: [], optional: [] },
         contributions: [
@@ -3579,7 +3627,7 @@ async function writeRecoveryDeclarationMismatchExtension(
       type: "module",
       adamAgent: {
         id: "fixture.extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./runtime.js" },
         capabilities: { required: [], optional: [] },
         contributions: [
@@ -3633,7 +3681,7 @@ async function writeGrantSensitiveRecoveryExtension(
       type: "module",
       adamAgent: {
         id: "fixture.extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./runtime.js" },
         capabilities: {
           required: [{ id: "fixture.capability@1", version: "^1.0.0" }],

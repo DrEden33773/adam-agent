@@ -10,6 +10,7 @@
     }
   },
   "dependencies": {
-    "@adam-agent/agent": "workspace:*"
+    "@adam-agent/agent": "workspace:*",
+    "@adam-agent/extension-api": "workspace:*"
   }
 }

@@ -97,14 +97,23 @@ test("the packed extension API imports with only its public runtime shape", asyn
       "EXTENSION_OPERATION_PROGRESS_RECORD_MAX_BYTES",
       "EXTENSION_PACKAGE_NAME_MAX_LENGTH",
       "EXTENSION_PACKAGE_VERSION_MAX_LENGTH",
+      "EXTENSION_PROJECT_CHANGE_DIFF_MAX_BYTES",
+      "EXTENSION_PROJECT_CHANGE_ENTRY_MAX_BYTES",
+      "EXTENSION_PROJECT_CHANGE_MAX_ENTRIES_PER_SIDE",
+      "EXTENSION_PROJECT_CHANGE_PATHS_MAX_BYTES",
+      "EXTENSION_PROJECT_CHANGE_PATH_MAX_BYTES",
+      "EXTENSION_PROJECT_CHANGE_SNAPSHOT_CONTRACT",
+      "EXTENSION_PROJECT_CHANGE_SNAPSHOT_MAX_BYTES",
+      "EXTENSION_PROJECT_CHANGE_SOURCES_MAX_BYTES",
       "EXTENSION_RECORDS_CAPABILITY_ID",
       "EXTENSION_RECORD_MAX_AGGREGATE_BYTES",
       "EXTENSION_RECORD_MAX_BYTES",
       "EXTENSION_RECORD_MAX_CREATES",
       "EXTENSION_RECORD_NAMESPACE_MAX_BYTES",
+      "extensionProjectChangeSnapshotCodec",
       "parseExtensionPackageManifest",
     ]);
-    expect(Reflect.get(imported, "EXTENSION_API_VERSION")).toBe("0.2.0");
+    expect(Reflect.get(imported, "EXTENSION_API_VERSION")).toBe("0.3.0");
     const manifest = JSON.parse(await readFile(join(installedPackage, "package.json"), "utf8"));
     expect(manifest).toMatchObject({
       engines: { node: ">=24.0.0 <25" },
@@ -115,7 +124,7 @@ test("the packed extension API imports with only its public runtime shape", asyn
         type: "git",
         url: "git+https://github.com/DrEden33773/adam-agent.git",
       },
-      version: "0.2.0",
+      version: "0.3.0",
     });
     expect(manifest.publishConfig).toEqual({ access: "public", provenance: true });
   } finally {
