@@ -10,6 +10,7 @@ import type {
   ExtensionOperationBudgetSnapshot,
   ExtensionOperationCapabilities,
   ExtensionOperationContext,
+  ExtensionOperationContribution,
   ExtensionOperationEvidenceReference,
   ExtensionOperationReconciliationContext,
   ExtensionOperationReconciliationResult,
@@ -68,6 +69,7 @@ import type { PermissionPolicy } from "./tool-runtime.js";
 export type RegisteredOperation = {
   readonly capabilityIds: readonly string[];
   readonly contributionId: string;
+  readonly contribution: ExtensionOperationContribution;
   readonly definitionDigest: string;
   readonly diagnostics: readonly ExtensionActivationDiagnostic[];
   readonly extensionId: string;
@@ -122,7 +124,13 @@ type OperationSnapshotBase = {
   readonly operationId: string;
   readonly origin: OperationOrigin | null;
   readonly progress?: ExtensionJsonValue | undefined;
+  readonly presentation: {
+    readonly kind: "descriptor" | "generic";
+    readonly report: { readonly id: string; readonly version: number } | null;
+    readonly title: string;
+  };
   readonly startedAt: string;
+  readonly throughSequence: number;
 };
 
 export type OperationSnapshot =
@@ -149,6 +157,7 @@ export type OperationSnapshot =
     })
   | (OperationSnapshotBase & {
       readonly status: "recovery_required";
+      readonly recoverable: boolean;
       readonly error: {
         readonly code: "operation_recovery_required";
         readonly message: string;
@@ -160,6 +169,7 @@ export interface OperationHost {
   events(options: {
     readonly afterSequence?: number;
     readonly operationId: string;
+    readonly signal?: AbortSignal;
   }): AsyncIterable<OperationEventRecord>;
   listLinked(options: LinkedOperationListOptions): Promise<LinkedOperationPage>;
   query(operationId: string): Promise<OperationSnapshot>;
@@ -565,7 +575,11 @@ export function createOperationHost(options: {
         throw new OperationHostError("operation_not_found");
       }
       const active = activeOperations.get(operationId);
-      return createSnapshot(records, active !== undefined && !active.terminalPersistenceFailed);
+      return createSnapshot(
+        records,
+        active !== undefined && !active.terminalPersistenceFailed,
+        options.resolveOperation,
+      );
     },
 
     async recover(operationId) {
@@ -582,6 +596,7 @@ export function createOperationHost(options: {
           const existing = createSnapshot(
             records,
             isDurablyActive(activeOperations.get(operationId)),
+            options.resolveOperation,
           );
           if (existing.status !== "recovery_required") {
             return existing;
@@ -674,7 +689,7 @@ export function createOperationHost(options: {
             });
           } catch {
             const durableRecords = await store.read(operationId);
-            return createSnapshot(durableRecords, false);
+            return createSnapshot(durableRecords, false, options.resolveOperation);
           }
           return host.query(operationId);
         })
@@ -692,11 +707,11 @@ export function createOperationHost(options: {
       return recovery;
     },
 
-    events({ afterSequence = 0, operationId }) {
+    events({ afterSequence = 0, operationId, signal }) {
       if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
         throw new TypeError("The event sequence cursor must be a non-negative integer.");
       }
-      return streamEvents(operationId, afterSequence, store, activeOperations, listeners);
+      return streamEvents(operationId, afterSequence, store, activeOperations, listeners, signal);
     },
 
     async cancel(operationId) {
@@ -714,7 +729,7 @@ export function createOperationHost(options: {
         return options.lifecycleOwner
           .run(async () => {
             const records = await store.read(operationId);
-            const current = createSnapshot(records, false);
+            const current = createSnapshot(records, false, options.resolveOperation);
             if (
               current.status === "completed" ||
               current.status === "failed" ||
@@ -2022,6 +2037,7 @@ async function* streamEvents(
   store: OperationStore,
   activeOperations: Map<string, ActiveOperation>,
   listeners: Map<string, Set<() => void>>,
+  signal: AbortSignal | undefined,
 ): AsyncIterable<OperationEventRecord> {
   let notified = false;
   let resume: (() => void) | undefined;
@@ -2029,12 +2045,20 @@ async function* streamEvents(
     notified = true;
     resume?.();
   };
+  const abortListener = () => {
+    notified = true;
+    resume?.();
+  };
   const operationListeners = listeners.get(operationId) ?? new Set<() => void>();
   operationListeners.add(listener);
   listeners.set(operationId, operationListeners);
+  signal?.addEventListener("abort", abortListener, { once: true });
   let cursor = afterSequence;
   try {
     while (true) {
+      if (signal?.aborted === true) {
+        return;
+      }
       notified = false;
       const active = activeOperations.get(operationId);
       const records = await store.read(operationId);
@@ -2074,6 +2098,7 @@ async function* streamEvents(
       resume = undefined;
     }
   } finally {
+    signal?.removeEventListener("abort", abortListener);
     operationListeners.delete(listener);
     if (operationListeners.size === 0) {
       listeners.delete(operationId);
@@ -2088,6 +2113,7 @@ function isDurablyActive(active: ActiveOperation | undefined): boolean {
 function createSnapshot(
   records: readonly OperationEventRecord[],
   isActive: boolean,
+  resolveOperation: (contributionId: string) => RegisteredOperation | undefined,
 ): OperationSnapshot {
   const first = records[0];
   if (first?.event.type !== "operation_started") {
@@ -2102,7 +2128,9 @@ function createSnapshot(
     operationId: first.operationId,
     origin: first.schemaVersion === 3 ? first.origin : null,
     progress: latestProgress(records),
+    presentation: operationPresentation(first, resolveOperation(first.event.contributionId)),
     startedAt: first.recordedAt,
+    throughSequence: records.at(-1)?.sequence ?? first.sequence,
   };
   const terminal = records.find((record) => isTerminal(record.event))?.event;
   if (terminal?.type === "operation_completed") {
@@ -2144,6 +2172,7 @@ function createSnapshot(
         code: "operation_recovery_required",
         message: "The interrupted operation requires explicit recovery.",
       },
+      recoverable: isOperationRecoverable(first, resolveOperation(first.event.contributionId)),
       status: "recovery_required",
     };
   }
@@ -2152,6 +2181,48 @@ function createSnapshot(
     status: records.some((record) => record.event.type === "operation_cancel_requested")
       ? "cancel_requested"
       : "running",
+  };
+}
+
+function isOperationRecoverable(
+  started: OperationEventRecord,
+  registered: RegisteredOperation | undefined,
+): boolean {
+  if (started.event.type !== "operation_started") {
+    return false;
+  }
+  if (started.schemaVersion === 1) {
+    return true;
+  }
+  return (
+    registered !== undefined &&
+    registered.contributionId === started.event.contributionId &&
+    registered.extensionId === started.event.extensionId &&
+    registered.extensionVersion === started.event.extensionVersion &&
+    registered.definitionDigest === started.event.definitionDigest &&
+    typeof registered.registration.reconcile === "function"
+  );
+}
+
+function operationPresentation(
+  started: OperationEventRecord,
+  registered: RegisteredOperation | undefined,
+): OperationSnapshotBase["presentation"] {
+  if (started.event.type !== "operation_started") {
+    throw new OperationHostError("operation_persistence_failed");
+  }
+  const exact =
+    started.schemaVersion !== 1 &&
+    registered !== undefined &&
+    registered.contributionId === started.event.contributionId &&
+    registered.extensionId === started.event.extensionId &&
+    registered.extensionVersion === started.event.extensionVersion &&
+    registered.definitionDigest === started.event.definitionDigest;
+  const contribution = exact ? registered.contribution : undefined;
+  return {
+    kind: contribution?.command === undefined ? "generic" : "descriptor",
+    report: contribution?.report ?? null,
+    title: contribution?.command?.title ?? started.event.contributionId,
   };
 }
 

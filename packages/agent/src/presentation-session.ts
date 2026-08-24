@@ -5,6 +5,7 @@ import type {
   AuthoritativePresentationSnapshot,
   CommandReceipt,
   McpDisplay,
+  OperationDisplay,
   PresentationCommand,
   PresentationDisplayState,
   PresentationSession,
@@ -29,6 +30,7 @@ import {
   type ModelTargets,
   sameModelTargetIdentity,
 } from "./model-targets.js";
+import type { OperationHost, OperationSnapshot } from "./operation-host.js";
 import type { PresentationPreferences } from "./presentation-preferences.js";
 import { listProjectPaths } from "./project-path-catalog.js";
 import {
@@ -80,6 +82,7 @@ export type PresentationSessionRecordReader = (
 type PresentationSessionBaseOptions = {
   readonly lifecycle: SessionLifecycle;
   readonly modelTargets?: ModelTargets;
+  readonly operations?: OperationHost;
   readonly preferences?: PresentationPreferences;
   readonly projectLabel: string;
   readonly stateRoot?: string;
@@ -180,7 +183,32 @@ export async function createPresentationSession(
     }
     const records =
       created === undefined ? [] : await readActiveBranchRecords(options, created.sessionId);
-    let transcript: readonly TranscriptItem[] = projectTranscript(records);
+    const initialOperationProjection = await projectLinkedOperations(options.operations, records);
+    const projectedOperations = initialOperationProjection.items;
+    const operationCursors = new Map(
+      projectedOperations.map((operation) => [
+        operation.display.operationId,
+        operation.throughSequence,
+      ]),
+    );
+    const operationCursorSnapshot = (): readonly {
+      readonly operationId: string;
+      readonly sequence: number;
+    }[] => [...operationCursors].map(([operationId, sequence]) => ({ operationId, sequence }));
+    const advanceOperationCursor = (operationId: string, sequence: number): void => {
+      operationCursors.set(operationId, Math.max(sequence, operationCursors.get(operationId) ?? 0));
+    };
+    const resetOperationCursors = (operations: readonly ProjectedOperation[]): void => {
+      operationCursors.clear();
+      for (const operation of operations) {
+        operationCursors.set(operation.display.operationId, operation.throughSequence);
+      }
+    };
+    let activeSessionThroughSequence = created?.lastSequence ?? 0;
+    const advanceSessionCursor = (sequence: number): void => {
+      activeSessionThroughSequence = Math.max(activeSessionThroughSequence, sequence);
+    };
+    let transcript: readonly TranscriptItem[] = projectTranscript(records, projectedOperations);
     const historyPageSize = boundedHistoryPageSize(options[presentationHistoryPageSize]);
     let loadedTranscriptStart = Math.max(0, transcript.length - historyPageSize);
     const naming =
@@ -275,11 +303,19 @@ export async function createPresentationSession(
         : null;
     const authoritative: AuthoritativePresentationSnapshot = {
       schemaVersion: 1,
-      continuity: {
-        status: "current",
-        sessionThroughSequence: created?.lastSequence ?? 0,
-        operationThrough: [],
-      },
+      continuity: initialOperationProjection.truncated
+        ? {
+            status: "degraded",
+            fault: {
+              code: "authoritative_state_unavailable",
+              message: "The linked operation view exceeds the Presentation bound.",
+            },
+          }
+        : {
+            status: "current",
+            sessionThroughSequence: activeSessionThroughSequence,
+            operationThrough: operationCursorSnapshot(),
+          },
       project: { id: catalogPage.projectId, label: options.projectLabel },
       targets: {
         items: (modelTargetSnapshot?.targets ?? []).map((target) => ({
@@ -315,6 +351,8 @@ export async function createPresentationSession(
           : {
               session: summary,
               transcript: transcriptPage(transcript, loadedTranscriptStart, created.sessionId),
+              linkedOperations: projectedOperations.map(({ display }) => display),
+              linkedOperationsTruncated: initialOperationProjection.truncated,
               context: projectSessionContext(created, initialContextUsage, modelTargetSnapshot),
               pendingInteractions: await projectPendingInteractions(records, options),
               repositoryInstructions: projectRepositoryInstructions(created),
@@ -353,6 +391,203 @@ export async function createPresentationSession(
       }
     };
     let closed = false;
+    const operationRefreshes = new Set<Promise<void>>();
+    const operationObservers = new Map<string, AbortController>();
+    const operationRepairs = new Set<string>();
+    const operationRecoveries = new Set<string>();
+    const publishOperationSnapshot = (next: ProjectedOperation): boolean => {
+      const active = state.authoritative.active;
+      if (
+        closed ||
+        active === null ||
+        !active.linkedOperations.some(
+          (operation) => operation.operationId === next.display.operationId,
+        )
+      ) {
+        return false;
+      }
+      const previousSequence = operationCursors.get(next.display.operationId) ?? 0;
+      if (next.throughSequence < previousSequence) {
+        return true;
+      }
+      advanceOperationCursor(next.display.operationId, next.throughSequence);
+      state = {
+        revision: state.revision + 1,
+        authoritative: {
+          ...state.authoritative,
+          continuity:
+            state.authoritative.continuity.status === "current"
+              ? {
+                  ...state.authoritative.continuity,
+                  operationThrough: operationCursorSnapshot(),
+                }
+              : state.authoritative.continuity,
+          active: {
+            ...active,
+            linkedOperations: active.linkedOperations.map((operation) =>
+              operation.operationId === next.display.operationId ? next.display : operation,
+            ),
+          },
+        },
+        draft: state.draft,
+        transient: state.transient,
+      };
+      publishStateChange();
+      return true;
+    };
+    const watchOperation = (projected: ProjectedOperation): void => {
+      const operations = options.operations;
+      if (
+        operations === undefined ||
+        (projected.display.status !== "running" && projected.display.status !== "cancel_requested")
+      ) {
+        return;
+      }
+      operationObservers.get(projected.display.operationId)?.abort();
+      const observer = new AbortController();
+      operationObservers.set(projected.display.operationId, observer);
+      const refresh = (async () => {
+        let observedStatus = projected.display.status;
+        let observedThroughSequence = projected.throughSequence;
+        for await (const _record of operations.events({
+          afterSequence: projected.throughSequence,
+          operationId: projected.display.operationId,
+          signal: observer.signal,
+        })) {
+          if (closed || observer.signal.aborted) {
+            return;
+          }
+          const snapshot = await operations.query(projected.display.operationId);
+          const next = projectLinkedOperation(snapshot);
+          if (observer.signal.aborted || next === null || !publishOperationSnapshot(next)) {
+            return;
+          }
+          observedStatus = next.display.status;
+          observedThroughSequence = next.throughSequence;
+        }
+        if (closed || observer.signal.aborted) {
+          return;
+        }
+        const snapshot = await operations.query(projected.display.operationId);
+        const next = projectLinkedOperation(snapshot);
+        if (
+          observer.signal.aborted ||
+          next === null ||
+          (next.throughSequence === observedThroughSequence &&
+            next.display.status === observedStatus) ||
+          !publishOperationSnapshot(next)
+        ) {
+          return;
+        }
+      })().catch(async () => {
+        if (closed || observer.signal.aborted) {
+          return;
+        }
+        const active = state.authoritative.active;
+        const continuity = state.authoritative.continuity;
+        if (
+          active === null ||
+          continuity.status === "degraded" ||
+          !active.linkedOperations.some(
+            (operation) => operation.operationId === projected.display.operationId,
+          )
+        ) {
+          return;
+        }
+        operationRepairs.add(projected.display.operationId);
+        const sessionId = active.session.id;
+        if (continuity.status === "current") {
+          state = {
+            revision: state.revision + 1,
+            authoritative: {
+              ...state.authoritative,
+              continuity: { status: "repairing", reason: "reconnect" },
+            },
+            draft: state.draft,
+            transient: state.transient,
+          };
+          publishStateChange();
+        }
+        try {
+          const snapshot = await operations.query(projected.display.operationId);
+          const next = projectLinkedOperation(snapshot);
+          const latest = state.authoritative.active;
+          if (
+            closed ||
+            observer.signal.aborted ||
+            next === null ||
+            latest === null ||
+            latest.session.id !== sessionId ||
+            !latest.linkedOperations.some(
+              (operation) => operation.operationId === projected.display.operationId,
+            )
+          ) {
+            operationRepairs.delete(projected.display.operationId);
+            return;
+          }
+          advanceOperationCursor(next.display.operationId, next.throughSequence);
+          operationRepairs.delete(projected.display.operationId);
+          const latestContinuity = state.authoritative.continuity;
+          state = {
+            revision: state.revision + 1,
+            authoritative: {
+              ...state.authoritative,
+              continuity:
+                latestContinuity.status === "degraded"
+                  ? latestContinuity
+                  : operationRepairs.size > 0
+                    ? { status: "repairing", reason: "reconnect" }
+                    : {
+                        status: "current",
+                        sessionThroughSequence: activeSessionThroughSequence,
+                        operationThrough: operationCursorSnapshot(),
+                      },
+              active: {
+                ...latest,
+                linkedOperations: latest.linkedOperations.map((operation) =>
+                  operation.operationId === next.display.operationId ? next.display : operation,
+                ),
+              },
+            },
+            draft: state.draft,
+            transient: state.transient,
+          };
+          publishStateChange();
+          watchOperation(next);
+        } catch {
+          operationRepairs.delete(projected.display.operationId);
+          if (closed || observer.signal.aborted) {
+            return;
+          }
+          state = {
+            revision: state.revision + 1,
+            authoritative: {
+              ...state.authoritative,
+              continuity: {
+                status: "degraded",
+                fault: {
+                  code: "authoritative_state_unavailable",
+                  message: "The durable operation view is temporarily unavailable.",
+                },
+              },
+            },
+            draft: state.draft,
+            transient: state.transient,
+          };
+          publishStateChange();
+        }
+      });
+      operationRefreshes.add(refresh);
+      void refresh.finally(() => {
+        operationRefreshes.delete(refresh);
+        if (operationObservers.get(projected.display.operationId) === observer) {
+          operationObservers.delete(projected.display.operationId);
+        }
+      });
+    };
+    for (const operation of projectedOperations) {
+      watchOperation(operation);
+    }
     let activeRun:
       | {
           sessionId: string | null;
@@ -363,11 +598,23 @@ export async function createPresentationSession(
     let snapshotActivationQueue = Promise.resolve();
     const activateSnapshotNow = async (snapshot: CurrentSessionSnapshot): Promise<void> => {
       const activatedRecords = await readActiveBranchRecords(options, snapshot.sessionId);
+      const activatedOperationProjection = await projectLinkedOperations(
+        options.operations,
+        activatedRecords,
+      );
+      const activatedOperations = activatedOperationProjection.items;
       const activatedContextUsage = await options.lifecycle.inspectContextUsage({
         sessionId: snapshot.sessionId,
       });
-      transcript = projectTranscript(activatedRecords);
-      loadedTranscriptStart = Math.max(0, transcript.length - historyPageSize);
+      const activatedTranscript = projectTranscript(activatedRecords, activatedOperations);
+      const activatedLoadedTranscriptStart = Math.max(
+        0,
+        activatedTranscript.length - historyPageSize,
+      );
+      const activatedPendingInteractions = await projectPendingInteractions(
+        activatedRecords,
+        options,
+      );
       const activatedNaming = sessionNamingFromRecords(activatedRecords, snapshot.sessionId);
       const activatedSummary: SessionSummary = {
         id: snapshot.sessionId,
@@ -393,15 +640,31 @@ export async function createPresentationSession(
             : maximum,
         snapshot.lastSequence,
       );
+      for (const observer of operationObservers.values()) {
+        observer.abort();
+      }
+      operationRepairs.clear();
+      resetOperationCursors(activatedOperations);
+      activeSessionThroughSequence = activeSequence;
+      transcript = activatedTranscript;
+      loadedTranscriptStart = activatedLoadedTranscriptStart;
       state = {
         revision: state.revision + 1,
         authoritative: {
           ...state.authoritative,
-          continuity: {
-            status: "current",
-            sessionThroughSequence: activeSequence,
-            operationThrough: [],
-          },
+          continuity: activatedOperationProjection.truncated
+            ? {
+                status: "degraded",
+                fault: {
+                  code: "authoritative_state_unavailable",
+                  message: "The linked operation view exceeds the Presentation bound.",
+                },
+              }
+            : {
+                status: "current",
+                sessionThroughSequence: activeSequence,
+                operationThrough: operationCursorSnapshot(),
+              },
           sessions: {
             items: catalogItems,
             nextCursor: state.authoritative.sessions.nextCursor,
@@ -409,8 +672,10 @@ export async function createPresentationSession(
           active: {
             session: activatedSummary,
             transcript: transcriptPage(transcript, loadedTranscriptStart, snapshot.sessionId),
+            linkedOperations: activatedOperations.map((operation) => operation.display),
+            linkedOperationsTruncated: activatedOperationProjection.truncated,
             context: projectSessionContext(snapshot, activatedContextUsage, modelTargetSnapshot),
-            pendingInteractions: await projectPendingInteractions(activatedRecords, options),
+            pendingInteractions: activatedPendingInteractions,
             repositoryInstructions: projectRepositoryInstructions(snapshot),
             skills: projectSkills(snapshot),
             projectPaths,
@@ -422,6 +687,9 @@ export async function createPresentationSession(
       };
       draftTargetIdentity = null;
       publishStateChange();
+      for (const operation of activatedOperations) {
+        watchOperation(operation);
+      }
     };
     const activateSnapshot = (snapshot: CurrentSessionSnapshot): Promise<void> => {
       const activation = snapshotActivationQueue.then(() => activateSnapshotNow(snapshot));
@@ -450,20 +718,20 @@ export async function createPresentationSession(
         label: refreshedNaming.displayLabel,
         naming: refreshedNaming,
       };
+      advanceSessionCursor(throughSequence);
+      const continuity = state.authoritative.continuity;
       state = {
         revision: state.revision + 1,
         authoritative: {
           ...state.authoritative,
-          continuity: {
-            status: "current",
-            sessionThroughSequence: Math.max(
-              throughSequence,
-              state.authoritative.continuity.status === "current"
-                ? state.authoritative.continuity.sessionThroughSequence
-                : 0,
-            ),
-            operationThrough: [],
-          },
+          continuity:
+            continuity.status === "current"
+              ? {
+                  status: "current",
+                  sessionThroughSequence: activeSessionThroughSequence,
+                  operationThrough: operationCursorSnapshot(),
+                }
+              : continuity,
           sessions: {
             ...state.authoritative.sessions,
             items: state.authoritative.sessions.items.map((session) =>
@@ -490,15 +758,20 @@ export async function createPresentationSession(
       if (closed || current === null || current.session.id !== sessionId) {
         return;
       }
+      advanceSessionCursor(Math.max(throughSequence, inspected.lastSequence));
+      const continuity = state.authoritative.continuity;
       state = {
         revision: state.revision + 1,
         authoritative: {
           ...state.authoritative,
-          continuity: {
-            status: "current",
-            sessionThroughSequence: Math.max(throughSequence, inspected.lastSequence),
-            operationThrough: [],
-          },
+          continuity:
+            continuity.status === "current"
+              ? {
+                  status: "current",
+                  sessionThroughSequence: activeSessionThroughSequence,
+                  operationThrough: operationCursorSnapshot(),
+                }
+              : continuity,
           active: { ...current, mcp: projectMcp(inspected) },
         },
         draft: state.draft,
@@ -689,11 +962,16 @@ export async function createPresentationSession(
             }
             await options[presentationRuntimeRefreshBarrier]?.beforeRead(notification);
             const refreshedRecords = await readActiveBranchRecords(options, active.session.id);
+            const refreshedOperationProjection = await projectLinkedOperations(
+              options.operations,
+              refreshedRecords,
+            );
+            const refreshedOperations = refreshedOperationProjection.items;
             const current = state.authoritative.active;
             if (closed || current === null || current.session.id !== active.session.id) {
               return;
             }
-            transcript = projectTranscript(refreshedRecords);
+            transcript = projectTranscript(refreshedRecords, refreshedOperations);
             loadedTranscriptStart = Math.min(
               loadedTranscriptStart,
               Math.max(0, transcript.length - historyPageSize),
@@ -739,22 +1017,46 @@ export async function createPresentationSession(
             if (closed || latest === null || latest.session.id !== active.session.id) {
               return;
             }
+            const effectiveOperations = refreshedOperations.map((operation) => {
+              const previousSequence = operationCursors.get(operation.display.operationId) ?? 0;
+              if (operation.throughSequence >= previousSequence) {
+                advanceOperationCursor(operation.display.operationId, operation.throughSequence);
+                return operation;
+              }
+              const currentDisplay = latest.linkedOperations.find(
+                (candidate) => candidate.operationId === operation.display.operationId,
+              );
+              return currentDisplay === undefined
+                ? operation
+                : { display: currentDisplay, throughSequence: previousSequence };
+            });
             const latestSequence =
               state.authoritative.continuity.status === "current"
                 ? state.authoritative.continuity.sessionThroughSequence
                 : 0;
+            advanceSessionCursor(Math.max(activeSequence, latestSequence));
             state = {
               revision: state.revision + 1,
               authoritative: {
                 ...state.authoritative,
-                continuity: {
-                  status: "current",
-                  sessionThroughSequence: Math.max(activeSequence, latestSequence),
-                  operationThrough: [],
-                },
+                continuity: refreshedOperationProjection.truncated
+                  ? {
+                      status: "degraded",
+                      fault: {
+                        code: "authoritative_state_unavailable",
+                        message: "The linked operation view exceeds the Presentation bound.",
+                      },
+                    }
+                  : {
+                      status: "current",
+                      sessionThroughSequence: activeSessionThroughSequence,
+                      operationThrough: operationCursorSnapshot(),
+                    },
                 active: {
                   ...latest,
                   transcript: transcriptPage(transcript, loadedTranscriptStart, current.session.id),
+                  linkedOperations: effectiveOperations.map((operation) => operation.display),
+                  linkedOperationsTruncated: refreshedOperationProjection.truncated,
                   context: resolvePresentationTerminalContext(
                     latest.context,
                     projectSessionContextUsage(
@@ -778,6 +1080,11 @@ export async function createPresentationSession(
                     },
             };
             publishStateChange();
+            for (const operation of effectiveOperations) {
+              if (!operationObservers.has(operation.display.operationId)) {
+                watchOperation(operation);
+              }
+            }
           } catch {
             if (closed) {
               return;
@@ -936,6 +1243,12 @@ export async function createPresentationSession(
             message: "The exact target and draft Skill catalog could not be prepared.",
           };
         }
+        for (const observer of operationObservers.values()) {
+          observer.abort();
+        }
+        operationRepairs.clear();
+        operationCursors.clear();
+        activeSessionThroughSequence = 0;
         state = {
           revision: state.revision + 1,
           authoritative: {
@@ -1332,6 +1645,102 @@ export async function createPresentationSession(
           };
         }
         activeRun.controller.abort();
+        return { status: "admitted", commandId: randomUUID(), resource: null };
+      }
+      if (command.type === "cancel_operation") {
+        const operation = state.authoritative.active?.linkedOperations.find(
+          (candidate) => candidate.operationId === command.operationId,
+        );
+        if (
+          operation === undefined ||
+          !operation.actions.some((action: "cancel" | "recover") => action === "cancel")
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The linked operation is no longer cancellable.",
+          };
+        }
+        if (options.operations === undefined) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "Operation control is unavailable.",
+          };
+        }
+        try {
+          await options.operations.cancel(command.operationId);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "The linked operation could not be cancelled.",
+          };
+        }
+      }
+      if (command.type === "recover_operation") {
+        const operation = state.authoritative.active?.linkedOperations.find(
+          (candidate) => candidate.operationId === command.operationId,
+        );
+        if (
+          operation === undefined ||
+          !operation.actions.some((action: "cancel" | "recover") => action === "recover") ||
+          operationRecoveries.has(command.operationId)
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The linked operation no longer requires recovery.",
+          };
+        }
+        if (options.operations === undefined) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "Operation recovery is unavailable.",
+          };
+        }
+        const operations = options.operations;
+        operationRecoveries.add(command.operationId);
+        void (async () => {
+          let snapshot: OperationSnapshot;
+          try {
+            snapshot = await operations.recover(command.operationId);
+          } catch {
+            try {
+              snapshot = await operations.query(command.operationId);
+            } catch {
+              if (!closed) {
+                state = {
+                  revision: state.revision + 1,
+                  authoritative: {
+                    ...state.authoritative,
+                    continuity: {
+                      status: "degraded",
+                      fault: {
+                        code: "authoritative_state_unavailable",
+                        message: "The durable operation view is temporarily unavailable.",
+                      },
+                    },
+                  },
+                  draft: state.draft,
+                  transient: state.transient,
+                };
+                publishStateChange();
+              }
+              return;
+            }
+          }
+          if (closed) {
+            return;
+          }
+          operationRecoveries.delete(command.operationId);
+          const next = projectLinkedOperation(snapshot);
+          if (next !== null && publishOperationSnapshot(next)) {
+            watchOperation(next);
+          }
+        })().finally(() => operationRecoveries.delete(command.operationId));
         return { status: "admitted", commandId: randomUUID(), resource: null };
       }
       if (command.type === "load_older_transcript") {
@@ -1869,11 +2278,15 @@ export async function createPresentationSession(
         }
         closed = true;
         activeRun?.controller.abort();
+        for (const observer of operationObservers.values()) {
+          observer.abort();
+        }
         unsubscribeLifecycle();
         unsubscribeMetadata();
         await activeRun?.settlement;
         await runtimeRefresh;
         await metadataRefresh;
+        await Promise.all(operationRefreshes);
         listeners.clear();
         state = { ...state, transient: null };
         bufferedEvents.length = 0;
@@ -1884,6 +2297,224 @@ export async function createPresentationSession(
     unsubscribeMetadata();
     throw error;
   }
+}
+
+type ProjectedOperation = {
+  readonly display: OperationDisplay;
+  readonly throughSequence: number;
+};
+
+type ProjectedOperationCollection = {
+  readonly items: readonly ProjectedOperation[];
+  readonly truncated: boolean;
+};
+
+async function projectLinkedOperations(
+  operations: OperationHost | undefined,
+  records: readonly SourcedSessionRecord[],
+): Promise<ProjectedOperationCollection> {
+  if (operations === undefined || records.length === 0) {
+    return { items: [], truncated: false };
+  }
+  const throughBySession = new Map<string, number>();
+  for (const record of records) {
+    throughBySession.set(
+      record.sessionId,
+      Math.max(throughBySession.get(record.sessionId) ?? 0, record.entry.sequence),
+    );
+  }
+  const references: { readonly operationId: string }[] = [];
+  let truncated = false;
+  for (const [sessionId, throughSequence] of throughBySession) {
+    if (references.length > 256) {
+      truncated = true;
+      break;
+    }
+    const prefix = await listLinkedOperationPrefix(
+      operations,
+      sessionId,
+      throughSequence,
+      257 - references.length,
+    );
+    references.push(...prefix.items);
+    if (prefix.truncated || references.length > 256) {
+      truncated = true;
+      break;
+    }
+  }
+  const snapshots = await Promise.all(
+    [...new Set(references.slice(0, 256).map((reference) => reference.operationId))].map(
+      (operationId) => operations.query(operationId),
+    ),
+  );
+  return {
+    items: snapshots
+      .map(projectLinkedOperation)
+      .filter((projected): projected is ProjectedOperation => projected !== null),
+    truncated,
+  };
+}
+
+async function listLinkedOperationPrefix(
+  operations: OperationHost,
+  sessionId: string,
+  throughSequence: number,
+  maximumItems: number,
+): Promise<{
+  readonly items: readonly { readonly operationId: string }[];
+  readonly truncated: boolean;
+}> {
+  const references: { readonly operationId: string }[] = [];
+  let cursor: string | undefined;
+  while (true) {
+    const remaining = maximumItems - references.length;
+    if (remaining === 0) {
+      return { items: references, truncated: true };
+    }
+    const page = await operations.listLinked({
+      ...(cursor === undefined ? {} : { cursor }),
+      limit: Math.min(100, remaining),
+      sessionId,
+      throughSequence,
+    });
+    references.push(...page.items);
+    if (page.nextCursor === null) {
+      return { items: references, truncated: false };
+    }
+    cursor = page.nextCursor;
+  }
+}
+
+function projectLinkedOperation(snapshot: OperationSnapshot): ProjectedOperation | null {
+  if (snapshot.origin === null) {
+    return null;
+  }
+  const base = {
+    artifacts: projectOperationArtifacts(snapshot),
+    operationId: snapshot.operationId,
+    origin: snapshot.origin,
+    provenance: {
+      contributionId: snapshot.contributionId,
+      extensionId: snapshot.extensionId,
+      extensionVersion: snapshot.extensionVersion,
+      presentation: snapshot.presentation.kind,
+      title: snapshot.presentation.title,
+    },
+    progress: projectOperationProgress(snapshot.progress),
+  };
+  const display: OperationDisplay =
+    snapshot.status === "running"
+      ? { ...base, status: "running", actions: ["cancel"], settlement: null }
+      : snapshot.status === "cancel_requested"
+        ? { ...base, status: "cancel_requested", actions: [], settlement: null }
+        : snapshot.status === "completed"
+          ? {
+              ...base,
+              status: "completed",
+              actions: [],
+              settlement: { summary: null },
+            }
+          : snapshot.status === "failed"
+            ? {
+                ...base,
+                status: "failed",
+                actions: [],
+                settlement: snapshot.error,
+              }
+            : snapshot.status === "cancelled"
+              ? {
+                  ...base,
+                  status: "cancelled",
+                  actions: [],
+                  settlement: { reason: snapshot.reason },
+                }
+              : snapshot.status === "inspection_required"
+                ? {
+                    ...base,
+                    status: "inspection_required",
+                    actions: [],
+                    settlement: { message: snapshot.message },
+                  }
+                : projectRecoveryRequiredOperation(base, snapshot);
+  return {
+    display,
+    throughSequence: snapshot.throughSequence,
+  };
+}
+
+function projectOperationProgress(
+  progress: OperationSnapshot["progress"],
+): OperationDisplay["progress"] {
+  if (progress === undefined || progress === null) {
+    return null;
+  }
+  const serialized = JSON.stringify(progress);
+  const maximumBytes = 240;
+  const encoded = new TextEncoder().encode(serialized);
+  if (encoded.byteLength <= maximumBytes) {
+    return { summary: serialized };
+  }
+  const prefix = encoded.subarray(0, maximumBytes - 3);
+  for (let trim = 0; trim <= 3; trim += 1) {
+    try {
+      return {
+        summary: `${new TextDecoder("utf-8", { fatal: true }).decode(
+          prefix.subarray(0, prefix.byteLength - trim),
+        )}…`,
+      };
+    } catch {
+      // The byte bound may split one UTF-8 scalar; retry without its partial bytes.
+    }
+  }
+  throw new TypeError("The operation progress summary could not be bounded.");
+}
+
+function projectOperationArtifacts(
+  snapshot: OperationSnapshot,
+): readonly import("@adam-agent/presentation").OperationArtifactDisplay[] {
+  const terminal = "artifacts" in snapshot ? (snapshot.artifacts ?? []) : [];
+  const evidence =
+    snapshot.status === "inspection_required"
+      ? (snapshot.evidence ?? []).flatMap((reference) =>
+          reference.type === "artifact" ? [reference.artifact] : [],
+        )
+      : [];
+  const evidenceIds = new Set(evidence.map((artifact) => artifact.id));
+  const unique = new Map([...terminal, ...evidence].map((artifact) => [artifact.id, artifact]));
+  return [...unique.values()].map((artifact) => ({
+    contract: artifact.contract,
+    reference: {
+      id: artifact.id,
+      mediaType: artifact.mediaType,
+      byteCount: artifact.byteCount,
+      source: "operation",
+    },
+    role:
+      artifact.contract.id === snapshot.presentation.report?.id &&
+      artifact.contract.version === snapshot.presentation.report.version
+        ? "report"
+        : evidenceIds.has(artifact.id)
+          ? "evidence"
+          : "artifact",
+  }));
+}
+
+function projectRecoveryRequiredOperation(
+  base: Omit<
+    Extract<OperationDisplay, { readonly status: "running" }>,
+    "actions" | "settlement" | "status"
+  >,
+  snapshot: OperationSnapshot,
+): OperationDisplay {
+  if (snapshot.status !== "recovery_required") {
+    throw new TypeError("The operation status could not be projected.");
+  }
+  return {
+    ...base,
+    status: "recovery_required",
+    actions: snapshot.recoverable ? ["recover"] : [],
+    settlement: snapshot.error,
+  };
 }
 
 function decodeArtifactPage(
@@ -1910,6 +2541,9 @@ function isKnownArtifact(
   artifact: import("@adam-agent/presentation").ArtifactReference,
 ): boolean {
   const candidates = [
+    ...active.linkedOperations.flatMap((operation) =>
+      operation.artifacts.map((artifact) => artifact.reference),
+    ),
     ...active.pendingInteractions.flatMap((interaction) =>
       interaction.changePreviewRef === null ? [] : [interaction.changePreviewRef],
     ),
@@ -2112,7 +2746,10 @@ async function readPresentationSessionRecords(
   );
 }
 
-function projectTranscript(records: readonly SourcedSessionRecord[]): readonly TranscriptItem[] {
+function projectTranscript(
+  records: readonly SourcedSessionRecord[],
+  operations: readonly ProjectedOperation[] = [],
+): readonly TranscriptItem[] {
   const toolDisplays = collectToolDisplays(records);
   const attemptProviders = new Map<string, string>(
     records.flatMap(({ entry, sessionId }) =>
@@ -2395,7 +3032,40 @@ function projectTranscript(records: readonly SourcedSessionRecord[]): readonly T
       artifact,
     });
   }
-  return items;
+  const recordOrder = new Map(
+    records.map(
+      (record, index) => [`${record.sessionId}:${record.entry.sequence}`, index] as const,
+    ),
+  );
+  const itemOrder = new Map(items.map((item, index) => [item, index] as const));
+  const operationLinks: TranscriptItem[] = operations.map(({ display }) => ({
+    type: "operation_link",
+    id: `operation:${display.operationId}`,
+    operationId: display.operationId,
+    sequence: display.origin.sourceSequence,
+    sourceSessionId: display.origin.sessionId,
+    branchBoundary: {
+      sessionId: display.origin.sessionId,
+      sequence: display.origin.sourceSequence,
+    },
+  }));
+  return [...items, ...operationLinks].sort((left, right) => {
+    const leftRecord = recordOrder.get(`${left.sourceSessionId}:${left.sequence}`) ?? Infinity;
+    const rightRecord = recordOrder.get(`${right.sourceSessionId}:${right.sequence}`) ?? Infinity;
+    if (leftRecord !== rightRecord) {
+      return leftRecord - rightRecord;
+    }
+    if (left.type === "operation_link" && right.type === "operation_link") {
+      return left.operationId.localeCompare(right.operationId);
+    }
+    if (left.type === "operation_link") {
+      return 1;
+    }
+    if (right.type === "operation_link") {
+      return -1;
+    }
+    return (itemOrder.get(left) ?? 0) - (itemOrder.get(right) ?? 0);
+  });
 }
 
 function projectActiveReasoningSnapshot(input: {

@@ -230,6 +230,73 @@ test("ExtensionHost persists the exact session command origin before a linked op
   }
 });
 
+test("ExtensionHost stops one operation observer without cancelling the running operation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-observer-abort-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(
+      packageRoot,
+      `await new Promise((resolve, reject) => {
+        context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true });
+      });
+      return { unreachable: true };`,
+    );
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationOriginAuthority: acceptingOperationOriginAuthority,
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+    });
+    await host.loadConfiguredExtensions();
+    const started = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "operation-observer-abort-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: reviewInvocation,
+        sessionId: "123e4567-e89b-42d3-a456-426614174199",
+        sourceSequence: 1,
+      },
+    });
+    const observer = new AbortController();
+    const events = host.operations
+      .events({ operationId: started.operationId, signal: observer.signal })
+      [Symbol.asyncIterator]();
+    await expect(events.next()).resolves.toMatchObject({
+      done: false,
+      value: { sequence: 1, event: { type: "operation_started" } },
+    });
+    const detached = events.next();
+
+    observer.abort();
+    await expect(detached).resolves.toEqual({ done: true, value: undefined });
+    await expect(host.operations.query(started.operationId)).resolves.toMatchObject({
+      status: "running",
+    });
+    await host.operations.cancel(started.operationId);
+    for await (const record of host.operations.events({ operationId: started.operationId })) {
+      if (record.event.type === "operation_cancelled") {
+        break;
+      }
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("ExtensionHost never executes a linked operation whose v3 start is not durable", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-linked-persistence-"));
   const workspaceRoot = join(testRoot, "workspace");
