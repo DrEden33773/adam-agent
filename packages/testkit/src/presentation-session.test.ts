@@ -7401,9 +7401,16 @@ test("PresentationSession normalizes a real read call without exposing raw argum
       resultSummary: "65536 bytes · output truncated",
       artifacts: [],
       changePreviewRef: null,
+      preview: {
+        kind: "read_text",
+        language: "text",
+        lines: [{ number: 1, text: expect.stringMatching(/^r+$/u) }],
+        omittedBytes: expect.any(Number),
+        sourceTruncated: true,
+      },
     });
     expect(JSON.stringify(tool)).not.toContain('{"path":"notes.txt"}');
-    expect(JSON.stringify(tool)).not.toContain("r".repeat(1_024));
+    expect(JSON.stringify(tool)).not.toContain("r".repeat(17 * 1_024));
 
     await presentation.close();
   } finally {
@@ -7506,6 +7513,16 @@ test("PresentationSession exposes a bounded shell summary and durable overflow a
           source: "tool_output",
         },
       ],
+      preview: {
+        kind: "shell_output",
+        termination: { type: "exited", exitCode: 0 },
+        stdout: { text: "", totalBytes: 0, omittedBytes: 0 },
+        stderr: {
+          text: expect.stringMatching(/x+$/u),
+          totalBytes: 70_000,
+          omittedBytes: expect.any(Number),
+        },
+      },
     });
     if (tool?.type !== "tool_call" || tool.artifacts[0] === undefined) {
       throw new Error("Expected one shell output artifact.");
@@ -7767,7 +7784,18 @@ test("PresentationSession publishes a durable change preview before write permis
           .authoritative.active?.transcript.items.find(
             (item) => item.type === "tool_call" && item.callId === "pending-write",
           ),
-      ).toMatchObject({ changePreviewRef: pending?.changePreviewRef });
+      ).toMatchObject({
+        changePreviewRef: pending?.changePreviewRef,
+        preview: {
+          kind: "write_text",
+          language: "text",
+          lines: [
+            { number: 1, text: "line one" },
+            { number: 2, text: "line two" },
+          ],
+          omittedBytes: 0,
+        },
+      });
       const previewId = pending?.changePreviewRef?.id;
       if (previewId === undefined || requestId === undefined) {
         throw new Error("Expected an actionable canonical preview.");
@@ -7896,6 +7924,23 @@ test("PresentationSession publishes a canonical structured-edit preview before p
         callId: "pending-edit",
         canAllow: true,
         changePreviewRef: { source: "change_preview" },
+      });
+      expect(
+        presentation
+          .getState()
+          .authoritative.active?.transcript.items.find(
+            (item) => item.type === "tool_call" && item.callId === "pending-edit",
+          ),
+      ).toMatchObject({
+        preview: {
+          kind: "diff",
+          language: "text",
+          lines: expect.arrayContaining([
+            { kind: "deletion", oldLineNumber: null, newLineNumber: null, text: "before" },
+            { kind: "addition", oldLineNumber: null, newLineNumber: null, text: "after" },
+          ]),
+          omittedBytes: 0,
+        },
       });
     } finally {
       if (failureGuard !== undefined) {

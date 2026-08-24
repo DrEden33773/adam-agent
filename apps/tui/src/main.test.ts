@@ -3412,13 +3412,15 @@ test("a real read tool is rendered as a bounded Pi-style tool card", async () =>
   await writeFile(join(workspaceRoot, "README.md"), "# Fixture\n\nReadable content.\n", "utf8");
 
   try {
-    const fixture = startFixture({ scenario: "read", stateRoot, workspaceRoot });
+    const fixture = startFixture({ noColor: true, scenario: "read", stateRoot, workspaceRoot });
     await fixture.waitForCompleteFrameAfter("Adam · New session", 0);
     await fixture.waitForCompleteFrameAfter(" · idle", 0);
     fixture.write("Read README\r");
     await fixture.waitFor("read README.md");
     await fixture.waitFor("29 bytes");
     await fixture.waitFor("Read complete");
+    await fixture.waitFor("1 │ # Fixture");
+    await fixture.waitFor("3 │ Readable content.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -3431,16 +3433,25 @@ test("Ctrl+O toggles bounded authoritative tool details", async () => {
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
-  await writeFile(join(workspaceRoot, "README.md"), "alpha\nbeta\n", "utf8");
+  await writeFile(
+    join(workspaceRoot, "README.md"),
+    `${Array.from({ length: 12 }, (_, index) => `line${String(index + 1).padStart(2, "0")}`).join(
+      "\n",
+    )}\n`,
+    "utf8",
+  );
 
   try {
-    const fixture = startFixture({ scenario: "read", stateRoot, workspaceRoot });
+    const fixture = startFixture({ noColor: true, scenario: "read", stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     fixture.write("Read the README\r");
     await fixture.waitFor("Read complete");
+    expect(fixture.output()).toContain("10 │ line10");
+    expect(fixture.output()).not.toContain("11 │ line11");
     expect(fixture.output()).not.toContain("provider model response");
     const beforeExpand = fixture.output().length;
     fixture.write("\u000f");
+    await fixture.waitForAfter("12 │ line12", beforeExpand);
     await fixture.waitForAfter("read_file · read · completed · replay safe", beforeExpand);
     await fixture.waitForAfter("provider model response", beforeExpand);
     await fixture.waitForAfter("duration unavailable", beforeExpand);
@@ -3450,8 +3461,62 @@ test("Ctrl+O toggles bounded authoritative tool details", async () => {
     await fixture.waitForAfter("provider model response", beforeRestore);
     const beforeCollapse = fixture.output().length;
     fixture.write("\u000f");
-    await fixture.waitForAfter("11 bytes", beforeCollapse);
+    await fixture.waitForAfter("84 bytes", beforeCollapse);
     expect(fixture.output().slice(beforeCollapse)).not.toContain("provider model response");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a settled write card previews numbered content from its canonical change artifact", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-write-preview-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ noColor: true, scenario: "write", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Create a TypeScript file\r");
+    await fixture.waitFor("Permission required");
+    await fixture.waitFor("+export const value12 = 12;");
+    const beforeAllow = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForAfter("Write complete.", beforeAllow);
+    await fixture.waitForAfter(" 1 │ export const value01 = 1;", beforeAllow);
+    await fixture.waitForAfter("10 │ export const value10 = 10;", beforeAllow);
+    expect(fixture.output().slice(beforeAllow)).not.toContain("11 │ export const value11");
+    await expect(readFile(join(workspaceRoot, "created.ts"), "utf8")).resolves.toContain(
+      "export const value12 = 12;",
+    );
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a settled edit card previews its canonical diff without inventing line coordinates", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-edit-preview-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "edit.txt"), "before\n", "utf8");
+
+  try {
+    const fixture = startFixture({ noColor: true, scenario: "mutation", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Edit the file\r");
+    await fixture.waitFor("Permission required");
+    await fixture.waitFor("+after");
+    const beforeAllow = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForAfter("Edit complete.", beforeAllow);
+    await fixture.waitForAfter("  - │ before", beforeAllow);
+    await fixture.waitForAfter("  + │ after", beforeAllow);
+    await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("after\n");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -3598,10 +3663,13 @@ test("a shell tool card uses the accepted dollar-command grammar", async () => {
   await mkdir(workspaceRoot);
 
   try {
-    const fixture = startFixture({ scenario: "shell", stateRoot, workspaceRoot });
+    const fixture = startFixture({ noColor: true, scenario: "shell", stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     fixture.write("Show shell card\r");
     await fixture.waitFor("$ printf shell-card-fixture");
+    await fixture.waitFor("Shell card complete.");
+    await fixture.waitFor("stdout");
+    expect(fixture.output()).not.toContain("stderr");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -3628,9 +3696,13 @@ test("tool subjects keep their full bounded value only in the 120-column layout"
 
     beforeResize = fixture.output().length;
     await fixture.resize(80, 24);
-    frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    const frameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+    frame = frameLines.join("\n");
     expect(frame).toContain("$ printf shell-card-fixture");
-    expect(frame).not.toContain("bounded-secondary-provenance-and-wide-tail");
+    expect(frameLines.find((line) => line.includes("$ printf"))).not.toContain(
+      "bounded-secondary-provenance-and-wide-tail",
+    );
+    expect(frame).toContain("shell-card-fixture-with-bounded-secondary-provenance-and-wide-tail");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {

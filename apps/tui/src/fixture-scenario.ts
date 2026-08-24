@@ -35,6 +35,7 @@ export const fixtureScenarios = [
   "tool-artifact",
   "unsafe-history",
   "unsafe-output",
+  "write",
 ] as const;
 
 export type FixtureScenario = (typeof fixtureScenarios)[number];

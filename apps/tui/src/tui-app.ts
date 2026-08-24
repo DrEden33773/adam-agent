@@ -67,6 +67,7 @@ import { SkillPalette } from "./skill-palette.js";
 import { TargetPicker } from "./target-picker.js";
 import { createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
+import { ToolPreview } from "./tool-preview.js";
 
 export type { ClipboardAdapter, DeadlineScheduler } from "./exit-policy.js";
 
@@ -777,6 +778,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
               ? label
               : `${label} ${safeTerminalText(subject)}`;
         tool.addChild(new ResponsiveLine(theme.toolTitle(title)));
+        if (item.preview !== null) {
+          tool.addChild(new ToolPreview(item.preview, toolDetailsExpanded, theme));
+        }
         const detail = item.resultSummary ?? toolStatusText(item.status, item.outcome?.status);
         if (detail !== null) {
           tool.addChild(new ResponsiveLine(theme.toolOutput(safeTerminalText(detail))));

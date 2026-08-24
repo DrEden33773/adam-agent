@@ -9,6 +9,7 @@
   "dependencies": {
     "@adam-agent/agent": "workspace:*",
     "@adam-agent/presentation": "workspace:*",
-    "@earendil-works/pi-tui": "0.84.2"
+    "@earendil-works/pi-tui": "0.84.2",
+    "highlight.js": "11.11.1"
   }
 }
