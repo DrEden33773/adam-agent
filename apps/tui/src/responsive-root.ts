@@ -8,21 +8,25 @@ export function terminalSizeIsSupported(columns: number, rows: number): boolean 
 }
 
 export class ResponsiveRoot extends Container {
+  readonly #columns: () => number;
   readonly #rows: () => number;
 
-  constructor(rows: () => number) {
+  constructor(rows: () => number, columns?: () => number) {
     super();
     this.#rows = rows;
+    this.#columns = columns ?? (() => Number.NaN);
   }
 
   override render(width: number): string[] {
+    const physicalColumns = this.#columns();
+    const columns = Number.isFinite(physicalColumns) ? physicalColumns : width;
     const rows = this.#rows();
-    if (terminalSizeIsSupported(width, rows)) {
+    if (terminalSizeIsSupported(columns, rows)) {
       return super.render(width);
     }
     return [
       "Terminal too small",
-      `${width}×${rows} · resize to ${minimumTerminalColumns}×${minimumTerminalRows} or larger`,
+      `${columns}×${rows} · resize to ${minimumTerminalColumns}×${minimumTerminalRows} or larger`,
       "Ctrl+C abort/exit · Esc deny/close · Ctrl+Q exit",
     ].map((line) => truncateToWidth(line, Math.max(0, width)));
   }
@@ -35,7 +39,12 @@ export type ResponsiveTextContent = {
 };
 
 export class ResponsiveText implements Component {
+  readonly #columns: ((renderWidth: number) => number) | undefined;
   #content: ResponsiveTextContent = { narrow: "", standard: "", wide: "" };
+
+  constructor(columns?: (renderWidth: number) => number) {
+    this.#columns = columns;
+  }
 
   invalidate(): void {}
 
@@ -45,10 +54,11 @@ export class ResponsiveText implements Component {
   }
 
   render(width: number): string[] {
+    const columns = this.#columns?.(width) ?? width;
     const content =
-      width >= 120
+      columns >= 120
         ? this.#content.wide
-        : width >= 80
+        : columns >= 80
           ? this.#content.standard
           : this.#content.narrow;
     return new Text(content).render(width);

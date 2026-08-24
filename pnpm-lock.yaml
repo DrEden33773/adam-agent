@@ -4,6 +4,9 @@ settings:
   autoInstallPeers: true
   excludeLinksFromLockfile: false
 
+patchedDependencies:
+  '@earendil-works/pi-tui@0.84.2': bd1e6d9a618b183c8a4050a6754bcaa706661ded6882cfc6465a3775a0789a7f
+
 importers:
 
   .:
@@ -49,7 +52,10 @@ importers:
         version: link:../../packages/presentation
       '@earendil-works/pi-tui':
         specifier: 0.84.2
-        version: 0.84.2
+        version: 0.84.2(patch_hash=bd1e6d9a618b183c8a4050a6754bcaa706661ded6882cfc6465a3775a0789a7f)
+      highlight.js:
+        specifier: 11.11.1
+        version: 11.11.1
 
   packages/agent:
     dependencies:
@@ -642,6 +648,10 @@ packages:
   globby@16.2.2:
     resolution: {integrity: sha512-NLvV9ubZ6NDsJaOpKPy3cQeJpKi9DcWiyCiFUpJPA0YihRqiE6RWaLUmgNNPr8MgPpLZjnBjSmou7uZBRJv9wA==}
     engines: {node: '>=20'}
+
+  highlight.js@11.11.1:
+    resolution: {integrity: sha512-Xwwo44whKBVCYoliBQwaPvtd/2tYFkRQtXDWj1nackaV2JPXx3L0+Jvd8/qCJ2p+ML0/XVkJ2q+Mr+UVdpJK5w==}
+    engines: {node: '>=12.0.0'}
 
   ignore@7.0.6:
     resolution: {integrity: sha512-BAg6QkE8W+TuQLrrw0Ugr7HegXduRuuj8/ti2kSOc+jz1dmx8/WNcjr6XGnq5YpDWxFwwaavqD0+jIUOKelTsw==}
@@ -1293,7 +1303,7 @@ snapshots:
   '@biomejs/cli-win32-x64@2.5.8':
     optional: true
 
-  '@earendil-works/pi-tui@0.84.2':
+  '@earendil-works/pi-tui@0.84.2(patch_hash=bd1e6d9a618b183c8a4050a6754bcaa706661ded6882cfc6465a3775a0789a7f)':
     dependencies:
       get-east-asian-width: 1.6.0
       marked: 18.0.5
@@ -1615,6 +1625,8 @@ snapshots:
       is-path-inside: 4.0.0
       slash: 5.1.0
       unicorn-magic: 0.4.0
+
+  highlight.js@11.11.1: {}
 
   ignore@7.0.6: {}
 

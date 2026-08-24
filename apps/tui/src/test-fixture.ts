@@ -157,7 +157,10 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       : {}),
     ...(modelTargets === undefined ? {} : { modelTargets }),
     permissions: createPermissionPolicy({
-      allowedEffects: options.scenario === "tool-artifact" ? ["read", "execute"] : ["read"],
+      allowedEffects:
+        options.scenario === "tool-artifact" || options.scenario === "shell"
+          ? ["read", "execute"]
+          : ["read"],
       askedEffects: ["write"],
     }),
     stateRoot: options.stateRoot,
@@ -736,6 +739,24 @@ function createFixtureModelTargets(options: {
           return;
         }
         yield { type: "text_delta", text: "Read complete." };
+      } else if (options.scenario === "write") {
+        const latest = request.messages.at(-1);
+        if (latest?.role === "user") {
+          const content = Array.from(
+            { length: 12 },
+            (_, index) => `export const value${String(index + 1).padStart(2, "0")} = ${index + 1};`,
+          ).join("\n");
+          yield { type: "tool_call_start", id: "write-file", name: "write_file" };
+          yield {
+            type: "tool_call_delta",
+            id: "write-file",
+            json: JSON.stringify({ path: "created.ts", content: `${content}\n` }),
+          };
+          yield { type: "tool_call_end", id: "write-file" };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: "Write complete." };
       } else if (
         options.scenario === "mutation" ||
         options.scenario === "mutation-after-release" ||

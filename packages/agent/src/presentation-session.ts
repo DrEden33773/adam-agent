@@ -14,6 +14,7 @@ import type {
   SessionSummary,
   SkillCatalogDisplay,
   ToolCallDisplay,
+  ToolPreviewDisplay,
   TranscriptItem,
 } from "@adam-agent/presentation";
 import {
@@ -125,6 +126,7 @@ export async function createPresentationSession(
   options: CreatePresentationSessionOptions,
 ): Promise<PresentationSession> {
   options.lifecycle.enableAutomaticTitles();
+  const changePreviewCache = new Map<string, ToolPreviewDisplay | null>();
   const bufferedEvents: SessionRuntimeNotification[] = [];
   const bufferedMetadata: SessionMetadataEvent[] = [];
   let handleRuntime: ((notification: SessionRuntimeNotification) => void) | undefined;
@@ -210,7 +212,15 @@ export async function createPresentationSession(
     const advanceSessionCursor = (sequence: number): void => {
       activeSessionThroughSequence = Math.max(activeSessionThroughSequence, sequence);
     };
-    let transcript: readonly TranscriptItem[] = projectTranscript(records, projectedOperations);
+    const initialPreviewHydration = hydrateChangePreviews(records, options, changePreviewCache);
+    if (initialPreviewHydration !== null) {
+      await initialPreviewHydration;
+    }
+    let transcript: readonly TranscriptItem[] = projectTranscript(
+      records,
+      projectedOperations,
+      changePreviewCache,
+    );
     const historyPageSize = boundedHistoryPageSize(options[presentationHistoryPageSize]);
     let loadedTranscriptStart = Math.max(0, transcript.length - historyPageSize);
     const naming =
@@ -766,7 +776,19 @@ export async function createPresentationSession(
       const activatedContextUsage = await options.lifecycle.inspectContextUsage({
         sessionId: snapshot.sessionId,
       });
-      const activatedTranscript = projectTranscript(activatedRecords, activatedOperations);
+      const activatedPreviewHydration = hydrateChangePreviews(
+        activatedRecords,
+        options,
+        changePreviewCache,
+      );
+      if (activatedPreviewHydration !== null) {
+        await activatedPreviewHydration;
+      }
+      const activatedTranscript = projectTranscript(
+        activatedRecords,
+        activatedOperations,
+        changePreviewCache,
+      );
       const activatedLoadedTranscriptStart = Math.max(
         0,
         activatedTranscript.length - historyPageSize,
@@ -1131,7 +1153,19 @@ export async function createPresentationSession(
             if (closed || current === null || current.session.id !== active.session.id) {
               return;
             }
-            transcript = projectTranscript(refreshedRecords, refreshedOperations);
+            const refreshedPreviewHydration = hydrateChangePreviews(
+              refreshedRecords,
+              options,
+              changePreviewCache,
+            );
+            if (refreshedPreviewHydration !== null) {
+              await refreshedPreviewHydration;
+            }
+            transcript = projectTranscript(
+              refreshedRecords,
+              refreshedOperations,
+              changePreviewCache,
+            );
             loadedTranscriptStart = Math.min(
               loadedTranscriptStart,
               Math.max(0, transcript.length - historyPageSize),
@@ -3006,9 +3040,10 @@ async function readPresentationSessionRecords(
 
 function projectTranscript(
   records: readonly SourcedSessionRecord[],
-  operations: readonly ProjectedOperation[] = [],
+  operations: readonly ProjectedOperation[],
+  changePreviewCache: ReadonlyMap<string, ToolPreviewDisplay | null>,
 ): readonly TranscriptItem[] {
-  const toolDisplays = collectToolDisplays(records);
+  const toolDisplays = collectToolDisplays(records, changePreviewCache);
   const attemptProviders = new Map<string, string>(
     records.flatMap(({ entry, sessionId }) =>
       entry.schemaVersion === 3 && entry.record.type === "provider_attempt_started"
@@ -3404,9 +3439,9 @@ type MutableToolDisplay = {
   changePreviewRef?: NonNullable<ToolCallDisplay["changePreviewRef"]>;
 };
 
-function collectToolDisplays(
+function collectMutableToolDisplays(
   records: readonly SourcedSessionRecord[],
-): ReadonlyMap<string, ToolCallDisplay> {
+): ReadonlyMap<string, MutableToolDisplay> {
   const tools = new Map<string, MutableToolDisplay>();
   const toolFor = (sessionId: string, callId: string): MutableToolDisplay => {
     const key = `${sessionId}:${callId}`;
@@ -3487,6 +3522,14 @@ function collectToolDisplays(
     }
   }
 
+  return tools;
+}
+
+function collectToolDisplays(
+  records: readonly SourcedSessionRecord[],
+  changePreviewCache: ReadonlyMap<string, ToolPreviewDisplay | null>,
+): ReadonlyMap<string, ToolCallDisplay> {
+  const tools = collectMutableToolDisplays(records);
   return new Map(
     [...tools.entries()].flatMap(([key, tool]) => {
       if (tool.sequence === undefined) {
@@ -3519,6 +3562,13 @@ function collectToolDisplays(
                 : `${tool.failure.code}: ${tool.failure.message}`,
             artifacts: toolArtifacts(tool.output),
             changePreviewRef: tool.changePreviewRef ?? null,
+            preview: toolPreview(
+              name,
+              tool.output,
+              subject,
+              tool.changePreviewRef,
+              changePreviewCache,
+            ),
           },
         ] as const,
       ];
@@ -3826,6 +3876,292 @@ function toolResultSummary(name: string, output: JsonValue | undefined): string 
   return output === undefined ? null : "Completed";
 }
 
+const toolTextPreviewMaximumBytes = 16 * 1024;
+const toolTextPreviewMaximumLines = 200;
+const toolShellStreamPreviewMaximumBytes = 8 * 1024;
+
+function hydrateChangePreviews(
+  records: readonly SourcedSessionRecord[],
+  options: PresentationSessionRecordOptions,
+  changePreviewCache: Map<string, ToolPreviewDisplay | null>,
+): Promise<void> | null {
+  const pending = [...collectMutableToolDisplays(records).values()].flatMap((tool) => {
+    const name = tool.name;
+    const reference = tool.changePreviewRef;
+    if (
+      (name !== "write_file" && name !== "edit_file") ||
+      reference === undefined ||
+      changePreviewCache.has(reference.id)
+    ) {
+      return [];
+    }
+    changePreviewCache.set(reference.id, null);
+    return [
+      projectChangePreview(name, reference, options).then((preview) => {
+        changePreviewCache.set(reference.id, preview);
+      }),
+    ];
+  });
+  return pending.length === 0 ? null : Promise.all(pending).then(() => undefined);
+}
+
+function toolPreview(
+  name: string,
+  output: JsonValue | undefined,
+  subject: ToolCallDisplay["subject"],
+  changePreviewRef: ToolCallDisplay["changePreviewRef"] | undefined,
+  changePreviewCache: ReadonlyMap<string, ToolPreviewDisplay | null>,
+): ToolCallDisplay["preview"] {
+  const outputRecord = jsonRecord(output);
+  if (name === "read_file" && typeof outputRecord?.content === "string") {
+    const bounded = boundedTextLines(
+      outputRecord.content,
+      toolTextPreviewMaximumBytes,
+      toolTextPreviewMaximumLines,
+    );
+    return {
+      kind: "read_text",
+      language: subject?.type === "path" ? languageForPath(subject.value) : null,
+      lines: bounded.lines.map((text, index) => ({ number: index + 1, text })),
+      omittedBytes: bounded.omittedBytes,
+      sourceTruncated: outputRecord.truncated === true,
+    };
+  }
+  if (
+    (name === "write_file" || name === "edit_file") &&
+    changePreviewRef !== undefined &&
+    changePreviewRef !== null
+  ) {
+    return changePreviewCache.get(changePreviewRef.id) ?? null;
+  }
+  if (name === "run_shell") {
+    const termination = jsonRecord(outputRecord?.termination);
+    const stdout = jsonRecord(outputRecord?.stdout);
+    const stderr = jsonRecord(outputRecord?.stderr);
+    const projectedTermination = shellTerminationPreview(termination);
+    const projectedStdout = shellStreamPreview(stdout);
+    const projectedStderr = shellStreamPreview(stderr);
+    return projectedTermination === null || projectedStdout === null || projectedStderr === null
+      ? null
+      : {
+          kind: "shell_output",
+          termination: projectedTermination,
+          stdout: projectedStdout,
+          stderr: projectedStderr,
+        };
+  }
+  return null;
+}
+
+async function projectChangePreview(
+  name: "write_file" | "edit_file",
+  reference: NonNullable<ToolCallDisplay["changePreviewRef"]>,
+  options: PresentationSessionRecordOptions,
+): Promise<ToolPreviewDisplay | null> {
+  if (
+    options.stateRoot === undefined ||
+    reference.byteCount <= 0 ||
+    !reference.mediaType.startsWith("text/x-diff")
+  ) {
+    return null;
+  }
+  try {
+    const page = await readFileArtifactRange({
+      root: join(options.stateRoot, "artifacts"),
+      id: reference.id,
+      expectedByteCount: reference.byteCount,
+      offset: 0,
+      maximumBytes: Math.min(reference.byteCount, presentationArtifactPageMaximumBytes),
+    });
+    if (page === undefined || page.totalByteCount !== reference.byteCount) {
+      return null;
+    }
+    const decoded = decodeArtifactPage(page.bytes, page.eof);
+    const bounded = boundedTextLines(
+      decoded.text,
+      toolTextPreviewMaximumBytes,
+      toolTextPreviewMaximumLines,
+    );
+    const omittedBytes =
+      Math.max(0, reference.byteCount - decoded.byteCount) + bounded.omittedBytes;
+    const path = bounded.lines.find((line) => line.startsWith("+++ b/"))?.slice("+++ b/".length);
+    if (name === "write_file") {
+      const lines = bounded.lines
+        .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+        .map((line, index) => ({ number: index + 1, text: line.slice(1) }));
+      return {
+        kind: "write_text",
+        language: path === undefined ? null : languageForPath(path),
+        lines,
+        omittedBytes,
+      };
+    }
+    return {
+      kind: "diff",
+      language: path === undefined ? null : languageForPath(path),
+      lines: bounded.lines.map((line) => {
+        const kind = diffLineKind(line);
+        return {
+          kind,
+          oldLineNumber: null,
+          newLineNumber: null,
+          text: kind === "addition" || kind === "deletion" ? line.slice(1) : line,
+        };
+      }),
+      omittedBytes,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function diffLineKind(line: string): "meta" | "context" | "addition" | "deletion" {
+  if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("@@")) {
+    return "meta";
+  }
+  if (line.startsWith("+")) {
+    return "addition";
+  }
+  if (line.startsWith("-")) {
+    return "deletion";
+  }
+  return "context";
+}
+
+function boundedTextLines(
+  text: string,
+  maximumBytes: number,
+  maximumLines: number,
+): { readonly lines: readonly string[]; readonly omittedBytes: number } {
+  const sourceBytes = Buffer.byteLength(text, "utf8");
+  const sourceLines = text.split("\n");
+  if (sourceLines.at(-1) === "") {
+    sourceLines.pop();
+  }
+  const lines: string[] = [];
+  let consumedBytes = 0;
+  for (const [index, line] of sourceLines.entries()) {
+    if (lines.length >= maximumLines || consumedBytes >= maximumBytes) {
+      break;
+    }
+    const lineBytes = Buffer.byteLength(line, "utf8");
+    const newlineBytes = index < sourceLines.length - 1 || text.endsWith("\n") ? 1 : 0;
+    if (consumedBytes + lineBytes + newlineBytes <= maximumBytes) {
+      lines.push(line);
+      consumedBytes += lineBytes + newlineBytes;
+      continue;
+    }
+    const remainingBytes = maximumBytes - consumedBytes;
+    const prefix = boundedUtf8Prefix(line, remainingBytes);
+    if (prefix.byteCount > 0 || lines.length === 0) {
+      lines.push(prefix.text);
+      consumedBytes += prefix.byteCount;
+    }
+    break;
+  }
+  return { lines, omittedBytes: Math.max(0, sourceBytes - consumedBytes) };
+}
+
+function boundedUtf8Prefix(
+  text: string,
+  maximumBytes: number,
+): { readonly text: string; readonly byteCount: number } {
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.byteLength <= maximumBytes) {
+    return { text, byteCount: bytes.byteLength };
+  }
+  let end = Math.max(0, maximumBytes);
+  while (end > 0 && (bytes[end] ?? 0) >= 0x80 && (bytes[end] ?? 0) < 0xc0) {
+    end -= 1;
+  }
+  return { text: bytes.subarray(0, end).toString("utf8"), byteCount: end };
+}
+
+function boundedUtf8Tail(
+  text: string,
+  maximumBytes: number,
+): { readonly text: string; readonly byteCount: number } {
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.byteLength <= maximumBytes) {
+    return { text, byteCount: bytes.byteLength };
+  }
+  let start = bytes.byteLength - maximumBytes;
+  while (start < bytes.byteLength && (bytes[start] ?? 0) >= 0x80 && (bytes[start] ?? 0) < 0xc0) {
+    start += 1;
+  }
+  return {
+    text: bytes.subarray(start).toString("utf8"),
+    byteCount: bytes.byteLength - start,
+  };
+}
+
+function shellStreamPreview(value: KnownJsonRecord | undefined): {
+  readonly text: string;
+  readonly totalBytes: number;
+  readonly omittedBytes: number;
+} | null {
+  if (
+    typeof value?.tail !== "string" ||
+    typeof value.totalBytes !== "number" ||
+    typeof value.omittedBytes !== "number"
+  ) {
+    return null;
+  }
+  const bounded = boundedUtf8Tail(value.tail, toolShellStreamPreviewMaximumBytes);
+  const retainedBytes = Buffer.byteLength(value.tail, "utf8");
+  return {
+    text: bounded.text,
+    totalBytes: value.totalBytes,
+    omittedBytes: value.omittedBytes + retainedBytes - bounded.byteCount,
+  };
+}
+
+function shellTerminationPreview(
+  value: KnownJsonRecord | undefined,
+): Extract<ToolCallDisplay["preview"], { readonly kind: "shell_output" }>["termination"] | null {
+  if (value?.type === "exited" && typeof value.exitCode === "number") {
+    return { type: "exited", exitCode: value.exitCode };
+  }
+  if (value?.type === "timed_out" || value?.type === "interrupted") {
+    return { type: value.type };
+  }
+  return value?.type === "signalled" && typeof value.signal === "string"
+    ? { type: "signalled", signal: value.signal }
+    : null;
+}
+
+function languageForPath(path: string): string | null {
+  const extension = /\.([^./]+)$/u.exec(path)?.[1]?.toLowerCase();
+  const languages: Readonly<Record<string, string>> = {
+    bash: "bash",
+    c: "c",
+    cc: "cpp",
+    cpp: "cpp",
+    css: "css",
+    go: "go",
+    h: "c",
+    hpp: "cpp",
+    html: "html",
+    java: "java",
+    js: "javascript",
+    json: "json",
+    jsx: "javascript",
+    kt: "kotlin",
+    kts: "kotlin",
+    md: "markdown",
+    py: "python",
+    rb: "ruby",
+    rs: "rust",
+    sh: "bash",
+    sql: "sql",
+    ts: "typescript",
+    tsx: "typescript",
+    yaml: "yaml",
+    yml: "yaml",
+  };
+  return extension === undefined ? "text" : (languages[extension] ?? "text");
+}
+
 function boundedDisplayText(value: string): string {
   return [...value.replaceAll(/\s+/gu, " ").trim()].slice(0, 240).join("");
 }
@@ -3874,6 +4210,8 @@ type KnownJsonRecord = Readonly<Record<string, JsonValue>> & {
   readonly artifact?: JsonValue;
   readonly type?: JsonValue;
   readonly exitCode?: JsonValue;
+  readonly signal?: JsonValue;
+  readonly tail?: JsonValue;
   readonly totalBytes?: JsonValue;
   readonly omittedBytes?: JsonValue;
   readonly omittedContentBlocks?: JsonValue;

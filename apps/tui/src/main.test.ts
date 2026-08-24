@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, expect, test } from "vitest";
+import { AppliedViewportTerminal } from "./applied-viewport-terminal.test-support.js";
 import { runTuiFixture } from "./test-fixture.js";
 import {
   readFilesRecursively,
@@ -447,10 +448,35 @@ function latestSynchronizedFrame(output: string): readonly string[] {
   if (start < 0 || end < 0) {
     throw new Error("The TUI did not emit one complete synchronized frame.");
   }
-  return output
+  const frame = output
     .slice(start + "\u001b[?2026h".length, end)
-    .replace("\u001b[2J\u001b[H\u001b[3J", "")
-    .split("\r\n");
+    .replace("\u001b[2J\u001b[H\u001b[3J", "");
+  const absoluteRows = [...frame.matchAll(new RegExp(`${"\u001b"}\\[(\\d+);1H`, "gu"))];
+  if (absoluteRows.length === 0) {
+    return frame.split("\r\n");
+  }
+  const lines: string[] = [];
+  for (const [index, match] of absoluteRows.entries()) {
+    const row = Number(match[1]) - 1;
+    const contentStart = (match.index ?? 0) + match[0].length;
+    const contentEnd = absoluteRows[index + 1]?.index ?? frame.length;
+    const content = frame.slice(contentStart, contentEnd);
+    if (content === "\u001b[2K") {
+      lines[row] = "";
+    } else if (content.length > 0) {
+      lines[row] = content.startsWith("\u001b[2K") ? content.slice("\u001b[2K".length) : content;
+    }
+  }
+  return lines.map((line) => line ?? "");
+}
+
+async function inputAndWaitForPhysicalFrame(
+  terminal: AppliedViewportTerminal,
+  input: string,
+): Promise<void> {
+  const frame = terminal.frame;
+  terminal.input(input);
+  await terminal.nextFrame(frame);
 }
 
 function expectFramedOverlay(output: string, title: string): void {
@@ -1387,7 +1413,7 @@ test("an active operation card keeps its status, action, identity, and draft thr
     let operationId: string | undefined;
     for (const columns of [120, 80, 40]) {
       const beforeResize = fixture.output().length;
-      await fixture.resize(columns, 24);
+      await fixture.resize(columns, 40);
       await fixture.waitForCompleteFrameAfter("Ctrl+C cancel", beforeResize);
       const lines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
       const frame = lines.join("\n");
@@ -1432,7 +1458,7 @@ test("a 40-column operation card keeps exact long provenance identities reachabl
     fixture.write("/review\r");
     await fixture.waitFor("Ctrl+C cancel");
     const beforeResize = fixture.output().length;
-    await fixture.resize(40, 24);
+    await fixture.resize(40, 60);
     await fixture.waitForCompleteFrameAfter("Ctrl+C cancel", beforeResize);
     const lines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
     const compactFrame = lines
@@ -2503,6 +2529,7 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     let frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
     expect(frame).not.toContain("Inspect ");
     expect(frame).not.toContain("Working");
+    expect(frame).not.toContain("╭");
 
     fixture.write("\u0014");
     await fixture.waitFor("Inspect ");
@@ -2511,6 +2538,10 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     await fixture.resize(79, 24);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
     expect(frame).toContain("Inspect ");
+    expect(frame).toContain("╭");
+    expect(frame).toContain("╮");
+    expect(frame).toContain("╰");
+    expect(frame).toContain("╯");
     beforeFrame = fixture.output().length;
     fixture.write("\u001b[116;5:3u");
     await fixture.resize(40, 12);
@@ -2532,6 +2563,7 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     await fixture.waitFor("Thinking done · adam");
     await fixture.waitFor("Reasoning answer.");
     await fixture.waitForAfter(" · idle", beforeCompletion);
+    await fixture.waitForAfter("Adam · Streaming session", beforeCompletion);
     beforeFrame = fixture.output().length;
     await fixture.resize(80, 24);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
@@ -2542,7 +2574,6 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(
       "Reasoning answer.",
     );
-    await fixture.waitForAfter("Adam · Streaming session", beforeCompletion);
     fixture.write("/session\r");
     await fixture.waitFor("Session facts");
     beforeFrame = fixture.output().length;
@@ -2972,6 +3003,83 @@ test("the real TUI opens exact next-turn Skill metadata instead of submitting a 
   }
 });
 
+test("repeated Skill navigation leaves the physical viewport and the next overlay clean", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-viewport-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillRoot = join(workspaceRoot, ".agents", "skills");
+  await mkdir(skillRoot, { recursive: true });
+  await Promise.all(
+    Array.from({ length: 64 }, async (_, index) => {
+      const name = `viewport-${String(index).padStart(2, "0")}`;
+      const directory = join(skillRoot, name);
+      await mkdir(directory);
+      await writeFile(
+        join(directory, "SKILL.md"),
+        `---\nname: ${name}\ndescription: Deterministic viewport Skill ${index}.\n---\nBody.\n`,
+        "utf8",
+      );
+    }),
+  );
+  const terminal = new AppliedViewportTerminal({
+    columns: 120,
+    commitPendingWrapAtFrameEnd: true,
+    rows: 30,
+  });
+  const execution = runTuiFixture({
+    scenario: "history",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    const interactionOutputOffset = terminal.output().length;
+    await inputAndWaitForPhysicalFrame(terminal, "/skills");
+    await inputAndWaitForPhysicalFrame(terminal, "\r");
+    expect(terminal.lines().join("\n")).toContain("Select next-turn Skills");
+    let maximumSkillRows = 0;
+    let minimumUniqueSkillRows = Number.POSITIVE_INFINITY;
+    for (let step = 0; step < 56; step += 1) {
+      await inputAndWaitForPhysicalFrame(terminal, "\u001b[B");
+      const skillRows = terminal.lines().filter((line) => line.includes("skill:v1:"));
+      maximumSkillRows = Math.max(maximumSkillRows, skillRows.length);
+      minimumUniqueSkillRows = Math.min(minimumUniqueSkillRows, new Set(skillRows).size);
+    }
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b");
+    const afterSkills = terminal.lines().join("\n");
+    await inputAndWaitForPhysicalFrame(terminal, "/tree");
+    await inputAndWaitForPhysicalFrame(terminal, "\r");
+    const treeViewport = terminal.lines().join("\n");
+
+    expect({
+      maximumSkillRows,
+      minimumUniqueSkillRows,
+      skillsRemainAfterClose:
+        afterSkills.includes("Select next-turn Skills") || afterSkills.includes("skill:v1:"),
+      treeOpened: treeViewport.includes("Active chronology"),
+      skillsLeakIntoTree:
+        treeViewport.includes("Select next-turn Skills") || treeViewport.includes("skill:v1:"),
+      scrollbackWasCleared: terminal.output().slice(interactionOutputOffset).includes("\u001b[3J"),
+    }).toEqual({
+      maximumSkillRows: 8,
+      minimumUniqueSkillRows: 8,
+      skillsRemainAfterClose: false,
+      treeOpened: true,
+      skillsLeakIntoTree: false,
+      scrollbackWasCleared: false,
+    });
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the Skill palette renders untrusted metadata and diagnostic identities as inert text", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-controls-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -3304,13 +3412,15 @@ test("a real read tool is rendered as a bounded Pi-style tool card", async () =>
   await writeFile(join(workspaceRoot, "README.md"), "# Fixture\n\nReadable content.\n", "utf8");
 
   try {
-    const fixture = startFixture({ scenario: "read", stateRoot, workspaceRoot });
+    const fixture = startFixture({ noColor: true, scenario: "read", stateRoot, workspaceRoot });
     await fixture.waitForCompleteFrameAfter("Adam · New session", 0);
     await fixture.waitForCompleteFrameAfter(" · idle", 0);
     fixture.write("Read README\r");
     await fixture.waitFor("read README.md");
     await fixture.waitFor("29 bytes");
     await fixture.waitFor("Read complete");
+    await fixture.waitFor("1 │ # Fixture");
+    await fixture.waitFor("3 │ Readable content.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -3323,16 +3433,25 @@ test("Ctrl+O toggles bounded authoritative tool details", async () => {
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
-  await writeFile(join(workspaceRoot, "README.md"), "alpha\nbeta\n", "utf8");
+  await writeFile(
+    join(workspaceRoot, "README.md"),
+    `${Array.from({ length: 12 }, (_, index) => `line${String(index + 1).padStart(2, "0")}`).join(
+      "\n",
+    )}\n`,
+    "utf8",
+  );
 
   try {
-    const fixture = startFixture({ scenario: "read", stateRoot, workspaceRoot });
+    const fixture = startFixture({ noColor: true, scenario: "read", stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     fixture.write("Read the README\r");
     await fixture.waitFor("Read complete");
+    expect(fixture.output()).toContain("10 │ line10");
+    expect(fixture.output()).not.toContain("11 │ line11");
     expect(fixture.output()).not.toContain("provider model response");
     const beforeExpand = fixture.output().length;
     fixture.write("\u000f");
+    await fixture.waitForAfter("12 │ line12", beforeExpand);
     await fixture.waitForAfter("read_file · read · completed · replay safe", beforeExpand);
     await fixture.waitForAfter("provider model response", beforeExpand);
     await fixture.waitForAfter("duration unavailable", beforeExpand);
@@ -3342,8 +3461,62 @@ test("Ctrl+O toggles bounded authoritative tool details", async () => {
     await fixture.waitForAfter("provider model response", beforeRestore);
     const beforeCollapse = fixture.output().length;
     fixture.write("\u000f");
-    await fixture.waitForAfter("11 bytes", beforeCollapse);
+    await fixture.waitForAfter("84 bytes", beforeCollapse);
     expect(fixture.output().slice(beforeCollapse)).not.toContain("provider model response");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a settled write card previews numbered content from its canonical change artifact", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-write-preview-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ noColor: true, scenario: "write", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Create a TypeScript file\r");
+    await fixture.waitFor("Permission required");
+    await fixture.waitFor("+export const value12 = 12;");
+    const beforeAllow = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForAfter("Write complete.", beforeAllow);
+    await fixture.waitForAfter(" 1 │ export const value01 = 1;", beforeAllow);
+    await fixture.waitForAfter("10 │ export const value10 = 10;", beforeAllow);
+    expect(fixture.output().slice(beforeAllow)).not.toContain("11 │ export const value11");
+    await expect(readFile(join(workspaceRoot, "created.ts"), "utf8")).resolves.toContain(
+      "export const value12 = 12;",
+    );
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a settled edit card previews its canonical diff without inventing line coordinates", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-edit-preview-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "edit.txt"), "before\n", "utf8");
+
+  try {
+    const fixture = startFixture({ noColor: true, scenario: "mutation", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Edit the file\r");
+    await fixture.waitFor("Permission required");
+    await fixture.waitFor("+after");
+    const beforeAllow = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForAfter("Edit complete.", beforeAllow);
+    await fixture.waitForAfter("  - │ before", beforeAllow);
+    await fixture.waitForAfter("  + │ after", beforeAllow);
+    await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("after\n");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -3490,10 +3663,13 @@ test("a shell tool card uses the accepted dollar-command grammar", async () => {
   await mkdir(workspaceRoot);
 
   try {
-    const fixture = startFixture({ scenario: "shell", stateRoot, workspaceRoot });
+    const fixture = startFixture({ noColor: true, scenario: "shell", stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     fixture.write("Show shell card\r");
     await fixture.waitFor("$ printf shell-card-fixture");
+    await fixture.waitFor("Shell card complete.");
+    await fixture.waitFor("stdout");
+    expect(fixture.output()).not.toContain("stderr");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -3520,9 +3696,13 @@ test("tool subjects keep their full bounded value only in the 120-column layout"
 
     beforeResize = fixture.output().length;
     await fixture.resize(80, 24);
-    frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    const frameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+    frame = frameLines.join("\n");
     expect(frame).toContain("$ printf shell-card-fixture");
-    expect(frame).not.toContain("bounded-secondary-provenance-and-wide-tail");
+    expect(frameLines.find((line) => line.includes("$ printf"))).not.toContain(
+      "bounded-secondary-provenance-and-wide-tail",
+    );
+    expect(frame).toContain("shell-card-fixture-with-bounded-secondary-provenance-and-wide-tail");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {

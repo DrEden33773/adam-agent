@@ -5,6 +5,12 @@ import type { EditorTheme, MarkdownTheme } from "@earendil-works/pi-tui";
  * commit cd09277df06621155d9c4c20e45309bce5341779 (MIT). See THIRD_PARTY_NOTICES.md.
  */
 
+export type AdamSyntaxTheme = Readonly<
+  Record<string, (text: string) => string> & {
+    readonly default: (text: string) => string;
+  }
+>;
+
 export type AdamTuiTheme = {
   readonly allow: (text: string) => string;
   readonly danger: (text: string) => string;
@@ -16,6 +22,10 @@ export type AdamTuiTheme = {
   readonly muted: (text: string) => string;
   readonly primary: (text: string) => string;
   readonly subject: (text: string) => string;
+  readonly syntax: AdamSyntaxTheme;
+  readonly lineNumber: (text: string) => string;
+  readonly diffAddition: (text: string) => string;
+  readonly diffDeletion: (text: string) => string;
   readonly toolBackground: (text: string) => string;
   readonly toolOutput: (text: string) => string;
   readonly toolTitle: (text: string) => string;
@@ -43,6 +53,9 @@ export function createAdamTuiTheme(noColor = noColorRequested()): AdamTuiTheme {
   const blue = color(137, 180, 250);
   const pink = color(245, 194, 231);
   const teal = color(148, 226, 213);
+  const peach = color(250, 179, 135);
+  const yellow = color(249, 226, 175);
+  const lavender = color(180, 190, 254);
   const overlay = color(108, 112, 134);
   const subtext = color(186, 194, 222);
   const crust = color(17, 17, 27);
@@ -52,6 +65,35 @@ export function createAdamTuiTheme(noColor = noColorRequested()): AdamTuiTheme {
     muted,
     keyword: bold(mauve),
     subject: blue,
+    lineNumber: overlay,
+    diffAddition: green,
+    diffDeletion: red,
+    syntax: {
+      default: subtext,
+      comment: overlay,
+      quote: overlay,
+      keyword: mauve,
+      literal: mauve,
+      "selector-tag": mauve,
+      string: green,
+      regexp: green,
+      attribute: green,
+      number: peach,
+      bullet: peach,
+      title: blue,
+      section: blue,
+      function: blue,
+      name: blue,
+      type: yellow,
+      class: yellow,
+      params: lavender,
+      variable: pink,
+      "template-variable": pink,
+      meta: teal,
+      doctag: teal,
+      addition: green,
+      deletion: red,
+    },
     danger: red,
     allow: green,
     deny: red,

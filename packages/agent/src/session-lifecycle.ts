@@ -3355,9 +3355,13 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
       const afterSessionId = decodeProjectSessionCatalogCursor(input.cursor);
       const projectId = await canonicalProjectId(options.workspaceRoot);
-      const sessionIds: string[] = [];
-      for (const sessionId of [...(await storeDirectory.listSessionIds())].sort()) {
-        const records = await readSessionRecords(options, sessionId);
+      const directoryEntries = await storeDirectory.listSessionEntries();
+      const catalogEntries: Array<{
+        readonly sessionId: string;
+        readonly modifiedAtMilliseconds: number;
+      }> = [];
+      for (const entry of directoryEntries) {
+        const records = await readSessionRecords(options, entry.sessionId);
         if (
           records.some((entry) =>
             entry.schemaVersion === 3
@@ -3365,15 +3369,27 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               : entry.event.type === "user_message",
           )
         ) {
-          sessionIds.push(sessionId);
+          catalogEntries.push(entry);
         }
       }
-      const afterIndex =
+      catalogEntries.sort(
+        (left, right) =>
+          right.modifiedAtMilliseconds - left.modifiedAtMilliseconds ||
+          (left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0),
+      );
+      const cursorIndex =
+        afterSessionId === undefined
+          ? -1
+          : catalogEntries.findIndex((entry) => entry.sessionId === afterSessionId);
+      const start =
         afterSessionId === undefined
           ? 0
-          : sessionIds.findIndex((sessionId) => sessionId > afterSessionId);
-      const start = afterIndex < 0 ? sessionIds.length : afterIndex;
-      const selectedIds = sessionIds.slice(start, start + limit);
+          : cursorIndex < 0
+            ? catalogEntries.length
+            : cursorIndex + 1;
+      const selectedIds = catalogEntries
+        .slice(start, start + limit)
+        .map((entry) => entry.sessionId);
       const items = await Promise.all(
         selectedIds.map((sessionId) => inspectSession({ sessionId })),
       );
@@ -3382,7 +3398,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         projectId,
         items,
         nextCursor:
-          lastSessionId !== undefined && start + selectedIds.length < sessionIds.length
+          lastSessionId !== undefined && start + selectedIds.length < catalogEntries.length
             ? encodeProjectSessionCatalogCursor(lastSessionId)
             : null,
       };

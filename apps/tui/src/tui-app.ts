@@ -58,6 +58,8 @@ import {
   ResponsiveText,
   terminalSizeIsSupported,
 } from "./responsive-root.js";
+import { RightEdgeGuardTerminal } from "./right-edge-guard-terminal.js";
+import { RoundedFrame } from "./rounded-frame.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { SessionInspector, type SessionRunStatus } from "./session-inspector.js";
 import { SessionPicker } from "./session-picker.js";
@@ -65,6 +67,7 @@ import { SkillPalette } from "./skill-palette.js";
 import { TargetPicker } from "./target-picker.js";
 import { createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
+import { ToolPreview } from "./tool-preview.js";
 
 export type { ClipboardAdapter, DeadlineScheduler } from "./exit-policy.js";
 
@@ -85,7 +88,8 @@ export type RunTuiOptions = {
 };
 
 export async function runTui(options: RunTuiOptions): Promise<void> {
-  const terminal = options.terminal ?? new ProcessTerminal();
+  const physicalTerminal = options.terminal ?? new ProcessTerminal();
+  const terminal = new RightEdgeGuardTerminal(physicalTerminal);
   const deadlineScheduler = options.deadlineScheduler ?? nodeDeadlineScheduler;
   const commandRegistry = options.commandRegistry ?? adamCommandRegistry;
   const startupTargetId =
@@ -95,17 +99,26 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     options.presentation.getState().authoritative.sessions.items.length === 0;
   const tui: TUI = new TuiMainScreen(terminal, true);
   const theme = createAdamTuiTheme();
-  const showOverlay = (component: Component, overlayOptions: OverlayOptions) =>
-    tui.showOverlay(
+  const showOverlay = (component: Component, overlayOptions: OverlayOptions) => {
+    const renderOptions = resolvePhysicalOverlayWidth(
+      overlayOptions,
+      physicalTerminal.columns,
+      terminal.columns,
+    );
+    return tui.showOverlay(
       new OverlayFrame(component, theme, () =>
         resolveOverlayMaximumHeight(overlayOptions, terminal.rows),
       ),
       {
-        ...overlayOptions,
-        visible: (columns, rows) => terminalSizeIsSupported(columns, rows),
+        ...renderOptions,
+        visible: () => terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows),
       },
     );
-  const root = new ResponsiveRoot(() => terminal.rows);
+  };
+  const root = new ResponsiveRoot(
+    () => physicalTerminal.rows,
+    () => physicalTerminal.columns,
+  );
   const header = new Text();
   const transcript = new Container();
   const editorSlot = new Container();
@@ -148,7 +161,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   );
   let projectedHistorySessionId = options.presentation.getState().authoritative.active?.session.id;
   const statusLine = new Text();
-  const footer = new ResponsiveText();
+  const footer = new ResponsiveText(() => physicalTerminal.columns);
   const working = new Loader(tui, theme.toolTitle, theme.muted, "Working", { intervalMs: 80 });
   const thinking = new Loader(tui, theme.keyword, theme.muted, "Thinking", { intervalMs: 80 });
   thinking.stop();
@@ -696,12 +709,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       if (reasoning.status === "active") {
         activeReasoningVisible = true;
         thinking.setMessage(title);
-        transcript.addChild(thinking);
-      } else {
-        transcript.addChild(new Spacer(1));
-        transcript.addChild(new ResponsiveLine(title));
       }
       if (!expanded) {
+        if (reasoning.status === "active") {
+          transcript.addChild(thinking);
+        } else {
+          transcript.addChild(new Spacer(1));
+          transcript.addChild(new ResponsiveLine(title));
+        }
         return;
       }
       const text =
@@ -714,7 +729,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : reasoningArtifactReads.has(reasoning.id)
             ? "Loading provider reasoning…"
             : "Provider reasoning is available as an artifact · Ctrl+T to retry loading");
-      transcript.addChild(new Markdown(safeTerminalText(text), 0, 0, theme.markdown));
+      const content = new Container();
+      content.addChild(reasoning.status === "active" ? thinking : new ResponsiveLine(title));
+      content.addChild(new Markdown(safeTerminalText(text), 0, 0, theme.markdown));
+      transcript.addChild(new Spacer(1));
+      transcript.addChild(new RoundedFrame(content, theme.editor.borderColor));
     };
     let previousWasAssistant = false;
     for (const item of active?.transcript.items ?? []) {
@@ -759,6 +778,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
               ? label
               : `${label} ${safeTerminalText(subject)}`;
         tool.addChild(new ResponsiveLine(theme.toolTitle(title)));
+        if (item.preview !== null) {
+          tool.addChild(new ToolPreview(item.preview, toolDetailsExpanded, theme));
+        }
         const detail = item.resultSummary ?? toolStatusText(item.status, item.outcome?.status);
         if (detail !== null) {
           tool.addChild(new ResponsiveLine(theme.toolOutput(safeTerminalText(detail))));
@@ -2316,7 +2338,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return { consume: true };
     }
     if (
-      !terminalSizeIsSupported(terminal.columns, terminal.rows) &&
+      !terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows) &&
       !commandRegistry.matchesInput(data, "interrupt")
     ) {
       if (commandRegistry.matchesInput(data, "back")) {
@@ -2593,6 +2615,22 @@ function operationActionText(operation: OperationDisplay): string {
         : []),
   ];
   return actions.join(" · ");
+}
+
+function resolvePhysicalOverlayWidth(
+  options: OverlayOptions,
+  physicalColumns: number,
+  renderColumns: number,
+): OverlayOptions {
+  if (typeof options.width !== "string") {
+    return options;
+  }
+  const match = options.width.match(/^(\d+(?:\.\d+)?)%$/u);
+  if (match === null) {
+    return options;
+  }
+  const requested = Math.floor((physicalColumns * Number.parseFloat(match[1] as string)) / 100);
+  return { ...options, width: Math.max(1, Math.min(requested, renderColumns)) };
 }
 
 function resolveOverlayMaximumHeight(

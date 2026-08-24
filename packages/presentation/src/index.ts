@@ -164,6 +164,55 @@ export type SessionNoticeDisplay = {
   | { readonly status: "failed"; readonly code: string; readonly message: string }
 );
 
+export type ToolTextPreviewLine = {
+  readonly number: number;
+  readonly text: string;
+};
+
+export type ToolStreamPreview = {
+  readonly text: string;
+  readonly totalBytes: number;
+  readonly omittedBytes: number;
+};
+
+export type ToolDiffPreviewLine = {
+  readonly kind: "meta" | "context" | "addition" | "deletion";
+  readonly oldLineNumber: number | null;
+  readonly newLineNumber: number | null;
+  readonly text: string;
+};
+
+export type ToolPreviewDisplay =
+  | {
+      readonly kind: "read_text";
+      readonly language: string | null;
+      readonly lines: readonly ToolTextPreviewLine[];
+      readonly omittedBytes: number;
+      readonly sourceTruncated: boolean;
+    }
+  | {
+      readonly kind: "write_text";
+      readonly language: string | null;
+      readonly lines: readonly ToolTextPreviewLine[];
+      readonly omittedBytes: number;
+    }
+  | {
+      readonly kind: "diff";
+      readonly language: string | null;
+      readonly lines: readonly ToolDiffPreviewLine[];
+      readonly omittedBytes: number;
+    }
+  | {
+      readonly kind: "shell_output";
+      readonly termination:
+        | { readonly type: "exited"; readonly exitCode: number }
+        | { readonly type: "timed_out" }
+        | { readonly type: "interrupted" }
+        | { readonly type: "signalled"; readonly signal: string };
+      readonly stdout: ToolStreamPreview;
+      readonly stderr: ToolStreamPreview;
+    };
+
 export type ToolCallDisplay = {
   readonly type: "tool_call";
   readonly id: string;
@@ -217,6 +266,7 @@ export type ToolCallDisplay = {
   readonly resultSummary: string | null;
   readonly artifacts: readonly ArtifactReference[];
   readonly changePreviewRef: ArtifactReference | null;
+  readonly preview: ToolPreviewDisplay | null;
 };
 
 export type OperationLinkDisplay = {

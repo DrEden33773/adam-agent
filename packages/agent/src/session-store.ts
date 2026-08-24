@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { chmod, type FileHandle, mkdir, open, readdir, realpath } from "node:fs/promises";
+import { chmod, type FileHandle, mkdir, open, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -771,8 +771,14 @@ export interface SessionStore<RecordType extends SessionRecord = SessionEventRec
   read(): Promise<readonly RecordType[]>;
 }
 
+export interface SessionStoreDirectoryEntry {
+  readonly sessionId: string;
+  readonly modifiedAtMilliseconds: number;
+}
+
 export interface SessionStoreDirectory<RecordType extends SessionRecord = SessionRecord> {
   create(sessionId: string): Promise<SessionStore<RecordType>>;
+  listSessionEntries(): Promise<readonly SessionStoreDirectoryEntry[]>;
   listSessionIds(): Promise<readonly string[]>;
   open(sessionId: string): Promise<SessionStore<RecordType> | undefined>;
 }
@@ -2087,24 +2093,52 @@ export function createInMemorySessionStore<
 export function createInMemorySessionStoreDirectory<
   RecordType extends SessionRecord = SessionRecord,
 >(): SessionStoreDirectory<RecordType> {
-  const stores = new Map<string, SessionStore<RecordType>>();
+  const stores = new Map<
+    string,
+    { readonly store: SessionStore<RecordType>; modifiedAtMilliseconds: number }
+  >();
+  let lastModifiedAtMilliseconds = 0;
+  const nextModifiedAtMilliseconds = () => {
+    lastModifiedAtMilliseconds = Math.max(Date.now(), lastModifiedAtMilliseconds + 1);
+    return lastModifiedAtMilliseconds;
+  };
   return {
     async create(sessionId) {
       validateSessionId(sessionId);
       if (stores.has(sessionId)) {
         throw new SessionStoreError("session_log_exists");
       }
-      const store = createInMemorySessionStore<RecordType>();
-      stores.set(sessionId, store);
-      return store;
+      const backing = createInMemorySessionStore<RecordType>();
+      const entry = {
+        modifiedAtMilliseconds: nextModifiedAtMilliseconds(),
+        store: {
+          async append(record: RecordType) {
+            await backing.append(record);
+            entry.modifiedAtMilliseconds = nextModifiedAtMilliseconds();
+          },
+          read: () => backing.read(),
+        },
+      };
+      stores.set(sessionId, entry);
+      return entry.store;
+    },
+    async listSessionEntries() {
+      return [...stores.entries()]
+        .map(([sessionId, entry]) => ({
+          sessionId,
+          modifiedAtMilliseconds: entry.modifiedAtMilliseconds,
+        }))
+        .sort((left, right) =>
+          left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0,
+        );
     },
     async listSessionIds() {
       return [...stores.keys()].sort();
     },
     async open(sessionId) {
       validateSessionId(sessionId);
-      const store = stores.get(sessionId);
-      return store !== undefined && (await store.read()).length > 0 ? store : undefined;
+      const entry = stores.get(sessionId);
+      return entry !== undefined && (await entry.store.read()).length > 0 ? entry.store : undefined;
     },
   };
 }
@@ -2118,6 +2152,41 @@ export function createJsonlSessionStoreDirectory<
   return {
     create(sessionId) {
       return createJsonlSessionStore<RecordType>({ ...options, sessionId });
+    },
+    async listSessionEntries() {
+      const { sessionsDirectory } = await resolveProjectSessionDirectories(options);
+      try {
+        const files = (await readdir(sessionsDirectory, { withFileTypes: true }))
+          .filter((entry) => entry.isFile() && /^[0-9a-f-]{36}\.jsonl$/u.test(entry.name))
+          .sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+        const entries = await Promise.all(
+          files.map(async (file) => {
+            try {
+              const metadata = await stat(join(sessionsDirectory, file.name));
+              return {
+                sessionId: file.name.slice(0, -".jsonl".length),
+                modifiedAtMilliseconds: metadata.mtimeMs,
+              };
+            } catch (error) {
+              if (isNodeError(error) && error.code === "ENOENT") {
+                return null;
+              }
+              throw error;
+            }
+          }),
+        );
+        return entries.filter(
+          (
+            entry,
+          ): entry is { readonly sessionId: string; readonly modifiedAtMilliseconds: number } =>
+            entry !== null,
+        );
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") {
+          return [];
+        }
+        throw error;
+      }
     },
     async listSessionIds() {
       const { sessionsDirectory } = await resolveProjectSessionDirectories(options);
