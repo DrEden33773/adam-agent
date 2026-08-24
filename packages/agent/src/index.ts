@@ -91,6 +91,8 @@ export {
   ExtensionHostError,
   type ExtensionHostOptions,
   type ExtensionHostSnapshot,
+  ExtensionProjectChangesError,
+  type ExtensionProjectChangesStartOptions,
   type ExtensionStateSnapshot,
 } from "./extension-host.js";
 export { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";

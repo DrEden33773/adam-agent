@@ -11,7 +11,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createExtensionHost } from "@adam-agent/agent";
+import { createExtensionHost, createInMemoryOperationStore } from "@adam-agent/agent";
 import { afterEach, expect, test, vi } from "vitest";
 
 const temporaryRoots: string[] = [];
@@ -36,7 +36,7 @@ test("a missing required capability rejects an extension before its runtime is i
       type: "module",
       adamAgent: {
         id: "fixture.requires-missing-capability",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [{ id: "fixture.capability.missing", version: "^1.0.0" }],
@@ -102,7 +102,7 @@ test("a locked ESM extension with no capabilities or contributions activates", a
       type: "module",
       adamAgent: {
         id: "fixture.empty-extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -160,7 +160,7 @@ test("a CommonJS runtime entry rejects before import", async () => {
       type: "module",
       adamAgent: {
         id: "fixture.commonjs-runtime",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.cjs" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -210,7 +210,7 @@ test("a nested CommonJS package scope cannot override the locked ESM runtime", a
       type: "module",
       adamAgent: {
         id: "fixture.nested-commonjs-runtime",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./nested/extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -258,7 +258,7 @@ test("an extensionless runtime in a module package scope activates as ESM", asyn
       type: "module",
       adamAgent: {
         id: "fixture.extensionless-esm-runtime",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -297,7 +297,7 @@ test("a declared operation becomes visible only after its matching runtime regis
       type: "module",
       adamAgent: {
         id: "fixture.echo-extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [
@@ -362,6 +362,562 @@ export async function activate(context) {
   ]);
 });
 
+test("a matching project-change command descriptor becomes visible only after activation", async () => {
+  const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(packageRoot);
+  const contribution = {
+    command: {
+      id: "eve-reviewer.review",
+      name: "review",
+      title: "Review project changes",
+      version: 1,
+    },
+    id: "eve-reviewer.local-worktree-review@1",
+    input: { id: "adam.project-change-snapshot", version: 1 },
+    inputSource: { id: "project_changes", version: 1 },
+    kind: "operation",
+    output: { id: "eve-reviewer.review-result", version: 1 },
+    progress: { id: "eve-reviewer.review-progress", version: 1 },
+    report: { id: "eve-reviewer.review-result", version: 1 },
+  } as const;
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/project-review-extension",
+      version: "3.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.project-review-extension",
+        apiVersion: "^0.3.0",
+        runtime: { entry: "./extension.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [contribution],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "extension.js"),
+    `const codec = (id) => ({
+  id,
+  version: 1,
+  decode: (value) => ({ ok: true, value }),
+  encode: (value) => ({ ok: true, value }),
+});
+export async function activate(context) {
+  context.registerOperation({
+    id: "eve-reviewer.local-worktree-review@1",
+    input: codec("adam.project-change-snapshot"),
+    output: codec("eve-reviewer.review-result"),
+    progress: codec("eve-reviewer.review-progress"),
+    execute: async (input) => input,
+  });
+}
+`,
+    "utf8",
+  );
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.project-review-extension",
+        grants: [],
+        packageName: "@fixture/project-review-extension",
+        packageRoot,
+        packageVersion: "3.0.0",
+      },
+    ],
+  });
+
+  await expect(host.loadConfiguredExtensions()).resolves.toMatchObject({
+    extensions: [{ extensionId: "fixture.project-review-extension", status: "active" }],
+  });
+  expect(host.listContributions()).toEqual([
+    { extensionId: "fixture.project-review-extension", ...contribution },
+  ]);
+  const exposed = host.listContributions()[0] as {
+    command?: { name: string };
+  };
+  if (exposed.command === undefined) {
+    throw new TypeError("The active command descriptor disappeared.");
+  }
+  exposed.command.name = "mutated";
+  expect(host.listContributions()).toEqual([
+    { extensionId: "fixture.project-review-extension", ...contribution },
+  ]);
+});
+
+test("project-change admission materializes, persists v3, then executes under one owner lease", async () => {
+  const projectRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(projectRoot);
+  const controlKey = `__adam_project_changes_${Math.random().toString(16).slice(2)}`;
+  const control = {
+    decoded: undefined as unknown,
+    executed: undefined as unknown,
+    executions: 0,
+    leaseActive: false,
+    persisted: false,
+  };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+  const snapshot = {
+    base: { commit: "a".repeat(40), kind: "head", tree: "b".repeat(40) },
+    candidateTree: "c".repeat(40),
+    capturePolicy: { id: "adam.git-project-changes", objectFormat: "sha1", version: 1 },
+    digest: `sha256:${"d".repeat(64)}`,
+    kind: "adam.project-change-snapshot",
+    schemaVersion: 1,
+    sources: [
+      {
+        content: "new text\n",
+        contentDigest: `sha256:${"e".repeat(64)}`,
+        mode: "100644",
+        path: "new.txt",
+        side: "head",
+      },
+    ],
+    unavailable: [],
+    unifiedDiff: "diff --git a/new.txt b/new.txt\n",
+  } as const;
+  const contribution = {
+    command: {
+      id: "eve-reviewer.review",
+      name: "review",
+      title: "Review project changes",
+      version: 1,
+    },
+    id: "eve-reviewer.local-worktree-review@1",
+    input: { id: "adam.project-change-snapshot", version: 1 },
+    inputSource: { id: "project_changes", version: 1 },
+    kind: "operation",
+    output: { id: "fixture.output", version: 1 },
+    progress: { id: "fixture.progress", version: 1 },
+  } as const;
+  await writeFile(
+    join(projectRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/project-change-admission",
+      version: "3.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.project-change-admission",
+        apiVersion: "^0.3.0",
+        runtime: { entry: "./extension.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [contribution],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(projectRoot, "extension.js"),
+    `const codec = (id) => ({
+  id,
+  version: 1,
+  decode(value) {
+    const control = globalThis[${JSON.stringify(controlKey)}];
+    if (id === "adam.project-change-snapshot") control.decoded = value;
+    return { ok: true, value };
+  },
+  encode: (value) => ({ ok: true, value }),
+});
+export async function activate(context) {
+  context.registerOperation({
+    id: "eve-reviewer.local-worktree-review@1",
+    input: codec("adam.project-change-snapshot"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    execute: async (input) => {
+      const control = globalThis[${JSON.stringify(controlKey)}];
+      if (!control.persisted) throw new Error("execute-before-persist");
+      control.executions += 1;
+      control.executed = input;
+      return { accepted: true };
+    },
+  });
+}
+`,
+    "utf8",
+  );
+  const durableStore = createInMemoryOperationStore();
+  let startedAppends = 0;
+  const store = {
+    async append(record: Parameters<typeof durableStore.append>[0]) {
+      await durableStore.append(record);
+      if (record.event.type === "operation_started") {
+        startedAppends += 1;
+        control.persisted = true;
+      }
+    },
+    findByIdempotency: durableStore.findByIdempotency,
+    listLinkedStarts: durableStore.listLinkedStarts,
+    read: durableStore.read,
+  };
+  let ownerAcquisitions = 0;
+  const owner = {
+    async acquire() {
+      ownerAcquisitions += 1;
+      control.leaseActive = true;
+      return {
+        async release() {
+          control.leaseActive = false;
+        },
+      };
+    },
+    async run<T>(operation: () => Promise<T>): Promise<T> {
+      const lease = await this.acquire();
+      try {
+        return await operation();
+      } finally {
+        await lease.release();
+      }
+    },
+  };
+  let materializations = 0;
+  let rejectMaterialization = false;
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.project-change-admission",
+        grants: [],
+        packageName: "@fixture/project-change-admission",
+        packageRoot: projectRoot,
+        packageVersion: "3.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: store,
+    projectChangeMaterializer: {
+      async materialize({ canonicalProjectRoot }: { readonly canonicalProjectRoot: string }) {
+        expect(canonicalProjectRoot).toBe(projectRoot);
+        expect(control.leaseActive).toBe(true);
+        materializations += 1;
+        if (rejectMaterialization) {
+          throw new Error("injected capture failure");
+        }
+        return snapshot;
+      },
+    },
+    projectLifecycleOwner: owner,
+    projectRoot,
+  });
+  await host.loadConfiguredExtensions();
+  ownerAcquisitions = 0;
+
+  const startOptions = {
+    command: { id: "eve-reviewer.review", version: 1 },
+    idempotencyKey: "project-review-1",
+    origin: {
+      invocation: {
+        id: "review",
+        kind: "presentation_command",
+        version: 1,
+      },
+      sessionId: "22222222-2222-4222-8222-222222222222",
+      sourceSequence: 7,
+    },
+  } as const;
+  const started = await host.startProjectChanges(startOptions);
+  for await (const _record of host.operations.events({ operationId: started.operationId })) {
+    // Draining through the terminal fact is the causal execution boundary.
+  }
+
+  expect(materializations).toBe(1);
+  expect(ownerAcquisitions).toBe(1);
+  expect(control.decoded).toEqual(snapshot);
+  expect(control.executed).toEqual(snapshot);
+  const records = await durableStore.read(started.operationId);
+  expect(records[0]).toMatchObject({
+    event: { input: snapshot, type: "operation_started" },
+    origin: { sourceSequence: 7 },
+    schemaVersion: 3,
+  });
+  await expect(host.startProjectChanges(startOptions)).resolves.toEqual(started);
+  expect(materializations).toBe(1);
+  expect(ownerAcquisitions).toBe(1);
+  expect(startedAppends).toBe(1);
+  expect(control.executions).toBe(1);
+  rejectMaterialization = true;
+  await expect(
+    host.startProjectChanges({
+      ...startOptions,
+      idempotencyKey: "project-review-2",
+      origin: { ...startOptions.origin, sourceSequence: 8 },
+    }),
+  ).rejects.toThrow("injected capture failure");
+  expect(materializations).toBe(2);
+  expect(ownerAcquisitions).toBe(2);
+  expect(startedAppends).toBe(1);
+  expect(control.executions).toBe(1);
+  delete (globalThis as Record<string, unknown>)[controlKey];
+});
+
+test("a project-change input source with another input contract rejects before runtime import", async () => {
+  const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(packageRoot);
+  const markerPath = join(packageRoot, "runtime-imported.txt");
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/project-review-mismatch",
+      version: "3.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.project-review-mismatch",
+        apiVersion: "^0.3.0",
+        runtime: { entry: "./extension.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [
+          {
+            id: "fixture.project-review@1",
+            input: { id: "fixture.other-input", version: 1 },
+            inputSource: { id: "project_changes", version: 1 },
+            kind: "operation",
+            output: { id: "fixture.output", version: 1 },
+            progress: { id: "fixture.progress", version: 1 },
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "extension.js"),
+    `import { writeFile } from "node:fs/promises";
+await writeFile(${JSON.stringify(markerPath)}, "imported", "utf8");
+export async function activate() {}
+`,
+    "utf8",
+  );
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.project-review-mismatch",
+        grants: [],
+        packageName: "@fixture/project-review-mismatch",
+        packageRoot,
+        packageVersion: "3.0.0",
+      },
+    ],
+  });
+
+  await expect(host.loadConfiguredExtensions()).resolves.toEqual({
+    extensions: [
+      {
+        diagnostics: [
+          {
+            code: "contribution_input_source_mismatch",
+            contributionId: "fixture.project-review@1",
+          },
+        ],
+        extensionId: "fixture.project-review-mismatch",
+        packageName: "@fixture/project-review-mismatch",
+        packageVersion: "3.0.0",
+        status: "rejected",
+      },
+    ],
+  });
+  await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test("a command descriptor colliding with a built-in command rejects before runtime import", async () => {
+  const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(packageRoot);
+  const markerPath = join(packageRoot, "runtime-imported.txt");
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/built-in-command-collision",
+      version: "3.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.built-in-command-collision",
+        apiVersion: "^0.3.0",
+        runtime: { entry: "./extension.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [
+          {
+            command: { id: "fixture.help", name: "help", title: "Replace help", version: 1 },
+            id: "fixture.help@1",
+            input: { id: "fixture.input", version: 1 },
+            kind: "operation",
+            output: { id: "fixture.output", version: 1 },
+            progress: { id: "fixture.progress", version: 1 },
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "extension.js"),
+    `import { writeFile } from "node:fs/promises";
+await writeFile(${JSON.stringify(markerPath)}, "imported", "utf8");
+export async function activate() {}
+`,
+    "utf8",
+  );
+  const reservedCommandNames = ["help"];
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.built-in-command-collision",
+        grants: [],
+        packageName: "@fixture/built-in-command-collision",
+        packageRoot,
+        packageVersion: "3.0.0",
+      },
+    ],
+    reservedCommandNames,
+  });
+  reservedCommandNames.length = 0;
+
+  await expect(host.loadConfiguredExtensions()).resolves.toEqual({
+    extensions: [
+      {
+        diagnostics: [
+          {
+            code: "command_collision",
+            commandId: "fixture.help",
+            commandName: "help",
+          },
+        ],
+        extensionId: "fixture.built-in-command-collision",
+        packageName: "@fixture/built-in-command-collision",
+        packageVersion: "3.0.0",
+        status: "rejected",
+      },
+    ],
+  });
+  await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+});
+
+test("a command descriptor colliding with an active command rejects before runtime import", async () => {
+  const firstRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  const secondRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
+  temporaryRoots.push(firstRoot, secondRoot);
+  const secondMarker = join(secondRoot, "runtime-imported.txt");
+  const writeCommandExtension = async (options: {
+    readonly commandId: string;
+    readonly contributionId: string;
+    readonly extensionId: string;
+    readonly marker?: string;
+    readonly packageName: string;
+    readonly packageRoot: string;
+  }) => {
+    const contribution = {
+      command: {
+        id: options.commandId,
+        name: "review",
+        title: "Review project changes",
+        version: 1,
+      },
+      id: options.contributionId,
+      input: { id: "fixture.input", version: 1 },
+      kind: "operation",
+      output: { id: "fixture.output", version: 1 },
+      progress: { id: "fixture.progress", version: 1 },
+    };
+    await writeFile(
+      join(options.packageRoot, "package.json"),
+      JSON.stringify({
+        name: options.packageName,
+        version: "3.0.0",
+        type: "module",
+        adamAgent: {
+          id: options.extensionId,
+          apiVersion: "^0.3.0",
+          runtime: { entry: "./extension.js" },
+          capabilities: { required: [], optional: [] },
+          contributions: [contribution],
+        },
+      }),
+      "utf8",
+    );
+    await writeFile(
+      join(options.packageRoot, "extension.js"),
+      `${options.marker === undefined ? "" : `import { writeFile } from "node:fs/promises";\nawait writeFile(${JSON.stringify(options.marker)}, "imported", "utf8");\n`}const codec = (id) => ({ id, version: 1, decode: (value) => ({ ok: true, value }), encode: (value) => ({ ok: true, value }) });
+export async function activate(context) {
+  context.registerOperation({ id: ${JSON.stringify(options.contributionId)}, input: codec("fixture.input"), output: codec("fixture.output"), progress: codec("fixture.progress"), execute: async (input) => input });
+}
+`,
+      "utf8",
+    );
+    return contribution;
+  };
+  const firstContribution = await writeCommandExtension({
+    commandId: "fixture.first-review",
+    contributionId: "fixture.first-review@1",
+    extensionId: "fixture.first-review-extension",
+    packageName: "@fixture/first-review-extension",
+    packageRoot: firstRoot,
+  });
+  await writeCommandExtension({
+    commandId: "fixture.second-review",
+    contributionId: "fixture.second-review@1",
+    extensionId: "fixture.second-review-extension",
+    marker: secondMarker,
+    packageName: "@fixture/second-review-extension",
+    packageRoot: secondRoot,
+  });
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.first-review-extension",
+        grants: [],
+        packageName: "@fixture/first-review-extension",
+        packageRoot: firstRoot,
+        packageVersion: "3.0.0",
+      },
+      {
+        enabled: true,
+        extensionId: "fixture.second-review-extension",
+        grants: [],
+        packageName: "@fixture/second-review-extension",
+        packageRoot: secondRoot,
+        packageVersion: "3.0.0",
+      },
+    ],
+  });
+
+  await expect(host.loadConfiguredExtensions()).resolves.toEqual({
+    extensions: [
+      {
+        diagnostics: [],
+        extensionId: "fixture.first-review-extension",
+        packageName: "@fixture/first-review-extension",
+        packageVersion: "3.0.0",
+        status: "active",
+      },
+      {
+        diagnostics: [
+          {
+            code: "command_collision",
+            commandId: "fixture.second-review",
+            commandName: "review",
+          },
+        ],
+        extensionId: "fixture.second-review-extension",
+        packageName: "@fixture/second-review-extension",
+        packageVersion: "3.0.0",
+        status: "rejected",
+      },
+    ],
+  });
+  expect(host.listContributions()).toEqual([
+    { extensionId: "fixture.first-review-extension", ...firstContribution },
+  ]);
+  await expect(readFile(secondMarker, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+});
+
 test("a missing runtime registration rejects the activation without publishing contributions", async () => {
   const packageRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
   temporaryRoots.push(packageRoot);
@@ -373,7 +929,7 @@ test("a missing runtime registration rejects the activation without publishing c
       type: "module",
       adamAgent: {
         id: "fixture.missing-registration",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [
@@ -438,7 +994,7 @@ test("an activation failure discards registrations and becomes a bounded diagnos
       type: "module",
       adamAgent: {
         id: "fixture.throwing-extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [
@@ -515,7 +1071,7 @@ test("an unavailable optional capability reports a diagnostic without blocking a
       type: "module",
       adamAgent: {
         id: "fixture.optional-capability",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [],
@@ -581,7 +1137,7 @@ test("an ungranted required capability rejects an extension before runtime impor
       type: "module",
       adamAgent: {
         id: "fixture.ungranted-capability",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [{ id: "fixture.capability.required", version: "^1.0.0" }],
@@ -646,7 +1202,7 @@ test("an incompatible required capability version rejects an extension before ru
       type: "module",
       adamAgent: {
         id: "fixture.incompatible-capability",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [{ id: "fixture.capability.required", version: "^1.0.0" }],
@@ -712,7 +1268,7 @@ test("an incompatible Extension API range rejects an extension before runtime im
       type: "module",
       adamAgent: {
         id: "fixture.incompatible-api",
-        apiVersion: "^0.1.0",
+        apiVersion: "^0.2.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -748,8 +1304,8 @@ export async function activate() {}
         diagnostics: [
           {
             code: "extension_api_incompatible",
-            hostVersion: "0.2.0",
-            requestedVersion: "^0.1.0",
+            hostVersion: "0.3.0",
+            requestedVersion: "^0.2.0",
           },
         ],
         extensionId: "fixture.incompatible-api",
@@ -774,7 +1330,7 @@ test("a package version that differs from the Owner lock rejects before runtime 
       type: "module",
       adamAgent: {
         id: "fixture.version-mismatch",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -888,7 +1444,7 @@ test("a runtime entry that resolves outside its package rejects before import", 
       type: "module",
       adamAgent: {
         id: "fixture.escaping-entry",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "../outside.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -943,7 +1499,7 @@ test("an undeclared runtime contribution rejects the complete activation", async
       type: "module",
       adamAgent: {
         id: "fixture.undeclared-contribution",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -1011,7 +1567,7 @@ test("a runtime contribution with a mismatched contract rejects the complete act
       type: "module",
       adamAgent: {
         id: "fixture.contract-mismatch",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [contribution],
@@ -1088,7 +1644,7 @@ test("duplicate runtime contribution IDs reject the complete activation", async 
       type: "module",
       adamAgent: {
         id: "fixture.duplicate-contribution",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [contribution],
@@ -1165,7 +1721,7 @@ test("a contribution collision rejects only the later extension activation", asy
         type: "module",
         adamAgent: {
           id: extensionId,
-          apiVersion: "^0.2.0",
+          apiVersion: "^0.3.0",
           runtime: { entry: "./extension.js" },
           capabilities: { required: [], optional: [] },
           contributions: [contribution],
@@ -1253,7 +1809,7 @@ test("an ungranted optional capability reports a diagnostic without blocking act
       type: "module",
       adamAgent: {
         id: "fixture.optional-ungranted",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [],
@@ -1313,7 +1869,7 @@ test("an incompatible optional capability reports a diagnostic without blocking 
       type: "module",
       adamAgent: {
         id: "fixture.optional-incompatible",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [],
@@ -1375,7 +1931,7 @@ test("an Owner-disabled extension is not imported or published", async () => {
       type: "module",
       adamAgent: {
         id: "fixture.disabled-extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -1441,7 +1997,7 @@ test("disabling an idle extension persists before contributions become unavailab
         type: "module",
         adamAgent: {
           id: "fixture.persisted-disable",
-          apiVersion: "^0.2.0",
+          apiVersion: "^0.3.0",
           runtime: { entry: "./extension.js" },
           capabilities: { required: [], optional: [] },
           contributions: [contribution],
@@ -1539,7 +2095,7 @@ test("a disable persistence failure leaves the active contribution available", a
       type: "module",
       adamAgent: {
         id: "fixture.disable-persistence-failure",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [contribution],
@@ -1603,7 +2159,7 @@ test("enabling a persisted idle extension makes it eligible for activation again
       type: "module",
       adamAgent: {
         id: "fixture.reenabled-extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -1664,7 +2220,7 @@ test("enabling an already active extension is idempotent", async () => {
       type: "module",
       adamAgent: {
         id: "fixture.idempotent-enable",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -1719,7 +2275,7 @@ test("enabling an active extension refreshes shared lifecycle truth without reac
       type: "module",
       adamAgent: {
         id: "fixture.shared-enable",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -1781,7 +2337,7 @@ test("concurrent disable then enable settles with durable and active truth align
       type: "module",
       adamAgent: {
         id: "fixture.concurrent-lifecycle",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -1842,7 +2398,7 @@ test("disabling an idle extension invokes its optional deactivation hook", async
       type: "module",
       adamAgent: {
         id: "fixture.deactivation",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -1896,7 +2452,7 @@ test("a deactivation failure does not reverse the persisted disabled state or le
       type: "module",
       adamAgent: {
         id: "fixture.deactivation-failure",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -1962,7 +2518,7 @@ test("an activation that exceeds its deadline publishes nothing", async () => {
       type: "module",
       adamAgent: {
         id: "fixture.activation-timeout",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -2023,7 +2579,7 @@ test("activation receives immutable identity, configuration, compatibility, and 
       type: "module",
       adamAgent: {
         id: "fixture.activation-context",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [{ id: "fixture.required", version: "^1.0.0" }],
@@ -2083,7 +2639,7 @@ export async function activate(context) {
     },
     configuration: { profile: "fixture" },
     compatibility: {
-      api: { hostVersion: "0.2.0", requestedVersion: "^0.2.0" },
+      api: { hostVersion: "0.3.0", requestedVersion: "^0.3.0" },
       capabilities: {
         optional: [
           {
@@ -2133,7 +2689,7 @@ test("an undeclared Owner capability grant rejects before runtime import", async
       type: "module",
       adamAgent: {
         id: "fixture.undeclared-grant",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -2194,7 +2750,7 @@ test("duplicate capability declarations make the static manifest invalid", async
       type: "module",
       adamAgent: {
         id: "fixture.duplicate-capability",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [
@@ -2262,7 +2818,7 @@ test("an invalid operation handler rejects the complete activation", async () =>
       type: "module",
       adamAgent: {
         id: "fixture.invalid-handler",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [contribution],
@@ -2337,7 +2893,7 @@ test("duplicate contribution declarations make the static manifest invalid", asy
       type: "module",
       adamAgent: {
         id: "fixture.duplicate-declaration",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [contribution, contribution],
@@ -2399,7 +2955,7 @@ test("loading configured extensions repeatedly is idempotent", async () => {
       type: "module",
       adamAgent: {
         id: "fixture.idempotent-load",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [contribution],
@@ -2553,7 +3109,7 @@ test("standard npm package metadata does not invalidate the Adam manifest", asyn
       dependencies: { "fixture-dependency": "1.0.0" },
       adamAgent: {
         id: "fixture.npm-metadata",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -2605,7 +3161,7 @@ test("a non-semantic package version makes the static manifest invalid", async (
       type: "module",
       adamAgent: {
         id: "fixture.invalid-package-version",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -2652,7 +3208,7 @@ test("an invalid capability range makes the static manifest invalid", async () =
       type: "module",
       adamAgent: {
         id: "fixture.invalid-capability-range",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [{ id: "fixture.capability", version: "not a range" }],
@@ -2698,7 +3254,7 @@ test("an exact prerelease capability grant containing x activates", async () => 
       type: "module",
       adamAgent: {
         id: "fixture.prerelease-grant",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [{ id: "fixture.capability", version: "1.0.0-x" }],
@@ -2744,7 +3300,7 @@ test("a full-version capability range with spaced comparators activates", async 
       type: "module",
       adamAgent: {
         id: "fixture.spaced-comparator-grant",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [{ id: "fixture.capability", version: "^1.0.0" }],
@@ -2791,7 +3347,7 @@ test("an implicit partial-version capability grant rejects before runtime import
       type: "module",
       adamAgent: {
         id: "fixture.partial-grant",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [{ id: "fixture.capability", version: "^1.0.0" }],
@@ -2847,7 +3403,7 @@ test("a wildcard capability grant rejects before runtime import", async () => {
       type: "module",
       adamAgent: {
         id: "fixture.wildcard-grant",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [{ id: "fixture.capability", version: "^1.0.0" }],
@@ -2902,7 +3458,7 @@ test("a capability grant spanning multiple major versions rejects before runtime
       type: "module",
       adamAgent: {
         id: "fixture.multi-major-grant",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: {
           required: [{ id: "fixture.capability", version: "^1.0.0" }],
@@ -2952,7 +3508,7 @@ test("an oversized package manifest rejects before runtime import", async () => 
     type: "module",
     adamAgent: {
       id: "fixture.oversized-manifest",
-      apiVersion: "^0.2.0",
+      apiVersion: "^0.3.0",
       runtime: { entry: "./extension.js" },
       capabilities: { required: [], optional: [] },
       contributions: [],
@@ -2999,7 +3555,7 @@ test("a non-JSON Owner configuration rejects before runtime import", async () =>
       type: "module",
       adamAgent: {
         id: "fixture.invalid-configuration",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -3133,7 +3689,7 @@ test("an unreadable lifecycle truth rejects before runtime import", async () => 
       type: "module",
       adamAgent: {
         id: "fixture.corrupt-lifecycle",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -3200,7 +3756,7 @@ test("disable rejects before deactivation when the lifecycle truth is corrupt", 
       type: "module",
       adamAgent: {
         id: "fixture.corrupt-disable",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -3265,7 +3821,7 @@ test("a lifecycle symlink cannot redirect enable persistence", async () => {
       type: "module",
       adamAgent: {
         id: "fixture.lifecycle-symlink",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -3329,7 +3885,7 @@ test("a lifecycle directory symlink cannot redirect persistence", async () => {
       type: "module",
       adamAgent: {
         id: "fixture.lifecycle-directory-symlink",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -3394,7 +3950,7 @@ test("disable wins over an activation already in progress", async () => {
       type: "module",
       adamAgent: {
         id: "fixture.serialized-disable",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [contribution],
@@ -3475,7 +4031,7 @@ test("concurrent loads share one activation transaction", async () => {
       type: "module",
       adamAgent: {
         id: "fixture.concurrent-load",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -3539,7 +4095,7 @@ test("a malformed runtime registration becomes a bounded activation rejection", 
       type: "module",
       adamAgent: {
         id: "fixture.malformed-registration",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [contribution],
@@ -3596,7 +4152,7 @@ test("a throwing runtime registration accessor becomes a bounded activation reje
       type: "module",
       adamAgent: {
         id: "fixture.throwing-registration",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [],
@@ -3658,7 +4214,7 @@ test("a registration codec without callable encode and decode rejects activation
       type: "module",
       adamAgent: {
         id: "fixture.invalid-codec",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./extension.js" },
         capabilities: { required: [], optional: [] },
         contributions: [contribution],

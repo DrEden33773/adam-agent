@@ -7,5 +7,5 @@
     "rootDir": "./src"
   },
   "include": ["src/**/*.ts"],
-  "references": [{ "path": "../agent" }]
+  "references": [{ "path": "../agent" }, { "path": "../extension-api" }]
 }

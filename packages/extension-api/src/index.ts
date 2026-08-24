@@ -1,7 +1,7 @@
 import { valid, validRange } from "semver";
 import { z } from "zod";
 
-export const EXTENSION_API_VERSION = "0.2.0";
+export const EXTENSION_API_VERSION = "0.3.0";
 export const EXTENSION_BIOME_CAPABILITY_ID = "adam.analyzer-execution.biome@1";
 export const EXTENSION_BIOME_MAX_FILES = 100;
 export const EXTENSION_BIOME_MAX_FILE_BYTES = 1024 * 1024;
@@ -31,6 +31,17 @@ export const EXTENSION_OPERATION_PROGRESS_MAX_RECORDS = 256;
 export const EXTENSION_OPERATION_PROGRESS_RECORD_MAX_BYTES = 64 * 1024;
 export const EXTENSION_PACKAGE_NAME_MAX_LENGTH = 256;
 export const EXTENSION_PACKAGE_VERSION_MAX_LENGTH = 128;
+export const EXTENSION_PROJECT_CHANGE_DIFF_MAX_BYTES = 1_000_000;
+export const EXTENSION_PROJECT_CHANGE_ENTRY_MAX_BYTES = 1_000_000;
+export const EXTENSION_PROJECT_CHANGE_MAX_ENTRIES_PER_SIDE = 100;
+export const EXTENSION_PROJECT_CHANGE_PATHS_MAX_BYTES = 256 * 1024;
+export const EXTENSION_PROJECT_CHANGE_PATH_MAX_BYTES = 4_096;
+export const EXTENSION_PROJECT_CHANGE_SNAPSHOT_MAX_BYTES = 12_000_000;
+export const EXTENSION_PROJECT_CHANGE_SOURCES_MAX_BYTES = 8_000_000;
+export const EXTENSION_PROJECT_CHANGE_SNAPSHOT_CONTRACT = Object.freeze({
+  id: "adam.project-change-snapshot",
+  version: 1,
+});
 
 const capabilityRequirementSchema = z.strictObject({
   id: z.string().min(1),
@@ -45,12 +56,172 @@ const contractReferenceSchema = z.strictObject({
   version: z.number().int().positive(),
 });
 
+const commandDescriptorSchema = z.strictObject({
+  id: z.string().min(1).max(EXTENSION_ID_MAX_LENGTH),
+  version: z.number().int().positive(),
+  name: z
+    .string()
+    .regex(/^[a-z]+$/u)
+    .max(64),
+  title: z.string().min(1).max(256),
+});
+
+const projectChangesInputSourceSchema = z.strictObject({
+  id: z.literal("project_changes"),
+  version: z.literal(1),
+});
+
+const digestSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/u);
+const gitObjectIdSchema = z.string().regex(/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u);
+const projectChangePathSchema = z
+  .string()
+  .refine(isStrictUnicode, { message: "invalid-unicode" })
+  .refine(isProjectRelativePath, { message: "invalid-path" })
+  .refine((path) => utf8ByteLength(path) <= EXTENSION_PROJECT_CHANGE_PATH_MAX_BYTES, {
+    message: "max-bytes",
+  });
+const projectChangeSourceSchema = z.strictObject({
+  content: z
+    .string()
+    .refine(isStrictUnicode, { message: "invalid-unicode" })
+    .refine((content) => utf8ByteLength(content) <= EXTENSION_PROJECT_CHANGE_ENTRY_MAX_BYTES, {
+      message: "max-bytes",
+    }),
+  contentDigest: digestSchema,
+  mode: z.enum(["100644", "100755"]),
+  path: projectChangePathSchema,
+  side: z.enum(["base", "head"]),
+});
+const projectChangeUnavailableSchema = z.strictObject({
+  mode: z.enum(["100644", "100755", "120000", "160000"]),
+  path: projectChangePathSchema,
+  reason: z.enum(["binary", "symlink", "gitlink"]),
+  side: z.enum(["base", "head"]),
+});
+const projectChangeSnapshotSchema = z
+  .strictObject({
+    base: z.discriminatedUnion("kind", [
+      z.strictObject({
+        commit: gitObjectIdSchema,
+        kind: z.literal("head"),
+        tree: gitObjectIdSchema,
+      }),
+      z.strictObject({ kind: z.literal("unborn"), tree: gitObjectIdSchema }),
+    ]),
+    candidateTree: gitObjectIdSchema,
+    capturePolicy: z.strictObject({
+      id: z.literal("adam.git-project-changes"),
+      objectFormat: z.enum(["sha1", "sha256"]),
+      version: z.literal(1),
+    }),
+    digest: digestSchema,
+    kind: z.literal("adam.project-change-snapshot"),
+    schemaVersion: z.literal(1),
+    sources: z
+      .array(projectChangeSourceSchema)
+      .max(EXTENSION_PROJECT_CHANGE_MAX_ENTRIES_PER_SIDE * 2),
+    unavailable: z
+      .array(projectChangeUnavailableSchema)
+      .max(EXTENSION_PROJECT_CHANGE_MAX_ENTRIES_PER_SIDE * 2),
+    unifiedDiff: z
+      .string()
+      .min(1)
+      .refine(isStrictUnicode, { message: "invalid-unicode" })
+      .refine((diff) => utf8ByteLength(diff) <= EXTENSION_PROJECT_CHANGE_DIFF_MAX_BYTES, {
+        message: "max-bytes",
+      }),
+  })
+  .superRefine((snapshot, context) => {
+    const seen = new Set<string>();
+    const paths = new Set<string>();
+    let sourceBytes = 0;
+    let pathBytes = 0;
+    for (const [index, source] of snapshot.sources.entries()) {
+      const identity = `${source.side}\0${source.path}`;
+      if (seen.has(identity)) {
+        context.addIssue({
+          code: "custom",
+          message: "duplicate-entry",
+          path: ["sources", index],
+        });
+      }
+      seen.add(identity);
+      if (!paths.has(source.path)) {
+        paths.add(source.path);
+        pathBytes += utf8ByteLength(source.path);
+      }
+      sourceBytes += utf8ByteLength(source.content);
+    }
+    for (const [index, unavailable] of snapshot.unavailable.entries()) {
+      const identity = `${unavailable.side}\0${unavailable.path}`;
+      if (seen.has(identity)) {
+        context.addIssue({
+          code: "custom",
+          message: "duplicate-entry",
+          path: ["unavailable", index],
+        });
+      }
+      seen.add(identity);
+      if (!paths.has(unavailable.path)) {
+        paths.add(unavailable.path);
+        pathBytes += utf8ByteLength(unavailable.path);
+      }
+      if (
+        (unavailable.reason === "binary" &&
+          unavailable.mode.startsWith("1") &&
+          unavailable.mode !== "100644" &&
+          unavailable.mode !== "100755") ||
+        (unavailable.reason === "symlink" && unavailable.mode !== "120000") ||
+        (unavailable.reason === "gitlink" && unavailable.mode !== "160000")
+      ) {
+        context.addIssue({
+          code: "custom",
+          message: "mode-reason-mismatch",
+          path: ["unavailable", index, "reason"],
+        });
+      }
+    }
+    for (const side of ["base", "head"] as const) {
+      const count = [...snapshot.sources, ...snapshot.unavailable].filter(
+        (entry) => entry.side === side,
+      ).length;
+      if (count > EXTENSION_PROJECT_CHANGE_MAX_ENTRIES_PER_SIDE) {
+        context.addIssue({ code: "custom", message: "max-entries", path: [side] });
+      }
+    }
+    if (sourceBytes > EXTENSION_PROJECT_CHANGE_SOURCES_MAX_BYTES) {
+      context.addIssue({ code: "custom", message: "max-bytes", path: ["sources"] });
+    }
+    if (pathBytes > EXTENSION_PROJECT_CHANGE_PATHS_MAX_BYTES) {
+      context.addIssue({ code: "custom", message: "max-bytes", path: ["paths"] });
+    }
+    if (utf8ByteLength(JSON.stringify(snapshot)) > EXTENSION_PROJECT_CHANGE_SNAPSHOT_MAX_BYTES) {
+      context.addIssue({ code: "custom", message: "max-bytes", path: [] });
+    }
+    const oidLength = snapshot.capturePolicy.objectFormat === "sha1" ? 40 : 64;
+    const objectIds = [
+      snapshot.base.tree,
+      ...(snapshot.base.kind === "head" ? [snapshot.base.commit] : []),
+      snapshot.candidateTree,
+    ];
+    if (objectIds.some((objectId) => objectId.length !== oidLength)) {
+      context.addIssue({
+        code: "custom",
+        message: "object-format-mismatch",
+        path: ["capturePolicy"],
+      });
+    }
+  });
+
 const operationContributionSchema = z.strictObject({
   kind: z.literal("operation"),
   id: z.string().min(1),
   input: contractReferenceSchema,
   output: contractReferenceSchema,
   progress: contractReferenceSchema,
+  command: commandDescriptorSchema.optional(),
+  inputSource: projectChangesInputSourceSchema.optional(),
+  report: contractReferenceSchema.optional(),
   recovery: z.strictObject({ version: z.literal(1) }).optional(),
 });
 
@@ -97,12 +268,64 @@ const extensionPackageManifestSchema = z
         path: ["adamAgent", "contributions"],
       });
     }
+    const commandDescriptors = manifest.adamAgent.contributions.flatMap((contribution) =>
+      contribution.command === undefined ? [] : [contribution.command],
+    );
+    const commandIds = commandDescriptors.map((command) => command.id);
+    const commandNames = commandDescriptors.map((command) => command.name);
+    if (
+      new Set(commandIds).size !== commandIds.length ||
+      new Set(commandNames).size !== commandNames.length
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Command descriptors must have unique IDs and names.",
+        path: ["adamAgent", "contributions"],
+      });
+    }
   });
 
 export type ExtensionCapabilityRequirement = z.infer<typeof capabilityRequirementSchema>;
+export type ExtensionCommandDescriptor = z.infer<typeof commandDescriptorSchema>;
 export type ExtensionContractReference = z.infer<typeof contractReferenceSchema>;
 export type ExtensionOperationContribution = z.infer<typeof operationContributionSchema>;
 export type ExtensionPackageManifest = z.infer<typeof extensionPackageManifestSchema>;
+export type ExtensionProjectChangesInputSource = z.infer<typeof projectChangesInputSourceSchema>;
+export type ExtensionProjectChangeSnapshot = {
+  readonly base:
+    | {
+        readonly commit: string;
+        readonly kind: "head";
+        readonly tree: string;
+      }
+    | {
+        readonly kind: "unborn";
+        readonly tree: string;
+      };
+  readonly candidateTree: string;
+  readonly capturePolicy: {
+    readonly id: "adam.git-project-changes";
+    readonly objectFormat: "sha1" | "sha256";
+    readonly version: 1;
+  };
+  readonly digest: `sha256:${string}`;
+  readonly kind: "adam.project-change-snapshot";
+  readonly schemaVersion: 1;
+  readonly sources: readonly {
+    readonly content: string;
+    readonly contentDigest: `sha256:${string}`;
+    readonly mode: "100644" | "100755";
+    readonly path: string;
+    readonly side: "base" | "head";
+  }[];
+  readonly unavailable: readonly {
+    readonly mode: "100644" | "100755" | "120000" | "160000";
+    readonly path: string;
+    readonly reason: "binary" | "symlink" | "gitlink";
+    readonly side: "base" | "head";
+  }[];
+  readonly unifiedDiff: string;
+};
 
 export type ExtensionContractIssue = {
   readonly code: string;
@@ -119,6 +342,14 @@ export interface ExtensionContractCodec<T = unknown> {
   decode(value: unknown): ExtensionContractResult<T>;
   encode(value: T): ExtensionContractResult<unknown>;
 }
+
+export const extensionProjectChangeSnapshotCodec: ExtensionContractCodec<ExtensionProjectChangeSnapshot> =
+  Object.freeze({
+    id: EXTENSION_PROJECT_CHANGE_SNAPSHOT_CONTRACT.id,
+    version: EXTENSION_PROJECT_CHANGE_SNAPSHOT_CONTRACT.version,
+    decode: decodeProjectChangeSnapshot,
+    encode: decodeProjectChangeSnapshot,
+  });
 
 export type ExtensionOperationRegistration = {
   readonly id: string;
@@ -418,6 +649,71 @@ export interface ExtensionActivationContext {
 
 export interface ExtensionDeactivationContext {
   readonly extension: ExtensionIdentity;
+}
+
+function decodeProjectChangeSnapshot(
+  value: unknown,
+): ExtensionContractResult<ExtensionProjectChangeSnapshot> {
+  const result = projectChangeSnapshotSchema.safeParse(value);
+  if (result.success) {
+    return { ok: true, value: result.data as ExtensionProjectChangeSnapshot };
+  }
+  return {
+    ok: false,
+    issues: result.error.issues.map((issue) => ({
+      code: issue.code === "custom" ? issue.message : issue.code,
+      path:
+        issue.path.length === 0
+          ? "/"
+          : `/${issue.path.map((part) => escapeJsonPointer(String(part))).join("/")}`,
+    })),
+  };
+}
+
+function escapeJsonPointer(value: string): string {
+  return value.replaceAll("~", "~0").replaceAll("/", "~1");
+}
+
+function isProjectRelativePath(path: string): boolean {
+  if (
+    path.length === 0 ||
+    path.startsWith("/") ||
+    path.includes("\\") ||
+    hasControlCharacter(path)
+  ) {
+    return false;
+  }
+  return path.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
+}
+
+function hasControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 0x1f || code === 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isStrictUnicode(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        return false;
+      }
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
 }
 
 export function parseExtensionPackageManifest(value: unknown): ExtensionPackageManifest {

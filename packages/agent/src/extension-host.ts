@@ -12,6 +12,7 @@ import {
   EXTENSION_OPERATION_DEADLINE_MAX_MS,
   EXTENSION_PACKAGE_NAME_MAX_LENGTH,
   EXTENSION_PACKAGE_VERSION_MAX_LENGTH,
+  EXTENSION_PROJECT_CHANGE_SNAPSHOT_CONTRACT,
   type ExtensionActivationCapability,
   type ExtensionActivationContext,
   type ExtensionActivationDiagnostic,
@@ -32,13 +33,23 @@ import {
 } from "./extension-lifecycle-store.js";
 import { createExtensionRecordStore } from "./extension-record-store.js";
 import {
+  createGitProjectChangeCaptureAdapter,
+  GitProjectChangeCaptureError,
+} from "./git-project-change-capture.js";
+import {
   createOperationHost,
   type OperationHost,
   type OperationHostControl,
   type OperationOriginAuthority,
+  type OperationReference,
   type RegisteredOperation,
 } from "./operation-host.js";
-import type { OperationStore } from "./operation-store.js";
+import type { OperationOrigin, OperationStore } from "./operation-store.js";
+import {
+  createProjectChangeMaterializer,
+  type ProjectChangeMaterializer,
+  ProjectChangeMaterializerError,
+} from "./project-change-materializer.js";
 import {
   createProjectLifecycleOwner,
   type ProjectLifecycleOwner,
@@ -76,8 +87,10 @@ export type ExtensionHostOptions = {
   readonly operationOriginAuthority?: OperationOriginAuthority;
   readonly operationStore?: OperationStore;
   readonly permissions?: PermissionPolicy;
+  readonly projectChangeMaterializer?: ProjectChangeMaterializer;
   readonly projectLifecycleOwner?: ProjectLifecycleOwner;
   readonly projectRoot?: string;
+  readonly reservedCommandNames?: readonly string[];
   readonly stateRoot?: string;
 };
 
@@ -133,12 +146,21 @@ export type ExtensionDiagnostic =
       readonly expected: ExtensionContractReference;
     }
   | {
+      readonly code: "command_collision";
+      readonly commandId: string;
+      readonly commandName: string;
+    }
+  | {
       readonly code: "contribution_codec_invalid";
       readonly contract: "input" | "output" | "progress";
       readonly contributionId: string;
     }
   | {
       readonly code: "contribution_handler_invalid";
+      readonly contributionId: string;
+    }
+  | {
+      readonly code: "contribution_input_source_mismatch";
       readonly contributionId: string;
     }
   | { readonly code: "contribution_registration_invalid" }
@@ -211,6 +233,37 @@ export interface ExtensionHost {
   enableExtension(extensionId: string): Promise<ExtensionStateSnapshot>;
   listContributions(): readonly ExtensionContributionSummary[];
   loadConfiguredExtensions(): Promise<ExtensionHostSnapshot>;
+  startProjectChanges(options: ExtensionProjectChangesStartOptions): Promise<OperationReference>;
+}
+
+export type ExtensionProjectChangesStartOptions = {
+  readonly command: {
+    readonly id: string;
+    readonly version: number;
+  };
+  readonly deadlineMs?: number;
+  readonly idempotencyKey: string;
+  readonly origin: OperationOrigin;
+};
+
+export class ExtensionProjectChangesError extends Error {
+  readonly code:
+    | "capture_inconsistent"
+    | "cleanup_failed"
+    | "content_invalid_utf8"
+    | "git_command_failed"
+    | "limit_exceeded"
+    | "mode_invalid"
+    | "no_changes"
+    | "path_invalid"
+    | "repository_state_unsupported"
+    | "repository_unavailable";
+
+  constructor(code: ExtensionProjectChangesError["code"], options: { readonly cause: unknown }) {
+    super("The project changes could not be captured for this operation.", options);
+    this.name = "ExtensionProjectChangesError";
+    this.code = code;
+  }
 }
 
 export type InternalExtensionSkillSource = {
@@ -295,6 +348,7 @@ export class ExtensionHostError extends Error {
   readonly code:
     | "extension_configuration_invalid"
     | "extension_state_persistence_failed"
+    | "project_changes_unavailable"
     | "project_in_use"
     | "project_owner_unavailable";
 
@@ -304,9 +358,11 @@ export class ExtensionHostError extends Error {
         ? "The extension Host configuration is invalid."
         : code === "extension_state_persistence_failed"
           ? "The extension lifecycle state could not be persisted."
-          : code === "project_in_use"
-            ? "Another process owns lifecycle mutations for this canonical project."
-            : "The OS-backed project lifecycle owner is unavailable.",
+          : code === "project_changes_unavailable"
+            ? "No active extension command can admit project changes."
+            : code === "project_in_use"
+              ? "Another process owns lifecycle mutations for this canonical project."
+              : "The OS-backed project lifecycle owner is unavailable.",
       options,
     );
     this.name = "ExtensionHostError";
@@ -317,9 +373,13 @@ export class ExtensionHostError extends Error {
 export function createExtensionHost(options: ExtensionHostOptions): ExtensionHost {
   const extensionIds = options.extensions.map((extension) => extension.extensionId);
   const capabilityIds = options.capabilities.map((capability) => capability.id);
+  const reservedCommandNameValues = options.reservedCommandNames ?? [];
+  const reservedCommandNames = new Set(reservedCommandNameValues);
   if (
     new Set(extensionIds).size !== extensionIds.length ||
     new Set(capabilityIds).size !== capabilityIds.length ||
+    reservedCommandNames.size !== reservedCommandNameValues.length ||
+    reservedCommandNameValues.some((name) => !/^[a-z]+$/u.test(name) || name.length > 64) ||
     options.extensions.some(
       (extension) =>
         extension.extensionId.length === 0 ||
@@ -361,6 +421,9 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
   const loadedSnapshots = new Map<string, ExtensionStateSnapshot>();
   const lifecycleStore = createExtensionLifecycleStore(options.stateRoot);
   const recordStore = createExtensionRecordStore(options.stateRoot);
+  const projectChangeMaterializer =
+    options.projectChangeMaterializer ??
+    createProjectChangeMaterializer(createGitProjectChangeCaptureAdapter());
   const lifecycleCommandQueues = new Map<string, Promise<void>>();
   const extensionSkillSources = new Map<string, InternalExtensionSkillSource>();
   const projectLifecycleOwner: ProjectLifecycleOwner =
@@ -470,7 +533,46 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       });
     },
     listContributions() {
-      return [...publishedContributions];
+      return publishedContributions.map(cloneContributionSummary);
+    },
+    async startProjectChanges(startOptions) {
+      const findContribution = () =>
+        publishedContributions.find(
+          (candidate) =>
+            candidate.command?.id === startOptions.command.id &&
+            candidate.command.version === startOptions.command.version &&
+            candidate.inputSource?.id === "project_changes" &&
+            candidate.inputSource.version === 1,
+        );
+      let contribution = findContribution();
+      if (contribution === undefined) {
+        await this.loadConfiguredExtensions();
+        contribution = findContribution();
+      }
+      if (contribution === undefined) {
+        throw new ExtensionHostError("project_changes_unavailable");
+      }
+      try {
+        return await operationHost.startLinkedMaterialized({
+          contributionId: contribution.id,
+          ...(startOptions.deadlineMs === undefined ? {} : { deadlineMs: startOptions.deadlineMs }),
+          idempotencyKey: startOptions.idempotencyKey,
+          async materialize() {
+            return projectChangeMaterializer.materialize({
+              canonicalProjectRoot: await realpath(options.projectRoot ?? process.cwd()),
+            });
+          },
+          origin: startOptions.origin,
+        });
+      } catch (error) {
+        if (
+          error instanceof GitProjectChangeCaptureError ||
+          error instanceof ProjectChangeMaterializerError
+        ) {
+          throw new ExtensionProjectChangesError(error.code, { cause: error });
+        }
+        throw error;
+      }
     },
     loadConfiguredExtensions() {
       if (loadInFlight !== undefined) {
@@ -540,6 +642,74 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
             if (identityMismatch !== undefined) {
               extensions.push({
                 diagnostics: [identityMismatch],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const inputSourceMismatch = manifest.adamAgent.contributions.find(
+              (contribution) =>
+                contribution.inputSource?.id === "project_changes" &&
+                (contribution.input.id !== EXTENSION_PROJECT_CHANGE_SNAPSHOT_CONTRACT.id ||
+                  contribution.input.version !==
+                    EXTENSION_PROJECT_CHANGE_SNAPSHOT_CONTRACT.version),
+            );
+            if (inputSourceMismatch !== undefined) {
+              extensions.push({
+                diagnostics: [
+                  {
+                    code: "contribution_input_source_mismatch",
+                    contributionId: inputSourceMismatch.id,
+                  },
+                ],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const reservedCommandCollision = manifest.adamAgent.contributions.find(
+              (contribution) =>
+                contribution.command !== undefined &&
+                reservedCommandNames.has(contribution.command.name),
+            );
+            if (reservedCommandCollision?.command !== undefined) {
+              extensions.push({
+                diagnostics: [
+                  {
+                    code: "command_collision",
+                    commandId: reservedCommandCollision.command.id,
+                    commandName: reservedCommandCollision.command.name,
+                  },
+                ],
+                extensionId: configured.extensionId,
+                packageName: configured.packageName,
+                packageVersion: configured.packageVersion,
+                status: "rejected",
+              });
+              continue;
+            }
+            const activeCommandCollision = manifest.adamAgent.contributions.find(
+              (contribution) =>
+                contribution.command !== undefined &&
+                publishedContributions.some(
+                  (published) =>
+                    published.command?.id === contribution.command?.id ||
+                    published.command?.name === contribution.command?.name,
+                ),
+            );
+            if (activeCommandCollision?.command !== undefined) {
+              extensions.push({
+                diagnostics: [
+                  {
+                    code: "command_collision",
+                    commandId: activeCommandCollision.command.id,
+                    commandName: activeCommandCollision.command.name,
+                  },
+                ],
                 extensionId: configured.extensionId,
                 packageName: configured.packageName,
                 packageVersion: configured.packageVersion,
@@ -922,6 +1092,23 @@ function enqueueLifecycleCommand<T>(
     }
   });
   return operation;
+}
+
+function cloneContributionSummary(
+  contribution: ExtensionContributionSummary,
+): ExtensionContributionSummary {
+  return {
+    ...contribution,
+    ...(contribution.command === undefined ? {} : { command: { ...contribution.command } }),
+    input: { ...contribution.input },
+    ...(contribution.inputSource === undefined
+      ? {}
+      : { inputSource: { ...contribution.inputSource } }),
+    output: { ...contribution.output },
+    progress: { ...contribution.progress },
+    ...(contribution.recovery === undefined ? {} : { recovery: { ...contribution.recovery } }),
+    ...(contribution.report === undefined ? {} : { report: { ...contribution.report } }),
+  };
 }
 
 async function deactivateRuntime(
@@ -1352,6 +1539,11 @@ function digestOperationDefinition(input: {
       input: input.contribution.input,
       output: input.contribution.output,
       progress: input.contribution.progress,
+      ...(input.contribution.command === undefined ? {} : { command: input.contribution.command }),
+      ...(input.contribution.inputSource === undefined
+        ? {}
+        : { inputSource: input.contribution.inputSource }),
+      ...(input.contribution.report === undefined ? {} : { report: input.contribution.report }),
       ...(input.contribution.recovery === undefined
         ? {}
         : { recovery: input.contribution.recovery }),

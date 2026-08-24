@@ -86,6 +86,10 @@ export type LinkedOperationStartOptions = OperationStartOptions & {
   readonly origin: OperationOrigin;
 };
 
+export type MaterializedLinkedOperationStartOptions = Omit<LinkedOperationStartOptions, "input"> & {
+  materialize(): Promise<unknown>;
+};
+
 export type OperationReference = {
   readonly operationId: string;
 };
@@ -167,6 +171,9 @@ export interface OperationHost {
 export interface OperationHostControl extends OperationHost {
   disableExtensionOperations(extensionId: string, graceMs: number): Promise<boolean>;
   enableExtensionOperations(extensionId: string): Promise<void>;
+  startLinkedMaterialized(
+    options: MaterializedLinkedOperationStartOptions,
+  ): Promise<OperationReference>;
 }
 
 export class OperationHostError extends Error {
@@ -283,8 +290,11 @@ export function createOperationHost(options: {
   }
 
   async function startOperation(
-    startOptions: OperationStartOptions,
+    startOptions: Omit<OperationStartOptions, "input">,
     origin: OperationOrigin | undefined,
+    inputSource:
+      | { readonly kind: "static"; readonly value: unknown }
+      | { readonly kind: "materialized"; materialize(): Promise<unknown> },
   ): Promise<OperationReference> {
     const registered = options.resolveOperation(startOptions.contributionId);
     if (registered === undefined) {
@@ -306,15 +316,10 @@ export function createOperationHost(options: {
       ) {
         throw new OperationHostError("operation_deadline_invalid");
       }
-      let normalizedInput: ReturnType<typeof normalizeJson>;
-      try {
-        normalizedInput = normalizeJson(startOptions.input, EXTENSION_OPERATION_INPUT_MAX_BYTES);
-      } catch (error) {
-        if (error instanceof OperationHostError) {
-          throw error;
-        }
-        throw new OperationHostError("operation_input_invalid", { cause: error });
-      }
+      let normalizedInput =
+        inputSource.kind === "static" ? normalizeOperationInput(inputSource.value) : undefined;
+      let decodedInput: unknown;
+      let inputDecoded = false;
       projectIdPromise ??= createProjectId(options.projectRoot);
       const projectId = await projectIdPromise;
       if (origin !== undefined) {
@@ -340,15 +345,24 @@ export function createOperationHost(options: {
         projectId,
       };
       const existing = await store.findByIdempotency(scope);
-      const existingReference = resolveIdempotentOperation(existing, {
-        definitionDigest: registered.definitionDigest,
-        inputDigest: normalizedInput.digest,
-        origin,
-      });
+      const existingReference =
+        normalizedInput === undefined
+          ? resolveMaterializedIdempotentOperation(existing, {
+              definitionDigest: registered.definitionDigest,
+              origin,
+            })
+          : resolveIdempotentOperation(existing, {
+              definitionDigest: registered.definitionDigest,
+              inputDigest: normalizedInput.digest,
+              origin,
+            });
       if (existingReference !== undefined) {
         return existingReference;
       }
-      const decodedInput = decodeInput(registered.registration, normalizedInput.value);
+      if (normalizedInput !== undefined) {
+        decodedInput = decodeInput(registered.registration, normalizedInput.value);
+        inputDecoded = true;
+      }
       const lifecycleLease = await options.lifecycleOwner.acquire().catch((error: unknown) => {
         if (error instanceof ProjectLifecycleOwnerError) {
           throw new OperationHostError(error.code, { cause: error });
@@ -358,13 +372,27 @@ export function createOperationHost(options: {
       let lifecycleLeaseTransferred = false;
       try {
         const raced = await store.findByIdempotency(scope);
-        const racedReference = resolveIdempotentOperation(raced, {
-          definitionDigest: registered.definitionDigest,
-          inputDigest: normalizedInput.digest,
-          origin,
-        });
+        const racedReference =
+          normalizedInput === undefined
+            ? resolveMaterializedIdempotentOperation(raced, {
+                definitionDigest: registered.definitionDigest,
+                origin,
+              })
+            : resolveIdempotentOperation(raced, {
+                definitionDigest: registered.definitionDigest,
+                inputDigest: normalizedInput.digest,
+                origin,
+              });
         if (racedReference !== undefined) {
           return racedReference;
+        }
+        if (inputSource.kind === "materialized") {
+          normalizedInput = normalizeOperationInput(await inputSource.materialize());
+          decodedInput = decodeInput(registered.registration, normalizedInput.value);
+          inputDecoded = true;
+        }
+        if (normalizedInput === undefined || !inputDecoded) {
+          throw new OperationHostError("operation_input_invalid");
         }
         const operationId = randomUUID();
         const now = Date.now();
@@ -491,13 +519,20 @@ export function createOperationHost(options: {
 
   const host: OperationHostControl = {
     start(startOptions) {
-      return startOperation(startOptions, undefined);
+      const { input, ...ordinaryOptions } = startOptions;
+      return startOperation(ordinaryOptions, undefined, { kind: "static", value: input });
     },
 
     async startLinked(startOptions) {
       const origin = validateOperationOrigin(startOptions.origin);
-      const { origin: _origin, ...ordinaryOptions } = startOptions;
-      return startOperation(ordinaryOptions, origin);
+      const { input, origin: _origin, ...ordinaryOptions } = startOptions;
+      return startOperation(ordinaryOptions, origin, { kind: "static", value: input });
+    },
+
+    async startLinkedMaterialized(startOptions) {
+      const origin = validateOperationOrigin(startOptions.origin);
+      const { materialize, origin: _origin, ...ordinaryOptions } = startOptions;
+      return startOperation(ordinaryOptions, origin, { kind: "materialized", materialize });
     },
 
     async listLinked(listOptions) {
@@ -2386,6 +2421,36 @@ function resolveIdempotentOperation(
     throw new OperationHostError("operation_idempotency_conflict");
   }
   return { operationId: existing.operationId };
+}
+
+function resolveMaterializedIdempotentOperation(
+  existing: OperationEventRecord | undefined,
+  expected: {
+    readonly definitionDigest: string;
+    readonly origin: OperationOrigin | undefined;
+  },
+): OperationReference | undefined {
+  if (existing?.event.type !== "operation_started") {
+    return undefined;
+  }
+  const existingOrigin = existing.schemaVersion === 3 ? existing.origin : undefined;
+  const definitionMatches =
+    existing.schemaVersion === 1 || existing.event.definitionDigest === expected.definitionDigest;
+  if (!definitionMatches || !operationOriginsEqual(existingOrigin, expected.origin)) {
+    throw new OperationHostError("operation_idempotency_conflict");
+  }
+  return { operationId: existing.operationId };
+}
+
+function normalizeOperationInput(value: unknown): ReturnType<typeof normalizeJson> {
+  try {
+    return normalizeJson(value, EXTENSION_OPERATION_INPUT_MAX_BYTES);
+  } catch (error) {
+    if (error instanceof OperationHostError) {
+      throw error;
+    }
+    throw new OperationHostError("operation_input_invalid", { cause: error });
+  }
 }
 
 function operationOriginsEqual(

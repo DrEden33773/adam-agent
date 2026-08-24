@@ -241,7 +241,7 @@ async function writeCliRecoveryExtension(packageRoot: string): Promise<void> {
       type: "module",
       adamAgent: {
         id: "fixture.extension",
-        apiVersion: "^0.2.0",
+        apiVersion: "^0.3.0",
         runtime: { entry: "./runtime.js" },
         capabilities: {
           required: [
