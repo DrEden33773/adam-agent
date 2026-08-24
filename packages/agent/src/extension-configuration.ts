@@ -3,18 +3,19 @@ import { type FileHandle, open, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 
-import type { ConfiguredExtension, JsonValue } from "@adam-agent/agent";
+import type { ConfiguredExtension } from "./extension-host.js";
+import type { JsonValue } from "./tool-runtime.js";
 
 const maxConfigurationBytes = 1024 * 1024;
 const maxExtensions = 32;
 
-export class CliExtensionConfigurationError extends Error {
+export class ExtensionConfigurationError extends Error {
   readonly code:
     | "extension_configuration_invalid"
     | "extension_configuration_unavailable"
     | "extension_configuration_unsafe";
 
-  constructor(code: CliExtensionConfigurationError["code"], options?: { cause?: unknown }) {
+  constructor(code: ExtensionConfigurationError["code"], options?: { cause?: unknown }) {
     super(
       code === "extension_configuration_unavailable"
         ? "The Owner extension configuration is unavailable."
@@ -23,13 +24,14 @@ export class CliExtensionConfigurationError extends Error {
           : "The Owner extension configuration is invalid.",
       options,
     );
-    this.name = "CliExtensionConfigurationError";
+    this.name = "ExtensionConfigurationError";
     this.code = code;
   }
 }
 
-export async function loadCliExtensionConfiguration(
+export async function loadExtensionConfiguration(
   environment: NodeJS.ProcessEnv,
+  options: { readonly allowMissing?: boolean } = {},
 ): Promise<readonly ConfiguredExtension[]> {
   const { XDG_CONFIG_HOME: xdgConfigHome } = environment;
   const configRoot =
@@ -37,13 +39,18 @@ export async function loadCliExtensionConfiguration(
       ? join(homedir(), ".config")
       : xdgConfigHome;
   const directoryPath = join(configRoot, "adam-agent");
-  await assertOwnerOnlyDirectory(directoryPath);
+  if (!(await assertOwnerOnlyDirectory(directoryPath, options.allowMissing === true))) {
+    return [];
+  }
   const path = join(directoryPath, "extensions.json");
   let file: FileHandle;
   try {
     file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (error) {
-    throw new CliExtensionConfigurationError(
+    if (options.allowMissing === true && isNodeError(error) && error.code === "ENOENT") {
+      return [];
+    }
+    throw new ExtensionConfigurationError(
       isNodeError(error) && error.code === "ENOENT"
         ? "extension_configuration_unavailable"
         : "extension_configuration_unsafe",
@@ -62,7 +69,7 @@ export async function loadCliExtensionConfiguration(
       stats.uid !== currentEffectiveUserId() ||
       (stats.mode & 0o077) !== 0
     ) {
-      throw new CliExtensionConfigurationError("extension_configuration_unsafe");
+      throw new ExtensionConfigurationError("extension_configuration_unsafe");
     }
     const text = await file.readFile("utf8");
     return await parseConfiguration(text);
@@ -71,7 +78,7 @@ export async function loadCliExtensionConfiguration(
   }
 }
 
-async function assertOwnerOnlyDirectory(path: string): Promise<void> {
+async function assertOwnerOnlyDirectory(path: string, allowMissing: boolean): Promise<boolean> {
   let directory: FileHandle;
   try {
     directory = await open(
@@ -79,7 +86,10 @@ async function assertOwnerOnlyDirectory(path: string): Promise<void> {
       constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
     );
   } catch (error) {
-    throw new CliExtensionConfigurationError(
+    if (allowMissing && isNodeError(error) && error.code === "ENOENT") {
+      return false;
+    }
+    throw new ExtensionConfigurationError(
       isNodeError(error) && error.code === "ENOENT"
         ? "extension_configuration_unavailable"
         : "extension_configuration_unsafe",
@@ -93,11 +103,12 @@ async function assertOwnerOnlyDirectory(path: string): Promise<void> {
       stats.uid !== currentEffectiveUserId() ||
       (stats.mode & 0o077) !== 0
     ) {
-      throw new CliExtensionConfigurationError("extension_configuration_unsafe");
+      throw new ExtensionConfigurationError("extension_configuration_unsafe");
     }
   } finally {
     await directory.close();
   }
+  return true;
 }
 
 async function parseConfiguration(text: string): Promise<readonly ConfiguredExtension[]> {
@@ -105,10 +116,10 @@ async function parseConfiguration(text: string): Promise<readonly ConfiguredExte
   try {
     parsed = JSON.parse(text);
   } catch (error) {
-    throw new CliExtensionConfigurationError("extension_configuration_invalid", { cause: error });
+    throw new ExtensionConfigurationError("extension_configuration_invalid", { cause: error });
   }
   if (!isPlainRecord(parsed) || !hasOnlyKeys(parsed, ["extensions", "schemaVersion"])) {
-    throw new CliExtensionConfigurationError("extension_configuration_invalid");
+    throw new ExtensionConfigurationError("extension_configuration_invalid");
   }
   const { extensions: configuredExtensions, schemaVersion } = parsed;
   if (
@@ -117,11 +128,11 @@ async function parseConfiguration(text: string): Promise<readonly ConfiguredExte
     configuredExtensions.length === 0 ||
     configuredExtensions.length > maxExtensions
   ) {
-    throw new CliExtensionConfigurationError("extension_configuration_invalid");
+    throw new ExtensionConfigurationError("extension_configuration_invalid");
   }
   const extensions = await Promise.all(configuredExtensions.map(parseExtension));
   if (new Set(extensions.map((extension) => extension.extensionId)).size !== extensions.length) {
-    throw new CliExtensionConfigurationError("extension_configuration_invalid");
+    throw new ExtensionConfigurationError("extension_configuration_invalid");
   }
   return Object.freeze(extensions);
 }
@@ -139,7 +150,7 @@ async function parseExtension(value: unknown): Promise<ConfiguredExtension> {
       "packageVersion",
     ])
   ) {
-    throw new CliExtensionConfigurationError("extension_configuration_invalid");
+    throw new ExtensionConfigurationError("extension_configuration_invalid");
   }
   const {
     configuration: rawConfiguration,
@@ -160,28 +171,28 @@ async function parseExtension(value: unknown): Promise<ConfiguredExtension> {
     !Array.isArray(configuredGrants) ||
     configuredGrants.length > 64
   ) {
-    throw new CliExtensionConfigurationError("extension_configuration_invalid");
+    throw new ExtensionConfigurationError("extension_configuration_invalid");
   }
   const canonicalPackageRoot = await realpath(packageRoot).catch((error: unknown) => {
-    throw new CliExtensionConfigurationError("extension_configuration_unavailable", {
+    throw new ExtensionConfigurationError("extension_configuration_unavailable", {
       cause: error,
     });
   });
   if (canonicalPackageRoot !== resolve(packageRoot)) {
-    throw new CliExtensionConfigurationError("extension_configuration_invalid");
+    throw new ExtensionConfigurationError("extension_configuration_invalid");
   }
   const grants = configuredGrants.map((grant) => {
     if (!isPlainRecord(grant) || !hasOnlyKeys(grant, ["id", "version"])) {
-      throw new CliExtensionConfigurationError("extension_configuration_invalid");
+      throw new ExtensionConfigurationError("extension_configuration_invalid");
     }
     const { id, version } = grant;
     if (!isBoundedString(id, 256) || !isBoundedString(version, 128)) {
-      throw new CliExtensionConfigurationError("extension_configuration_invalid");
+      throw new ExtensionConfigurationError("extension_configuration_invalid");
     }
     return Object.freeze({ id, version });
   });
   if (new Set(grants.map((grant) => grant.id)).size !== grants.length) {
-    throw new CliExtensionConfigurationError("extension_configuration_invalid");
+    throw new ExtensionConfigurationError("extension_configuration_invalid");
   }
   const configuration = normalizeJson(rawConfiguration ?? null);
   return Object.freeze({
@@ -200,7 +211,7 @@ function normalizeJson(value: unknown): JsonValue {
   const seen = new WeakSet<object>();
   const visit = (candidate: unknown, depth: number): JsonValue => {
     if (depth > 64) {
-      throw new CliExtensionConfigurationError("extension_configuration_invalid");
+      throw new ExtensionConfigurationError("extension_configuration_invalid");
     }
     if (candidate === null || typeof candidate === "boolean" || typeof candidate === "string") {
       return candidate;
@@ -209,18 +220,18 @@ function normalizeJson(value: unknown): JsonValue {
       return candidate;
     }
     if (typeof candidate !== "object" || seen.has(candidate)) {
-      throw new CliExtensionConfigurationError("extension_configuration_invalid");
+      throw new ExtensionConfigurationError("extension_configuration_invalid");
     }
     seen.add(candidate);
     containers += 1;
     if (containers > 10_000) {
-      throw new CliExtensionConfigurationError("extension_configuration_invalid");
+      throw new ExtensionConfigurationError("extension_configuration_invalid");
     }
     if (Array.isArray(candidate)) {
       return candidate.map((item) => visit(item, depth + 1));
     }
     if (!isPlainRecord(candidate)) {
-      throw new CliExtensionConfigurationError("extension_configuration_invalid");
+      throw new ExtensionConfigurationError("extension_configuration_invalid");
     }
     return Object.fromEntries(
       Object.keys(candidate)
@@ -254,7 +265,7 @@ function isNodeError(error: unknown): error is NodeJS.ErrnoException {
 function currentEffectiveUserId(): number {
   const getEffectiveUserId = process.geteuid;
   if (getEffectiveUserId === undefined) {
-    throw new CliExtensionConfigurationError("extension_configuration_unsafe");
+    throw new ExtensionConfigurationError("extension_configuration_unsafe");
   }
   return getEffectiveUserId();
 }

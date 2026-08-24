@@ -11,6 +11,9 @@ importers:
       '@biomejs/biome':
         specifier: 2.5.8
         version: 2.5.8
+      '@eve-reviewer/adam-extension':
+        specifier: 0.3.0
+        version: 0.3.0(@adam-agent/extension-api@0.3.0)
       '@types/node':
         specifier: 24.13.3
         version: 24.13.3
@@ -109,6 +112,10 @@ importers:
 
 packages:
 
+  '@adam-agent/extension-api@0.3.0':
+    resolution: {integrity: sha512-ijWL5/NhP0Gvd0fNJGkfzNoL6MSKmdo48RcQRnTN2GqhcJnnOaFqCBr3iywxekbstPe7wxx5bs59aCI2ETdxWA==}
+    engines: {node: '>=24.0.0 <25'}
+
   '@ai-sdk/deepseek@3.0.28':
     resolution: {integrity: sha512-ySiafZL/1KQq8NF49eGWmVRYP4ezBjxAwAlMK+hhTV+9ee37LcCxlSIbURe4C4KFq8kYaTFKsTGI2poLFLOu0w==}
     engines: {node: '>=22'}
@@ -191,6 +198,16 @@ packages:
   '@earendil-works/pi-tui@0.84.2':
     resolution: {integrity: sha512-ds2TLihOnM5sLJB3VpXV6y0uR5efVuHf4MN7yDpsty6hA2DUO/EDVzjp/0od0G2JslzVLMjT8T8zavtxVb+qbg==}
     engines: {node: '>=22.19.0'}
+
+  '@eve-reviewer/adam-extension@0.3.0':
+    resolution: {integrity: sha512-VtOEsY5CMxmdj2Klkvo53dQiaWIsLnKsrgd16RQ9NNnwqqCPL+3YaeCP+s9eWzsVn5i/7tWkviK1ZQNVAf1m0g==}
+    engines: {node: '>=24.0.0 <25'}
+    peerDependencies:
+      '@adam-agent/extension-api': 0.3.0
+
+  '@eve-reviewer/core@0.2.0':
+    resolution: {integrity: sha512-IYlTrWlno+z9GTK5dSOMfeWdEbwspfuKkHr5o/k31sCh8vw8S1Ii8ZSR7xx0+RKM3w0B/Kr3UgK1j2EibUAGqA==}
+    engines: {node: '>=24.0.0 <25'}
 
   '@jridgewell/sourcemap-codec@1.5.5':
     resolution: {integrity: sha512-cYQ9310grqxueWbl+WuIUIaiUaDcj7WOq5fVhEljNVgRfOUhY9fy2zTvfoqWsnebh8Sl70VScFbICvJnLKB0Og==}
@@ -562,6 +579,10 @@ packages:
 
   devlop@1.1.0:
     resolution: {integrity: sha512-RWmIqhcFf1lRYBvNmr7qTNuyCt/7/ns2jbpp1+PalgE/rDQcBT0fioSMUpJ93irlUhC5hrg4cYqe6U+0ImW0rA==}
+
+  diff@9.0.0:
+    resolution: {integrity: sha512-svtcdpS8CgJyqAjEQIXdb3OjhFVVYjzGAPO8WGCmRbrml64SPw/jJD4GoE98aR7r25A0XcgrK3F02yw9R/vhQw==}
+    engines: {node: '>=0.3.1'}
 
   entities@4.5.0:
     resolution: {integrity: sha512-V0hjH4dGPh9Ao5p0MoRY6BVqtwCjhz6vI5LT8AJ55H+4g9/4vbHx1I54fS0XuclLhDHArPQCiMjDxjaL8fPxhw==}
@@ -1080,6 +1101,9 @@ packages:
     resolution: {integrity: sha512-65P7iz6X5yEr1cwcgvQxbbIw7Uk3gOy5dIdtZ4rDveLqhrdJP+Li/Hx6tyK0NEb+2GCyneCMJiGqrADCSNk8sQ==}
     engines: {node: '>=8.0'}
 
+  typebox@1.3.6:
+    resolution: {integrity: sha512-Sc8RA0NCMEFmApHNU9ZMzqcpQj46She44J8ffpLM/bdhLNUZKq7DJumcLcsFx1gRmDfQPgCgOmFFJ7rcnfWNyA==}
+
   typescript@7.0.2:
     resolution: {integrity: sha512-8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA==}
     engines: {node: '>=16.20.0'}
@@ -1203,6 +1227,11 @@ packages:
 
 snapshots:
 
+  '@adam-agent/extension-api@0.3.0':
+    dependencies:
+      semver: 7.8.5
+      zod: 4.4.3
+
   '@ai-sdk/deepseek@3.0.28(zod@4.4.3)':
     dependencies:
       '@ai-sdk/provider': 4.0.7
@@ -1268,6 +1297,16 @@ snapshots:
     dependencies:
       get-east-asian-width: 1.6.0
       marked: 18.0.5
+
+  '@eve-reviewer/adam-extension@0.3.0(@adam-agent/extension-api@0.3.0)':
+    dependencies:
+      '@adam-agent/extension-api': 0.3.0
+      '@eve-reviewer/core': 0.2.0
+
+  '@eve-reviewer/core@0.2.0':
+    dependencies:
+      diff: 9.0.0
+      typebox: 1.3.6
 
   '@jridgewell/sourcemap-codec@1.5.5': {}
 
@@ -1520,6 +1559,8 @@ snapshots:
   devlop@1.1.0:
     dependencies:
       dequal: 2.0.3
+
+  diff@9.0.0: {}
 
   entities@4.5.0: {}
 
@@ -2010,6 +2051,8 @@ snapshots:
   to-regex-range@5.0.1:
     dependencies:
       is-number: 7.0.0
+
+  typebox@1.3.6: {}
 
   typescript@7.0.2:
     optionalDependencies:

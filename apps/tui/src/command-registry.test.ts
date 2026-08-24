@@ -1,0 +1,26 @@
+import { expect, test } from "vitest";
+import { createAdamCommandRegistryFromContributions } from "./command-registry.js";
+
+test("the TUI Registry exposes only descriptor commands backed by project changes", () => {
+  const registry = createAdamCommandRegistryFromContributions([
+    {
+      command: { id: "fixture.command-only", name: "orphan", title: "Orphan command", version: 1 },
+    },
+    {
+      command: { id: "fixture.wrong-input", name: "wrong", title: "Wrong input", version: 1 },
+      inputSource: { id: "remote_pull_request", version: 1 },
+    },
+    {
+      command: { id: "fixture.wrong-version", name: "old", title: "Old input", version: 1 },
+      inputSource: { id: "project_changes", version: 2 },
+    },
+    {
+      command: { id: "fixture.review", name: "review", title: "Review changes", version: 1 },
+      inputSource: { id: "project_changes", version: 1 },
+    },
+  ]);
+
+  expect(registry.entries().filter((entry) => entry.id === "extension")).toMatchObject([
+    { name: "review", usage: "/review" },
+  ]);
+});

@@ -4,7 +4,7 @@ import type {
   AutocompleteSuggestions,
 } from "@earendil-works/pi-tui";
 
-import { adamCommandRegistry } from "./command-registry.js";
+import { type AdamCommandRegistry, adamCommandRegistry } from "./command-registry.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 
 type SkillCompletion = {
@@ -18,15 +18,18 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
   readonly #getProjectPaths: () => readonly string[];
   readonly #getRunActive: () => boolean;
   readonly #getSkills: () => readonly SkillCompletion[];
+  readonly #registry: AdamCommandRegistry;
 
   constructor(options: {
     readonly getProjectPaths: () => readonly string[];
     readonly getRunActive: () => boolean;
     readonly getSkills: () => readonly SkillCompletion[];
+    readonly registry?: AdamCommandRegistry;
   }) {
     this.#getProjectPaths = options.getProjectPaths;
     this.#getRunActive = options.getRunActive;
     this.#getSkills = options.getSkills;
+    this.#registry = options.registry ?? adamCommandRegistry;
   }
 
   getSuggestions(
@@ -46,10 +49,10 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
       !beforeCursor.includes("\t")
     ) {
       const query = beforeCursor.slice(1);
-      const availableCommands = adamCommandRegistry
+      const availableCommands = this.#registry
         .entries()
         .filter((command) =>
-          adamCommandRegistry.isAvailable(command, { runActive: this.#getRunActive() }),
+          this.#registry.isAvailable(command, { runActive: this.#getRunActive() }),
         );
       const prefixMatches = availableCommands.filter(
         (command) =>
@@ -59,9 +62,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
       const commands =
         prefixMatches.length > 0
           ? prefixMatches
-          : adamCommandRegistry
-              .suggest(query)
-              .filter((command) => availableCommands.includes(command));
+          : this.#registry.suggest(query).filter((command) => availableCommands.includes(command));
       const items = commands.map<AutocompleteItem>((command) => ({
         value: `/${command.name}`,
         label: `/${command.name}`,
@@ -72,7 +73,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     const helpPrefix =
       cursorLine === 0 ? /^\/help[ \t]+([^\s]*)$/.exec(beforeCursor)?.[1] : undefined;
     if (helpPrefix !== undefined) {
-      const helpItems = adamCommandRegistry
+      const helpItems = this.#registry
         .helpTopics()
         .filter((topic) => topic.id.startsWith(helpPrefix))
         .map<AutocompleteItem>((topic) => ({

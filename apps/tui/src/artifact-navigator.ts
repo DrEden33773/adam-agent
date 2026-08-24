@@ -2,6 +2,7 @@ import type {
   ArtifactChunk,
   ArtifactRange,
   ArtifactReference,
+  OperationDisplay,
   TranscriptItem,
 } from "@adam-agent/presentation";
 import { presentationArtifactPageMaximumBytes } from "@adam-agent/presentation";
@@ -22,8 +23,9 @@ export type ArtifactEntry = {
 
 export function activeChronologyArtifacts(
   items: readonly TranscriptItem[],
+  operations: readonly OperationDisplay[] = [],
 ): readonly ArtifactEntry[] {
-  return items.flatMap((item) => {
+  const chronology = items.flatMap((item) => {
     if (item.type === "assistant_message" && item.artifact !== null) {
       return [
         {
@@ -44,6 +46,15 @@ export function activeChronologyArtifacts(
       label: `${item.label} output`,
     }));
   });
+  const linked = operations.flatMap((operation) =>
+    operation.artifacts.map((artifact, index) => ({
+      artifact: artifact.reference,
+      description: `${artifact.reference.byteCount} bytes · ${artifact.reference.mediaType} · ${artifact.contract.id}@${artifact.contract.version}`,
+      key: `operation:${operation.operationId}:${artifact.role}:${index}`,
+      label: `${operation.provenance.title} ${artifact.role}`,
+    })),
+  );
+  return [...chronology, ...linked];
 }
 
 export function activeChronologyDiffs(items: readonly TranscriptItem[]): readonly ArtifactEntry[] {

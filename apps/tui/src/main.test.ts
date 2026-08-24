@@ -1101,7 +1101,7 @@ test("the real TUI opens slash Help locally without submitting it to the model",
   await mkdir(workspaceRoot);
 
   try {
-    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    const fixture = startFixture({ scenario: "review-unavailable", stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     const beforeHelp = fixture.output().length;
     fixture.write("/help\r");
@@ -1316,6 +1316,257 @@ test("Tab completes a slash command from the local Registry", async () => {
     await rm(testRoot, { recursive: true, force: true });
   }
 });
+
+test("Registry discovers the no-argument review command without sending it to the model", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-review-registry-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "review-unavailable", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeCompletion = fixture.output().length;
+    fixture.write("/rev");
+    await fixture.waitForAfter("Review project changes", beforeCompletion);
+    fixture.write("\t\r");
+    const outcome = await Promise.race([
+      fixture
+        .waitForAfter("No active extension command can admit project changes.", beforeCompletion)
+        .then(() => "rejected" as const),
+      fixture
+        .waitForAfter("Skill selection complete.", beforeCompletion)
+        .then(() => "model" as const),
+    ]);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(outcome).toBe("rejected");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an admitted project review renders one inline generic operation card", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-review-operation-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "review-operation", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
+    const beforeReview = fixture.output().length;
+    fixture.write("/review\r");
+    await fixture.waitForCompleteFrameAfter("fixture.review-extension@1.0.0", beforeReview);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeReview)).join("\n");
+    expect(frame).toContain("fixture.review-extension@1.0.0");
+    expect(frame).toContain("fixture.local-worktree-review@1");
+    expect(frame).toContain("Running · analyzing project changes");
+    expect(frame.match(/fixture\.local-worktree-review@1/gu)).toHaveLength(1);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+}, 5_000);
+
+test("an active operation card keeps its status, action, identity, and draft through 120, 80, and 40 columns", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-review-responsive-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "review-operation", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/review\r");
+    await fixture.waitFor("Ctrl+C cancel");
+    fixture.write("preserved review draft");
+
+    let operationId: string | undefined;
+    for (const columns of [120, 80, 40]) {
+      const beforeResize = fixture.output().length;
+      await fixture.resize(columns, 24);
+      await fixture.waitForCompleteFrameAfter("Ctrl+C cancel", beforeResize);
+      const lines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+      const frame = lines.join("\n");
+      expect(frame).toContain("Running");
+      expect(frame).toContain("Ctrl+C cancel");
+      expect(frame).toContain("preserved review draft");
+      expect(frame).toContain("fixture.review-extension@1.0.0");
+      expect(frame).toContain("fixture.local-worktree-review@1");
+      expect(frame).toContain("descriptor");
+      if (columns === 120) {
+        operationId = /[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}/u.exec(
+          frame,
+        )?.[0];
+        expect(operationId).toBeDefined();
+      }
+      expect(frame).toContain(operationId);
+      expect(lines.every((line) => visibleWidth(line) <= columns)).toBe(true);
+    }
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+}, 5_000);
+
+test("a 40-column operation card keeps exact long provenance identities reachable", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-review-long-provenance-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const extensionId = `fixture.review-extension.${"extension-segment.".repeat(4)}final`;
+  const contributionId = `fixture.local-worktree-review.${"contribution-segment.".repeat(4)}final@1`;
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      noColor: true,
+      scenario: "review-operation-long-provenance",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/review\r");
+    await fixture.waitFor("Ctrl+C cancel");
+    const beforeResize = fixture.output().length;
+    await fixture.resize(40, 24);
+    await fixture.waitForCompleteFrameAfter("Ctrl+C cancel", beforeResize);
+    const lines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+    const compactFrame = lines
+      .map((line) =>
+        line
+          .replaceAll("\u001b]8;;\u0007", "")
+          .replaceAll("\u001b[0m", "")
+          .replaceAll("\u001b[7m", "")
+          .trim(),
+      )
+      .join("");
+    expect(compactFrame).toContain(extensionId);
+    expect(compactFrame).toContain(contributionId);
+    expect(lines.every((line) => visibleWidth(line) <= 40)).toBe(true);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+}, 5_000);
+
+test("Ctrl+C cancels only an actionable linked review and waits for durable settlement", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-review-cancel-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "review-operation", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/review\r");
+    await fixture.waitFor("Ctrl+C cancel");
+    const beforeCancel = fixture.output().length;
+    fixture.write("\u0003");
+    await fixture.waitForCompleteFrameAfter("Cancelled · caller", beforeCancel);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeCancel)).join("\n");
+    expect(frame).toContain("Cancelled · caller");
+    expect(frame).not.toContain("Ctrl+C cancel");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+}, 5_000);
+
+test("a completed linked review opens its bounded generic report through slash Artifacts", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-review-report-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "review-completed",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
+    fixture.write("/review\r");
+    await fixture.waitFor("Completed");
+    await fixture.waitFor("Review project changes admitted.");
+    expect(fixture.output()).toContain("Report · fixture.review-result@1 · application/json");
+    const beforeArtifacts = fixture.output().length;
+    fixture.write("/artifacts\r");
+    await fixture.waitForCompleteFrameAfter("Session artifacts", beforeArtifacts);
+    expect(latestSynchronizedFrame(fixture.output().slice(beforeArtifacts)).join("\n")).toContain(
+      "Review project changes report",
+    );
+    const beforeOpen = fixture.output().length;
+    fixture.write("\r");
+    await waitForPath(join(controlRoot, "artifact-read-1-settled"));
+    await fixture.waitForAfter('"reviewed":true', beforeOpen);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+}, 5_000);
+
+test("Ctrl+R recovers only an eligible linked review from durable operation evidence", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-review-recovery-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "review-recovery",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/review\r");
+    await fixture.waitFor("Ctrl+R recover");
+    const beforeRecovery = fixture.output().length;
+    fixture.write("\u0012");
+    await waitForPath(join(controlRoot, "operation-recover-submitted"));
+    await fixture.waitForCompleteFrameAfter("Completed", beforeRecovery);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeRecovery)).join("\n");
+    expect(frame).toContain("Completed");
+    expect(frame).not.toContain("Ctrl+R recover");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+}, 5_000);
+
+test("review arguments are rejected locally with descriptor-owned usage", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-review-usage-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "review-unavailable", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/review extra\r");
+    await fixture.waitFor("Usage: /review");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/review extra"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+}, 5_000);
 
 test("slash completion exposes Registry usage as its argument hint", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-slash-usage-hint-"));
