@@ -41,12 +41,29 @@ export type OperationStartedEvent = ExtensionOperationStartedEvent;
 
 export type LegacyOperationStartedEvent = Omit<ExtensionOperationStartedEvent, "definitionDigest">;
 
+export type OperationOrigin = {
+  readonly invocation: {
+    readonly id: "review";
+    readonly kind: "presentation_command";
+    readonly version: 1;
+  };
+  readonly sessionId: string;
+  readonly sourceSequence: number;
+};
+
 export type OperationIdempotencyScope = {
   readonly contributionId: string;
   readonly extensionId: string;
   readonly extensionVersion: string;
   readonly idempotencyKey: string;
   readonly projectId: string;
+};
+
+export type OperationLinkedStartListOptions = {
+  readonly afterOperationId?: string;
+  readonly limit: number;
+  readonly sessionId: string;
+  readonly throughSequence: number;
 };
 
 export type OperationProgressEvent = ExtensionOperationProgressEvent;
@@ -105,13 +122,21 @@ export type OperationEventRecord =
     })
   | (OperationEventRecordBase & {
       readonly schemaVersion: 2;
-      readonly event: OperationEvent;
+      readonly event: ExtensionOperationEvent;
+    })
+  | (OperationEventRecordBase & {
+      readonly schemaVersion: 3;
+      readonly origin: OperationOrigin;
+      readonly event: OperationStartedEvent;
     });
 
 export interface OperationStore {
   readonly projectId?: string;
   append(record: OperationEventRecord): Promise<void>;
   findByIdempotency(scope: OperationIdempotencyScope): Promise<OperationEventRecord | undefined>;
+  listLinkedStarts(
+    options: OperationLinkedStartListOptions,
+  ): Promise<readonly OperationEventRecord[]>;
   read(operationId: string): Promise<readonly OperationEventRecord[]>;
 }
 
@@ -119,20 +144,24 @@ export class OperationStoreError extends Error {
   readonly code:
     | "operation_idempotency_conflict"
     | "operation_log_invalid"
-    | "operation_log_too_large";
+    | "operation_log_too_large"
+    | "operation_query_invalid";
 
   constructor(
     code:
       | "operation_idempotency_conflict"
       | "operation_log_invalid"
-      | "operation_log_too_large" = "operation_log_invalid",
+      | "operation_log_too_large"
+      | "operation_query_invalid" = "operation_log_invalid",
   ) {
     super(
       code === "operation_idempotency_conflict"
         ? "The operation idempotency key is already in use."
         : code === "operation_log_too_large"
           ? "The operation log exceeds its storage limit."
-          : "The operation log contains an invalid record.",
+          : code === "operation_query_invalid"
+            ? "The operation query cursor is outside its requested scope."
+            : "The operation log contains an invalid record.",
     );
     this.name = "OperationStoreError";
     this.code = code;
@@ -160,6 +189,15 @@ const legacyOperationStartedEventSchema = z.strictObject({
 });
 const operationStartedEventSchema = legacyOperationStartedEventSchema.extend({
   definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+});
+const operationOriginSchema = z.strictObject({
+  invocation: z.strictObject({
+    id: z.literal("review"),
+    kind: z.literal("presentation_command"),
+    version: z.literal(1),
+  }),
+  sessionId: z.uuid(),
+  sourceSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
 });
 const operationReconciliationStartedEventSchema = z.strictObject({
   type: z.literal("operation_reconciliation_started"),
@@ -292,6 +330,14 @@ const operationEventRecordSchema: z.ZodType<OperationEventRecord> = z.union([
       operationInspectionRequiredEventSchema,
     ]),
   }),
+  z.strictObject({
+    schemaVersion: z.literal(3),
+    operationId: z.uuid(),
+    sequence: z.literal(1),
+    recordedAt: canonicalTimestampSchema,
+    origin: operationOriginSchema,
+    event: operationStartedEventSchema,
+  }),
 ]);
 const operationIdempotencyScopeSchema: z.ZodType<OperationIdempotencyScope> = z.strictObject({
   contributionId: z.string().min(1).max(256),
@@ -303,6 +349,12 @@ const operationIdempotencyScopeSchema: z.ZodType<OperationIdempotencyScope> = z.
     .refine((version) => valid(version) !== null),
   idempotencyKey: z.string().min(1).max(256),
   projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+});
+const operationLinkedStartListOptionsSchema = z.strictObject({
+  afterOperationId: z.uuid().optional(),
+  limit: z.number().int().positive().max(101),
+  sessionId: z.uuid(),
+  throughSequence: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
 });
 const maxOperationRecordBytes = 16 * 1024 * 1024;
 const maxOperationLogBytes = 256 * 1024 * 1024;
@@ -324,6 +376,9 @@ export function createInMemoryOperationStore(): OperationStore {
     },
     async findByIdempotency(scope) {
       return findStartRecord(records, validateIdempotencyScope(scope));
+    },
+    async listLinkedStarts(options) {
+      return listLinkedStartRecords(records, validateLinkedStartListOptions(options));
     },
     async read(operationId) {
       assertOperationId(operationId);
@@ -415,6 +470,12 @@ export async function createJsonlOperationStore(options: {
       records = await readOperationLog(operationLogPath);
       assertProjectRecords(records, scopedProjectId);
       return findStartRecord(records, validateIdempotencyScope(scope));
+    },
+    async listLinkedStarts(options) {
+      await (operationAppendQueues.get(operationLogPath) ?? Promise.resolve());
+      records = await readOperationLog(operationLogPath);
+      assertProjectRecords(records, scopedProjectId);
+      return listLinkedStartRecords(records, validateLinkedStartListOptions(options));
     },
     async read(operationId) {
       assertOperationId(operationId);
@@ -554,6 +615,21 @@ function validateIdempotencyScope(value: unknown): OperationIdempotencyScope {
   return result.data;
 }
 
+function validateLinkedStartListOptions(value: unknown): OperationLinkedStartListOptions {
+  const result = operationLinkedStartListOptionsSchema.safeParse(value);
+  if (!result.success) {
+    throw new OperationStoreError();
+  }
+  return {
+    ...(result.data.afterOperationId === undefined
+      ? {}
+      : { afterOperationId: result.data.afterOperationId }),
+    limit: result.data.limit,
+    sessionId: result.data.sessionId,
+    throughSequence: result.data.throughSequence,
+  };
+}
+
 function validateSequences(records: readonly OperationEventRecord[]): void {
   const histories = new Map<string, OperationEventRecord[]>();
   for (const record of records) {
@@ -601,6 +677,26 @@ function findStartRecord(
   );
 }
 
+function listLinkedStartRecords(
+  records: readonly OperationEventRecord[],
+  options: OperationLinkedStartListOptions,
+): readonly OperationEventRecord[] {
+  const starts = records.filter(
+    (record) =>
+      record.schemaVersion === 3 &&
+      record.origin.sessionId === options.sessionId &&
+      record.origin.sourceSequence <= options.throughSequence,
+  );
+  const afterIndex =
+    options.afterOperationId === undefined
+      ? -1
+      : starts.findIndex((record) => record.operationId === options.afterOperationId);
+  if (options.afterOperationId !== undefined && afterIndex < 0) {
+    throw new OperationStoreError("operation_query_invalid");
+  }
+  return starts.slice(afterIndex + 1, afterIndex + 1 + options.limit);
+}
+
 function assertProjectRecords(records: readonly OperationEventRecord[], projectId: string): void {
   for (const record of records) {
     assertProjectRecord(record, projectId);
@@ -639,7 +735,8 @@ function validateNextRecord(
       (record) => record.event.type === "operation_reconciliation_started",
     );
     if (
-      started?.schemaVersion !== 2 ||
+      started === undefined ||
+      started.schemaVersion === 1 ||
       started.event.type !== "operation_started" ||
       candidate.event.attemptNumber !== attempts.length + 1 ||
       candidate.event.definitionDigest !== started.event.definitionDigest ||
@@ -684,7 +781,7 @@ function validateNextRecord(
     }
     for (const artifact of candidate.event.artifacts) {
       assertArtifactScope(artifact, candidate.operationId, started);
-      if (startedRecord.schemaVersion === 2) {
+      if (startedRecord.schemaVersion !== 1) {
         assertArtifactWasPublished(history, artifact);
       }
     }

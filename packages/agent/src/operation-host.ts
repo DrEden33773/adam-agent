@@ -54,6 +54,7 @@ import {
   type OperationEvent,
   type OperationEventRecord,
   type OperationFailure,
+  type OperationOrigin,
   type OperationStartedEvent,
   type OperationStore,
   OperationStoreError,
@@ -81,8 +82,31 @@ export type OperationStartOptions = {
   readonly input: unknown;
 };
 
+export type LinkedOperationStartOptions = OperationStartOptions & {
+  readonly origin: OperationOrigin;
+};
+
 export type OperationReference = {
   readonly operationId: string;
+};
+
+export type OperationOriginAuthority = {
+  validateBoundary(input: {
+    readonly origin: OperationOrigin;
+    readonly projectId: string;
+  }): Promise<boolean>;
+};
+
+export type LinkedOperationListOptions = {
+  readonly cursor?: string;
+  readonly limit?: number;
+  readonly sessionId: string;
+  readonly throughSequence: number;
+};
+
+export type LinkedOperationPage = {
+  readonly items: readonly OperationReference[];
+  readonly nextCursor: string | null;
 };
 
 type OperationSnapshotBase = {
@@ -92,6 +116,7 @@ type OperationSnapshotBase = {
   readonly extensionId: string;
   readonly extensionVersion: string;
   readonly operationId: string;
+  readonly origin: OperationOrigin | null;
   readonly progress?: ExtensionJsonValue | undefined;
   readonly startedAt: string;
 };
@@ -132,9 +157,11 @@ export interface OperationHost {
     readonly afterSequence?: number;
     readonly operationId: string;
   }): AsyncIterable<OperationEventRecord>;
+  listLinked(options: LinkedOperationListOptions): Promise<LinkedOperationPage>;
   query(operationId: string): Promise<OperationSnapshot>;
   recover(operationId: string): Promise<OperationSnapshot>;
   start(options: OperationStartOptions): Promise<OperationReference>;
+  startLinked(options: LinkedOperationStartOptions): Promise<OperationReference>;
 }
 
 export interface OperationHostControl extends OperationHost {
@@ -149,7 +176,9 @@ export class OperationHostError extends Error {
     | "operation_idempotency_conflict"
     | "operation_input_invalid"
     | "operation_input_too_large"
+    | "operation_list_invalid"
     | "operation_not_found"
+    | "operation_origin_invalid"
     | "operation_persistence_failed"
     | "operation_project_unavailable"
     | "operation_reconciliation_failed"
@@ -218,6 +247,7 @@ export function createOperationHost(options: {
   readonly biomeExecution?: BiomeExecutionAdapter;
   readonly defaultDeadlineMs?: number;
   readonly lifecycleOwner: ProjectLifecycleOwner;
+  readonly originAuthority?: OperationOriginAuthority;
   readonly projectRoot: string;
   readonly permissions?: PermissionPolicy;
   readonly recordStore?: ExtensionRecordStore;
@@ -252,187 +282,246 @@ export function createOperationHost(options: {
     notifyOperationListeners(record.operationId);
   }
 
-  const host: OperationHostControl = {
-    async start(startOptions) {
-      const registered = options.resolveOperation(startOptions.contributionId);
-      if (registered === undefined) {
+  async function startOperation(
+    startOptions: OperationStartOptions,
+    origin: OperationOrigin | undefined,
+  ): Promise<OperationReference> {
+    const registered = options.resolveOperation(startOptions.contributionId);
+    if (registered === undefined) {
+      throw new OperationHostError("operation_contribution_unavailable");
+    }
+    return enqueueExtensionAdmission(extensionAdmissionQueues, registered.extensionId, async () => {
+      if (
+        disabledExtensions.has(registered.extensionId) ||
+        options.resolveOperation(startOptions.contributionId) !== registered
+      ) {
         throw new OperationHostError("operation_contribution_unavailable");
       }
-      return enqueueExtensionAdmission(
-        extensionAdmissionQueues,
-        registered.extensionId,
-        async () => {
-          if (
-            disabledExtensions.has(registered.extensionId) ||
-            options.resolveOperation(startOptions.contributionId) !== registered
-          ) {
-            throw new OperationHostError("operation_contribution_unavailable");
-          }
-          const deadlineMs = startOptions.deadlineMs ?? configuredDeadlineMs;
-          if (
-            !Number.isSafeInteger(deadlineMs) ||
-            deadlineMs <= 0 ||
-            deadlineMs > configuredDeadlineMs ||
-            deadlineMs > EXTENSION_OPERATION_DEADLINE_MAX_MS
-          ) {
-            throw new OperationHostError("operation_deadline_invalid");
-          }
-          let normalizedInput: ReturnType<typeof normalizeJson>;
-          try {
-            normalizedInput = normalizeJson(
-              startOptions.input,
-              EXTENSION_OPERATION_INPUT_MAX_BYTES,
-            );
-          } catch (error) {
-            if (error instanceof OperationHostError) {
-              throw error;
-            }
-            throw new OperationHostError("operation_input_invalid", { cause: error });
-          }
-          projectIdPromise ??= createProjectId(options.projectRoot);
-          const projectId = await projectIdPromise;
-          if (store.projectId !== undefined && store.projectId !== projectId) {
-            throw new OperationHostError("operation_store_project_mismatch");
-          }
-          const scope = {
-            contributionId: registered.contributionId,
-            extensionId: registered.extensionId,
-            extensionVersion: registered.extensionVersion,
-            idempotencyKey: validateIdempotencyKey(startOptions.idempotencyKey),
-            projectId,
-          };
-          const existing = await store.findByIdempotency(scope);
-          if (existing !== undefined && existing.event.type === "operation_started") {
-            if (existing.event.inputDigest !== normalizedInput.digest) {
-              throw new OperationHostError("operation_idempotency_conflict");
-            }
-            return { operationId: existing.operationId };
-          }
-          const decodedInput = decodeInput(registered.registration, normalizedInput.value);
-          const lifecycleLease = await options.lifecycleOwner.acquire().catch((error: unknown) => {
-            if (error instanceof ProjectLifecycleOwnerError) {
-              throw new OperationHostError(error.code, { cause: error });
-            }
-            throw error;
-          });
-          let lifecycleLeaseTransferred = false;
-          try {
-            const raced = await store.findByIdempotency(scope);
-            if (raced?.event.type === "operation_started") {
-              if (raced.event.inputDigest !== normalizedInput.digest) {
-                throw new OperationHostError("operation_idempotency_conflict");
-              }
-              return { operationId: raced.operationId };
-            }
-            const operationId = randomUUID();
-            const now = Date.now();
-            const recordedAt = new Date(now).toISOString();
-            const deadlineAt = new Date(now + deadlineMs).toISOString();
-            const startedEvent: OperationStartedEvent = {
-              type: "operation_started",
-              contributionId: registered.contributionId,
-              deadlineAt,
-              definitionDigest: registered.definitionDigest,
-              extensionId: registered.extensionId,
-              extensionVersion: registered.extensionVersion,
-              idempotencyKey: scope.idempotencyKey,
-              input: normalizedInput.value,
-              inputDigest: normalizedInput.digest,
-              projectId,
-            };
-            try {
-              await appendAndPublish({
+      const deadlineMs = startOptions.deadlineMs ?? configuredDeadlineMs;
+      if (
+        !Number.isSafeInteger(deadlineMs) ||
+        deadlineMs <= 0 ||
+        deadlineMs > configuredDeadlineMs ||
+        deadlineMs > EXTENSION_OPERATION_DEADLINE_MAX_MS
+      ) {
+        throw new OperationHostError("operation_deadline_invalid");
+      }
+      let normalizedInput: ReturnType<typeof normalizeJson>;
+      try {
+        normalizedInput = normalizeJson(startOptions.input, EXTENSION_OPERATION_INPUT_MAX_BYTES);
+      } catch (error) {
+        if (error instanceof OperationHostError) {
+          throw error;
+        }
+        throw new OperationHostError("operation_input_invalid", { cause: error });
+      }
+      projectIdPromise ??= createProjectId(options.projectRoot);
+      const projectId = await projectIdPromise;
+      if (origin !== undefined) {
+        let validBoundary = false;
+        try {
+          validBoundary =
+            (await options.originAuthority?.validateBoundary({ origin, projectId })) === true;
+        } catch (error) {
+          throw new OperationHostError("operation_origin_invalid", { cause: error });
+        }
+        if (!validBoundary) {
+          throw new OperationHostError("operation_origin_invalid");
+        }
+      }
+      if (store.projectId !== undefined && store.projectId !== projectId) {
+        throw new OperationHostError("operation_store_project_mismatch");
+      }
+      const scope = {
+        contributionId: registered.contributionId,
+        extensionId: registered.extensionId,
+        extensionVersion: registered.extensionVersion,
+        idempotencyKey: validateIdempotencyKey(startOptions.idempotencyKey),
+        projectId,
+      };
+      const existing = await store.findByIdempotency(scope);
+      const existingReference = resolveIdempotentOperation(existing, {
+        definitionDigest: registered.definitionDigest,
+        inputDigest: normalizedInput.digest,
+        origin,
+      });
+      if (existingReference !== undefined) {
+        return existingReference;
+      }
+      const decodedInput = decodeInput(registered.registration, normalizedInput.value);
+      const lifecycleLease = await options.lifecycleOwner.acquire().catch((error: unknown) => {
+        if (error instanceof ProjectLifecycleOwnerError) {
+          throw new OperationHostError(error.code, { cause: error });
+        }
+        throw error;
+      });
+      let lifecycleLeaseTransferred = false;
+      try {
+        const raced = await store.findByIdempotency(scope);
+        const racedReference = resolveIdempotentOperation(raced, {
+          definitionDigest: registered.definitionDigest,
+          inputDigest: normalizedInput.digest,
+          origin,
+        });
+        if (racedReference !== undefined) {
+          return racedReference;
+        }
+        const operationId = randomUUID();
+        const now = Date.now();
+        const recordedAt = new Date(now).toISOString();
+        const deadlineAt = new Date(now + deadlineMs).toISOString();
+        const startedEvent: OperationStartedEvent = {
+          type: "operation_started",
+          contributionId: registered.contributionId,
+          deadlineAt,
+          definitionDigest: registered.definitionDigest,
+          extensionId: registered.extensionId,
+          extensionVersion: registered.extensionVersion,
+          idempotencyKey: scope.idempotencyKey,
+          input: normalizedInput.value,
+          inputDigest: normalizedInput.digest,
+          projectId,
+        };
+        const startedRecord: OperationEventRecord =
+          origin === undefined
+            ? {
                 schemaVersion: 2,
                 operationId,
                 sequence: 1,
                 recordedAt,
                 event: startedEvent,
-              });
-            } catch (error) {
-              if (
-                error instanceof OperationStoreError &&
-                error.code === "operation_idempotency_conflict"
-              ) {
-                const raced = await store.findByIdempotency(scope);
-                if (raced?.event.type === "operation_started") {
-                  if (raced.event.inputDigest !== normalizedInput.digest) {
-                    throw new OperationHostError("operation_idempotency_conflict");
-                  }
-                  return { operationId: raced.operationId };
-                }
               }
-              throw error;
-            }
-            let signalSettled = () => {};
-            const settled = new Promise<void>((resolve) => {
-              signalSettled = resolve;
+            : {
+                schemaVersion: 3,
+                operationId,
+                sequence: 1,
+                recordedAt,
+                origin,
+                event: startedEvent,
+              };
+        try {
+          await appendAndPublish(startedRecord);
+        } catch (error) {
+          if (
+            error instanceof OperationStoreError &&
+            error.code === "operation_idempotency_conflict"
+          ) {
+            const raced = await store.findByIdempotency(scope);
+            const racedReference = resolveIdempotentOperation(raced, {
+              definitionDigest: registered.definitionDigest,
+              inputDigest: normalizedInput.digest,
+              origin,
             });
-            let signalHandlerSettled = () => {};
-            const handlerSettled = new Promise<void>((resolve) => {
-              signalHandlerSettled = resolve;
-            });
-            let signalOwnerSettled = () => {};
-            const ownerSettled = new Promise<void>((resolve) => {
-              signalOwnerSettled = resolve;
-            });
-            const active: ActiveOperation = {
-              abortController: new AbortController(),
-              artifactBytes: 0,
-              artifacts: [],
-              artifactCount: 0,
-              capabilityCalls: 0,
-              appendQueue: Promise.resolve(),
-              deadlineAt,
-              handlerDidSettle: false,
-              handlerSettled,
-              inputBytes: normalizedInput.byteLength,
-              nextSequence: 2,
-              operationId,
-              ownerDidSettle: false,
-              ownerSettled,
-              projectId,
-              progressBytes: 0,
-              progressRecords: 0,
-              recordBytes: 0,
-              recordCreates: 0,
-              registered,
-              settled,
-              signalHandlerSettled,
-              signalOwnerSettled,
-              signalSettled,
-              settling: false,
-              terminalDidSettle: false,
-              terminalPersistenceFailed: false,
-            };
-            activeOperations.set(operationId, active);
-            lifecycleLeaseTransferred = true;
-            queueMicrotask(() => {
-              void executeOperation(
-                active,
-                decodedInput,
-                appendAndPublish,
-                activeOperations,
-                options.artifactStore,
-                options.biomeExecution,
-                options.permissions,
-                options.recordStore,
-              )
-                .catch(() => undefined)
-                .finally(async () => {
-                  await lifecycleLease.release();
-                  active.ownerDidSettle = true;
-                  active.signalOwnerSettled();
-                  releaseActiveOperation(active, activeOperations);
-                });
-            });
-            return { operationId };
-          } finally {
-            if (!lifecycleLeaseTransferred) {
-              await lifecycleLease.release();
+            if (racedReference !== undefined) {
+              return racedReference;
             }
           }
-        },
-      );
+          throw error;
+        }
+        let signalSettled = () => {};
+        const settled = new Promise<void>((resolve) => {
+          signalSettled = resolve;
+        });
+        let signalHandlerSettled = () => {};
+        const handlerSettled = new Promise<void>((resolve) => {
+          signalHandlerSettled = resolve;
+        });
+        let signalOwnerSettled = () => {};
+        const ownerSettled = new Promise<void>((resolve) => {
+          signalOwnerSettled = resolve;
+        });
+        const active: ActiveOperation = {
+          abortController: new AbortController(),
+          artifactBytes: 0,
+          artifacts: [],
+          artifactCount: 0,
+          capabilityCalls: 0,
+          appendQueue: Promise.resolve(),
+          deadlineAt,
+          handlerDidSettle: false,
+          handlerSettled,
+          inputBytes: normalizedInput.byteLength,
+          nextSequence: 2,
+          operationId,
+          ownerDidSettle: false,
+          ownerSettled,
+          projectId,
+          progressBytes: 0,
+          progressRecords: 0,
+          recordBytes: 0,
+          recordCreates: 0,
+          registered,
+          settled,
+          signalHandlerSettled,
+          signalOwnerSettled,
+          signalSettled,
+          settling: false,
+          terminalDidSettle: false,
+          terminalPersistenceFailed: false,
+        };
+        activeOperations.set(operationId, active);
+        lifecycleLeaseTransferred = true;
+        queueMicrotask(() => {
+          void executeOperation(
+            active,
+            decodedInput,
+            appendAndPublish,
+            activeOperations,
+            options.artifactStore,
+            options.biomeExecution,
+            options.permissions,
+            options.recordStore,
+          )
+            .catch(() => undefined)
+            .finally(async () => {
+              await lifecycleLease.release();
+              active.ownerDidSettle = true;
+              active.signalOwnerSettled();
+              releaseActiveOperation(active, activeOperations);
+            });
+        });
+        return { operationId };
+      } finally {
+        if (!lifecycleLeaseTransferred) {
+          await lifecycleLease.release();
+        }
+      }
+    });
+  }
+
+  const host: OperationHostControl = {
+    start(startOptions) {
+      return startOperation(startOptions, undefined);
+    },
+
+    async startLinked(startOptions) {
+      const origin = validateOperationOrigin(startOptions.origin);
+      const { origin: _origin, ...ordinaryOptions } = startOptions;
+      return startOperation(ordinaryOptions, origin);
+    },
+
+    async listLinked(listOptions) {
+      const normalized = validateLinkedOperationListOptions(listOptions);
+      let starts: readonly OperationEventRecord[];
+      try {
+        starts = await store.listLinkedStarts({
+          ...(normalized.cursor === undefined ? {} : { afterOperationId: normalized.cursor }),
+          limit: normalized.limit + 1,
+          sessionId: normalized.sessionId,
+          throughSequence: normalized.throughSequence,
+        });
+      } catch (error) {
+        if (error instanceof OperationStoreError && error.code === "operation_query_invalid") {
+          throw new OperationHostError("operation_list_invalid", { cause: error });
+        }
+        throw new OperationHostError("operation_persistence_failed", { cause: error });
+      }
+      const pageStarts = starts.slice(0, normalized.limit);
+      return {
+        items: pageStarts.map((record) => ({ operationId: record.operationId })),
+        nextCursor:
+          starts.length > normalized.limit ? (pageStarts.at(-1)?.operationId ?? null) : null,
+      };
     },
 
     async query(operationId) {
@@ -474,7 +563,7 @@ export function createOperationHost(options: {
           ) {
             throw new OperationHostError("operation_store_project_mismatch");
           }
-          if (started.schemaVersion !== 2) {
+          if (started.schemaVersion === 1) {
             await appendAndPublish({
               schemaVersion: 2,
               operationId,
@@ -1976,6 +2065,7 @@ function createSnapshot(
     extensionId: first.event.extensionId,
     extensionVersion: first.event.extensionVersion,
     operationId: first.operationId,
+    origin: first.schemaVersion === 3 ? first.origin : null,
     progress: latestProgress(records),
     startedAt: first.recordedAt,
   };
@@ -2199,6 +2289,121 @@ function validateIdempotencyKey(value: string): string {
   return value;
 }
 
+function validateOperationOrigin(value: unknown): OperationOrigin {
+  if (!isPlainRecord(value)) {
+    throw new OperationHostError("operation_origin_invalid");
+  }
+  const candidate = value as {
+    readonly invocation?: unknown;
+    readonly sessionId?: unknown;
+    readonly sourceSequence?: unknown;
+  };
+  const keys = Object.keys(value).sort();
+  const invocation = candidate.invocation;
+  const invocationCandidate = invocation as {
+    readonly id?: unknown;
+    readonly kind?: unknown;
+    readonly version?: unknown;
+  };
+  const invocationKeys = isPlainRecord(invocation) ? Object.keys(invocation).sort() : [];
+  if (
+    keys.length !== 3 ||
+    keys[0] !== "invocation" ||
+    keys[1] !== "sessionId" ||
+    keys[2] !== "sourceSequence" ||
+    !isPlainRecord(invocation) ||
+    invocationKeys.length !== 3 ||
+    invocationKeys[0] !== "id" ||
+    invocationKeys[1] !== "kind" ||
+    invocationKeys[2] !== "version" ||
+    invocationCandidate.id !== "review" ||
+    invocationCandidate.kind !== "presentation_command" ||
+    invocationCandidate.version !== 1 ||
+    typeof candidate.sessionId !== "string" ||
+    !isOperationUuid(candidate.sessionId) ||
+    typeof candidate.sourceSequence !== "number" ||
+    !Number.isSafeInteger(candidate.sourceSequence) ||
+    candidate.sourceSequence <= 0
+  ) {
+    throw new OperationHostError("operation_origin_invalid");
+  }
+  return {
+    invocation: { id: "review", kind: "presentation_command", version: 1 },
+    sessionId: candidate.sessionId,
+    sourceSequence: candidate.sourceSequence,
+  };
+}
+
+function validateLinkedOperationListOptions(value: LinkedOperationListOptions): {
+  readonly cursor?: string;
+  readonly limit: number;
+  readonly sessionId: string;
+  readonly throughSequence: number;
+} {
+  const limit = value.limit ?? 50;
+  if (
+    !isOperationUuid(value.sessionId) ||
+    !Number.isSafeInteger(value.throughSequence) ||
+    value.throughSequence <= 0 ||
+    !Number.isSafeInteger(limit) ||
+    limit <= 0 ||
+    limit > 100 ||
+    (value.cursor !== undefined && !isOperationUuid(value.cursor))
+  ) {
+    throw new OperationHostError("operation_list_invalid");
+  }
+  return {
+    ...(value.cursor === undefined ? {} : { cursor: value.cursor }),
+    limit,
+    sessionId: value.sessionId,
+    throughSequence: value.throughSequence,
+  };
+}
+
+function isOperationUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(value);
+}
+
+function resolveIdempotentOperation(
+  existing: OperationEventRecord | undefined,
+  expected: {
+    readonly definitionDigest: string;
+    readonly inputDigest: string;
+    readonly origin: OperationOrigin | undefined;
+  },
+): OperationReference | undefined {
+  if (existing?.event.type !== "operation_started") {
+    return undefined;
+  }
+  const existingOrigin = existing.schemaVersion === 3 ? existing.origin : undefined;
+  const definitionMatches =
+    existing.schemaVersion === 1 || existing.event.definitionDigest === expected.definitionDigest;
+  if (
+    existing.event.inputDigest !== expected.inputDigest ||
+    !definitionMatches ||
+    !operationOriginsEqual(existingOrigin, expected.origin)
+  ) {
+    throw new OperationHostError("operation_idempotency_conflict");
+  }
+  return { operationId: existing.operationId };
+}
+
+function operationOriginsEqual(
+  left: OperationOrigin | undefined,
+  right: OperationOrigin | undefined,
+): boolean {
+  return (
+    left === right ||
+    (left !== undefined &&
+      right !== undefined &&
+      left.invocation.id === right.invocation.id &&
+      left.invocation.kind === right.invocation.kind &&
+      left.invocation.version === right.invocation.version &&
+      left.sessionId === right.sessionId &&
+      left.sourceSequence === right.sourceSequence)
+  );
+}
+
 async function createProjectId(projectRoot: string): Promise<string> {
   try {
     const canonicalRoot = await realpath(projectRoot);
@@ -2224,13 +2429,17 @@ function operationHostErrorMessage(code: OperationHostError["code"]): string {
     case "operation_deadline_invalid":
       return "The requested operation deadline is invalid.";
     case "operation_idempotency_conflict":
-      return "The operation idempotency key was reused with different input.";
+      return "The operation idempotency key was reused with a different definition, origin, or input.";
     case "operation_input_invalid":
       return "The operation input is invalid.";
     case "operation_input_too_large":
       return "The operation input exceeds its byte limit.";
+    case "operation_list_invalid":
+      return "The linked operation list request is invalid.";
     case "operation_not_found":
       return "The operation does not exist.";
+    case "operation_origin_invalid":
+      return "The linked operation origin is invalid.";
     case "operation_persistence_failed":
       return "The operation state could not be persisted.";
     case "operation_project_unavailable":

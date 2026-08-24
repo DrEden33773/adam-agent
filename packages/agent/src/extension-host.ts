@@ -35,6 +35,7 @@ import {
   createOperationHost,
   type OperationHost,
   type OperationHostControl,
+  type OperationOriginAuthority,
   type RegisteredOperation,
 } from "./operation-host.js";
 import type { OperationStore } from "./operation-store.js";
@@ -72,6 +73,7 @@ export type ExtensionHostOptions = {
   readonly extensions: readonly ConfiguredExtension[];
   readonly operationDeadlineMs?: number;
   readonly operationDisableGraceMs?: number;
+  readonly operationOriginAuthority?: OperationOriginAuthority;
   readonly operationStore?: OperationStore;
   readonly permissions?: PermissionPolicy;
   readonly projectLifecycleOwner?: ProjectLifecycleOwner;
@@ -380,6 +382,9 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
     ...(options.biomeExecution === undefined ? {} : { biomeExecution: options.biomeExecution }),
     projectRoot: options.projectRoot ?? process.cwd(),
     lifecycleOwner: projectLifecycleOwner,
+    ...(options.operationOriginAuthority === undefined
+      ? {}
+      : { originAuthority: options.operationOriginAuthority }),
     ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
     recordStore,
     resolveOperation: (contributionId) => registeredOperations.get(contributionId),

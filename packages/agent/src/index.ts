@@ -109,8 +109,12 @@ export {
   type OpenAICompatibleModelDriverOptions,
 } from "./openai-compatible-model-driver.js";
 export {
+  type LinkedOperationListOptions,
+  type LinkedOperationPage,
+  type LinkedOperationStartOptions,
   type OperationHost,
   OperationHostError,
+  type OperationOriginAuthority,
   type OperationReference,
   type OperationSnapshot,
   type OperationStartOptions,
@@ -129,6 +133,8 @@ export {
   type OperationFailure,
   type OperationIdempotencyScope,
   type OperationInspectionRequiredEvent,
+  type OperationLinkedStartListOptions,
+  type OperationOrigin,
   type OperationProgressEvent,
   type OperationReconciliationStartedEvent,
   type OperationStartedEvent,
