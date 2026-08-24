@@ -59,6 +59,7 @@ import {
   terminalSizeIsSupported,
 } from "./responsive-root.js";
 import { RightEdgeGuardTerminal } from "./right-edge-guard-terminal.js";
+import { RoundedFrame } from "./rounded-frame.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { SessionInspector, type SessionRunStatus } from "./session-inspector.js";
 import { SessionPicker } from "./session-picker.js";
@@ -707,12 +708,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       if (reasoning.status === "active") {
         activeReasoningVisible = true;
         thinking.setMessage(title);
-        transcript.addChild(thinking);
-      } else {
-        transcript.addChild(new Spacer(1));
-        transcript.addChild(new ResponsiveLine(title));
       }
       if (!expanded) {
+        if (reasoning.status === "active") {
+          transcript.addChild(thinking);
+        } else {
+          transcript.addChild(new Spacer(1));
+          transcript.addChild(new ResponsiveLine(title));
+        }
         return;
       }
       const text =
@@ -725,7 +728,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : reasoningArtifactReads.has(reasoning.id)
             ? "Loading provider reasoning…"
             : "Provider reasoning is available as an artifact · Ctrl+T to retry loading");
-      transcript.addChild(new Markdown(safeTerminalText(text), 0, 0, theme.markdown));
+      const content = new Container();
+      content.addChild(reasoning.status === "active" ? thinking : new ResponsiveLine(title));
+      content.addChild(new Markdown(safeTerminalText(text), 0, 0, theme.markdown));
+      transcript.addChild(new Spacer(1));
+      transcript.addChild(new RoundedFrame(content, theme.editor.borderColor));
     };
     let previousWasAssistant = false;
     for (const item of active?.transcript.items ?? []) {

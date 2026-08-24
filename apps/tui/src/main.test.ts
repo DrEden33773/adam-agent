@@ -2529,6 +2529,7 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     let frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
     expect(frame).not.toContain("Inspect ");
     expect(frame).not.toContain("Working");
+    expect(frame).not.toContain("╭");
 
     fixture.write("\u0014");
     await fixture.waitFor("Inspect ");
@@ -2537,6 +2538,10 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     await fixture.resize(79, 24);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
     expect(frame).toContain("Inspect ");
+    expect(frame).toContain("╭");
+    expect(frame).toContain("╮");
+    expect(frame).toContain("╰");
+    expect(frame).toContain("╯");
     beforeFrame = fixture.output().length;
     fixture.write("\u001b[116;5:3u");
     await fixture.resize(40, 12);
@@ -2558,6 +2563,7 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     await fixture.waitFor("Thinking done · adam");
     await fixture.waitFor("Reasoning answer.");
     await fixture.waitForAfter(" · idle", beforeCompletion);
+    await fixture.waitForAfter("Adam · Streaming session", beforeCompletion);
     beforeFrame = fixture.output().length;
     await fixture.resize(80, 24);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
@@ -2568,7 +2574,6 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(
       "Reasoning answer.",
     );
-    await fixture.waitForAfter("Adam · Streaming session", beforeCompletion);
     fixture.write("/session\r");
     await fixture.waitFor("Session facts");
     beforeFrame = fixture.output().length;

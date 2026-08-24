@@ -195,6 +195,10 @@ test("real PTY streams Ctrl+T provider reasoning without taking terminal mouse s
     expect(result.stdout).toContain("\u001b[?2004h");
     expect(result.stdout).toContain("\u001b[?2004l");
     expect(result.stdout).toContain("\u001b[?25h");
+    expect(result.stdout).toContain("╭");
+    expect(result.stdout).toContain("╮");
+    expect(result.stdout).toContain("╰");
+    expect(result.stdout).toContain("╯");
     expect(result.stdout).not.toContain("\u001b[?1000h");
     expect(result.stdout).not.toContain("\u001b[?1006h");
   } finally {
