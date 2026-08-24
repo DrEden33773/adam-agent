@@ -1007,6 +1007,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
               }
               registeredOperations.set(registration.id, {
                 capabilityIds,
+                contribution: declaration,
                 contributionId: registration.id,
                 definitionDigest: digestOperationDefinition({
                   capabilityIds,

@@ -219,13 +219,23 @@ export type ToolCallDisplay = {
   readonly changePreviewRef: ArtifactReference | null;
 };
 
+export type OperationLinkDisplay = {
+  readonly type: "operation_link";
+  readonly id: string;
+  readonly operationId: string;
+  readonly sequence: number;
+  readonly sourceSessionId: string;
+  readonly branchBoundary: BranchSourceBoundary;
+};
+
 export type TranscriptItem =
   | UserMessageDisplay
   | AssistantMessageDisplay
   | ReasoningBlockDisplay
   | CompactionMarkerDisplay
   | SessionNoticeDisplay
-  | ToolCallDisplay;
+  | ToolCallDisplay
+  | OperationLinkDisplay;
 
 export type BranchSourceBoundary = {
   readonly sessionId: string;
@@ -265,6 +275,8 @@ export type ContextUsageDisplay = {
 export type ActiveSessionDisplay = {
   readonly session: SessionSummary;
   readonly transcript: TranscriptPage;
+  readonly linkedOperations: readonly OperationDisplay[];
+  readonly linkedOperationsTruncated: boolean;
   readonly context: SessionContextDisplay | null;
   readonly pendingInteractions: readonly PendingInteraction[];
   readonly repositoryInstructions: RepositoryInstructionsDisplay | null;
@@ -272,6 +284,83 @@ export type ActiveSessionDisplay = {
   readonly projectPaths: ProjectPathCatalogDisplay;
   readonly mcp: McpDisplay | null;
 };
+
+export type OperationCursor = {
+  readonly operationId: string;
+  readonly sequence: number;
+};
+
+type OperationDisplayBase = {
+  readonly artifacts: readonly OperationArtifactDisplay[];
+  readonly operationId: string;
+  readonly origin: {
+    readonly invocation: {
+      readonly id: "review";
+      readonly kind: "presentation_command";
+      readonly version: 1;
+    };
+    readonly sessionId: string;
+    readonly sourceSequence: number;
+  };
+  readonly provenance: {
+    readonly contributionId: string;
+    readonly extensionId: string;
+    readonly extensionVersion: string;
+    readonly presentation: "descriptor" | "generic";
+    readonly title: string;
+  };
+  readonly progress: OperationProgressDisplay | null;
+};
+
+export type OperationProgressDisplay = {
+  readonly summary: string;
+};
+
+export type OperationArtifactDisplay = {
+  readonly contract: { readonly id: string; readonly version: number };
+  readonly reference: ArtifactReference;
+  readonly role: "artifact" | "evidence" | "report";
+};
+
+export type OperationDisplay =
+  | (OperationDisplayBase & {
+      readonly status: "running";
+      readonly actions: readonly ["cancel"];
+      readonly settlement: null;
+    })
+  | (OperationDisplayBase & {
+      readonly status: "cancel_requested";
+      readonly actions: readonly [];
+      readonly settlement: null;
+    })
+  | (OperationDisplayBase & {
+      readonly status: "completed";
+      readonly actions: readonly [];
+      readonly settlement: { readonly summary: string | null };
+    })
+  | (OperationDisplayBase & {
+      readonly status: "failed";
+      readonly actions: readonly [];
+      readonly settlement: { readonly code: string; readonly message: string };
+    })
+  | (OperationDisplayBase & {
+      readonly status: "cancelled";
+      readonly actions: readonly [];
+      readonly settlement: { readonly reason: "caller" | "extension_disabled" };
+    })
+  | (OperationDisplayBase & {
+      readonly status: "inspection_required";
+      readonly actions: readonly [];
+      readonly settlement: { readonly message: string };
+    })
+  | (OperationDisplayBase & {
+      readonly status: "recovery_required";
+      readonly actions: readonly [] | readonly ["recover"];
+      readonly settlement: {
+        readonly code: "operation_recovery_required";
+        readonly message: string;
+      };
+    });
 
 export type McpDisplay = {
   readonly schemaVersion: 1;
@@ -488,7 +577,7 @@ export type AuthoritativePresentationSnapshot = {
     | {
         readonly status: "current";
         readonly sessionThroughSequence: number;
-        readonly operationThrough: readonly [];
+        readonly operationThrough: readonly OperationCursor[];
       }
     | { readonly status: "repairing"; readonly reason: "open" | "gap" | "reconnect" }
     | { readonly status: "degraded"; readonly fault: PresentationFault };
@@ -667,6 +756,14 @@ export type PresentationCommand =
   | {
       readonly type: "cancel_run";
       readonly sessionId: string | null;
+    }
+  | {
+      readonly type: "cancel_operation";
+      readonly operationId: string;
+    }
+  | {
+      readonly type: "recover_operation";
+      readonly operationId: string;
     }
   | {
       readonly type: "decide_permission";

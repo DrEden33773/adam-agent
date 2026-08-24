@@ -7,7 +7,9 @@ import { join } from "node:path";
 import {
   type ContextProfile,
   createCodingToolRegistry,
+  createExtensionHost,
   createFileArtifactStore,
+  createInMemoryOperationStore,
   createModelTargets,
   createPermissionPolicy,
   createPresentationPreferences,
@@ -18,6 +20,7 @@ import {
   ModelDriverError,
   type ModelTargetIdentity,
   type ModelTargets,
+  type OperationStore,
   type SessionLifecycle,
 } from "@adam-agent/agent";
 import {
@@ -215,6 +218,307 @@ function waitForAssistantMessage(
     completed.resolve();
   }
   return completed.promise;
+}
+
+async function writePresentationOperationExtension(packageRoot: string): Promise<void> {
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/extension",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.extension",
+        apiVersion: "^0.3.0",
+        runtime: { entry: "./runtime.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [
+          {
+            kind: "operation",
+            id: "fixture.review",
+            input: { id: "fixture.input", version: 1 },
+            output: { id: "fixture.output", version: 1 },
+            progress: { id: "fixture.progress", version: 1 },
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({
+    id,
+    version: 1,
+    decode(value) { return { ok: true, value }; },
+    encode(value) { return { ok: true, value }; },
+  });
+  context.registerOperation({
+    id: "fixture.review",
+    input: codec("fixture.input"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    execute(input) { return { accepted: true, revision: input.revision }; },
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function writePresentationProgressOperationExtension(
+  packageRoot: string,
+  controlKey: string,
+): Promise<void> {
+  await writePresentationOperationExtension(packageRoot);
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({
+    id,
+    version: 1,
+    decode(value) { return { ok: true, value }; },
+    encode(value) { return { ok: true, value }; },
+  });
+  context.registerOperation({
+    id: "fixture.review",
+    input: codec("fixture.input"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    async execute(input, operation) {
+      const control = globalThis[${JSON.stringify(controlKey)}];
+      await operation.progress({
+        completed: 1,
+        phase: "analyzing",
+        total: 2,
+        detail: "x".repeat(1_000),
+      });
+      control.progressPublished();
+      await control.releaseExecution;
+      return { accepted: true, revision: input.revision };
+    },
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function writePresentationRepairOperationExtension(
+  packageRoot: string,
+  controlKey: string,
+): Promise<void> {
+  await writePresentationOperationExtension(packageRoot);
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({
+    id,
+    version: 1,
+    decode(value) { return { ok: true, value }; },
+    encode(value) { return { ok: true, value }; },
+  });
+  context.registerOperation({
+    id: "fixture.review",
+    input: codec("fixture.input"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    async execute(input, operation) {
+      const control = globalThis[${JSON.stringify(controlKey)}];
+      control.executionStarted();
+      await control.releaseProgress;
+      await operation.progress({ phase: "repairing" });
+      control.progressPublished();
+      await control.releaseExecution;
+      return { accepted: true, revision: input.revision };
+    },
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function writePresentationConcurrentRepairOperationExtension(
+  packageRoot: string,
+  controlKey: string,
+): Promise<void> {
+  await writePresentationOperationExtension(packageRoot);
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({
+    id,
+    version: 1,
+    decode(value) { return { ok: true, value }; },
+    encode(value) { return { ok: true, value }; },
+  });
+  context.registerOperation({
+    id: "fixture.review",
+    input: codec("fixture.input"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    async execute(input, operation) {
+      const control = globalThis[${JSON.stringify(controlKey)}];
+      control.executionStarted(input.revision);
+      await control.releaseProgress[input.revision];
+      await operation.progress({ phase: input.revision });
+      control.progressPublished(input.revision);
+      await control.releaseExecution[input.revision];
+      return { accepted: true, revision: input.revision };
+    },
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function writePresentationCancellableOperationExtension(
+  packageRoot: string,
+  controlKey: string,
+): Promise<void> {
+  await writePresentationOperationExtension(packageRoot);
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({
+    id,
+    version: 1,
+    decode(value) { return { ok: true, value }; },
+    encode(value) { return { ok: true, value }; },
+  });
+  context.registerOperation({
+    id: "fixture.review",
+    input: codec("fixture.input"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    async execute(_input, operation) {
+      globalThis[${JSON.stringify(controlKey)}].executionStarted();
+      await new Promise((resolve, reject) => {
+        operation.signal.addEventListener("abort", () => reject(operation.signal.reason), {
+          once: true,
+        });
+      });
+      return { unreachable: true };
+    },
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function writePresentationRecoverableOperationExtension(
+  packageRoot: string,
+  controlKey?: string,
+): Promise<void> {
+  await writePresentationOperationExtension(packageRoot);
+  const packageJson = JSON.parse(await readFile(join(packageRoot, "package.json"), "utf8"));
+  packageJson.adamAgent.contributions[0].recovery = { version: 1 };
+  await writeFile(join(packageRoot, "package.json"), JSON.stringify(packageJson), "utf8");
+  const reconciliation =
+    controlKey === undefined
+      ? `reconcile(input) {
+      return {
+        status: "completed",
+        output: { accepted: true, recovered: true, revision: input.revision },
+      };
+    },`
+      : `async reconcile(input) {
+      const control = globalThis[${JSON.stringify(controlKey)}];
+      control.reconciliationStarted();
+      await control.releaseReconciliation;
+      if (control.rejectReconciliation === true) {
+        throw new Error("injected reconciliation failure");
+      }
+      return {
+        status: "completed",
+        output: { accepted: true, recovered: true, revision: input.revision },
+      };
+    },`;
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({
+    id,
+    version: 1,
+    decode(value) { return { ok: true, value }; },
+    encode(value) { return { ok: true, value }; },
+  });
+  context.registerOperation({
+    id: "fixture.review",
+    input: codec("fixture.input"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    execute(input) { return { accepted: true, revision: input.revision }; },
+    ${reconciliation}
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function writePresentationArtifactOperationExtension(packageRoot: string): Promise<void> {
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/extension",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.extension",
+        apiVersion: "^0.3.0",
+        runtime: { entry: "./runtime.js" },
+        capabilities: {
+          required: [{ id: "adam.artifact.publish@1", version: "^1.0.0" }],
+          optional: [],
+        },
+        contributions: [
+          {
+            kind: "operation",
+            id: "fixture.review",
+            input: { id: "fixture.input", version: 1 },
+            output: { id: "fixture.output", version: 1 },
+            progress: { id: "fixture.progress", version: 1 },
+            report: { id: "fixture.report", version: 1 },
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({
+    id,
+    version: 1,
+    decode(value) { return { ok: true, value }; },
+    encode(value) { return { ok: true, value }; },
+  });
+  context.registerOperation({
+    id: "fixture.review",
+    input: codec("fixture.input"),
+    output: codec("fixture.output"),
+    progress: codec("fixture.progress"),
+    async execute(_input, operation) {
+      const report = await operation.capabilities["adam.artifact.publish@1"].publish({
+        bytes: new TextEncoder().encode("# Fixture review report"),
+        contract: { id: "fixture.report", version: 1 },
+        mediaType: "text/markdown",
+      });
+      return { report };
+    },
+  });
+}
+`,
+    "utf8",
+  );
 }
 
 function presentationThinkingSelection(
@@ -2746,6 +3050,1688 @@ test("PresentationSession opens an existing authoritative session by identity", 
       },
     });
 
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession preserves linked operation truth through session and runtime refreshes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-linked-operation-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  await mkdir(workspaceRoot);
+  await writePresentationOperationExtension(packageRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: createInMemoryOperationStore(),
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const operation = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-linked-operation-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: created.sessionId,
+        sourceSequence: created.lastSequence,
+      },
+    });
+    for await (const record of host.operations.events({ operationId: operation.operationId })) {
+      if (record.event.type === "operation_completed") {
+        break;
+      }
+    }
+
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+
+    expect(presentation.getState().authoritative.active?.linkedOperations).toMatchObject([
+      {
+        operationId: operation.operationId,
+        origin: {
+          invocation: { id: "review", kind: "presentation_command", version: 1 },
+          sessionId: created.sessionId,
+          sourceSequence: created.lastSequence,
+        },
+        provenance: {
+          contributionId: "fixture.review",
+          extensionId: "fixture.extension",
+          extensionVersion: "1.0.0",
+        },
+        status: "completed",
+      },
+    ]);
+    expect(presentation.getState().authoritative.continuity).toMatchObject({
+      operationThrough: [{ operationId: operation.operationId, sequence: 2 }],
+      status: "current",
+    });
+    await expect(
+      presentation.dispatch({
+        type: "set_session_manual_name",
+        sessionId: created.sessionId,
+        name: "Operation session",
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().authoritative.continuity).toMatchObject({
+      operationThrough: [{ operationId: operation.operationId, sequence: 2 }],
+      status: "current",
+    });
+    const answerVisible = waitForAssistantMessage(presentation, "Presentation fixture answer.");
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Refresh the active session" },
+    });
+    await answerVisible;
+    expect(presentation.getState().authoritative.continuity).toMatchObject({
+      operationThrough: [{ operationId: operation.operationId, sequence: 2 }],
+      status: "current",
+    });
+    expect(
+      presentation
+        .getState()
+        .authoritative.active?.transcript.items.some(
+          (item) => item.type === "operation_link" && item.operationId === operation.operationId,
+        ),
+    ).toBe(true);
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession publishes linked operation progress and replaces it with durable completion", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-progress-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamPresentationOperation${Date.now()}${Math.random()}`;
+  const progressPublished = Promise.withResolvers<void>();
+  const releaseExecution = Promise.withResolvers<void>();
+  (globalThis as Record<string, unknown>)[controlKey] = {
+    progressPublished: progressPublished.resolve,
+    releaseExecution: releaseExecution.promise,
+  };
+  await mkdir(workspaceRoot);
+  await writePresentationProgressOperationExtension(packageRoot, controlKey);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: createInMemoryOperationStore(),
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const operation = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-progress-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: created.sessionId,
+        sourceSequence: created.lastSequence,
+      },
+    });
+    await progressPublished.promise;
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const completed = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation.getState().authoritative.active?.linkedOperations[0]?.status === "completed"
+      ) {
+        completed.resolve();
+      }
+    });
+
+    expect(presentation.getState().authoritative.active?.linkedOperations).toMatchObject([
+      {
+        operationId: operation.operationId,
+        progress: {
+          summary: expect.stringMatching(/^\{"completed":1,"detail":"x+/),
+        },
+        status: "running",
+      },
+    ]);
+    const progress = presentation.getState().authoritative.active?.linkedOperations[0]?.progress;
+    expect(progress).not.toBeNull();
+    expect(typeof progress === "object" && progress !== null && "summary" in progress).toBe(true);
+    if (typeof progress === "object" && progress !== null && "summary" in progress) {
+      expect(new TextEncoder().encode(progress.summary as string).byteLength).toBeLessThanOrEqual(
+        240,
+      );
+    }
+    releaseExecution.resolve();
+    await completed.promise;
+    expect(presentation.getState().authoritative).toMatchObject({
+      continuity: {
+        operationThrough: [{ operationId: operation.operationId, sequence: 3 }],
+        status: "current",
+      },
+      active: {
+        linkedOperations: [
+          {
+            operationId: operation.operationId,
+            progress,
+            status: "completed",
+          },
+        ],
+      },
+    });
+    unsubscribe();
+    await presentation.close();
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    releaseExecution.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession rechecks Host truth when a running operation stream closes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-stream-close-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamPresentationOperationClose${Date.now()}${Math.random()}`;
+  const progressPublished = Promise.withResolvers<void>();
+  const releaseExecution = Promise.withResolvers<void>();
+  (globalThis as Record<string, unknown>)[controlKey] = {
+    progressPublished: progressPublished.resolve,
+    releaseExecution: releaseExecution.promise,
+  };
+  await mkdir(workspaceRoot);
+  await writePresentationProgressOperationExtension(packageRoot, controlKey);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const durableStore = createInMemoryOperationStore();
+  let rejectTerminal = true;
+  const interruptedStore: OperationStore = {
+    append(record) {
+      if (rejectTerminal && record.event.type === "operation_completed") {
+        rejectTerminal = false;
+        return Promise.reject(new Error("injected terminal persistence failure"));
+      }
+      return durableStore.append(record);
+    },
+    findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
+    read: (operationId) => durableStore.read(operationId),
+  };
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: interruptedStore,
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const operation = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-stream-close-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: created.sessionId,
+        sourceSequence: created.lastSequence,
+      },
+    });
+    await progressPublished.promise;
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const recoveryRequired = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation.getState().authoritative.active?.linkedOperations[0]?.status ===
+        "recovery_required"
+      ) {
+        recoveryRequired.resolve();
+      }
+    });
+    try {
+      expect(presentation.getState().authoritative.active?.linkedOperations[0]?.status).toBe(
+        "running",
+      );
+      releaseExecution.resolve();
+      await recoveryRequired.promise;
+      expect(presentation.getState().authoritative.active?.linkedOperations[0]).toMatchObject({
+        actions: [],
+        operationId: operation.operationId,
+        status: "recovery_required",
+      });
+    } finally {
+      unsubscribe();
+      releaseExecution.resolve();
+      await presentation.close();
+    }
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    releaseExecution.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession repairs one failed operation refresh and resumes observation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-repair-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamPresentationOperationRepair${Date.now()}${Math.random()}`;
+  const executionStarted = Promise.withResolvers<void>();
+  const releaseProgress = Promise.withResolvers<void>();
+  const progressPublished = Promise.withResolvers<void>();
+  const releaseExecution = Promise.withResolvers<void>();
+  (globalThis as Record<string, unknown>)[controlKey] = {
+    executionStarted: executionStarted.resolve,
+    progressPublished: progressPublished.resolve,
+    releaseExecution: releaseExecution.promise,
+    releaseProgress: releaseProgress.promise,
+  };
+  await mkdir(workspaceRoot);
+  await writePresentationRepairOperationExtension(packageRoot, controlKey);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const durableStore = createInMemoryOperationStore();
+  const observerReady = Promise.withResolvers<void>();
+  let readCount = 0;
+  let rejectNextRead = false;
+  const repairStore: OperationStore = {
+    append: (record) => durableStore.append(record),
+    findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
+    async read(operationId) {
+      const records = await durableStore.read(operationId);
+      readCount += 1;
+      if (readCount === 2) {
+        observerReady.resolve();
+      }
+      if (rejectNextRead) {
+        rejectNextRead = false;
+        throw new Error("injected operation refresh failure");
+      }
+      return records;
+    },
+  };
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: repairStore,
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const operation = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-repair-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: created.sessionId,
+        sourceSequence: created.lastSequence,
+      },
+    });
+    await executionStarted.promise;
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const repairing = Promise.withResolvers<void>();
+    const repaired = Promise.withResolvers<void>();
+    const completed = Promise.withResolvers<void>();
+    let repairingObserved = false;
+    let failureGuard: ReturnType<typeof setTimeout> | undefined;
+    const failed = new Promise<never>((_resolve, reject) => {
+      failureGuard = setTimeout(
+        () => reject(new Error("Operation refresh repair did not settle.")),
+        5_000,
+      );
+    });
+    const unsubscribe = presentation.subscribe(() => {
+      const current = presentation.getState();
+      if (current.authoritative.continuity.status === "repairing") {
+        repairingObserved = true;
+        repairing.resolve();
+      }
+      const linked = current.authoritative.active?.linkedOperations[0];
+      if (
+        repairingObserved &&
+        current.authoritative.continuity.status === "current" &&
+        linked?.progress?.summary === '{"phase":"repairing"}'
+      ) {
+        repaired.resolve();
+      }
+      if (linked?.status === "completed") {
+        completed.resolve();
+      }
+    });
+    try {
+      await observerReady.promise;
+      rejectNextRead = true;
+      releaseProgress.resolve();
+      await progressPublished.promise;
+      await Promise.race([repairing.promise, failed]);
+      await Promise.race([repaired.promise, failed]);
+      releaseExecution.resolve();
+      await Promise.race([completed.promise, failed]);
+      expect(presentation.getState().authoritative.continuity).toMatchObject({
+        operationThrough: [{ operationId: operation.operationId, sequence: 3 }],
+        status: "current",
+      });
+    } finally {
+      if (failureGuard !== undefined) {
+        clearTimeout(failureGuard);
+      }
+      unsubscribe();
+      await presentation.close();
+    }
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    releaseProgress.resolve();
+    releaseExecution.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps every operation cursor monotonic during one concurrent repair", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-monotonic-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamPresentationOperationMonotonic${Date.now()}${Math.random()}`;
+  const revisions = ["repair", "concurrent"] as const;
+  const started = new Map(revisions.map((revision) => [revision, Promise.withResolvers<void>()]));
+  const progressReleases = new Map(
+    revisions.map((revision) => [revision, Promise.withResolvers<void>()]),
+  );
+  const progressPublished = new Map(
+    revisions.map((revision) => [revision, Promise.withResolvers<void>()]),
+  );
+  const executionReleases = new Map(
+    revisions.map((revision) => [revision, Promise.withResolvers<void>()]),
+  );
+  (globalThis as Record<string, unknown>)[controlKey] = {
+    executionStarted(revision: string) {
+      if (revision === "repair" || revision === "concurrent") {
+        started.get(revision)?.resolve();
+      }
+    },
+    progressPublished(revision: string) {
+      if (revision === "repair" || revision === "concurrent") {
+        progressPublished.get(revision)?.resolve();
+      }
+    },
+    releaseExecution: Object.fromEntries(
+      revisions.map((revision) => [revision, executionReleases.get(revision)?.promise]),
+    ),
+    releaseProgress: Object.fromEntries(
+      revisions.map((revision) => [revision, progressReleases.get(revision)?.promise]),
+    ),
+  };
+  await mkdir(workspaceRoot);
+  await writePresentationConcurrentRepairOperationExtension(packageRoot, controlKey);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const durableStore = createInMemoryOperationStore();
+  const observerReady = new Map(
+    revisions.map((revision) => [revision, Promise.withResolvers<void>()]),
+  );
+  const readCounts = new Map<string, number>();
+  const repairReadStarted = Promise.withResolvers<void>();
+  const releaseRepairRead = Promise.withResolvers<void>();
+  let repairOperationId: string | undefined;
+  let concurrentOperationId: string | undefined;
+  let rejectRepairRead = false;
+  let rejectConcurrentRead = false;
+  let blockRepairRead = false;
+  const operationRevision = new Map<string, (typeof revisions)[number]>();
+  const repairStore: OperationStore = {
+    append: (record) => durableStore.append(record),
+    findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
+    async read(operationId) {
+      const records = await durableStore.read(operationId);
+      const count = (readCounts.get(operationId) ?? 0) + 1;
+      readCounts.set(operationId, count);
+      if (count === 2) {
+        const revision = operationRevision.get(operationId);
+        if (revision !== undefined) {
+          observerReady.get(revision)?.resolve();
+        }
+      }
+      if (operationId === repairOperationId && rejectRepairRead) {
+        rejectRepairRead = false;
+        throw new Error("injected concurrent operation refresh failure");
+      }
+      if (operationId === concurrentOperationId && rejectConcurrentRead) {
+        rejectConcurrentRead = false;
+        throw new Error("injected second operation refresh failure");
+      }
+      if (operationId === repairOperationId && blockRepairRead) {
+        blockRepairRead = false;
+        repairReadStarted.resolve();
+        await releaseRepairRead.promise;
+      }
+      return records;
+    },
+  };
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: repairStore,
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const operations = await Promise.all(
+      revisions.map(async (revision) => {
+        const reference = await host.operations.startLinked({
+          contributionId: "fixture.review",
+          idempotencyKey: `presentation-operation-monotonic-${revision}`,
+          input: { revision },
+          origin: {
+            invocation: { id: "review", kind: "presentation_command", version: 1 },
+            sessionId: created.sessionId,
+            sourceSequence: created.lastSequence,
+          },
+        });
+        operationRevision.set(reference.operationId, revision);
+        return reference;
+      }),
+    );
+    repairOperationId = operations[0]?.operationId;
+    concurrentOperationId = operations[1]?.operationId;
+    await Promise.all(revisions.map((revision) => started.get(revision)?.promise));
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const repairing = Promise.withResolvers<void>();
+    const concurrentVisible = Promise.withResolvers<void>();
+    const repaired = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      const current = presentation.getState();
+      if (current.authoritative.continuity.status === "repairing") {
+        repairing.resolve();
+      }
+      const linked = current.authoritative.active?.linkedOperations ?? [];
+      if (
+        current.authoritative.continuity.status === "repairing" &&
+        linked.some((operation) => operation.progress?.summary === '{"phase":"concurrent"}')
+      ) {
+        concurrentVisible.resolve();
+      }
+      if (
+        current.authoritative.continuity.status === "current" &&
+        linked.some((operation) => operation.progress?.summary === '{"phase":"repair"}')
+      ) {
+        repaired.resolve();
+      }
+    });
+    try {
+      await Promise.all(revisions.map((revision) => observerReady.get(revision)?.promise));
+      rejectRepairRead = true;
+      blockRepairRead = true;
+      progressReleases.get("repair")?.resolve();
+      await progressPublished.get("repair")?.promise;
+      await repairing.promise;
+      await repairReadStarted.promise;
+      await expect(
+        presentation.dispatch({
+          type: "set_session_manual_name",
+          sessionId: created.sessionId,
+          name: "Repair remains authoritative",
+        }),
+      ).resolves.toMatchObject({ status: "admitted" });
+      expect(presentation.getState().authoritative.continuity).toEqual({
+        status: "repairing",
+        reason: "reconnect",
+      });
+      rejectConcurrentRead = true;
+      progressReleases.get("concurrent")?.resolve();
+      await progressPublished.get("concurrent")?.promise;
+      await concurrentVisible.promise;
+      releaseRepairRead.resolve();
+      await repaired.promise;
+      expect(presentation.getState().authoritative.continuity).toMatchObject({
+        operationThrough: expect.arrayContaining(
+          operations.map((operation) => ({ operationId: operation.operationId, sequence: 2 })),
+        ),
+        status: "current",
+      });
+    } finally {
+      unsubscribe();
+      for (const revision of revisions) {
+        progressReleases.get(revision)?.resolve();
+        executionReleases.get(revision)?.resolve();
+      }
+      releaseRepairRead.resolve();
+      await presentation.close();
+    }
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    for (const revision of revisions) {
+      progressReleases.get(revision)?.resolve();
+      executionReleases.get(revision)?.resolve();
+    }
+    releaseRepairRead.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession observes an operation first discovered by a runtime refresh", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-discovery-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamPresentationOperationDiscovery${Date.now()}${Math.random()}`;
+  const executionStarted = Promise.withResolvers<void>();
+  const releaseProgress = Promise.withResolvers<void>();
+  const progressPublished = Promise.withResolvers<void>();
+  const releaseExecution = Promise.withResolvers<void>();
+  (globalThis as Record<string, unknown>)[controlKey] = {
+    executionStarted: executionStarted.resolve,
+    progressPublished: progressPublished.resolve,
+    releaseExecution: releaseExecution.promise,
+    releaseProgress: releaseProgress.promise,
+  };
+  await mkdir(workspaceRoot);
+  await writePresentationRepairOperationExtension(packageRoot, controlKey);
+  const modelTargets = settledModelTargets();
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const created = await lifecycle.create({ targetIdentity });
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: createInMemoryOperationStore(),
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const operation = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-discovery-1",
+      input: { revision: "discovered" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: created.sessionId,
+        sourceSequence: created.lastSequence,
+      },
+    });
+    await executionStarted.promise;
+    const linkedVisible = Promise.withResolvers<void>();
+    const completed = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      const linked = presentation.getState().authoritative.active?.linkedOperations[0];
+      if (linked?.operationId === operation.operationId) {
+        linkedVisible.resolve();
+      }
+      if (linked?.operationId === operation.operationId && linked.status === "completed") {
+        completed.resolve();
+      }
+    });
+    try {
+      await lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Discover the linked operation" },
+      });
+      await linkedVisible.promise;
+      releaseProgress.resolve();
+      await progressPublished.promise;
+      releaseExecution.resolve();
+      await completed.promise;
+      expect(presentation.getState().authoritative.continuity).toMatchObject({
+        operationThrough: [{ operationId: operation.operationId, sequence: 3 }],
+        status: "current",
+      });
+    } finally {
+      unsubscribe();
+      releaseProgress.resolve();
+      releaseExecution.resolve();
+      await presentation.close();
+    }
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    releaseProgress.resolve();
+    releaseExecution.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession inherits only operation links inside an authoritative branch prefix", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-branch-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  await mkdir(workspaceRoot);
+  await writePresentationOperationExtension(packageRoot);
+  const modelTargets = settledModelTargets("Branch operation answer.");
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const parent = await lifecycle.create({ targetIdentity });
+  const firstTurn = await lifecycle.continue({
+    sessionId: parent.sessionId,
+    input: { text: "Create the included operation boundary" },
+  });
+  const includedThrough = firstTurn.snapshot.lastSequence;
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: createInMemoryOperationStore(),
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const included = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-branch-included",
+      input: { revision: "included" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: parent.sessionId,
+        sourceSequence: includedThrough,
+      },
+    });
+    for await (const record of host.operations.events({ operationId: included.operationId })) {
+      if (record.event.type === "operation_completed") {
+        break;
+      }
+    }
+    const secondTurn = await lifecycle.continue({
+      sessionId: parent.sessionId,
+      input: { text: "Create the excluded operation boundary" },
+    });
+    const excluded = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-branch-excluded",
+      input: { revision: "excluded" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: parent.sessionId,
+        sourceSequence: secondTurn.snapshot.lastSequence,
+      },
+    });
+    for await (const record of host.operations.events({ operationId: excluded.operationId })) {
+      if (record.event.type === "operation_completed") {
+        break;
+      }
+    }
+    const child = await lifecycle.branch({
+      parentSessionId: parent.sessionId,
+      atSequence: includedThrough,
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: child.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+
+    expect(
+      presentation
+        .getState()
+        .authoritative.active?.linkedOperations.map((operation) => operation.operationId),
+    ).toEqual([included.operationId]);
+    expect(
+      presentation
+        .getState()
+        .authoritative.active?.transcript.items.filter((item) => item.type === "operation_link"),
+    ).toEqual([
+      {
+        type: "operation_link",
+        id: `operation:${included.operationId}`,
+        operationId: included.operationId,
+        sequence: includedThrough,
+        sourceSessionId: parent.sessionId,
+        branchBoundary: { sessionId: parent.sessionId, sequence: includedThrough },
+      },
+    ]);
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession admits cancel only for the currently running linked operation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-cancel-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamPresentationCancellation${Date.now()}${Math.random()}`;
+  const executionStarted = Promise.withResolvers<void>();
+  (globalThis as Record<string, unknown>)[controlKey] = {
+    executionStarted: executionStarted.resolve,
+  };
+  await mkdir(workspaceRoot);
+  await writePresentationCancellableOperationExtension(packageRoot, controlKey);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: createInMemoryOperationStore(),
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const operation = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-cancel-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: created.sessionId,
+        sourceSequence: created.lastSequence,
+      },
+    });
+    await executionStarted.promise;
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const cancelled = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation.getState().authoritative.active?.linkedOperations[0]?.status === "cancelled"
+      ) {
+        cancelled.resolve();
+      }
+    });
+
+    expect(presentation.getState().authoritative.active?.linkedOperations[0]).toMatchObject({
+      actions: ["cancel"],
+      operationId: operation.operationId,
+      status: "running",
+    });
+    await expect(
+      presentation.dispatch({ type: "cancel_operation", operationId: operation.operationId }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    await cancelled.promise;
+    expect(presentation.getState().authoritative.active?.linkedOperations[0]).toMatchObject({
+      actions: [],
+      operationId: operation.operationId,
+      settlement: { reason: "caller" },
+      status: "cancelled",
+    });
+    await expect(
+      presentation.dispatch({ type: "cancel_operation", operationId: operation.operationId }),
+    ).resolves.toMatchObject({ code: "stale_interaction", status: "rejected" });
+    unsubscribe();
+    await presentation.close();
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession recovers only an interrupted linked operation from immutable Host truth", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-recover-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamPresentationRecovery${Date.now()}${Math.random()}`;
+  const reconciliationStarted = Promise.withResolvers<void>();
+  const releaseReconciliation = Promise.withResolvers<void>();
+  (globalThis as Record<string, unknown>)[controlKey] = {
+    reconciliationStarted: reconciliationStarted.resolve,
+    releaseReconciliation: releaseReconciliation.promise,
+  };
+  await mkdir(workspaceRoot);
+  await writePresentationRecoverableOperationExtension(packageRoot, controlKey);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const durableStore = createInMemoryOperationStore();
+  let rejectTerminal = true;
+  const interruptedStore: OperationStore = {
+    append(record) {
+      if (rejectTerminal && record.event.type === "operation_completed") {
+        rejectTerminal = false;
+        return Promise.reject(new Error("injected terminal persistence failure"));
+      }
+      return durableStore.append(record);
+    },
+    findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
+    read: (operationId) => durableStore.read(operationId),
+  };
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: interruptedStore,
+    projectRoot: workspaceRoot,
+    stateRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const operation = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-recover-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: created.sessionId,
+        sourceSequence: created.lastSequence,
+      },
+    });
+    for await (const _record of host.operations.events({ operationId: operation.operationId })) {
+      // The real Host closes this causal stream when terminal persistence fails.
+    }
+    await expect(host.operations.query(operation.operationId)).resolves.toMatchObject({
+      status: "recovery_required",
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+
+    expect(presentation.getState().authoritative.active?.linkedOperations[0]).toMatchObject({
+      actions: ["recover"],
+      operationId: operation.operationId,
+      status: "recovery_required",
+    });
+    const recovered = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation.getState().authoritative.active?.linkedOperations[0]?.status === "completed"
+      ) {
+        recovered.resolve();
+      }
+    });
+    let failureGuard: ReturnType<typeof setTimeout> | undefined;
+    const failed = new Promise<never>((_resolve, reject) => {
+      failureGuard = setTimeout(
+        () => reject(new Error("Recovery admission waited for operation settlement.")),
+        5_000,
+      );
+    });
+    const receipt = presentation.dispatch({
+      type: "recover_operation",
+      operationId: operation.operationId,
+    });
+    await reconciliationStarted.promise;
+    await expect(Promise.race([receipt, failed])).resolves.toMatchObject({
+      status: "admitted",
+      resource: null,
+    });
+    releaseReconciliation.resolve();
+    await Promise.race([recovered.promise, failed]);
+    if (failureGuard !== undefined) {
+      clearTimeout(failureGuard);
+    }
+    expect(presentation.getState().authoritative.active?.linkedOperations[0]).toMatchObject({
+      actions: [],
+      operationId: operation.operationId,
+      status: "completed",
+    });
+    await expect(
+      presentation.dispatch({ type: "recover_operation", operationId: operation.operationId }),
+    ).resolves.toMatchObject({ code: "stale_interaction", status: "rejected" });
+    unsubscribe();
+    await presentation.close();
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    releaseReconciliation.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession advances durable recovery truth after reconciliation rejects", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-recovery-reject-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamPresentationRecoveryReject${Date.now()}${Math.random()}`;
+  const reconciliationStarted = Promise.withResolvers<void>();
+  const releaseReconciliation = Promise.withResolvers<void>();
+  (globalThis as Record<string, unknown>)[controlKey] = {
+    reconciliationStarted: reconciliationStarted.resolve,
+    rejectReconciliation: true,
+    releaseReconciliation: releaseReconciliation.promise,
+  };
+  await mkdir(workspaceRoot);
+  await writePresentationRecoverableOperationExtension(packageRoot, controlKey);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const durableStore = createInMemoryOperationStore();
+  let rejectTerminal = true;
+  const interruptedStore: OperationStore = {
+    append(record) {
+      if (rejectTerminal && record.event.type === "operation_completed") {
+        rejectTerminal = false;
+        return Promise.reject(new Error("injected terminal persistence failure"));
+      }
+      return durableStore.append(record);
+    },
+    findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
+    read: (operationId) => durableStore.read(operationId),
+  };
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: interruptedStore,
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const operation = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-recovery-reject-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: created.sessionId,
+        sourceSequence: created.lastSequence,
+      },
+    });
+    for await (const _record of host.operations.events({ operationId: operation.operationId })) {
+      // The real Host closes this stream after terminal persistence fails.
+    }
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const durableAttemptVisible = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      const current = presentation.getState();
+      if (
+        current.authoritative.continuity.status === "current" &&
+        current.authoritative.continuity.operationThrough.some(
+          (cursor) => cursor.operationId === operation.operationId && cursor.sequence === 2,
+        )
+      ) {
+        durableAttemptVisible.resolve();
+      }
+    });
+    try {
+      await expect(
+        presentation.dispatch({ type: "recover_operation", operationId: operation.operationId }),
+      ).resolves.toMatchObject({ status: "admitted" });
+      await reconciliationStarted.promise;
+      releaseReconciliation.resolve();
+      await durableAttemptVisible.promise;
+      expect(presentation.getState().authoritative.active?.linkedOperations[0]).toMatchObject({
+        actions: ["recover"],
+        operationId: operation.operationId,
+        status: "recovery_required",
+      });
+    } finally {
+      unsubscribe();
+      releaseReconciliation.resolve();
+      await presentation.close();
+    }
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    releaseReconciliation.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps an unavailable recovery generic and actionless", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-generic-recovery-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  await mkdir(workspaceRoot);
+  await writePresentationRecoverableOperationExtension(packageRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const durableStore = createInMemoryOperationStore();
+  let rejectTerminal = true;
+  const interruptedStore: OperationStore = {
+    append(record) {
+      if (rejectTerminal && record.event.type === "operation_completed") {
+        rejectTerminal = false;
+        return Promise.reject(new Error("injected terminal persistence failure"));
+      }
+      return durableStore.append(record);
+    },
+    findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
+    read: (operationId) => durableStore.read(operationId),
+  };
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: interruptedStore,
+    projectRoot: workspaceRoot,
+    stateRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const operation = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-generic-recovery-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: created.sessionId,
+        sourceSequence: created.lastSequence,
+      },
+    });
+    for await (const _record of host.operations.events({ operationId: operation.operationId })) {
+      // The real Host closes this stream after terminal persistence fails.
+    }
+    await host.disableExtension("fixture.extension");
+    await expect(host.operations.query(operation.operationId)).resolves.toMatchObject({
+      presentation: { kind: "generic" },
+      recoverable: false,
+      status: "recovery_required",
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    expect(presentation.getState().authoritative.active?.linkedOperations[0]).toMatchObject({
+      actions: [],
+      operationId: operation.operationId,
+      provenance: { presentation: "generic" },
+      status: "recovery_required",
+    });
+    await expect(
+      presentation.dispatch({ type: "recover_operation", operationId: operation.operationId }),
+    ).resolves.toMatchObject({ code: "stale_interaction", status: "rejected" });
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps a generic linked operation and reads its bounded report artifact", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-artifact-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  await mkdir(workspaceRoot);
+  await writePresentationArtifactOperationExtension(packageRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const host = createExtensionHost({
+    artifactStore: await createFileArtifactStore({ root: join(stateRoot, "artifacts") }),
+    capabilities: [{ id: "adam.artifact.publish@1", version: "1.0.0" }],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [{ id: "adam.artifact.publish@1", version: "^1.0.0" }],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: createInMemoryOperationStore(),
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const operation = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-artifact-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: created.sessionId,
+        sourceSequence: created.lastSequence,
+      },
+    });
+    for await (const record of host.operations.events({ operationId: operation.operationId })) {
+      if (record.event.type === "operation_completed") {
+        break;
+      }
+    }
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const projected = presentation.getState().authoritative.active?.linkedOperations[0];
+
+    expect(projected).toMatchObject({
+      artifacts: [
+        {
+          contract: { id: "fixture.report", version: 1 },
+          reference: {
+            byteCount: 23,
+            mediaType: "text/markdown",
+            source: "operation",
+          },
+          role: "report",
+        },
+      ],
+      operationId: operation.operationId,
+      provenance: {
+        presentation: "generic",
+        title: "fixture.review",
+      },
+      status: "completed",
+    });
+    const report = projected?.artifacts[0]?.reference;
+    if (report === undefined) {
+      throw new Error("Expected one projected operation report.");
+    }
+    await expect(
+      presentation.dispatch({
+        type: "read_artifact",
+        artifact: report,
+        range: { offset: 0, maximumBytes: 16 * 1024 },
+      }),
+    ).resolves.toMatchObject({
+      status: "admitted",
+      resource: { eof: true, text: "# Fixture review report" },
+    });
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession bounds linked-operation overflow without rejecting the session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-pages-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  await mkdir(workspaceRoot);
+  await writePresentationOperationExtension(packageRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: createInMemoryOperationStore(),
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const operations = await Promise.all(
+      Array.from({ length: 256 }, (_, index) =>
+        host.operations.startLinked({
+          contributionId: "fixture.review",
+          idempotencyKey: `presentation-operation-page-${index}`,
+          input: { revision: `${index}` },
+          origin: {
+            invocation: { id: "review", kind: "presentation_command", version: 1 },
+            sessionId: created.sessionId,
+            sourceSequence: created.lastSequence,
+          },
+        }),
+      ),
+    );
+    await Promise.all(
+      operations.map(async (operation) => {
+        for await (const record of host.operations.events({ operationId: operation.operationId })) {
+          if (record.event.type === "operation_completed") {
+            break;
+          }
+        }
+      }),
+    );
+    const firstPage = await host.operations.listLinked({
+      limit: 100,
+      sessionId: created.sessionId,
+      throughSequence: created.lastSequence,
+    });
+    expect(firstPage).toMatchObject({ items: { length: 100 }, nextCursor: expect.any(String) });
+    if (firstPage.nextCursor === null) {
+      throw new Error("Expected a second linked-operation page.");
+    }
+    await expect(
+      host.operations.listLinked({
+        cursor: firstPage.nextCursor,
+        limit: 100,
+        sessionId: created.sessionId,
+        throughSequence: created.lastSequence,
+      }),
+    ).resolves.toMatchObject({ items: { length: 100 }, nextCursor: expect.any(String) });
+    const child = await lifecycle.branch({
+      parentSessionId: created.sessionId,
+      atSequence: created.lastSequence,
+    });
+    const exactBound = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: child.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    expect(exactBound.getState().authoritative.active).toMatchObject({
+      linkedOperations: { length: 256 },
+      linkedOperationsTruncated: false,
+    });
+    expect(exactBound.getState().authoritative.continuity).toMatchObject({ status: "current" });
+    await exactBound.close();
+    const overflow = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "presentation-operation-page-overflow",
+      input: { revision: "overflow" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: child.sessionId,
+        sourceSequence: child.lastSequence,
+      },
+    });
+    for await (const record of host.operations.events({ operationId: overflow.operationId })) {
+      if (record.event.type === "operation_completed") {
+        break;
+      }
+    }
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: child.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const projected = presentation.getState().authoritative.active?.linkedOperations ?? [];
+
+    expect(projected).toHaveLength(256);
+    expect(new Set(projected.map((operation) => operation.operationId)).size).toBe(256);
+    expect(presentation.getState().authoritative.active).toMatchObject({
+      linkedOperationsTruncated: true,
+    });
+    expect(presentation.getState().authoritative.continuity).toMatchObject({
+      status: "degraded",
+      fault: { code: "authoritative_state_unavailable" },
+    });
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession replaces linked operation truth when selecting another project session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-select-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  await mkdir(workspaceRoot);
+  await writePresentationOperationExtension(packageRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const modelTargets = settledModelTargets();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const firstCreated = await lifecycle.create({ targetIdentity });
+  const secondCreated = await lifecycle.create({ targetIdentity });
+  const first = (
+    await lifecycle.continue({
+      sessionId: firstCreated.sessionId,
+      input: { text: "First session" },
+    })
+  ).snapshot;
+  const second = (
+    await lifecycle.continue({
+      sessionId: secondCreated.sessionId,
+      input: { text: "Second session" },
+    })
+  ).snapshot;
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.extension",
+        grants: [],
+        packageName: "@fixture/extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore: createInMemoryOperationStore(),
+    projectRoot: workspaceRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const starts = await Promise.all(
+      [first, second].map((session, index) =>
+        host.operations.startLinked({
+          contributionId: "fixture.review",
+          idempotencyKey: `presentation-operation-select-${index}`,
+          input: { revision: `${index}` },
+          origin: {
+            invocation: { id: "review", kind: "presentation_command", version: 1 },
+            sessionId: session.sessionId,
+            sourceSequence: session.lastSequence,
+          },
+        }),
+      ),
+    );
+    await Promise.all(
+      starts.map(async (operation) => {
+        for await (const record of host.operations.events({ operationId: operation.operationId })) {
+          if (record.event.type === "operation_completed") {
+            break;
+          }
+        }
+      }),
+    );
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      operations: host.operations,
+      projectLabel: "workspace",
+      sessionId: first.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    expect(
+      presentation
+        .getState()
+        .authoritative.active?.linkedOperations.map((operation) => operation.operationId),
+    ).toEqual([starts[0]?.operationId]);
+
+    await expect(
+      presentation.dispatch({ type: "select_session", sessionId: second.sessionId }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(
+      presentation
+        .getState()
+        .authoritative.active?.linkedOperations.map((operation) => operation.operationId),
+    ).toEqual([starts[1]?.operationId]);
+    expect(presentation.getState().authoritative.continuity).toMatchObject({
+      operationThrough: [{ operationId: starts[1]?.operationId, sequence: 2 }],
+      status: "current",
+    });
+    expect(
+      presentation
+        .getState()
+        .authoritative.active?.transcript.items.filter((item) => item.type === "operation_link"),
+    ).toHaveLength(1);
     await presentation.close();
   } finally {
     await lifecycle.close();
