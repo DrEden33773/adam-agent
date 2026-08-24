@@ -758,6 +758,14 @@ export type PresentationCommand =
       readonly sessionId: string | null;
     }
   | {
+      readonly type: "start_project_changes";
+      readonly sessionId: string;
+      readonly command: {
+        readonly id: string;
+        readonly version: number;
+      };
+    }
+  | {
       readonly type: "cancel_operation";
       readonly operationId: string;
     }

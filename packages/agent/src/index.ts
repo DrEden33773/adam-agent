@@ -81,6 +81,10 @@ export {
 } from "./biome-execution.js";
 export type { ContextProfile } from "./context-profile.js";
 export {
+  ExtensionConfigurationError,
+  loadExtensionConfiguration,
+} from "./extension-configuration.js";
+export {
   type ConfiguredExtension,
   createExtensionHost,
   type ExtensionCapabilityAvailability,

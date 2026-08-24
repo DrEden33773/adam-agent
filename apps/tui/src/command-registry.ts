@@ -11,6 +11,7 @@ export type AdamCommandDefinition = {
     | "clone"
     | "copy"
     | "diffs"
+    | "extension"
     | "fork"
     | "help"
     | "history"
@@ -30,6 +31,10 @@ export type AdamCommandDefinition = {
   readonly name: string;
   readonly summary: string;
   readonly usage: string;
+  readonly extensionCommand?: {
+    readonly id: string;
+    readonly version: number;
+  };
 };
 
 export type AdamKeybindingAction =
@@ -67,11 +72,15 @@ export type AdamCommandParseResult =
       readonly kind: "known";
     };
 
-class AdamCommandRegistry {
+export class AdamCommandRegistry {
   readonly #commands: readonly AdamCommandDefinition[];
   readonly #commandsByName: ReadonlyMap<string, AdamCommandDefinition>;
 
   constructor(commands: readonly AdamCommandDefinition[]) {
+    const names = commands.flatMap((command) => [command.name, ...command.aliases]);
+    if (new Set(names).size !== names.length) {
+      throw new TypeError("Adam command names and aliases must be unique.");
+    }
     this.#commands = commands;
     this.#commandsByName = new Map(
       commands.flatMap((command) =>
@@ -147,7 +156,7 @@ class AdamCommandRegistry {
   }
 }
 
-export const adamCommandRegistry = new AdamCommandRegistry([
+const builtInCommands: readonly AdamCommandDefinition[] = [
   {
     aliases: [],
     availability: "always",
@@ -308,7 +317,52 @@ export const adamCommandRegistry = new AdamCommandRegistry([
     summary: "Open the project MCP authority wizard.",
     usage: "/mcp",
   },
-]);
+];
+
+export type AdamExtensionCommandDefinition = {
+  readonly id: string;
+  readonly name: string;
+  readonly title: string;
+  readonly version: number;
+};
+
+export function createAdamCommandRegistry(
+  extensionCommands: readonly AdamExtensionCommandDefinition[] = [],
+): AdamCommandRegistry {
+  return new AdamCommandRegistry([
+    ...builtInCommands,
+    ...extensionCommands.map(
+      (command): AdamCommandDefinition => ({
+        aliases: [],
+        availability: "idle",
+        id: "extension",
+        name: command.name,
+        summary: command.title,
+        usage: `/${command.name}`,
+        extensionCommand: { id: command.id, version: command.version },
+      }),
+    ),
+  ]);
+}
+
+export function createAdamCommandRegistryFromContributions(
+  contributions: readonly {
+    readonly command?: AdamExtensionCommandDefinition | undefined;
+    readonly inputSource?: { readonly id: string; readonly version: number } | undefined;
+  }[],
+): AdamCommandRegistry {
+  return createAdamCommandRegistry(
+    contributions.flatMap((contribution) =>
+      contribution.command !== undefined &&
+      contribution.inputSource?.id === "project_changes" &&
+      contribution.inputSource.version === 1
+        ? [contribution.command]
+        : [],
+    ),
+  );
+}
+
+export const adamCommandRegistry = createAdamCommandRegistry();
 
 type KeybindingProjection = {
   readonly action: AdamKeybindingDefinition["action"];
@@ -377,7 +431,7 @@ const keybindingProjections: readonly KeybindingProjection[] = [
     action: "rename_session",
     adamInputs: ["ctrl+r"],
     keys: "Ctrl+R",
-    description: "Rename the focused session in the session picker",
+    description: "Recover the latest eligible operation; rename the focused session in its picker",
     section: "application",
   },
   {

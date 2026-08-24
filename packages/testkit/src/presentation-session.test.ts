@@ -20,6 +20,8 @@ import {
   ModelDriverError,
   type ModelTargetIdentity,
   type ModelTargets,
+  type OperationHost,
+  type OperationSnapshot,
   type OperationStore,
   type SessionLifecycle,
 } from "@adam-agent/agent";
@@ -218,6 +220,111 @@ function waitForAssistantMessage(
     completed.resolve();
   }
   return completed.promise;
+}
+
+function waitForLinkedOperation(
+  presentation: Awaited<ReturnType<typeof createPresentationSession>>,
+  operationId: string,
+  status: OperationSnapshot["status"],
+): Promise<void> {
+  const completed = Promise.withResolvers<void>();
+  const observed = () =>
+    presentation
+      .getState()
+      .authoritative.active?.linkedOperations.some(
+        (operation) => operation.operationId === operationId && operation.status === status,
+      ) === true;
+  const unsubscribe = presentation.subscribe(() => {
+    if (observed()) {
+      unsubscribe();
+      completed.resolve();
+    }
+  });
+  if (observed()) {
+    unsubscribe();
+    completed.resolve();
+  }
+  return completed.promise;
+}
+
+function presentationOperationHost(
+  overrides: Partial<OperationHost> & Pick<OperationHost, "query">,
+): OperationHost {
+  return {
+    async cancel(operationId) {
+      if (overrides.cancel !== undefined) {
+        return overrides.cancel(operationId);
+      }
+      throw new Error("Unexpected operation cancellation.");
+    },
+    events:
+      overrides.events ??
+      async function* emptyOperationEvents() {
+        // A settled fake operation has no live records.
+      },
+    async listLinked(options) {
+      return overrides.listLinked?.(options) ?? { items: [], nextCursor: null };
+    },
+    query: overrides.query,
+    async recover(operationId) {
+      if (overrides.recover !== undefined) {
+        return overrides.recover(operationId);
+      }
+      throw new Error("Unexpected operation recovery.");
+    },
+    async start(options) {
+      if (overrides.start !== undefined) {
+        return overrides.start(options);
+      }
+      throw new Error("Unexpected unlinked operation admission.");
+    },
+    async startLinked(options) {
+      if (overrides.startLinked !== undefined) {
+        return overrides.startLinked(options);
+      }
+      throw new Error("Unexpected linked operation admission.");
+    },
+  };
+}
+
+function presentationOperationSnapshot(
+  operationId: string,
+  sessionId: string,
+  sourceSequence: number,
+  status: "cancel_requested" | "cancelled" | "completed" | "running",
+): OperationSnapshot {
+  const base = {
+    budget: {
+      inputBytes: 32,
+      outputBytesRemaining: 1_024,
+      progressBytesRemaining: 1_024,
+      progressRecordsRemaining: 8,
+    },
+    contributionId: "fixture.review",
+    deadlineAt: "2030-01-01T00:00:00.000Z",
+    extensionId: "fixture.extension",
+    extensionVersion: "1.0.0",
+    operationId,
+    origin: {
+      invocation: {
+        id: "review" as const,
+        kind: "presentation_command" as const,
+        version: 1 as const,
+      },
+      sessionId,
+      sourceSequence,
+    },
+    presentation: { kind: "descriptor" as const, report: null, title: "Review changes" },
+    startedAt: "2026-01-01T00:00:00.000Z",
+    throughSequence: status === "running" ? 1 : 2,
+  };
+  if (status === "completed") {
+    return { ...base, status, output: { reviewed: true } };
+  }
+  if (status === "cancelled") {
+    return { ...base, status, reason: "caller" };
+  }
+  return { ...base, status };
 }
 
 async function writePresentationOperationExtension(packageRoot: string): Promise<void> {
@@ -3052,6 +3159,234 @@ test("PresentationSession opens an existing authoritative session by identity", 
 
     await presentation.close();
   } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps durable project-change admission distinct from projection failure", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-admission-query-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const created = await lifecycle.create({ targetIdentity });
+  const operationId = "operation-query-failure";
+  const snapshot = (status: "cancelled" | "running") =>
+    presentationOperationSnapshot(operationId, created.sessionId, created.lastSequence, status);
+  let starts = 0;
+  let queries = 0;
+  let cancellations = 0;
+  let cancelled = false;
+  const operations = presentationOperationHost({
+    async cancel() {
+      cancellations += 1;
+      cancelled = true;
+      return snapshot("cancelled");
+    },
+    async *events({ afterSequence = 0 }) {
+      if (afterSequence === 0) {
+        yield {
+          schemaVersion: 2,
+          operationId,
+          sequence: 1,
+          recordedAt: "2026-01-01T00:00:00.000Z",
+          event: { type: "operation_progress", value: "durable retry boundary" },
+        };
+      }
+    },
+    async query() {
+      queries += 1;
+      if (queries === 1) {
+        throw new Error("injected projection failure");
+      }
+      return snapshot(cancelled ? "cancelled" : "running");
+    },
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      operations,
+      projectChanges: {
+        async startProjectChanges() {
+          starts += 1;
+          return { operationId };
+        },
+      },
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    await expect(
+      presentation.dispatch({
+        type: "start_project_changes",
+        sessionId: created.sessionId,
+        command: { id: "fixture.review", version: 1 },
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await waitForLinkedOperation(presentation, operationId, "running");
+    expect(
+      presentation
+        .getState()
+        .authoritative.active?.linkedOperations.find(
+          (operation) => operation.operationId === operationId,
+        )?.actions,
+    ).toContain("cancel");
+    await expect(
+      presentation.dispatch({ type: "cancel_operation", operationId }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(starts).toBe(1);
+    expect(queries).toBeGreaterThanOrEqual(2);
+    expect(cancellations).toBe(1);
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession projects a slow admitted operation after the active cursor advances", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-admission-cursor-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const created = await lifecycle.create({ targetIdentity });
+  const admissionStarted = Promise.withResolvers<void>();
+  const releaseAdmission = Promise.withResolvers<void>();
+  const snapshot = presentationOperationSnapshot(
+    "operation-cursor-advance",
+    created.sessionId,
+    created.lastSequence,
+    "completed",
+  );
+  const operations = presentationOperationHost({
+    async cancel() {
+      return snapshot;
+    },
+    async query() {
+      return snapshot;
+    },
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      operations,
+      projectChanges: {
+        async startProjectChanges() {
+          admissionStarted.resolve();
+          await releaseAdmission.promise;
+          return { operationId: snapshot.operationId };
+        },
+      },
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    const admission = presentation.dispatch({
+      type: "start_project_changes",
+      sessionId: created.sessionId,
+      command: { id: "fixture.review", version: 1 },
+    });
+    await admissionStarted.promise;
+    await expect(
+      presentation.dispatch({
+        type: "set_session_manual_name",
+        sessionId: created.sessionId,
+        name: "Cursor advanced",
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    releaseAdmission.resolve();
+    await expect(admission).resolves.toMatchObject({ status: "admitted" });
+    await waitForLinkedOperation(presentation, snapshot.operationId, "completed");
+    expect(
+      presentation
+        .getState()
+        .authoritative.active?.transcript.items.some(
+          (item) => item.type === "operation_link" && item.operationId === snapshot.operationId,
+        ),
+    ).toBe(true);
+    await presentation.close();
+  } finally {
+    releaseAdmission.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession close cancels and causally settles an operation admitted by this view", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-admission-close-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const created = await lifecycle.create({ targetIdentity });
+  const operationId = "operation-owned-on-close";
+  const admissionStarted = Promise.withResolvers<void>();
+  const releaseAdmission = Promise.withResolvers<void>();
+  const cancelRequested = Promise.withResolvers<void>();
+  const releaseTerminal = Promise.withResolvers<void>();
+  let settled = false;
+  const snapshot = (status: "cancel_requested" | "cancelled" | "running") =>
+    presentationOperationSnapshot(operationId, created.sessionId, created.lastSequence, status);
+  const operations = presentationOperationHost({
+    async cancel() {
+      cancelRequested.resolve();
+      return snapshot("cancel_requested");
+    },
+    async *events() {
+      await releaseTerminal.promise;
+      settled = true;
+      yield {
+        schemaVersion: 2,
+        operationId,
+        sequence: 3,
+        recordedAt: "2026-01-01T00:00:01.000Z",
+        event: { type: "operation_cancelled", reason: "caller" },
+      };
+    },
+    async query() {
+      return snapshot(settled ? "cancelled" : "running");
+    },
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      operations,
+      projectChanges: {
+        async startProjectChanges() {
+          admissionStarted.resolve();
+          await releaseAdmission.promise;
+          return { operationId };
+        },
+      },
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    const admission = presentation.dispatch({
+      type: "start_project_changes",
+      sessionId: created.sessionId,
+      command: { id: "fixture.review", version: 1 },
+    });
+    await admissionStarted.promise;
+    const closing = presentation.close();
+    releaseAdmission.resolve();
+    await cancelRequested.promise;
+    releaseTerminal.resolve();
+    await closing;
+    await expect(admission).resolves.toMatchObject({ status: "admitted" });
+    expect(settled).toBe(true);
+  } finally {
+    releaseAdmission.resolve();
+    releaseTerminal.resolve();
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }

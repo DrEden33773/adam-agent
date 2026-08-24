@@ -1,3 +1,7 @@
 packages:
   - "apps/*"
   - "packages/*"
+minimumReleaseAgeExclude:
+  - '@adam-agent/extension-api@0.3.0'
+  - '@eve-reviewer/adam-extension@0.3.0'
+  - '@eve-reviewer/core@0.2.0'

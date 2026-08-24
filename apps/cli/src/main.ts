@@ -15,8 +15,10 @@ import {
   createModelTargets,
   createPermissionPolicy,
   createSessionLifecycle,
+  ExtensionConfigurationError,
   ExtensionHostError,
   type JsonValue,
+  loadExtensionConfiguration,
   type ModelMessage,
   ModelTargetError,
   type ModelTargetIdentity,
@@ -30,10 +32,6 @@ import {
   selectModelTargetId,
 } from "@adam-agent/agent";
 import { FakeModelDriver } from "@adam-agent/testkit";
-import {
-  CliExtensionConfigurationError,
-  loadCliExtensionConfiguration,
-} from "./extension-config.js";
 
 const command = parseCliCommand(process.argv.slice(2));
 if (command.type !== "recover_operation") {
@@ -391,7 +389,7 @@ type CliCommand =
 async function runCliCommand(activeCommand: CliCommand): Promise<void> {
   try {
     if (activeCommand.type === "recover_operation") {
-      const extensions = await loadCliExtensionConfiguration(process.env);
+      const extensions = await loadExtensionConfiguration(process.env);
       const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
       const operationStore = await createJsonlOperationStore({ stateRoot, workspaceRoot });
       const host = createExtensionHost({
@@ -457,7 +455,7 @@ async function runCliCommand(activeCommand: CliCommand): Promise<void> {
     await continueAndPresent(lifecycle, { sessionId: activeCommand.sessionId });
   } catch (error) {
     if (
-      error instanceof CliExtensionConfigurationError ||
+      error instanceof ExtensionConfigurationError ||
       error instanceof ExtensionHostError ||
       error instanceof ModelTargetError ||
       error instanceof OperationHostError ||

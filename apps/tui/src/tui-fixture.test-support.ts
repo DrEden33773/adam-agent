@@ -21,7 +21,7 @@ export type TuiFixture = {
   readonly closed: Promise<TuiFixtureResult>;
   readonly output: () => string;
   readonly resize: (columns: number, rows: number) => Promise<void>;
-  readonly terminate: (signal: "SIGHUP" | "SIGTERM") => Promise<void>;
+  readonly terminate: (signal: "SIGHUP" | "SIGKILL" | "SIGTERM") => Promise<void>;
   readonly waitFor: (text: string) => Promise<void>;
   readonly waitForAfter: (text: string, offset: number) => Promise<void>;
   readonly waitForCompleteFrameAfter: (text: string, offset: number) => Promise<void>;
@@ -327,6 +327,10 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
       await resizeTerminalProcess(processId, columns, rows);
     },
     async terminate(signal) {
+      if (signal === "SIGKILL") {
+        signalProcessGroup(signal);
+        return;
+      }
       if (input.terminalProcessMarker === undefined) {
         throw new Error("The external TUI fixture requires a terminal process marker to signal.");
       }

@@ -1,10 +1,13 @@
 import { createHash } from "node:crypto";
-import { access, watch, writeFile } from "node:fs/promises";
+import { access, mkdir, watch, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
   type ContextProfile,
+  createExtensionHost,
+  createFileArtifactStore,
+  createInMemoryOperationStore,
   createPermissionPolicy,
   createPresentationPreferences,
   createPresentationSession,
@@ -23,6 +26,7 @@ import {
 } from "@adam-agent/agent/internal-testing";
 import type { PresentationSession } from "@adam-agent/presentation";
 import type { Terminal } from "@earendil-works/pi-tui";
+import { createAdamCommandRegistry } from "./command-registry.js";
 import { type FixtureScenario, isFixtureScenario } from "./fixture-scenario.js";
 import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 import { type ClipboardAdapter, type DeadlineScheduler, runTui } from "./tui-app.js";
@@ -159,6 +163,17 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     stateRoot: options.stateRoot,
     workspaceRoot: options.workspaceRoot,
   });
+  const reviewFixture =
+    options.scenario === "review-operation" ||
+    options.scenario === "review-operation-long-provenance" ||
+    options.scenario === "review-completed" ||
+    options.scenario === "review-recovery"
+      ? await createReviewOperationFixture(
+          options.stateRoot,
+          options.workspaceRoot,
+          options.scenario,
+        )
+      : undefined;
 
   try {
     const previewBarrier = previewReadBarrier(options);
@@ -241,6 +256,9 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       options.launch !== undefined
         ? {
             lifecycle,
+            ...(reviewFixture === undefined
+              ? {}
+              : { operations: reviewFixture.host.operations, projectChanges: reviewFixture.host }),
             ...(modelTargets === undefined ? {} : { modelTargets }),
             openProject: true,
             preferences: createPresentationPreferences({
@@ -258,6 +276,12 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
         : options.scenario === "session-selection-history"
           ? {
               lifecycle,
+              ...(reviewFixture === undefined
+                ? {}
+                : {
+                    operations: reviewFixture.host.operations,
+                    projectChanges: reviewFixture.host,
+                  }),
               ...(modelTargets === undefined ? {} : { modelTargets }),
               openProject: true,
               projectLabel: "workspace",
@@ -267,6 +291,12 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
           : resumedSessionId === undefined
             ? {
                 lifecycle,
+                ...(reviewFixture === undefined
+                  ? {}
+                  : {
+                      operations: reviewFixture.host.operations,
+                      projectChanges: reviewFixture.host,
+                    }),
                 ...(modelTargets === undefined ? {} : { modelTargets }),
                 projectLabel: "workspace",
                 stateRoot: options.stateRoot,
@@ -278,6 +308,12 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
               }
             : {
                 lifecycle,
+                ...(reviewFixture === undefined
+                  ? {}
+                  : {
+                      operations: reviewFixture.host.operations,
+                      projectChanges: reviewFixture.host,
+                    }),
                 ...(modelTargets === undefined ? {} : { modelTargets }),
                 projectLabel: "workspace",
                 sessionId: resumedSessionId,
@@ -298,6 +334,26 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     const tuiPresentation = observeTuiDispatch(presentation, options);
     await runTui({
       ...(clipboard === undefined ? {} : { clipboard }),
+      ...(options.scenario === "review-unavailable" || reviewFixture !== undefined
+        ? {
+            commandRegistry: createAdamCommandRegistry(
+              reviewFixture === undefined
+                ? [
+                    {
+                      id: "fixture.local-worktree-review",
+                      name: "review",
+                      title: "Review project changes",
+                      version: 1,
+                    },
+                  ]
+                : reviewFixture.host
+                    .listContributions()
+                    .flatMap((contribution) =>
+                      contribution.command === undefined ? [] : [contribution.command],
+                    ),
+            ),
+          }
+        : {}),
       ...(deadlineScheduler === undefined ? {} : { deadlineScheduler }),
       presentation: tuiPresentation,
       ...(options.launch === undefined
@@ -313,11 +369,197 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       ...(options.terminal === undefined ? {} : { terminal: options.terminal }),
     });
   } finally {
+    reviewFixture?.releaseExecution();
     requireConfirmedLifecycleClose(await lifecycle.close());
     if (options.controlRoot !== undefined) {
       await writeFile(join(options.controlRoot, "tui-fixture-closed"), "closed\n", "utf8");
     }
   }
+}
+
+async function createReviewOperationFixture(
+  stateRoot: string,
+  workspaceRoot: string,
+  mode:
+    | "review-completed"
+    | "review-operation"
+    | "review-operation-long-provenance"
+    | "review-recovery",
+) {
+  const packageRoot = join(stateRoot, "review-extension");
+  const extensionId =
+    mode === "review-operation-long-provenance"
+      ? `fixture.review-extension.${"extension-segment.".repeat(4)}final`
+      : "fixture.review-extension";
+  const contributionId =
+    mode === "review-operation-long-provenance"
+      ? `fixture.local-worktree-review.${"contribution-segment.".repeat(4)}final@1`
+      : "fixture.local-worktree-review@1";
+  const controlKey = `__adamTuiReview${process.pid}${Date.now()}${Math.random()}`;
+  const executionRelease = Promise.withResolvers<void>();
+  (globalThis as Record<string, unknown>)[controlKey] = {
+    releaseExecution: executionRelease.promise,
+  };
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/review-extension",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: extensionId,
+        apiVersion: "^0.3.0",
+        runtime: { entry: "./runtime.js" },
+        capabilities: {
+          required: [{ id: "adam.artifact.publish@1", version: "^1.0.0" }],
+          optional: [],
+        },
+        contributions: [
+          {
+            command: {
+              id: "fixture.review",
+              name: "review",
+              title: "Review project changes",
+              version: 1,
+            },
+            id: contributionId,
+            input: { id: "adam.project-change-snapshot", version: 1 },
+            inputSource: { id: "project_changes", version: 1 },
+            kind: "operation",
+            output: { id: "fixture.review-result", version: 1 },
+            progress: { id: "fixture.review-progress", version: 1 },
+            report: { id: "fixture.review-result", version: 1 },
+            ...(mode === "review-recovery" ? { recovery: { version: 1 } } : {}),
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `const codec = (id) => ({
+  id,
+  version: 1,
+  decode(value) { return { ok: true, value }; },
+  encode(value) { return { ok: true, value }; },
+});
+export function activate(context) {
+  context.registerOperation({
+    id: ${JSON.stringify(contributionId)},
+    input: codec("adam.project-change-snapshot"),
+    output: codec("fixture.review-result"),
+    progress: codec("fixture.review-progress"),
+    async execute(input, operation) {
+      await operation.progress("analyzing project changes");
+      ${
+        mode === "review-operation" || mode === "review-operation-long-provenance"
+          ? `await Promise.race([
+        globalThis[${JSON.stringify(controlKey)}].releaseExecution,
+        new Promise((_, reject) => {
+          operation.signal.addEventListener("abort", () => reject(operation.signal.reason), { once: true });
+        }),
+      ]);`
+          : ""
+      }
+      const output = { digest: input.digest, reviewed: true, summary: "Review complete" };
+      ${
+        mode === "review-recovery"
+          ? ""
+          : `await operation.capabilities["adam.artifact.publish@1"].publish({
+        bytes: new TextEncoder().encode(JSON.stringify(output)),
+        contract: { id: "fixture.review-result", version: 1 },
+        mediaType: "application/json",
+      });`
+      }
+      return output;
+    },
+    ${
+      mode === "review-recovery"
+        ? `reconcile(input) {
+      return { status: "completed", output: { digest: input.digest, reviewed: true, summary: "Recovered review" } };
+    },`
+        : ""
+    }
+  });
+}
+`,
+    "utf8",
+  );
+  const artifactStore = await createFileArtifactStore({
+    root: join(stateRoot, "artifacts"),
+  });
+  const durableOperationStore = createInMemoryOperationStore();
+  let rejectOriginalTerminal = mode === "review-recovery";
+  const operationStore =
+    mode === "review-recovery"
+      ? {
+          async append(record: Parameters<typeof durableOperationStore.append>[0]) {
+            if (rejectOriginalTerminal && record.event.type === "operation_completed") {
+              rejectOriginalTerminal = false;
+              throw new Error("injected terminal persistence failure");
+            }
+            await durableOperationStore.append(record);
+          },
+          findByIdempotency: durableOperationStore.findByIdempotency,
+          listLinkedStarts: durableOperationStore.listLinkedStarts,
+          read: durableOperationStore.read,
+        }
+      : durableOperationStore;
+  const host = createExtensionHost({
+    artifactStore,
+    capabilities: [{ id: "adam.artifact.publish@1", version: "1.0.0" }],
+    extensions: [
+      {
+        enabled: true,
+        extensionId,
+        grants: [{ id: "adam.artifact.publish@1", version: "^1.0.0" }],
+        packageName: "@fixture/review-extension",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore,
+    projectChangeMaterializer: {
+      async materialize() {
+        return {
+          base: { commit: "a".repeat(40), kind: "head" as const, tree: "b".repeat(40) },
+          candidateTree: "c".repeat(40),
+          capturePolicy: {
+            id: "adam.git-project-changes" as const,
+            objectFormat: "sha1" as const,
+            version: 1 as const,
+          },
+          digest: `sha256:${"d".repeat(64)}` as const,
+          kind: "adam.project-change-snapshot" as const,
+          schemaVersion: 1 as const,
+          sources: [
+            {
+              content: "export const reviewed = true;\n",
+              contentDigest: `sha256:${"e".repeat(64)}` as const,
+              mode: "100644" as const,
+              path: "src/reviewed.ts",
+              side: "head" as const,
+            },
+          ],
+          unavailable: [],
+          unifiedDiff: "diff --git a/src/reviewed.ts b/src/reviewed.ts\n",
+        };
+      },
+    },
+    projectRoot: workspaceRoot,
+    stateRoot: join(stateRoot, "review-extension-state"),
+  });
+  await host.loadConfiguredExtensions();
+  return {
+    host,
+    releaseExecution() {
+      executionRelease.resolve();
+      delete (globalThis as Record<string, unknown>)[controlKey];
+    },
+  };
 }
 
 function observeTuiDispatch(
@@ -334,7 +576,9 @@ function observeTuiDispatch(
     (options.scenario === "mutation-delayed-preview" ||
       options.scenario === "tool-artifact" ||
       options.scenario === "artifact-backed-assistant" ||
-      options.scenario === "artifact-page-race");
+      options.scenario === "artifact-page-race" ||
+      options.scenario === "review-completed" ||
+      options.scenario === "review-recovery");
   if (!observeDispatch && options.presentationCloseMarker === undefined) {
     return presentation;
   }
@@ -372,6 +616,13 @@ function observeTuiDispatch(
           "utf8",
         );
         return settled;
+      }
+      if (command.type === "recover_operation") {
+        await writeFile(
+          join(controlRoot as string, "operation-recover-submitted"),
+          "recover\n",
+          "utf8",
+        );
       }
       if (command.type === "submit_prompt") {
         await writeFile(

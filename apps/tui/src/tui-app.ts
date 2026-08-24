@@ -1,6 +1,7 @@
 import type {
   ActiveSessionDisplay,
   ArtifactReference,
+  OperationDisplay,
   PresentationSession,
   PresentationTransientState,
   ReasoningBlockDisplay,
@@ -33,7 +34,7 @@ import {
 } from "./artifact-navigator.js";
 import { ChronologyPicker, completeChronologyBoundaries } from "./chronology-picker.js";
 import { AdamAutocompleteProvider } from "./command-autocomplete.js";
-import { adamCommandRegistry } from "./command-registry.js";
+import { type AdamCommandRegistry, adamCommandRegistry } from "./command-registry.js";
 import {
   type ClipboardAdapter,
   copyDraftToClipboard,
@@ -73,7 +74,9 @@ export type TuiTargetStatus = {
 };
 
 export type RunTuiOptions = {
+  readonly commandRegistry?: AdamCommandRegistry;
   readonly presentation: PresentationSession;
+  readonly startupNotice?: string;
   readonly startupTargetId?: string;
   readonly targetStatus?: TuiTargetStatus;
   readonly terminal?: Terminal;
@@ -84,6 +87,7 @@ export type RunTuiOptions = {
 export async function runTui(options: RunTuiOptions): Promise<void> {
   const terminal = options.terminal ?? new ProcessTerminal();
   const deadlineScheduler = options.deadlineScheduler ?? nodeDeadlineScheduler;
+  const commandRegistry = options.commandRegistry ?? adamCommandRegistry;
   const startupTargetId =
     options.startupTargetId ??
     options.presentation.getState().authoritative.targets.defaultTargetId;
@@ -130,6 +134,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             name: skill.name,
             qualifiedId: skill.qualifiedId,
           })),
+        registry: commandRegistry,
       }),
     );
     for (const prompt of authoritativePromptHistory(active)) {
@@ -147,6 +152,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const working = new Loader(tui, theme.toolTitle, theme.muted, "Working", { intervalMs: 80 });
   const thinking = new Loader(tui, theme.keyword, theme.muted, "Thinking", { intervalMs: 80 });
   thinking.stop();
+  const operationLoaders = new Map<string, Loader>();
   let workingVisible = false;
   let thinkingVisible = false;
   let cancelSettling = false;
@@ -155,7 +161,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const legacyDuplicateGuard = new LegacyDuplicateGuard(deadlineScheduler);
   let previousRunActive: boolean | undefined;
   let toolDetailsExpanded = false;
-  let statusMessage: string | null = null;
+  let statusMessage: string | null = options.startupNotice ?? null;
   let permission:
     | {
         readonly overlay: PermissionOverlay;
@@ -670,6 +676,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       ),
     );
     transcript.clear();
+    const visibleRunningOperations = new Set<string>();
     let activeReasoningVisible = false;
     const durableReasoningIds = new Set<string>();
     const renderReasoning = (
@@ -812,6 +819,80 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         transcript.addChild(new Spacer(1));
         transcript.addChild(new Text(theme.muted(safeTerminalText(message))));
         previousWasAssistant = false;
+      } else if (item.type === "operation_link") {
+        const operation = active?.linkedOperations.find(
+          (candidate) => candidate.operationId === item.operationId,
+        );
+        transcript.addChild(new Spacer(1));
+        const card = new Box(1, 1, theme.toolBackground);
+        if (operation === undefined) {
+          card.addChild(new ResponsiveLine(theme.toolTitle("Linked operation")));
+          card.addChild(
+            new ResponsiveLine(theme.muted("Authoritative operation details are unavailable.")),
+          );
+        } else {
+          card.addChild(
+            new ResponsiveLine(theme.toolTitle(safeTerminalText(operation.provenance.title))),
+          );
+          const status = operationStatusText(operation);
+          if (operation.status === "running" || operation.status === "cancel_requested") {
+            visibleRunningOperations.add(operation.operationId);
+            let loader = operationLoaders.get(operation.operationId);
+            if (loader === undefined) {
+              loader = new Loader(tui, theme.keyword, theme.muted, status, { intervalMs: 80 });
+              operationLoaders.set(operation.operationId, loader);
+              loader.start();
+            } else {
+              loader.setMessage(status);
+            }
+            card.addChild(loader);
+          } else {
+            card.addChild(new ResponsiveLine(theme.toolOutput(safeTerminalText(status))));
+          }
+          card.addChild(new ResponsiveLine(theme.muted("Extension")));
+          card.addChild(
+            new Text(
+              theme.muted(
+                safeTerminalText(
+                  `${operation.provenance.extensionId}@${operation.provenance.extensionVersion}`,
+                ),
+              ),
+            ),
+          );
+          card.addChild(new ResponsiveLine(theme.muted("Contribution")));
+          card.addChild(
+            new Text(theme.muted(safeTerminalText(operation.provenance.contributionId))),
+          );
+          card.addChild(new ResponsiveLine(theme.muted("Presentation")));
+          card.addChild(
+            new ResponsiveLine(theme.muted(safeTerminalText(operation.provenance.presentation))),
+          );
+          card.addChild(new ResponsiveLine(theme.muted("Operation ID")));
+          card.addChild(new ResponsiveLine(theme.muted(safeTerminalText(operation.operationId))));
+          for (const artifact of operation.artifacts) {
+            card.addChild(
+              new ResponsiveLine(
+                theme.muted(
+                  safeTerminalText(
+                    `${operationArtifactLabel(artifact.role)} · ${artifact.contract.id}@${artifact.contract.version} · ${artifact.reference.mediaType} · ${artifact.reference.byteCount} bytes`,
+                  ),
+                ),
+              ),
+            );
+          }
+          const actions = operationActionText(operation);
+          if (actions.length > 0) {
+            card.addChild(new ResponsiveLine(theme.muted(actions)));
+          }
+        }
+        transcript.addChild(card);
+        previousWasAssistant = false;
+      }
+    }
+    for (const [operationId, loader] of operationLoaders) {
+      if (!visibleRunningOperations.has(operationId)) {
+        loader.stop();
+        operationLoaders.delete(operationId);
       }
     }
     const transientReasoning = state.transient?.reasoning;
@@ -961,7 +1042,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         active.transcript.olderCursor === null ? "" : " · older history available";
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${adamCommandRegistry.footerHint()}`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
         ),
         standard: theme.muted(
           `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
@@ -1196,7 +1277,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     const entries = diffs
       ? activeChronologyDiffs(current.transcript.items)
-      : activeChronologyArtifacts(current.transcript.items);
+      : activeChronologyArtifacts(current.transcript.items, current.linkedOperations);
     const olderCursor = current.transcript.olderCursor;
     if (entries.length === 0 && olderCursor === null) {
       statusMessage = diffs
@@ -1281,10 +1362,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const initialPage: HelpPage =
       requestedTopic.length === 0
         ? "root"
-        : (adamCommandRegistry.helpTopics().find((topic) => topic.id === requestedTopic)?.id ??
-          "root");
+        : (commandRegistry.helpTopics().find((topic) => topic.id === requestedTopic)?.id ?? "root");
     if (requestedTopic.length > 0 && initialPage === "root") {
-      const suggestions = adamCommandRegistry.suggestHelpTopics(requestedTopic);
+      const suggestions = commandRegistry.suggestHelpTopics(requestedTopic);
       statusMessage = `Unknown Help topic ${safeTerminalText(requestedTopic)}${
         suggestions.length === 0
           ? ""
@@ -1305,12 +1385,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       tui.requestRender();
     };
     const navigator = new HelpNavigator({
-      commands: adamCommandRegistry.entries(),
+      commands: commandRegistry.entries(),
       initialPage,
-      keybindings: adamCommandRegistry.keybindings(),
+      keybindings: commandRegistry.keybindings(),
       onClose: close,
       theme,
-      topics: adamCommandRegistry.helpTopics(),
+      topics: commandRegistry.helpTopics(),
     });
     handle = showOverlay(navigator, {
       width: "80%",
@@ -1331,7 +1411,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       if (state.draft === null) {
         return;
       }
-      const parsedDraft = adamCommandRegistry.parse(text);
+      const parsedDraft = commandRegistry.parse(text);
       if (parsedDraft.kind === "known" && parsedDraft.command.id === "thinking") {
         handleThinkingCommand(parsedDraft.argumentsText);
         return;
@@ -1409,7 +1489,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         return;
       }
       if (parsedDraft.kind === "unknown") {
-        const suggestions = adamCommandRegistry.suggest(parsedDraft.name);
+        const suggestions = commandRegistry.suggest(parsedDraft.name);
         statusMessage = `Unknown command /${parsedDraft.name}${
           suggestions.length === 0
             ? ""
@@ -1460,9 +1540,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       state.transient !== null || active.pendingInteractions.length > 0 || cancelSettling;
     clearExitWindow();
     editor.disableSubmit = true;
-    const parsedCommand = adamCommandRegistry.parse(text);
+    const parsedCommand = commandRegistry.parse(text);
     if (parsedCommand.kind === "unknown") {
-      const suggestions = adamCommandRegistry.suggest(parsedCommand.name);
+      const suggestions = commandRegistry.suggest(parsedCommand.name);
       statusMessage = `Unknown command /${parsedCommand.name}${
         suggestions.length === 0
           ? ""
@@ -1474,7 +1554,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     if (
       parsedCommand.kind === "known" &&
-      !adamCommandRegistry.isAvailable(parsedCommand.command, { runActive })
+      !commandRegistry.isAvailable(parsedCommand.command, { runActive })
     ) {
       statusMessage = `/${parsedCommand.command.name} is unavailable while a run is active.`;
       editor.disableSubmit = false;
@@ -1485,6 +1565,37 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       statusMessage = "A run is active; use a local read-only command or Ctrl+C to abort.";
       editor.disableSubmit = false;
       renderState();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "extension" &&
+      parsedCommand.argumentsText.length === 0 &&
+      parsedCommand.command.extensionCommand !== undefined
+    ) {
+      const extensionCommand = parsedCommand.command.extensionCommand;
+      void options.presentation
+        .dispatch({
+          type: "start_project_changes",
+          sessionId: active.session.id,
+          command: extensionCommand,
+        })
+        .then((receipt) => {
+          editor.disableSubmit = false;
+          if (receipt.status === "admitted") {
+            editor.setText("");
+            statusMessage = `${safeTerminalText(parsedCommand.command.summary)} admitted.`;
+          } else {
+            statusMessage = receipt.message;
+          }
+        })
+        .catch(() => {
+          editor.disableSubmit = false;
+          statusMessage = "The extension command could not be admitted safely.";
+        })
+        .finally(() => {
+          renderState();
+        });
       return;
     }
     if (parsedCommand.kind === "known" && parsedCommand.command.id === "thinking") {
@@ -2150,6 +2261,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     attempt(() => permission?.hide());
     attempt(() => working.stop());
     attempt(() => thinking.stop());
+    for (const loader of operationLoaders.values()) {
+      attempt(() => loader.stop());
+    }
+    operationLoaders.clear();
     attempt(() => tui.stop());
     try {
       if (copyDraft) {
@@ -2196,15 +2311,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     handleTerminationSignal("SIGTERM");
   }
   tui.addInputListener((data) => {
-    if (adamCommandRegistry.matchesInput(data, "exit")) {
+    if (commandRegistry.matchesInput(data, "exit")) {
       void stop(true);
       return { consume: true };
     }
     if (
       !terminalSizeIsSupported(terminal.columns, terminal.rows) &&
-      !adamCommandRegistry.matchesInput(data, "interrupt")
+      !commandRegistry.matchesInput(data, "interrupt")
     ) {
-      if (adamCommandRegistry.matchesInput(data, "back")) {
+      if (commandRegistry.matchesInput(data, "back")) {
         if (permission !== undefined) {
           permission.overlay.handleInput(data);
         } else {
@@ -2225,12 +2340,55 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       return { consume: true };
     }
-    if (adamCommandRegistry.matchesInput(data, "toggle_tool_details")) {
+    if (commandRegistry.matchesInput(data, "toggle_tool_details")) {
       toolDetailsExpanded = !toolDetailsExpanded;
       renderState();
       return { consume: true };
     }
-    if (adamCommandRegistry.matchesInput(data, "toggle_reasoning")) {
+    if (
+      commandRegistry.matchesInput(data, "rename_session") &&
+      permission === undefined &&
+      targetPicker === undefined &&
+      thinkingPicker === undefined &&
+      sessionPicker === undefined &&
+      sessionInspector === undefined &&
+      chronologyPicker === undefined &&
+      resourceReloadPicker === undefined &&
+      skillPalette === undefined &&
+      pathPicker === undefined &&
+      mcpWizard === undefined &&
+      helpNavigator === undefined &&
+      artifactNavigator === undefined
+    ) {
+      if (isKeyRepeat(data) || isKeyRelease(data)) {
+        return { consume: true };
+      }
+      const operation = options.presentation
+        .getState()
+        .authoritative.active?.linkedOperations.findLast(
+          (candidate) =>
+            candidate.status === "recovery_required" &&
+            candidate.actions.some((action: "cancel" | "recover") => action === "recover"),
+        );
+      if (operation !== undefined) {
+        clearExitWindow();
+        statusMessage = "Recovering the linked operation from durable evidence…";
+        renderState();
+        void options.presentation
+          .dispatch({ type: "recover_operation", operationId: operation.operationId })
+          .then((receipt) => {
+            statusMessage =
+              receipt.status === "admitted" ? "Operation recovery admitted." : receipt.message;
+            renderState();
+          })
+          .catch(() => {
+            statusMessage = "The linked operation could not be recovered safely.";
+            renderState();
+          });
+        return { consume: true };
+      }
+    }
+    if (commandRegistry.matchesInput(data, "toggle_reasoning")) {
       if (isKeyRepeat(data) || isKeyRelease(data)) {
         return { consume: true };
       }
@@ -2282,7 +2440,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       renderState();
       return { consume: true };
     }
-    if (adamCommandRegistry.matchesInput(data, "interrupt")) {
+    if (commandRegistry.matchesInput(data, "interrupt")) {
       if (isKeyRepeat(data) || isKeyRelease(data)) {
         return { consume: true };
       }
@@ -2312,6 +2470,29 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       const runActive =
         options.presentation.getState().transient !== null ||
         (active?.pendingInteractions.length ?? 0) > 0;
+      const cancellableOperation = active?.linkedOperations.findLast(
+        (candidate) => candidate.status === "running" && candidate.actions.includes("cancel"),
+      );
+      if (!runActive && !cancelSettling && cancellableOperation !== undefined) {
+        clearExitWindow();
+        statusMessage = "Requesting cancellation of the linked operation…";
+        renderState();
+        void options.presentation
+          .dispatch({
+            type: "cancel_operation",
+            operationId: cancellableOperation.operationId,
+          })
+          .then((receipt) => {
+            statusMessage =
+              receipt.status === "admitted" ? "Operation cancellation requested." : receipt.message;
+            renderState();
+          })
+          .catch(() => {
+            statusMessage = "The linked operation could not be cancelled safely.";
+            renderState();
+          });
+        return { consume: true };
+      }
       if (runActive || cancelSettling) {
         if (!cancelSettling) {
           cancelSettling = true;
@@ -2370,6 +2551,48 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   } finally {
     removeTerminationListeners();
   }
+}
+
+function operationStatusText(operation: OperationDisplay): string {
+  switch (operation.status) {
+    case "running":
+      return operation.progress === null ? "Running" : `Running · ${operation.progress.summary}`;
+    case "cancel_requested":
+      return "Cancellation requested · waiting for durable settlement";
+    case "completed":
+      return operation.settlement.summary === null
+        ? "Completed"
+        : `Completed · ${operation.settlement.summary}`;
+    case "failed":
+      return `Failed · ${operation.settlement.code} · ${operation.settlement.message}`;
+    case "cancelled":
+      return `Cancelled · ${operation.settlement.reason}`;
+    case "inspection_required":
+      return `Inspection required · ${operation.settlement.message}`;
+    case "recovery_required":
+      return `Recovery required · ${operation.settlement.message}`;
+  }
+}
+
+function operationArtifactLabel(role: OperationDisplay["artifacts"][number]["role"]): string {
+  return role.charAt(0).toUpperCase() + role.slice(1);
+}
+
+function operationActionText(operation: OperationDisplay): string {
+  const actions = [
+    ...(operation.actions.some((action: "cancel" | "recover") => action === "cancel")
+      ? ["Ctrl+C cancel"]
+      : []),
+    ...(operation.actions.some((action: "cancel" | "recover") => action === "recover")
+      ? ["Ctrl+R recover"]
+      : []),
+    ...(operation.artifacts.some((artifact) => artifact.role === "report")
+      ? ["/artifacts inspect report"]
+      : operation.artifacts.length > 0
+        ? ["/artifacts inspect artifacts"]
+        : []),
+  ];
+  return actions.join(" · ");
 }
 
 function resolveOverlayMaximumHeight(

@@ -23,6 +23,7 @@ import {
 } from "@adam-agent/presentation";
 import { readFileArtifact, readFileArtifactRange } from "./artifact-store.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
+import type { ExtensionHost } from "./extension-host.js";
 import type { RuntimeEvent } from "./index.js";
 import {
   type ModelTargetIdentity,
@@ -83,6 +84,7 @@ type PresentationSessionBaseOptions = {
   readonly lifecycle: SessionLifecycle;
   readonly modelTargets?: ModelTargets;
   readonly operations?: OperationHost;
+  readonly projectChanges?: Pick<ExtensionHost, "startProjectChanges">;
   readonly preferences?: PresentationPreferences;
   readonly projectLabel: string;
   readonly stateRoot?: string;
@@ -391,8 +393,10 @@ export async function createPresentationSession(
       }
     };
     let closed = false;
+    const operationAdmissions = new Set<Promise<void>>();
     const operationRefreshes = new Set<Promise<void>>();
     const operationObservers = new Map<string, AbortController>();
+    const ownedOperationIds = new Set<string>();
     const operationRepairs = new Set<string>();
     const operationRecoveries = new Set<string>();
     const publishOperationSnapshot = (next: ProjectedOperation): boolean => {
@@ -427,6 +431,90 @@ export async function createPresentationSession(
             linkedOperations: active.linkedOperations.map((operation) =>
               operation.operationId === next.display.operationId ? next.display : operation,
             ),
+          },
+        },
+        draft: state.draft,
+        transient: state.transient,
+      };
+      publishStateChange();
+      return true;
+    };
+    const publishAdmittedOperation = (next: ProjectedOperation): boolean => {
+      const active = state.authoritative.active;
+      const continuity = state.authoritative.continuity;
+      if (
+        closed ||
+        active === null ||
+        continuity.status !== "current" ||
+        active.session.id !== next.display.origin.sessionId ||
+        continuity.sessionThroughSequence < next.display.origin.sourceSequence
+      ) {
+        return false;
+      }
+      if (
+        active.linkedOperations.some(
+          (operation) => operation.operationId === next.display.operationId,
+        )
+      ) {
+        return publishOperationSnapshot(next);
+      }
+      if (active.linkedOperations.length >= 256) {
+        state = {
+          revision: state.revision + 1,
+          authoritative: {
+            ...state.authoritative,
+            continuity: {
+              status: "degraded",
+              fault: {
+                code: "authoritative_state_unavailable",
+                message: "The linked operation view exceeds the Presentation bound.",
+              },
+            },
+            active: { ...active, linkedOperationsTruncated: true },
+          },
+          draft: state.draft,
+          transient: state.transient,
+        };
+        publishStateChange();
+        return false;
+      }
+      advanceOperationCursor(next.display.operationId, next.throughSequence);
+      const link = {
+        type: "operation_link" as const,
+        id: `operation:${next.display.operationId}`,
+        operationId: next.display.operationId,
+        sequence: next.display.origin.sourceSequence,
+        sourceSessionId: next.display.origin.sessionId,
+        branchBoundary: {
+          sessionId: next.display.origin.sessionId,
+          sequence: next.display.origin.sourceSequence,
+        },
+      };
+      const items = [...active.transcript.items];
+      const insertionIndex = items.findIndex(
+        (item) =>
+          item.sourceSessionId === next.display.origin.sessionId &&
+          (item.sequence > next.display.origin.sourceSequence ||
+            (item.sequence === next.display.origin.sourceSequence &&
+              item.type === "operation_link" &&
+              item.operationId.localeCompare(next.display.operationId) > 0)),
+      );
+      items.splice(insertionIndex < 0 ? items.length : insertionIndex, 0, link);
+      state = {
+        revision: state.revision + 1,
+        authoritative: {
+          ...state.authoritative,
+          continuity: {
+            ...continuity,
+            operationThrough: operationCursorSnapshot(),
+          },
+          active: {
+            ...active,
+            transcript: {
+              ...active.transcript,
+              items,
+            },
+            linkedOperations: [...active.linkedOperations, next.display],
           },
         },
         draft: state.draft,
@@ -582,6 +670,78 @@ export async function createPresentationSession(
         operationRefreshes.delete(refresh);
         if (operationObservers.get(projected.display.operationId) === observer) {
           operationObservers.delete(projected.display.operationId);
+        }
+      });
+    };
+    const repairAdmittedOperationProjection = (operationId: string): void => {
+      const operations = options.operations;
+      if (operations === undefined || operationObservers.has(operationId)) {
+        return;
+      }
+      const observer = new AbortController();
+      operationObservers.set(operationId, observer);
+      const degrade = () => {
+        const active = state.authoritative.active;
+        if (
+          closed ||
+          observer.signal.aborted ||
+          active === null ||
+          state.authoritative.continuity.status === "degraded"
+        ) {
+          return;
+        }
+        state = {
+          revision: state.revision + 1,
+          authoritative: {
+            ...state.authoritative,
+            continuity: {
+              status: "degraded",
+              fault: {
+                code: "authoritative_state_unavailable",
+                message: "The admitted operation view is temporarily unavailable.",
+              },
+            },
+          },
+          draft: state.draft,
+          transient: state.transient,
+        };
+        publishStateChange();
+      };
+      const refresh = (async () => {
+        const projectCurrent = async (): Promise<boolean> => {
+          try {
+            const snapshot = await operations.query(operationId);
+            const operation = projectLinkedOperation(snapshot);
+            if (operation !== null && publishAdmittedOperation(operation)) {
+              watchOperation(operation);
+            }
+            return operation !== null;
+          } catch {
+            return false;
+          }
+        };
+        for await (const _record of operations.events({
+          afterSequence: 0,
+          operationId,
+          signal: observer.signal,
+        })) {
+          if (closed || observer.signal.aborted) {
+            return;
+          }
+          if (await projectCurrent()) {
+            return;
+          }
+        }
+        if (closed || observer.signal.aborted || (await projectCurrent())) {
+          return;
+        }
+        degrade();
+      })().catch(degrade);
+      operationRefreshes.add(refresh);
+      void refresh.finally(() => {
+        operationRefreshes.delete(refresh);
+        if (operationObservers.get(operationId) === observer) {
+          operationObservers.delete(operationId);
         }
       });
     };
@@ -1647,6 +1807,69 @@ export async function createPresentationSession(
         activeRun.controller.abort();
         return { status: "admitted", commandId: randomUUID(), resource: null };
       }
+      if (command.type === "start_project_changes") {
+        if (
+          command.sessionId !== state.authoritative.active?.session.id ||
+          state.authoritative.continuity.status !== "current"
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The active session boundary is no longer available for this command.",
+          };
+        }
+        if (options.operations === undefined || options.projectChanges === undefined) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "No active extension command can admit project changes.",
+          };
+        }
+        const commandId = randomUUID();
+        const start = options.projectChanges
+          .startProjectChanges({
+            command: command.command,
+            idempotencyKey: commandId,
+            origin: {
+              invocation: { id: "review", kind: "presentation_command", version: 1 },
+              sessionId: command.sessionId,
+              sourceSequence: state.authoritative.continuity.sessionThroughSequence,
+            },
+          })
+          .then((reference) => {
+            ownedOperationIds.add(reference.operationId);
+            return reference;
+          });
+        const admissionSettlement = start.then(
+          () => undefined,
+          () => undefined,
+        );
+        operationAdmissions.add(admissionSettlement);
+        let reference: Awaited<typeof start>;
+        try {
+          reference = await start;
+        } catch {
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "The project changes could not be admitted for this command.",
+          };
+        } finally {
+          operationAdmissions.delete(admissionSettlement);
+        }
+        const projection = options.operations
+          .query(reference.operationId)
+          .then((snapshot) => {
+            const operation = projectLinkedOperation(snapshot);
+            if (operation !== null && publishAdmittedOperation(operation)) {
+              watchOperation(operation);
+            }
+          })
+          .catch(() => repairAdmittedOperationProjection(reference.operationId));
+        operationRefreshes.add(projection);
+        void projection.finally(() => operationRefreshes.delete(projection));
+        return { status: "admitted", commandId, resource: null };
+      }
       if (command.type === "cancel_operation") {
         const operation = state.authoritative.active?.linkedOperations.find(
           (candidate) => candidate.operationId === command.operationId,
@@ -2281,6 +2504,14 @@ export async function createPresentationSession(
         for (const observer of operationObservers.values()) {
           observer.abort();
         }
+        await Promise.all(operationAdmissions);
+        if (options.operations !== undefined) {
+          await Promise.all(
+            [...ownedOperationIds].map((operationId) =>
+              settleOwnedOperationForClose(options.operations as OperationHost, operationId),
+            ),
+          );
+        }
         unsubscribeLifecycle();
         unsubscribeMetadata();
         await activeRun?.settlement;
@@ -2303,6 +2534,33 @@ type ProjectedOperation = {
   readonly display: OperationDisplay;
   readonly throughSequence: number;
 };
+
+async function settleOwnedOperationForClose(
+  operations: OperationHost,
+  operationId: string,
+): Promise<void> {
+  const cancellation = await operations.cancel(operationId);
+  if (cancellation.status !== "running" && cancellation.status !== "cancel_requested") {
+    return;
+  }
+  for await (const record of operations.events({
+    afterSequence: cancellation.throughSequence,
+    operationId,
+  })) {
+    if (
+      record.event.type === "operation_cancelled" ||
+      record.event.type === "operation_completed" ||
+      record.event.type === "operation_failed" ||
+      record.event.type === "operation_inspection_required"
+    ) {
+      break;
+    }
+  }
+  const settled = await operations.query(operationId);
+  if (settled.status === "running" || settled.status === "cancel_requested") {
+    throw new Error("The owned extension operation did not reach durable settlement on close.");
+  }
+}
 
 type ProjectedOperationCollection = {
   readonly items: readonly ProjectedOperation[];
@@ -2448,7 +2706,7 @@ function projectOperationProgress(
   if (progress === undefined || progress === null) {
     return null;
   }
-  const serialized = JSON.stringify(progress);
+  const serialized = typeof progress === "string" ? progress : JSON.stringify(progress);
   const maximumBytes = 240;
   const encoded = new TextEncoder().encode(serialized);
   if (encoded.byteLength <= maximumBytes) {

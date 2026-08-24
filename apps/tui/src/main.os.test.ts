@@ -1,9 +1,16 @@
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { execFile as execFileCallback } from "node:child_process";
+import { chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 
-import { createModelTargets, createSessionLifecycle } from "@adam-agent/agent";
+import {
+  createExtensionHost,
+  createJsonlOperationStore,
+  createModelTargets,
+  createSessionLifecycle,
+} from "@adam-agent/agent";
 import { afterEach, expect, test } from "vitest";
 import { removeTuiFixtureRoot as rm, waitForPath } from "./tui-filesystem.test-support.js";
 import {
@@ -12,12 +19,123 @@ import {
 } from "./tui-fixture.test-support.js";
 
 const productionPath = fileURLToPath(new URL("../dist/main.js", import.meta.url));
+const productionFixturePath = fileURLToPath(
+  new URL("../dist/production-main.fixture.js", import.meta.url),
+);
+const productRoot = fileURLToPath(new URL("../../..", import.meta.url));
+const execFile = promisify(execFileCallback);
 const mcpFixturePath = fileURLToPath(
   new URL("../../../packages/testkit/dist/mcp-stdio-server.fixture.js", import.meta.url),
 );
 afterEach(async () => {
   await cleanupActiveTuiFixtures();
 });
+
+async function writeRecoverableReviewPackage(packageRoot: string): Promise<void> {
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/recoverable-review",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.recoverable-review",
+        apiVersion: "^0.3.0",
+        runtime: { entry: "./runtime.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [
+          {
+            command: {
+              id: "fixture.recoverable-review",
+              name: "review",
+              title: "Recoverable project review",
+              version: 1,
+            },
+            id: "fixture.recoverable-review@1",
+            input: { id: "adam.project-change-snapshot", version: 1 },
+            inputSource: { id: "project_changes", version: 1 },
+            kind: "operation",
+            output: { id: "fixture.review-result", version: 1 },
+            progress: { id: "fixture.review-progress", version: 1 },
+            recovery: { version: 1 },
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `import { appendFileSync } from "node:fs";
+const codec = (id) => ({
+  id,
+  version: 1,
+  decode(value) { return { ok: true, value }; },
+  encode(value) { return { ok: true, value }; },
+});
+export function activate(context) {
+  const configuration = context.configuration;
+  const record = (event) => {
+    const marker = configuration && event === "execute"
+      ? configuration.executeMarker
+      : configuration && event === "reconcile"
+        ? configuration.reconcileMarker
+        : undefined;
+    if (typeof marker === "string") {
+      appendFileSync(marker, event + "\\n", "utf8");
+    }
+  };
+  context.registerOperation({
+    id: "fixture.recoverable-review@1",
+    input: codec("adam.project-change-snapshot"),
+    output: codec("fixture.review-result"),
+    progress: codec("fixture.review-progress"),
+    async execute(input, operation) {
+      record("execute");
+      await operation.progress("analyzing interrupted project changes");
+      if (configuration && configuration.block === true) {
+        await new Promise(() => {});
+      }
+      return { digest: input.digest ?? "fixture", reviewed: true };
+    },
+    reconcile(input) {
+      record("reconcile");
+      return { status: "completed", output: { digest: input.digest ?? "fixture", reviewed: true } };
+    },
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function writeReviewExtensionConfiguration(
+  configDirectory: string,
+  packageRoot: string,
+  configuration: unknown,
+): Promise<void> {
+  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+  await chmod(configDirectory, 0o700);
+  await writeFile(
+    join(configDirectory, "extensions.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      extensions: [
+        {
+          configuration,
+          enabled: true,
+          extensionId: "fixture.recoverable-review",
+          grants: [],
+          packageName: "@fixture/recoverable-review",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+    }),
+    { encoding: "utf8", mode: 0o600 },
+  );
+}
 
 test("real TUI starts on an authoritative empty session and restores the terminal on exit", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-startup-"));
@@ -323,6 +441,322 @@ test("the production TUI entry reaches a credentialed exact-target session witho
     await fixture.waitFor("deepseek-v4-flash.direct · Certified");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI reviews real Git changes through the exact public Eve adapter and survives restart", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-eve-registry-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  const terminalProcessMarker = join(testRoot, "terminal-process");
+  await mkdir(workspaceRoot);
+  await execFile("git", ["init", "--initial-branch=main"], { cwd: workspaceRoot });
+  await execFile("git", ["config", "user.name", "Adam Test"], { cwd: workspaceRoot });
+  await execFile("git", ["config", "user.email", "adam@example.invalid"], {
+    cwd: workspaceRoot,
+  });
+  await writeFile(join(workspaceRoot, ".gitignore"), "ignored.ts\n", "utf8");
+  await writeFile(join(workspaceRoot, "reviewed.ts"), "export const answer = 1;\n", "utf8");
+  await writeFile(join(workspaceRoot, "staged.ts"), "export const staged = 1;\n", "utf8");
+  await execFile("git", ["add", ".gitignore", "reviewed.ts", "staged.ts"], {
+    cwd: workspaceRoot,
+  });
+  await execFile("git", ["commit", "-m", "fixture base"], { cwd: workspaceRoot });
+  await writeFile(join(workspaceRoot, "reviewed.ts"), "export const answer = 2;\n", "utf8");
+  await writeFile(join(workspaceRoot, "staged.ts"), "export const staged = 2;\n", "utf8");
+  await execFile("git", ["add", "staged.ts"], { cwd: workspaceRoot });
+  await writeFile(join(workspaceRoot, "untracked.ts"), "export const added = true;\n", "utf8");
+  await writeFile(join(workspaceRoot, "ignored.ts"), "export const ignored = true;\n", "utf8");
+  const beforeStatus = (await execFile("git", ["status", "--porcelain=v1"], { cwd: workspaceRoot }))
+    .stdout;
+  expect(beforeStatus).toBe(" M reviewed.ts\nM  staged.ts\n?? untracked.ts\n");
+
+  const adapterRoot = await realpath(
+    join(productRoot, "node_modules", "@eve-reviewer", "adam-extension"),
+  );
+  const adapterPackage = JSON.parse(await readFile(join(adapterRoot, "package.json"), "utf8"));
+  const coreRoot = await realpath(join(adapterRoot, "..", "core"));
+  const corePackage = JSON.parse(await readFile(join(coreRoot, "package.json"), "utf8"));
+  expect(adapterPackage).toMatchObject({
+    name: "@eve-reviewer/adam-extension",
+    version: "0.3.0",
+    dependencies: { "@eve-reviewer/core": "0.2.0" },
+    peerDependencies: { "@adam-agent/extension-api": "0.3.0" },
+  });
+  expect(corePackage).toMatchObject({ name: "@eve-reviewer/core", version: "0.2.0" });
+  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+  await chmod(configDirectory, 0o700);
+  await writeFile(
+    join(configDirectory, "extensions.json"),
+    JSON.stringify({
+      schemaVersion: 1,
+      extensions: [
+        {
+          configuration: null,
+          enabled: true,
+          extensionId: "eve-reviewer",
+          grants: [
+            { id: "adam.analyzer-execution.biome@1", version: "1.0.0" },
+            { id: "adam.artifact.publish@1", version: "1.0.0" },
+            { id: "adam.storage.records@1", version: "1.0.0" },
+          ],
+          packageName: "@eve-reviewer/adam-extension",
+          packageRoot: adapterRoot,
+          packageVersion: "0.3.0",
+        },
+      ],
+    }),
+    { encoding: "utf8", mode: 0o600 },
+  );
+
+  const environment = {
+    ADAM_TEST_TERMINAL_PROCESS_MARKER: terminalProcessMarker,
+    DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+    XDG_CONFIG_HOME: configRoot,
+  } as const;
+  const modelTargets = createModelTargets({ environment });
+  const targetIdentity = (
+    await modelTargets.snapshot({ signal: new AbortController().signal })
+  ).targets.find(({ identity }) => identity.targetId === "deepseek-v4-flash.direct")?.identity;
+  if (targetIdentity === undefined) {
+    throw new Error("The registry Eve fixture requires the DeepSeek Flash target.");
+  }
+  const seedLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const created = await seedLifecycle.create({ targetIdentity });
+  await seedLifecycle.close();
+  const program = {
+    arguments: ["--resume", created.sessionId, "--state-root", stateRoot],
+    cwd: workspaceRoot,
+    entrypoint: productionFixturePath,
+    environment,
+  } as const;
+
+  try {
+    const fixture = startFixture({ program, stateRoot, terminalProcessMarker, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
+    fixture.write("/review\r");
+    await fixture.waitFor("eve-reviewer@0.3.0");
+    await fixture.waitFor("Completed");
+    await fixture.waitFor("Report · eve-reviewer.review-result@1 · application/json");
+
+    let beforeResize = fixture.output().length;
+    await fixture.resize(40, 24);
+    await fixture.waitForCompleteFrameAfter("Completed", beforeResize);
+    expect(fixture.output().slice(beforeResize)).toContain("/artifacts inspect report");
+    beforeResize = fixture.output().length;
+    await fixture.resize(80, 24);
+    await fixture.waitForCompleteFrameAfter("Completed", beforeResize);
+    beforeResize = fixture.output().length;
+    await fixture.resize(120, 40);
+    await fixture.waitForCompleteFrameAfter("eve-reviewer.local-worktree-review@1", beforeResize);
+
+    fixture.write("/artifacts\r");
+    await fixture.waitFor("Review project changes report");
+    fixture.write("\r");
+    await fixture.waitFor("Artifact detail");
+    await fixture.waitFor("schemaVersion");
+    fixture.write("\u0011");
+    const firstResult = await fixture.closed;
+    expect(firstResult).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(firstResult.stdout).toContain("\u001b[?2004l");
+    expect(firstResult.stdout).toContain("\u001b[?25h");
+
+    const resumed = startFixture({ program, stateRoot, terminalProcessMarker, workspaceRoot });
+    await resumed.waitFor("Completed");
+    const beforeRestartResize = resumed.output().length;
+    await resumed.resize(120, 40);
+    await resumed.waitForCompleteFrameAfter(
+      "eve-reviewer.local-worktree-review@1",
+      beforeRestartResize,
+    );
+    const restartedFrame = resumed.output().slice(beforeRestartResize);
+    expect(restartedFrame.match(/eve-reviewer\.local-worktree-review@1/gu) ?? []).toHaveLength(1);
+    expect(restartedFrame).toContain("Report · eve-reviewer.review-result@1");
+    resumed.write("\u0011");
+    await expect(resumed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    const afterStatus = (
+      await execFile("git", ["status", "--porcelain=v1"], { cwd: workspaceRoot })
+    ).stdout;
+    expect(afterStatus).toBe(beforeStatus);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a missing configured package disables admission while preserving generic historical operations", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-missing-extension-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  const packageRoot = join(testRoot, "recoverable-review");
+  const terminalProcessMarker = join(testRoot, "terminal-process");
+  await mkdir(workspaceRoot);
+  await writeRecoverableReviewPackage(packageRoot);
+  await writeReviewExtensionConfiguration(configDirectory, packageRoot, { block: false });
+  const environment = {
+    ADAM_TEST_TERMINAL_PROCESS_MARKER: terminalProcessMarker,
+    DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+    XDG_CONFIG_HOME: configRoot,
+  } as const;
+  const modelTargets = createModelTargets({ environment });
+  const targetIdentity = (
+    await modelTargets.snapshot({ signal: new AbortController().signal })
+  ).targets.find(({ identity }) => identity.targetId === "deepseek-v4-flash.direct")?.identity;
+  if (targetIdentity === undefined) {
+    throw new Error("The missing-extension fixture requires the DeepSeek Flash target.");
+  }
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const created = await lifecycle.create({ targetIdentity });
+  await lifecycle.close();
+  const operationStore = await createJsonlOperationStore({ stateRoot, workspaceRoot });
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        configuration: { block: false },
+        enabled: true,
+        extensionId: "fixture.recoverable-review",
+        grants: [],
+        packageName: "@fixture/recoverable-review",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    operationOriginAuthority: { validateBoundary: async () => true },
+    operationStore,
+    projectRoot: workspaceRoot,
+    stateRoot,
+  });
+
+  try {
+    await host.loadConfiguredExtensions();
+    const reference = await host.operations.startLinked({
+      contributionId: "fixture.recoverable-review@1",
+      idempotencyKey: "missing-package-history",
+      input: { digest: `sha256:${"a".repeat(64)}` },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: created.sessionId,
+        sourceSequence: created.lastSequence,
+      },
+    });
+    for await (const record of host.operations.events({ operationId: reference.operationId })) {
+      if (record.event.type === "operation_completed") {
+        break;
+      }
+    }
+    await rm(packageRoot, { recursive: true, force: true });
+
+    const fixture = startFixture({
+      program: {
+        arguments: ["--resume", created.sessionId, "--state-root", stateRoot],
+        cwd: workspaceRoot,
+        entrypoint: productionFixturePath,
+        environment,
+      },
+      stateRoot,
+      terminalProcessMarker,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Configured extension packages are unavailable");
+    await fixture.resize(120, 40);
+    await fixture.waitFor("fixture.recoverable-review@1");
+    await fixture.waitFor("Completed");
+    await fixture.waitFor("generic");
+    fixture.write("/review\r");
+    await fixture.waitFor("Unknown command /review");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI rehydrates and explicitly recovers one operation after process interruption", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-operation-restart-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  const packageRoot = join(testRoot, "recoverable-review");
+  const executionMarker = join(testRoot, "operation-execution");
+  const reconciliationMarker = join(testRoot, "operation-reconciliation");
+  const terminalProcessMarker = join(testRoot, "terminal-process");
+  await mkdir(workspaceRoot);
+  await execFile("git", ["init", "--initial-branch=main"], { cwd: workspaceRoot });
+  await execFile("git", ["config", "user.name", "Adam Test"], { cwd: workspaceRoot });
+  await execFile("git", ["config", "user.email", "adam@example.invalid"], {
+    cwd: workspaceRoot,
+  });
+  await writeFile(join(workspaceRoot, "reviewed.ts"), "export const answer = 1;\n", "utf8");
+  await execFile("git", ["add", "reviewed.ts"], { cwd: workspaceRoot });
+  await execFile("git", ["commit", "-m", "fixture base"], { cwd: workspaceRoot });
+  await writeFile(join(workspaceRoot, "reviewed.ts"), "export const answer = 2;\n", "utf8");
+  const beforeStatus = (await execFile("git", ["status", "--porcelain=v1"], { cwd: workspaceRoot }))
+    .stdout;
+  await writeRecoverableReviewPackage(packageRoot);
+  await writeReviewExtensionConfiguration(configDirectory, packageRoot, {
+    block: true,
+    executeMarker: executionMarker,
+    reconcileMarker: reconciliationMarker,
+  });
+  const environment = {
+    ADAM_TEST_TERMINAL_PROCESS_MARKER: terminalProcessMarker,
+    DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+    XDG_CONFIG_HOME: configRoot,
+  } as const;
+  const modelTargets = createModelTargets({ environment });
+  const targetIdentity = (
+    await modelTargets.snapshot({ signal: new AbortController().signal })
+  ).targets.find(({ identity }) => identity.targetId === "deepseek-v4-flash.direct")?.identity;
+  if (targetIdentity === undefined) {
+    throw new Error("The operation restart fixture requires the DeepSeek Flash target.");
+  }
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const created = await lifecycle.create({ targetIdentity });
+  await lifecycle.close();
+  const program = {
+    arguments: ["--resume", created.sessionId, "--state-root", stateRoot],
+    cwd: workspaceRoot,
+    entrypoint: productionFixturePath,
+    environment,
+  } as const;
+
+  try {
+    const interrupted = startFixture({
+      program,
+      stateRoot,
+      terminalProcessMarker,
+      workspaceRoot,
+    });
+    await interrupted.waitFor("Adam · New session");
+    interrupted.write("/review\r");
+    await interrupted.waitFor("Running · analyzing interrupted project changes");
+    await waitForPath(executionMarker);
+    await interrupted.terminate("SIGKILL");
+    await interrupted.closed;
+
+    const resumed = startFixture({ program, stateRoot, terminalProcessMarker, workspaceRoot });
+    await resumed.waitFor("Recovery required");
+    await resumed.waitFor("Ctrl+R recover");
+    const beforeRecovery = resumed.output().length;
+    resumed.write("\u0012");
+    await resumed.waitForCompleteFrameAfter("Completed", beforeRecovery);
+    await waitForPath(reconciliationMarker);
+    expect(await readFile(executionMarker, "utf8")).toBe("execute\n");
+    expect(await readFile(reconciliationMarker, "utf8")).toBe("reconcile\n");
+    resumed.write("\u0011");
+    await expect(resumed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(
+      (await execFile("git", ["status", "--porcelain=v1"], { cwd: workspaceRoot })).stdout,
+    ).toBe(beforeStatus);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
