@@ -16,9 +16,13 @@ const maximumToolArgumentBytes = 2 * 1024 * 1024;
 const maximumToolCallCount = 128;
 const maximumToolCallIdBytes = 1_024;
 const maximumToolNameBytes = 256;
+const maximumReasoningIdBytes = 1_024;
 const maximumStreamPartCount = 2_000_000;
 
 type StreamNormalization = {
+  activeReasoningIds: Set<string>;
+  pendingReasoningEndIds: Set<string>;
+  reasoningIds: Map<string, string>;
   activeToolCallIds: Set<string>;
   contentBytes: number;
   toolArgumentBytes: number;
@@ -74,6 +78,7 @@ export class AiSdkModelDriver implements ModelDriver {
       }, this.#deadlineMs);
     };
     armDeadline();
+    let normalization: StreamNormalization | undefined;
     try {
       const providerOptions = providerOptionsForRequest(
         this.#providerOptions,
@@ -99,7 +104,10 @@ export class AiSdkModelDriver implements ModelDriver {
             }),
       });
 
-      const normalization: StreamNormalization = {
+      normalization = {
+        activeReasoningIds: new Set(),
+        pendingReasoningEndIds: new Set(),
+        reasoningIds: new Map(),
         activeToolCallIds: new Set(),
         contentBytes: 0,
         toolArgumentBytes: 0,
@@ -123,12 +131,16 @@ export class AiSdkModelDriver implements ModelDriver {
         }
         yield* events;
       }
+      yield* endActiveReasoning(normalization);
       if (deadlineExpired) {
         throw new ModelDriverError("timeout", "The model provider request reached its deadline.", {
           cause: undefined,
         });
       }
     } catch (error) {
+      if (normalization !== undefined) {
+        yield* endPendingReasoning(normalization);
+      }
       if (deadlineExpired) {
         throw new ModelDriverError("timeout", "The model provider request reached its deadline.", {
           cause: error,
@@ -190,8 +202,6 @@ function isIgnoredStructuralPart(part: LanguageModelV4StreamPart): boolean {
     case "response-metadata":
     case "text-start":
     case "text-end":
-    case "reasoning-start":
-    case "reasoning-end":
       return true;
     default:
       return false;
@@ -264,12 +274,39 @@ function* mapStreamPart(
       }
       return;
     case "response-metadata":
-    case "text-start":
     case "text-end":
+      return;
+    case "text-start":
+      yield* endActiveReasoning(normalization);
+      return;
     case "reasoning-start":
+      assertWithinLimit(Buffer.byteLength(part.id, "utf8"), maximumReasoningIdBytes);
+      if (normalization.reasoningIds.has(part.id)) {
+        if (!normalization.pendingReasoningEndIds.delete(part.id)) {
+          throw invalidReasoningStreamError();
+        }
+        normalization.activeReasoningIds.add(part.id);
+        return;
+      }
+      normalization.reasoningIds.set(
+        part.id,
+        `provider-reasoning-${normalization.reasoningIds.size}`,
+      );
+      normalization.activeReasoningIds.add(part.id);
+      yield {
+        type: "reasoning_start",
+        id: normalization.reasoningIds.get(part.id) as string,
+        artifactType: "provider_reasoning",
+      };
+      return;
     case "reasoning-end":
+      if (!normalization.activeReasoningIds.delete(part.id)) {
+        throw invalidReasoningStreamError();
+      }
+      normalization.pendingReasoningEndIds.add(part.id);
       return;
     case "text-delta":
+      yield* endActiveReasoning(normalization);
       normalization.contentBytes = addBytesWithinLimit(
         normalization.contentBytes,
         part.delta,
@@ -278,12 +315,32 @@ function* mapStreamPart(
       yield { type: "text_delta", text: part.delta };
       return;
     case "reasoning-delta":
+      if (!normalization.activeReasoningIds.has(part.id)) {
+        assertWithinLimit(Buffer.byteLength(part.id, "utf8"), maximumReasoningIdBytes);
+        if (normalization.reasoningIds.has(part.id)) {
+          throw invalidReasoningStreamError();
+        }
+        normalization.reasoningIds.set(
+          part.id,
+          `provider-reasoning-${normalization.reasoningIds.size}`,
+        );
+        normalization.activeReasoningIds.add(part.id);
+        yield {
+          type: "reasoning_start",
+          id: normalization.reasoningIds.get(part.id) as string,
+          artifactType: "provider_reasoning",
+        };
+      }
       normalization.contentBytes = addBytesWithinLimit(
         normalization.contentBytes,
         part.delta,
         maximumModelResponseContentBytes,
       );
-      yield { type: "reasoning_delta", text: part.delta };
+      yield {
+        type: "reasoning_delta",
+        id: normalization.reasoningIds.get(part.id) as string,
+        text: part.delta,
+      };
       return;
     case "tool-input-start":
       if (part.providerExecuted === true) {
@@ -328,6 +385,7 @@ function* mapStreamPart(
         { cause: part.error },
       );
     case "finish": {
+      yield* endActiveReasoning(normalization);
       const inputTokens = part.usage.inputTokens.total;
       const outputTokens = part.usage.outputTokens.total;
       if (inputTokens !== undefined && outputTokens !== undefined) {
@@ -381,6 +439,35 @@ function invalidToolStreamError(): ModelDriverError {
     "The model provider returned an invalid tool-call stream sequence.",
     { cause: undefined },
   );
+}
+
+function invalidReasoningStreamError(): ModelDriverError {
+  return new ModelDriverError(
+    "protocol_incompatibility",
+    "The model provider returned an invalid reasoning stream sequence.",
+    { cause: undefined },
+  );
+}
+
+function* endActiveReasoning(normalization: StreamNormalization): Iterable<ModelEvent> {
+  yield* endPendingReasoning(normalization);
+  for (const providerId of normalization.activeReasoningIds) {
+    yield {
+      type: "reasoning_end",
+      id: normalization.reasoningIds.get(providerId) as string,
+    };
+  }
+  normalization.activeReasoningIds.clear();
+}
+
+function* endPendingReasoning(normalization: StreamNormalization): Iterable<ModelEvent> {
+  for (const providerId of normalization.pendingReasoningEndIds) {
+    yield {
+      type: "reasoning_end",
+      id: normalization.reasoningIds.get(providerId) as string,
+    };
+  }
+  normalization.pendingReasoningEndIds.clear();
 }
 
 function addBytesWithinLimit(current: number, value: string, maximum: number): number {

@@ -94,6 +94,20 @@ export type AssistantMessageDisplay = {
   readonly artifact: ArtifactReference | null;
 };
 
+export type ReasoningBlockDisplay = {
+  readonly type: "reasoning_block";
+  readonly id: string;
+  readonly sequence: number;
+  readonly sourceSessionId: string;
+  readonly branchBoundary: BranchSourceBoundary | null;
+  readonly artifactType: "provider_reasoning";
+  readonly disclosure: "owner_only";
+  readonly provider: string;
+  readonly status: "active" | "completed" | "interrupted" | "failed";
+  readonly text: string | null;
+  readonly artifact: ArtifactReference | null;
+};
+
 export type ArtifactReference = {
   readonly id: string;
   readonly mediaType: string;
@@ -208,6 +222,7 @@ export type ToolCallDisplay = {
 export type TranscriptItem =
   | UserMessageDisplay
   | AssistantMessageDisplay
+  | ReasoningBlockDisplay
   | CompactionMarkerDisplay
   | SessionNoticeDisplay
   | ToolCallDisplay;
@@ -490,6 +505,15 @@ export type PresentationTransientState = {
     readonly afterSequence: number;
     readonly text: string;
   } | null;
+  readonly reasoning: {
+    readonly id: string;
+    readonly afterSequence: number;
+    readonly artifactType: "provider_reasoning";
+    readonly disclosure: "owner_only";
+    readonly provider: string;
+    readonly status: "active" | "completed" | "interrupted" | "failed";
+    readonly text: string;
+  } | null;
 };
 
 export type PresentationDisplayState = {
@@ -505,6 +529,11 @@ export type PresentationUpdate =
       readonly streamId: string;
       readonly afterSequence: number;
       readonly text: string;
+    }
+  | {
+      readonly type: "reasoning_snapshot";
+      readonly afterSequence: number;
+      readonly reasoning: NonNullable<PresentationTransientState["reasoning"]>;
     }
   | {
       readonly type: "authoritative_snapshot";
@@ -688,6 +717,19 @@ export function reconcilePresentationUpdate(
     };
   }
 
+  if (update.type === "reasoning_snapshot") {
+    return {
+      revision: state.revision + 1,
+      authoritative: state.authoritative,
+      draft: state.draft,
+      transient: {
+        activity: state.transient?.activity ?? "working",
+        assistant: state.transient?.assistant ?? null,
+        reasoning: update.reasoning,
+      },
+    };
+  }
+
   return {
     revision: state.revision + 1,
     authoritative: state.authoritative,
@@ -699,6 +741,7 @@ export function reconcilePresentationUpdate(
         afterSequence: update.afterSequence,
         text: update.text,
       },
+      reasoning: state.transient?.reasoning ?? null,
     },
   };
 }

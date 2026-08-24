@@ -133,6 +133,7 @@ export class OpenAICompatibleModelDriver implements ModelDriver {
     let chunkCount = 0;
     let normalizedTextBytes = 0;
     let normalizedReasoningBytes = 0;
+    let reasoningStarted = false;
     let toolArgumentBytes = 0;
     const toolCalls = new Map<
       number,
@@ -172,12 +173,20 @@ export class OpenAICompatibleModelDriver implements ModelDriver {
           choice.delta as typeof choice.delta & { readonly reasoning_content?: unknown }
         ).reasoning_content;
         if (typeof reasoningContent === "string") {
+          if (!reasoningStarted) {
+            reasoningStarted = true;
+            yield {
+              type: "reasoning_start",
+              id: "provider-reasoning-0",
+              artifactType: "provider_reasoning",
+            };
+          }
           normalizedReasoningBytes = addBytesWithinLimit(
             normalizedReasoningBytes,
             reasoningContent,
             maximumNormalizedReasoningBytes,
           );
-          yield { type: "reasoning_delta", text: reasoningContent };
+          yield { type: "reasoning_delta", id: "provider-reasoning-0", text: reasoningContent };
         }
         if (choice.delta.content !== null && choice.delta.content !== undefined) {
           normalizedTextBytes = addBytesWithinLimit(
@@ -243,6 +252,9 @@ export class OpenAICompatibleModelDriver implements ModelDriver {
         yield { type: "tool_call_delta", id: call.id, json };
       }
       yield { type: "tool_call_end", id: call.id };
+    }
+    if (reasoningStarted) {
+      yield { type: "reasoning_end", id: "provider-reasoning-0" };
     }
     if (usage !== undefined) {
       yield { type: "usage", ...usage };

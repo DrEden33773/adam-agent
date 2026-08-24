@@ -2,6 +2,8 @@ import type {
   ActiveSessionDisplay,
   ArtifactReference,
   PresentationSession,
+  PresentationTransientState,
+  ReasoningBlockDisplay,
   RepositoryInstructionsDisplay,
   TargetDisplay,
   ThinkingCapabilityDisplay,
@@ -47,6 +49,7 @@ import { McpWizard } from "./mcp-wizard.js";
 import { OverlayFrame } from "./overlay-frame.js";
 import { PermissionOverlay } from "./permission-overlay.js";
 import { ProjectPathPicker } from "./project-path-picker.js";
+import { reasoningFoldTitle } from "./reasoning-fold.js";
 import { ResourceReloadPicker } from "./resource-reload-picker.js";
 import {
   ResponsiveLine,
@@ -142,7 +145,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const statusLine = new Text();
   const footer = new ResponsiveText();
   const working = new Loader(tui, theme.toolTitle, theme.muted, "Working", { intervalMs: 80 });
+  const thinking = new Loader(tui, theme.keyword, theme.muted, "Thinking", { intervalMs: 80 });
+  thinking.stop();
   let workingVisible = false;
+  let thinkingVisible = false;
   let cancelSettling = false;
   let requestPolicyRender: () => void = () => undefined;
   const exitArm = new ExitArm(deadlineScheduler, () => requestPolicyRender());
@@ -232,6 +238,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     | undefined;
   const selectedSkills = new Set<string>();
   const selectedThinkingLevels = new Map<string, string>();
+  const expandedReasoningIds = new Set<string>();
+  const reasoningArtifactReads = new Set<string>();
+  const reasoningArtifactTexts = new Map<string, string>();
   let previousActiveSessionId = options.presentation.getState().authoritative.active?.session.id;
   let sessionPickerDismissed = false;
   let sessionPickerRequested = false;
@@ -334,6 +343,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const active = state.authoritative.active;
     synchronizePromptHistory(active);
     if (active?.session.id !== previousActiveSessionId) {
+      expandedReasoningIds.clear();
+      reasoningArtifactReads.clear();
+      reasoningArtifactTexts.clear();
       selectedSkills.clear();
       skillPalette?.hide();
       skillPalette = undefined;
@@ -436,7 +448,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             .dispatch({ type: "select_session", sessionId: session.id })
             .then((receipt) => {
               if (receipt.status === "admitted") {
+                expandedReasoningIds.clear();
+                reasoningArtifactReads.clear();
+                reasoningArtifactTexts.clear();
                 close();
+                renderState();
               } else if (sessionPicker?.picker === picker) {
                 picker.setNotice(receipt.message);
                 tui.requestRender();
@@ -654,6 +670,45 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       ),
     );
     transcript.clear();
+    let activeReasoningVisible = false;
+    const durableReasoningIds = new Set<string>();
+    const renderReasoning = (
+      reasoning: ReasoningBlockDisplay | NonNullable<PresentationTransientState["reasoning"]>,
+      artifact: ArtifactReference | null,
+    ): void => {
+      if (reasoning.text !== null && reasoning.text.length > 0) {
+        reasoningArtifactTexts.set(reasoning.id, reasoning.text);
+      }
+      const expanded = expandedReasoningIds.has(reasoning.id);
+      const title = reasoningFoldTitle({
+        expanded,
+        provider: reasoning.provider,
+        status: reasoning.status,
+        theme,
+      });
+      if (reasoning.status === "active") {
+        activeReasoningVisible = true;
+        thinking.setMessage(title);
+        transcript.addChild(thinking);
+      } else {
+        transcript.addChild(new Spacer(1));
+        transcript.addChild(new ResponsiveLine(title));
+      }
+      if (!expanded) {
+        return;
+      }
+      const text =
+        reasoning.text ??
+        reasoningArtifactTexts.get(reasoning.id) ??
+        (artifact === null
+          ? reasoning.status === "active"
+            ? "Waiting for provider reasoning…"
+            : "Provider reasoning content was not retained."
+          : reasoningArtifactReads.has(reasoning.id)
+            ? "Loading provider reasoning…"
+            : "Provider reasoning is available as an artifact · Ctrl+T to retry loading");
+      transcript.addChild(new Markdown(safeTerminalText(text), 0, 0, theme.markdown));
+    };
     let previousWasAssistant = false;
     for (const item of active?.transcript.items ?? []) {
       if (item.type === "user_message") {
@@ -680,6 +735,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           );
         }
         previousWasAssistant = true;
+      } else if (item.type === "reasoning_block") {
+        durableReasoningIds.add(item.id);
+        renderReasoning(item, item.artifact);
+        previousWasAssistant = false;
       } else if (item.type === "tool_call") {
         const tool = new Box(1, 1, theme.toolBackground);
         const subject = item.subject?.value;
@@ -755,8 +814,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         previousWasAssistant = false;
       }
     }
+    const transientReasoning = state.transient?.reasoning;
+    if (
+      transientReasoning !== null &&
+      transientReasoning !== undefined &&
+      !durableReasoningIds.has(transientReasoning.id)
+    ) {
+      renderReasoning(transientReasoning, null);
+    }
     const transientAssistant = state.transient?.assistant?.text;
-    const showWorking = state.transient?.activity === "working";
+    const showWorking = state.transient?.activity === "working" && transientReasoning === null;
     if (showWorking) {
       transcript.addChild(new Spacer(1));
       transcript.addChild(working);
@@ -770,6 +837,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       working.stop();
     }
     workingVisible = showWorking;
+    if (activeReasoningVisible && !thinkingVisible) {
+      thinking.start();
+    } else if (!activeReasoningVisible && thinkingVisible) {
+      thinking.stop();
+    }
+    thinkingVisible = activeReasoningVisible;
     const pending = active?.pendingInteractions[0];
     if (
       cancelSettling &&
@@ -2076,6 +2149,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     attempt(() => thinkingPicker?.hide());
     attempt(() => permission?.hide());
     attempt(() => working.stop());
+    attempt(() => thinking.stop());
     attempt(() => tui.stop());
     try {
       if (copyDraft) {
@@ -2153,6 +2227,58 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     if (adamCommandRegistry.matchesInput(data, "toggle_tool_details")) {
       toolDetailsExpanded = !toolDetailsExpanded;
+      renderState();
+      return { consume: true };
+    }
+    if (adamCommandRegistry.matchesInput(data, "toggle_reasoning")) {
+      if (isKeyRepeat(data) || isKeyRelease(data)) {
+        return { consume: true };
+      }
+      const state = options.presentation.getState();
+      const active = state.authoritative.active;
+      const reasoning =
+        state.transient?.reasoning ??
+        active?.transcript.items.findLast((item) => item.type === "reasoning_block");
+      if (reasoning === undefined || reasoning === null) {
+        statusMessage = "No provider reasoning block is available.";
+        renderState();
+        return { consume: true };
+      }
+      if (expandedReasoningIds.delete(reasoning.id)) {
+        renderState();
+        return { consume: true };
+      }
+      expandedReasoningIds.add(reasoning.id);
+      const artifact = "artifact" in reasoning ? reasoning.artifact : null;
+      if (
+        reasoning.text === null &&
+        artifact !== null &&
+        !reasoningArtifactTexts.has(reasoning.id) &&
+        !reasoningArtifactReads.has(reasoning.id)
+      ) {
+        reasoningArtifactReads.add(reasoning.id);
+        const sessionId = active?.session.id;
+        void options.presentation.dispatch({ type: "read_artifact", artifact, range: null }).then(
+          (receipt) => {
+            reasoningArtifactReads.delete(reasoning.id);
+            if (
+              receipt.status === "admitted" &&
+              receipt.resource !== null &&
+              options.presentation.getState().authoritative.active?.session.id === sessionId
+            ) {
+              reasoningArtifactTexts.set(reasoning.id, receipt.resource.text);
+            } else if (receipt.status === "rejected") {
+              statusMessage = receipt.message;
+            }
+            renderState();
+          },
+          () => {
+            reasoningArtifactReads.delete(reasoning.id);
+            statusMessage = "Provider reasoning could not be read safely.";
+            renderState();
+          },
+        );
+      }
       renderState();
       return { consume: true };
     }

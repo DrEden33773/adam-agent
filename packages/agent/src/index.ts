@@ -267,7 +267,13 @@ export type ModelRequest = {
 
 export type ModelEvent =
   | { readonly type: "text_delta"; readonly text: string }
-  | { readonly type: "reasoning_delta"; readonly text: string }
+  | {
+      readonly type: "reasoning_start";
+      readonly id: string;
+      readonly artifactType: "provider_reasoning";
+    }
+  | { readonly type: "reasoning_delta"; readonly id: string; readonly text: string }
+  | { readonly type: "reasoning_end"; readonly id: string }
   | { readonly type: "tool_call_start"; readonly id: string; readonly name: string }
   | { readonly type: "tool_call_delta"; readonly id: string; readonly json: string }
   | { readonly type: "tool_call_end"; readonly id: string }
@@ -417,6 +423,17 @@ export type ActiveContextUsage =
 export type RuntimeEvent =
   | { readonly type: "user_message"; readonly text: string }
   | { readonly type: "model_message_started" }
+  | {
+      readonly type: "model_reasoning_started";
+      readonly id: string;
+      readonly artifactType: "provider_reasoning";
+    }
+  | { readonly type: "model_reasoning_updated"; readonly id: string; readonly text: string }
+  | {
+      readonly type: "model_reasoning_settled";
+      readonly id: string;
+      readonly status: "completed" | "interrupted" | "failed";
+    }
   | { readonly type: "model_message_delta"; readonly text: string }
   | { readonly type: "model_message_completed"; readonly text: string }
   | {
@@ -566,6 +583,7 @@ export class AgentSession {
   #promptContext: PromptContextRecord | undefined;
   #skillContext: SkillContextRecordV1 | undefined;
   readonly #activeSkillContents = new Map<string, string>();
+  #pendingReasoningBlock: { readonly id: string } | undefined;
   readonly #repositoryWorkspaceRoot: string | undefined;
   readonly #durableContext: AgentSessionDurableContext | undefined;
   readonly #durableOutputLimits: Required<AgentSessionDurableOutputLimits>;
@@ -1091,6 +1109,8 @@ export class AgentSession {
         | undefined;
       const assemblingCalls = new Map<string, ToolCall>();
       const completedCalls: ToolCall[] = [];
+      let activeReasoningModelId: string | undefined;
+      let reasoningBlockId: string | undefined;
       let streamError: unknown;
       const requestMessageCount = requestMessages.length;
 
@@ -1109,6 +1129,36 @@ export class AgentSession {
             break;
           }
           switch (event.type) {
+            case "reasoning_start": {
+              if (reasoningBlockId !== undefined) {
+                protocolError ??= "The model started more than one reasoning block in one attempt.";
+                break;
+              }
+              const runtimeId = `${modelTurns}:${attemptNumber}:${event.id}`;
+              activeReasoningModelId = event.id;
+              reasoningBlockId = runtimeId;
+              await this.#emit({
+                type: "model_reasoning_started",
+                id: runtimeId,
+                artifactType: event.artifactType,
+              });
+              this.#pendingReasoningBlock = { id: runtimeId };
+              break;
+            }
+            case "reasoning_end": {
+              if (activeReasoningModelId !== event.id || reasoningBlockId === undefined) {
+                protocolError ??= "The model ended a reasoning block that was not started.";
+                break;
+              }
+              activeReasoningModelId = undefined;
+              this.#pendingReasoningBlock = undefined;
+              await this.#emit({
+                type: "model_reasoning_settled",
+                id: reasoningBlockId,
+                status: "completed",
+              });
+              break;
+            }
             case "text_delta":
               {
                 const deltaBytes = Buffer.byteLength(event.text, "utf8");
@@ -1125,6 +1175,10 @@ export class AgentSession {
               }
               break;
             case "reasoning_delta": {
+              if (activeReasoningModelId !== event.id || reasoningBlockId === undefined) {
+                protocolError ??= "The model sent reasoning for a block that was not started.";
+                break;
+              }
               const deltaBytes = Buffer.byteLength(event.text, "utf8");
               if (
                 answerBytes + reasoningBytes + deltaBytes >
@@ -1135,6 +1189,11 @@ export class AgentSession {
               }
               reasoningBytes += deltaBytes;
               reasoningChunks.push(event.text);
+              await this.#emit({
+                type: "model_reasoning_updated",
+                id: reasoningBlockId,
+                text: reasoningChunks.join(""),
+              });
               break;
             }
             case "tool_call_start":
@@ -1264,6 +1323,10 @@ export class AgentSession {
       const answer = answerChunks.join("");
       const reasoning = reasoningChunks.join("");
 
+      if (finishReason !== undefined && activeReasoningModelId !== undefined) {
+        protocolError ??= "The model finished before ending its reasoning block.";
+      }
+
       if (signal.aborted) {
         return this.#settleCancelled();
       }
@@ -1279,6 +1342,7 @@ export class AgentSession {
           completedCalls.length === 0 &&
           assemblingCalls.size === 0;
         if (safeContextOverflow) {
+          await this.#settlePendingReasoningBlock("interrupted");
           await this.#interruptProviderAttemptForContextOverflow();
           const remainingCompactionCalls = 2 - compactionCallsThisTurn;
           if (reactiveRetryUsed || remainingCompactionCalls <= 0) {
@@ -3142,6 +3206,9 @@ export class AgentSession {
       return this.#terminalResult;
     }
     this.#terminalResult = result;
+    await this.#settlePendingReasoningBlock(
+      result.status === "cancelled" ? "interrupted" : "failed",
+    );
     await this.#interruptActiveProviderAttempt(result);
     if (interrupted) {
       await this.#emit({ type: "session_interrupted", reason: "cancelled" });
@@ -3191,6 +3258,15 @@ export class AgentSession {
       },
     });
     this.#activeProviderAttempt = undefined;
+  }
+
+  async #settlePendingReasoningBlock(status: "interrupted" | "failed"): Promise<void> {
+    const pending = this.#pendingReasoningBlock;
+    if (pending === undefined) {
+      return;
+    }
+    this.#pendingReasoningBlock = undefined;
+    await this.#emit({ type: "model_reasoning_settled", id: pending.id, status });
   }
 
   async #interruptProviderAttemptForContextOverflow(): Promise<void> {
@@ -3326,7 +3402,7 @@ export class AgentSession {
       this.#publish(event);
       return;
     }
-    if (event.type !== "model_message_delta") {
+    if (event.type !== "model_message_delta" && event.type !== "model_reasoning_updated") {
       const canonicalEvent: CanonicalRuntimeEvent = event;
       const runId = this.#activeRunId;
       if (runId === undefined) {

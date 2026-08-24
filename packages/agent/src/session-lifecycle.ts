@@ -4292,6 +4292,10 @@ function validateCurrentSessionHistory(
   let sawSessionInterruption = false;
   let sawModelStart = false;
   let sawModelCompletion = false;
+  let reasoningBlock:
+    | { readonly id: string; readonly status: "active" | "completed" | "interrupted" | "failed" }
+    | undefined;
+  let sawReasoningBlock = false;
   let publishedResponseSequence: number | undefined;
   let terminalIntent: RunResult | undefined;
   let lastContextTerminal:
@@ -4585,6 +4589,8 @@ function validateCurrentSessionHistory(
         sawSessionInterruption = false;
         sawModelStart = false;
         sawModelCompletion = false;
+        reasoningBlock = undefined;
+        sawReasoningBlock = false;
         publishedResponseSequence = undefined;
         terminalIntent = undefined;
         lastContextTerminal = undefined;
@@ -5062,6 +5068,8 @@ function validateCurrentSessionHistory(
       };
       sawModelStart = false;
       sawModelCompletion = false;
+      reasoningBlock = undefined;
+      sawReasoningBlock = false;
       lastUsage = undefined;
       toolStates = new Map();
       continue;
@@ -5069,6 +5077,7 @@ function validateCurrentSessionHistory(
     if (record.type === "provider_attempt_interrupted") {
       if (
         !isMatchingStartedAttempt(attemptState, record) ||
+        reasoningBlock?.status === "active" ||
         ((record.reason === "process_restart" || record.reason === "context_overflow") &&
           record.result !== undefined) ||
         (record.reason === "run_terminal" && record.result === undefined)
@@ -5086,6 +5095,8 @@ function validateCurrentSessionHistory(
         terminalIntent !== undefined ||
         !isMatchingStartedAttempt(attemptState, record) ||
         !sawModelStart ||
+        reasoningBlock?.status === "active" ||
+        (sawReasoningBlock && reasoningBlock?.status !== "completed") ||
         !sameModelTargetIdentity(record.targetIdentity, genesis.record.targetIdentity)
       ) {
         throw new SessionLifecycleError("session_invalid");
@@ -5191,6 +5202,32 @@ function validateCurrentSessionHistory(
         throw new SessionLifecycleError("session_invalid");
       }
       sawModelStart = true;
+      continue;
+    }
+    if (event.type === "model_reasoning_started") {
+      if (
+        terminalIntent !== undefined ||
+        attemptState?.status !== "started" ||
+        !sawModelStart ||
+        sawReasoningBlock ||
+        event.id !== `${attemptState.turn}:${attemptState.attempt}:provider-reasoning-0`
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      sawReasoningBlock = true;
+      reasoningBlock = { id: event.id, status: "active" };
+      continue;
+    }
+    if (event.type === "model_reasoning_settled") {
+      if (
+        terminalIntent !== undefined ||
+        attemptState?.status !== "started" ||
+        reasoningBlock?.status !== "active" ||
+        reasoningBlock.id !== event.id
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      reasoningBlock = { id: event.id, status: event.status };
       continue;
     }
     if (event.type === "model_usage") {
@@ -7151,15 +7188,46 @@ async function appendDanglingAttemptInterruption(
   ) {
     return false;
   }
+  const attemptRecord = attempt.record;
   const store = await openSessionStore(options, snapshot.sessionId);
+  let nextSequence = records.length + 1;
+  const reasoningId = `${attemptRecord.turn}:${attemptRecord.attempt}:provider-reasoning-0`;
+  const reasoningStarted = currentRecords.findLast(
+    (record) =>
+      record.sequence > attempt.sequence &&
+      record.record.type === "runtime_event" &&
+      record.record.runId === attemptRecord.runId &&
+      record.record.event.type === "model_reasoning_started" &&
+      record.record.event.id === reasoningId,
+  );
+  const reasoningSettled = currentRecords.some(
+    (record) =>
+      record.sequence > (reasoningStarted?.sequence ?? Number.MAX_SAFE_INTEGER) &&
+      record.record.type === "runtime_event" &&
+      record.record.runId === attemptRecord.runId &&
+      record.record.event.type === "model_reasoning_settled" &&
+      record.record.event.id === reasoningId,
+  );
+  if (reasoningStarted !== undefined && !reasoningSettled) {
+    await store.append({
+      schemaVersion: 3,
+      sequence: nextSequence,
+      record: {
+        type: "runtime_event",
+        runId: attemptRecord.runId,
+        event: { type: "model_reasoning_settled", id: reasoningId, status: "interrupted" },
+      },
+    });
+    nextSequence += 1;
+  }
   await store.append({
     schemaVersion: 3,
-    sequence: records.length + 1,
+    sequence: nextSequence,
     record: {
       type: "provider_attempt_interrupted",
-      runId: attempt.record.runId,
-      turn: attempt.record.turn,
-      attempt: attempt.record.attempt,
+      runId: attemptRecord.runId,
+      turn: attemptRecord.turn,
+      attempt: attemptRecord.attempt,
       reason: "process_restart",
     },
   });

@@ -29,7 +29,9 @@ import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from ".
 
 export type CanonicalRuntimeEvent = Exclude<
   RuntimeEvent,
-  { readonly type: "model_message_delta" | "mcp_catalog_state_changed" }
+  {
+    readonly type: "model_message_delta" | "model_reasoning_updated" | "mcp_catalog_state_changed";
+  }
 >;
 
 type V1PermissionSubject = Exclude<
@@ -1154,6 +1156,16 @@ function createCanonicalRuntimeEventSchema(options: {
   return z.discriminatedUnion("type", [
     z.strictObject({ type: z.literal("user_message"), text: z.string() }),
     z.strictObject({ type: z.literal("model_message_started") }),
+    z.strictObject({
+      type: z.literal("model_reasoning_started"),
+      id: z.string().min(1).max(512),
+      artifactType: z.literal("provider_reasoning"),
+    }),
+    z.strictObject({
+      type: z.literal("model_reasoning_settled"),
+      id: z.string().min(1).max(512),
+      status: z.enum(["completed", "interrupted", "failed"]),
+    }),
     z.strictObject({ type: z.literal("model_message_completed"), text: z.string() }),
     z
       .strictObject({

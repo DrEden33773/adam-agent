@@ -1362,6 +1362,106 @@ test("SessionLifecycle rejects restored v3 records that violate session causalit
   }
 });
 
+test.each(["failed", "interrupted"] as const)(
+  "SessionLifecycle rejects a %s reasoning block followed by an answer-only completed response",
+  async (status) => {
+    const testRoot = await mkdtemp(
+      join(tmpdir(), `adam-agent-session-invalid-reasoning-${status}-`),
+    );
+    const stateRoot = join(testRoot, "state");
+    const workspaceRoot = join(testRoot, "workspace");
+    await mkdir(workspaceRoot);
+
+    try {
+      const harness = createInMemorySessionLifecycleHarness();
+      const lifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
+      const created = await lifecycle.create({ targetIdentity });
+      const runId = "123e4567-e89b-42d3-a456-426614174097";
+      const store = await harness.sessions.open(created.sessionId);
+      if (store === undefined) {
+        throw new Error("Expected the created session store.");
+      }
+      const records: readonly Omit<
+        Extract<SessionRecord, { readonly schemaVersion: 3 }>,
+        "sequence"
+      >[] = [
+        {
+          schemaVersion: 3,
+          record: { type: "logical_run_started", runId, userMessage: "Reject split outcome" },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "user_message", text: "Reject split outcome" },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "provider_attempt_started",
+            runId,
+            turn: 1,
+            attempt: 1,
+            targetIdentity,
+            promptProjection: promptProjectionFor(created, "Reject split outcome"),
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: { type: "runtime_event", runId, event: { type: "model_message_started" } },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: {
+              type: "model_reasoning_started",
+              id: "1:1:provider-reasoning-0",
+              artifactType: "provider_reasoning",
+            },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "model_reasoning_settled", id: "1:1:provider-reasoning-0", status },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "model_response_completed",
+            runId,
+            turn: 1,
+            attempt: 1,
+            targetIdentity,
+            response: {
+              text: "Impossible answer.",
+              toolCalls: [],
+              toolIntents: [],
+              finishReason: "stop",
+            },
+          },
+        },
+      ];
+      for (const [index, record] of records.entries()) {
+        await store.append({ ...record, sequence: index + 2 } as SessionRecord);
+      }
+
+      await expect(lifecycle.inspect({ sessionId: created.sessionId })).rejects.toMatchObject({
+        code: "session_invalid",
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
 test("SessionLifecycle rejects a fabricated completed settlement without a provider response", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-invalid-settlement-"));
   const stateRoot = join(testRoot, "state");
@@ -2875,7 +2975,13 @@ test("SessionLifecycle artifactizes replay-critical reasoning instead of truncat
   await mkdir(workspaceRoot);
   const oversizedReasoning = "r".repeat(512 * 1024 + 1);
   const driver = new FakeModelDriver([
-    { type: "reasoning_delta", text: oversizedReasoning },
+    {
+      type: "reasoning_start",
+      id: "provider-reasoning-0",
+      artifactType: "provider_reasoning",
+    },
+    { type: "reasoning_delta", id: "provider-reasoning-0", text: oversizedReasoning },
+    { type: "reasoning_end", id: "provider-reasoning-0" },
     { type: "finish", reason: "stop" },
   ]);
   const modelTargets: ModelTargets = {
@@ -3053,7 +3159,16 @@ test("SessionLifecycle commits a complete tool response before permission resolu
       input: { text: "Read the project name" },
       limits: { maxTurns: 2 },
     });
-    const permission = await permissionRequested;
+    const firstOutcome = await Promise.race([
+      permissionRequested.then((event) => ({ type: "permission" as const, event })),
+      pendingContinue.then((continued) => ({ type: "settled" as const, continued })),
+    ]);
+    if (firstOutcome.type === "settled") {
+      throw new Error(
+        `The run settled before requesting permission: ${JSON.stringify(firstOutcome.continued.result)}`,
+      );
+    }
+    const permission = firstOutcome.event;
     const beforeDecision = await lifecycle.inspect({ sessionId: created.sessionId });
     const durableRecords = await harness.sessions
       .open(created.sessionId)
@@ -3071,7 +3186,7 @@ test("SessionLifecycle commits a complete tool response before permission resolu
       beforeDecision: {
         ...snapshotWithLastPromptProjection(created, permissionRequestDigest),
         status: "interrupted",
-        lastSequence: 10,
+        lastSequence: 12,
         run: {
           runId: expect.any(String),
           status: "interrupted",

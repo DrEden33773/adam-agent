@@ -41,6 +41,7 @@ export type AdamKeybindingAction =
   | "rename_session"
   | "save_default_target"
   | "submit"
+  | "toggle_reasoning"
   | "toggle_tool_details";
 
 export type AdamKeybindingDefinition = {
@@ -350,6 +351,13 @@ const keybindingProjections: readonly KeybindingProjection[] = [
     adamInputs: ["ctrl+q"],
     keys: "Ctrl+Q",
     description: "Exit Adam",
+    section: "application",
+  },
+  {
+    action: "toggle_reasoning",
+    adamInputs: ["ctrl+t"],
+    keys: "Ctrl+T",
+    description: "Expand or collapse the active, otherwise latest, provider reasoning block",
     section: "application",
   },
   {
