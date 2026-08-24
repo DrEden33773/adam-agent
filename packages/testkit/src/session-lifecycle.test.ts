@@ -1128,7 +1128,7 @@ test("SessionLifecycle paginates prompt-admitted sessions while hiding genesis-o
     });
 
     expect([...firstPage.items, ...secondPage.items].map((item) => item.sessionId)).toEqual(
-      admitted.map((item) => item.sessionId).sort(),
+      admitted.map((item) => item.sessionId).reverse(),
     );
     expect([...firstPage.items, ...secondPage.items]).not.toContainEqual(
       expect.objectContaining({ sessionId: genesisOnly.sessionId }),

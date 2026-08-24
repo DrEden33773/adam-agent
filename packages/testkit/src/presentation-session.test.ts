@@ -1,6 +1,16 @@
 import { createHash } from "node:crypto";
 import { rmSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -1960,6 +1970,7 @@ test("PresentationSession keeps its draft when logical input persistence fails",
       wrappedStores.set(sessionId, wrapped);
       return wrapped;
     },
+    listSessionEntries: () => backing.listSessionEntries(),
     listSessionIds: () => backing.listSessionIds(),
     async open(sessionId) {
       return (await backing.open(sessionId)) === undefined
@@ -8238,6 +8249,77 @@ test("PresentationSession discovers and selects cold sibling project sessions", 
   }
 });
 
+test("PresentationSession orders project sessions by durable modification time with a stable tie", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-session-mtime-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelTargets = settledModelTargets("Modification order answer.");
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    lifecycle.enableAutomaticTitles();
+    const created = [
+      await lifecycle.create({ targetIdentity }),
+      await lifecycle.create({ targetIdentity }),
+      await lifecycle.create({ targetIdentity }),
+    ];
+    for (const [index, session] of created.entries()) {
+      await lifecycle.setSessionManualName({
+        sessionId: session.sessionId,
+        name: `Modification order ${index + 1}`,
+      });
+      await lifecycle.continue({
+        sessionId: session.sessionId,
+        input: { text: `Modification order ${index + 1}` },
+      });
+    }
+    const sortedIds = created.map((session) => session.sessionId).sort();
+    const [oldestId, ...newestIds] = sortedIds;
+    if (oldestId === undefined || newestIds.length !== 2) {
+      throw new Error("Expected three durable sessions.");
+    }
+    const projectId = createHash("sha256").update(workspaceRoot).digest("hex");
+    const sessionPath = (sessionId: string) =>
+      join(stateRoot, "projects", projectId, "sessions", `${sessionId}.jsonl`);
+    const olderTime = new Date("2026-01-01T00:00:00.000Z");
+    const newerTime = new Date("2026-01-02T00:00:00.000Z");
+    await utimes(sessionPath(oldestId), olderTime, olderTime);
+    await Promise.all(
+      newestIds.map((sessionId) => utimes(sessionPath(sessionId), newerTime, newerTime)),
+    );
+    const [oldestMetadata, ...newestMetadata] = await Promise.all(
+      [oldestId, ...newestIds].map((sessionId) => stat(sessionPath(sessionId))),
+    );
+    expect(oldestMetadata?.mtimeMs).toBeLessThan(newestMetadata[0]?.mtimeMs ?? 0);
+    expect(newestMetadata.map((metadata) => metadata.mtimeMs)).toEqual([
+      newerTime.getTime(),
+      newerTime.getTime(),
+    ]);
+    expect(
+      (await lifecycle.listProjectSessions()).items.map((session) => session.sessionId),
+    ).toEqual([...newestIds, oldestId]);
+
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: oldestId,
+      stateRoot,
+      workspaceRoot,
+    });
+    try {
+      expect(
+        presentation.getState().authoritative.sessions.items.map((session) => session.id),
+      ).toEqual([...newestIds, oldestId]);
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("PresentationSession consumes the opaque project catalog cursor", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-catalog-page-"));
   const stateRoot = join(testRoot, "state");
@@ -8252,13 +8334,17 @@ test("PresentationSession consumes the opaque project catalog cursor", async () 
       await lifecycle.create({ targetIdentity }),
     ];
     for (const [index, session] of created.entries()) {
+      await lifecycle.setSessionManualName({
+        sessionId: session.sessionId,
+        name: `Catalog page ${index + 1}`,
+      });
       await lifecycle.continue({
         sessionId: session.sessionId,
         input: { text: `Catalog page ${index + 1}` },
       });
     }
-    created.sort((left, right) => left.sessionId.localeCompare(right.sessionId));
-    const first = created[0];
+    const expectedOrder = [...created].reverse();
+    const first = expectedOrder[0];
     if (first === undefined) {
       throw new Error("Expected a project session.");
     }
@@ -8280,7 +8366,7 @@ test("PresentationSession consumes the opaque project catalog cursor", async () 
         presentation.dispatch({ type: "load_more_sessions", after: cursor }),
       ).resolves.toMatchObject({ status: "admitted", resource: null });
       expect(presentation.getState().authoritative.sessions).toMatchObject({
-        items: [{ id: created[0]?.sessionId }, { id: created[1]?.sessionId }],
+        items: [{ id: expectedOrder[0]?.sessionId }, { id: expectedOrder[1]?.sessionId }],
         nextCursor: null,
       });
     } finally {

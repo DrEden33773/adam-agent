@@ -67,6 +67,7 @@ test("SessionStoreDirectory adapters create open and list isolated session store
 
   try {
     for (const [name, directory] of directories) {
+      expect(await directory.listSessionEntries(), name).toEqual([]);
       expect(await directory.listSessionIds(), name).toEqual([]);
       expect(await directory.open(sessionId), name).toBeUndefined();
       const created = await directory.create(sessionId);
@@ -78,6 +79,10 @@ test("SessionStoreDirectory adapters create open and list isolated session store
         code: "session_log_exists",
       });
       expect(await directory.listSessionIds(), name).toEqual([sessionId, secondSessionId]);
+      expect(await directory.listSessionEntries(), name).toEqual([
+        { sessionId, modifiedAtMilliseconds: expect.any(Number) },
+        { sessionId: secondSessionId, modifiedAtMilliseconds: expect.any(Number) },
+      ]);
       await expect(
         directory.open(sessionId).then((store) => store?.read()),
         name,
