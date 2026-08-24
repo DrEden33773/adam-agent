@@ -26,6 +26,7 @@ import {
   createPermissionPolicy,
   createReadToolRegistry,
   type ModelDriver,
+  ModelDriverError,
   type RuntimeEvent,
   type SessionEventRecord,
   type SessionStore,
@@ -74,6 +75,193 @@ describe("AgentSession", () => {
         result: { status: "completed", answer: "Hello, Adam." },
       },
     ]);
+  });
+
+  test("a provider reasoning block streams as structural runtime facts before the answer", async () => {
+    const model = new FakeModelDriver([
+      {
+        type: "reasoning_start",
+        id: "provider-reasoning-0",
+        artifactType: "provider_reasoning",
+      },
+      { type: "reasoning_delta", id: "provider-reasoning-0", text: "Inspect " },
+      { type: "reasoning_delta", id: "provider-reasoning-0", text: "the evidence." },
+      { type: "reasoning_end", id: "provider-reasoning-0" },
+      { type: "text_delta", text: "Done." },
+      { type: "finish", reason: "stop" },
+    ]);
+    const session = createTestSession({ model });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const result = await session.run({ text: "Think, then answer" });
+
+    expect(result).toEqual({ status: "completed", answer: "Done." });
+    expect(events).toEqual([
+      { type: "user_message", text: "Think, then answer" },
+      { type: "model_message_started" },
+      {
+        type: "model_reasoning_started",
+        id: "1:1:provider-reasoning-0",
+        artifactType: "provider_reasoning",
+      },
+      {
+        type: "model_reasoning_updated",
+        id: "1:1:provider-reasoning-0",
+        text: "Inspect ",
+      },
+      {
+        type: "model_reasoning_updated",
+        id: "1:1:provider-reasoning-0",
+        text: "Inspect the evidence.",
+      },
+      {
+        type: "model_reasoning_settled",
+        id: "1:1:provider-reasoning-0",
+        status: "completed",
+      },
+      { type: "model_message_delta", text: "Done." },
+      { type: "model_message_completed", text: "Done." },
+      {
+        type: "session_settled",
+        result: { status: "completed", answer: "Done." },
+      },
+    ]);
+  });
+
+  test("a provider failure settles its streamed reasoning block as failed", async () => {
+    const model: ModelDriver = {
+      async *stream() {
+        yield {
+          type: "reasoning_start",
+          id: "provider-reasoning-0",
+          artifactType: "provider_reasoning",
+        } as const;
+        yield {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: "Partial evidence.",
+        } as const;
+        throw new ModelDriverError("transport", "The provider stream failed.", {
+          cause: undefined,
+        });
+      },
+    };
+    const session = createTestSession({ model });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const result = await session.run({ text: "Think until failure" });
+
+    expect(result).toEqual({
+      status: "failed",
+      error: {
+        code: "model_request_failed",
+        message: "The provider stream failed.",
+        category: "transport",
+      },
+    });
+    expect(events).toEqual([
+      { type: "user_message", text: "Think until failure" },
+      { type: "model_message_started" },
+      {
+        type: "model_reasoning_started",
+        id: "1:1:provider-reasoning-0",
+        artifactType: "provider_reasoning",
+      },
+      {
+        type: "model_reasoning_updated",
+        id: "1:1:provider-reasoning-0",
+        text: "Partial evidence.",
+      },
+      {
+        type: "model_reasoning_settled",
+        id: "1:1:provider-reasoning-0",
+        status: "failed",
+      },
+      {
+        type: "session_settled",
+        result: {
+          status: "failed",
+          error: {
+            code: "model_request_failed",
+            message: "The provider stream failed.",
+            category: "transport",
+          },
+        },
+      },
+    ]);
+  });
+
+  test("cancelling an active provider reasoning block settles it as interrupted", async () => {
+    let reportReasoning = (): void => undefined;
+    const reasoningStarted = new Promise<void>((resolve) => {
+      reportReasoning = resolve;
+    });
+    const model: ModelDriver = {
+      async *stream(request) {
+        yield {
+          type: "reasoning_start",
+          id: "provider-reasoning-0",
+          artifactType: "provider_reasoning",
+        } as const;
+        yield {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: "Still reasoning.",
+        } as const;
+        reportReasoning();
+        await new Promise<void>((resolve) => {
+          request.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+      },
+    };
+    const session = createTestSession({ model });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const resultPromise = session.run({ text: "Cancel this reasoning" });
+    await reasoningStarted;
+    session.abort();
+
+    await expect(resultPromise).resolves.toEqual(cancelledResult);
+    expect(events).toContainEqual({
+      type: "model_reasoning_settled",
+      id: "1:1:provider-reasoning-0",
+      status: "interrupted",
+    });
+    expect(events.findIndex((event) => event.type === "model_reasoning_settled")).toBeLessThan(
+      events.findIndex((event) => event.type === "session_settled"),
+    );
+  });
+
+  test("a second provider reasoning block in one attempt fails closed", async () => {
+    const model = new FakeModelDriver([
+      {
+        type: "reasoning_start",
+        id: "provider-reasoning-0",
+        artifactType: "provider_reasoning",
+      },
+      { type: "reasoning_end", id: "provider-reasoning-0" },
+      {
+        type: "reasoning_start",
+        id: "provider-reasoning-1",
+        artifactType: "provider_reasoning",
+      },
+      { type: "reasoning_end", id: "provider-reasoning-1" },
+      { type: "finish", reason: "stop" },
+    ]);
+    const session = createTestSession({ model });
+
+    const result = await session.run({ text: "Do not merge reasoning blocks" });
+
+    expect(result).toEqual({
+      status: "failed",
+      error: {
+        code: "model_protocol_invalid",
+        message: "The model started more than one reasoning block in one attempt.",
+      },
+    });
   });
 
   test.each(["in-memory", "JSONL"] as const)(
@@ -179,6 +367,63 @@ describe("AgentSession", () => {
       await chmod(stateRoot, 0o700);
       await rm(testRoot, { recursive: true, force: true });
     }
+  });
+
+  test("a failed reasoning-start append cannot leak settlement into the next run", async () => {
+    const backingStore = createInMemorySessionStore();
+    let failReasoningStart = true;
+    const store: SessionStore = {
+      async append(record) {
+        if (failReasoningStart && record.event.type === "model_reasoning_started") {
+          failReasoningStart = false;
+          throw new Error("Fail the first reasoning-start append.");
+        }
+        await backingStore.append(record);
+      },
+      read: () => backingStore.read(),
+    };
+    let modelCalls = 0;
+    const model = new FakeModelDriver(() => {
+      modelCalls += 1;
+      return modelCalls === 1
+        ? [
+            {
+              type: "reasoning_start" as const,
+              id: "provider-reasoning-0",
+              artifactType: "provider_reasoning" as const,
+            },
+          ]
+        : [
+            { type: "text_delta" as const, text: "Clean second answer." },
+            { type: "finish" as const, reason: "stop" as const },
+          ];
+    });
+    const session = createTestSession({ model, store });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const first = await session.run({ text: "Fail reasoning persistence" });
+    const second = await session.run({ text: "Answer without reasoning" });
+
+    expect({
+      first,
+      second,
+      reasoningEvents: events.filter((event) => event.type.startsWith("model_reasoning_")),
+      durableReasoningEvents: (await store.read())
+        .map((record) => record.event)
+        .filter((event) => event.type.startsWith("model_reasoning_")),
+    }).toEqual({
+      first: {
+        status: "failed",
+        error: {
+          code: "session_persistence_failed",
+          message: "The session event could not be persisted.",
+        },
+      },
+      second: { status: "completed", answer: "Clean second answer." },
+      reasoningEvents: [],
+      durableReasoningEvents: [],
+    });
   });
 
   test("abort settles an active model wait once as cancelled", async () => {

@@ -321,7 +321,11 @@ export async function generateContextSummary(input: {
         }
       } else if (event.type === "finish") {
         finishReason = event.reason;
-      } else if (event.type !== "reasoning_delta") {
+      } else if (
+        event.type !== "reasoning_start" &&
+        event.type !== "reasoning_delta" &&
+        event.type !== "reasoning_end"
+      ) {
         invalid = true;
       }
     }

@@ -285,7 +285,13 @@ test("AgentSession spills every non-empty response field when JSON escaping cros
   });
   const model: ModelDriver = {
     async *stream() {
-      yield { type: "reasoning_delta", text: reasoning };
+      yield {
+        type: "reasoning_start",
+        id: "provider-reasoning-0",
+        artifactType: "provider_reasoning",
+      } as const;
+      yield { type: "reasoning_delta", id: "provider-reasoning-0", text: reasoning };
+      yield { type: "reasoning_end", id: "provider-reasoning-0" } as const;
       yield { type: "text_delta", text };
       yield { type: "finish", reason: "stop" };
     },
@@ -345,7 +351,12 @@ test("AgentSession rejects text plus reasoning above the shared 64 MiB response 
   const model: ModelDriver = {
     async *stream() {
       yield { type: "text_delta", text: boundaryChunk };
-      yield { type: "reasoning_delta", text: "y" };
+      yield {
+        type: "reasoning_start",
+        id: "provider-reasoning-0",
+        artifactType: "provider_reasoning",
+      } as const;
+      yield { type: "reasoning_delta", id: "provider-reasoning-0", text: "y" };
       yield { type: "finish", reason: "stop" };
     },
   };
@@ -370,7 +381,13 @@ test("AgentSession accepts separate text and reasoning at the shared 64 MiB boun
   const reasoning = "r".repeat(32 * 1024 * 1024);
   const model: ModelDriver = {
     async *stream() {
-      yield { type: "reasoning_delta", text: reasoning };
+      yield {
+        type: "reasoning_start",
+        id: "provider-reasoning-0",
+        artifactType: "provider_reasoning",
+      } as const;
+      yield { type: "reasoning_delta", id: "provider-reasoning-0", text: reasoning };
+      yield { type: "reasoning_end", id: "provider-reasoning-0" } as const;
       yield { type: "text_delta", text };
       yield { type: "finish", reason: "stop" };
     },

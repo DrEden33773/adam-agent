@@ -10,6 +10,7 @@ import {
   createPresentationSession,
   createSessionLifecycle,
   type ModelDriver,
+  ModelDriverError,
   type ModelTargetIdentity,
   type ModelTargets,
 } from "@adam-agent/agent";
@@ -436,8 +437,11 @@ function createFixtureModelTargets(options: {
   ) {
     return undefined;
   }
-  if (options.scenario === "streaming" && options.controlRoot === undefined) {
-    throw new TypeError("The streaming fixture requires --control-root.");
+  if (
+    (options.scenario === "streaming" || options.scenario === "reasoning-streaming") &&
+    options.controlRoot === undefined
+  ) {
+    throw new TypeError("The streaming fixtures require --control-root.");
   }
   let artifactResponseOrdinal = 0;
   const model: ModelDriver = {
@@ -623,6 +627,67 @@ function createFixtureModelTargets(options: {
           type: "text_delta",
           text: "\u001b]52;c;YXR0YWNr\u0007Visible \u001b[2Janswer.",
         };
+      } else if (options.scenario === "reasoning-artifact") {
+        yield {
+          type: "reasoning_start",
+          id: "provider-reasoning-0",
+          artifactType: "provider_reasoning",
+        };
+        yield {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: `Artifact reasoning evidence\n${"r".repeat(270_000)}`,
+        };
+        yield { type: "reasoning_end", id: "provider-reasoning-0" };
+        yield { type: "text_delta", text: "Artifact reasoning answer." };
+      } else if (
+        options.scenario === "reasoning-cancellation" ||
+        options.scenario === "reasoning-failure"
+      ) {
+        yield {
+          type: "reasoning_start",
+          id: "provider-reasoning-0",
+          artifactType: "provider_reasoning",
+        };
+        yield {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: "Inspect terminal state.",
+        };
+        if (options.scenario === "reasoning-failure") {
+          throw new ModelDriverError("transport", "The reasoning fixture failed.", {
+            cause: new Error("reasoning fixture transport failure"),
+          });
+        }
+        await new Promise<void>((resolve) => {
+          if (request.signal.aborted) {
+            resolve();
+            return;
+          }
+          request.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        throw request.signal.reason;
+      } else if (options.scenario === "reasoning-streaming") {
+        yield {
+          type: "reasoning_start",
+          id: "provider-reasoning-0",
+          artifactType: "provider_reasoning",
+        };
+        yield {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: "Inspect ",
+        };
+        await writeFile(join(options.controlRoot as string, "model-started"), "started\n", "utf8");
+        await waitForFile(options.controlRoot as string, "release-reasoning");
+        yield {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: "the evidence.",
+        };
+        await waitForFile(options.controlRoot as string, "release-model");
+        yield { type: "reasoning_end", id: "provider-reasoning-0" };
+        yield { type: "text_delta", text: "Reasoning answer." };
       } else {
         await writeFile(join(options.controlRoot as string, "model-started"), "started\n", "utf8");
         await waitForFile(options.controlRoot as string, "release-model");
@@ -651,7 +716,9 @@ function createFixtureModelTargets(options: {
           ? alternateTargetIdentity
           : targetIdentity);
       const thinkingCapability =
-        options.launch !== undefined || options.scenario === "streaming"
+        options.launch !== undefined ||
+        options.scenario === "streaming" ||
+        options.scenario === "reasoning-streaming"
           ? fixtureThinkingCapabilities.get(identity.targetId)
           : undefined;
       return {
@@ -682,7 +749,7 @@ function createFixtureModelTargets(options: {
             identity: targetIdentity,
             readiness: { status: "available", credentialSource: "deterministic TUI fixture" },
             contextProfile,
-            ...(options.scenario === "streaming"
+            ...(options.scenario === "streaming" || options.scenario === "reasoning-streaming"
               ? { thinkingCapability: requireFixtureThinkingCapability(targetIdentity.targetId) }
               : {}),
           },
@@ -778,6 +845,7 @@ function clipboardAdapter(options: {
     options.scenario !== "copy-large-assistant" &&
     options.scenario !== "copy-older-assistant" &&
     options.scenario !== "artifact-backed-assistant" &&
+    options.scenario !== "reasoning-streaming" &&
     options.scenario !== "read" &&
     options.scenario !== "history" &&
     options.scenario !== "session-selection-history" &&

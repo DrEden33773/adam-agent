@@ -1224,6 +1224,7 @@ test("slash Hotkeys opens the shared local Help navigator", async () => {
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(outcome).toBe("hotkeys");
+    expect(fixture.output().slice(beforeHotkeys)).toContain("Ctrl+T");
     expect(fixture.output().slice(beforeHotkeys)).toContain("Ctrl+R");
     expect(fixture.output().slice(beforeHotkeys)).toContain("Ctrl+N");
     expect(fixture.output().slice(beforeHotkeys)).toContain("Ctrl+F");
@@ -2222,6 +2223,204 @@ test("editor submission renders Working then a streamed Markdown answer from rea
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).toContain("\u001b[48;2;49;50;68m");
     expect(result.stdout).toContain("\u001b[38;2;243;139;168m");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure through completion", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-streaming-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "reasoning-streaming",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Reason before answering\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await fixture.waitFor("Thinking · provider reasoning · adam");
+    let beforeFrame = fixture.output().length;
+    await fixture.resize(80, 24);
+    let frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
+    expect(frame).not.toContain("Inspect ");
+    expect(frame).not.toContain("Working");
+
+    fixture.write("\u0014");
+    await fixture.waitFor("Inspect ");
+    beforeFrame = fixture.output().length;
+    fixture.write("\u001b[116;5:2u");
+    await fixture.resize(79, 24);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
+    expect(frame).toContain("Inspect ");
+    beforeFrame = fixture.output().length;
+    fixture.write("\u001b[116;5:3u");
+    await fixture.resize(40, 12);
+    let lines = latestSynchronizedFrame(fixture.output().slice(beforeFrame));
+    frame = lines.join("\n");
+    expect(frame).toContain("Inspect ");
+    expect(lines.every((line) => visibleWidth(line) <= 40)).toBe(true);
+
+    await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
+    await fixture.waitFor("Inspect the evidence.");
+    beforeFrame = fixture.output().length;
+    await fixture.resize(120, 40);
+    lines = latestSynchronizedFrame(fixture.output().slice(beforeFrame));
+    expect(lines.join("\n")).toContain("Inspect the evidence.");
+    expect(lines.every((line) => visibleWidth(line) <= 120)).toBe(true);
+
+    const beforeCompletion = fixture.output().length;
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitFor("Thinking done · adam");
+    await fixture.waitFor("Reasoning answer.");
+    await fixture.waitForAfter(" · idle", beforeCompletion);
+    beforeFrame = fixture.output().length;
+    await fixture.resize(80, 24);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
+    expect(frame).toContain("Inspect the evidence.");
+    expect(frame).not.toContain("Working");
+    fixture.write("/copy\r");
+    await fixture.waitFor("Copied last assistant response.");
+    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(
+      "Reasoning answer.",
+    );
+    await fixture.waitForAfter("Adam · Streaming session", beforeCompletion);
+    fixture.write("/session\r");
+    await fixture.waitFor("Session facts");
+    beforeFrame = fixture.output().length;
+    fixture.write("\u001b");
+    await fixture.waitForAfter("Copied last assistant response.", beforeFrame);
+
+    fixture.write("/resume\r");
+    await fixture.waitFor("Select a project session");
+    beforeFrame = fixture.output().length;
+    fixture.write("fake.local\r");
+    await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforeFrame);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
+    expect(frame).not.toContain("Inspect the evidence.");
+    fixture.write("\u0014");
+    await fixture.waitForAfter("Inspect the evidence.", beforeFrame);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  {
+    scenario: "reasoning-cancellation" as const,
+    title: "Thinking interrupted · adam",
+    marker: "◇",
+    action: "cancel" as const,
+  },
+  {
+    scenario: "reasoning-failure" as const,
+    title: "Thinking failed · adam",
+    marker: "×",
+    action: "wait" as const,
+  },
+])(
+  "provider reasoning renders its $action terminal state",
+  async ({ action, marker, scenario, title }) => {
+    const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-tui-${scenario}-`));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(workspaceRoot);
+
+    try {
+      const fixture = startFixture({ noColor: true, scenario, stateRoot, workspaceRoot });
+      await fixture.waitFor("Adam · New session");
+      const beforePrompt = fixture.output().length;
+      fixture.write("Exercise a reasoning terminal state\r");
+      if (action === "cancel") {
+        await fixture.waitForCompleteFrameAfter(
+          "Thinking · provider reasoning · adam",
+          beforePrompt,
+        );
+        fixture.write("\u0003");
+      }
+      await fixture.waitForCompleteFrameAfter(title, beforePrompt);
+      const frame = latestSynchronizedFrame(fixture.output().slice(beforePrompt)).join("\n");
+      expect(frame).toContain(`${marker} ▸ ${title}`);
+      expect(frame).not.toContain("Inspect terminal state.");
+      fixture.write("\u0011");
+      await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test("Ctrl+T reads artifact-backed provider reasoning without placing it in the collapsed frame", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-artifact-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "reasoning-artifact", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforePrompt = fixture.output().length;
+    fixture.write("Store provider reasoning out of line\r");
+    await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforePrompt);
+    let frame = latestSynchronizedFrame(fixture.output().slice(beforePrompt)).join("\n");
+    expect(frame).not.toContain("Artifact reasoning evidence");
+
+    const beforeExpand = fixture.output().length;
+    fixture.write("\u0014");
+    await fixture.waitForCompleteFrameAfter("Artifact reasoning evidence", beforeExpand);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeExpand)).join("\n");
+    expect(frame).toContain("✓ ▾ Thinking done · adam");
+    expect(frame).toContain("Artifact reasoning evidence");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("provider reasoning disclosure keeps explicit markers without color", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-no-color-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      noColor: true,
+      scenario: "reasoning-streaming",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Reason without color\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await fixture.waitFor("▸ Thinking · provider reasoning · adam");
+    fixture.write("\u0014");
+    await fixture.waitFor("Inspect ");
+    const beforeFrame = fixture.output().length;
+    await fixture.resize(40, 12);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
+    expect(frame).toContain("▾ Thinking");
+    expect(frame).toContain("Inspect ");
+    expect(frame).not.toContain("\u001b[38;2;");
+    expect(frame).not.toContain("\u001b[48;2;");
+    await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitFor("Reasoning answer.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

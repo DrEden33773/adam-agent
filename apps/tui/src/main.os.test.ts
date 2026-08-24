@@ -43,6 +43,47 @@ test("real TUI starts on an authoritative empty session and restores the termina
   }
 });
 
+test("real PTY streams Ctrl+T provider reasoning without taking terminal mouse selection", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-pty-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      external: true,
+      scenario: "reasoning-streaming",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Exercise PTY reasoning\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await fixture.waitFor("Thinking · provider reasoning · adam");
+    fixture.write("\u0014");
+    await fixture.waitFor("Inspect ");
+    await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
+    await fixture.waitFor("Inspect the evidence.");
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitFor("Thinking done · adam");
+    await fixture.waitFor("Reasoning answer.");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("\u001b[?2004h");
+    expect(result.stdout).toContain("\u001b[?2004l");
+    expect(result.stdout).toContain("\u001b[?25h");
+    expect(result.stdout).not.toContain("\u001b[?1000h");
+    expect(result.stdout).not.toContain("\u001b[?1006h");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test.each([
   { code: 143, signal: "SIGTERM" as const },
   { code: 129, signal: "SIGHUP" as const },

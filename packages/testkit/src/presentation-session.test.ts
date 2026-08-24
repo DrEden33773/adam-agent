@@ -1424,6 +1424,16 @@ test("PresentationSession keeps an admitted draft durable when the provider fail
   await mkdir(workspaceRoot);
   const driver: ModelDriver = {
     async *stream() {
+      yield {
+        type: "reasoning_start",
+        id: "provider-reasoning-0",
+        artifactType: "provider_reasoning",
+      } as const;
+      yield {
+        type: "reasoning_delta",
+        id: "provider-reasoning-0",
+        text: "Inspect the failing transport.",
+      } as const;
       yield await Promise.reject(
         new ModelDriverError("transport", "private provider failure", {
           cause: new Error("fixture transport failure"),
@@ -1493,6 +1503,13 @@ test("PresentationSession keeps an admitted draft durable when the provider fail
           transcript: {
             items: [
               { type: "user_message", text: "Persist before provider failure" },
+              {
+                type: "reasoning_block",
+                status: "failed",
+                provider: "DeepSeek",
+                text: null,
+                artifact: null,
+              },
               { type: "session_notice", status: "failed", code: "model_request_failed" },
             ],
           },
@@ -3324,6 +3341,97 @@ test("PresentationSession links an artifact-backed assistant response without em
   }
 });
 
+test("PresentationSession replays artifact-backed provider reasoning through an owner-only reference", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-reasoning-artifact-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const reasoning = `Evidence: ${"r".repeat(256 * 1024)}`;
+  const reasoningByteCount = Buffer.byteLength(reasoning, "utf8");
+  const driver = new FakeModelDriver([
+    {
+      type: "reasoning_start",
+      id: "provider-reasoning-0",
+      artifactType: "provider_reasoning",
+    },
+    { type: "reasoning_delta", id: "provider-reasoning-0", text: reasoning },
+    { type: "reasoning_end", id: "provider-reasoning-0" },
+    { type: "text_delta", text: "Verified." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Store large provider reasoning" },
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    try {
+      const block = presentation
+        .getState()
+        .authoritative.active?.transcript.items.find(
+          (item) => item.type === "reasoning_block" && item.artifact !== null,
+        );
+      expect(block).toMatchObject({
+        type: "reasoning_block",
+        artifactType: "provider_reasoning",
+        disclosure: "owner_only",
+        provider: "DeepSeek",
+        status: "completed",
+        text: null,
+        artifact: {
+          mediaType: "text/plain; charset=utf-8",
+          byteCount: reasoningByteCount,
+          source: "model_response",
+        },
+      });
+      expect(JSON.stringify(presentation.getState())).not.toContain(reasoning.slice(0, 4_096));
+      if (block?.type !== "reasoning_block" || block.artifact === null) {
+        throw new Error("Expected artifact-backed provider reasoning.");
+      }
+      await expect(
+        presentation.dispatch({
+          type: "read_artifact",
+          artifact: block.artifact,
+          range: { offset: 0, maximumBytes: 16 * 1024 },
+        }),
+      ).resolves.toMatchObject({
+        status: "admitted",
+        resource: { offset: 0, totalByteCount: reasoningByteCount },
+      });
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("PresentationSession preserves a durable compaction marker in visible chronology", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-compaction-"));
   const stateRoot = join(testRoot, "state");
@@ -3442,6 +3550,16 @@ test("PresentationSession preserves a causally cancelled run as an interrupted n
   const modelStarted = Promise.withResolvers<void>();
   const model: ModelDriver = {
     async *stream(request) {
+      yield {
+        type: "reasoning_start",
+        id: "provider-reasoning-0",
+        artifactType: "provider_reasoning",
+      } as const;
+      yield {
+        type: "reasoning_delta",
+        id: "provider-reasoning-0",
+        text: "Inspect before cancellation.",
+      } as const;
       modelStarted.resolve();
       await new Promise<void>((resolve) => {
         if (request.signal.aborted) {
@@ -3489,6 +3607,19 @@ test("PresentationSession preserves a causally cancelled run as an interrupted n
       sessionId: created.sessionId,
       stateRoot,
       workspaceRoot,
+    });
+    expect(presentation.getState().authoritative.active?.transcript.items).toContainEqual({
+      type: "reasoning_block",
+      id: expect.stringMatching(new RegExp(`^${created.sessionId}:`, "u")),
+      sequence: expect.any(Number),
+      sourceSessionId: created.sessionId,
+      branchBoundary: { sessionId: created.sessionId, sequence: expect.any(Number) },
+      artifactType: "provider_reasoning",
+      disclosure: "owner_only",
+      provider: "DeepSeek",
+      status: "interrupted",
+      text: null,
+      artifact: null,
     });
     expect(presentation.getState().authoritative.active?.transcript.items).toContainEqual({
       type: "session_notice",
@@ -3578,6 +3709,19 @@ test("PresentationSession resumes and normalizes an in-flight provider attempt b
         event: { type: "model_message_started" },
       },
     });
+    await store.append({
+      schemaVersion: 3,
+      sequence: 6,
+      record: {
+        type: "runtime_event",
+        runId,
+        event: {
+          type: "model_reasoning_started",
+          id: "1:1:provider-reasoning-0",
+          artifactType: "provider_reasoning",
+        },
+      },
+    });
     await firstLifecycle.close();
 
     const resumeTargets: ModelTargets = {
@@ -3615,12 +3759,17 @@ test("PresentationSession resumes and normalizes an in-flight provider attempt b
 
     expect(presentation.getState()).toMatchObject({
       authoritative: {
-        continuity: { status: "current", sessionThroughSequence: 6 },
+        continuity: { status: "current", sessionThroughSequence: 8 },
         active: {
           session: { status: "interrupted" },
           transcript: {
             items: [
               { type: "user_message", text: "Recover the display" },
+              {
+                type: "reasoning_block",
+                status: "interrupted",
+                provider: "DeepSeek",
+              },
               { type: "session_notice", status: "interrupted", reason: "process_restart" },
             ],
           },
@@ -3642,6 +3791,17 @@ test("PresentationSession reconstructs a child transcript from its durable branc
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
   const driver = new FakeModelDriver([
+    {
+      type: "reasoning_start",
+      id: "provider-reasoning-0",
+      artifactType: "provider_reasoning",
+    },
+    {
+      type: "reasoning_delta",
+      id: "provider-reasoning-0",
+      text: "Inspect the parent branch.",
+    },
+    { type: "reasoning_end", id: "provider-reasoning-0" },
     { type: "text_delta", text: "Parent answer." },
     { type: "finish", reason: "stop" },
   ]);
@@ -3693,11 +3853,24 @@ test("PresentationSession reconstructs a child transcript from its durable branc
           text: "Parent prompt",
         },
         {
-          type: "assistant_message",
-          id: `${parent.sessionId}:7`,
-          sequence: 7,
+          type: "reasoning_block",
+          id: expect.stringMatching(new RegExp(`^${parent.sessionId}:`, "u")),
+          sequence: 9,
           sourceSessionId: parent.sessionId,
-          branchBoundary: { sessionId: parent.sessionId, sequence: 9 },
+          branchBoundary: { sessionId: parent.sessionId, sequence: 11 },
+          artifactType: "provider_reasoning",
+          disclosure: "owner_only",
+          provider: "DeepSeek",
+          status: "completed",
+          text: "Inspect the parent branch.",
+          artifact: null,
+        },
+        {
+          type: "assistant_message",
+          id: `${parent.sessionId}:9`,
+          sequence: 9,
+          sourceSessionId: parent.sessionId,
+          branchBoundary: { sessionId: parent.sessionId, sequence: 11 },
           text: "Parent answer.",
           artifact: null,
         },
@@ -6178,6 +6351,233 @@ test("PresentationSession publishes live assistant progress and replaces it with
         unsubscribe();
       }
     } finally {
+      releaseCompletion.resolve();
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession publishes cumulative provider reasoning separately from the durable answer", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-live-reasoning-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const releaseSecondDelta = Promise.withResolvers<void>();
+  const releaseCompletion = Promise.withResolvers<void>();
+  const model: ModelDriver = {
+    async *stream() {
+      yield {
+        type: "reasoning_start",
+        id: "provider-reasoning-0",
+        artifactType: "provider_reasoning",
+      } as const;
+      yield {
+        type: "reasoning_delta",
+        id: "provider-reasoning-0",
+        text: "Inspect ",
+      } as const;
+      await releaseSecondDelta.promise;
+      yield {
+        type: "reasoning_delta",
+        id: "provider-reasoning-0",
+        text: "the evidence.",
+      } as const;
+      await releaseCompletion.promise;
+      yield { type: "reasoning_end", id: "provider-reasoning-0" } as const;
+      yield { type: "text_delta", text: "Verified." } as const;
+      yield { type: "finish", reason: "stop" } as const;
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      const firstVisible = Promise.withResolvers<void>();
+      const cumulativeVisible = Promise.withResolvers<void>();
+      const durableVisible = Promise.withResolvers<void>();
+      const unsubscribe = presentation.subscribe(() => {
+        const current = presentation.getState();
+        if (current.transient?.reasoning?.text === "Inspect ") {
+          firstVisible.resolve();
+        }
+        if (current.transient?.reasoning?.text === "Inspect the evidence.") {
+          cumulativeVisible.resolve();
+        }
+        if (
+          current.transient === null &&
+          current.authoritative.active?.transcript.items.some(
+            (item) =>
+              item.type === "reasoning_block" &&
+              item.status === "completed" &&
+              item.text === "Inspect the evidence.",
+          )
+        ) {
+          durableVisible.resolve();
+        }
+      });
+      try {
+        await expect(
+          presentation.dispatch({
+            type: "submit_prompt",
+            sessionId,
+            text: "Reason, then answer",
+            skills: [],
+            thinkingSelection: null,
+          }),
+        ).resolves.toMatchObject({ status: "admitted", resource: null });
+        await firstVisible.promise;
+        expect(presentation.getState().transient?.reasoning).toMatchObject({
+          artifactType: "provider_reasoning",
+          provider: "DeepSeek",
+          status: "active",
+          text: "Inspect ",
+        });
+        releaseSecondDelta.resolve();
+        await cumulativeVisible.promise;
+        releaseCompletion.resolve();
+        await durableVisible.promise;
+        expect(
+          presentation.getState().authoritative.active?.transcript.items.map((item) => item.type),
+        ).toEqual(["user_message", "reasoning_block", "assistant_message"]);
+      } finally {
+        unsubscribe();
+      }
+    } finally {
+      releaseSecondDelta.resolve();
+      releaseCompletion.resolve();
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession repairs a dropped canonical reasoning start from a cumulative snapshot", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-reasoning-start-gap-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const releaseCompletion = Promise.withResolvers<void>();
+  let droppedStart = false;
+  const model: ModelDriver = {
+    async *stream() {
+      yield {
+        type: "reasoning_start",
+        id: "provider-reasoning-0",
+        artifactType: "provider_reasoning",
+      } as const;
+      yield {
+        type: "reasoning_delta",
+        id: "provider-reasoning-0",
+        text: "Recovered cumulative reasoning.",
+      } as const;
+      await releaseCompletion.promise;
+      yield { type: "reasoning_end", id: "provider-reasoning-0" } as const;
+      yield { type: "text_delta", text: "Recovered answer." } as const;
+      yield { type: "finish", reason: "stop" } as const;
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionRuntimeNotificationTransform]: {
+      project(notification) {
+        if (!droppedStart && notification.event.type === "model_reasoning_started") {
+          droppedStart = true;
+          return [];
+        }
+        return [notification];
+      },
+    },
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const recovered = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation.getState().transient?.reasoning?.text === "Recovered cumulative reasoning."
+      ) {
+        recovered.resolve();
+      }
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId,
+          text: "Repair reasoning start",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await recovered.promise;
+      expect(droppedStart).toBe(true);
+      expect(presentation.getState().transient?.reasoning).toMatchObject({
+        provider: "DeepSeek",
+        status: "active",
+        text: "Recovered cumulative reasoning.",
+      });
+    } finally {
+      unsubscribe();
       releaseCompletion.resolve();
       await presentation.close();
     }

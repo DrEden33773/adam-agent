@@ -8,6 +8,7 @@ import type {
   PresentationCommand,
   PresentationDisplayState,
   PresentationSession,
+  PresentationTransientState,
   RepositoryInstructionsDisplay,
   SessionSummary,
   SkillCatalogDisplay,
@@ -21,6 +22,7 @@ import {
 } from "@adam-agent/presentation";
 import { readFileArtifact, readFileArtifactRange } from "./artifact-store.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
+import type { RuntimeEvent } from "./index.js";
 import {
   type ModelTargetIdentity,
   type ModelTargetSnapshot,
@@ -529,12 +531,21 @@ export async function createPresentationSession(
               return;
             }
             const event = notification.event;
+            let missingReasoningSnapshot:
+              | {
+                  readonly expectedId: string;
+                  readonly event: Extract<
+                    RuntimeEvent,
+                    { readonly type: "model_reasoning_updated" }
+                  >;
+                }
+              | undefined;
             if (event.type === "user_message" || event.type === "model_message_started") {
               state = {
                 revision: state.revision + 1,
                 authoritative: state.authoritative,
                 draft: state.draft,
-                transient: { activity: "working", assistant: null },
+                transient: { activity: "working", assistant: null, reasoning: null },
               };
               publishStateChange();
             } else if (event.type === "tool_requested" || event.type === "tool_started") {
@@ -542,9 +553,69 @@ export async function createPresentationSession(
                 revision: state.revision + 1,
                 authoritative: state.authoritative,
                 draft: state.draft,
-                transient: { activity: "using_tool", assistant: null },
+                transient: { activity: "using_tool", assistant: null, reasoning: null },
               };
               publishStateChange();
+            } else if (event.type === "model_reasoning_started") {
+              const target = knownTargets.get(active.session.targetId);
+              state = {
+                revision: state.revision + 1,
+                authoritative: state.authoritative,
+                draft: state.draft,
+                transient: {
+                  activity: "working",
+                  assistant: state.transient?.assistant ?? null,
+                  reasoning: {
+                    id: reasoningDisplayId(notification.sessionId, notification.runId, event.id),
+                    afterSequence: notification.throughSequence,
+                    artifactType: event.artifactType,
+                    disclosure: "owner_only",
+                    provider: providerDisplayName(target?.vendor),
+                    status: "active",
+                    text: "",
+                  },
+                },
+              };
+              publishStateChange();
+            } else if (event.type === "model_reasoning_settled") {
+              const reasoning = state.transient?.reasoning;
+              const expectedId = reasoningDisplayId(
+                notification.sessionId,
+                notification.runId,
+                event.id,
+              );
+              if (reasoning?.id === expectedId) {
+                state = {
+                  revision: state.revision + 1,
+                  authoritative: state.authoritative,
+                  draft: state.draft,
+                  transient: {
+                    activity: state.transient?.activity ?? "working",
+                    assistant: state.transient?.assistant ?? null,
+                    reasoning: { ...reasoning, status: event.status },
+                  },
+                };
+                publishStateChange();
+              }
+            }
+            if (event.type === "model_reasoning_updated") {
+              const reasoning = state.transient?.reasoning;
+              const expectedId = reasoningDisplayId(
+                notification.sessionId,
+                notification.runId,
+                event.id,
+              );
+              if (reasoning?.id !== expectedId) {
+                missingReasoningSnapshot = { expectedId, event };
+              } else {
+                state = reconcilePresentationUpdate(state, {
+                  type: "reasoning_snapshot",
+                  afterSequence: notification.throughSequence,
+                  reasoning: { ...reasoning, text: event.text },
+                });
+                publishStateChange();
+                return;
+              }
             }
             if (isModelMessageDelta(event)) {
               const streamId = `${notification.sessionId}:${notification.runId}`;
@@ -597,7 +668,11 @@ export async function createPresentationSession(
               state.authoritative.continuity.status === "current"
                 ? state.authoritative.continuity.sessionThroughSequence
                 : null;
-            if (previousSequence !== null && notification.throughSequence === previousSequence) {
+            if (
+              previousSequence !== null &&
+              notification.throughSequence === previousSequence &&
+              missingReasoningSnapshot === undefined
+            ) {
               return;
             }
             if (previousSequence !== null && notification.throughSequence < previousSequence) {
@@ -643,6 +718,20 @@ export async function createPresentationSession(
               publishStateChange();
             }
             const pendingInteractions = await projectPendingInteractions(refreshedRecords, options);
+            const recoveredReasoning =
+              missingReasoningSnapshot === undefined
+                ? undefined
+                : projectActiveReasoningSnapshot({
+                    records: refreshedRecords,
+                    sessionId: notification.sessionId,
+                    runId: notification.runId,
+                    expectedId: missingReasoningSnapshot.expectedId,
+                    event: missingReasoningSnapshot.event,
+                    afterSequence: notification.throughSequence,
+                    provider: providerDisplayName(
+                      knownTargets.get(active.session.targetId)?.vendor,
+                    ),
+                  });
             const terminalContextUsage = isAssistantTerminalEvent(event)
               ? await options.lifecycle.inspectContextUsage({ sessionId: active.session.id })
               : null;
@@ -678,7 +767,15 @@ export async function createPresentationSession(
                 },
               },
               draft: state.draft,
-              transient: isAssistantTerminalEvent(event) ? null : state.transient,
+              transient: isAssistantTerminalEvent(event)
+                ? null
+                : recoveredReasoning === undefined
+                  ? state.transient
+                  : {
+                      activity: state.transient?.activity ?? "working",
+                      assistant: state.transient?.assistant ?? null,
+                      reasoning: recoveredReasoning,
+                    },
             };
             publishStateChange();
           } catch {
@@ -1050,7 +1147,7 @@ export async function createPresentationSession(
         state = {
           ...state,
           revision: state.revision + 1,
-          transient: { activity: "working", assistant: null },
+          transient: { activity: "working", assistant: null, reasoning: null },
         };
         publishStateChange();
         const continuation = options.lifecycle.admit({
@@ -1820,6 +1917,9 @@ function isKnownArtifact(
       if (item.type === "assistant_message") {
         return item.artifact === null ? [] : [item.artifact];
       }
+      if (item.type === "reasoning_block") {
+        return item.artifact === null ? [] : [item.artifact];
+      }
       if (item.type === "tool_call") {
         return [
           ...item.artifacts,
@@ -2014,6 +2114,32 @@ async function readPresentationSessionRecords(
 
 function projectTranscript(records: readonly SourcedSessionRecord[]): readonly TranscriptItem[] {
   const toolDisplays = collectToolDisplays(records);
+  const attemptProviders = new Map<string, string>(
+    records.flatMap(({ entry, sessionId }) =>
+      entry.schemaVersion === 3 && entry.record.type === "provider_attempt_started"
+        ? [
+            [
+              `${sessionId}:${entry.record.runId}:${entry.record.turn}:${entry.record.attempt}`,
+              providerDisplayName(entry.record.targetIdentity.vendor),
+            ] as const,
+          ]
+        : [],
+    ),
+  );
+  const reasoningStarts = new Map(
+    records.flatMap(({ entry, sessionId }) =>
+      entry.schemaVersion === 3 &&
+      entry.record.type === "runtime_event" &&
+      entry.record.event.type === "model_reasoning_started"
+        ? [
+            [
+              `${sessionId}:${entry.record.runId}:${entry.record.event.id}`,
+              entry.record.event,
+            ] as const,
+          ]
+        : [],
+    ),
+  );
   const terminalBoundaries = new Map(
     records.flatMap(({ entry, sessionId }) => {
       if (entry.schemaVersion !== 3) {
@@ -2080,6 +2206,35 @@ function projectTranscript(records: readonly SourcedSessionRecord[]): readonly T
         sourceThrough: entry.record.sourceThrough,
         retainedFrom: entry.record.retainedFrom,
       });
+      continue;
+    }
+    if (
+      entry.record.type === "runtime_event" &&
+      entry.record.event.type === "model_reasoning_settled" &&
+      entry.record.event.status !== "completed"
+    ) {
+      const start = reasoningStarts.get(
+        `${sessionId}:${entry.record.runId}:${entry.record.event.id}`,
+      );
+      const attemptIdentity = /^(\d+):(\d+):/.exec(entry.record.event.id);
+      if (start !== undefined && attemptIdentity !== null) {
+        items.push({
+          type: "reasoning_block",
+          id: reasoningDisplayId(sessionId, entry.record.runId, entry.record.event.id),
+          sequence: entry.sequence,
+          sourceSessionId: sessionId,
+          branchBoundary: terminalBoundaries.get(`${sessionId}:${entry.record.runId}`) ?? null,
+          artifactType: start.artifactType,
+          disclosure: "owner_only",
+          provider:
+            attemptProviders.get(
+              `${sessionId}:${entry.record.runId}:${attemptIdentity[1]}:${attemptIdentity[2]}`,
+            ) ?? providerDisplayName(undefined),
+          status: entry.record.event.status,
+          text: null,
+          artifact: null,
+        });
+      }
       continue;
     }
     if (
@@ -2167,12 +2322,50 @@ function projectTranscript(records: readonly SourcedSessionRecord[]): readonly T
     }
     const artifactBacked =
       entry.record.response.recordVersion === 2 &&
-      entry.record.response.text.storage === "artifact";
+      (entry.record.response.text.storage === "artifact" ||
+        entry.record.response.reasoning?.storage === "artifact");
     if (
       (artifactBacked && !publishedResponses.has(`${sessionId}:${entry.sequence}`)) ||
       (!artifactBacked && !completedInlineRuns.has(`${sessionId}:${entry.record.runId}`))
     ) {
       continue;
+    }
+    const reasoningField = entry.record.response.reasoning;
+    if (reasoningField !== undefined) {
+      const reasoningText =
+        typeof reasoningField === "string"
+          ? reasoningField
+          : reasoningField.storage === "inline"
+            ? reasoningField.text
+            : null;
+      const reasoningArtifact =
+        typeof reasoningField !== "string" && reasoningField.storage === "artifact"
+          ? {
+              id: reasoningField.reference.id,
+              mediaType: reasoningField.reference.mediaType,
+              byteCount: reasoningField.reference.byteCount,
+              source: "model_response" as const,
+            }
+          : null;
+      if (reasoningArtifact !== null || (reasoningText !== null && reasoningText.length > 0)) {
+        items.push({
+          type: "reasoning_block",
+          id: reasoningDisplayId(
+            sessionId,
+            entry.record.runId,
+            `${entry.record.turn}:${entry.record.attempt}:provider-reasoning-0`,
+          ),
+          sequence: entry.sequence,
+          sourceSessionId: sessionId,
+          branchBoundary: terminalBoundaries.get(`${sessionId}:${entry.record.runId}`) ?? null,
+          artifactType: "provider_reasoning",
+          disclosure: "owner_only",
+          provider: providerDisplayName(entry.record.targetIdentity.vendor),
+          status: "completed",
+          text: reasoningText,
+          artifact: reasoningArtifact,
+        });
+      }
     }
     const text =
       entry.record.response.recordVersion === 2
@@ -2203,6 +2396,70 @@ function projectTranscript(records: readonly SourcedSessionRecord[]): readonly T
     });
   }
   return items;
+}
+
+function projectActiveReasoningSnapshot(input: {
+  readonly records: readonly SourcedSessionRecord[];
+  readonly sessionId: string;
+  readonly runId: string;
+  readonly expectedId: string;
+  readonly event: Extract<RuntimeEvent, { readonly type: "model_reasoning_updated" }>;
+  readonly afterSequence: number;
+  readonly provider: string;
+}): NonNullable<PresentationTransientState["reasoning"]> | undefined {
+  let start: Extract<RuntimeEvent, { readonly type: "model_reasoning_started" }> | undefined;
+  let startSequence = 0;
+  for (const { entry, sessionId } of input.records) {
+    if (
+      sessionId !== input.sessionId ||
+      entry.schemaVersion !== 3 ||
+      entry.record.type !== "runtime_event" ||
+      entry.record.runId !== input.runId
+    ) {
+      continue;
+    }
+    const event = entry.record.event;
+    if (
+      event.type === "model_reasoning_started" &&
+      reasoningDisplayId(sessionId, input.runId, event.id) === input.expectedId
+    ) {
+      start = event;
+      startSequence = entry.sequence;
+      continue;
+    }
+    if (
+      start !== undefined &&
+      entry.sequence > startSequence &&
+      event.type === "model_reasoning_settled" &&
+      event.id === start.id
+    ) {
+      return undefined;
+    }
+  }
+  if (start === undefined || start.id !== input.event.id) {
+    return undefined;
+  }
+  return {
+    id: input.expectedId,
+    afterSequence: input.afterSequence,
+    artifactType: start.artifactType,
+    disclosure: "owner_only",
+    provider: input.provider,
+    status: "active",
+    text: input.event.text,
+  };
+}
+
+function reasoningDisplayId(
+  sessionId: string | null,
+  runId: string | null,
+  runtimeReasoningId: string,
+): string {
+  return `${sessionId ?? "unknown-session"}:${runId ?? "unknown-run"}:${runtimeReasoningId}`;
+}
+
+function providerDisplayName(vendor: string | undefined): string {
+  return vendor === "deepseek" ? "DeepSeek" : (vendor ?? "Provider");
 }
 
 type MutableToolDisplay = {

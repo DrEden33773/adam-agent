@@ -348,12 +348,14 @@ test("the unified driver preserves reasoning and fragmented tool calls for Adam 
   );
 
   expect(events).toEqual([
-    { type: "reasoning_delta", text: "I need " },
-    { type: "reasoning_delta", text: "the README." },
+    { type: "reasoning_start", id: "provider-reasoning-0", artifactType: "provider_reasoning" },
+    { type: "reasoning_delta", id: "provider-reasoning-0", text: "I need " },
+    { type: "reasoning_delta", id: "provider-reasoning-0", text: "the README." },
     { type: "tool_call_start", id: "read-project", name: "read_file" },
     { type: "tool_call_delta", id: "read-project", json: '{"pa' },
     { type: "tool_call_delta", id: "read-project", json: 'th":"README.md"}' },
     { type: "tool_call_end", id: "read-project" },
+    { type: "reasoning_end", id: "provider-reasoning-0" },
     { type: "usage", inputTokens: 13, outputTokens: 9 },
     { type: "finish", reason: "tool_calls", rawReason: "tool_calls" },
   ]);
@@ -1164,6 +1166,128 @@ test("the unified driver retains the independent tool-argument stream limit", as
     message: "The model provider response exceeded Adam's stream limit.",
   });
 });
+
+test("the unified driver preserves explicit Provider V4 reasoning boundaries", async () => {
+  const model = {
+    specificationVersion: "v4",
+    provider: "test",
+    modelId: "reasoning-boundaries",
+    supportedUrls: {},
+    async doGenerate() {
+      throw new Error("Generation is not used by this test.");
+    },
+    async doStream() {
+      return {
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: "reasoning-start", id: "provider-private-id" });
+            controller.enqueue({ type: "reasoning-end", id: "provider-private-id" });
+            controller.close();
+          },
+        }),
+      };
+    },
+  } as unknown as ConstructorParameters<typeof AiSdkModelDriverForTesting>[0]["model"];
+  const driver = new AiSdkModelDriverForTesting({
+    model,
+    maximumOutputTokens: 4_096,
+    deadlineMs: 120_000,
+    sensitiveValues: [],
+  });
+
+  const events = await collect(
+    driver.stream({
+      maximumOutputTokens: 4_096,
+      messages: [{ role: "user", content: "Preserve the boundary." }],
+      tools: [],
+      signal: new AbortController().signal,
+    }),
+  );
+
+  expect(events).toEqual([
+    { type: "reasoning_start", id: "provider-reasoning-0", artifactType: "provider_reasoning" },
+    { type: "reasoning_end", id: "provider-reasoning-0" },
+  ]);
+});
+
+test.each([
+  { failure: "error-part" as const, category: "protocol_incompatibility" },
+  { failure: "stream-rejection" as const, category: "unknown" },
+])(
+  "the unified driver flushes an explicit reasoning end before a $failure failure",
+  async ({ category, failure }) => {
+    let ordinal = 0;
+    const model = {
+      specificationVersion: "v4",
+      provider: "test",
+      modelId: `reasoning-end-${failure}`,
+      supportedUrls: {},
+      async doGenerate() {
+        throw new Error("Generation is not used by this test.");
+      },
+      async doStream() {
+        return {
+          stream: new ReadableStream(
+            {
+              pull(controller) {
+                ordinal += 1;
+                if (ordinal === 1) {
+                  controller.enqueue({ type: "reasoning-start", id: "provider-private-id" });
+                } else if (ordinal === 2) {
+                  controller.enqueue({
+                    type: "reasoning-delta",
+                    id: "provider-private-id",
+                    delta: "Provider settled this block.",
+                  });
+                } else if (ordinal === 3) {
+                  controller.enqueue({ type: "reasoning-end", id: "provider-private-id" });
+                } else if (failure === "error-part") {
+                  controller.enqueue({ type: "error", error: new Error("provider stream error") });
+                  controller.close();
+                } else {
+                  controller.error(new Error("provider iterator rejected"));
+                }
+              },
+            },
+            { highWaterMark: 0 },
+          ),
+        };
+      },
+    } as unknown as ConstructorParameters<typeof AiSdkModelDriverForTesting>[0]["model"];
+    const driver = new AiSdkModelDriverForTesting({
+      model,
+      maximumOutputTokens: 4_096,
+      deadlineMs: 120_000,
+      sensitiveValues: [],
+    });
+    const events: ModelEvent[] = [];
+    let observedFailure: unknown;
+
+    try {
+      for await (const event of driver.stream({
+        maximumOutputTokens: 4_096,
+        messages: [{ role: "user", content: "Preserve provider settlement truth." }],
+        tools: [],
+        signal: new AbortController().signal,
+      })) {
+        events.push(event);
+      }
+    } catch (error) {
+      observedFailure = error;
+    }
+
+    expect(events).toEqual([
+      { type: "reasoning_start", id: "provider-reasoning-0", artifactType: "provider_reasoning" },
+      {
+        type: "reasoning_delta",
+        id: "provider-reasoning-0",
+        text: "Provider settled this block.",
+      },
+      { type: "reasoning_end", id: "provider-reasoning-0" },
+    ]);
+    expect(observedFailure).toMatchObject({ category });
+  },
+);
 
 test("the unified driver counts every Provider V4 part against the 2,000,000 part ceiling", async () => {
   let emitted = 0;

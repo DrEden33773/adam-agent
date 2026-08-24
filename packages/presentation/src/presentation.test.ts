@@ -84,6 +84,7 @@ describe("presentation reconciliation", () => {
           afterSequence: 0,
           text: "正在检查",
         },
+        reasoning: null,
       },
     });
 
@@ -168,6 +169,42 @@ describe("presentation reconciliation", () => {
       draft: null,
       transient: null,
     });
+  });
+
+  it("repairs a dropped reasoning fragment from the next cumulative snapshot", () => {
+    const initial: PresentationDisplayState = {
+      revision: 3,
+      authoritative: emptySnapshot,
+      draft: null,
+      transient: {
+        activity: "working",
+        assistant: null,
+        reasoning: {
+          id: "session-1:run-1:1:1:provider-reasoning-0",
+          afterSequence: 0,
+          artifactType: "provider_reasoning",
+          disclosure: "owner_only",
+          provider: "DeepSeek",
+          status: "active",
+          text: "Inspect ",
+        },
+      },
+    };
+    const reasoning = initial.transient?.reasoning;
+    if (reasoning === null || reasoning === undefined) {
+      throw new Error("Expected a transient reasoning block.");
+    }
+
+    const repaired = reconcilePresentationUpdate(initial, {
+      type: "reasoning_snapshot",
+      afterSequence: 0,
+      reasoning: {
+        ...reasoning,
+        text: "Inspect the complete evidence.",
+      },
+    });
+
+    expect(repaired.transient?.reasoning?.text).toBe("Inspect the complete evidence.");
   });
 });
 
