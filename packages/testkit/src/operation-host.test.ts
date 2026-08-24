@@ -7,11 +7,22 @@ import {
   createFileArtifactStore,
   createInMemoryOperationStore,
   createJsonlOperationStore,
+  type OperationOrigin,
+  type OperationOriginAuthority,
   type OperationStore,
 } from "@adam-agent/agent";
 import { expect, test, vi } from "vitest";
 
-test("ExtensionHost starts one durable operation and reuses it for the same idempotent input", async () => {
+const acceptingOperationOriginAuthority: OperationOriginAuthority = Object.freeze({
+  validateBoundary: async () => true,
+});
+const reviewInvocation = Object.freeze({
+  id: "review",
+  kind: "presentation_command",
+  version: 1,
+} as const);
+
+test("ExtensionHost starts one unlinked durable operation and ignores hidden origin input", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-host-"));
   const workspaceRoot = join(testRoot, "workspace");
   const packageRoot = join(testRoot, "extension");
@@ -43,7 +54,12 @@ test("ExtensionHost starts one durable operation and reuses it for the same idem
       contributionId: "fixture.review",
       idempotencyKey: "review-request-1",
       input: { revision: "abc123" },
-    });
+      origin: {
+        invocation: reviewInvocation,
+        sessionId: "123e4567-e89b-42d3-a456-426614174091",
+        sourceSequence: 1,
+      },
+    } as Parameters<typeof host.operations.start>[0]);
     const second = await host.operations.start({
       contributionId: "fixture.review",
       idempotencyKey: "review-request-1",
@@ -56,6 +72,8 @@ test("ExtensionHost starts one durable operation and reuses it for the same idem
 
     expect(first.operationId).toMatch(/^[0-9a-f-]{36}$/u);
     expect(second.operationId).toBe(first.operationId);
+    expect(records[0]).toMatchObject({ schemaVersion: 2 });
+    expect(records[0]).not.toHaveProperty("origin");
     expect(records.map((record) => record.event)).toEqual([
       {
         type: "operation_started",
@@ -76,8 +94,497 @@ test("ExtensionHost starts one durable operation and reuses it for the same idem
     ]);
     await expect(host.operations.query(first.operationId)).resolves.toMatchObject({
       operationId: first.operationId,
+      origin: null,
       status: "completed",
     });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost rejects a linked start when its durable session boundary is not authoritative", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-linked-authority-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const store = createInMemoryOperationStore();
+  const origin = {
+    invocation: reviewInvocation,
+    sessionId: "123e4567-e89b-42d3-a456-426614174096",
+    sourceSequence: 4,
+  };
+  let observedProjectId: string | undefined;
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(packageRoot);
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationOriginAuthority: {
+        async validateBoundary(input) {
+          observedProjectId = input.projectId;
+          return false;
+        },
+      },
+      operationStore: store,
+      projectRoot: workspaceRoot,
+    });
+    await host.loadConfiguredExtensions();
+
+    await expect(
+      host.operations.startLinked({
+        contributionId: "fixture.review",
+        idempotencyKey: "linked-origin-validation-1",
+        input: { revision: "abc123" },
+        origin: {
+          invocation: { id: "other", kind: "presentation_command", version: 1 },
+          sessionId: "123e4567-e89b-42d3-a456-426614174111",
+          sourceSequence: 1,
+        } as unknown as OperationOrigin,
+      }),
+    ).rejects.toMatchObject({ code: "operation_origin_invalid", name: "OperationHostError" });
+    await expect(
+      host.operations.startLinked({
+        contributionId: "fixture.review",
+        idempotencyKey: "linked-authority-1",
+        input: { revision: "abc123" },
+        origin,
+      }),
+    ).rejects.toMatchObject({ code: "operation_origin_invalid", name: "OperationHostError" });
+    expect(observedProjectId).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    await expect(
+      store.listLinkedStarts({
+        limit: 1,
+        sessionId: origin.sessionId,
+        throughSequence: origin.sourceSequence,
+      }),
+    ).resolves.toEqual([]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost persists the exact session command origin before a linked operation executes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-linked-start-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(packageRoot);
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationOriginAuthority: acceptingOperationOriginAuthority,
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+
+    const origin = {
+      invocation: reviewInvocation,
+      sessionId: "123e4567-e89b-42d3-a456-426614174101",
+      sourceSequence: 7,
+    } as const;
+    const reference = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "linked-review-request-1",
+      input: { revision: "abc123" },
+      origin,
+    });
+    const records = [];
+    for await (const record of host.operations.events({ operationId: reference.operationId })) {
+      records.push(record);
+    }
+
+    expect(records[0]).toMatchObject({
+      origin,
+      schemaVersion: 3,
+      sequence: 1,
+      event: {
+        type: "operation_started",
+      },
+    });
+    await expect(host.operations.query(reference.operationId)).resolves.toMatchObject({ origin });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost never executes a linked operation whose v3 start is not durable", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-linked-persistence-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const controlKey = `__adamLinkedStartPersistence${Date.now()}${Math.random()}`;
+  const control = { executeCalls: 0 };
+  (globalThis as Record<string, unknown>)[controlKey] = control;
+  const durableStore = createInMemoryOperationStore();
+  const rejectingStore: OperationStore = {
+    append(record) {
+      if (record.event.type === "operation_started") {
+        return Promise.reject(new Error("injected linked-start persistence failure"));
+      }
+      return durableStore.append(record);
+    },
+    findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
+    read: (operationId) => durableStore.read(operationId),
+  };
+  const origin = {
+    invocation: reviewInvocation,
+    sessionId: "123e4567-e89b-42d3-a456-426614174105",
+    sourceSequence: 3,
+  } as const;
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(
+      packageRoot,
+      `globalThis[${JSON.stringify(controlKey)}].executeCalls += 1;
+      return { accepted: true, revision: input.revision };`,
+    );
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationOriginAuthority: acceptingOperationOriginAuthority,
+      operationStore: rejectingStore,
+      projectRoot: workspaceRoot,
+    });
+    await host.loadConfiguredExtensions();
+
+    await expect(
+      host.operations.startLinked({
+        contributionId: "fixture.review",
+        idempotencyKey: "linked-persistence-1",
+        input: { revision: "abc123" },
+        origin,
+      }),
+    ).rejects.toMatchObject({ code: "operation_persistence_failed", name: "OperationHostError" });
+    expect(control.executeCalls).toBe(0);
+    await expect(
+      durableStore.listLinkedStarts({
+        limit: 1,
+        sessionId: origin.sessionId,
+        throughSequence: origin.sourceSequence,
+      }),
+    ).resolves.toEqual([]);
+  } finally {
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost rejects an invalid linked origin before reserving its idempotency key", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-linked-origin-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(packageRoot);
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationOriginAuthority: acceptingOperationOriginAuthority,
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+
+    await expect(
+      host.operations.startLinked({
+        contributionId: "fixture.review",
+        idempotencyKey: "linked-origin-validation-1",
+        input: { revision: "abc123" },
+        origin: {
+          invocation: reviewInvocation,
+          sessionId: "123e4567-e89b-42d3-a456-426614174111",
+          sourceSequence: 0,
+        },
+      }),
+    ).rejects.toMatchObject({ code: "operation_origin_invalid", name: "OperationHostError" });
+    await expect(
+      host.operations.startLinked({
+        contributionId: "fixture.review",
+        idempotencyKey: "linked-origin-validation-1",
+        input: { revision: "abc123" },
+        origin: {
+          invocation: reviewInvocation,
+          sessionId: "123e4567-e89b-42d3-a456-426614174111",
+          sourceSequence: 1,
+        },
+      }),
+    ).resolves.toMatchObject({ operationId: expect.any(String) });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost reuses an exact linked start and rejects a different origin", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-linked-idempotency-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(packageRoot);
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationOriginAuthority: acceptingOperationOriginAuthority,
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+
+    const origin = {
+      invocation: reviewInvocation,
+      sessionId: "123e4567-e89b-42d3-a456-426614174121",
+      sourceSequence: 9,
+    };
+    const first = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "linked-idempotency-1",
+      input: { revision: "abc123" },
+      origin,
+    });
+    await expect(
+      host.operations.startLinked({
+        contributionId: "fixture.review",
+        idempotencyKey: "linked-idempotency-1",
+        input: { revision: "abc123" },
+        origin,
+      }),
+    ).resolves.toEqual(first);
+    await expect(
+      host.operations.startLinked({
+        contributionId: "fixture.review",
+        idempotencyKey: "linked-idempotency-1",
+        input: { revision: "abc123" },
+        origin: {
+          ...origin,
+          sessionId: "123e4567-e89b-42d3-a456-426614174122",
+        },
+      }),
+    ).rejects.toMatchObject({ code: "operation_idempotency_conflict" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost rejects a linked idempotency key after its operation definition changes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-linked-definition-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const firstPackageRoot = join(testRoot, "extension-a");
+  const secondPackageRoot = join(testRoot, "extension-b");
+  const store = createInMemoryOperationStore();
+  const configuredExtension = (packageRoot: string) => ({
+    enabled: true,
+    extensionId: "fixture.extension",
+    grants: [],
+    packageName: "@fixture/extension",
+    packageRoot,
+    packageVersion: "1.0.0",
+  });
+  const origin = {
+    invocation: reviewInvocation,
+    sessionId: "123e4567-e89b-42d3-a456-426614174126",
+    sourceSequence: 2,
+  };
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(firstPackageRoot);
+    await writeOperationExtension(secondPackageRoot);
+    const firstHost = createExtensionHost({
+      capabilities: [],
+      extensions: [configuredExtension(firstPackageRoot)],
+      operationOriginAuthority: acceptingOperationOriginAuthority,
+      operationStore: store,
+      projectRoot: workspaceRoot,
+    });
+    await firstHost.loadConfiguredExtensions();
+    const first = await firstHost.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "linked-definition-1",
+      input: { revision: "abc123" },
+      origin,
+    });
+    for await (const _record of firstHost.operations.events({ operationId: first.operationId })) {
+      // The durable terminal event and owner release are the synchronization point.
+    }
+
+    const secondHost = createExtensionHost({
+      capabilities: [],
+      extensions: [configuredExtension(secondPackageRoot)],
+      operationOriginAuthority: acceptingOperationOriginAuthority,
+      operationStore: store,
+      projectRoot: workspaceRoot,
+    });
+    await secondHost.loadConfiguredExtensions();
+    await expect(
+      secondHost.operations.startLinked({
+        contributionId: "fixture.review",
+        idempotencyKey: "linked-definition-1",
+        input: { revision: "abc123" },
+        origin,
+      }),
+    ).rejects.toMatchObject({ code: "operation_idempotency_conflict" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost lists only linked operations inside an exact session prefix", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-linked-list-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeOperationExtension(packageRoot);
+    const host = createExtensionHost({
+      capabilities: [],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.extension",
+          grants: [],
+          packageName: "@fixture/extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      operationOriginAuthority: acceptingOperationOriginAuthority,
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+
+    const sessionId = "123e4567-e89b-42d3-a456-426614174130";
+    const included = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "linked-list-included-1",
+      input: { revision: "included" },
+      origin: {
+        invocation: reviewInvocation,
+        sessionId,
+        sourceSequence: 3,
+      },
+    });
+    const secondIncluded = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "linked-list-included-2",
+      input: { revision: "included-2" },
+      origin: {
+        invocation: reviewInvocation,
+        sessionId,
+        sourceSequence: 5,
+      },
+    });
+    await host.operations.start({
+      contributionId: "fixture.review",
+      idempotencyKey: "linked-list-legacy-1",
+      input: { revision: "legacy" },
+    });
+    const afterPrefix = await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "linked-list-after-prefix-1",
+      input: { revision: "later" },
+      origin: {
+        invocation: reviewInvocation,
+        sessionId,
+        sourceSequence: 8,
+      },
+    });
+    await host.operations.startLinked({
+      contributionId: "fixture.review",
+      idempotencyKey: "linked-list-other-session-1",
+      input: { revision: "other" },
+      origin: {
+        invocation: reviewInvocation,
+        sessionId: "123e4567-e89b-42d3-a456-426614174134",
+        sourceSequence: 2,
+      },
+    });
+
+    await expect(host.operations.listLinked({ sessionId, throughSequence: 7 })).resolves.toEqual({
+      items: [included, secondIncluded],
+      nextCursor: null,
+    });
+    const firstPage = await host.operations.listLinked({
+      limit: 1,
+      sessionId,
+      throughSequence: 7,
+    });
+    expect(firstPage).toEqual({ items: [included], nextCursor: included.operationId });
+    if (firstPage.nextCursor === null) {
+      throw new Error("Expected a linked-operation pagination cursor.");
+    }
+    await expect(
+      host.operations.listLinked({
+        cursor: firstPage.nextCursor,
+        limit: 1,
+        sessionId,
+        throughSequence: 7,
+      }),
+    ).resolves.toEqual({ items: [secondIncluded], nextCursor: null });
+    await expect(
+      host.operations.listLinked({
+        cursor: afterPrefix.operationId,
+        sessionId,
+        throughSequence: 7,
+      }),
+    ).rejects.toMatchObject({ code: "operation_list_invalid", name: "OperationHostError" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -537,6 +1044,7 @@ test("ExtensionHost reports recovery-required when terminal persistence fails", 
       return durableStore.append(record);
     },
     findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
     read: (operationId) => durableStore.read(operationId),
   };
 
@@ -606,6 +1114,7 @@ test("ExtensionHost recovers completed immutable evidence without rerunning exec
       return durableStore.append(record);
     },
     findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
     read: (operationId) => durableStore.read(operationId),
   };
   const controlKey = `__adamOperationRecovery${Date.now()}${Math.random()}`;
@@ -633,6 +1142,7 @@ test("ExtensionHost recovers completed immutable evidence without rerunning exec
       artifactStore,
       capabilities,
       extensions: [configuredExtension],
+      operationOriginAuthority: acceptingOperationOriginAuthority,
       operationStore: interruptedStore,
       projectRoot: workspaceRoot,
       stateRoot,
@@ -640,10 +1150,16 @@ test("ExtensionHost recovers completed immutable evidence without rerunning exec
     await expect(firstHost.loadConfiguredExtensions()).resolves.toMatchObject({
       extensions: [{ diagnostics: [], extensionId: "fixture.extension", status: "active" }],
     });
-    const started = await firstHost.operations.start({
+    const origin = {
+      invocation: reviewInvocation,
+      sessionId: "123e4567-e89b-42d3-a456-426614174141",
+      sourceSequence: 11,
+    };
+    const started = await firstHost.operations.startLinked({
       contributionId: "fixture.review",
       idempotencyKey: "review-reconcile-completed-1",
       input: { revision: "recovered" },
+      origin,
     });
     for await (const _record of firstHost.operations.events({
       operationId: started.operationId,
@@ -677,6 +1193,7 @@ test("ExtensionHost recovers completed immutable evidence without rerunning exec
         },
       ],
       operationId: started.operationId,
+      origin,
       output: { accepted: true, revision: "recovered" },
       status: "completed",
     });
@@ -709,6 +1226,7 @@ test("ExtensionHost recovers completed immutable evidence without rerunning exec
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     const missingTerminalHost = createExtensionHost({
@@ -862,6 +1380,7 @@ test("ExtensionHost rejects inspection evidence from another operation", async (
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     await writeRecoverableOperationExtension(packageRoot, controlKey);
@@ -955,6 +1474,7 @@ test("ExtensionHost rejects an artifact relabeled from another operation", async
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     await writeRecoverableOperationExtension(packageRoot, controlKey);
@@ -1044,6 +1564,7 @@ test("ExtensionHost keeps proven completion after a durable cold cancel request"
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     await writeRecoverableOperationExtension(packageRoot, controlKey);
@@ -1138,6 +1659,7 @@ test("ExtensionHost shares one in-flight reconciliation for duplicate recovery c
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     await writeRecoverableOperationExtension(packageRoot, controlKey);
@@ -1302,6 +1824,7 @@ test("ExtensionHost rejects recovery after the exact capability grant changes", 
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     const configuredExtension = (grantVersion: string) => ({
@@ -1403,6 +1926,7 @@ test("ExtensionHost bounds an uncooperative reconciliation hook", async () => {
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     const configuredExtension = {
@@ -1482,6 +2006,7 @@ test("ExtensionHost rereads a durable recovery terminal after an ambiguous appen
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     await writeRecoverableOperationExtension(packageRoot, controlKey);
@@ -1528,6 +2053,7 @@ test("ExtensionHost rereads a durable recovery terminal after an ambiguous appen
         }
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     const recoveredHost = createExtensionHost({
@@ -2410,6 +2936,7 @@ test("ExtensionHost settles a legacy nonterminal operation as stable inspection-
 
     expect(first).toMatchObject({
       message: "Legacy operation identity cannot be reconciled safely.",
+      origin: null,
       status: "inspection_required",
     });
     expect(repeated).toEqual(first);
@@ -2669,6 +3196,7 @@ function createProgressFailingOperationStore(): OperationStore {
       return durableStore.append(record);
     },
     findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+    listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
     read: (operationId) => durableStore.read(operationId),
   };
 }
@@ -2925,6 +3453,7 @@ async function expectStableReconciliationOutcome(fixture: {
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     await writeRecoverableOperationExtension(packageRoot, controlKey);
@@ -3199,6 +3728,7 @@ async function expectRecoveryValidationMismatch(fixture: {
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     const configured = {
@@ -3284,6 +3814,7 @@ async function expectRecoveryIdentityMismatch(fixture: {
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     const capability = { id: "fixture.capability@1", version: "1.0.0" } as const;

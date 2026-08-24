@@ -37,6 +37,7 @@ test("CLI recovers one exact configured operation from durable evidence", async 
         return durableStore.append(record);
       },
       findByIdempotency: (scope) => durableStore.findByIdempotency(scope),
+      listLinkedStarts: (options) => durableStore.listLinkedStarts(options),
       read: (operationId) => durableStore.read(operationId),
     };
     const host = createExtensionHost({

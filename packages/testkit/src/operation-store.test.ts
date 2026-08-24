@@ -62,6 +62,123 @@ test("OperationStore adapters append and read a versioned start record", async (
   }
 });
 
+test("OperationStore adapters reject an unbounded linked-start query", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-linked-query-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+
+  try {
+    await mkdir(workspaceRoot);
+    const stores = [
+      ["in-memory", createInMemoryOperationStore()],
+      ["JSONL", await createJsonlOperationStore({ stateRoot, workspaceRoot })],
+    ] as const;
+
+    for (const [name, store] of stores) {
+      await expect(
+        store.listLinkedStarts({
+          limit: 0,
+          sessionId: "123e4567-e89b-42d3-a456-426614174010",
+          throughSequence: 1,
+        }),
+        name,
+      ).rejects.toMatchObject({ code: "operation_log_invalid", name: "OperationStoreError" });
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("OperationStore adapters list only schema 3 starts with an exact linked prefix", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-linked-store-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const projectId = projectIdForWorkspace(workspaceRoot);
+  const sessionId = "123e4567-e89b-42d3-a456-426614174020";
+  const records: readonly OperationEventRecord[] = [
+    {
+      schemaVersion: 1,
+      operationId,
+      sequence: 1,
+      recordedAt: "2026-08-24T08:00:00.000Z",
+      event: {
+        type: "operation_started",
+        contributionId: "fixture.review",
+        deadlineAt: "2026-08-24T08:01:00.000Z",
+        extensionId: "fixture.extension",
+        extensionVersion: "1.0.0",
+        idempotencyKey: "linked-store-v1",
+        input: { revision: "abc123" },
+        inputDigest: canonicalInputDigest,
+        projectId,
+      },
+    },
+    {
+      schemaVersion: 2,
+      operationId: "123e4567-e89b-42d3-a456-426614174001",
+      sequence: 1,
+      recordedAt: "2026-08-24T08:00:01.000Z",
+      event: {
+        type: "operation_started",
+        contributionId: "fixture.review",
+        deadlineAt: "2026-08-24T08:01:01.000Z",
+        definitionDigest: `sha256:${"a".repeat(64)}`,
+        extensionId: "fixture.extension",
+        extensionVersion: "2.0.0",
+        idempotencyKey: "linked-store-v2",
+        input: { revision: "abc123" },
+        inputDigest: canonicalInputDigest,
+        projectId,
+      },
+    },
+    {
+      schemaVersion: 3,
+      operationId: "123e4567-e89b-42d3-a456-426614174002",
+      sequence: 1,
+      recordedAt: "2026-08-24T08:00:02.000Z",
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId,
+        sourceSequence: 4,
+      },
+      event: {
+        type: "operation_started",
+        contributionId: "fixture.review",
+        deadlineAt: "2026-08-24T08:01:02.000Z",
+        definitionDigest: `sha256:${"b".repeat(64)}`,
+        extensionId: "fixture.extension",
+        extensionVersion: "3.0.0",
+        idempotencyKey: "linked-store-v3",
+        input: { revision: "abc123" },
+        inputDigest: canonicalInputDigest,
+        projectId,
+      },
+    },
+  ];
+
+  try {
+    await mkdir(workspaceRoot);
+    const stores = [
+      ["in-memory", createInMemoryOperationStore()],
+      ["JSONL", await createJsonlOperationStore({ stateRoot, workspaceRoot })],
+    ] as const;
+
+    for (const [name, store] of stores) {
+      for (const record of records) {
+        await store.append(record);
+      }
+      expect(
+        await store.listLinkedStarts({ limit: 2, sessionId, throughSequence: 4 }),
+        name,
+      ).toEqual([records[2]]);
+      expect(await store.read(operationId), name).toEqual([records[0]]);
+      expect(await store.read("123e4567-e89b-42d3-a456-426614174001"), name).toEqual([records[1]]);
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("OperationStore adapters reject a non-contiguous reconciliation attempt", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-attempt-sequence-"));
   const workspaceRoot = join(testRoot, "workspace");
