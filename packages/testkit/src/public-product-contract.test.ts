@@ -491,6 +491,153 @@ test("SessionLifecycle canonical history projections have package-internal owner
   }
 });
 
+test("PresentationSession tool projection has one package-internal owner", async () => {
+  const agentSourceRoot = join(productRoot, "packages", "agent", "src");
+  const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
+    .filter((entry) => entry.endsWith(".ts"))
+    .sort();
+  const sources = await Promise.all(
+    sourceFiles.map(async (sourceFile) => ({
+      path: sourceFile,
+      source: await readFile(join(agentSourceRoot, sourceFile), "utf8"),
+    })),
+  );
+  const expectedOwners = {
+    collectChangePreviewRequests: ["presentation-tool-projection.ts"],
+    projectChangePreviewPage: ["presentation-tool-projection.ts"],
+    projectPendingPermissionCandidates: ["presentation-tool-projection.ts"],
+    projectToolDisplays: ["presentation-tool-projection.ts"],
+    resolveActionableChangePreviewReference: ["presentation-tool-projection.ts"],
+  } as const;
+  const actualOwners = Object.fromEntries(
+    Object.keys(expectedOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) => new RegExp(`\\bfunction\\s+${symbol}\\s*\\(`, "u").test(source))
+        .map(({ path }) => path),
+    ]),
+  );
+  const expectedTypeOwners = {
+    ChangePreviewProjectionRequest: ["presentation-tool-projection.ts"],
+  } as const;
+  const actualTypeOwners = Object.fromEntries(
+    Object.keys(expectedTypeOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) => new RegExp(`\\bexport\\s+type\\s+${symbol}\\b`, "u").test(source))
+        .map(({ path }) => path),
+    ]),
+  );
+  const projectionSource =
+    sources.find(({ path }) => path === "presentation-tool-projection.ts")?.source ?? "";
+  const projectionConsumers = sources
+    .filter(({ source }) => moduleSpecifiers(source).includes("./presentation-tool-projection.js"))
+    .map(({ path }) => path);
+  const projectionDependencies = [...moduleSpecifiers(projectionSource)].sort();
+  const projectionRuntimeImports = runtimeModuleSpecifiers(projectionSource);
+  const projectionTypeImports = typeOnlyImportSpecifiers(projectionSource).sort();
+  const publicFacadeSource = sources.find(({ path }) => path === "index.ts")?.source ?? "";
+  const testingFacadeSource =
+    sources.find(({ path }) => path === "internal-testing.ts")?.source ?? "";
+  const testSourceRoots = (
+    await Promise.all(
+      ["apps", "packages"].map(async (root) =>
+        (
+          await readdir(join(productRoot, root), { withFileTypes: true })
+        )
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => join(productRoot, root, entry.name, "src")),
+      ),
+    )
+  ).flat();
+  const testSources = (
+    await Promise.all(
+      testSourceRoots.map(async (sourceRoot) => {
+        try {
+          return (await readdir(sourceRoot, { recursive: true }))
+            .filter((entry) => entry.endsWith(".test.ts"))
+            .map((entry) => join(sourceRoot, entry));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return [];
+          }
+          throw error;
+        }
+      }),
+    )
+  ).flat();
+  const directTestImports = (
+    await Promise.all(
+      testSources
+        .filter((testPath) => testPath !== fileURLToPath(import.meta.url))
+        .map(async (testPath) =>
+          moduleSpecifiers(await readFile(testPath, "utf8"))
+            .filter((specifier) => /presentation-tool-projection\.js$/u.test(specifier))
+            .map((specifier) => ({
+              path: relative(productRoot, testPath),
+              specifier,
+            })),
+        ),
+    )
+  ).flat();
+
+  expect.soft(actualOwners).toEqual(expectedOwners);
+  expect.soft(actualTypeOwners).toEqual(expectedTypeOwners);
+  expect.soft(projectionConsumers).toEqual(["presentation-session.ts"]);
+  expect.soft(projectionRuntimeImports).toEqual([]);
+  expect
+    .soft(projectionTypeImports)
+    .toEqual([
+      "./artifact-store.js",
+      "./session-store.js",
+      "./tool-runtime.js",
+      "@adam-agent/presentation",
+    ]);
+  expect
+    .soft(projectionDependencies)
+    .toEqual([
+      "./artifact-store.js",
+      "./session-store.js",
+      "./tool-runtime.js",
+      "@adam-agent/presentation",
+    ]);
+  const packageInternalSymbols = [
+    "ChangePreviewProjectionRequest",
+    "collectChangePreviewRequests",
+    "projectChangePreviewPage",
+    "projectPendingPermissionCandidates",
+    "projectToolDisplays",
+    "resolveActionableChangePreviewReference",
+  ];
+  for (const facadeSource of [publicFacadeSource, testingFacadeSource]) {
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./presentation-tool-projection.js");
+    expect
+      .soft(packageInternalSymbols.filter((symbol) => facadeSource.includes(symbol)))
+      .toEqual([]);
+  }
+  expect.soft(directTestImports).toEqual([]);
+});
+
+test("the runtime module detector covers every value-bearing module form", () => {
+  expect(
+    runtimeModuleSpecifiers(`
+      import { staticValue } from "static-module";
+      import "side-effect-module";
+      const dynamicValue = import("dynamic-module");
+      export { runtimeValue } from "runtime-reexport-module";
+      export * from "star-reexport-module";
+      import type { StaticType } from "type-module";
+      export type { ReexportedType } from "type-reexport-module";
+    `),
+  ).toEqual([
+    "static-module",
+    "side-effect-module",
+    "dynamic-module",
+    "runtime-reexport-module",
+    "star-reexport-module",
+  ]);
+});
+
 test("PresentationSession linked-operation projection has one package-internal owner", async () => {
   const agentSourceRoot = join(productRoot, "packages", "agent", "src");
   const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
@@ -633,5 +780,23 @@ function moduleSpecifiers(source: string): readonly string[] {
   ];
   return patterns.flatMap((pattern) =>
     [...source.matchAll(pattern)].map((match) => match[1] ?? ""),
+  );
+}
+
+function runtimeModuleSpecifiers(source: string): readonly string[] {
+  const patterns = [
+    /\bimport\s+(?!type\b)[^;]*?\sfrom\s*["']([^"']+)["']/gu,
+    /\bimport\s*["']([^"']+)["']/gu,
+    /\bimport\s*\(\s*["']([^"']+)["']\s*\)/gu,
+    /\bexport\s+(?!type\b)(?:\*(?:\s+as\s+\S+)?|\{[^}]*\})\s+from\s+["']([^"']+)["']/gu,
+  ];
+  return patterns.flatMap((pattern) =>
+    [...source.matchAll(pattern)].map((match) => match[1] ?? ""),
+  );
+}
+
+function typeOnlyImportSpecifiers(source: string): string[] {
+  return [...source.matchAll(/\bimport\s+type\s+[^;]*?\sfrom\s*["']([^"']+)["']/gu)].map(
+    (match) => match[1] ?? "",
   );
 }
