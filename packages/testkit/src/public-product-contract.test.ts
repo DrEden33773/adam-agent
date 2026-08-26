@@ -268,7 +268,7 @@ test("SessionLifecycle canonical history projections have package-internal owner
     modelMessagesFromCompleteRecords: ["session-history-replay.ts"],
     promptContextRecordFromRecords: ["session-history-folds.ts"],
     readValidatedLineagePrefix: ["session-lineage.ts"],
-    sessionDisplayLabelFromRecords: ["session-history-folds.ts"],
+    sessionNamingStateFromRecords: ["session-history-folds.ts"],
     sessionInheritsSourceBoundary: ["session-lineage.ts"],
     skillContextRecordFromRecords: ["session-history-folds.ts"],
     snapshotFromGenesis: ["session-history-folds.ts"],
@@ -301,6 +301,7 @@ test("SessionLifecycle canonical history projections have package-internal owner
     ModelResponseArtifactInspection: ["session-history-folds.ts"],
     SessionLineageRecordReader: ["session-lineage.ts"],
     SessionLineageTraversal: ["session-lineage.ts"],
+    SessionNamingHistoryState: ["session-history-folds.ts"],
     SessionContextSnapshot: ["session-snapshot-contracts.ts"],
     SessionContextUsageSnapshot: ["session-snapshot-contracts.ts"],
     SessionResumeResult: ["session-snapshot-contracts.ts"],
@@ -330,23 +331,27 @@ test("SessionLifecycle canonical history projections have package-internal owner
   );
   const forbiddenImports = extractedSources.flatMap(({ path, source }) =>
     moduleSpecifiers(source)
-      .filter((specifier) =>
-        [
-          "./agent-session.js",
-          "./extension-host.js",
-          "./index.js",
-          "./session-lifecycle.js",
-          "@adam-agent/agent",
-          "@adam-agent/presentation",
-          "node:child_process",
-          "node:fs",
-          "node:fs/promises",
-        ].includes(specifier),
+      .filter(
+        (specifier) =>
+          specifier.startsWith("./presentation-") ||
+          [
+            "./agent-session.js",
+            "./extension-host.js",
+            "./index.js",
+            "./session-lifecycle.js",
+            "@adam-agent/agent",
+            "@adam-agent/presentation",
+            "node:child_process",
+            "node:fs",
+            "node:fs/promises",
+          ].includes(specifier),
       )
       .map((specifier) => ({ path, specifier })),
   );
   const lifecycleSource = sources.find(({ path }) => path === "session-lifecycle.ts")?.source ?? "";
   const lineageSource = sources.find(({ path }) => path === "session-lineage.ts")?.source ?? "";
+  const presentationSource =
+    sources.find(({ path }) => path === "presentation-session.ts")?.source ?? "";
   const publicFacadeSource = sources.find(({ path }) => path === "index.ts")?.source ?? "";
   const testingFacadeSource =
     sources.find(({ path }) => path === "internal-testing.ts")?.source ?? "";
@@ -432,6 +437,29 @@ test("SessionLifecycle canonical history projections have package-internal owner
     })
     .toEqual({ storeSpecifierReferences: 1, storeRuntimeImport: false, storeTypeImport: true });
   expect.soft(directTestImports).toEqual([]);
+  expect
+    .soft({
+      historyImport: moduleSpecifiers(presentationSource).includes("./session-history-folds.js"),
+      namingStateConsumers: sources
+        .filter(
+          ({ path, source }) =>
+            path !== "session-history-folds.ts" &&
+            /\bsessionNamingStateFromRecords\b/u.test(source),
+        )
+        .map(({ path }) => path),
+      legacyDisplayLabelOwners: sources
+        .filter(({ source }) => /\bfunction\s+sessionDisplayLabelFromRecords\s*\(/u.test(source))
+        .map(({ path }) => path),
+      legacyPresentationNamingOwners: sources
+        .filter(({ source }) => /\bfunction\s+sessionNamingFromRecords\s*\(/u.test(source))
+        .map(({ path }) => path),
+    })
+    .toEqual({
+      historyImport: true,
+      namingStateConsumers: ["presentation-session.ts", "session-lifecycle.ts"],
+      legacyDisplayLabelOwners: [],
+      legacyPresentationNamingOwners: [],
+    });
   expect
     .soft({
       errorImport: lifecycleSource.includes('from "./session-lifecycle-error.js"'),

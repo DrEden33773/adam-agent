@@ -10,6 +10,7 @@ import type {
   PresentationSession,
   PresentationTransientState,
   RepositoryInstructionsDisplay,
+  SessionNaming,
   SessionSummary,
   SkillCatalogDisplay,
   ToolCallDisplay,
@@ -39,6 +40,10 @@ import {
 import type { PresentationPreferences } from "./presentation-preferences.js";
 import { listProjectPaths } from "./project-path-catalog.js";
 import {
+  type SessionNamingHistoryState,
+  sessionNamingStateFromRecords,
+} from "./session-history-folds.js";
+import {
   type CurrentSessionSnapshot,
   type SessionContextUsageSnapshot,
   type SessionLifecycle,
@@ -46,7 +51,6 @@ import {
   type SessionMetadataEvent,
   type SessionRuntimeNotification,
 } from "./session-lifecycle.js";
-import { sessionTitleFallback } from "./session-naming.js";
 import { readJsonlSessionRecords, type SessionRecord } from "./session-store.js";
 import type { JsonValue, PermissionSubject, ToolEffect } from "./tool-runtime.js";
 
@@ -227,7 +231,7 @@ export async function createPresentationSession(
     const historyPageSize = boundedHistoryPageSize(options[presentationHistoryPageSize]);
     let loadedTranscriptStart = Math.max(0, transcript.length - historyPageSize);
     const naming =
-      created === undefined ? undefined : sessionNamingFromRecords(records, created.sessionId);
+      created === undefined ? undefined : projectSessionNaming(records, created.sessionId);
     const catalogPageSize = boundedCatalogPageSize(options[presentationCatalogPageSize]);
     const activeSummary: SessionSummary | undefined =
       created === undefined || naming === undefined
@@ -800,7 +804,7 @@ export async function createPresentationSession(
         activatedRecords,
         options,
       );
-      const activatedNaming = sessionNamingFromRecords(activatedRecords, snapshot.sessionId);
+      const activatedNaming = projectSessionNaming(activatedRecords, snapshot.sessionId);
       const activatedSummary: SessionSummary = {
         id: snapshot.sessionId,
         label: activatedNaming.displayLabel,
@@ -897,7 +901,7 @@ export async function createPresentationSession(
       if (closed || current === null || current.session.id !== sessionId) {
         return;
       }
-      const refreshedNaming = sessionNamingFromRecords(refreshedRecords, sessionId);
+      const refreshedNaming = projectSessionNaming(refreshedRecords, sessionId);
       const refreshedSummary: SessionSummary = {
         ...current.session,
         label: refreshedNaming.displayLabel,
@@ -2845,7 +2849,7 @@ function sessionSummaryFromSnapshot(
   snapshot: CurrentSessionSnapshot,
   records: readonly SourcedSessionRecord[],
 ): SessionSummary {
-  const naming = sessionNamingFromRecords(records, snapshot.sessionId);
+  const naming = projectSessionNaming(records, snapshot.sessionId);
   return {
     id: snapshot.sessionId,
     label: naming.displayLabel,
@@ -4335,87 +4339,49 @@ function projectMcp(snapshot: CurrentSessionSnapshot): McpDisplay | null {
   };
 }
 
-function sessionNamingFromRecords(
+function projectSessionNaming(
   records: readonly SourcedSessionRecord[],
   sessionId: string,
-): SessionSummary["naming"] {
-  const firstRun = records.find(
-    ({ entry, sessionId: sourceSessionId }) =>
-      sourceSessionId === sessionId &&
-      entry.schemaVersion === 3 &&
-      entry.record.type === "logical_run_started",
+): SessionNaming {
+  const naming = sessionNamingStateFromRecords(
+    records
+      .filter(({ sessionId: sourceSessionId }) => sourceSessionId === sessionId)
+      .map(({ entry }) => entry),
   );
-  const genesis = records.find(
-    ({ entry, sessionId: sourceSessionId }) =>
-      sourceSessionId === sessionId &&
-      entry.schemaVersion === 3 &&
-      entry.record.type === "session_genesis",
-  );
-  const genesisFallback =
-    genesis?.entry.schemaVersion === 3 && genesis.entry.record.type === "session_genesis"
-      ? (genesis.entry.record.naming?.fallbackTitle ?? null)
-      : null;
-  const fallbackTitle =
-    genesisFallback ??
-    (firstRun?.entry.schemaVersion === 3 && firstRun.entry.record.type === "logical_run_started"
-      ? (firstRun.entry.record.naming?.fallbackTitle ??
-        sessionTitleFallback(firstRun.entry.record.userMessage))
-      : null);
-  let manualName: string | null = null;
-  let generatedTitle: string | null = null;
-  let generation: SessionSummary["naming"]["generation"] = { status: "not_started" };
-  for (const { entry, sessionId: sourceSessionId } of records) {
-    if (
-      sourceSessionId === sessionId &&
-      entry.schemaVersion === 3 &&
-      (entry.record.type === "session_manual_name_set" ||
-        entry.record.type === "session_manual_name_cleared")
-    ) {
-      manualName = entry.record.type === "session_manual_name_set" ? entry.record.name : null;
-    }
-    if (
-      sourceSessionId === sessionId &&
-      entry.schemaVersion === 3 &&
-      entry.record.type === "session_title_generation_started"
-    ) {
-      generation = { status: "in_progress", generationId: entry.record.generationId };
-    }
-    if (
-      sourceSessionId === sessionId &&
-      entry.schemaVersion === 3 &&
-      entry.record.type === "session_title_generation_completed"
-    ) {
-      generatedTitle = entry.record.title;
-      generation = {
+  return {
+    manualName: naming.manualName,
+    generatedTitle: naming.generatedTitle,
+    fallbackTitle: naming.fallbackTitle,
+    displayLabel: naming.displayLabel,
+    generation: projectSessionTitleGeneration(naming.generation),
+  };
+}
+
+function projectSessionTitleGeneration(
+  generation: SessionNamingHistoryState["generation"],
+): SessionNaming["generation"] {
+  switch (generation.status) {
+    case "not_started":
+      return { status: "not_started" };
+    case "in_progress":
+      return { status: "in_progress", generationId: generation.generationId };
+    case "completed":
+      return {
         status: "completed",
-        generationId: entry.record.generationId,
-        usage: entry.record.usage,
+        generationId: generation.generationId,
+        usage: generation.usage,
       };
-    }
-    if (
-      sourceSessionId === sessionId &&
-      entry.schemaVersion === 3 &&
-      entry.record.type === "session_title_generation_skipped_manual"
-    ) {
-      generation = { status: "skipped_manual" };
-    }
-    if (
-      sourceSessionId === sessionId &&
-      entry.schemaVersion === 3 &&
-      entry.record.type === "session_title_generation_failed"
-    ) {
-      generation = {
+    case "failed":
+      return {
         status: "failed",
-        generationId: entry.record.generationId,
-        reason: entry.record.reason,
+        generationId: generation.generationId,
+        reason: generation.reason,
       };
+    case "skipped_manual":
+      return { status: "skipped_manual" };
+    default: {
+      const unreachable: never = generation;
+      return unreachable;
     }
   }
-  return {
-    manualName,
-    generatedTitle,
-    fallbackTitle,
-    displayLabel: manualName ?? generatedTitle ?? fallbackTitle ?? "New session",
-    generation,
-  };
 }

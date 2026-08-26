@@ -7288,6 +7288,111 @@ test("PresentationSession explicitly regenerates and replaces the generated titl
   }
 });
 
+test("PresentationSession preserves the last completed title through regeneration progress and failure", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-title-preserved-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const regenerationStarted = Promise.withResolvers<void>();
+  const releaseRegenerationFailure = Promise.withResolvers<void>();
+  let titleCalls = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        titleCalls += 1;
+        if (titleCalls === 1) {
+          yield { type: "text_delta", text: "Stable generated title" };
+          yield { type: "finish", reason: "stop" };
+          return;
+        }
+        regenerationStarted.resolve();
+        await releaseRegenerationFailure.promise;
+        throw new Error("Regeneration provider failed.");
+      }
+      yield { type: "text_delta", text: "Ordinary answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const firstLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  firstLifecycle.enableAutomaticTitles();
+  let secondLifecycle: ReturnType<typeof createSessionLifecycle> | undefined;
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+
+  try {
+    const created = await firstLifecycle.create({ targetIdentity });
+    await firstLifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Preserve the last completed title" },
+    });
+    await firstLifecycle.close();
+
+    secondLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    presentation = await createPresentationSession({
+      lifecycle: secondLifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    const inProgress = Promise.withResolvers<void>();
+    const failed = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      const naming = presentation?.getState().authoritative.active?.session.naming;
+      if (naming?.generation.status === "in_progress") {
+        inProgress.resolve();
+      }
+      if (naming?.generation.status === "failed") {
+        failed.resolve();
+      }
+    });
+
+    await expect(
+      presentation.dispatch({
+        type: "regenerate_session_title",
+        sessionId: created.sessionId,
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    await regenerationStarted.promise;
+    await inProgress.promise;
+    expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+      generatedTitle: "Stable generated title",
+      displayLabel: "Stable generated title",
+      generation: { status: "in_progress" },
+    });
+
+    releaseRegenerationFailure.resolve();
+    await failed.promise;
+    expect(presentation.getState().authoritative.active?.session.naming).toMatchObject({
+      generatedTitle: "Stable generated title",
+      displayLabel: "Stable generated title",
+      generation: { status: "failed", reason: "model_request_failed" },
+    });
+    unsubscribe();
+  } finally {
+    releaseRegenerationFailure.resolve();
+    await presentation?.close();
+    await secondLifecycle?.close();
+    await firstLifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("PresentationSession gives a child an immutable branch fallback before its first turn", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-branch-name-"));
   const stateRoot = join(testRoot, "state");

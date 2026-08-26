@@ -243,7 +243,36 @@ export function isGenesisRecord(record: SessionRecord): record is SessionGenesis
   return record.schemaVersion === 3 && record.record.type === "session_genesis";
 }
 
-export function sessionDisplayLabelFromRecords(records: readonly SessionRecord[]): string {
+export type SessionNamingHistoryState = {
+  readonly manualName: string | null;
+  readonly generatedTitle: string | null;
+  readonly fallbackTitle: string | null;
+  readonly displayLabel: string;
+  readonly generation:
+    | { readonly status: "not_started" }
+    | { readonly status: "in_progress"; readonly generationId: string }
+    | {
+        readonly status: "completed";
+        readonly generationId: string;
+        readonly usage:
+          | { readonly status: "unknown" }
+          | {
+              readonly status: "known";
+              readonly inputTokens: number;
+              readonly outputTokens: number;
+            };
+      }
+    | {
+        readonly status: "failed";
+        readonly generationId: string;
+        readonly reason: "model_request_failed" | "invalid_title" | "process_restart";
+      }
+    | { readonly status: "skipped_manual" };
+};
+
+export function sessionNamingStateFromRecords(
+  records: readonly SessionRecord[],
+): SessionNamingHistoryState {
   const genesis = records[0];
   let fallbackTitle =
     genesis?.schemaVersion === 3 && genesis.record.type === "session_genesis"
@@ -251,6 +280,7 @@ export function sessionDisplayLabelFromRecords(records: readonly SessionRecord[]
       : null;
   let manualName: string | null = null;
   let generatedTitle: string | null = null;
+  let generation: SessionNamingHistoryState["generation"] = { status: "not_started" };
   for (const entry of records) {
     if (entry.schemaVersion !== 3) {
       continue;
@@ -262,11 +292,32 @@ export function sessionDisplayLabelFromRecords(records: readonly SessionRecord[]
       manualName = entry.record.name;
     } else if (entry.record.type === "session_manual_name_cleared") {
       manualName = null;
+    } else if (entry.record.type === "session_title_generation_started") {
+      generation = { status: "in_progress", generationId: entry.record.generationId };
     } else if (entry.record.type === "session_title_generation_completed") {
       generatedTitle = entry.record.title;
+      generation = {
+        status: "completed",
+        generationId: entry.record.generationId,
+        usage: entry.record.usage,
+      };
+    } else if (entry.record.type === "session_title_generation_skipped_manual") {
+      generation = { status: "skipped_manual" };
+    } else if (entry.record.type === "session_title_generation_failed") {
+      generation = {
+        status: "failed",
+        generationId: entry.record.generationId,
+        reason: entry.record.reason,
+      };
     }
   }
-  return manualName ?? generatedTitle ?? fallbackTitle ?? "New session";
+  return {
+    manualName,
+    generatedTitle,
+    fallbackTitle,
+    displayLabel: manualName ?? generatedTitle ?? fallbackTitle ?? "New session",
+    generation,
+  };
 }
 
 export function attemptStatus(
