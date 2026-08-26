@@ -83,7 +83,7 @@ pnpm install --frozen-lockfile
 pnpm hooks:install
 pnpm quality:check
 ADAM_AGENT_TARGET=fake.local pnpm --silent adam "What is this repository?"
-pnpm tui --target fake.local
+pnpm tui --target deepseek-v4-flash.direct
 ```
 
 For the headless CLI, the explicit `fake.local` target exercises deterministic read, edit, and shell scenarios. Omitting a target fails with copy-pastable guidance, and a credential never selects a target implicitly. Adam asks on stderr before write or execute effects. Session and operation JSONL, overflow and extension artifacts, immutable extension records, extension lifecycle state, and private patch recovery data are written under `ADAM_AGENT_STATE_ROOT` when set, otherwise under `~/.local/state/adam-agent`. Recovery data is normally removed after a successful patch or complete rollback. If removal fails, Adam returns `patch_recovery_cleanup_failed` with the known `committed` or `rolled_back` settlement and an opaque reference to the cleanup attempt; because recursive removal may have partially completed, any remaining bundle is not guaranteed to be complete. Inspect the reference and workspace state before any retry. Recovery data is retained intact when Adam stops cleanup because it cannot confirm the workspace state, and this first version deliberately provides no automatic restart recovery.
