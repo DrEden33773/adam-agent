@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import { access, mkdir, watch, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,11 +26,12 @@ import {
   presentationHistoryPageSize,
 } from "@adam-agent/agent/internal-testing";
 import type { PresentationSession } from "@adam-agent/presentation";
-import type { Terminal } from "@earendil-works/pi-tui";
+import { ProcessTerminal, type Terminal } from "@earendil-works/pi-tui";
 import { createAdamCommandRegistry } from "./command-registry.js";
 import { type FixtureScenario, isFixtureScenario } from "./fixture-scenario.js";
 import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 import { type ClipboardAdapter, type DeadlineScheduler, runTui } from "./tui-app.js";
+import { tuiProcessFailureMessage } from "./tui-process-failure.js";
 
 const targetIdentity: ModelTargetIdentity = {
   targetId: "fake.local",
@@ -140,6 +142,23 @@ export type TuiFixtureOptions = {
   readonly workspaceRoot: string;
 };
 
+class TerminalRestorationFailure extends ProcessTerminal {
+  readonly #failureMarker: string | undefined;
+
+  constructor(failureMarker: string | undefined) {
+    super();
+    this.#failureMarker = failureMarker;
+  }
+
+  override stop(): void {
+    super.stop();
+    if (this.#failureMarker !== undefined) {
+      writeFileSync(this.#failureMarker, "failed\n", "utf8");
+    }
+    throw new Error("Injected terminal stop failure after restoration.");
+  }
+}
+
 export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
   if (options.terminalProcessMarker !== undefined) {
     await writeFile(options.terminalProcessMarker, `${process.pid}\n`, "utf8");
@@ -177,6 +196,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
           options.scenario,
         )
       : undefined;
+  let lifecycleCloseAttempted = false;
 
   try {
     const previewBarrier = previewReadBarrier(options);
@@ -335,8 +355,33 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     const clipboard = options.clipboard ?? clipboardAdapter(options);
     const deadlineScheduler = controlledDeadlineScheduler(options);
     const tuiPresentation = observeTuiDispatch(presentation, options);
+    const closeRuntime = async () => {
+      let presentationFailure: unknown;
+      try {
+        await tuiPresentation.close();
+      } catch (error) {
+        presentationFailure = error;
+      }
+      if (options.scenario === "mcp-close-unconfirmed") {
+        lifecycleCloseAttempted = true;
+        requireConfirmedLifecycleClose(await lifecycle.close());
+      }
+      if (presentationFailure !== undefined) {
+        throw presentationFailure;
+      }
+    };
+    const terminal =
+      options.terminal ??
+      (options.scenario === "mcp-close-unconfirmed"
+        ? new TerminalRestorationFailure(
+            options.controlRoot === undefined
+              ? undefined
+              : join(options.controlRoot, "terminal-restoration-failed"),
+          )
+        : undefined);
     await runTui({
       ...(clipboard === undefined ? {} : { clipboard }),
+      closeRuntime,
       ...(options.scenario === "review-unavailable" || reviewFixture !== undefined
         ? {
             commandRegistry: createAdamCommandRegistry(
@@ -369,11 +414,13 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
         : options.launch.startupTargetId === undefined
           ? {}
           : { startupTargetId: options.launch.startupTargetId }),
-      ...(options.terminal === undefined ? {} : { terminal: options.terminal }),
+      ...(terminal === undefined ? {} : { terminal }),
     });
   } finally {
     reviewFixture?.releaseExecution();
-    requireConfirmedLifecycleClose(await lifecycle.close());
+    if (!lifecycleCloseAttempted) {
+      requireConfirmedLifecycleClose(await lifecycle.close());
+    }
     if (options.controlRoot !== undefined) {
       await writeFile(join(options.controlRoot, "tui-fixture-closed"), "closed\n", "utf8");
     }
@@ -669,7 +716,16 @@ function parseArguments(arguments_: readonly string[]): {
 }
 
 if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === process.argv[1]) {
-  await runTuiFixture(parseArguments(process.argv.slice(2)));
+  const options = parseArguments(process.argv.slice(2));
+  try {
+    await runTuiFixture(options);
+  } catch (error) {
+    if (options.scenario !== "mcp-close-unconfirmed") {
+      throw error;
+    }
+    process.stderr.write(`${tuiProcessFailureMessage(error)}\n`);
+    process.exitCode = 1;
+  }
 }
 
 function optionValue(arguments_: readonly string[], option: string): string | undefined {

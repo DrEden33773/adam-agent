@@ -4,31 +4,19 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
 import {
-  createBiomeExecutionAdapter,
-  createExtensionHost,
-  createFileArtifactStore,
-  createJsonlOperationStore,
   createModelTargets,
   createPermissionPolicy,
   createPresentationPreferences,
-  createPresentationSession,
-  createSessionLifecycle,
-  ExtensionConfigurationError,
-  loadExtensionConfiguration,
-  ModelTargetError,
-  type SessionLifecycle,
-  SessionLifecycleError,
   selectModelTargetId,
 } from "@adam-agent/agent";
 import {
   adamCommandRegistry,
   createAdamCommandRegistryFromContributions,
 } from "./command-registry.js";
-import { McpShutdownUnconfirmedError, requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 import { createLinuxClipboardAdapter } from "./linux-clipboard.js";
+import { createProductionProjectRuntime } from "./project-runtime.js";
 import { runTui } from "./tui-app.js";
-
-class TuiConfigurationError extends Error {}
+import { TuiConfigurationError, tuiProcessFailureMessage } from "./tui-process-failure.js";
 
 try {
   const command = parseCommand(process.argv.slice(2));
@@ -47,91 +35,45 @@ try {
       askedEffects: ["write", "execute", "network", "delegate", "administrative"],
     });
     const extensionPermissions = createPermissionPolicy({ allowedEffects: ["execute"] });
-    let extensionConfigurationUnavailable = false;
-    const extensions = await loadExtensionConfiguration(process.env, { allowMissing: true }).catch(
-      (error: unknown) => {
-        if (
-          error instanceof ExtensionConfigurationError &&
-          error.code === "extension_configuration_unavailable"
-        ) {
-          extensionConfigurationUnavailable = true;
-          return [];
-        }
-        throw error;
-      },
-    );
-    const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
-    const operationStore = await createJsonlOperationStore({ stateRoot, workspaceRoot });
-    let lifecycle: SessionLifecycle | undefined;
-    const host = createExtensionHost({
-      artifactStore,
-      biomeExecution: createBiomeExecutionAdapter(),
-      capabilities: [
-        { id: "adam.analyzer-execution.biome@1", version: "1.0.0" },
-        { id: "adam.artifact.publish@1", version: "1.0.0" },
-        { id: "adam.storage.records@1", version: "1.0.0" },
-      ],
-      extensions,
-      operationOriginAuthority: {
-        async validateBoundary({ origin, projectId }) {
-          if (lifecycle === undefined) {
-            return false;
-          }
-          const snapshot = await lifecycle.inspect({ sessionId: origin.sessionId });
-          return (
-            snapshot.schemaVersion === 3 &&
-            snapshot.projectId === projectId &&
-            origin.sourceSequence <= snapshot.lastSequence
-          );
-        },
-      },
-      operationStore,
-      permissions: extensionPermissions,
-      projectRoot: workspaceRoot,
+    const runtime = await createProductionProjectRuntime({
+      environment: process.env,
+      extensionPermissions,
+      modelTargets,
+      permissions,
+      preferences,
+      projectLabel: basename(workspaceRoot),
       reservedCommandNames: adamCommandRegistry
         .entries()
         .flatMap((entry) => [entry.name, ...entry.aliases]),
       stateRoot,
-    });
-    const extensionSnapshot = await host.loadConfiguredExtensions();
-    const commandRegistry = createAdamCommandRegistryFromContributions(host.listContributions());
-    const rejectedExtensions = extensionSnapshot.extensions.filter(
-      (extension) => extension.status === "rejected",
-    ).length;
-    const startupNotice = extensionConfigurationUnavailable
-      ? "Configured extension packages are unavailable; new extension commands are disabled."
-      : rejectedExtensions === 0
-        ? undefined
-        : `${rejectedExtensions} configured extension${rejectedExtensions === 1 ? " is" : "s are"} unavailable.`;
-    lifecycle = createSessionLifecycle({
-      extensionHost: host,
-      modelTargets,
-      permissions,
-      stateRoot,
       workspaceRoot,
     });
+    const commandRegistry = createAdamCommandRegistryFromContributions(runtime.contributions);
+    const startupNotice = runtime.extensionAvailability.configurationUnavailable
+      ? "Configured extension packages are unavailable; new extension commands are disabled."
+      : runtime.extensionAvailability.rejectedCount === 0
+        ? undefined
+        : `${runtime.extensionAvailability.rejectedCount} configured extension${runtime.extensionAvailability.rejectedCount === 1 ? " is" : "s are"} unavailable.`;
+    let runtimeCloseAttempted = false;
+    const closeRuntime = async () => {
+      runtimeCloseAttempted = true;
+      await runtime.close();
+    };
     try {
       if (command.resumeSessionId !== undefined && command.targetId !== undefined) {
         throw new TuiConfigurationError("--resume and --target cannot be combined.");
       }
       if (command.resumeSessionId !== undefined) {
-        const snapshot = await lifecycle.inspect({ sessionId: command.resumeSessionId });
+        const snapshot = await runtime.inspectSession(command.resumeSessionId);
         if (snapshot.schemaVersion !== 3) {
           throw new TuiConfigurationError("The selected session cannot be opened by this TUI.");
         }
-        const presentation = await createPresentationSession({
-          lifecycle,
-          modelTargets,
-          operations: host.operations,
-          preferences,
-          projectChanges: host,
-          projectLabel: basename(workspaceRoot),
+        const presentation = await runtime.createPresentation({
           sessionId: command.resumeSessionId,
-          stateRoot,
-          workspaceRoot,
         });
         await runTui({
           clipboard,
+          closeRuntime,
           commandRegistry,
           presentation,
           ...(startupNotice === undefined ? {} : { startupNotice }),
@@ -155,19 +97,12 @@ try {
         const startupTargetId = hasConfiguredTargetSelector
           ? (command.targetId ?? selectModelTargetId(process.env))
           : undefined;
-        const presentation = await createPresentationSession({
-          lifecycle,
-          modelTargets,
+        const presentation = await runtime.createPresentation({
           openProject: true,
-          operations: host.operations,
-          preferences,
-          projectChanges: host,
-          projectLabel: basename(workspaceRoot),
-          stateRoot,
-          workspaceRoot,
         });
         await runTui({
           clipboard,
+          closeRuntime,
           commandRegistry,
           presentation,
           ...(startupNotice === undefined ? {} : { startupNotice }),
@@ -175,19 +110,13 @@ try {
         });
       }
     } finally {
-      requireConfirmedLifecycleClose(await lifecycle.close());
+      if (!runtimeCloseAttempted) {
+        await runtime.close();
+      }
     }
   }
 } catch (error) {
-  const message =
-    error instanceof TuiConfigurationError ||
-    error instanceof ExtensionConfigurationError ||
-    error instanceof McpShutdownUnconfirmedError ||
-    error instanceof ModelTargetError ||
-    error instanceof SessionLifecycleError
-      ? error.message
-      : "The Adam TUI could not start safely.";
-  process.stderr.write(`${message}\n${usage()}\n`);
+  process.stderr.write(`${tuiProcessFailureMessage(error)}\n${usage()}\n`);
   process.exitCode = 1;
 }
 

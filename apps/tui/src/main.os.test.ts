@@ -1020,13 +1020,15 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
   }
 });
 
-test("the TUI process fails visibly when MCP shutdown cannot be confirmed", async () => {
+test("the TUI process preserves the MCP shutdown diagnosis across a terminal cleanup failure", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-mcp-close-unconfirmed-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
   const spawnMarker = join(testRoot, "mcp-spawned");
   const closeMarker = join(testRoot, "mcp-closed");
   await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
   await writeFile(
     join(workspaceRoot, ".mcp.json"),
     JSON.stringify({
@@ -1042,6 +1044,7 @@ test("the TUI process fails visibly when MCP shutdown cannot be confirmed", asyn
 
   try {
     const fixture = startFixture({
+      controlRoot,
       external: true,
       scenario: "mcp-close-unconfirmed",
       stateRoot,
@@ -1070,7 +1073,9 @@ test("the TUI process fails visibly when MCP shutdown cannot be confirmed", asyn
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 1, signal: null });
-    expect(`${result.stdout}${result.stderr}`).toContain("MCP shutdown could not be confirmed.");
+    const output = `${result.stdout}${result.stderr}`;
+    expect(output).toContain("MCP shutdown could not be confirmed.");
+    await waitForPath(join(controlRoot, "terminal-restoration-failed"));
     await waitForPath(closeMarker);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
