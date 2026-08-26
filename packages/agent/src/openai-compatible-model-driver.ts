@@ -9,7 +9,12 @@ import type {
   ChatCompletionTool,
 } from "openai/resources/chat/completions";
 
-import type { ModelDriver, ModelEvent, ModelMessage, ModelRequest } from "./index.js";
+import type {
+  ModelDriver,
+  ModelEvent,
+  ModelMessage,
+  ModelRequest,
+} from "./agent-session-contracts.js";
 import { ModelDriverError } from "./model-driver-error.js";
 
 const maximumNormalizedTextBytes = 512 * 1024;

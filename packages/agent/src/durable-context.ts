@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 
 import { z } from "zod";
+import type { ModelDriver, ModelMessage } from "./agent-session-contracts.js";
 import {
   type ContextProfile,
   resolveCompactionSummaryMaximumOutputTokens,
 } from "./context-profile.js";
-import type { ModelDriver, ModelMessage } from "./index.js";
 import { ModelDriverError } from "./model-driver-error.js";
 import type { SessionRecord } from "./session-store.js";
 import type { PermissionSubject } from "./tool-runtime.js";

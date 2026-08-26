@@ -22,10 +22,10 @@ import {
   reconcilePresentationUpdate,
   resolveSkillMentions,
 } from "@adam-agent/presentation";
+import type { RuntimeEvent } from "./agent-session-contracts.js";
 import { readFileArtifact, readFileArtifactRange } from "./artifact-store.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
 import type { ExtensionHost } from "./extension-host.js";
-import type { RuntimeEvent } from "./index.js";
 import {
   type ModelTargetIdentity,
   type ModelTargetSnapshot,
