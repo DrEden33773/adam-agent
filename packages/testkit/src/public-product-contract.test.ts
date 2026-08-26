@@ -236,6 +236,147 @@ test("the agent root facade detector covers relative and package self-references
   expect(moduleSpecifiers('export * as facade from "./index.js";')).toEqual(["./index.js"]);
 });
 
+test("SessionLifecycle canonical validation and replay have package-internal owners", async () => {
+  const agentSourceRoot = join(productRoot, "packages", "agent", "src");
+  const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
+    .filter((entry) => entry.endsWith(".ts"))
+    .sort();
+  const sources = await Promise.all(
+    sourceFiles.map(async (sourceFile) => ({
+      path: sourceFile,
+      source: await readFile(join(agentSourceRoot, sourceFile), "utf8"),
+    })),
+  );
+  const expectedOwners = {
+    SessionLifecycleError: ["session-lifecycle-error.ts"],
+    hasSuccessfullySettledAssistant: ["session-history-validation.ts"],
+    inlineModelResponseField: ["session-history-replay.ts"],
+    isSkillActivationBatchValid: ["session-history-folds.ts"],
+    isSkillActivationBatchTransitionValid: ["session-history-folds.ts"],
+    isSkillContextCatalogSuccessor: ["session-history-folds.ts"],
+    isSkillContextPathSuccessor: ["session-history-folds.ts"],
+    modelMessagesFromCanonicalRecords: ["session-history-replay.ts"],
+    modelMessagesFromCompleteRecords: ["session-history-replay.ts"],
+    validateCurrentSessionHistory: ["session-history-validation.ts"],
+  } as const;
+  const actualOwners = Object.fromEntries(
+    Object.keys(expectedOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) =>
+          new RegExp(
+            symbol === "SessionLifecycleError"
+              ? `\\bclass\\s+${symbol}\\b`
+              : `\\bfunction\\s+${symbol}\\s*\\(`,
+            "u",
+          ).test(source),
+        )
+        .map(({ path }) => path),
+    ]),
+  );
+
+  expect.soft(actualOwners).toEqual(expectedOwners);
+
+  const extractedSources = sources.filter(({ path }) =>
+    [
+      "session-history-folds.ts",
+      "session-history-replay.ts",
+      "session-history-validation.ts",
+      "session-lifecycle-error.ts",
+    ].includes(path),
+  );
+  const forbiddenImports = extractedSources.flatMap(({ path, source }) =>
+    moduleSpecifiers(source)
+      .filter((specifier) =>
+        [
+          "./agent-session.js",
+          "./extension-host.js",
+          "./index.js",
+          "./session-lifecycle.js",
+          "@adam-agent/agent",
+          "@adam-agent/presentation",
+          "node:child_process",
+          "node:fs",
+          "node:fs/promises",
+        ].includes(specifier),
+      )
+      .map((specifier) => ({ path, specifier })),
+  );
+  const lifecycleSource = sources.find(({ path }) => path === "session-lifecycle.ts")?.source ?? "";
+  const publicFacadeSource = sources.find(({ path }) => path === "index.ts")?.source ?? "";
+  const testingFacadeSource =
+    sources.find(({ path }) => path === "internal-testing.ts")?.source ?? "";
+  const testSourceRoots = (
+    await Promise.all(
+      ["apps", "packages"].map(async (root) =>
+        (
+          await readdir(join(productRoot, root), { withFileTypes: true })
+        )
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => join(productRoot, root, entry.name, "src")),
+      ),
+    )
+  ).flat();
+  const testSources = (
+    await Promise.all(
+      testSourceRoots.map(async (sourceRoot) => {
+        try {
+          return (await readdir(sourceRoot, { recursive: true }))
+            .filter((entry) => entry.endsWith(".test.ts"))
+            .map((entry) => join(sourceRoot, entry));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return [];
+          }
+          throw error;
+        }
+      }),
+    )
+  ).flat();
+  const directTestImports = (
+    await Promise.all(
+      testSources
+        .filter((testPath) => testPath !== fileURLToPath(import.meta.url))
+        .map(async (testPath) =>
+          moduleSpecifiers(await readFile(testPath, "utf8"))
+            .filter((specifier) =>
+              /(?:session-history-(?:folds|replay|validation)|session-lifecycle-error)\.js$/u.test(
+                specifier,
+              ),
+            )
+            .map((specifier) => ({
+              path: relative(productRoot, testPath),
+              specifier,
+            })),
+        ),
+    )
+  ).flat();
+
+  expect.soft(forbiddenImports).toEqual([]);
+  expect.soft(directTestImports).toEqual([]);
+  expect
+    .soft({
+      errorImport: lifecycleSource.includes('from "./session-lifecycle-error.js"'),
+      errorReexport: lifecycleSource.includes(
+        'export { SessionLifecycleError } from "./session-lifecycle-error.js";',
+      ),
+      replayImport: lifecycleSource.includes('from "./session-history-replay.js"'),
+      validationImport: lifecycleSource.includes('from "./session-history-validation.js"'),
+    })
+    .toEqual({
+      errorImport: true,
+      errorReexport: true,
+      replayImport: true,
+      validationImport: true,
+    });
+  for (const facadeSource of [publicFacadeSource, testingFacadeSource]) {
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-history-folds.js");
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-history-replay.js");
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-history-validation.js");
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-lifecycle-error.js");
+  }
+});
+
 async function readPackageJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, "utf8"));
 }
