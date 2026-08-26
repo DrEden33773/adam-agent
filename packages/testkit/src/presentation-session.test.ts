@@ -3518,6 +3518,169 @@ test("PresentationSession preserves linked operation truth through session and r
   }
 });
 
+test("PresentationSession projects linked-operation status, progress, and artifact variants from Host truth", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-projection-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: settledModelTargets(),
+    stateRoot,
+    workspaceRoot,
+  });
+  const created = await lifecycle.create({ targetIdentity });
+  const origin = {
+    invocation: {
+      id: "review" as const,
+      kind: "presentation_command" as const,
+      version: 1 as const,
+    },
+    sessionId: created.sessionId,
+    sourceSequence: created.lastSequence,
+  };
+  const base = {
+    budget: {
+      inputBytes: 32,
+      outputBytesRemaining: 1_024,
+      progressBytesRemaining: 1_024,
+      progressRecordsRemaining: 8,
+    },
+    contributionId: "fixture.review",
+    deadlineAt: "2030-01-01T00:00:00.000Z",
+    extensionId: "fixture.extension",
+    extensionVersion: "1.0.0",
+    presentation: { kind: "descriptor" as const, report: null, title: "Review changes" },
+    startedAt: "2026-01-01T00:00:00.000Z",
+  };
+  const artifact = (id: string, operationId: string) => ({
+    byteCount: 17,
+    contract: { id: `fixture.${id}`, version: 1 },
+    id,
+    mediaType: "application/json",
+    provenance: {
+      contributionId: base.contributionId,
+      extensionId: base.extensionId,
+      extensionVersion: base.extensionVersion,
+      operationId,
+      projectId: "fixture-project",
+    },
+  });
+  const genericArtifact = artifact("failure-log", "operation-failed");
+  const inspectionEvidence = artifact("inspection-evidence", "operation-inspection");
+  const snapshots: readonly OperationSnapshot[] = [
+    {
+      ...base,
+      operationId: "operation-unlinked",
+      origin: null,
+      output: { ignored: true },
+      status: "completed",
+      throughSequence: 2,
+    },
+    {
+      ...base,
+      operationId: "operation-cancel-requested",
+      origin,
+      status: "cancel_requested",
+      throughSequence: 2,
+    },
+    {
+      ...base,
+      artifacts: [genericArtifact],
+      error: { code: "extension_execution_failed", message: "Review execution failed." },
+      operationId: "operation-failed",
+      origin,
+      progress: "Collected partial evidence.",
+      status: "failed",
+      throughSequence: 3,
+    },
+    {
+      ...base,
+      evidence: [
+        { type: "artifact", artifact: inspectionEvidence },
+        {
+          type: "record",
+          record: {
+            byteCount: 19,
+            contract: { id: "fixture.inspection-record", version: 1 },
+            digest: "fixture-record-digest",
+            key: "operations/operation-inspection",
+            provenance: inspectionEvidence.provenance,
+          },
+        },
+      ],
+      message: "Human inspection is required.",
+      operationId: "operation-inspection",
+      origin,
+      progress: null,
+      status: "inspection_required",
+      throughSequence: 4,
+    },
+  ];
+  const snapshotsById = new Map(snapshots.map((snapshot) => [snapshot.operationId, snapshot]));
+  const operations = presentationOperationHost({
+    async listLinked() {
+      return {
+        items: snapshots.map(({ operationId }) => ({ operationId })),
+        nextCursor: null,
+      };
+    },
+    async query(operationId) {
+      const snapshot = snapshotsById.get(operationId);
+      if (snapshot === undefined) {
+        throw new Error(`Unexpected operation query: ${operationId}`);
+      }
+      return snapshot;
+    },
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets: settledModelTargets(),
+      operations,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const projected = presentation.getState().authoritative.active?.linkedOperations ?? [];
+    const projectedById = new Map(projected.map((operation) => [operation.operationId, operation]));
+
+    expect([...projectedById.keys()].sort()).toEqual([
+      "operation-cancel-requested",
+      "operation-failed",
+      "operation-inspection",
+    ]);
+    expect(projectedById.get("operation-cancel-requested")).toMatchObject({
+      actions: [],
+      artifacts: [],
+      progress: null,
+      settlement: null,
+      status: "cancel_requested",
+    });
+    expect(projectedById.get("operation-failed")).toMatchObject({
+      actions: [],
+      artifacts: [{ role: "artifact" }],
+      progress: { summary: "Collected partial evidence." },
+      settlement: { code: "extension_execution_failed", message: "Review execution failed." },
+      status: "failed",
+    });
+    expect(projectedById.get("operation-inspection")).toMatchObject({
+      actions: [],
+      artifacts: [{ role: "evidence" }],
+      progress: null,
+      settlement: { message: "Human inspection is required." },
+      status: "inspection_required",
+    });
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("PresentationSession publishes linked operation progress and replaces it with durable completion", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-operation-progress-"));
   const stateRoot = join(testRoot, "state");
