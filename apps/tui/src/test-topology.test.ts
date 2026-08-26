@@ -1,11 +1,15 @@
-import { readFile } from "node:fs/promises";
+import { readdir, readFile } from "node:fs/promises";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, test } from "vitest";
 
 const behaviorSuitePath = fileURLToPath(new URL("./main.test.ts", import.meta.url));
 const operatingSystemSuitePath = fileURLToPath(new URL("./main.os.test.ts", import.meta.url));
+const tuiSourceRoot = fileURLToPath(new URL(".", import.meta.url));
+const productionEntryPath = fileURLToPath(new URL("./main.ts", import.meta.url));
 const productionTuiPath = fileURLToPath(new URL("./tui-app.ts", import.meta.url));
+const cliEntryPath = fileURLToPath(new URL("../../cli/src/main.ts", import.meta.url));
 const packagePath = fileURLToPath(new URL("../../../package.json", import.meta.url));
 const qualityWorkflowPath = fileURLToPath(
   new URL("../../../.github/workflows/quality.yml", import.meta.url),
@@ -84,6 +88,104 @@ test("every production overlay family enters Pi through the shared Adam frame", 
     expect(source).toContain(`new ${family}`);
   }
 });
+
+test("the production TUI has one app-private project runtime composition owner", async () => {
+  const [productionSources, entrySource, rendererSource, cliSource] = await Promise.all([
+    readProductionTuiSources(tuiSourceRoot),
+    readFile(productionEntryPath, "utf8"),
+    readFile(productionTuiPath, "utf8"),
+    readFile(cliEntryPath, "utf8"),
+  ]);
+  const runtimeSource = productionSources.get("project-runtime.ts");
+  expect(runtimeSource).toBeDefined();
+
+  for (const assemblyCall of [
+    "createExtensionHost",
+    "createFileArtifactStore",
+    "createJsonlOperationStore",
+    "createSessionLifecycle",
+    "createPresentationSession",
+  ]) {
+    expect(
+      [...productionSources]
+        .filter(([, source]) => importsFactoryFromAgent(source, assemblyCall))
+        .map(([path]) => path),
+    ).toEqual(["project-runtime.ts"]);
+  }
+  expect(
+    importsFactoryFromAgent(
+      'import { createExtensionHost as buildHost } from "@adam-agent/agent";',
+      "createExtensionHost",
+    ),
+  ).toBe(true);
+  expect(
+    importsFactoryFromAgent(
+      'import * as agent from "@adam-agent/agent";',
+      "createSessionLifecycle",
+    ),
+  ).toBe(true);
+  expect([...entrySource.matchAll(/\bcreateProductionProjectRuntime\(/gu)]).toHaveLength(1);
+  expect([...entrySource.matchAll(/\btuiProcessFailureMessage\(error\)/gu)]).toHaveLength(1);
+  expect(rendererSource).not.toContain("options.presentation.close()");
+  expect(rendererSource).toContain("options.closeRuntime()");
+  expect(cliSource).not.toContain("project-runtime.js");
+  const presentationClose = (runtimeSource as string).indexOf("await presentation.close();");
+  const lifecycleClose = (runtimeSource as string).indexOf(
+    "requireConfirmedLifecycleClose(await lifecycle.close());",
+  );
+  expect(presentationClose).toBeGreaterThan(-1);
+  expect(lifecycleClose).toBeGreaterThan(presentationClose);
+});
+
+async function readProductionTuiSources(root: string): Promise<ReadonlyMap<string, string>> {
+  const sources = new Map<string, string>();
+  await visit(root);
+  return new Map([...sources].sort(([left], [right]) => left.localeCompare(right)));
+
+  async function visit(directory: string): Promise<void> {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await visit(path);
+      } else if (entry.isFile() && isProductionTuiSource(entry.name)) {
+        sources.set(relative(root, path), await readFile(path, "utf8"));
+      }
+    }
+  }
+}
+
+function isProductionTuiSource(filename: string): boolean {
+  return (
+    filename.endsWith(".ts") &&
+    !filename.endsWith(".test.ts") &&
+    !filename.endsWith(".test-support.ts") &&
+    !filename.endsWith(".fixture.ts") &&
+    filename !== "fixture-scenario.ts" &&
+    filename !== "test-fixture.ts"
+  );
+}
+
+function importsFactoryFromAgent(source: string, factory: string): boolean {
+  if (/import\s+\*\s+as\s+\w+\s+from\s+["']@adam-agent\/agent["']/u.test(source)) {
+    return true;
+  }
+  for (const declaration of source.matchAll(
+    /import\s*\{([^}]*)\}\s*from\s*["']@adam-agent\/agent["']/gu,
+  )) {
+    const bindings = declaration[1] ?? "";
+    const importedNames = bindings.split(",").map((binding) =>
+      binding
+        .trim()
+        .replace(/^type\s+/u, "")
+        .split(/\s+as\s+/u)[0]
+        ?.trim(),
+    );
+    if (importedNames.includes(factory)) {
+      return true;
+    }
+  }
+  return false;
+}
 
 function topLevelTestBlocks(source: string): readonly string[] {
   const starts = [...source.matchAll(/^test\(/gmu)].map((match) => match.index);

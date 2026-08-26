@@ -77,6 +77,7 @@ export type TuiTargetStatus = {
 };
 
 export type RunTuiOptions = {
+  readonly closeRuntime: () => Promise<void>;
   readonly commandRegistry?: AdamCommandRegistry;
   readonly presentation: PresentationSession;
   readonly startupNotice?: string;
@@ -2310,7 +2311,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       failures.push(error);
     }
     try {
-      await options.presentation.close();
+      await options.closeRuntime();
     } catch (error) {
       failures.push(error);
     }
