@@ -134,25 +134,31 @@ test("the public claim guard recognizes representative positive inversions", () 
 
 test("the public walkthrough fixture is structurally bounded", async () => {
   const fixtureRoot = join(productRoot, "examples", "portfolio-walkthrough");
-  const [instructions, fixturePackage, fixtureEntries, acceptance] = await Promise.all([
-    readFile(join(fixtureRoot, "AGENTS.md"), "utf8"),
-    readPackageJson(join(fixtureRoot, "package.json")),
-    readdir(fixtureRoot, { recursive: true }),
-    readFile(join(productRoot, "docs", "portfolio-acceptance.md"), "utf8"),
-  ]);
+  const [instructions, fixturePackage, fixtureEntries, fixtureIgnore, fixtureLock, acceptance] =
+    await Promise.all([
+      readFile(join(fixtureRoot, "AGENTS.md"), "utf8"),
+      readPackageJson(join(fixtureRoot, "package.json")),
+      readdir(fixtureRoot, { recursive: true }),
+      readFile(join(fixtureRoot, ".gitignore"), "utf8"),
+      readFile(join(fixtureRoot, "pnpm-lock.yaml"), "utf8"),
+      readFile(join(productRoot, "docs", "portfolio-acceptance.md"), "utf8"),
+    ]);
 
   expect(fixturePackage).toEqual({
     name: "adam-portfolio-walkthrough-fixture",
     version: "0.0.0",
     private: true,
     type: "module",
+    packageManager: "pnpm@11.21.0",
     engines: { node: ">=24.0.0 <25" },
     scripts: { test: "node test/order-total.test.ts" },
   });
   expect([...fixtureEntries].sort()).toEqual(
     [
+      ".gitignore",
       "AGENTS.md",
       "package.json",
+      "pnpm-lock.yaml",
       "src",
       "src/discounts.ts",
       "src/order-total.ts",
@@ -162,6 +168,9 @@ test("the public walkthrough fixture is structurally bounded", async () => {
   );
   expect(instructions).toContain("Change only `src/order-total.ts`");
   expect(instructions).toContain("Run `pnpm test`");
+  expect(fixtureIgnore).toBe("node_modules/\n");
+  expect(fixtureLock).toContain("lockfileVersion: '9.0'");
+  expect(fixtureLock).toContain("  .: {}\n");
   expect(acceptance).toContain("examples/portfolio-walkthrough");
 });
 
