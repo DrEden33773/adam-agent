@@ -254,6 +254,8 @@ test("SessionLifecycle canonical history projections have package-internal owner
     attemptStatus: ["session-history-folds.ts"],
     contextSnapshotFromRecords: ["session-history-folds.ts"],
     contextUsageSnapshotFromRecords: ["session-history-folds.ts"],
+    createInheritedContextEvidence: ["session-lineage.ts"],
+    createSessionLineageTraversal: ["session-lineage.ts"],
     hasSuccessfullySettledAssistant: ["session-history-validation.ts"],
     inlineModelResponseField: ["session-history-replay.ts"],
     isCompleteBranchBoundary: ["session-history-folds.ts"],
@@ -265,11 +267,14 @@ test("SessionLifecycle canonical history projections have package-internal owner
     modelMessagesFromCanonicalRecords: ["session-history-replay.ts"],
     modelMessagesFromCompleteRecords: ["session-history-replay.ts"],
     promptContextRecordFromRecords: ["session-history-folds.ts"],
+    readValidatedLineagePrefix: ["session-lineage.ts"],
     sessionDisplayLabelFromRecords: ["session-history-folds.ts"],
+    sessionInheritsSourceBoundary: ["session-lineage.ts"],
     skillContextRecordFromRecords: ["session-history-folds.ts"],
     snapshotFromGenesis: ["session-history-folds.ts"],
     snapshotFromRecords: ["session-history-folds.ts"],
     validateCurrentSessionHistory: ["session-history-validation.ts"],
+    validateSessionLineage: ["session-lineage.ts"],
   } as const;
   const actualOwners = Object.fromEntries(
     Object.keys(expectedOwners).map((symbol) => [
@@ -294,10 +299,13 @@ test("SessionLifecycle canonical history projections have package-internal owner
     LegacySessionSnapshot: ["session-snapshot-contracts.ts"],
     ModelResponseArtifactDegradation: ["session-history-folds.ts"],
     ModelResponseArtifactInspection: ["session-history-folds.ts"],
+    SessionLineageRecordReader: ["session-lineage.ts"],
+    SessionLineageTraversal: ["session-lineage.ts"],
     SessionContextSnapshot: ["session-snapshot-contracts.ts"],
     SessionContextUsageSnapshot: ["session-snapshot-contracts.ts"],
     SessionResumeResult: ["session-snapshot-contracts.ts"],
     SessionSnapshot: ["session-snapshot-contracts.ts"],
+    ValidatedLineagePrefix: ["session-lineage.ts"],
   } as const;
   const actualTypeOwners = Object.fromEntries(
     Object.keys(expectedTypeOwners).map((symbol) => [
@@ -316,6 +324,7 @@ test("SessionLifecycle canonical history projections have package-internal owner
       "session-history-replay.ts",
       "session-history-validation.ts",
       "session-lifecycle-error.ts",
+      "session-lineage.ts",
       "session-snapshot-contracts.ts",
     ].includes(path),
   );
@@ -337,6 +346,7 @@ test("SessionLifecycle canonical history projections have package-internal owner
       .map((specifier) => ({ path, specifier })),
   );
   const lifecycleSource = sources.find(({ path }) => path === "session-lifecycle.ts")?.source ?? "";
+  const lineageSource = sources.find(({ path }) => path === "session-lineage.ts")?.source ?? "";
   const publicFacadeSource = sources.find(({ path }) => path === "index.ts")?.source ?? "";
   const testingFacadeSource =
     sources.find(({ path }) => path === "internal-testing.ts")?.source ?? "";
@@ -377,7 +387,7 @@ test("SessionLifecycle canonical history projections have package-internal owner
               (specifier) =>
                 /(?:session-history-(?:folds|replay|validation)|session-lifecycle-error)\.js$/u.test(
                   specifier,
-                ) || /session-snapshot-contracts\.js$/u.test(specifier),
+                ) || /session-(?:lineage|snapshot-contracts)\.js$/u.test(specifier),
             )
             .map((specifier) => ({
               path: relative(productRoot, testPath),
@@ -388,6 +398,39 @@ test("SessionLifecycle canonical history projections have package-internal owner
   ).flat();
 
   expect.soft(forbiddenImports).toEqual([]);
+  expect
+    .soft(
+      moduleSpecifiers(lineageSource).filter((specifier) =>
+        [
+          "./agent-session.js",
+          "./artifact-store.js",
+          "./extension-host.js",
+          "./index.js",
+          "./mcp-host.js",
+          "./session-lifecycle.js",
+          "@adam-agent/agent",
+          "@adam-agent/presentation",
+          "node:child_process",
+          "node:fs",
+          "node:fs/promises",
+          "node:process",
+        ].includes(specifier),
+      ),
+    )
+    .toEqual([]);
+  expect
+    .soft({
+      storeSpecifierReferences: moduleSpecifiers(lineageSource).filter(
+        (specifier) => specifier === "./session-store.js",
+      ).length,
+      storeRuntimeImport: /import\s+(?!type\b)[^;]*from\s+"\.\/session-store\.js";/su.test(
+        lineageSource,
+      ),
+      storeTypeImport: /import\s+type\s+\{[^}]*\}\s+from\s+"\.\/session-store\.js";/su.test(
+        lineageSource,
+      ),
+    })
+    .toEqual({ storeSpecifierReferences: 1, storeRuntimeImport: false, storeTypeImport: true });
   expect.soft(directTestImports).toEqual([]);
   expect
     .soft({
@@ -395,6 +438,7 @@ test("SessionLifecycle canonical history projections have package-internal owner
       errorReexport: lifecycleSource.includes(
         'export { SessionLifecycleError } from "./session-lifecycle-error.js";',
       ),
+      lineageImport: lifecycleSource.includes('from "./session-lineage.js"'),
       replayImport: lifecycleSource.includes('from "./session-history-replay.js"'),
       snapshotContractReferences: moduleSpecifiers(lifecycleSource).filter(
         (specifier) => specifier === "./session-snapshot-contracts.js",
@@ -404,6 +448,7 @@ test("SessionLifecycle canonical history projections have package-internal owner
     .toEqual({
       errorImport: true,
       errorReexport: true,
+      lineageImport: true,
       replayImport: true,
       snapshotContractReferences: 2,
       validationImport: true,
@@ -413,6 +458,7 @@ test("SessionLifecycle canonical history projections have package-internal owner
     expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-history-replay.js");
     expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-history-validation.js");
     expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-lifecycle-error.js");
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-lineage.js");
     expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-snapshot-contracts.js");
   }
 });
