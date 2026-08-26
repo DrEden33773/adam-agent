@@ -12,7 +12,11 @@ import {
   createSessionLifecycle,
 } from "@adam-agent/agent";
 import { afterEach, expect, test } from "vitest";
-import { removeTuiFixtureRoot as rm, waitForPath } from "./tui-filesystem.test-support.js";
+import {
+  removeTuiFixtureRoot as rm,
+  waitForFileContents,
+  waitForPath,
+} from "./tui-filesystem.test-support.js";
 import {
   cleanupActiveTuiFixtures,
   startTuiFixture as startFixture,
@@ -428,8 +432,7 @@ test("the production TUI composes the Linux clipboard adapter for copy commands"
         .then(() => "unavailable" as const),
     ]);
     expect(copyStatus).toBe("copied");
-    await waitForPath(clipboardMarker);
-    await expect(readFile(clipboardMarker, "utf8")).resolves.toBe(assistantText);
+    await expect(waitForFileContents(clipboardMarker, assistantText)).resolves.toBe(assistantText);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {

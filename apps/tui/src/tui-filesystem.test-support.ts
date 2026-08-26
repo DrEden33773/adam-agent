@@ -14,36 +14,65 @@ export async function removeTuiFixtureRoot(
 }
 
 export async function waitForPath(path: string): Promise<void> {
+  await waitForFilesystemEffect(
+    path,
+    async () =>
+      access(path).then(
+        () => true,
+        () => undefined,
+      ),
+    "create",
+  );
+}
+
+export async function waitForFileContents(path: string, expected: string): Promise<string> {
+  return await waitForFilesystemEffect(
+    path,
+    async () => {
+      try {
+        const contents = await readFile(path, "utf8");
+        return contents === expected ? contents : undefined;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          return undefined;
+        }
+        throw error;
+      }
+    },
+    "publish the expected contents for",
+  );
+}
+
+async function waitForFilesystemEffect<T>(
+  path: string,
+  observe: () => Promise<T | undefined>,
+  action: string,
+): Promise<T> {
   const directory = join(path, "..");
   const filename = path.slice(directory.length + 1);
   const watcher = watch(directory);
   const failure = Promise.withResolvers<never>();
   const guard = setTimeout(
-    () => failure.reject(new Error(`The fixture did not create ${filename}.`)),
+    () => failure.reject(new Error(`The fixture did not ${action} ${filename}.`)),
     missingFilesystemEffectFailureMilliseconds,
   );
   guard.unref();
   try {
-    if (
-      await access(path).then(
-        () => true,
-        () => false,
-      )
-    ) {
-      return;
+    const initial = await observe();
+    if (initial !== undefined) {
+      return initial;
     }
-    await Promise.race([
+    return await Promise.race([
       (async () => {
         for await (const _event of watcher) {
-          if (
-            await access(path).then(
-              () => true,
-              () => false,
-            )
-          ) {
-            return;
+          const observed = await observe();
+          if (observed !== undefined) {
+            return observed;
           }
         }
+        throw new Error(
+          `The filesystem watcher closed before the fixture could ${action} ${filename}.`,
+        );
       })(),
       failure.promise,
     ]);
