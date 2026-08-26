@@ -621,6 +621,7 @@ function observeTuiDispatch(
   },
 ): PresentationSession {
   const controlRoot = options.controlRoot;
+  const observeNamingDispatch = controlRoot !== undefined;
   const observeDispatch =
     controlRoot !== undefined &&
     (options.scenario === "mutation-delayed-preview" ||
@@ -629,7 +630,7 @@ function observeTuiDispatch(
       options.scenario === "artifact-page-race" ||
       options.scenario === "review-completed" ||
       options.scenario === "review-recovery");
-  if (!observeDispatch && options.presentationCloseMarker === undefined) {
+  if (!observeNamingDispatch && !observeDispatch && options.presentationCloseMarker === undefined) {
     return presentation;
   }
   let artifactReadCount = 0;
@@ -642,6 +643,15 @@ function observeTuiDispatch(
     },
     dispatch: async (command) => {
       const receipt = presentation.dispatch(command);
+      if (command.type === "set_session_manual_name" && controlRoot !== undefined) {
+        const settled = await receipt;
+        await writeFile(
+          join(controlRoot, "session-name-dispatch-settled"),
+          `${settled.status}\n`,
+          "utf8",
+        );
+        return settled;
+      }
       if (!observeDispatch) {
         return receipt;
       }

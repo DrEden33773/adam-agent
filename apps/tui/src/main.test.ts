@@ -1104,14 +1104,18 @@ test("the production editor renames the active session through canonical Present
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-name-session-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
   await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
 
   try {
-    const fixture = startFixture({ stateRoot, workspaceRoot });
+    const fixture = startFixture({ controlRoot, stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     const beforeRename = fixture.output().length;
     fixture.write("/name Release triage\r");
-    await fixture.waitForAfter("Release triage", beforeRename);
+    const settledMarker = join(controlRoot, "session-name-dispatch-settled");
+    await expect(waitForFileContents(settledMarker, "admitted\n")).resolves.toBe("admitted\n");
+    await fixture.waitForCompleteFrameAfter("Adam · Release triage", beforeRename);
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
