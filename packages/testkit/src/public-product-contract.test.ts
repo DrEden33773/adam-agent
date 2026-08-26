@@ -463,6 +463,119 @@ test("SessionLifecycle canonical history projections have package-internal owner
   }
 });
 
+test("PresentationSession linked-operation projection has one package-internal owner", async () => {
+  const agentSourceRoot = join(productRoot, "packages", "agent", "src");
+  const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
+    .filter((entry) => entry.endsWith(".ts"))
+    .sort();
+  const sources = await Promise.all(
+    sourceFiles.map(async (sourceFile) => ({
+      path: sourceFile,
+      source: await readFile(join(agentSourceRoot, sourceFile), "utf8"),
+    })),
+  );
+  const expectedOwners = {
+    projectLinkedOperation: ["presentation-operation-projection.ts"],
+  } as const;
+  const actualOwners = Object.fromEntries(
+    Object.keys(expectedOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) => new RegExp(`\\bfunction\\s+${symbol}\\s*\\(`, "u").test(source))
+        .map(({ path }) => path),
+    ]),
+  );
+  const expectedTypeOwners = {
+    ProjectedOperation: ["presentation-operation-projection.ts"],
+  } as const;
+  const actualTypeOwners = Object.fromEntries(
+    Object.keys(expectedTypeOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) => new RegExp(`\\bexport\\s+type\\s+${symbol}\\b`, "u").test(source))
+        .map(({ path }) => path),
+    ]),
+  );
+  const projectionSource =
+    sources.find(({ path }) => path === "presentation-operation-projection.ts")?.source ?? "";
+  const projectionConsumers = sources
+    .filter(({ source }) =>
+      moduleSpecifiers(source).includes("./presentation-operation-projection.js"),
+    )
+    .map(({ path }) => path);
+  const projectionDependencies = [...moduleSpecifiers(projectionSource)].sort();
+  const testSourceRoots = (
+    await Promise.all(
+      ["apps", "packages"].map(async (root) =>
+        (
+          await readdir(join(productRoot, root), { withFileTypes: true })
+        )
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => join(productRoot, root, entry.name, "src")),
+      ),
+    )
+  ).flat();
+  const testSources = (
+    await Promise.all(
+      testSourceRoots.map(async (sourceRoot) => {
+        try {
+          return (await readdir(sourceRoot, { recursive: true }))
+            .filter((entry) => entry.endsWith(".test.ts"))
+            .map((entry) => join(sourceRoot, entry));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return [];
+          }
+          throw error;
+        }
+      }),
+    )
+  ).flat();
+  const directTestImports = (
+    await Promise.all(
+      testSources
+        .filter((testPath) => testPath !== fileURLToPath(import.meta.url))
+        .map(async (testPath) =>
+          moduleSpecifiers(await readFile(testPath, "utf8"))
+            .filter((specifier) => /presentation-operation-projection\.js$/u.test(specifier))
+            .map((specifier) => ({
+              path: relative(productRoot, testPath),
+              specifier,
+            })),
+        ),
+    )
+  ).flat();
+
+  expect.soft(actualOwners).toEqual(expectedOwners);
+  expect.soft(actualTypeOwners).toEqual(expectedTypeOwners);
+  expect.soft(projectionConsumers).toEqual(["presentation-session.ts"]);
+  expect.soft(projectionDependencies).toEqual(["./operation-host.js", "@adam-agent/presentation"]);
+  expect
+    .soft({
+      operationHostReferences: moduleSpecifiers(projectionSource).filter(
+        (specifier) => specifier === "./operation-host.js",
+      ).length,
+      operationHostTypeImport:
+        /import\s+type\s+\{[^}]*OperationSnapshot[^}]*\}\s+from\s+"\.\/operation-host\.js";/su.test(
+          projectionSource,
+        ),
+      presentationReferences: moduleSpecifiers(projectionSource).filter(
+        (specifier) => specifier === "@adam-agent/presentation",
+      ).length,
+      presentationTypeImport:
+        /import\s+type\s+\{[^}]*OperationDisplay[^}]*\}\s+from\s+"@adam-agent\/presentation";/su.test(
+          projectionSource,
+        ),
+    })
+    .toEqual({
+      operationHostReferences: 1,
+      operationHostTypeImport: true,
+      presentationReferences: 1,
+      presentationTypeImport: true,
+    });
+  expect.soft(directTestImports).toEqual([]);
+});
+
 async function readPackageJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, "utf8"));
 }
