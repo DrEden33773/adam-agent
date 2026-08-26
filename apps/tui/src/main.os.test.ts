@@ -466,6 +466,55 @@ test("the production TUI entry reaches a credentialed exact-target session witho
   }
 });
 
+test("the production TUI exposes one enabled extension Skill in the first-prompt draft", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-extension-skill-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  const packageRoot = join(testRoot, "extension-package");
+  const skillDirectory = join(packageRoot, "skills", "extension-procedure");
+  await mkdir(workspaceRoot);
+  await writeRecoverableReviewPackage(packageRoot);
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: extension-procedure\ndescription: Runs only from one enabled production extension.\n---\nExtension procedure body.\n",
+    "utf8",
+  );
+  await writeReviewExtensionConfiguration(configDirectory, packageRoot, { block: false });
+
+  try {
+    const fixture = startFixture({
+      program: {
+        arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
+        cwd: workspaceRoot,
+        entrypoint: productionPath,
+        environment: {
+          DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+          XDG_CONFIG_HOME: configRoot,
+        },
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforePalette = fixture.output().length;
+    fixture.write("/skills\r");
+    await fixture.waitForCompleteFrameAfter("Select next-turn Skills", beforePalette);
+    const paletteFrame = fixture.output().slice(beforePalette);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    expect(paletteFrame).toContain("extension-procedure ·");
+    expect(paletteFrame).toContain("Runs only from one enabled production extension.");
+    expect(paletteFrame).toContain("extension:fixture.recoverable-review@1.0.0 · available");
+    expect(paletteFrame).not.toContain("No matching commands");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the production TUI reviews real Git changes through the exact public Eve adapter and survives restart", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-eve-registry-"));
   const workspaceRoot = join(testRoot, "workspace");

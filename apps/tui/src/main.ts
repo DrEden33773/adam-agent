@@ -103,7 +103,13 @@ try {
       : rejectedExtensions === 0
         ? undefined
         : `${rejectedExtensions} configured extension${rejectedExtensions === 1 ? " is" : "s are"} unavailable.`;
-    lifecycle = createSessionLifecycle({ modelTargets, permissions, stateRoot, workspaceRoot });
+    lifecycle = createSessionLifecycle({
+      extensionHost: host,
+      modelTargets,
+      permissions,
+      stateRoot,
+      workspaceRoot,
+    });
     try {
       if (command.resumeSessionId !== undefined && command.targetId !== undefined) {
         throw new TuiConfigurationError("--resume and --target cannot be combined.");

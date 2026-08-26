@@ -578,6 +578,14 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       if (loadInFlight !== undefined) {
         return loadInFlight;
       }
+      const existing = options.extensions.map(({ extensionId }) =>
+        loadedSnapshots.get(extensionId),
+      );
+      if (
+        existing.every((snapshot): snapshot is ExtensionStateSnapshot => snapshot !== undefined)
+      ) {
+        return Promise.resolve({ extensions: existing });
+      }
       const operation = projectLifecycleOwner
         .run(async () => {
           const availableCapabilities = new Map(
