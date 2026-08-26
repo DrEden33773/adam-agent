@@ -265,6 +265,7 @@ test("SessionLifecycle canonical history projections have package-internal owner
     modelMessagesFromCanonicalRecords: ["session-history-replay.ts"],
     modelMessagesFromCompleteRecords: ["session-history-replay.ts"],
     promptContextRecordFromRecords: ["session-history-folds.ts"],
+    sessionDisplayLabelFromRecords: ["session-history-folds.ts"],
     skillContextRecordFromRecords: ["session-history-folds.ts"],
     snapshotFromGenesis: ["session-history-folds.ts"],
     snapshotFromRecords: ["session-history-folds.ts"],

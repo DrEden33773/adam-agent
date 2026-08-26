@@ -14,6 +14,7 @@ import {
 } from "./prompt-assembly.js";
 import { modelMessagesFromCanonicalRecords } from "./session-history-replay.js";
 import { SessionLifecycleError } from "./session-lifecycle-error.js";
+import { sessionTitleFallback } from "./session-naming.js";
 import type {
   CurrentSessionSnapshot,
   SessionContextSnapshot,
@@ -240,6 +241,32 @@ export type ModelResponseArtifactInspection = {
 
 export function isGenesisRecord(record: SessionRecord): record is SessionGenesisRecord {
   return record.schemaVersion === 3 && record.record.type === "session_genesis";
+}
+
+export function sessionDisplayLabelFromRecords(records: readonly SessionRecord[]): string {
+  const genesis = records[0];
+  let fallbackTitle =
+    genesis?.schemaVersion === 3 && genesis.record.type === "session_genesis"
+      ? (genesis.record.naming?.fallbackTitle ?? null)
+      : null;
+  let manualName: string | null = null;
+  let generatedTitle: string | null = null;
+  for (const entry of records) {
+    if (entry.schemaVersion !== 3) {
+      continue;
+    }
+    if (entry.record.type === "logical_run_started" && fallbackTitle === null) {
+      fallbackTitle =
+        entry.record.naming?.fallbackTitle ?? sessionTitleFallback(entry.record.userMessage);
+    } else if (entry.record.type === "session_manual_name_set") {
+      manualName = entry.record.name;
+    } else if (entry.record.type === "session_manual_name_cleared") {
+      manualName = null;
+    } else if (entry.record.type === "session_title_generation_completed") {
+      generatedTitle = entry.record.title;
+    }
+  }
+  return manualName ?? generatedTitle ?? fallbackTitle ?? "New session";
 }
 
 export function attemptStatus(

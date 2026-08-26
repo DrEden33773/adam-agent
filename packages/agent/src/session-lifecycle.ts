@@ -106,6 +106,7 @@ import {
   type ModelResponseArtifactDegradation,
   type ModelResponseArtifactInspection,
   promptContextRecordFromRecords,
+  sessionDisplayLabelFromRecords,
   skillContextRecordFromRecords,
   snapshotFromGenesis,
   snapshotFromRecords,
@@ -3739,32 +3740,6 @@ function boundedTitleInput(input: string): string {
     bounded += character;
   }
   return bounded;
-}
-
-function sessionDisplayLabelFromRecords(records: readonly SessionRecord[]): string {
-  const genesis = records[0];
-  let fallbackTitle =
-    genesis?.schemaVersion === 3 && genesis.record.type === "session_genesis"
-      ? (genesis.record.naming?.fallbackTitle ?? null)
-      : null;
-  let manualName: string | null = null;
-  let generatedTitle: string | null = null;
-  for (const entry of records) {
-    if (entry.schemaVersion !== 3) {
-      continue;
-    }
-    if (entry.record.type === "logical_run_started" && fallbackTitle === null) {
-      fallbackTitle =
-        entry.record.naming?.fallbackTitle ?? sessionTitleFallback(entry.record.userMessage);
-    } else if (entry.record.type === "session_manual_name_set") {
-      manualName = entry.record.name;
-    } else if (entry.record.type === "session_manual_name_cleared") {
-      manualName = null;
-    } else if (entry.record.type === "session_title_generation_completed") {
-      generatedTitle = entry.record.title;
-    }
-  }
-  return manualName ?? generatedTitle ?? fallbackTitle ?? "New session";
 }
 
 function mcpWorkspaceConfirmationFromRecords(
