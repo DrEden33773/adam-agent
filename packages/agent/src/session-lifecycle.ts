@@ -101,7 +101,7 @@ import {
   type ModelResponseArtifactDegradation,
   type ModelResponseArtifactInspection,
   promptContextRecordFromRecords,
-  sessionDisplayLabelFromRecords,
+  sessionNamingStateFromRecords,
   skillContextRecordFromRecords,
   snapshotFromGenesis,
   snapshotFromRecords,
@@ -1910,7 +1910,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         const store = await sessionStoreDirectoryFrom(options).create(sessionId);
         const prefix = `${parentPrefix.map((record) => JSON.stringify(record)).join("\n")}\n`;
         const branchFallback = sessionTitleFallback(
-          `Branch of ${sessionDisplayLabelFromRecords(parentRecords)}`,
+          `Branch of ${sessionNamingStateFromRecords(parentRecords).displayLabel}`,
         );
         const genesis: SessionGenesisRecord = {
           schemaVersion: 3,
