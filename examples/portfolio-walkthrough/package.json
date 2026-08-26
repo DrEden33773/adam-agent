@@ -1,0 +1,12 @@
+{
+  "name": "adam-portfolio-walkthrough-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0 <25"
+  },
+  "scripts": {
+    "test": "node test/order-total.test.ts"
+  }
+}

@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -307,15 +307,27 @@ test("the production TUI entry exposes its usage contract", async () => {
 
   try {
     const fixture = startFixture({
-      program: { arguments: ["--help"], cwd: workspaceRoot, entrypoint: productionPath },
+      program: {
+        arguments: ["--help"],
+        cwd: workspaceRoot,
+        entrypoint: productionPath,
+        environment: { ADAM_AGENT_STATE_ROOT: stateRoot },
+      },
       stateRoot,
       workspaceRoot,
     });
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("Adam Agent TUI");
+    expect(result.stdout).toContain("pnpm tui --target fake.local");
+    expect(result.stdout).toContain("pnpm tui --resume <session-id>");
     expect(result.stdout).toContain(
-      "Usage: adam-agent-tui [--target <exact-target-id> | --resume <session-id>]",
+      "Under the default policy, built-in write and execute tools require call-scoped approval.",
     );
+    expect(result.stdout).toContain("Credentials remain external plaintext inputs.");
+    expect(result.stdout).toContain("Session state and artifacts are owner-only local files.");
+    expect(result.stdout).toContain("Adam does not provide an OS, process, or network sandbox.");
+    await expect(stat(stateRoot)).rejects.toMatchObject({ code: "ENOENT" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

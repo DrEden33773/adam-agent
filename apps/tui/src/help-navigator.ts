@@ -14,7 +14,7 @@ import {
 } from "./command-registry.js";
 import type { AdamTuiTheme } from "./theme.js";
 
-export type HelpPage = "commands" | "editor" | "hotkeys" | "root";
+export type HelpPage = "commands" | "editor" | "hotkeys" | "root" | "safety";
 
 export class HelpNavigator implements Component, Focusable {
   focused = false;
@@ -134,6 +134,23 @@ function helpContent(
       ...keybindings
         .filter((binding) => binding.section === "editor")
         .map((binding) => `${theme.toolTitle(binding.keys)}  ${binding.description}`),
+      "",
+      theme.muted("Esc back"),
+    ];
+  }
+  if (page === "safety") {
+    return [
+      theme.toolTitle("Safety and Trust"),
+      "",
+      "Default built-in policy:",
+      "  Write/execute: exact-call approval.",
+      "Built-in file tools:",
+      "  Reject traversal/symlink escape.",
+      "Shell/MCP: same-user authority.",
+      "Extensions: trusted in-process code.",
+      "Credentials: external plaintext.",
+      "State/artifacts: owner-only local.",
+      "No OS/process/network sandbox.",
       "",
       theme.muted("Esc back"),
     ];
