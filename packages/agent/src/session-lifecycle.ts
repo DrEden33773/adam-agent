@@ -23,11 +23,6 @@ import {
 } from "./artifact-store.js";
 import { isContextProfileSupported } from "./context-profile.js";
 import {
-  type ContextEvidenceV1,
-  mergeContextEvidence,
-  reduceContextEvidence,
-} from "./durable-context.js";
-import {
   maximumModelResponseContentBytes,
   maximumReferencedModelResponseArtifactBytes,
 } from "./durable-model-response-policy.js";
@@ -120,6 +115,7 @@ import {
   validateCurrentSessionHistory,
 } from "./session-history-validation.js";
 import { SessionLifecycleError } from "./session-lifecycle-error.js";
+import { createSessionLineageTraversal, type SessionLineageTraversal } from "./session-lineage.js";
 import { normalizedSessionTitle, sessionTitleFallback } from "./session-naming.js";
 import type {
   CurrentSessionSnapshot,
@@ -605,6 +601,13 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           : { stateRoot: providedOptions.stateRoot }),
       }),
   };
+  const lineage = createSessionLineageTraversal({
+    readRecords: async (sessionId) => {
+      const store = await storeDirectory.open(sessionId);
+      return store?.read() ?? [];
+    },
+    workspaceRoot: options.workspaceRoot,
+  });
   const listeners = new Set<RuntimeEventListener>();
   const sessionEventListeners = new Set<SessionRuntimeNotificationListener>();
   const metadataListeners = new Set<SessionMetadataListener>();
@@ -1224,12 +1227,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       throw new SessionLifecycleError("session_project_mismatch");
     }
     validateCurrentSessionHistory(first, records, options.workspaceRoot);
-    await validateSessionLineage(options, first, new Set([input.sessionId]));
-    await validateMcpAuthorityFromLineage(options, first, records);
-    await skillResourceBytesFromLineage(options, first, records);
-    await validateInheritedContextEvidence(options, first, records);
+    await lineage.validateSessionLineage(first, records);
+    await validateMcpAuthorityFromLineage(lineage, first, records);
+    await skillResourceBytesFromLineage(lineage, first, records);
     const artifactInspection = await inspectModelResponseArtifactLineage(
       options,
+      lineage,
       first,
       records,
       artifactCache,
@@ -1237,6 +1240,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     if (artifactInspection.degradation === undefined) {
       await validatePromptProjectionDigests(
         options,
+        lineage,
         first,
         artifactInspection.records,
         artifactCache,
@@ -1247,14 +1251,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     const snapshot = snapshotFromRecords(first, replayRecords, artifactInspection);
     const inheritedContext =
       artifactInspection.degradation === undefined
-        ? await contextSnapshotFromLineage(options, first, replayRecords, artifactCache)
+        ? await contextSnapshotFromLineage(options, lineage, first, replayRecords, artifactCache)
         : undefined;
     const [mcpWorkspaceConfirmation, mcpServerApprovals, mcpCommittedProfile, mcpCatalogState] =
       await Promise.all([
-        mcpWorkspaceConfirmationFromLineage(options, first, records),
-        mcpServerApprovalsFromLineage(options, first, records),
-        mcpCommittedProfileFromLineage(options, first, records),
-        mcpCatalogStateFromLineage(options, first, records),
+        mcpWorkspaceConfirmationFromLineage(lineage, first, records),
+        mcpServerApprovalsFromLineage(lineage, first, records),
+        mcpCommittedProfileFromLineage(lineage, first, records),
+        mcpCatalogStateFromLineage(lineage, first, records),
       ]);
     let mcp: McpSessionSnapshot | undefined;
     try {
@@ -1301,10 +1305,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       throw new SessionLifecycleError("session_project_mismatch");
     }
     validateCurrentSessionHistory(first, records, options.workspaceRoot);
-    await validateSessionLineage(options, first, new Set([input.sessionId]));
-    await validateInheritedContextEvidence(options, first, records);
+    await lineage.validateSessionLineage(first, records);
     const artifactInspection = await inspectModelResponseArtifactLineage(
       options,
+      lineage,
       first,
       records,
       artifactCache,
@@ -1315,6 +1319,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     return (
       (await contextUsageSnapshotFromLineage(
         options,
+        lineage,
         first,
         artifactInspection.records,
         artifactCache,
@@ -1400,7 +1405,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         const profile =
           promptGenesis === undefined || !isGenesisRecord(promptGenesis)
             ? undefined
-            : await mcpCommittedProfileFromLineage(options, promptGenesis, promptRecords);
+            : await mcpCommittedProfileFromLineage(lineage, promptGenesis, promptRecords);
         if (profile === undefined || profile.digest !== activePromptContext.mcp.profileDigest) {
           throw new SessionLifecycleError("session_invalid");
         }
@@ -1791,12 +1796,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (
           parentGenesisRecord === undefined ||
           !isGenesisRecord(parentGenesisRecord) ||
-          !(await sessionInheritsSourceBoundary(
-            options,
+          !(await lineage.sessionInheritsSourceBoundary(
             parentGenesisRecord,
             sourceSessionId,
             sourceEventPosition,
-            new Set(),
           ))
         ) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
@@ -1814,8 +1817,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           throw new SessionLifecycleError("session_invalid");
         }
         validateCurrentSessionHistory(parentGenesis, parentPrefix, options.workspaceRoot);
-        await validateMcpAuthorityFromLineage(options, parentGenesis, parentPrefix);
-        await replayArtifactBytesFromLineage(options, parentGenesis, parentPrefix, artifactCache);
+        await validateMcpAuthorityFromLineage(lineage, parentGenesis, parentPrefix);
+        await replayArtifactBytesFromLineage(
+          options,
+          lineage,
+          parentGenesis,
+          parentPrefix,
+          artifactCache,
+        );
         if (!isCompleteBranchBoundary(parentPrefix)) {
           throw new SessionLifecycleError("session_branch_boundary_invalid");
         }
@@ -1839,7 +1848,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             throw new SessionLifecycleError("session_model_target_unavailable");
           }
           if (
-            (await modelResponseTargetsFromBranchContext(options, parentPrefix)).some(
+            (await modelResponseTargetsFromBranchContext(lineage, parentPrefix)).some(
               (identity) => !areReplayProfilesCompatible(target.identity, identity),
             )
           ) {
@@ -2129,7 +2138,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           persistedPromptContext.mcp !== undefined
         ) {
           const profile = requireMcpCommittedProfile(
-            await mcpCommittedProfileFromLineage(options, first, records),
+            await mcpCommittedProfileFromLineage(lineage, first, records),
             persistedPromptContext,
           );
           committedMcpProfile = profile;
@@ -2336,18 +2345,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         );
         const referencedModelResponseArtifactBytes = await replayArtifactBytesFromLineage(
           options,
+          lineage,
           first,
           records,
           artifactCache,
         );
         const skillResourceLineageBytes = await skillResourceBytesFromLineage(
-          options,
+          lineage,
           first,
           replayRecords,
         );
         const [inheritedMessages, inheritedEvidence] = await Promise.all([
-          createBranchMessages(options, records, artifactCache),
-          createBranchEvidence(options, records),
+          createBranchMessages(options, lineage, records, artifactCache),
+          lineage.createInheritedContextEvidence(records),
         ]);
         const resumeState =
           resumed.snapshot.status === "interrupted"
@@ -2470,7 +2480,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                     ),
                 }),
             ...(activeSkillContents.size === 0 ? {} : { activeSkillContents }),
-            ...(hasContextEvidence(inheritedEvidence) ? { inheritedEvidence } : {}),
+            ...(inheritedEvidence === undefined ? {} : { inheritedEvidence }),
             ...(resumeState !== undefined || initialMessages.length === 0
               ? {}
               : { initialMessages }),
@@ -2724,7 +2734,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               throw new SessionLifecycleError("session_invalid");
             }
             reactivationProfile = requireMcpCommittedProfile(
-              await mcpCommittedProfileFromLineage(options, genesis, activationRecords),
+              await mcpCommittedProfileFromLineage(lineage, genesis, activationRecords),
               promptContext,
             );
             if (
@@ -3082,7 +3092,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           if (genesis === undefined || !isGenesisRecord(genesis)) {
             throw new SessionLifecycleError("session_invalid");
           }
-          const profile = await mcpCommittedProfileFromLineage(options, genesis, records);
+          const profile = await mcpCommittedProfileFromLineage(lineage, genesis, records);
           if (profile?.digest !== inspected.mcp.profile.digest) {
             throw new SessionLifecycleError("session_invalid");
           }
@@ -3903,7 +3913,7 @@ function mcpStaleCatalogServersFromRecords(
 }
 
 async function mcpWorkspaceConfirmationFromLineage(
-  options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
 ): Promise<SessionMcpWorkspaceConfirmedRecord["record"] | undefined> {
@@ -3911,12 +3921,12 @@ async function mcpWorkspaceConfirmationFromLineage(
   if (own !== undefined || genesis.record.lineage === undefined) {
     return own;
   }
-  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
-  return mcpWorkspaceConfirmationFromLineage(options, parentGenesis, prefixRecords);
+  const { parentGenesis, prefixRecords } = await lineage.readValidatedLineagePrefix(genesis);
+  return mcpWorkspaceConfirmationFromLineage(lineage, parentGenesis, prefixRecords);
 }
 
 async function mcpServerApprovalsFromLineage(
-  options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
 ): Promise<ReadonlyMap<string, `sha256:${string}`>> {
@@ -3925,11 +3935,9 @@ async function mcpServerApprovalsFromLineage(
       ? new Map<string, `sha256:${string}`>()
       : new Map(
           await (async () => {
-            const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(
-              options,
-              genesis,
-            );
-            return mcpServerApprovalsFromLineage(options, parentGenesis, prefixRecords);
+            const { parentGenesis, prefixRecords } =
+              await lineage.readValidatedLineagePrefix(genesis);
+            return mcpServerApprovalsFromLineage(lineage, parentGenesis, prefixRecords);
           })(),
         );
   for (const [serverId, digest] of mcpServerApprovalsFromRecords(records)) {
@@ -3939,7 +3947,7 @@ async function mcpServerApprovalsFromLineage(
 }
 
 async function mcpCommittedProfileFromLineage(
-  options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
 ): Promise<McpToolProfileV1 | undefined> {
@@ -3947,12 +3955,12 @@ async function mcpCommittedProfileFromLineage(
   if (own !== undefined || genesis.record.lineage === undefined) {
     return own;
   }
-  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
-  return mcpCommittedProfileFromLineage(options, parentGenesis, prefixRecords);
+  const { parentGenesis, prefixRecords } = await lineage.readValidatedLineagePrefix(genesis);
+  return mcpCommittedProfileFromLineage(lineage, parentGenesis, prefixRecords);
 }
 
 async function mcpCatalogStateFromLineage(
-  options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
 ): Promise<"ready" | "stale" | "shutdown_unconfirmed" | undefined> {
@@ -3960,8 +3968,8 @@ async function mcpCatalogStateFromLineage(
   if (own !== undefined || genesis.record.lineage === undefined) {
     return own;
   }
-  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
-  return mcpCatalogStateFromLineage(options, parentGenesis, prefixRecords);
+  const { parentGenesis, prefixRecords } = await lineage.readValidatedLineagePrefix(genesis);
+  return mcpCatalogStateFromLineage(lineage, parentGenesis, prefixRecords);
 }
 
 type McpLineageAuthority = {
@@ -3971,14 +3979,14 @@ type McpLineageAuthority = {
 };
 
 async function validateMcpAuthorityFromLineage(
-  options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
 ): Promise<McpLineageAuthority> {
   let inherited: McpLineageAuthority = { approvals: new Map() };
   if (genesis.record.lineage !== undefined) {
-    const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
-    inherited = await validateMcpAuthorityFromLineage(options, parentGenesis, prefixRecords);
+    const { parentGenesis, prefixRecords } = await lineage.readValidatedLineagePrefix(genesis);
+    inherited = await validateMcpAuthorityFromLineage(lineage, parentGenesis, prefixRecords);
   }
   const authority: McpLineageAuthority = {
     approvals: new Map(inherited.approvals),
@@ -4094,105 +4102,9 @@ function mcpProfileDefinitionRegistry(profile: McpToolProfileV1): ToolRegistry {
   };
 }
 
-async function validateSessionLineage(
-  options: SessionLifecycleOptions,
-  genesis: SessionGenesisRecord,
-  visited: ReadonlySet<string>,
-): Promise<void> {
-  const lineage = genesis.record.lineage;
-  if (lineage === undefined) {
-    return;
-  }
-  if (visited.has(lineage.parentSessionId)) {
-    throw new SessionLifecycleError("session_invalid");
-  }
-  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
-  const expectedPromptContext = promptContextRecordFromRecords(parentGenesis, prefixRecords);
-  if (!isDeepStrictEqual(genesis.record.promptContext, expectedPromptContext)) {
-    throw new SessionLifecycleError("session_invalid");
-  }
-  await validateInheritedContextEvidence(options, parentGenesis, prefixRecords);
-  if ("recordVersion" in lineage) {
-    const declaredParentRecords = await readSessionRecords(options, lineage.parentSessionId);
-    const declaredParentGenesis = declaredParentRecords[0];
-    if (declaredParentGenesis === undefined || !isGenesisRecord(declaredParentGenesis)) {
-      throw new SessionLifecycleError("session_invalid");
-    }
-    await validateSessionLineage(
-      options,
-      declaredParentGenesis,
-      new Set([...visited, lineage.parentSessionId]),
-    );
-    return;
-  }
-  await validateSessionLineage(
-    options,
-    parentGenesis,
-    new Set([...visited, lineage.parentSessionId]),
-  );
-}
-
-async function sessionInheritsSourceBoundary(
-  options: SessionLifecycleOptions,
-  sessionGenesis: SessionGenesisRecord,
-  sourceSessionId: string,
-  sourceEventPosition: number,
-  visited: ReadonlySet<string>,
-): Promise<boolean> {
-  if (visited.has(sessionGenesis.record.sessionId)) {
-    return false;
-  }
-  if (sessionGenesis.record.sessionId === sourceSessionId) {
-    const ownRecords = await readSessionRecords(options, sourceSessionId);
-    return sourceEventPosition <= ownRecords.length;
-  }
-  const lineage = sessionGenesis.record.lineage;
-  if (lineage === undefined) {
-    return false;
-  }
-  const inheritedSessionId =
-    "recordVersion" in lineage ? lineage.sourceSessionId : lineage.parentSessionId;
-  const inheritedEventPosition =
-    "recordVersion" in lineage ? lineage.sourceEventPosition : lineage.parentEventPosition;
-  if (sourceSessionId === inheritedSessionId) {
-    return sourceEventPosition <= inheritedEventPosition;
-  }
-  const inheritedRecords = await readSessionRecords(options, inheritedSessionId);
-  const inheritedGenesis = inheritedRecords[0];
-  if (inheritedGenesis === undefined || !isGenesisRecord(inheritedGenesis)) {
-    return false;
-  }
-  return sessionInheritsSourceBoundary(
-    options,
-    inheritedGenesis,
-    sourceSessionId,
-    sourceEventPosition,
-    new Set([...visited, sessionGenesis.record.sessionId]),
-  );
-}
-
-async function validateInheritedContextEvidence(
-  options: SessionLifecycleOptions,
-  genesis: SessionGenesisRecord,
-  records: readonly SessionRecord[],
-): Promise<void> {
-  const expected = await createBranchEvidence(options, records);
-  for (const entry of records) {
-    if (entry.schemaVersion !== 3 || entry.record.type !== "context_compaction_committed") {
-      continue;
-    }
-    const actual = inheritedContextEvidence(entry.record.evidence);
-    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-      throw new SessionLifecycleError("session_invalid");
-    }
-  }
-  if (genesis.record.lineage === undefined && hasContextEvidence(expected)) {
-    throw new SessionLifecycleError("session_invalid");
-  }
-}
-
 async function contextSnapshotFromLineage(
   options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
   artifactCache: ModelResponseArtifactCache,
@@ -4201,7 +4113,7 @@ async function contextSnapshotFromLineage(
   if (ownContext !== undefined || genesis.record.lineage === undefined) {
     return ownContext;
   }
-  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  const { parentGenesis, prefixRecords } = await lineage.readValidatedLineagePrefix(genesis);
   const artifactInspection = await materializeModelResponseArtifacts(
     options,
     parentGenesis,
@@ -4211,6 +4123,7 @@ async function contextSnapshotFromLineage(
   );
   return contextSnapshotFromLineage(
     options,
+    lineage,
     parentGenesis,
     artifactInspection.records,
     artifactCache,
@@ -4219,6 +4132,7 @@ async function contextSnapshotFromLineage(
 
 async function contextUsageSnapshotFromLineage(
   options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
   artifactCache: ModelResponseArtifactCache,
@@ -4227,7 +4141,7 @@ async function contextUsageSnapshotFromLineage(
   if (genesis.record.lineage === undefined) {
     return ownUsage;
   }
-  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  const { parentGenesis, prefixRecords } = await lineage.readValidatedLineagePrefix(genesis);
   const artifactInspection = await materializeModelResponseArtifacts(
     options,
     parentGenesis,
@@ -4237,6 +4151,7 @@ async function contextUsageSnapshotFromLineage(
   );
   const inheritedUsage = await contextUsageSnapshotFromLineage(
     options,
+    lineage,
     parentGenesis,
     artifactInspection.records,
     artifactCache,
@@ -4259,6 +4174,7 @@ async function contextUsageSnapshotFromLineage(
 
 async function createBranchMessages(
   options: SessionLifecycleOptions,
+  lineageTraversal: SessionLineageTraversal,
   records: readonly SessionRecord[],
   artifactCache: ModelResponseArtifactCache,
 ): Promise<ModelMessage[]> {
@@ -4266,14 +4182,11 @@ async function createBranchMessages(
   if (genesis === undefined || !isGenesisRecord(genesis)) {
     throw new SessionLifecycleError("session_invalid");
   }
-  const lineage = genesis.record.lineage;
-  if (lineage === undefined) {
+  if (genesis.record.lineage === undefined) {
     return [];
   }
-  const { parentGenesis, prefixRecords: parentRecords } = await readValidatedLineagePrefix(
-    options,
-    genesis,
-  );
+  const { parentGenesis, prefixRecords: parentRecords } =
+    await lineageTraversal.readValidatedLineagePrefix(genesis);
   const artifactInspection = await materializeModelResponseArtifacts(
     options,
     parentGenesis,
@@ -4290,11 +4203,15 @@ async function createBranchMessages(
   ) {
     return projected;
   }
-  return [...(await createBranchMessages(options, parentRecords, artifactCache)), ...projected];
+  return [
+    ...(await createBranchMessages(options, lineageTraversal, parentRecords, artifactCache)),
+    ...projected,
+  ];
 }
 
 async function validatePromptProjectionDigests(
   options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
   artifactCache: ModelResponseArtifactCache,
@@ -4302,7 +4219,7 @@ async function validatePromptProjectionDigests(
   if (genesis.record.promptContext === undefined) {
     return;
   }
-  const inheritedMessages = await createBranchMessages(options, records, artifactCache);
+  const inheritedMessages = await createBranchMessages(options, lineage, records, artifactCache);
   for (const entry of records) {
     if (
       entry.schemaVersion !== 3 ||
@@ -4341,67 +4258,8 @@ async function validatePromptProjectionDigests(
   }
 }
 
-async function createBranchEvidence(
-  options: SessionLifecycleOptions,
-  records: readonly SessionRecord[],
-): Promise<ContextEvidenceV1> {
-  const genesis = records[0];
-  if (genesis === undefined || !isGenesisRecord(genesis)) {
-    throw new SessionLifecycleError("session_invalid");
-  }
-  if (genesis.record.lineage === undefined) {
-    return emptyContextEvidence();
-  }
-  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
-  const inherited = await createBranchEvidence(options, prefixRecords);
-  const run = prefixRecords.findLast(
-    (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
-  );
-  if (run?.schemaVersion !== 3 || run.record.type !== "logical_run_started") {
-    return inherited;
-  }
-  return mergeContextEvidence(
-    inherited,
-    reduceContextEvidence(
-      prefixRecords,
-      run.record.runId,
-      prefixRecords.at(-1)?.sequence ?? 1,
-      parentGenesis.record.sessionId,
-    ),
-  );
-}
-
-function inheritedContextEvidence(evidence: ContextEvidenceV1): ContextEvidenceV1 {
-  return {
-    schemaVersion: 1,
-    modifiedFiles: evidence.modifiedFiles.filter((entry) => entry.sessionId !== undefined),
-    permissions: evidence.permissions.filter((entry) => entry.sessionId !== undefined),
-    toolResults: evidence.toolResults.filter((entry) => entry.sessionId !== undefined),
-    failures: evidence.failures.filter((entry) => entry.sessionId !== undefined),
-  };
-}
-
-function emptyContextEvidence(): ContextEvidenceV1 {
-  return {
-    schemaVersion: 1,
-    modifiedFiles: [],
-    permissions: [],
-    toolResults: [],
-    failures: [],
-  };
-}
-
-function hasContextEvidence(evidence: ContextEvidenceV1): boolean {
-  return (
-    evidence.modifiedFiles.length > 0 ||
-    evidence.permissions.length > 0 ||
-    evidence.toolResults.length > 0 ||
-    evidence.failures.length > 0
-  );
-}
-
 async function modelResponseTargetsFromBranchContext(
-  options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   records: readonly SessionRecord[],
 ): Promise<ModelTargetIdentity[]> {
   const genesis = records[0];
@@ -4413,78 +4271,11 @@ async function modelResponseTargetsFromBranchContext(
       ? [record.record.targetIdentity]
       : [],
   );
-  const lineage = genesis.record.lineage;
-  if (lineage === undefined) {
+  if (genesis.record.lineage === undefined) {
     return ownTargets;
   }
-  const { prefixRecords: parentRecords } = await readValidatedLineagePrefix(options, genesis);
-  return [...(await modelResponseTargetsFromBranchContext(options, parentRecords)), ...ownTargets];
-}
-
-async function readValidatedLineagePrefix(
-  options: SessionLifecycleOptions,
-  childGenesis: SessionGenesisRecord,
-): Promise<{
-  readonly parentGenesis: SessionGenesisRecord;
-  readonly prefixRecords: readonly SessionRecord[];
-}> {
-  const lineage = childGenesis.record.lineage;
-  if (lineage === undefined) {
-    throw new SessionLifecycleError("session_invalid");
-  }
-  let declaredParentRecords: readonly SessionRecord[];
-  try {
-    declaredParentRecords = await readSessionRecords(options, lineage.parentSessionId);
-  } catch {
-    throw new SessionLifecycleError("session_invalid");
-  }
-  const declaredParentGenesis = declaredParentRecords[0];
-  if (
-    declaredParentGenesis === undefined ||
-    !isGenesisRecord(declaredParentGenesis) ||
-    declaredParentGenesis.record.sessionId !== lineage.parentSessionId ||
-    declaredParentGenesis.record.projectId !== childGenesis.record.projectId
-  ) {
-    throw new SessionLifecycleError("session_invalid");
-  }
-  const sourceSessionId =
-    "recordVersion" in lineage ? lineage.sourceSessionId : lineage.parentSessionId;
-  const sourceEventPosition =
-    "recordVersion" in lineage ? lineage.sourceEventPosition : lineage.parentEventPosition;
-  if (
-    !(await sessionInheritsSourceBoundary(
-      options,
-      declaredParentGenesis,
-      sourceSessionId,
-      sourceEventPosition,
-      new Set(),
-    ))
-  ) {
-    throw new SessionLifecycleError("session_invalid");
-  }
-  const parentRecords =
-    sourceSessionId === lineage.parentSessionId
-      ? declaredParentRecords
-      : await readSessionRecords(options, sourceSessionId);
-  const parentGenesis = parentRecords[0];
-  if (
-    parentGenesis === undefined ||
-    !isGenesisRecord(parentGenesis) ||
-    parentGenesis.record.projectId !== childGenesis.record.projectId ||
-    sourceEventPosition > parentRecords.length
-  ) {
-    throw new SessionLifecycleError("session_invalid");
-  }
-  const prefixRecords = parentRecords.slice(0, sourceEventPosition);
-  const prefix = `${prefixRecords.map((record) => JSON.stringify(record)).join("\n")}\n`;
-  const digest = `sha256:${createHash("sha256").update(prefix).digest("hex")}`;
-  const expectedDigest =
-    "recordVersion" in lineage ? lineage.sourcePrefixDigest : lineage.prefixDigest;
-  if (digest !== expectedDigest || !isCompleteBranchBoundary(prefixRecords)) {
-    throw new SessionLifecycleError("session_invalid");
-  }
-  validateCurrentSessionHistory(parentGenesis, prefixRecords, options.workspaceRoot);
-  return { parentGenesis, prefixRecords };
+  const { prefixRecords: parentRecords } = await lineage.readValidatedLineagePrefix(genesis);
+  return [...(await modelResponseTargetsFromBranchContext(lineage, parentRecords)), ...ownTargets];
 }
 
 async function appendDanglingAttemptInterruption(
@@ -5476,7 +5267,7 @@ function skillResourceBytesForRun(records: readonly SessionRecord[], runId: stri
 }
 
 async function skillResourceBytesFromLineage(
-  options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
 ): Promise<number> {
@@ -5491,11 +5282,9 @@ async function skillResourceBytesFromLineage(
     genesis.record.lineage === undefined
       ? 0
       : await (async () => {
-          const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(
-            options,
-            genesis,
-          );
-          return skillResourceBytesFromLineage(options, parentGenesis, prefixRecords);
+          const { parentGenesis, prefixRecords } =
+            await lineage.readValidatedLineagePrefix(genesis);
+          return skillResourceBytesFromLineage(lineage, parentGenesis, prefixRecords);
         })();
   const total = inheritedBytes + ownBytes;
   if (!Number.isSafeInteger(total) || total < 0 || total > 8 * 1024 * 1024) {
@@ -5662,6 +5451,7 @@ async function materializeActiveSkillContents(
 
 async function inspectModelResponseArtifactLineage(
   options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
   artifactCache: ModelResponseArtifactCache,
@@ -5676,9 +5466,10 @@ async function inspectModelResponseArtifactLineage(
   if (ownInspection.degradation !== undefined || genesis.record.lineage === undefined) {
     return ownInspection;
   }
-  const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(options, genesis);
+  const { parentGenesis, prefixRecords } = await lineage.readValidatedLineagePrefix(genesis);
   const inherited = await inspectModelResponseArtifactLineage(
     options,
+    lineage,
     parentGenesis,
     prefixRecords,
     artifactCache,
@@ -5702,6 +5493,7 @@ async function inspectModelResponseArtifactLineage(
 
 async function replayArtifactBytesFromLineage(
   options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
   artifactCache: ModelResponseArtifactCache,
@@ -5717,12 +5509,11 @@ async function replayArtifactBytesFromLineage(
     genesis.record.lineage === undefined
       ? 0
       : await (async () => {
-          const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(
-            options,
-            genesis,
-          );
+          const { parentGenesis, prefixRecords } =
+            await lineage.readValidatedLineagePrefix(genesis);
           return replayArtifactBytesFromLineage(
             options,
+            lineage,
             parentGenesis,
             prefixRecords,
             artifactCache,
