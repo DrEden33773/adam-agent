@@ -4,6 +4,19 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
+import { AgentSession } from "./agent-session.js";
+import type {
+  ContextUsageTotals,
+  ModelMessage,
+  PermissionDecisionCommand,
+  PermissionDecisionCommandResult,
+  RunOptions,
+  RunResult,
+  RuntimeEvent,
+  RuntimeEventListener,
+  RuntimeEventNotification,
+  UserInput,
+} from "./agent-session-contracts.js";
 import {
   type ArtifactReference,
   type ArtifactSource,
@@ -31,19 +44,6 @@ import {
   loadInternalExtensionSkillSources,
   withInternalExtensionSkillSourcesCurrent,
 } from "./extension-host.js";
-import {
-  AgentSession,
-  type ContextUsageTotals,
-  type ModelMessage,
-  type PermissionDecisionCommand,
-  type PermissionDecisionCommandResult,
-  type RunOptions,
-  type RunResult,
-  type RuntimeEvent,
-  type RuntimeEventListener,
-  type RuntimeEventNotification,
-  type UserInput,
-} from "./index.js";
 import {
   createMcpRuntimeHost,
   inspectMcpConfiguration,

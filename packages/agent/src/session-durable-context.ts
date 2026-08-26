@@ -1,5 +1,5 @@
+import type { ModelMessage } from "./agent-session-contracts.js";
 import type { ContextEvidenceV1 } from "./durable-context.js";
-import type { ModelMessage } from "./index.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import type { PromptContextRecord } from "./prompt-assembly.js";
 import type {

@@ -7,8 +7,8 @@ import type {
   SharedV4ProviderOptions,
 } from "@ai-sdk/provider";
 import { APICallError } from "@ai-sdk/provider";
+import type { ModelDriver, ModelEvent, ModelRequest } from "./agent-session-contracts.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
-import type { ModelDriver, ModelEvent, ModelRequest } from "./index.js";
 import { ModelDriverError } from "./model-driver-error.js";
 import type { ThinkingPolicyMappingV1 } from "./thinking-policy.js";
 

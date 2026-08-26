@@ -1,9 +1,8 @@
 import { createDeepSeek } from "@ai-sdk/deepseek";
 import { createGateway } from "@ai-sdk/gateway";
-
+import type { ModelDriver } from "./agent-session-contracts.js";
 import { AiSdkModelDriver } from "./ai-sdk-model-driver.js";
 import type { ContextProfile } from "./context-profile.js";
-import type { ModelDriver } from "./index.js";
 import {
   createDirectDeepSeekThinkingCapability,
   type ThinkingCapabilityV1,

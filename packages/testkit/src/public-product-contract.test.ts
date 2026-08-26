@@ -1,5 +1,5 @@
 import { readdir, readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { expect, test } from "vitest";
@@ -201,10 +201,69 @@ test("the retained H1 live evidence is bounded and reproducible", async () => {
   expect(retainedEvidence).not.toMatch(/\/(?:home|tmp)\//u);
 });
 
+test("agent source files do not import through their own public root facade", async () => {
+  const agentSourceRoot = join(productRoot, "packages", "agent", "src");
+  const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
+    .filter((entry) => entry.endsWith(".ts"))
+    .sort();
+  const backImports = (
+    await Promise.all(
+      sourceFiles.map(async (sourceFile) => {
+        const sourcePath = join(agentSourceRoot, sourceFile);
+        const source = await readFile(sourcePath, "utf8");
+        return moduleSpecifiers(source)
+          .filter((specifier) => isAgentRootFacadeSpecifier(sourcePath, specifier, agentSourceRoot))
+          .map((specifier) => ({
+            file: relative(productRoot, sourcePath),
+            specifier,
+          }));
+      }),
+    )
+  ).flat();
+
+  expect(backImports).toEqual([]);
+});
+
+test("the agent root facade detector covers relative and package self-references", () => {
+  const sourcePath = join(productRoot, "packages", "agent", "src", "session-lifecycle.ts");
+  const agentSourceRoot = join(productRoot, "packages", "agent", "src");
+
+  expect(
+    ["./index.js", "@adam-agent/agent"].filter((specifier) =>
+      isAgentRootFacadeSpecifier(sourcePath, specifier, agentSourceRoot),
+    ),
+  ).toEqual(["./index.js", "@adam-agent/agent"]);
+  expect(moduleSpecifiers('export * as facade from "./index.js";')).toEqual(["./index.js"]);
+});
+
 async function readPackageJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, "utf8"));
 }
 
 function isForbiddenPublicClaim(text: string): boolean {
   return forbiddenPublicClaimPatterns.some((pattern) => pattern.test(text));
+}
+
+function isAgentRootFacadeSpecifier(
+  sourcePath: string,
+  specifier: string,
+  agentSourceRoot: string,
+): boolean {
+  return (
+    specifier === "@adam-agent/agent" ||
+    (specifier.startsWith(".") &&
+      resolve(dirname(sourcePath), specifier) === join(agentSourceRoot, "index.js"))
+  );
+}
+
+function moduleSpecifiers(source: string): readonly string[] {
+  const patterns = [
+    /\bimport\s+[\s\S]*?\sfrom\s*["']([^"']+)["']/gu,
+    /\bimport\s*["']([^"']+)["']/gu,
+    /\bimport\s*\(\s*["']([^"']+)["']\s*\)/gu,
+    /\bexport\s+(?:type\s+)?(?:\*(?:\s+as\s+\S+)?|\{[\s\S]*?\})\s+from\s+["']([^"']+)["']/gu,
+  ];
+  return patterns.flatMap((pattern) =>
+    [...source.matchAll(pattern)].map((match) => match[1] ?? ""),
+  );
 }

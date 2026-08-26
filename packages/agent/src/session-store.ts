@@ -5,11 +5,11 @@ import { join } from "node:path";
 
 import { valid } from "semver";
 import { z } from "zod";
+import type { RunResult, RuntimeEvent } from "./agent-session-contracts.js";
 import type { ArtifactReference, ModelResponseArtifactSource } from "./artifact-store.js";
 import type { ContextProfile } from "./context-profile.js";
 import type { ContextCallUsage, ContextEvidenceV1, ContextSummaryV1 } from "./durable-context.js";
 import { maximumInlineModelResponseFieldBytes } from "./durable-model-response-policy.js";
-import type { RunResult, RuntimeEvent } from "./index.js";
 import type { McpToolProfileV1 } from "./mcp-host.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
