@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { access, mkdir, mkdtemp, rm } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,21 +72,75 @@ describe("one-shot CLI process help", () => {
   });
 });
 
+describe("one-shot CLI deterministic coding process", () => {
+  test("keeps the fake coding prompt authoritative when user Skills are visible", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-fake-skill-context-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const userHome = join(testRoot, "home");
+    const skillRoot = join(userHome, ".agents", "skills", "visible-skill");
+    const demoPath = join(workspaceRoot, "demo.txt");
+    await mkdir(workspaceRoot);
+    await mkdir(skillRoot, { recursive: true });
+    await writeFile(demoPath, "before\n", "utf8");
+    await writeFile(
+      join(skillRoot, "SKILL.md"),
+      "---\nname: visible-skill\ndescription: Visible deterministic fixture.\n---\n\nKeep this bounded.\n",
+      "utf8",
+    );
+
+    try {
+      const result = await runCliArguments({
+        args: ["Update the demo file and verify it"],
+        cwd: workspaceRoot,
+        environment: { HOME: userHome },
+        stateRoot,
+        stdin: "y\ny\n",
+      });
+
+      expect({ result, content: await readFile(demoPath, "utf8") }).toEqual({
+        result: {
+          stdout: "The demo file was updated and verified.\n",
+          stderr:
+            'Allow edit_file patch (update "demo.txt"; sha256:3140812d57f41d8a7cd3d7631794832d62016234af63f1bc9ea87fc29fd6a441) [y/N] Allow run_shell at ".": "test \\"$(cat demo.txt)\\" = after && printf verified" [y/N] ',
+          exitCode: 0,
+          signal: null,
+        },
+        content: "after\n",
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 async function runCliArguments(input: {
   readonly args: readonly string[];
   readonly cwd: string;
+  readonly environment?: Readonly<Record<string, string>>;
   readonly stateRoot: string;
+  readonly stdin?: string;
 }): Promise<CliResult> {
+  const environment: NodeJS.ProcessEnv = { ...process.env, ...input.environment };
+  for (const name of [
+    "ADAM_AGENT_MODEL",
+    "ADAM_AGENT_PROVIDER",
+    "ADAM_AGENT_TARGET",
+    "DEEPSEEK_API_KEY",
+  ] as const) {
+    delete environment[name];
+  }
   const child = spawn(process.execPath, [cliPath, ...input.args], {
     cwd: input.cwd,
     env: {
-      ...process.env,
+      ...environment,
       ADAM_AGENT_STATE_ROOT: input.stateRoot,
       ADAM_AGENT_TARGET: "fake.local",
       NO_COLOR: "1",
     },
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
+  child.stdin.end(input.stdin ?? "");
 
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];

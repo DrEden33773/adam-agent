@@ -68,7 +68,7 @@ const fakeContextProfile: ContextProfile = {
   estimatorVersion: 1,
 };
 const fakeModel = new FakeModelDriver((request) => {
-  const prompt = request.messages.find((message) => message.role === "user")?.content ?? "";
+  const prompt = request.messages.findLast((message) => message.role === "user")?.content ?? "";
   const latestMessage = request.messages.at(-1);
   if (latestMessage?.role === "user") {
     if (prompt === truncatedAnswerPrompt) {
