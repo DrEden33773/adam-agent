@@ -1,8 +1,14 @@
-import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, mkdir, open, realpath } from "node:fs/promises";
+import {
+  fchmod as chmodFileDescriptor,
+  close as closeFileDescriptor,
+  open as openFileDescriptor,
+} from "node:fs";
+import { chmod, mkdir, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { MessageChannel } from "node:worker_threads";
 
 export class ProjectLifecycleOwnerError extends Error {
   readonly code: "project_in_use" | "project_owner_unavailable";
@@ -55,40 +61,34 @@ async function acquireProjectLifecycleOwner(options: {
   await mkdir(projectDirectory, { recursive: true, mode: 0o700 });
   await chmod(projectDirectory, 0o700);
   const lockPath = join(projectDirectory, "lifecycle.lock");
-  const lockFile = await open(lockPath, "a", 0o600);
+  const lockFileDescriptor = await openLockFileDescriptor(lockPath);
   try {
-    await lockFile.chmod(0o600);
-  } finally {
-    await lockFile.close();
+    await chmodLockFileDescriptor(lockFileDescriptor);
+    const child = spawn("flock", ["--exclusive", "--nonblock", "3"], {
+      stdio: ["ignore", "ignore", "pipe", lockFileDescriptor],
+    });
+    await waitForAcquisition(child);
+  } catch (error) {
+    await closeLockFileDescriptor(lockFileDescriptor);
+    throw error;
   }
-  const child = spawn(
-    "flock",
-    [
-      "--exclusive",
-      "--nonblock",
-      lockPath,
-      "/bin/sh",
-      "-c",
-      "printf 'acquired\\n'; IFS= read -r _",
-    ],
-    { stdio: ["pipe", "pipe", "pipe"] },
-  );
-  await waitForAcquisition(child);
-  let released = false;
+  const keepAlive = new MessageChannel();
+  keepAlive.port1.ref();
+  keepAlive.port2.ref();
+  let releasePromise: Promise<void> | undefined;
   return {
-    async release() {
-      if (released) {
-        return;
-      }
-      released = true;
-      await closeOwnerProcess(child);
+    release() {
+      releasePromise ??= closeLockFileDescriptor(lockFileDescriptor).finally(() => {
+        keepAlive.port1.close();
+        keepAlive.port2.close();
+      });
+      return releasePromise;
     },
   };
 }
 
-async function waitForAcquisition(child: ChildProcessWithoutNullStreams): Promise<void> {
+async function waitForAcquisition(child: ChildProcess): Promise<void> {
   await new Promise<void>((resolve, reject) => {
-    let stdout = "";
     let stderr = "";
     let settled = false;
     const finish = (error?: Error) => {
@@ -102,20 +102,15 @@ async function waitForAcquisition(child: ChildProcessWithoutNullStreams): Promis
         reject(error);
       }
     };
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-      if (stdout.split("\n").includes("acquired")) {
-        finish();
-      }
-    });
-    child.stderr.on("data", (chunk: string) => {
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
       stderr += chunk;
     });
     child.once("error", () => finish(new ProjectLifecycleOwnerError("project_owner_unavailable")));
     child.once("close", (code) => {
-      if (code === 1 && stderr.length === 0) {
+      if (code === 0) {
+        finish();
+      } else if (code === 1 && stderr.length === 0) {
         finish(new ProjectLifecycleOwnerError("project_in_use"));
       } else {
         finish(new ProjectLifecycleOwnerError("project_owner_unavailable"));
@@ -124,15 +119,40 @@ async function waitForAcquisition(child: ChildProcessWithoutNullStreams): Promis
   });
 }
 
-async function closeOwnerProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return;
-  }
-  const closed = new Promise<void>((resolve) => {
-    child.once("close", () => resolve());
+async function openLockFileDescriptor(path: string): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    openFileDescriptor(path, "a", 0o600, (error, fileDescriptor) => {
+      if (error === null) {
+        resolve(fileDescriptor);
+      } else {
+        reject(error);
+      }
+    });
   });
-  child.stdin.end("\n");
-  await closed;
+}
+
+async function chmodLockFileDescriptor(fileDescriptor: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    chmodFileDescriptor(fileDescriptor, 0o600, (error) => {
+      if (error === null) {
+        resolve();
+      } else {
+        reject(error);
+      }
+    });
+  });
+}
+
+async function closeLockFileDescriptor(fileDescriptor: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    closeFileDescriptor(fileDescriptor, (error) => {
+      if (error === null) {
+        resolve();
+      } else {
+        reject(error);
+      }
+    });
+  });
 }
 
 function defaultStateRoot(): string {
