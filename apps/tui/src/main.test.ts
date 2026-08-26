@@ -8,6 +8,7 @@ import { runTuiFixture } from "./test-fixture.js";
 import {
   readFilesRecursively,
   removeTuiFixtureRoot as rm,
+  waitForFileContents,
   waitForPath,
 } from "./tui-filesystem.test-support.js";
 import {
@@ -3572,12 +3573,18 @@ test("slash Copy copies the last inline assistant response without persisting a 
   try {
     const fixture = startFixture({ controlRoot, scenario: "read", stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
+    const beforePrompt = fixture.output().length;
     fixture.write("Read the README\r");
-    await fixture.waitFor("Read complete");
+    await fixture.waitForCompleteFrameAfter("Read complete", beforePrompt);
+    const resultOccurrence = fixture.output().lastIndexOf("Read complete");
+    expect(resultOccurrence).toBeGreaterThanOrEqual(beforePrompt);
+    await fixture.waitForCompleteFrameAfter(" · idle", resultOccurrence);
     const beforeCopy = fixture.output().length;
     fixture.write("/copy \r");
     const outcome = await Promise.race([
-      waitForPath(join(controlRoot, "clipboard.txt")).then(() => "copied" as const),
+      waitForFileContents(join(controlRoot, "clipboard.txt"), "Read complete.").then(
+        () => "copied" as const,
+      ),
       fixture.waitForAfter("Unknown command /copy", beforeCopy).then(() => "unknown" as const),
     ]);
     expect(outcome).toBe("copied");
@@ -3607,12 +3614,16 @@ test("slash Copy never truncates a large inline assistant response", async () =>
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
+    const beforePrompt = fixture.output().length;
     fixture.write("Produce a large inline response\r");
-    await fixture.waitFor("Exact copy tail.");
+    await fixture.waitForCompleteFrameAfter("Exact copy tail.", beforePrompt);
+    const resultOccurrence = fixture.output().lastIndexOf("Exact copy tail.");
+    expect(resultOccurrence).toBeGreaterThanOrEqual(beforePrompt);
+    await fixture.waitForCompleteFrameAfter(" · idle", resultOccurrence);
+    const expected = `${"c".repeat(65 * 1024)}\nExact copy tail.`;
     fixture.write("/copy \r");
-    await waitForPath(join(controlRoot, "clipboard.txt"));
-    expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe(
-      `${"c".repeat(65 * 1024)}\nExact copy tail.`,
+    await expect(waitForFileContents(join(controlRoot, "clipboard.txt"), expected)).resolves.toBe(
+      expected,
     );
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -3637,11 +3648,15 @@ test("slash Copy reads and copies the complete last artifact-backed assistant re
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
+    const beforePrompt = fixture.output().length;
     fixture.write("Produce an artifact-backed answer\r");
-    await fixture.waitFor("Assistant response stored as artifact");
+    await fixture.waitForCompleteFrameAfter("Assistant response stored as artifact", beforePrompt);
+    const resultOccurrence = fixture.output().lastIndexOf("Assistant response stored as artifact");
+    expect(resultOccurrence).toBeGreaterThanOrEqual(beforePrompt);
+    await fixture.waitForCompleteFrameAfter(" · idle", resultOccurrence);
+    const expected = `Assistant artifact page one\n${"a".repeat(20_000)}\nAssistant artifact page two\n${"b".repeat(250_000)}`;
     fixture.write("/copy \r");
-    await waitForPath(join(controlRoot, "clipboard.txt"));
-    const copied = await readFile(join(controlRoot, "clipboard.txt"), "utf8");
+    const copied = await waitForFileContents(join(controlRoot, "clipboard.txt"), expected);
     expect(Buffer.byteLength(copied, "utf8")).toBe(270_057);
     expect(copied).toMatch(/^Assistant artifact page one/u);
     expect(copied).toContain("Assistant artifact page two");
@@ -3672,12 +3687,17 @@ test("slash Copy loads older active chronology to find the last assistant respon
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Later copy prompt two");
+    await fixture.waitForCompleteFrameAfter("Later copy prompt two", 0);
+    const resultOccurrence = fixture.output().lastIndexOf("Later copy prompt two");
+    expect(resultOccurrence).toBeGreaterThanOrEqual(0);
+    await fixture.waitForCompleteFrameAfter(" · idle", resultOccurrence);
     expect(fixture.output()).not.toContain("Older copy answer.");
     const beforeCopy = fixture.output().length;
     fixture.write("/copy \r");
     const outcome = await Promise.race([
-      waitForPath(join(controlRoot, "clipboard.txt")).then(() => "copied" as const),
+      waitForFileContents(join(controlRoot, "clipboard.txt"), "Older copy answer.").then(
+        () => "copied" as const,
+      ),
       fixture
         .waitForAfter("No assistant response is available to copy.", beforeCopy)
         .then(() => "missing" as const),
@@ -3849,8 +3869,12 @@ test("PageDown reads the next bounded assistant artifact page", async () => {
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
+    const beforePrompt = fixture.output().length;
     fixture.write("Produce an artifact-backed answer\r");
-    await fixture.waitFor("Assistant response stored as artifact");
+    await fixture.waitForCompleteFrameAfter("Assistant response stored as artifact", beforePrompt);
+    const resultOccurrence = fixture.output().lastIndexOf("Assistant response stored as artifact");
+    expect(resultOccurrence).toBeGreaterThanOrEqual(beforePrompt);
+    await fixture.waitForCompleteFrameAfter(" · idle", resultOccurrence);
     fixture.write("/artifacts \r");
     await fixture.waitFor("Session artifacts");
     fixture.write("\r");
@@ -3858,14 +3882,16 @@ test("PageDown reads the next bounded assistant artifact page", async () => {
     await fixture.waitFor("1-16384 of 270057 bytes");
     const beforeNextPage = fixture.output().length;
     fixture.write("\u001b[6~");
-    await waitForPath(join(controlRoot, "artifact-read-2"));
-    expect(await readFile(join(controlRoot, "artifact-read-2"), "utf8")).toBe("16384\n");
+    await expect(
+      waitForFileContents(join(controlRoot, "artifact-read-2"), "16384\n"),
+    ).resolves.toBe("16384\n");
     await fixture.waitForAfter("16385-32768 of 270057 bytes", beforeNextPage);
     await fixture.waitForAfter("Assistant artifact page two", beforeNextPage);
     const beforePreviousPage = fixture.output().length;
     fixture.write("\u001b[5~");
-    await waitForPath(join(controlRoot, "artifact-read-3"));
-    expect(await readFile(join(controlRoot, "artifact-read-3"), "utf8")).toBe("0\n");
+    await expect(waitForFileContents(join(controlRoot, "artifact-read-3"), "0\n")).resolves.toBe(
+      "0\n",
+    );
     await fixture.waitForAfter("1-16384 of 270057 bytes", beforePreviousPage);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
