@@ -42,6 +42,8 @@ test("the public entry describes a source-checkout portfolio checkpoint", async 
   expect(readme).toContain("not an npm package, standalone binary, or production release");
   expect(readme).toContain("pnpm install --frozen-lockfile");
   expect(readme).toContain("pnpm tui");
+  expect(readme).toContain("pnpm tui --target deepseek-v4-flash.direct");
+  expect(readme).not.toContain("pnpm tui --target fake.local");
   expect(readme).not.toMatch(/npm (?:install|i) (?:-g )?adam-agent/u);
   expect(readme).not.toContain("npx adam-agent");
 });

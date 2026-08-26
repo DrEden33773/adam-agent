@@ -232,7 +232,7 @@ function usage(): string {
     "",
     "From a source checkout:",
     "  pnpm tui",
-    "  pnpm tui --target fake.local",
+    "  pnpm tui --target deepseek-v4-flash.direct",
     "  pnpm tui --resume <session-id>",
     "",
     "Under the default policy, built-in write and execute tools require call-scoped approval.",
