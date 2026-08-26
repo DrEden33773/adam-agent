@@ -236,7 +236,7 @@ test("the agent root facade detector covers relative and package self-references
   expect(moduleSpecifiers('export * as facade from "./index.js";')).toEqual(["./index.js"]);
 });
 
-test("SessionLifecycle canonical validation and replay have package-internal owners", async () => {
+test("SessionLifecycle canonical history projections have package-internal owners", async () => {
   const agentSourceRoot = join(productRoot, "packages", "agent", "src");
   const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
     .filter((entry) => entry.endsWith(".ts"))
@@ -249,14 +249,25 @@ test("SessionLifecycle canonical validation and replay have package-internal own
   );
   const expectedOwners = {
     SessionLifecycleError: ["session-lifecycle-error.ts"],
+    addContextUsageTotals: ["session-history-folds.ts"],
+    areReplayProfilesCompatible: ["session-history-folds.ts"],
+    attemptStatus: ["session-history-folds.ts"],
+    contextSnapshotFromRecords: ["session-history-folds.ts"],
+    contextUsageSnapshotFromRecords: ["session-history-folds.ts"],
     hasSuccessfullySettledAssistant: ["session-history-validation.ts"],
     inlineModelResponseField: ["session-history-replay.ts"],
+    isCompleteBranchBoundary: ["session-history-folds.ts"],
+    isGenesisRecord: ["session-history-folds.ts"],
     isSkillActivationBatchValid: ["session-history-folds.ts"],
     isSkillActivationBatchTransitionValid: ["session-history-folds.ts"],
     isSkillContextCatalogSuccessor: ["session-history-folds.ts"],
     isSkillContextPathSuccessor: ["session-history-folds.ts"],
     modelMessagesFromCanonicalRecords: ["session-history-replay.ts"],
     modelMessagesFromCompleteRecords: ["session-history-replay.ts"],
+    promptContextRecordFromRecords: ["session-history-folds.ts"],
+    skillContextRecordFromRecords: ["session-history-folds.ts"],
+    snapshotFromGenesis: ["session-history-folds.ts"],
+    snapshotFromRecords: ["session-history-folds.ts"],
     validateCurrentSessionHistory: ["session-history-validation.ts"],
   } as const;
   const actualOwners = Object.fromEntries(
@@ -277,12 +288,34 @@ test("SessionLifecycle canonical validation and replay have package-internal own
 
   expect.soft(actualOwners).toEqual(expectedOwners);
 
+  const expectedTypeOwners = {
+    CurrentSessionSnapshot: ["session-snapshot-contracts.ts"],
+    LegacySessionSnapshot: ["session-snapshot-contracts.ts"],
+    ModelResponseArtifactDegradation: ["session-history-folds.ts"],
+    ModelResponseArtifactInspection: ["session-history-folds.ts"],
+    SessionContextSnapshot: ["session-snapshot-contracts.ts"],
+    SessionContextUsageSnapshot: ["session-snapshot-contracts.ts"],
+    SessionResumeResult: ["session-snapshot-contracts.ts"],
+    SessionSnapshot: ["session-snapshot-contracts.ts"],
+  } as const;
+  const actualTypeOwners = Object.fromEntries(
+    Object.keys(expectedTypeOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) => new RegExp(`\\bexport\\s+type\\s+${symbol}\\b`, "u").test(source))
+        .map(({ path }) => path),
+    ]),
+  );
+
+  expect.soft(actualTypeOwners).toEqual(expectedTypeOwners);
+
   const extractedSources = sources.filter(({ path }) =>
     [
       "session-history-folds.ts",
       "session-history-replay.ts",
       "session-history-validation.ts",
       "session-lifecycle-error.ts",
+      "session-snapshot-contracts.ts",
     ].includes(path),
   );
   const forbiddenImports = extractedSources.flatMap(({ path, source }) =>
@@ -339,10 +372,11 @@ test("SessionLifecycle canonical validation and replay have package-internal own
         .filter((testPath) => testPath !== fileURLToPath(import.meta.url))
         .map(async (testPath) =>
           moduleSpecifiers(await readFile(testPath, "utf8"))
-            .filter((specifier) =>
-              /(?:session-history-(?:folds|replay|validation)|session-lifecycle-error)\.js$/u.test(
-                specifier,
-              ),
+            .filter(
+              (specifier) =>
+                /(?:session-history-(?:folds|replay|validation)|session-lifecycle-error)\.js$/u.test(
+                  specifier,
+                ) || /session-snapshot-contracts\.js$/u.test(specifier),
             )
             .map((specifier) => ({
               path: relative(productRoot, testPath),
@@ -361,12 +395,16 @@ test("SessionLifecycle canonical validation and replay have package-internal own
         'export { SessionLifecycleError } from "./session-lifecycle-error.js";',
       ),
       replayImport: lifecycleSource.includes('from "./session-history-replay.js"'),
+      snapshotContractReferences: moduleSpecifiers(lifecycleSource).filter(
+        (specifier) => specifier === "./session-snapshot-contracts.js",
+      ).length,
       validationImport: lifecycleSource.includes('from "./session-history-validation.js"'),
     })
     .toEqual({
       errorImport: true,
       errorReexport: true,
       replayImport: true,
+      snapshotContractReferences: 2,
       validationImport: true,
     });
   for (const facadeSource of [publicFacadeSource, testingFacadeSource]) {
@@ -374,6 +412,7 @@ test("SessionLifecycle canonical validation and replay have package-internal own
     expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-history-replay.js");
     expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-history-validation.js");
     expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-lifecycle-error.js");
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./session-snapshot-contracts.js");
   }
 });
 
