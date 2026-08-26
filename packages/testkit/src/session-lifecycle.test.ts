@@ -25,10 +25,14 @@ import {
 } from "@adam-agent/agent";
 import {
   openJsonlSessionStore,
+  type ProjectLifecycleOwner,
+  ProjectLifecycleOwnerError,
   preparedDirectDeepSeekV2ContextProfile,
   type SessionRecord,
   sessionAutomaticTitlesEnabled,
+  sessionCloseDrainBarrier,
   sessionLogicalRunStartedBarrier,
+  sessionProjectLifecycleOwner,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
@@ -179,6 +183,230 @@ test("session metadata observers cannot overturn a durable naming mutation", asy
     releaseObserver.resolve();
     unsubscribeFailure();
     unsubscribePending();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle close causally joins an admitted naming mutation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-naming-close-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const naming = lifecycle.setSessionManualName({
+      sessionId: created.sessionId,
+      name: "Durable close name",
+    });
+    const closing = lifecycle.close();
+
+    await expect(naming).resolves.toMatchObject({ status: "updated" });
+    await expect(closing).resolves.toEqual({ status: "closed" });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle close drains every admitted owner operation after acquisition reorder", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-owner-drain-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const firstAcquisitionStarted = Promise.withResolvers<void>();
+  const releaseFirstAcquisition = Promise.withResolvers<void>();
+  const secondAcquisitionStarted = Promise.withResolvers<void>();
+  const releaseSecondAcquisition = Promise.withResolvers<void>();
+  let reorderAcquisitions = false;
+  let reorderedRun = 0;
+  let secondAcquisitionHeld = false;
+  const owner: ProjectLifecycleOwner = {
+    async acquire() {
+      return { async release() {} };
+    },
+    async run(operation) {
+      if (!reorderAcquisitions) {
+        return operation();
+      }
+      reorderedRun += 1;
+      if (reorderedRun === 1) {
+        firstAcquisitionStarted.resolve();
+        await releaseFirstAcquisition.promise;
+        throw new ProjectLifecycleOwnerError("project_in_use");
+      }
+      if (reorderedRun === 2) {
+        secondAcquisitionHeld = true;
+        secondAcquisitionStarted.resolve();
+        try {
+          const result = await operation();
+          await releaseSecondAcquisition.promise;
+          return result;
+        } finally {
+          secondAcquisitionHeld = false;
+        }
+      }
+      if (secondAcquisitionHeld) {
+        releaseSecondAcquisition.resolve();
+        throw new ProjectLifecycleOwnerError("project_in_use");
+      }
+      return operation();
+    },
+  };
+  const drainedCounts: number[] = [];
+  const lifecycle = createSessionLifecycle({
+    stateRoot,
+    workspaceRoot,
+    [sessionCloseDrainBarrier]: {
+      beforeWait({ activeCount }) {
+        drainedCounts.push(activeCount);
+        releaseSecondAcquisition.resolve();
+      },
+    },
+    [sessionProjectLifecycleOwner]: owner,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    reorderAcquisitions = true;
+    const firstNaming = lifecycle.setSessionManualName({
+      sessionId: created.sessionId,
+      name: "Rejected first acquisition",
+    });
+    await firstAcquisitionStarted.promise;
+    const secondNaming = lifecycle.setSessionManualName({
+      sessionId: created.sessionId,
+      name: "Durable reordered acquisition",
+    });
+    await secondAcquisitionStarted.promise;
+    releaseFirstAcquisition.resolve();
+    await expect(firstNaming).rejects.toMatchObject({ code: "project_in_use" });
+    const closing = lifecycle.close();
+
+    await expect(secondNaming).resolves.toMatchObject({ status: "updated" });
+    await expect(closing).resolves.toEqual({ status: "closed" });
+    expect(drainedCounts).toEqual([1]);
+  } finally {
+    releaseFirstAcquisition.resolve();
+    releaseSecondAcquisition.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle close joins title admission before returning", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-title-close-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const heldOwnerOperation = Promise.withResolvers<void>();
+  const releaseOwnerOperation = Promise.withResolvers<void>();
+  const titleRequestStarted = Promise.withResolvers<void>();
+  const releaseTitleRequest = Promise.withResolvers<void>();
+  const titleDrainStarted = Promise.withResolvers<void>();
+  const closeDurabilityStarted = Promise.withResolvers<void>();
+  let holdNextOwnerOperation = false;
+  let observeCloseDurability = false;
+  const owner: ProjectLifecycleOwner = {
+    async acquire() {
+      return { async release() {} };
+    },
+    async run(operation) {
+      const hold = holdNextOwnerOperation;
+      holdNextOwnerOperation = false;
+      if (observeCloseDurability && !hold) {
+        closeDurabilityStarted.resolve();
+      }
+      const result = await operation();
+      if (hold) {
+        heldOwnerOperation.resolve();
+        await releaseOwnerOperation.promise;
+      }
+      return result;
+    },
+  };
+  const closeOrder: string[] = [];
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.purpose === "title") {
+        closeOrder.push("title-started");
+        titleRequestStarted.resolve();
+        await releaseTitleRequest.promise;
+        yield { type: "text_delta", text: "Joined generated title" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      yield { type: "text_delta", text: "Ordinary answer." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionCloseDrainBarrier]: {
+      beforeWait({ kind }) {
+        if (kind === "owner") {
+          releaseOwnerOperation.resolve();
+        } else if (kind === "title_settlement") {
+          titleDrainStarted.resolve();
+        }
+      },
+    },
+    [sessionProjectLifecycleOwner]: owner,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Create title history" },
+    });
+    holdNextOwnerOperation = true;
+    const regeneration = lifecycle.regenerateSessionTitle({ sessionId: created.sessionId });
+    await heldOwnerOperation.promise;
+    observeCloseDurability = true;
+    const closing = lifecycle.close().then((result) => {
+      closeOrder.push("closed");
+      return result;
+    });
+    const firstClosePath = Promise.race([
+      titleDrainStarted.promise.then(() => "title-drain" as const),
+      closeDurabilityStarted.promise.then(() => "close-durability" as const),
+    ]).then((path) => {
+      releaseTitleRequest.resolve();
+      return path;
+    });
+
+    await titleRequestStarted.promise;
+    await expect(firstClosePath).resolves.toBe("title-drain");
+    await expect(regeneration).resolves.toMatchObject({ status: "updated" });
+    await expect(closing).resolves.toEqual({ status: "closed" });
+    expect(closeOrder).toEqual(["title-started", "closed"]);
+  } finally {
+    releaseOwnerOperation.resolve();
+    releaseTitleRequest.resolve();
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }

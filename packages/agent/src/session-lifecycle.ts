@@ -227,6 +227,16 @@ export const sessionAutomaticTitlesEnabled = Symbol("adam-agent.session-automati
 /** Tests only. Production lifecycle instances use the OS-backed project owner. */
 export const sessionProjectLifecycleOwner = Symbol("adam-agent.session-project-lifecycle-owner");
 
+/** Tests only. Production close draining has no observation barrier. */
+export const sessionCloseDrainBarrier = Symbol("adam-agent.session-close-drain-barrier");
+
+export type SessionCloseDrainBarrier = {
+  beforeWait(input: {
+    readonly activeCount: number;
+    readonly kind: "owner" | "title_admission" | "title_settlement";
+  }): Promise<void> | void;
+};
+
 /** Tests only. Production lifecycle instances use the JSONL session directory. */
 export const sessionStoreDirectory = Symbol("adam-agent.session-store-directory");
 
@@ -261,6 +271,7 @@ export type SessionLifecycleOptions = {
   readonly [sessionTitleDeadlineScheduler]?: SessionTitleDeadlineScheduler;
   readonly [sessionLogicalRunStartedBarrier]?: SessionLogicalRunStartedBarrier;
   readonly [sessionAutomaticTitlesEnabled]?: boolean;
+  readonly [sessionCloseDrainBarrier]?: SessionCloseDrainBarrier;
   readonly [sessionProjectLifecycleOwner]?: ProjectLifecycleOwner;
   readonly [sessionStoreDirectory]?: SessionStoreDirectory<SessionRecord>;
   readonly [sessionRuntimeNotificationTransform]?: SessionRuntimeNotificationTransform;
@@ -718,26 +729,30 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
     });
   };
-  let trackedOwnerOperation:
-    | { readonly kind: "ordinary" | "title"; readonly settlement: Promise<void> }
-    | undefined;
+  type TrackedOwnerOperation = {
+    readonly kind: "ordinary" | "title";
+    readonly settlement: Promise<void>;
+  };
+  const trackedOwnerOperations = new Set<TrackedOwnerOperation>();
+  let coordinatingOwnerOperation: TrackedOwnerOperation | undefined;
   const executeWithOwner = async <T>(
     kind: "ordinary" | "title",
     operation: () => Promise<T>,
   ): Promise<T> => {
-    const active = trackedOwnerOperation;
+    const active = coordinatingOwnerOperation;
     if (active !== undefined && (kind === "title" || active.kind === "title")) {
       await active.settlement;
     }
     const operationPromise = owner.run(operation);
-    let trackedSettlement: Promise<void> | undefined;
-    if (trackedOwnerOperation === undefined) {
-      trackedSettlement = operationPromise.then(
+    const tracked = {
+      kind,
+      settlement: operationPromise.then(
         () => undefined,
         () => undefined,
-      );
-      trackedOwnerOperation = { kind, settlement: trackedSettlement };
-    }
+      ),
+    };
+    trackedOwnerOperations.add(tracked);
+    coordinatingOwnerOperation ??= tracked;
     try {
       return await operationPromise;
     } catch (error) {
@@ -746,8 +761,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
       throw error;
     } finally {
-      if (trackedOwnerOperation?.settlement === trackedSettlement) {
-        trackedOwnerOperation = undefined;
+      trackedOwnerOperations.delete(tracked);
+      if (coordinatingOwnerOperation === tracked) {
+        coordinatingOwnerOperation = undefined;
       }
     }
   };
@@ -761,7 +777,34 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     }
     return runWithOwner(operation);
   };
+  const drainOwnerOperations = async (): Promise<void> => {
+    while (trackedOwnerOperations.size > 0) {
+      const settlements = [...trackedOwnerOperations].map(({ settlement }) => settlement);
+      await options[sessionCloseDrainBarrier]?.beforeWait({
+        activeCount: settlements.length,
+        kind: "owner",
+      });
+      await Promise.allSettled(settlements);
+    }
+  };
+  const titleAdmissionOperations = new Set<Promise<void>>();
   const titleOperations = new Set<Promise<void>>();
+  const drainTitleOperations = async (): Promise<void> => {
+    while (titleAdmissionOperations.size > 0) {
+      await options[sessionCloseDrainBarrier]?.beforeWait({
+        activeCount: titleAdmissionOperations.size,
+        kind: "title_admission",
+      });
+      await Promise.allSettled(titleAdmissionOperations);
+    }
+    while (titleOperations.size > 0) {
+      await options[sessionCloseDrainBarrier]?.beforeWait({
+        activeCount: titleOperations.size,
+        kind: "title_settlement",
+      });
+      await Promise.allSettled(titleOperations);
+    }
+  };
   const activeTitleSessions = new Set<string>();
   const commitTitleFailure = async (
     input: { readonly sessionId: string; readonly generationId: string },
@@ -924,90 +967,97 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     sessionSnapshot: CurrentSessionSnapshot,
     eligible: boolean,
   ): Promise<CurrentSessionSnapshot | undefined> => {
-    if (!automaticTitlesEnabled || !eligible) {
+    if (lifecycleClosing || !automaticTitlesEnabled || !eligible) {
       return undefined;
     }
+    const admission = Promise.withResolvers<void>();
+    titleAdmissionOperations.add(admission.promise);
     try {
-      return await withOwner(async () => {
-        const records = await readSessionRecords(options, sessionId);
-        if (
-          records.some(
-            (entry) =>
-              entry.schemaVersion === 3 &&
-              (entry.record.type === "session_title_generation_started" ||
-                entry.record.type === "session_title_generation_skipped_manual"),
-          )
-        ) {
-          return;
-        }
-        const store = await openSessionStore(options, sessionId);
-        let manualNameActive = false;
-        for (const entry of records) {
-          if (entry.schemaVersion !== 3) {
-            continue;
+      try {
+        return await withOwner(async () => {
+          const records = await readSessionRecords(options, sessionId);
+          if (
+            records.some(
+              (entry) =>
+                entry.schemaVersion === 3 &&
+                (entry.record.type === "session_title_generation_started" ||
+                  entry.record.type === "session_title_generation_skipped_manual"),
+            )
+          ) {
+            return;
           }
-          if (entry.record.type === "session_manual_name_set") {
-            manualNameActive = true;
-          } else if (entry.record.type === "session_manual_name_cleared") {
-            manualNameActive = false;
+          const store = await openSessionStore(options, sessionId);
+          let manualNameActive = false;
+          for (const entry of records) {
+            if (entry.schemaVersion !== 3) {
+              continue;
+            }
+            if (entry.record.type === "session_manual_name_set") {
+              manualNameActive = true;
+            } else if (entry.record.type === "session_manual_name_cleared") {
+              manualNameActive = false;
+            }
           }
-        }
-        if (manualNameActive) {
+          if (manualNameActive) {
+            const sequence = (records.at(-1)?.sequence ?? 0) + 1;
+            await store.append({
+              schemaVersion: 3,
+              sequence,
+              record: { type: "session_title_generation_skipped_manual", recordVersion: 1 },
+            });
+            await publishMetadata({
+              type: "session_naming_changed",
+              sessionId,
+              throughSequence: sequence,
+            });
+            const snapshot = await inspectSession({ sessionId });
+            return snapshot.schemaVersion === 3 ? snapshot : undefined;
+          }
+          const generationId = randomUUID();
           const sequence = (records.at(-1)?.sequence ?? 0) + 1;
           await store.append({
             schemaVersion: 3,
             sequence,
-            record: { type: "session_title_generation_skipped_manual", recordVersion: 1 },
+            record: {
+              type: "session_title_generation_started",
+              recordVersion: 1,
+              generationId,
+              reason: "automatic",
+              targetIdentity: sessionSnapshot.targetIdentity,
+            },
           });
           await publishMetadata({
             type: "session_naming_changed",
             sessionId,
             throughSequence: sequence,
           });
+          const firstRun = records.find(
+            (entry) => entry.schemaVersion === 3 && entry.record.type === "logical_run_started",
+          );
+          if (firstRun?.schemaVersion === 3 && firstRun.record.type === "logical_run_started") {
+            const operation = settleTitleGeneration({
+              sessionId,
+              generationId,
+              targetIdentity: sessionSnapshot.targetIdentity,
+              userMessage: firstRun.record.userMessage,
+            });
+            titleOperations.add(operation);
+            activeTitleSessions.add(sessionId);
+            void operation.finally(() => {
+              titleOperations.delete(operation);
+              activeTitleSessions.delete(sessionId);
+            });
+          }
           const snapshot = await inspectSession({ sessionId });
           return snapshot.schemaVersion === 3 ? snapshot : undefined;
-        }
-        const generationId = randomUUID();
-        const sequence = (records.at(-1)?.sequence ?? 0) + 1;
-        await store.append({
-          schemaVersion: 3,
-          sequence,
-          record: {
-            type: "session_title_generation_started",
-            recordVersion: 1,
-            generationId,
-            reason: "automatic",
-            targetIdentity: sessionSnapshot.targetIdentity,
-          },
         });
-        await publishMetadata({
-          type: "session_naming_changed",
-          sessionId,
-          throughSequence: sequence,
-        });
-        const firstRun = records.find(
-          (entry) => entry.schemaVersion === 3 && entry.record.type === "logical_run_started",
-        );
-        if (firstRun?.schemaVersion === 3 && firstRun.record.type === "logical_run_started") {
-          const operation = settleTitleGeneration({
-            sessionId,
-            generationId,
-            targetIdentity: sessionSnapshot.targetIdentity,
-            userMessage: firstRun.record.userMessage,
-          });
-          titleOperations.add(operation);
-          activeTitleSessions.add(sessionId);
-          void operation.finally(() => {
-            titleOperations.delete(operation);
-            activeTitleSessions.delete(sessionId);
-          });
-        }
-        const snapshot = await inspectSession({ sessionId });
-        return snapshot.schemaVersion === 3 ? snapshot : undefined;
-      });
-    } catch {
-      // Automatic naming metadata never changes the ordinary turn result.
-      return undefined;
+      } catch {
+        // Automatic naming metadata never changes the ordinary turn result.
+        return undefined;
+      }
+    } finally {
+      admission.resolve();
+      titleAdmissionOperations.delete(admission.promise);
     }
   };
   const flushPendingMcpCatalogChanges = async (sessionId: string): Promise<void> => {
@@ -1952,7 +2002,6 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       activeSession?.abort();
       lifecycleClosePromise = (async (): Promise<McpCloseResult> => {
         await runningSession;
-        await Promise.allSettled(titleOperations);
         await Promise.allSettled(pendingMcpCatalogDurability.values());
         for (const timer of mcpIdleTimers.values()) {
           timer.cancel();
@@ -1961,6 +2010,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         await Promise.allSettled(mcpIdleOperations.values());
         const hostResult = await mcpHost.close();
         await Promise.allSettled(activeMcpConfigurationOperations.values());
+        await drainOwnerOperations();
+        await drainTitleOperations();
+        await drainOwnerOperations();
         let durable = true;
         try {
           await runWithOwner(async () => {
@@ -3508,84 +3560,95 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       });
     },
     async regenerateSessionTitle(input) {
-      if (activeSession !== undefined || activeTitleSessions.has(input.sessionId)) {
+      if (
+        lifecycleClosing ||
+        activeSession !== undefined ||
+        activeTitleSessions.has(input.sessionId)
+      ) {
         throw new SessionLifecycleError("session_invalid");
       }
-      const started = await withOwner(async () => {
-        const inspected = await inspectSession({ sessionId: input.sessionId });
-        if (inspected.schemaVersion !== 3 || options.modelTargets === undefined) {
-          throw new SessionLifecycleError("session_invalid");
-        }
-        const records = await readSessionRecords(options, input.sessionId);
-        const firstRun = records.find(
-          (entry) => entry.schemaVersion === 3 && entry.record.type === "logical_run_started",
-        );
-        if (firstRun?.schemaVersion !== 3 || firstRun.record.type !== "logical_run_started") {
-          throw new SessionLifecycleError("session_invalid");
-        }
-        const latestStarted = records.findLast(
-          (entry) =>
-            entry.schemaVersion === 3 && entry.record.type === "session_title_generation_started",
-        );
-        if (
-          latestStarted?.schemaVersion === 3 &&
-          latestStarted.record.type === "session_title_generation_started"
-        ) {
-          const latestGenerationId = latestStarted.record.generationId;
-          const latestIsActive = !records.some(
-            (entry) =>
-              entry.schemaVersion === 3 &&
-              (entry.record.type === "session_title_generation_completed" ||
-                entry.record.type === "session_title_generation_failed") &&
-              entry.record.generationId === latestGenerationId,
-          );
-          if (latestIsActive) {
+      const admission = Promise.withResolvers<void>();
+      titleAdmissionOperations.add(admission.promise);
+      try {
+        const started = await withOwner(async () => {
+          const inspected = await inspectSession({ sessionId: input.sessionId });
+          if (inspected.schemaVersion !== 3 || options.modelTargets === undefined) {
             throw new SessionLifecycleError("session_invalid");
           }
-        }
-        const generationId = randomUUID();
-        const store = await openSessionStore(options, input.sessionId);
-        const sequence = (records.at(-1)?.sequence ?? 0) + 1;
-        await store.append({
-          schemaVersion: 3,
-          sequence,
-          record: {
-            type: "session_title_generation_started",
-            recordVersion: 1,
+          const records = await readSessionRecords(options, input.sessionId);
+          const firstRun = records.find(
+            (entry) => entry.schemaVersion === 3 && entry.record.type === "logical_run_started",
+          );
+          if (firstRun?.schemaVersion !== 3 || firstRun.record.type !== "logical_run_started") {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          const latestStarted = records.findLast(
+            (entry) =>
+              entry.schemaVersion === 3 && entry.record.type === "session_title_generation_started",
+          );
+          if (
+            latestStarted?.schemaVersion === 3 &&
+            latestStarted.record.type === "session_title_generation_started"
+          ) {
+            const latestGenerationId = latestStarted.record.generationId;
+            const latestIsActive = !records.some(
+              (entry) =>
+                entry.schemaVersion === 3 &&
+                (entry.record.type === "session_title_generation_completed" ||
+                  entry.record.type === "session_title_generation_failed") &&
+                entry.record.generationId === latestGenerationId,
+            );
+            if (latestIsActive) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+          }
+          const generationId = randomUUID();
+          const store = await openSessionStore(options, input.sessionId);
+          const sequence = (records.at(-1)?.sequence ?? 0) + 1;
+          await store.append({
+            schemaVersion: 3,
+            sequence,
+            record: {
+              type: "session_title_generation_started",
+              recordVersion: 1,
+              generationId,
+              reason: "regenerate",
+              targetIdentity: inspected.targetIdentity,
+            },
+          });
+          await publishMetadata({
+            type: "session_naming_changed",
+            sessionId: input.sessionId,
+            throughSequence: sequence,
+          });
+          const snapshot = await inspectSession({ sessionId: input.sessionId });
+          if (snapshot.schemaVersion !== 3) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          return {
             generationId,
-            reason: "regenerate",
             targetIdentity: inspected.targetIdentity,
-          },
+            userMessage: firstRun.record.userMessage,
+            result: { status: "updated" as const, snapshot },
+          };
         });
-        await publishMetadata({
-          type: "session_naming_changed",
+        const operation = settleTitleGeneration({
           sessionId: input.sessionId,
-          throughSequence: sequence,
+          generationId: started.generationId,
+          targetIdentity: started.targetIdentity,
+          userMessage: started.userMessage,
         });
-        const snapshot = await inspectSession({ sessionId: input.sessionId });
-        if (snapshot.schemaVersion !== 3) {
-          throw new SessionLifecycleError("session_invalid");
-        }
-        return {
-          generationId,
-          targetIdentity: inspected.targetIdentity,
-          userMessage: firstRun.record.userMessage,
-          result: { status: "updated" as const, snapshot },
-        };
-      });
-      const operation = settleTitleGeneration({
-        sessionId: input.sessionId,
-        generationId: started.generationId,
-        targetIdentity: started.targetIdentity,
-        userMessage: started.userMessage,
-      });
-      titleOperations.add(operation);
-      activeTitleSessions.add(input.sessionId);
-      void operation.finally(() => {
-        titleOperations.delete(operation);
-        activeTitleSessions.delete(input.sessionId);
-      });
-      return started.result;
+        titleOperations.add(operation);
+        activeTitleSessions.add(input.sessionId);
+        void operation.finally(() => {
+          titleOperations.delete(operation);
+          activeTitleSessions.delete(input.sessionId);
+        });
+        return started.result;
+      } finally {
+        admission.resolve();
+        titleAdmissionOperations.delete(admission.promise);
+      }
     },
     async resume(input) {
       if (activeTitleSessions.has(input.sessionId)) {
