@@ -34,7 +34,7 @@ import {
 import { FakeModelDriver } from "@adam-agent/testkit";
 
 const command = parseCliCommand(process.argv.slice(2));
-if (command.type !== "recover_operation") {
+if (command.type !== "help" && command.type !== "recover_operation") {
   loadProjectEnvironment();
 }
 const workspaceRoot = process.cwd();
@@ -376,6 +376,7 @@ function writeText(fileDescriptor: number, text: string): void {
 }
 
 type CliCommand =
+  | { readonly type: "help" }
   | { readonly type: "prompt"; readonly prompt: string; readonly skills?: readonly string[] }
   | { readonly type: "recover_operation"; readonly operationId: string }
   | { readonly type: "resume"; readonly sessionId: string; readonly continue: boolean }
@@ -388,6 +389,10 @@ type CliCommand =
 
 async function runCliCommand(activeCommand: CliCommand): Promise<void> {
   try {
+    if (activeCommand.type === "help") {
+      writeText(1, `${cliUsage()}\n`);
+      return;
+    }
     if (activeCommand.type === "recover_operation") {
       const extensions = await loadExtensionConfiguration(process.env);
       const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
@@ -586,6 +591,9 @@ function createCliModelTargets(): ModelTargets {
 }
 
 function parseCliCommand(arguments_: readonly string[]): CliCommand {
+  if (arguments_.length === 1 && (arguments_[0] === "--help" || arguments_[0] === "-h")) {
+    return { type: "help" };
+  }
   if (arguments_[0] === "--recover-operation") {
     const operationId = arguments_[1];
     if (
@@ -668,6 +676,29 @@ function parseCliCommand(arguments_: readonly string[]): CliCommand {
     prompt: arguments_.slice(promptStart).join(" "),
     ...(skills.length === 0 ? {} : { skills }),
   };
+}
+
+function cliUsage(): string {
+  return [
+    "Adam Agent headless CLI",
+    "Status: Linux source checkout; application packages are private and not an npm or binary distribution.",
+    "",
+    "Usage: adam-agent <prompt>",
+    "       adam-agent [--skill <id-or-unique-short-name>]... <prompt>",
+    "       adam-agent --resume <session-id> [--continue]",
+    "       adam-agent --branch <parent-session-id> --at <event-position> [--target <target-id>]",
+    "       adam-agent --recover-operation <operation-id>",
+    "       adam-agent --help | -h",
+    "",
+    "From a source checkout:",
+    '  ADAM_AGENT_TARGET=fake.local pnpm --silent adam "<prompt>"',
+    "  pnpm tui",
+    "",
+    "--resume without --continue hydrates only; --continue explicitly starts another attempt.",
+    "Final answers use stdout; approvals and errors use stderr.",
+    "Approvals and built-in path confinement are not an OS, process, or network sandbox.",
+    "Review every shell command before approving it.",
+  ].join("\n");
 }
 
 function failConfiguration(message: string): never {

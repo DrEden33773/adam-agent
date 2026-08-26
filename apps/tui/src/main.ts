@@ -225,5 +225,22 @@ function parseCommand(arguments_: readonly string[]): TuiCommand {
 }
 
 function usage(): string {
-  return "Usage: adam-agent-tui [--target <exact-target-id> | --resume <session-id>] [--state-root <path>]";
+  return [
+    "Adam Agent TUI",
+    "",
+    "Usage: adam-agent-tui [--target <exact-target-id> | --resume <session-id>] [--state-root <path>]",
+    "",
+    "From a source checkout:",
+    "  pnpm tui",
+    "  pnpm tui --target fake.local",
+    "  pnpm tui --resume <session-id>",
+    "",
+    "Under the default policy, built-in write and execute tools require call-scoped approval.",
+    "Built-in file tools reject lexical traversal and symlink escape from the workspace.",
+    "Approved shell commands and trusted MCP servers run with the invoking user's authority.",
+    "Extensions are trusted in-process code.",
+    "Credentials remain external plaintext inputs.",
+    "Session state and artifacts are owner-only local files.",
+    "Adam does not provide an OS, process, or network sandbox.",
+  ].join("\n");
 }

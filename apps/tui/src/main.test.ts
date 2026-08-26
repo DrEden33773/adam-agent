@@ -1145,6 +1145,42 @@ test("the real TUI opens slash Help locally without submitting it to the model",
   }
 });
 
+test("the real TUI explains its safety and trust boundary locally", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-safety-help-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "review-unavailable", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeHelp = fixture.output().length;
+    fixture.write("/help safety\r");
+    const outcome = await Promise.race([
+      fixture
+        .waitForCompleteFrameAfter("Safety and Trust", beforeHelp)
+        .then(() => "safety" as const),
+      fixture.waitForAfter("Unknown Help topic safety", beforeHelp).then(() => "unknown" as const),
+    ]);
+    expect(outcome).toBe("safety");
+    const frame = fixture.output().slice(beforeHelp);
+    expect(frame).toContain("Default built-in policy");
+    expect(frame).toContain("Write/execute: exact-call approval");
+    expect(frame).toContain("Built-in file tools");
+    expect(frame).toContain("Reject traversal/symlink escape");
+    expect(frame).toContain("Shell/MCP: same-user authority");
+    expect(frame).toContain("Extensions: trusted in-process code");
+    expect(frame).toContain("Credentials: external plaintext");
+    expect(frame).toContain("State/artifacts: owner-only local");
+    expect(frame).toContain("No OS/process/network sandbox");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/help safety"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("Escape closes the Help root and restores editor focus", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-escape-"));
   const workspaceRoot = join(testRoot, "workspace");

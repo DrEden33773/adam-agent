@@ -2,6 +2,55 @@
 
 Adam Agent is a lightweight, inspectable TypeScript coding agent for local software-engineering work.
 
+> **Status:** Adam is a Linux-supported source-checkout portfolio checkpoint. The root application and CLI/TUI packages remain private `0.0.0` workspace packages; this is not an npm package, standalone binary, or production release. The separately published `@adam-agent/extension-api` follows its own versioned release lifecycle.
+
+## Quick start
+
+Adam supports Linux with Node.js 24 and pnpm 11. Clone the source, enable the package manager declared by the repository, install the frozen lockfile, and launch the TUI:
+
+```bash
+git clone https://github.com/DrEden33773/adam-agent.git
+cd adam-agent
+corepack enable
+pnpm install --frozen-lockfile
+pnpm tui
+```
+
+The TUI lists durable sessions first and otherwise offers an explicit target picker. For a deterministic local headless check with no provider credential, use an isolated state root:
+
+```bash
+ADAM_AGENT_STATE_ROOT="$(mktemp -d)" ADAM_AGENT_TARGET=fake.local pnpm --silent adam "What is this repository?"
+```
+
+Run `pnpm tui --help` or `pnpm --silent adam --help` for copyable entry and lifecycle commands. Live Direct DeepSeek setup remains below.
+
+## Evidence
+
+Adam keeps four evidence classes separate so a deterministic fixture is never presented as a live-model or production claim.
+
+| Label | Meaning |
+| --- | --- |
+| Deterministically tested | Credential-free behavior exercised through public runtime, lifecycle, Presentation, CLI, or TUI seams. |
+| Real OS/PTY tested | Linux process, PTY, signal, stdio, terminal-restoration, filesystem, or transport behavior exercised at its irreducible external boundary. |
+| Live-provider observed | One bounded credentialed request or workflow observed against an exact named model target; this does not prove general model quality. |
+| Human walkthrough observed | One retained end-to-end manual workflow whose Git, test, session, approval, and terminal outcomes were independently checked. |
+
+See [Portfolio acceptance and walkthrough](docs/portfolio-acceptance.md) for the reproducible command matrix, public fixture contract, security boundary, and exact closeout evidence.
+
+## Security model
+
+Adam is intended for trusted local foreground work. Permission decisions, first-party path checks, process lifecycle controls, and code-loading trust are separate controls.
+
+| Surface | Active control | Explicit non-guarantee |
+| --- | --- | --- |
+| Built-in files | Lexical traversal and symlink escape are rejected beneath the canonical workspace root. | No protection from every hostile same-user race or mount-namespace change. |
+| Writes and commands | Write and execute effects require exact call-scoped approval by default. | Approval is not containment and does not make an unreviewed command safe. |
+| Shell and MCP | Processes use bounded inputs, environment disclosure, deadlines, process groups, and causal cleanup. | Approved processes retain the invoking user's authority and may use the network; there is no OS, process, or network sandbox. |
+| Extensions | Only exact Owner-configured, identity/version-checked packages are activated through bounded Host contracts. | Extensions are trusted in-process JavaScript, not isolated plugins. |
+| Credentials and state | Credentials remain external; durable state, artifacts, and configuration use owner-only local paths where specified. | `.env` remains plaintext local input, and local permissions do not defend against every same-user process or backup. |
+
+## Architecture and behavior
+
 The repository contains a provider-neutral Agent kernel with four model-facing coding tools (`read_file`, `write_file`, `edit_file`, and `run_shell`) plus two Agent Skill tools (`activate_skill` and `read_skill_resource`), call-scoped permission requests, canonical event persistence through caller-supplied in-memory and durable project-scoped JSONL stores, cancellation, bounded shell output with durable content-addressed overflow artifacts, and per-run turn/token limits. `write_file` is create-only, while `edit_file` accepts one bounded operations-only patch containing declarative create, exact update, ordinary-text delete, and move operations. Adam binds the normalized patch to one multi-path write approval with a SHA-256 digest, completes all semantic preflight before commit, and uses same-filesystem staging plus compensating rollback for ordinary in-process I/O failures. A rollback failure is reported as `patch_state_uncertain` with affected paths and an opaque reference to owner-only recovery data. A recovery-cleanup failure instead reports whether the workspace is known to be committed or rolled back and tells the caller not to retry automatically; neither result is a crash-safe or cross-path atomic filesystem guarantee.
 
 Every headless CLI run requires an explicit model target. The TUI instead lists existing project sessions first, then resolves an explicit target, a valid saved default, or an exact target picker only after the user chooses New Session. `fake.local` keeps deterministic development available, while the Certified Direct targets `deepseek-v4-flash.direct` and `deepseek-v4-pro.direct` use an exact-pinned Vercel Provider V4 adapter. Adam still owns the Agent loop, tools, permissions, retries, cancellation, deadlines, and canonical state; no SDK Agent or high-level tool loop is used. Filesystem path confinement rejects traversal and symlink escape, while approved shell commands run from the project root with a minimal environment and mandatory timeout/process-group cleanup. Neither mechanism is an OS sandbox or network isolation boundary, and the shell must only be used for trusted local work after reviewing each command. The accepted runtime is Node.js 24 LTS with pnpm 11; Bun is reserved for a later compatibility-tested distribution experiment.
@@ -34,7 +83,7 @@ pnpm install --frozen-lockfile
 pnpm hooks:install
 pnpm quality:check
 ADAM_AGENT_TARGET=fake.local pnpm --silent adam "What is this repository?"
-DEEPSEEK_API_KEY=<credential> pnpm tui
+pnpm tui --target fake.local
 ```
 
 For the headless CLI, the explicit `fake.local` target exercises deterministic read, edit, and shell scenarios. Omitting a target fails with copy-pastable guidance, and a credential never selects a target implicitly. Adam asks on stderr before write or execute effects. Session and operation JSONL, overflow and extension artifacts, immutable extension records, extension lifecycle state, and private patch recovery data are written under `ADAM_AGENT_STATE_ROOT` when set, otherwise under `~/.local/state/adam-agent`. Recovery data is normally removed after a successful patch or complete rollback. If removal fails, Adam returns `patch_recovery_cleanup_failed` with the known `committed` or `rolled_back` settlement and an opaque reference to the cleanup attempt; because recursive removal may have partially completed, any remaining bundle is not guaranteed to be complete. Inspect the reference and workspace state before any retry. Recovery data is retained intact when Adam stops cleanup because it cannot confirm the workspace state, and this first version deliberately provides no automatic restart recovery.

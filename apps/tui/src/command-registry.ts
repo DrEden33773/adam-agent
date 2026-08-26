@@ -58,7 +58,7 @@ export type AdamKeybindingDefinition = {
 };
 
 export type AdamHelpTopicDefinition = {
-  readonly id: "commands" | "editor" | "hotkeys";
+  readonly id: "commands" | "editor" | "hotkeys" | "safety";
   readonly label: string;
   readonly summary: string;
 };
@@ -533,6 +533,7 @@ const fixedHelpTopics: readonly AdamHelpTopicDefinition[] = [
   { id: "commands", label: "Commands", summary: "Command names, arguments, and aliases" },
   { id: "hotkeys", label: "Hotkeys", summary: "Fixed effective keyboard bindings" },
   { id: "editor", label: "Editor", summary: "Pi Editor navigation and editing bindings" },
+  { id: "safety", label: "Safety", summary: "Permissions, trust, and isolation boundaries" },
 ];
 
 function rankSuggestions<Entry>(
