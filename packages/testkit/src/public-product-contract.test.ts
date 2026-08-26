@@ -174,6 +174,33 @@ test("the public walkthrough fixture is structurally bounded", async () => {
   expect(acceptance).toContain("examples/portfolio-walkthrough");
 });
 
+test("the retained H1 live evidence is bounded and reproducible", async () => {
+  const acceptance = await readFile(join(productRoot, "docs", "portfolio-acceptance.md"), "utf8");
+  const retainedEvidence = acceptance.match(
+    /## Retained H1 live evidence\n\n([\s\S]*?)(?=\n## |\s*$)/u,
+  )?.[1];
+
+  expect(retainedEvidence).toBeDefined();
+  for (const fact of [
+    "65be417544cc8f47854e70cf19c0ba6ac7382e6e",
+    "deepseek-v4-flash.direct",
+    "profile version 2",
+    "752dc75b-d9b5-4531-8960-4cc4db2eb70d",
+    "2b20b5ba0fd374105e007bde095082cb42ea741282e07f97b9fadae17ef75962",
+    "sha256:5bc729f1969ba9b9aedca25b5444818092d08b6084149d2baf781babe59fa882",
+    "3bbe8cd1f77ee76b3b7889a159edc1754ffea175b7348c7ca721b0b52c87e7cc",
+    "2,000 cents",
+    "2,700 cents",
+    "2 insertions, 1 deletion",
+    "exit code 0",
+    "cold hydration performed no model request or effect",
+    "both TUI processes restored the terminal",
+  ]) {
+    expect(retainedEvidence).toContain(fact);
+  }
+  expect(retainedEvidence).not.toMatch(/\/(?:home|tmp)\//u);
+});
+
 async function readPackageJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, "utf8"));
 }
