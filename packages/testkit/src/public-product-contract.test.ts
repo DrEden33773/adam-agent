@@ -723,6 +723,7 @@ test("MCP canonical identity and durable Tool Profile contracts have package-int
     .soft(profileConsumers)
     .toEqual([
       "mcp-host.ts",
+      "mcp-schema-admission.ts",
       "prompt-assembly.ts",
       "session-history-validation.ts",
       "session-lifecycle.ts",
@@ -771,6 +772,163 @@ test("MCP canonical identity and durable Tool Profile contracts have package-int
     expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./mcp-profile-contracts.js");
     expect
       .soft(packagePrivateSymbols.filter((symbol) => facadeSource.includes(symbol)))
+      .toEqual([]);
+  }
+  expect.soft(directTestImports).toEqual([]);
+});
+
+test("MCP schema admission has one package-internal owner", async () => {
+  const agentSourceRoot = join(productRoot, "packages", "agent", "src");
+  const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
+    .filter((entry) => entry.endsWith(".ts"))
+    .sort();
+  const sources = await Promise.all(
+    sourceFiles.map(async (sourceFile) => ({
+      path: sourceFile,
+      source: await readFile(join(agentSourceRoot, sourceFile), "utf8"),
+    })),
+  );
+  const expectedOwners = { admitMcpSchema: ["mcp-schema-admission.ts"] } as const;
+  const actualOwners = Object.fromEntries(
+    Object.keys(expectedOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) =>
+          new RegExp(`\\bexport\\s+function\\s+${symbol}\\s*\\(`, "u").test(source),
+        )
+        .map(({ path }) => path),
+    ]),
+  );
+  const expectedTypeOwners = { McpSchemaAdmission: ["mcp-schema-admission.ts"] } as const;
+  const actualTypeOwners = Object.fromEntries(
+    Object.keys(expectedTypeOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) => new RegExp(`\\bexport\\s+type\\s+${symbol}\\b`, "u").test(source))
+        .map(({ path }) => path),
+    ]),
+  );
+  const schemaSource = sources.find(({ path }) => path === "mcp-schema-admission.ts")?.source ?? "";
+  const hostSource = sources.find(({ path }) => path === "mcp-host.ts")?.source ?? "";
+  const expectedProjectorOwners = {
+    projectMcpInputSchemaV1: ["mcp-host.ts"],
+    projectMcpRootChoice: ["mcp-host.ts"],
+  } as const;
+  const actualProjectorOwners = Object.fromEntries(
+    Object.keys(expectedProjectorOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) => new RegExp(`\\bfunction\\s+${symbol}\\s*\\(`, "u").test(source))
+        .map(({ path }) => path),
+    ]),
+  );
+  const schemaConsumers = sources
+    .filter(({ source }) => moduleSpecifiers(source).includes("./mcp-schema-admission.js"))
+    .map(({ path }) => path);
+  const schemaRuntimeConsumers = sources
+    .filter(({ source }) => runtimeModuleSpecifiers(source).includes("./mcp-schema-admission.js"))
+    .map(({ path }) => path);
+  const publicFacadeSource = sources.find(({ path }) => path === "index.ts")?.source ?? "";
+  const testingFacadeSource =
+    sources.find(({ path }) => path === "internal-testing.ts")?.source ?? "";
+  const testSourceRoots = (
+    await Promise.all(
+      ["apps", "packages"].map(async (root) =>
+        (
+          await readdir(join(productRoot, root), { withFileTypes: true })
+        )
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => join(productRoot, root, entry.name, "src")),
+      ),
+    )
+  ).flat();
+  const testSources = (
+    await Promise.all(
+      testSourceRoots.map(async (sourceRoot) => {
+        try {
+          return (await readdir(sourceRoot, { recursive: true }))
+            .filter((entry) => entry.endsWith(".test.ts"))
+            .map((entry) => join(sourceRoot, entry));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return [];
+          }
+          throw error;
+        }
+      }),
+    )
+  ).flat();
+  const directTestImports = (
+    await Promise.all(
+      testSources
+        .filter((testPath) => testPath !== fileURLToPath(import.meta.url))
+        .map(async (testPath) =>
+          moduleSpecifiers(await readFile(testPath, "utf8"))
+            .filter((specifier) => /mcp-schema-admission\.js$/u.test(specifier))
+            .map((specifier) => ({ path: relative(productRoot, testPath), specifier })),
+        ),
+    )
+  ).flat();
+
+  expect.soft(actualOwners).toEqual(expectedOwners);
+  expect.soft(actualTypeOwners).toEqual(expectedTypeOwners);
+  expect.soft(actualProjectorOwners).toEqual(expectedProjectorOwners);
+  expect.soft(schemaSource.match(/\bexport\s+/gu) ?? []).toHaveLength(2);
+  expect
+    .soft(
+      [
+        ...schemaSource.matchAll(/\bexport\s+(?:async\s+)?(?:function|const|class|enum)\s+(\w+)/gu),
+      ].map((match) => match[1]),
+    )
+    .toEqual(["admitMcpSchema"]);
+  expect
+    .soft(
+      [...schemaSource.matchAll(/\bexport\s+(?:type|interface)\s+(\w+)/gu)].map(
+        (match) => match[1],
+      ),
+    )
+    .toEqual(["McpSchemaAdmission"]);
+  expect.soft(schemaConsumers).toEqual(["mcp-host.ts"]);
+  expect.soft(schemaRuntimeConsumers).toEqual(["mcp-host.ts"]);
+  expect.soft(moduleSpecifiers(schemaSource)).toEqual(["./mcp-profile-contracts.js"]);
+  expect.soft(runtimeModuleSpecifiers(schemaSource)).toEqual([]);
+  expect.soft(typeOnlyImportSpecifiers(schemaSource)).toEqual(["./mcp-profile-contracts.js"]);
+  expect
+    .soft(
+      runtimeModuleSpecifiers(hostSource).filter(
+        (specifier) => specifier === "./mcp-schema-admission.js",
+      ),
+    )
+    .toEqual(["./mcp-schema-admission.js"]);
+  expect.soft(hostSource.match(/\badmitMcpSchema\s*\(/gu) ?? []).toHaveLength(3);
+  const legacyHostAdmissionOwnerFragments = [
+    "const mcpSchemaLimits",
+    "function assertMcpSchemaAdmissible",
+    "function validateMcpReferenceGraph",
+    "function resolveLocalSchemaReference",
+    "function resolveMcpProjectionBranch",
+    "function schemaDialect",
+  ];
+  expect
+    .soft(legacyHostAdmissionOwnerFragments.filter((fragment) => hostSource.includes(fragment)))
+    .toEqual([]);
+  const forbiddenSchemaOwnerFragments = [
+    "compatibilityHint",
+    "digestCanonicalMcpJson",
+    "truncateUtf8",
+    "@modelcontextprotocol/sdk",
+    "Ajv",
+    "McpHostError",
+    "McpTransportFactory",
+  ];
+  expect
+    .soft(forbiddenSchemaOwnerFragments.filter((fragment) => schemaSource.includes(fragment)))
+    .toEqual([]);
+  const packageInternalSymbols = ["admitMcpSchema", "McpSchemaAdmission"];
+  for (const facadeSource of [publicFacadeSource, testingFacadeSource]) {
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./mcp-schema-admission.js");
+    expect
+      .soft(packageInternalSymbols.filter((symbol) => facadeSource.includes(symbol)))
       .toEqual([]);
   }
   expect.soft(directTestImports).toEqual([]);

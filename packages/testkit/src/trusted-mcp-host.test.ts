@@ -3581,6 +3581,149 @@ test("SessionLifecycle projects root allOf local references without narrowing th
   }
 });
 
+test("SessionLifecycle preserves a supported MCP schema dialect and exact raw and projected identities", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-schema-dialect-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+  const inputSchema = {
+    $schema: "https://json-schema.org/draft/2020-12/schema#",
+    type: "object",
+    $defs: {
+      left: {
+        type: "object",
+        properties: { left: { type: "string" } },
+        required: ["left"],
+      },
+      right: {
+        type: "object",
+        properties: { right: { type: "integer" } },
+        required: ["right"],
+      },
+    },
+    allOf: [{ $ref: "#/$defs/left" }, { $ref: "#/$defs/right" }],
+    additionalProperties: false,
+  } as const;
+  const projectedSchema = {
+    $schema: "https://json-schema.org/draft/2020-12/schema#",
+    type: "object",
+    $defs: inputSchema.$defs,
+    properties: { left: { type: "string" }, right: { type: "integer" } },
+    required: ["left", "right"],
+    additionalProperties: false,
+  } as const;
+  const { harness, lifecycle, peer } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [{ tools: [scriptedStringTool("echo", inputSchema)] }],
+      },
+    },
+  );
+  let transportClosed: Promise<void> | undefined;
+  try {
+    const committed = await commitFixtureEchoTool(lifecycle);
+    transportClosed = peer.nextClose("fixture");
+    const sessionStore = await harness.sessions.open(committed.sessionId);
+    if (sessionStore === undefined) {
+      throw new Error("The fixture requires the committed in-memory session store.");
+    }
+    const profileRecord = (await sessionStore.read()).find(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "mcp_tool_profile_committed",
+    );
+    if (
+      profileRecord?.schemaVersion !== 3 ||
+      profileRecord.record.type !== "mcp_tool_profile_committed"
+    ) {
+      throw new Error("The fixture requires one durable MCP Tool Profile.");
+    }
+
+    expect(profileRecord.record.profile.tools[0]).toMatchObject({
+      rawSchema: {
+        dialect: "2020-12",
+        provenance: "tools/list",
+        value: inputSchema,
+        digest: "sha256:ae389fa3a818b9384383ae04c10692569da95ce96ee4bb7910754479ca05d44e",
+      },
+      modelProjection: {
+        version: 1,
+        schema: projectedSchema,
+        digest: "sha256:b9ba51bb6b450a6a92b892fd821aa70dc16708dc9450c32695fb439add2c79a3",
+      },
+    });
+  } finally {
+    expect(await lifecycle.close()).toEqual({ status: "closed" });
+    if (transportClosed !== undefined) {
+      await transportClosed;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle quarantines an unsupported MCP schema dialect without hiding a healthy sibling", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-schema-dialect-quarantine-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+
+  const { lifecycle } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: [
+              scriptedStringTool("unsupported_dialect", {
+                $schema: "https://json-schema.org/draft/2020-13/schema",
+                type: "object",
+                properties: { value: { type: "string" } },
+              }),
+              scriptedStringTool("healthy_unstamped"),
+            ],
+          },
+        ],
+      },
+    },
+  );
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    if (created.mcp === undefined) {
+      throw new Error("The fixture requires an MCP configuration snapshot.");
+    }
+    const confirmed = await lifecycle.configureMcp({
+      type: "confirm_workspace",
+      sessionId: created.sessionId,
+      sourceDigest: created.mcp.source.digest,
+    });
+    const preview = confirmed.snapshot.mcp?.servers[0];
+    if (preview === undefined) {
+      throw new Error("The fixture requires one MCP server preview.");
+    }
+    await lifecycle.configureMcp({
+      type: "approve_server",
+      sessionId: created.sessionId,
+      serverId: preview.serverId,
+      definitionDigest: preview.definitionDigest,
+    });
+    const activated = await lifecycle.configureMcp({
+      type: "activate_servers",
+      sessionId: created.sessionId,
+      servers: [{ serverId: preview.serverId, definitionDigest: preview.definitionDigest }],
+    });
+
+    expect(activated.snapshot.mcp).toMatchObject({
+      status: "tool_selection_required",
+      catalog: { tools: [{ serverId: "fixture", originalName: "healthy_unstamped" }] },
+      diagnostics: [],
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle quarantines a recursive MCP schema without hiding its healthy sibling", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-recursive-schema-"));
   const stateRoot = join(testRoot, "state");
