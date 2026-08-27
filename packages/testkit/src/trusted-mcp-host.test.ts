@@ -185,11 +185,10 @@ function scriptedReferenceDepthSchema(referenceCount: number): Readonly<Record<s
 function observeFileCreation(path: string): Promise<void> {
   return new Promise((resolve, reject) => {
     let settled = false;
-    const watcher = watch(dirname(path), (_event, filename) => {
-      if (filename === basename(path)) {
-        finish();
-      }
-    });
+    const observeTarget = () => {
+      void stat(path).then(finish, () => undefined);
+    };
+    const watcher = watch(dirname(path), observeTarget);
     const guard = setTimeout(() => {
       settled = true;
       watcher.close();
@@ -204,7 +203,7 @@ function observeFileCreation(path: string): Promise<void> {
       watcher.close();
       resolve();
     };
-    void stat(path).then(finish, () => undefined);
+    observeTarget();
   });
 }
 
