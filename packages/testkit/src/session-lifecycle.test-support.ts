@@ -2,7 +2,10 @@ import {
   createSessionLifecycle as createRawSessionLifecycle,
   type ModelTargetIdentity,
 } from "@adam-agent/agent";
-import { sessionAutomaticTitlesEnabled } from "@adam-agent/agent/internal-testing";
+import {
+  createTrustedWorkspaceTrustForTesting,
+  sessionAutomaticTitlesEnabled,
+} from "@adam-agent/agent/internal-testing";
 
 export const sessionLifecycleTargetIdentity: ModelTargetIdentity = {
   targetId: "deepseek-v4-flash.direct",
@@ -30,5 +33,10 @@ data: [DONE]
 export function createSessionLifecycleForTests(
   options: Parameters<typeof createRawSessionLifecycle>[0],
 ): ReturnType<typeof createRawSessionLifecycle> {
-  return createRawSessionLifecycle({ ...options, [sessionAutomaticTitlesEnabled]: false });
+  return createRawSessionLifecycle({
+    ...options,
+    workspaceTrust:
+      options.workspaceTrust ?? createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
+    [sessionAutomaticTitlesEnabled]: false,
+  });
 }

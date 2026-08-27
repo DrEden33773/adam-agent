@@ -21,6 +21,7 @@ import {
   type ModelRequest,
   type ModelTargets,
   type RuntimeEvent,
+  type WorkspaceTrustController,
 } from "@adam-agent/agent";
 import {
   createInMemorySessionStoreDirectory,
@@ -33,8 +34,11 @@ import {
   mcpIdleScheduler,
   mcpRequestScheduler,
   mcpTransportFactory,
+  type ProjectLifecycleOwner,
   type SessionRecord,
+  sessionProjectLifecycleOwner,
   sessionStoreDirectory,
+  workspaceMcpLeaseTransitionBarrier,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
@@ -88,6 +92,67 @@ function createScriptedMcpLifecycle(
     lifecycle: harness.createLifecycle({ ...options, [mcpTransportFactory]: peer }),
     peer,
   };
+}
+
+function createQueuedProjectLifecycleOwner(
+  onAcquire: () => void = () => {},
+): ProjectLifecycleOwner {
+  let tail = Promise.resolve();
+  const acquire: ProjectLifecycleOwner["acquire"] = async () => {
+    onAcquire();
+    const predecessor = tail;
+    const available = Promise.withResolvers<void>();
+    tail = predecessor.then(() => available.promise);
+    await predecessor;
+    let released = false;
+    return {
+      async release() {
+        if (!released) {
+          released = true;
+          available.resolve();
+        }
+      },
+    };
+  };
+  return {
+    acquire,
+    async run(operation) {
+      const lease = await acquire();
+      try {
+        return await operation();
+      } finally {
+        await lease.release();
+      }
+    },
+  };
+}
+
+async function prepareScriptedMcpSession(
+  lifecycle: ReturnType<typeof createSessionLifecycle>,
+): Promise<{
+  readonly sessionId: string;
+  readonly server: { readonly serverId: string; readonly definitionDigest: `sha256:${string}` };
+}> {
+  const created = await lifecycle.create({ targetIdentity });
+  if (created.mcp === undefined) {
+    throw new Error("The fixture requires an MCP configuration snapshot.");
+  }
+  const confirmed = await lifecycle.configureMcp({
+    type: "confirm_workspace",
+    sessionId: created.sessionId,
+    sourceDigest: created.mcp.source.digest,
+  });
+  const preview = confirmed.snapshot.mcp?.servers[0];
+  if (preview === undefined) {
+    throw new Error("The fixture requires one MCP server preview.");
+  }
+  await lifecycle.configureMcp({
+    type: "approve_server",
+    sessionId: created.sessionId,
+    serverId: preview.serverId,
+    definitionDigest: preview.definitionDigest,
+  });
+  return { sessionId: created.sessionId, server: preview };
 }
 
 function scriptedStringTool(
@@ -1460,10 +1525,34 @@ test("SessionLifecycle surfaces unconfirmed activation shutdown without offering
   await mkdir(workspaceRoot);
   await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
   let confirmationAttempts = 0;
+  let leaseReleaseCount = 0;
+  const canonicalRoot = await realpath(workspaceRoot);
+  const trustedSnapshot = {
+    projectId: `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}` as const,
+    projectLabel: basename(canonicalRoot),
+    status: "trusted" as const,
+    diagnostic: null,
+  };
+  const workspaceTrust: WorkspaceTrustController = {
+    async acquireMcpLease() {
+      return {
+        async release() {
+          leaseReleaseCount += 1;
+        },
+      };
+    },
+    async load() {
+      return trustedSnapshot;
+    },
+    async setTrusted() {
+      return trustedSnapshot;
+    },
+  };
   const { lifecycle, peer } = createScriptedMcpLifecycle(
     {
       stateRoot,
       workspaceRoot,
+      workspaceTrust,
       [mcpCloseConfirmation]: {
         async confirm() {
           confirmationAttempts += 1;
@@ -1536,9 +1625,370 @@ test("SessionLifecycle surfaces unconfirmed activation shutdown without offering
     ).rejects.toMatchObject({ code: "session_invalid" });
     await expect(lifecycle.close()).resolves.toEqual({ status: "mcp_shutdown_unconfirmed" });
     expect(confirmationAttempts).toBe(1);
+    expect(leaseReleaseCount).toBe(0);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle waits for a releasing MCP lease before concurrent activation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-lease-transition-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+  const canonicalRoot = await realpath(workspaceRoot);
+  const trustedSnapshot = {
+    projectId: `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}` as const,
+    projectLabel: basename(canonicalRoot),
+    status: "trusted" as const,
+    diagnostic: null,
+  };
+  const firstReleaseStarted = Promise.withResolvers<void>();
+  const allowFirstRelease = Promise.withResolvers<void>();
+  const secondActivationWaiting = Promise.withResolvers<void>();
+  let leaseAcquisitionCount = 0;
+  const workspaceTrust: WorkspaceTrustController = {
+    async acquireMcpLease() {
+      leaseAcquisitionCount += 1;
+      const acquisition = leaseAcquisitionCount;
+      return {
+        async release() {
+          if (acquisition === 1) {
+            firstReleaseStarted.resolve();
+            await allowFirstRelease.promise;
+          }
+        },
+      };
+    },
+    async load() {
+      return trustedSnapshot;
+    },
+    async setTrusted() {
+      return trustedSnapshot;
+    },
+  };
+  const peer = createScriptedMcpTransportFactory({ fixture: ordinaryScriptedMcpServer() });
+  const lifecycle = createSessionLifecycle({
+    stateRoot,
+    workspaceRoot,
+    workspaceTrust,
+    [mcpTransportFactory]: peer,
+    [sessionProjectLifecycleOwner]: createQueuedProjectLifecycleOwner(),
+    [workspaceMcpLeaseTransitionBarrier]: {
+      waitingForRelease() {
+        secondActivationWaiting.resolve();
+      },
+    },
+  });
+  let cancellingFirst: Promise<unknown> | undefined;
+  let activatingSecond: Promise<unknown> | undefined;
+  try {
+    const first = await prepareScriptedMcpSession(lifecycle);
+    const second = await prepareScriptedMcpSession(lifecycle);
+    const activatedFirst = await lifecycle.configureMcp({
+      type: "activate_servers",
+      sessionId: first.sessionId,
+      servers: [
+        { serverId: first.server.serverId, definitionDigest: first.server.definitionDigest },
+      ],
+    });
+    const firstMcp = activatedFirst.snapshot.mcp;
+    const firstGeneration =
+      firstMcp?.workspaceConfirmed === true ? firstMcp.activation?.generationId : undefined;
+    if (firstGeneration === undefined) {
+      throw new Error("The fixture requires one active MCP generation.");
+    }
+
+    cancellingFirst = lifecycle.configureMcp({
+      type: "cancel_configuration",
+      sessionId: first.sessionId,
+      generationId: firstGeneration,
+    });
+    await withFailureGuard(
+      firstReleaseStarted.promise,
+      5_000,
+      "The first MCP lease release did not start.",
+    );
+    activatingSecond = lifecycle.configureMcp({
+      type: "activate_servers",
+      sessionId: second.sessionId,
+      servers: [
+        { serverId: second.server.serverId, definitionDigest: second.server.definitionDigest },
+      ],
+    });
+
+    await expect(
+      withFailureGuard(
+        Promise.race([
+          secondActivationWaiting.promise.then(() => "waiting" as const),
+          activatingSecond.then(() => "activated" as const),
+        ]),
+        5_000,
+        "The concurrent MCP activation neither waited for release nor activated.",
+      ),
+    ).resolves.toBe("waiting");
+    expect(leaseAcquisitionCount).toBe(1);
+    allowFirstRelease.resolve();
+    await withFailureGuard(
+      Promise.all([cancellingFirst, activatingSecond]),
+      5_000,
+      "The concurrent MCP release and activation did not settle after release resumed.",
+    );
+    expect(leaseAcquisitionCount).toBe(2);
+  } finally {
+    allowFirstRelease.resolve();
+    try {
+      await withFailureGuard(
+        Promise.allSettled([cancellingFirst, activatingSecond].filter(Boolean)),
+        5_000,
+        "The concurrent MCP lease operations did not settle during cleanup.",
+      );
+    } finally {
+      try {
+        await withFailureGuard(
+          lifecycle.close(),
+          5_000,
+          "SessionLifecycle did not close after the concurrent MCP lease transition.",
+        );
+      } finally {
+        await rm(testRoot, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test("SessionLifecycle retains its MCP lease while an activation claim precedes generation start", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-lease-activation-claim-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+  const canonicalRoot = await realpath(workspaceRoot);
+  const trustedSnapshot = {
+    projectId: `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}` as const,
+    projectLabel: basename(canonicalRoot),
+    status: "trusted" as const,
+    diagnostic: null,
+  };
+  const secondActivationLeaseReady = Promise.withResolvers<void>();
+  const allowSecondActivation = Promise.withResolvers<void>();
+  const cancellationReachedOwner = Promise.withResolvers<void>();
+  let holdNextActivation = false;
+  let observeNextOwnerAcquire = false;
+  let leaseAcquisitionCount = 0;
+  let leaseReleaseCount = 0;
+  const workspaceTrust: WorkspaceTrustController = {
+    async acquireMcpLease() {
+      leaseAcquisitionCount += 1;
+      return {
+        async release() {
+          leaseReleaseCount += 1;
+        },
+      };
+    },
+    async load() {
+      return trustedSnapshot;
+    },
+    async setTrusted() {
+      return trustedSnapshot;
+    },
+  };
+  const peer = createScriptedMcpTransportFactory({ fixture: ordinaryScriptedMcpServer() });
+  const lifecycle = createSessionLifecycle({
+    stateRoot,
+    workspaceRoot,
+    workspaceTrust,
+    [mcpTransportFactory]: peer,
+    [sessionProjectLifecycleOwner]: createQueuedProjectLifecycleOwner(() => {
+      if (observeNextOwnerAcquire) {
+        observeNextOwnerAcquire = false;
+        cancellationReachedOwner.resolve();
+      }
+    }),
+    [workspaceMcpLeaseTransitionBarrier]: {
+      async activationLeaseReady() {
+        if (holdNextActivation) {
+          holdNextActivation = false;
+          secondActivationLeaseReady.resolve();
+          await allowSecondActivation.promise;
+        }
+      },
+      waitingForRelease() {},
+    },
+  });
+  let activatingSecond: Promise<unknown> | undefined;
+  let cancellingFirst: Promise<unknown> | undefined;
+  try {
+    const first = await prepareScriptedMcpSession(lifecycle);
+    const second = await prepareScriptedMcpSession(lifecycle);
+    const activatedFirst = await lifecycle.configureMcp({
+      type: "activate_servers",
+      sessionId: first.sessionId,
+      servers: [
+        { serverId: first.server.serverId, definitionDigest: first.server.definitionDigest },
+      ],
+    });
+    const firstMcp = activatedFirst.snapshot.mcp;
+    const firstGeneration =
+      firstMcp?.workspaceConfirmed === true ? firstMcp.activation?.generationId : undefined;
+    if (firstGeneration === undefined) {
+      throw new Error("The fixture requires one active MCP generation.");
+    }
+
+    holdNextActivation = true;
+    activatingSecond = lifecycle.configureMcp({
+      type: "activate_servers",
+      sessionId: second.sessionId,
+      servers: [
+        { serverId: second.server.serverId, definitionDigest: second.server.definitionDigest },
+      ],
+    });
+    await withFailureGuard(
+      secondActivationLeaseReady.promise,
+      5_000,
+      "The second MCP activation did not acquire its pre-generation lease claim.",
+    );
+    const firstTransportClosed = peer.nextClose("fixture");
+    observeNextOwnerAcquire = true;
+    cancellingFirst = lifecycle.configureMcp({
+      type: "cancel_configuration",
+      sessionId: first.sessionId,
+      generationId: firstGeneration,
+    });
+    await withFailureGuard(
+      firstTransportClosed,
+      5_000,
+      "The first MCP generation did not close while the second activation held its claim.",
+    );
+    await withFailureGuard(
+      cancellationReachedOwner.promise,
+      5_000,
+      "MCP cancellation did not finish its lease-release decision.",
+    );
+    expect(leaseAcquisitionCount).toBe(1);
+    expect(leaseReleaseCount).toBe(0);
+
+    allowSecondActivation.resolve();
+    await withFailureGuard(
+      Promise.all([activatingSecond, cancellingFirst]),
+      5_000,
+      "The activation-claim MCP operations did not settle after activation resumed.",
+    );
+    expect(peer.activeCount("fixture")).toBe(1);
+    expect(leaseAcquisitionCount).toBe(1);
+    expect(leaseReleaseCount).toBe(0);
+  } finally {
+    allowSecondActivation.resolve();
+    try {
+      await withFailureGuard(
+        Promise.allSettled([activatingSecond, cancellingFirst].filter(Boolean)),
+        5_000,
+        "The activation-claim MCP operations did not settle during cleanup.",
+      );
+    } finally {
+      try {
+        await withFailureGuard(
+          lifecycle.close(),
+          5_000,
+          "SessionLifecycle did not close after the MCP activation-claim race.",
+        );
+      } finally {
+        await rm(testRoot, { recursive: true, force: true });
+      }
+    }
+  }
+});
+
+test("SessionLifecycle fences later MCP activation when lease release fails", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-lease-release-failure-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+  const canonicalRoot = await realpath(workspaceRoot);
+  const trustedSnapshot = {
+    projectId: `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}` as const,
+    projectLabel: basename(canonicalRoot),
+    status: "trusted" as const,
+    diagnostic: null,
+  };
+  let leaseAcquisitionCount = 0;
+  let leaseReleaseCount = 0;
+  const workspaceTrust: WorkspaceTrustController = {
+    async acquireMcpLease() {
+      leaseAcquisitionCount += 1;
+      return {
+        async release() {
+          leaseReleaseCount += 1;
+          throw new Error("Injected MCP lease release failure.");
+        },
+      };
+    },
+    async load() {
+      return trustedSnapshot;
+    },
+    async setTrusted() {
+      return trustedSnapshot;
+    },
+  };
+  const peer = createScriptedMcpTransportFactory({ fixture: ordinaryScriptedMcpServer() });
+  const lifecycle = createSessionLifecycle({
+    stateRoot,
+    workspaceRoot,
+    workspaceTrust,
+    [mcpTransportFactory]: peer,
+    [sessionProjectLifecycleOwner]: createQueuedProjectLifecycleOwner(),
+  });
+  try {
+    const first = await prepareScriptedMcpSession(lifecycle);
+    const second = await prepareScriptedMcpSession(lifecycle);
+    const activatedFirst = await lifecycle.configureMcp({
+      type: "activate_servers",
+      sessionId: first.sessionId,
+      servers: [
+        { serverId: first.server.serverId, definitionDigest: first.server.definitionDigest },
+      ],
+    });
+    const firstMcp = activatedFirst.snapshot.mcp;
+    const firstGeneration =
+      firstMcp?.workspaceConfirmed === true ? firstMcp.activation?.generationId : undefined;
+    if (firstGeneration === undefined) {
+      throw new Error("The fixture requires one active MCP generation.");
+    }
+
+    await expect(
+      lifecycle.configureMcp({
+        type: "cancel_configuration",
+        sessionId: first.sessionId,
+        generationId: firstGeneration,
+      }),
+    ).rejects.toBeDefined();
+    const requestCountAfterReleaseFailure = peer.requests("fixture").length;
+    await expect(
+      lifecycle.configureMcp({
+        type: "activate_servers",
+        sessionId: second.sessionId,
+        servers: [
+          { serverId: second.server.serverId, definitionDigest: second.server.definitionDigest },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "mcp_start_failed" });
+    expect(peer.requests("fixture")).toHaveLength(requestCountAfterReleaseFailure);
+    expect(peer.activeCount("fixture")).toBe(0);
+    expect(leaseAcquisitionCount).toBe(1);
+    expect(leaseReleaseCount).toBe(1);
+  } finally {
+    try {
+      await withFailureGuard(
+        lifecycle.close(),
+        5_000,
+        "SessionLifecycle did not settle after the injected MCP lease release failure.",
+      ).catch(() => undefined);
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
   }
 });
 

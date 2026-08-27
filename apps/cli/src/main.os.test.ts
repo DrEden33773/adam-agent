@@ -77,6 +77,7 @@ describe("one-shot CLI deterministic coding process", () => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-fake-skill-context-"));
     const workspaceRoot = join(testRoot, "workspace");
     const stateRoot = join(testRoot, "state");
+    const configRoot = join(testRoot, "config");
     const userHome = join(testRoot, "home");
     const skillRoot = join(userHome, ".agents", "skills", "visible-skill");
     const demoPath = join(workspaceRoot, "demo.txt");
@@ -90,10 +91,17 @@ describe("one-shot CLI deterministic coding process", () => {
     );
 
     try {
+      const trusted = await runCliArguments({
+        args: ["--trust-workspace"],
+        cwd: workspaceRoot,
+        environment: { HOME: userHome, XDG_CONFIG_HOME: configRoot },
+        stateRoot,
+      });
+      expect(trusted).toMatchObject({ exitCode: 0, signal: null, stderr: "" });
       const result = await runCliArguments({
         args: ["Update the demo file and verify it"],
         cwd: workspaceRoot,
-        environment: { HOME: userHome },
+        environment: { HOME: userHome, XDG_CONFIG_HOME: configRoot },
         stateRoot,
         stdin: "y\ny\n",
       });

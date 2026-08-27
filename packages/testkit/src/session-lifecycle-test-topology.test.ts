@@ -67,7 +67,7 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
     .toEqual(["createSessionLifecycle"]);
   expect
     .soft(runtimeImportedBindings(supportSource, "@adam-agent/agent/internal-testing"))
-    .toEqual(["sessionAutomaticTitlesEnabled"]);
+    .toEqual(["createTrustedWorkspaceTrustForTesting", "sessionAutomaticTitlesEnabled"]);
   expect
     .soft(topLevelValueDeclarations(supportSource))
     .toEqual([

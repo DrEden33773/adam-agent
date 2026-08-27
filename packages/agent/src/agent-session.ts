@@ -1582,6 +1582,12 @@ export class AgentSession {
         if (candidate === undefined || this.#repositoryWorkspaceRoot === undefined) {
           return skillActivationFailure("Explicit Agent Skill content is unavailable.");
         }
+        if (
+          candidate.locator.source === "project" &&
+          (await this.#durableContext?.authorizeProjectContextLoad?.()) === false
+        ) {
+          return skillActivationFailure("Explicit Agent Skill content is unavailable.");
+        }
         const manifest =
           this.#durableContext?.preparedExplicitSkillManifests?.get(selection.requestId) ??
           (await buildSkillResourceManifestV1({
@@ -2086,6 +2092,12 @@ export class AgentSession {
       if (candidate === undefined || this.#repositoryWorkspaceRoot === undefined) {
         throw new SkillsError("skill_catalog_unavailable");
       }
+      if (
+        candidate.locator.source === "project" &&
+        (await this.#durableContext?.authorizeProjectContextLoad?.()) === false
+      ) {
+        throw new SkillsError("skill_catalog_unavailable");
+      }
       const manifest = await buildSkillResourceManifestV1({
         candidate,
         workspaceRoot: this.#repositoryWorkspaceRoot,
@@ -2255,6 +2267,18 @@ export class AgentSession {
         "The requested Agent Skill resource is unavailable in this session.",
       );
     }
+    const candidate = context.registry.candidates.find(
+      (entry) => entry.qualifiedId === input.qualifiedId,
+    );
+    if (
+      candidate?.locator.source === "project" &&
+      (await this.#durableContext?.authorizeProjectContextLoad?.()) === false
+    ) {
+      return skillResourceFailure(
+        "skill_resource_unavailable",
+        "The requested Agent Skill resource is unavailable in this session.",
+      );
+    }
     let page: Awaited<ReturnType<typeof readSkillResourcePageV1>>;
     try {
       page = await readSkillResourcePageV1({
@@ -2371,6 +2395,9 @@ export class AgentSession {
     const unionScopes = [...activeScopes, ...requestedScopes];
     let repository: PromptContextRecordV1["repository"];
     try {
+      if ((await this.#durableContext?.authorizeProjectContextLoad?.()) === false) {
+        throw new Error("Workspace trust does not authorize new project context.");
+      }
       repository = await loadRepositoryInstructions({
         workspaceRoot,
         activeScopes: unionScopes,
@@ -2491,6 +2518,9 @@ export class AgentSession {
     let repository: PromptContextRecordV1["repository"];
     let nextSkillContext: SkillContextRecordV1;
     try {
+      if ((await this.#durableContext?.authorizeProjectContextLoad?.()) === false) {
+        throw new Error("Workspace trust does not authorize new project context.");
+      }
       repository = await loadRepositoryInstructions({
         workspaceRoot,
         activeScopes: repositoryScopes,

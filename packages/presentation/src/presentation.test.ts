@@ -13,7 +13,11 @@ const emptySnapshot: AuthoritativePresentationSnapshot = {
     sessionThroughSequence: 0,
     operationThrough: [],
   },
-  project: { id: "project-1", label: "adam-agent" },
+  project: {
+    id: "project-1",
+    label: "adam-agent",
+    workspaceTrust: { status: "trusted", diagnostic: null },
+  },
   targets: { items: [], defaultTargetId: null, diagnostic: null },
   sessions: {
     items: [

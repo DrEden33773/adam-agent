@@ -1,6 +1,10 @@
 export type ProjectDisplay = {
   readonly id: string;
   readonly label: string;
+  readonly workspaceTrust: {
+    readonly status: "trusted" | "untrusted" | "unavailable";
+    readonly diagnostic: { readonly code: string; readonly message: string } | null;
+  };
 };
 
 export type ThinkingCapabilityDisplay = {
@@ -753,6 +757,11 @@ export type PresentationCommand =
         | "maximumOutputTokens"
         | "automaticCompactionWindowTokens";
       readonly value: number | null;
+    }
+  | {
+      readonly type: "set_workspace_trust";
+      readonly projectId: string;
+      readonly trusted: boolean;
     }
   | {
       readonly type: "load_older_transcript";

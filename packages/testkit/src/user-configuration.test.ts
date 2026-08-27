@@ -1,19 +1,30 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   type ContextProfile,
+  createExtensionHost,
   createPermissionPolicy,
   createPresentationSession,
   createReadToolRegistry,
   type ModelTargetIdentity,
   type ModelTargets,
   type PresentationPreferences,
+  type RuntimeEvent,
 } from "@adam-agent/agent";
-import { createPresentationPreferencesWithStorageForTesting } from "@adam-agent/agent/internal-testing";
+import {
+  createPresentationPreferencesWithStorageForTesting,
+  createWorkspaceTrustWithStorageForTesting,
+  mcpTransportFactory,
+} from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
-import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
+import {
+  createInMemorySessionLifecycleHarness,
+  createScriptedMcpTransportFactory,
+  FakeModelDriver,
+} from "./index.js";
 
 const targetIdentity: ModelTargetIdentity = {
   targetId: "deepseek-v4-flash.direct",
@@ -59,6 +70,43 @@ function createInMemoryUserConfiguration(initialText: string | null = null): {
     read: () => text,
     replace(nextText) {
       text = nextText;
+    },
+  };
+}
+
+function createInMemoryWorkspaceTrustConfiguration(
+  workspaceRoot: string,
+  initialText: string | null = null,
+): {
+  readonly controller: ReturnType<typeof createWorkspaceTrustWithStorageForTesting>;
+  read(): string | null;
+  replace(text: string | null): void;
+  failWrites(): void;
+} {
+  let text = initialText;
+  let writesFail = false;
+  const controller = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        return text === null ? { status: "missing" } : { status: "available", text };
+      },
+      async write(nextText) {
+        if (writesFail) {
+          throw new Error("Injected workspace trust write failure.");
+        }
+        text = nextText;
+      },
+    },
+  });
+  return {
+    controller,
+    read: () => text,
+    replace(nextText) {
+      text = nextText;
+    },
+    failWrites() {
+      writesFail = true;
     },
   };
 }
@@ -630,6 +678,71 @@ test("Presentation mutates one model-policy field and republishes its effective 
   }
 });
 
+test("Presentation exposes workspace trust and rejects a stale trust command", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-workspace-trust-presentation-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let trustDocument: string | null = null;
+  const workspaceTrust = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        return trustDocument === null
+          ? { status: "missing" as const }
+          : { status: "available" as const, text: trustDocument };
+      },
+      async write(text) {
+        trustDocument = text;
+      },
+    },
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ workspaceRoot, workspaceTrust });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    openProject: true,
+    projectLabel: "ignored-noncanonical-label",
+    workspaceRoot,
+  });
+
+  try {
+    const project = presentation.getState().authoritative.project;
+    expect(project).toMatchObject({
+      label: "workspace",
+      workspaceTrust: { status: "untrusted", diagnostic: null },
+    });
+    await expect(
+      presentation.dispatch({
+        type: "set_workspace_trust",
+        projectId: `sha256:${"0".repeat(64)}`,
+        trusted: true,
+      }),
+    ).resolves.toEqual({
+      status: "rejected",
+      code: "stale_interaction",
+      message: "The workspace trust command targets a stale project identity.",
+    });
+    expect(trustDocument).toBeNull();
+
+    await expect(
+      presentation.dispatch({
+        type: "set_workspace_trust",
+        projectId: project.id,
+        trusted: true,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().authoritative.project).toEqual({
+      id: project.id,
+      label: "workspace",
+      workspaceTrust: { status: "trusted", diagnostic: null },
+    });
+  } finally {
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("Presentation rejects user-configuration mutation while a model run is active", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-busy-user-configuration-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -699,6 +812,14 @@ test("Presentation rejects user-configuration mutation while a model run is acti
         field: "maximumOutputTokens",
         value: 12_000,
       }),
+    ).resolves.toEqual({
+      status: "rejected",
+      code: "conflict",
+      message: "User configuration can be changed only while the session is idle.",
+    });
+    const projectId = presentation.getState().authoritative.project.id;
+    await expect(
+      presentation.dispatch({ type: "set_workspace_trust", projectId, trusted: false }),
     ).resolves.toEqual({
       status: "rejected",
       code: "conflict",
@@ -1364,6 +1485,1579 @@ test("a v2 automatic compaction limit is persisted as an absolute effective thre
       ...compactingProfile,
       compactAtTokens: 450,
     });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+const boundedWorkspaceTrustIds = Array.from(
+  { length: 1_025 },
+  (_, index) => `sha256:${index.toString(16).padStart(64, "0")}`,
+);
+
+test.each([
+  { caseName: "empty", text: "" },
+  { caseName: "malformed JSON", text: "{" },
+  {
+    caseName: "duplicate object key",
+    text: '{"schemaVersion":1,"schemaVersion":1,"trustedProjectIds":[]}',
+  },
+  {
+    caseName: "unknown field",
+    text: JSON.stringify({ schemaVersion: 1, trustedProjectIds: [], wildcard: true }),
+  },
+  {
+    caseName: "wrong version",
+    text: JSON.stringify({ schemaVersion: 2, trustedProjectIds: [] }),
+  },
+  {
+    caseName: "uppercase digest",
+    text: JSON.stringify({ schemaVersion: 1, trustedProjectIds: [`sha256:${"A".repeat(64)}`] }),
+  },
+  {
+    caseName: "duplicate digest",
+    text: JSON.stringify({
+      schemaVersion: 1,
+      trustedProjectIds: [boundedWorkspaceTrustIds[0], boundedWorkspaceTrustIds[0]],
+    }),
+  },
+  {
+    caseName: "unsorted digests",
+    text: JSON.stringify({
+      schemaVersion: 1,
+      trustedProjectIds: [boundedWorkspaceTrustIds[1], boundedWorkspaceTrustIds[0]],
+    }),
+  },
+  {
+    caseName: "too many digests",
+    text: JSON.stringify({ schemaVersion: 1, trustedProjectIds: boundedWorkspaceTrustIds }),
+  },
+  { caseName: "oversized bytes", text: "x".repeat(128 * 1024 + 1) },
+])("workspace trust rejects a strict $caseName document", async ({ text }) => {
+  const configuration = createInMemoryWorkspaceTrustConfiguration(process.cwd(), text);
+
+  await expect(configuration.controller.load()).resolves.toMatchObject({
+    status: "untrusted",
+    diagnostic: { code: "workspace_trust_invalid" },
+  });
+});
+
+test("workspace trust persists an exact sorted unique bounded document", async () => {
+  const configuration = createInMemoryWorkspaceTrustConfiguration(
+    process.cwd(),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      trustedProjectIds: [boundedWorkspaceTrustIds[0], boundedWorkspaceTrustIds[1024]],
+    })}\n`,
+  );
+  const current = await configuration.controller.load();
+  if (current.projectId === null) {
+    throw new Error("The fixture requires one canonical project identity.");
+  }
+
+  await configuration.controller.setTrusted({ projectId: current.projectId, trusted: true });
+  const document = JSON.parse(configuration.read() ?? "null") as {
+    readonly schemaVersion: number;
+    readonly trustedProjectIds: readonly string[];
+  };
+  expect(document).toEqual({
+    schemaVersion: 1,
+    trustedProjectIds: [...document.trustedProjectIds].sort(),
+  });
+  expect(new Set(document.trustedProjectIds).size).toBe(3);
+});
+
+test("workspace trust refuses to exceed 1024 project identities", async () => {
+  const configuration = createInMemoryWorkspaceTrustConfiguration(process.cwd());
+  const current = await configuration.controller.load();
+  if (current.projectId === null) {
+    throw new Error("The fixture requires one canonical project identity.");
+  }
+  const full = boundedWorkspaceTrustIds.filter((id) => id !== current.projectId).slice(0, 1_024);
+  configuration.replace(`${JSON.stringify({ schemaVersion: 1, trustedProjectIds: full })}\n`);
+
+  await expect(
+    configuration.controller.setTrusted({ projectId: current.projectId, trusted: true }),
+  ).rejects.toThrow("workspace trust configuration is full");
+  expect(JSON.parse(configuration.read() ?? "null")).toEqual({
+    schemaVersion: 1,
+    trustedProjectIds: full,
+  });
+});
+
+test("a failed workspace trust write publishes no current-process authority", async () => {
+  const preferences = createInMemoryUserConfiguration(
+    `${JSON.stringify({ schemaVersion: 1, defaultTargetId: targetIdentity.targetId })}\n`,
+  );
+  const configuration = createInMemoryWorkspaceTrustConfiguration(process.cwd());
+  const current = await configuration.controller.load();
+  if (current.projectId === null) {
+    throw new Error("The fixture requires one canonical project identity.");
+  }
+  configuration.failWrites();
+
+  await expect(
+    configuration.controller.setTrusted({ projectId: current.projectId, trusted: true }),
+  ).rejects.toThrow("Injected workspace trust write failure");
+  await expect(configuration.controller.load()).resolves.toMatchObject({
+    status: "untrusted",
+    diagnostic: null,
+  });
+  expect(await preferences.preferences.load()).toMatchObject({
+    defaultTargetId: targetIdentity.targetId,
+    diagnostic: null,
+  });
+});
+
+test("an unreadable workspace trust document fails closed", async () => {
+  const controller = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot: process.cwd(),
+    storage: {
+      async read() {
+        throw new Error("Injected workspace trust read failure.");
+      },
+      async write() {
+        throw new Error("The unavailable document must not be repaired implicitly.");
+      },
+    },
+  });
+
+  await expect(controller.load()).resolves.toMatchObject({
+    status: "untrusted",
+    diagnostic: { code: "workspace_trust_unsafe" },
+  });
+});
+
+test("workspace trust reports unavailable when canonical identity cannot be resolved", async () => {
+  const controller = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot: join(tmpdir(), `missing-workspace-${randomUUID()}`),
+    storage: {
+      async read() {
+        return { status: "missing" };
+      },
+      async write() {
+        throw new Error("An unavailable identity must not be persisted.");
+      },
+    },
+  });
+
+  await expect(controller.load()).resolves.toMatchObject({
+    projectId: null,
+    status: "unavailable",
+    diagnostic: { code: "workspace_trust_unavailable" },
+  });
+});
+
+test("workspace trust keys aliases to one real canonical project identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-workspace-trust-canonical-"));
+  const canonicalRoot = join(testRoot, "canonical-project");
+  const aliasRoot = join(testRoot, "project-alias");
+  await mkdir(canonicalRoot);
+  await symlink(canonicalRoot, aliasRoot, "dir");
+  const canonical = createInMemoryWorkspaceTrustConfiguration(canonicalRoot);
+  const alias = createInMemoryWorkspaceTrustConfiguration(aliasRoot);
+
+  try {
+    const [canonicalSnapshot, aliasSnapshot] = await Promise.all([
+      canonical.controller.load(),
+      alias.controller.load(),
+    ]);
+    expect(aliasSnapshot).toEqual({
+      projectId: canonicalSnapshot.projectId,
+      projectLabel: "canonical-project",
+      status: "untrusted",
+      diagnostic: null,
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("workspace revoke and re-trust remain explicit across runtime restart", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-workspace-trust-restart-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "AGENTS.md"), "RETRUSTED_PROJECT\n", "utf8");
+  const configuration = createInMemoryWorkspaceTrustConfiguration(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  let lifecycle = harness.createLifecycle({
+    workspaceRoot,
+    workspaceTrust: configuration.controller,
+  });
+
+  try {
+    const initial = await lifecycle.inspectWorkspaceTrust();
+    if (initial.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: initial.projectId });
+    await lifecycle.configureWorkspaceTrust({ type: "revoke", projectId: initial.projectId });
+    await lifecycle.close();
+    lifecycle = harness.createLifecycle({
+      workspaceRoot,
+      workspaceTrust: configuration.controller,
+    });
+    await expect(lifecycle.inspectWorkspaceTrust()).resolves.toMatchObject({
+      projectId: initial.projectId,
+      status: "untrusted",
+    });
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: initial.projectId });
+    const created = await lifecycle.create({ targetIdentity });
+    expect(created.promptContext?.repository.sources).toMatchObject([
+      { selectedName: "AGENTS.md" },
+    ]);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("historical B8 source confirmation never migrates into workspace trust", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-workspace-trust-no-migration-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: { type: "stdio", command: process.execPath, args: ["--version"], env: {} },
+      },
+    }),
+    "utf8",
+  );
+  const configuration = createInMemoryWorkspaceTrustConfiguration(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  let lifecycle = harness.createLifecycle({
+    workspaceRoot,
+    workspaceTrust: configuration.controller,
+  });
+
+  try {
+    const initial = await lifecycle.inspectWorkspaceTrust();
+    if (initial.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: initial.projectId });
+    const created = await lifecycle.create({ targetIdentity });
+    if (created.mcp === undefined) {
+      throw new Error("The fixture requires an MCP configuration snapshot.");
+    }
+    await lifecycle.configureMcp({
+      type: "confirm_workspace",
+      sessionId: created.sessionId,
+      sourceDigest: created.mcp.source.digest,
+    });
+    await lifecycle.close();
+    configuration.replace(null);
+    lifecycle = harness.createLifecycle({
+      workspaceRoot,
+      workspaceTrust: configuration.controller,
+    });
+
+    await expect(lifecycle.inspectWorkspaceTrust()).resolves.toMatchObject({
+      status: "untrusted",
+      diagnostic: null,
+    });
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.not.toHaveProperty(
+      "mcp",
+    );
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("explicit durable workspace trust gates new project instructions, Skills, and MCP only", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-workspace-trust-admission-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const isolatedHome = join(testRoot, "home");
+  const extensionRoot = join(testRoot, "extension");
+  const projectSkillRoot = join(workspaceRoot, ".agents", "skills", "project-context");
+  const userSkillRoot = join(isolatedHome, ".agents", "skills", "user-context");
+  const extensionSkillRoot = join(extensionRoot, "skills", "extension-context");
+  // biome-ignore lint/complexity/useLiteralKeys: TypeScript requires indexed ProcessEnv access.
+  const previousHome = process.env["HOME"];
+  let trustDocument: string | null = null;
+  await mkdir(projectSkillRoot, { recursive: true });
+  await mkdir(userSkillRoot, { recursive: true });
+  await mkdir(extensionSkillRoot, { recursive: true });
+  await writeFile(join(workspaceRoot, "AGENTS.md"), "PROJECT_INSTRUCTION\n", "utf8");
+  await writeFile(
+    join(projectSkillRoot, "SKILL.md"),
+    "---\nname: project-context\ndescription: Project-owned context.\n---\nPROJECT_SKILL\n",
+    "utf8",
+  );
+  await writeFile(
+    join(userSkillRoot, "SKILL.md"),
+    "---\nname: user-context\ndescription: User-owned context.\n---\nUSER_SKILL\n",
+    "utf8",
+  );
+  await writeFile(
+    join(extensionSkillRoot, "SKILL.md"),
+    "---\nname: extension-context\ndescription: Extension-owned context.\n---\nEXTENSION_SKILL\n",
+    "utf8",
+  );
+  await writeFile(
+    join(extensionRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/workspace-trust-extension",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.workspace-trust-extension",
+        apiVersion: "^0.3.0",
+        runtime: { entry: "./extension.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(join(extensionRoot, "extension.js"), "export async function activate() {}\n");
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: { type: "stdio", command: process.execPath, args: ["--version"], env: {} },
+      },
+    }),
+    "utf8",
+  );
+  // biome-ignore lint/complexity/useLiteralKeys: TypeScript requires indexed ProcessEnv access.
+  process.env["HOME"] = isolatedHome;
+  const workspaceTrust = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        return trustDocument === null
+          ? { status: "missing" as const }
+          : { status: "available" as const, text: trustDocument };
+      },
+      async write(text) {
+        trustDocument = text;
+      },
+    },
+  });
+  const extensionHost = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.workspace-trust-extension",
+        grants: [],
+        packageName: "@fixture/workspace-trust-extension",
+        packageRoot: extensionRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    projectRoot: workspaceRoot,
+    stateRoot,
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("The workspace trust preview does not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: officialProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  let lifecycle = harness.createLifecycle({
+    extensionHost,
+    modelTargets,
+    workspaceRoot,
+    workspaceTrust,
+  });
+
+  try {
+    const before = await lifecycle.previewNewSession({ targetIdentity });
+    const beforeTrust = await lifecycle.inspectWorkspaceTrust();
+    if (beforeTrust.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    expect({
+      trust: beforeTrust,
+      skillSources: before.skillContext?.catalog.entries.map(
+        (candidate) => candidate.locator.source,
+      ),
+    }).toEqual({
+      trust: {
+        projectId: beforeTrust.projectId,
+        projectLabel: "workspace",
+        status: "untrusted",
+        diagnostic: null,
+      },
+      skillSources: ["extension", "user"],
+    });
+
+    await expect(
+      lifecycle.configureWorkspaceTrust({
+        type: "grant",
+        projectId: beforeTrust.projectId,
+      }),
+    ).resolves.toMatchObject({ status: "updated", snapshot: { status: "trusted" } });
+    expect(trustDocument).toBe(
+      `${JSON.stringify({ schemaVersion: 1, trustedProjectIds: [beforeTrust.projectId] })}\n`,
+    );
+    await lifecycle.close();
+    lifecycle = harness.createLifecycle({
+      extensionHost,
+      modelTargets,
+      workspaceRoot,
+      workspaceTrust,
+    });
+
+    const after = await lifecycle.create({ targetIdentity });
+    expect({
+      trust: await lifecycle.inspectWorkspaceTrust(),
+      repositorySources: after.promptContext?.repository.sources.map(
+        (source) => source.selectedName,
+      ),
+      skillSources: after.skillContext?.catalog.entries.map(
+        (candidate) => candidate.locator.source,
+      ),
+      mcp: after.mcp,
+    }).toEqual({
+      trust: {
+        projectId: after.projectId,
+        projectLabel: "workspace",
+        status: "trusted",
+        diagnostic: null,
+      },
+      repositorySources: ["AGENTS.md"],
+      skillSources: ["extension", "project", "user"],
+      mcp: {
+        schemaVersion: 1,
+        status: "workspace_confirmation_required",
+        workspaceConfirmed: false,
+        source: {
+          path: ".mcp.json",
+          digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        },
+        servers: [],
+        diagnostics: [],
+      },
+    });
+  } finally {
+    if (previousHome === undefined) {
+      // biome-ignore lint/complexity/useLiteralKeys: TypeScript requires indexed ProcessEnv access.
+      delete process.env["HOME"];
+    } else {
+      // biome-ignore lint/complexity/useLiteralKeys: TypeScript requires indexed ProcessEnv access.
+      process.env["HOME"] = previousHome;
+    }
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an ordinary prompt in an untrusted workspace fails before project or model dispatch", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-untrusted-prompt-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "AGENTS.md"), "NEVER_LOAD_UNTRUSTED_CONTEXT\n", "utf8");
+  let modelCalls = 0;
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: targetIdentity,
+        driver: new FakeModelDriver(() => {
+          modelCalls += 1;
+          return [{ type: "finish", reason: "stop" }];
+        }),
+        contextProfile: officialProfile,
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: officialProfile,
+          },
+        ],
+      };
+    },
+  };
+  const workspaceTrust = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        return { status: "missing" };
+      },
+      async write() {
+        throw new Error("The untrusted admission must not mutate workspace trust.");
+      },
+    },
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, workspaceRoot, workspaceTrust });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Do not dispatch this untrusted request." },
+      }),
+    ).rejects.toMatchObject({
+      code: "session_workspace_untrusted",
+      message:
+        "This workspace is not trusted. Run adam-agent --trust-workspace in this project, then retry.",
+    });
+    expect({ modelCalls, sessionIds: await harness.sessions.listSessionIds() }).toEqual({
+      modelCalls: 0,
+      sessionIds: [],
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("direct session creation cannot stage a later prompt around the workspace trust gate", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-untrusted-session-create-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const configuration = createInMemoryWorkspaceTrustConfiguration(workspaceRoot);
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    workspaceRoot,
+    workspaceTrust: configuration.controller,
+  });
+
+  try {
+    await expect(lifecycle.create({ targetIdentity })).rejects.toMatchObject({
+      code: "session_workspace_untrusted",
+    });
+    await expect(lifecycle.listProjectSessions({ limit: 10 })).resolves.toMatchObject({
+      items: [],
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("revoking workspace trust preserves historical context but blocks mutable project reloads", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-revoked-project-reload-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const projectSkillRoot = join(workspaceRoot, ".agents", "skills", "project-context");
+  await mkdir(projectSkillRoot, { recursive: true });
+  await writeFile(join(workspaceRoot, "AGENTS.md"), "ORIGINAL_PROJECT_INSTRUCTION\n", "utf8");
+  await writeFile(
+    join(projectSkillRoot, "SKILL.md"),
+    "---\nname: project-context\ndescription: Original project Skill.\n---\n",
+    "utf8",
+  );
+  let trustDocument: string | null = null;
+  const workspaceTrust = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        return trustDocument === null
+          ? { status: "missing" as const }
+          : { status: "available" as const, text: trustDocument };
+      },
+      async write(text) {
+        trustDocument = text;
+      },
+    },
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ workspaceRoot, workspaceTrust });
+
+  try {
+    const status = await lifecycle.inspectWorkspaceTrust();
+    if (status.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: status.projectId });
+    const created = await lifecycle.create({ targetIdentity });
+    const originalInstructionDigest = created.promptContext?.repository.sources[0]?.contentDigest;
+    await lifecycle.configureWorkspaceTrust({ type: "revoke", projectId: status.projectId });
+    await writeFile(join(workspaceRoot, "AGENTS.md"), "CHANGED_PROJECT_INSTRUCTION\n", "utf8");
+    await writeFile(
+      join(projectSkillRoot, "SKILL.md"),
+      "---\nname: project-context\ndescription: Changed project Skill.\n---\n",
+      "utf8",
+    );
+
+    await expect(
+      lifecycle.reloadRepositoryInstructions({ sessionId: created.sessionId }),
+    ).rejects.toMatchObject({ code: "session_workspace_untrusted" });
+    await expect(lifecycle.reloadSkills({ sessionId: created.sessionId })).rejects.toMatchObject({
+      code: "session_workspace_untrusted",
+    });
+    const historical = await lifecycle.inspect({ sessionId: created.sessionId });
+    if (historical.schemaVersion !== 3) {
+      throw new Error("The fixture requires a current session snapshot.");
+    }
+    expect({
+      instructionDigest: historical.promptContext?.repository.sources[0]?.contentDigest,
+      skillDescription: historical.skillContext?.catalog.entries[0]?.description,
+    }).toEqual({
+      instructionDigest: originalInstructionDigest,
+      skillDescription: "Original project Skill.",
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("revoked historical sessions cannot activate a project Skill from mutable bytes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-revoked-project-skill-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const skillRoot = join(workspaceRoot, ".agents", "skills", "revoked-skill");
+  await mkdir(skillRoot, { recursive: true });
+  await writeFile(
+    join(skillRoot, "SKILL.md"),
+    "---\nname: revoked-skill\ndescription: Original project Skill.\n---\nORIGINAL_SKILL_BODY\n",
+    "utf8",
+  );
+  const configuration = createInMemoryWorkspaceTrustConfiguration(workspaceRoot);
+  const model = new FakeModelDriver((request) =>
+    request.messages.at(-1)?.role === "user"
+      ? [
+          { type: "tool_call_start", id: "activate-revoked-skill", name: "activate_skill" },
+          {
+            type: "tool_call_delta",
+            id: "activate-revoked-skill",
+            json: JSON.stringify({ qualifiedId: "skill:v1:project:.:revoked-skill" }),
+          },
+          { type: "tool_call_end", id: "activate-revoked-skill" },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          { type: "text_delta", text: "Revoked project Skill stayed unavailable." },
+          { type: "finish", reason: "stop" },
+        ],
+  );
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile: officialProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: officialProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    workspaceRoot,
+    workspaceTrust: configuration.controller,
+  });
+  const events: RuntimeEvent[] = [];
+  lifecycle.subscribe((event) => events.push(event));
+
+  try {
+    const status = await lifecycle.inspectWorkspaceTrust();
+    if (status.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: status.projectId });
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.configureWorkspaceTrust({ type: "revoke", projectId: status.projectId });
+    await writeFile(
+      join(skillRoot, "SKILL.md"),
+      "---\nname: revoked-skill\ndescription: Changed project Skill.\n---\nCHANGED_SKILL_BODY\n",
+      "utf8",
+    );
+
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Try to activate the historical project Skill." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Revoked project Skill stayed unavailable." },
+      snapshot: { skillContext: { active: [] } },
+    });
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "tool_failed",
+          callId: "activate-revoked-skill",
+          error: expect.objectContaining({ code: "skill_unavailable" }),
+        }),
+      ]),
+    );
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("revoked historical sessions reject an explicit project Skill before model dispatch", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-revoked-explicit-skill-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const skillRoot = join(workspaceRoot, ".agents", "skills", "explicit-revoked");
+  await mkdir(skillRoot, { recursive: true });
+  await writeFile(
+    join(skillRoot, "SKILL.md"),
+    "---\nname: explicit-revoked\ndescription: Explicit project Skill.\n---\nEXPLICIT_PROJECT_BODY\n",
+    "utf8",
+  );
+  const configuration = createInMemoryWorkspaceTrustConfiguration(workspaceRoot);
+  let providerCalls = 0;
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: targetIdentity,
+        driver: new FakeModelDriver(() => {
+          providerCalls += 1;
+          return [{ type: "finish", reason: "stop" }];
+        }),
+        contextProfile: officialProfile,
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: officialProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    workspaceRoot,
+    workspaceTrust: configuration.controller,
+  });
+
+  try {
+    const status = await lifecycle.inspectWorkspaceTrust();
+    if (status.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: status.projectId });
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.configureWorkspaceTrust({ type: "revoke", projectId: status.projectId });
+
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: {
+          text: "Try the explicit project Skill after revocation.",
+          skills: ["skill:v1:project:.:explicit-revoked"],
+        },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "failed", error: { code: "skill_activation_failed" } },
+      snapshot: { skillContext: { active: [] } },
+    });
+    expect(providerCalls).toBe(0);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("revoked historical sessions cannot read a live resource from an active project Skill", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-revoked-skill-resource-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const skillRoot = join(workspaceRoot, ".agents", "skills", "resource-revoked");
+  await mkdir(join(skillRoot, "references"), { recursive: true });
+  await writeFile(
+    join(skillRoot, "SKILL.md"),
+    "---\nname: resource-revoked\ndescription: Project Skill with a resource.\n---\nRead references/guide.txt.\n",
+    "utf8",
+  );
+  await writeFile(join(skillRoot, "references", "guide.txt"), "PROJECT_RESOURCE_BYTES\n", "utf8");
+  const configuration = createInMemoryWorkspaceTrustConfiguration(workspaceRoot);
+  const model = new FakeModelDriver((request) => {
+    const latest = request.messages.at(-1);
+    if (latest?.role === "user" && latest.content.includes("Read the active")) {
+      return [
+        { type: "tool_call_start", id: "read-revoked-resource", name: "read_skill_resource" },
+        {
+          type: "tool_call_delta",
+          id: "read-revoked-resource",
+          json: JSON.stringify({
+            qualifiedId: "skill:v1:project:.:resource-revoked",
+            path: "references/guide.txt",
+            offset: 0,
+            maxByteCount: 256,
+          }),
+        },
+        { type: "tool_call_end", id: "read-revoked-resource" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    return [
+      {
+        type: "text_delta",
+        text:
+          latest?.role === "tool"
+            ? "Revoked project resource stayed unavailable."
+            : "Project Skill activated while trusted.",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile: officialProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: officialProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    workspaceRoot,
+    workspaceTrust: configuration.controller,
+  });
+  const events: RuntimeEvent[] = [];
+  lifecycle.subscribe((event) => events.push(event));
+
+  try {
+    const status = await lifecycle.inspectWorkspaceTrust();
+    if (status.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: status.projectId });
+    const created = await lifecycle.create({ targetIdentity });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: {
+          text: "Activate the project Skill while trusted.",
+          skills: ["skill:v1:project:.:resource-revoked"],
+        },
+      }),
+    ).resolves.toMatchObject({ result: { status: "completed" } });
+    await lifecycle.configureWorkspaceTrust({ type: "revoke", projectId: status.projectId });
+
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Read the active project Skill resource after revocation." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Revoked project resource stayed unavailable." },
+    });
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "tool_failed",
+          callId: "read-revoked-resource",
+          error: expect.objectContaining({ code: "skill_resource_unavailable" }),
+        }),
+      ]),
+    );
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("revoked historical sessions cannot activate descendant project context", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-revoked-descendant-context-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const nestedRoot = join(workspaceRoot, "nested");
+  const nestedSkillRoot = join(nestedRoot, ".agents", "skills", "nested-context");
+  await mkdir(nestedSkillRoot, { recursive: true });
+  await writeFile(join(nestedRoot, "AGENTS.md"), "NESTED_PROJECT_INSTRUCTION\n", "utf8");
+  await writeFile(join(nestedRoot, "target.txt"), "nested target\n", "utf8");
+  await writeFile(
+    join(nestedSkillRoot, "SKILL.md"),
+    "---\nname: nested-context\ndescription: Nested project context.\n---\n",
+    "utf8",
+  );
+  let trustDocument: string | null = null;
+  const workspaceTrust = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        return trustDocument === null
+          ? { status: "missing" as const }
+          : { status: "available" as const, text: trustDocument };
+      },
+      async write(text) {
+        trustDocument = text;
+      },
+    },
+  });
+  let modelTurn = 0;
+  const model = new FakeModelDriver(() => {
+    modelTurn += 1;
+    return modelTurn === 1
+      ? [
+          { type: "tool_call_start", id: "read-nested", name: "read_file" },
+          {
+            type: "tool_call_delta",
+            id: "read-nested",
+            json: JSON.stringify({ path: "nested/target.txt" }),
+          },
+          { type: "tool_call_end", id: "read-nested" },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          { type: "text_delta", text: "Revoked context stayed unavailable." },
+          { type: "finish", reason: "stop" },
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile: officialProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: officialProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    tools: createReadToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    workspaceTrust,
+  });
+  const events: RuntimeEvent[] = [];
+  lifecycle.subscribe((event) => events.push(event));
+
+  try {
+    const status = await lifecycle.inspectWorkspaceTrust();
+    if (status.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: status.projectId });
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.configureWorkspaceTrust({ type: "revoke", projectId: status.projectId });
+
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Read the nested target without widening context." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Revoked context stayed unavailable." },
+      snapshot: {
+        promptContext: { repository: { activeScopes: ["."] } },
+        skillContext: { activeProjectScopes: ["."] },
+      },
+    });
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "tool_failed",
+          callId: "read-nested",
+          error: expect.objectContaining({ code: "project_context_unavailable" }),
+        }),
+      ]),
+    );
+    expect(events.some((event) => event.type === "repository_instructions_activated")).toBe(false);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("workspace trust never replaces MCP source, server, Profile, or effect authority", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-workspace-trust-mcp-authority-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: { type: "stdio", command: process.execPath, args: ["--version"], env: {} },
+      },
+    }),
+    "utf8",
+  );
+  let trustDocument: string | null = null;
+  const workspaceTrust = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        return trustDocument === null
+          ? { status: "missing" as const }
+          : { status: "available" as const, text: trustDocument };
+      },
+      async write(text) {
+        trustDocument = text;
+      },
+    },
+  });
+  const peer = createScriptedMcpTransportFactory({
+    fixture: {
+      toolPages: [
+        {
+          tools: [
+            {
+              name: "echo",
+              description: "Echo one value.",
+              inputSchema: {
+                type: "object",
+                properties: { value: { type: "string" } },
+                required: ["value"],
+                additionalProperties: false,
+              },
+            },
+          ],
+        },
+      ],
+    },
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    [mcpTransportFactory]: peer,
+    workspaceRoot,
+    workspaceTrust,
+  });
+
+  try {
+    const status = await lifecycle.inspectWorkspaceTrust();
+    if (status.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: status.projectId });
+    const created = await lifecycle.create({ targetIdentity });
+    if (created.mcp === undefined) {
+      throw new Error("The fixture requires an MCP configuration snapshot.");
+    }
+    const confirmed = await lifecycle.configureMcp({
+      type: "confirm_workspace",
+      sessionId: created.sessionId,
+      sourceDigest: created.mcp.source.digest,
+    });
+    const server = confirmed.snapshot.mcp?.servers[0];
+    if (server === undefined) {
+      throw new Error("The fixture requires one MCP server preview.");
+    }
+    await lifecycle.configureMcp({
+      type: "approve_server",
+      sessionId: created.sessionId,
+      serverId: server.serverId,
+      definitionDigest: server.definitionDigest,
+    });
+    await lifecycle.configureWorkspaceTrust({ type: "revoke", projectId: status.projectId });
+
+    await expect(
+      lifecycle.configureMcp({
+        type: "activate_servers",
+        sessionId: created.sessionId,
+        servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
+      }),
+    ).rejects.toMatchObject({ code: "session_workspace_untrusted" });
+    expect(peer.requests("fixture")).toEqual([]);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("MCP configuration revalidates trust inside its mutation transaction", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-workspace-trust-mcp-race-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: { type: "stdio", command: process.execPath, args: ["--version"], env: {} },
+      },
+    }),
+    "utf8",
+  );
+  let trustDocument: string | null = null;
+  let revokeAfterRead = false;
+  const workspaceTrust = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        const current = trustDocument;
+        if (revokeAfterRead && current !== null) {
+          revokeAfterRead = false;
+          trustDocument = `${JSON.stringify({ schemaVersion: 1, trustedProjectIds: [] })}\n`;
+        }
+        return current === null
+          ? { status: "missing" as const }
+          : { status: "available" as const, text: current };
+      },
+      async write(text) {
+        trustDocument = text;
+      },
+    },
+  });
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    workspaceRoot,
+    workspaceTrust,
+  });
+
+  try {
+    const status = await lifecycle.inspectWorkspaceTrust();
+    if (status.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: status.projectId });
+    const trustedDocument = trustDocument;
+    const created = await lifecycle.create({ targetIdentity });
+    if (created.mcp === undefined) {
+      throw new Error("The fixture requires one MCP source preview.");
+    }
+    revokeAfterRead = true;
+
+    await expect(
+      lifecycle.configureMcp({
+        type: "confirm_workspace",
+        sessionId: created.sessionId,
+        sourceDigest: created.mcp.source.digest,
+      }),
+    ).rejects.toMatchObject({ code: "session_workspace_untrusted" });
+    trustDocument = trustedDocument;
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      mcp: { workspaceConfirmed: false },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("revoking workspace trust closes active MCP before publishing untrusted state", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-workspace-trust-mcp-revoke-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: { type: "stdio", command: process.execPath, args: ["--version"], env: {} },
+      },
+    }),
+    "utf8",
+  );
+  let trustDocument: string | null = null;
+  let requireClosedTransport = false;
+  let peer: ReturnType<typeof createScriptedMcpTransportFactory> | undefined;
+  const workspaceTrust = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        return trustDocument === null
+          ? { status: "missing" as const }
+          : { status: "available" as const, text: trustDocument };
+      },
+      async write(text) {
+        if (requireClosedTransport && peer?.activeCount("fixture") !== 0) {
+          throw new Error("Workspace trust was published before the MCP transport closed.");
+        }
+        trustDocument = text;
+      },
+    },
+  });
+  peer = createScriptedMcpTransportFactory({
+    fixture: {
+      toolPages: [
+        {
+          tools: [
+            {
+              name: "echo",
+              description: "Echo one value.",
+              inputSchema: {
+                type: "object",
+                properties: { value: { type: "string" } },
+                required: ["value"],
+                additionalProperties: false,
+              },
+            },
+          ],
+        },
+      ],
+    },
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    [mcpTransportFactory]: peer,
+    workspaceRoot,
+    workspaceTrust,
+  });
+
+  try {
+    const status = await lifecycle.inspectWorkspaceTrust();
+    if (status.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: status.projectId });
+    const created = await lifecycle.create({ targetIdentity });
+    if (created.mcp === undefined) {
+      throw new Error("The fixture requires an MCP configuration snapshot.");
+    }
+    const confirmed = await lifecycle.configureMcp({
+      type: "confirm_workspace",
+      sessionId: created.sessionId,
+      sourceDigest: created.mcp.source.digest,
+    });
+    const server = confirmed.snapshot.mcp?.servers[0];
+    if (server === undefined) {
+      throw new Error("The fixture requires one MCP server preview.");
+    }
+    await lifecycle.configureMcp({
+      type: "approve_server",
+      sessionId: created.sessionId,
+      serverId: server.serverId,
+      definitionDigest: server.definitionDigest,
+    });
+    const activated = await lifecycle.configureMcp({
+      type: "activate_servers",
+      sessionId: created.sessionId,
+      servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
+    });
+    const activeMcp = activated.snapshot.mcp;
+    if (activeMcp?.status !== "tool_selection_required") {
+      throw new Error("The fixture requires one live MCP catalog.");
+    }
+    const echo = activeMcp.catalog?.tools[0];
+    const generationId = activeMcp.activation?.generationId;
+    if (echo === undefined || generationId === undefined) {
+      throw new Error("The fixture requires one discovered MCP tool.");
+    }
+    await lifecycle.configureMcp({
+      type: "commit_tool_profile",
+      sessionId: created.sessionId,
+      generationId,
+      selections: [
+        {
+          qualifiedName: echo.qualifiedName,
+          definitionDigest: echo.definitionDigest,
+          effect: "read",
+        },
+      ],
+    });
+
+    const transportClosed = peer.nextClose("fixture");
+    requireClosedTransport = true;
+    await expect(
+      lifecycle.configureWorkspaceTrust({ type: "revoke", projectId: status.projectId }),
+    ).resolves.toMatchObject({ snapshot: { status: "untrusted" } });
+    await transportClosed;
+    expect(JSON.parse(trustDocument ?? "null")).toEqual({
+      schemaVersion: 1,
+      trustedProjectIds: [],
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a revoked historical session neither reactivates nor dispatches its MCP Profile", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-workspace-trust-mcp-history-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        fixture: { type: "stdio", command: process.execPath, args: ["--version"], env: {} },
+      },
+    }),
+    "utf8",
+  );
+  let trustDocument: string | null = null;
+  const workspaceTrust = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        return trustDocument === null
+          ? { status: "missing" as const }
+          : { status: "available" as const, text: trustDocument };
+      },
+      async write(text) {
+        trustDocument = text;
+      },
+    },
+  });
+  const peer = createScriptedMcpTransportFactory({
+    fixture: {
+      toolPages: [
+        {
+          tools: [
+            {
+              name: "echo",
+              description: "Echo one value.",
+              inputSchema: {
+                type: "object",
+                properties: { value: { type: "string" } },
+                required: ["value"],
+                additionalProperties: false,
+              },
+            },
+          ],
+        },
+      ],
+    },
+  });
+  let qualifiedName = "";
+  let modelTurn = 0;
+  const model = new FakeModelDriver(() => {
+    modelTurn += 1;
+    const requestsMcp = modelTurn === 1 || modelTurn === 3;
+    const callId = modelTurn === 1 ? "revoked-mcp" : "retrusted-mcp";
+    return requestsMcp
+      ? [
+          { type: "tool_call_start", id: callId, name: qualifiedName },
+          {
+            type: "tool_call_delta",
+            id: callId,
+            json: JSON.stringify({
+              value: modelTurn === 1 ? "must-not-dispatch" : "dispatch-after-retrust",
+            }),
+          },
+          { type: "tool_call_end", id: callId },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          {
+            type: "text_delta",
+            text:
+              modelTurn === 2
+                ? "Historical MCP stayed unavailable."
+                : "Explicit re-trust restored MCP admission.",
+          },
+          { type: "finish", reason: "stop" },
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile: officialProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: officialProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    [mcpTransportFactory]: peer,
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    tools: createReadToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    workspaceTrust,
+  });
+
+  try {
+    const status = await lifecycle.inspectWorkspaceTrust();
+    if (status.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: status.projectId });
+    const created = await lifecycle.create({ targetIdentity });
+    if (created.mcp === undefined) {
+      throw new Error("The fixture requires an MCP configuration snapshot.");
+    }
+    const confirmed = await lifecycle.configureMcp({
+      type: "confirm_workspace",
+      sessionId: created.sessionId,
+      sourceDigest: created.mcp.source.digest,
+    });
+    const server = confirmed.snapshot.mcp?.servers[0];
+    if (server === undefined) {
+      throw new Error("The fixture requires one MCP server preview.");
+    }
+    await lifecycle.configureMcp({
+      type: "approve_server",
+      sessionId: created.sessionId,
+      serverId: server.serverId,
+      definitionDigest: server.definitionDigest,
+    });
+    const activated = await lifecycle.configureMcp({
+      type: "activate_servers",
+      sessionId: created.sessionId,
+      servers: [{ serverId: server.serverId, definitionDigest: server.definitionDigest }],
+    });
+    const activeMcp = activated.snapshot.mcp;
+    if (activeMcp?.status !== "tool_selection_required") {
+      throw new Error("The fixture requires one live MCP catalog.");
+    }
+    const echo = activeMcp.catalog?.tools[0];
+    const generationId = activeMcp.activation?.generationId;
+    if (echo === undefined || generationId === undefined) {
+      throw new Error("The fixture requires one discovered MCP tool.");
+    }
+    qualifiedName = echo.qualifiedName;
+    await lifecycle.configureMcp({
+      type: "commit_tool_profile",
+      sessionId: created.sessionId,
+      generationId,
+      selections: [
+        {
+          qualifiedName,
+          definitionDigest: echo.definitionDigest,
+          effect: "read",
+        },
+      ],
+    });
+    await lifecycle.configureWorkspaceTrust({ type: "revoke", projectId: status.projectId });
+    const requestsBeforeContinue = peer.requests("fixture");
+
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Try the historical MCP tool." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Historical MCP stayed unavailable." },
+    });
+    expect(peer.requests("fixture")).toEqual(requestsBeforeContinue);
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: status.projectId });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Retry the historical MCP tool after explicit re-trust." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Explicit re-trust restored MCP admission." },
+    });
+    expect(peer.requests("fixture")).toContainEqual({
+      method: "tools/call",
+      params: { name: "echo", arguments: { value: "dispatch-after-retrust" } },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("untrusted historical inspection never reads new mutable MCP configuration", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-workspace-trust-mcp-inspection-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let trustDocument: string | null = null;
+  const workspaceTrust = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        return trustDocument === null
+          ? { status: "missing" as const }
+          : { status: "available" as const, text: trustDocument };
+      },
+      async write(text) {
+        trustDocument = text;
+      },
+    },
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ workspaceRoot, workspaceTrust });
+
+  try {
+    const status = await lifecycle.inspectWorkspaceTrust();
+    if (status.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await lifecycle.configureWorkspaceTrust({ type: "grant", projectId: status.projectId });
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.configureWorkspaceTrust({ type: "revoke", projectId: status.projectId });
+    await writeFile(join(workspaceRoot, ".mcp.json"), "not json\n", "utf8");
+
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      schemaVersion: 3,
+      sessionId: created.sessionId,
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an untrusted draft preview excludes project Skills", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-workspace-trust-draft-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const projectSkillRoot = join(workspaceRoot, ".agents", "skills", "project-draft");
+  await mkdir(projectSkillRoot, { recursive: true });
+  await writeFile(
+    join(projectSkillRoot, "SKILL.md"),
+    "---\nname: project-draft\ndescription: Must not enter an untrusted draft.\n---\n",
+    "utf8",
+  );
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: targetIdentity,
+        driver: new FakeModelDriver([]),
+        contextProfile: officialProfile,
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: officialProfile,
+          },
+        ],
+      };
+    },
+  };
+  const workspaceTrust = createWorkspaceTrustWithStorageForTesting({
+    workspaceRoot,
+    storage: {
+      async read() {
+        return { status: "missing" };
+      },
+      async write() {
+        throw new Error("The draft must not mutate workspace trust.");
+      },
+    },
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, workspaceRoot, workspaceTrust });
+
+  try {
+    const preview = await lifecycle.previewNewSession({ targetIdentity });
+    expect(preview.skillContext.catalog.entries).toEqual([]);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });

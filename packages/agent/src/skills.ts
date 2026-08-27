@@ -423,6 +423,7 @@ export async function createInitialSkillContextV1(input: {
   readonly userHome: string;
   readonly workspaceRoot: string;
   readonly extensionSources?: readonly ExtensionSkillSourceV1[];
+  readonly includeProjectSources?: boolean;
 }): Promise<SkillContextRecordV1> {
   const canonicalProject = await realpath(input.workspaceRoot);
   const canonicalHome = await realpath(input.userHome);
@@ -436,12 +437,14 @@ export async function createInitialSkillContextV1(input: {
     diagnostics,
     catalogRevision: 1,
   };
-  await discoverSource({
-    ...shared,
-    authorityRoot: canonicalProject,
-    lexicalRoot: join(canonicalProject, ".agents", "skills"),
-    locator: { source: "project", scope: "." },
-  });
+  if (input.includeProjectSources !== false) {
+    await discoverSource({
+      ...shared,
+      authorityRoot: canonicalProject,
+      lexicalRoot: join(canonicalProject, ".agents", "skills"),
+      locator: { source: "project", scope: "." },
+    });
+  }
   await discoverSource({
     ...shared,
     authorityRoot: canonicalHome,

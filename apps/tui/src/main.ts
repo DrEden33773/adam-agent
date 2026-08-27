@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 
 import {
   createModelTargets,
   createPermissionPolicy,
   createPresentationPreferences,
+  createWorkspaceTrust,
   selectModelTargetId,
 } from "@adam-agent/agent";
 import {
@@ -24,11 +25,28 @@ try {
     process.stdout.write(`${usage()}\n`);
   } else {
     const workspaceRoot = process.cwd();
+    const { XDG_CONFIG_HOME: inheritedUserConfigurationRoot } = process.env;
+    const ownerConfigurationRoot =
+      inheritedUserConfigurationRoot === undefined || inheritedUserConfigurationRoot.length === 0
+        ? join(homedir(), ".config")
+        : inheritedUserConfigurationRoot;
+    const userConfigurationEnvironment: NodeJS.ProcessEnv = {
+      XDG_CONFIG_HOME: isAbsolute(ownerConfigurationRoot)
+        ? ownerConfigurationRoot
+        : resolve(ownerConfigurationRoot),
+    };
+    loadProjectEnvironment();
     const { ADAM_AGENT_STATE_ROOT: configuredStateRoot } = process.env;
     const stateRoot =
       command.stateRoot ?? configuredStateRoot ?? join(homedir(), ".local", "state", "adam-agent");
     const modelTargets = createModelTargets({ environment: process.env });
-    const preferences = createPresentationPreferences({ environment: process.env });
+    const preferences = createPresentationPreferences({
+      environment: userConfigurationEnvironment,
+    });
+    const workspaceTrust = createWorkspaceTrust({
+      environment: userConfigurationEnvironment,
+      workspaceRoot,
+    });
     const clipboard = createLinuxClipboardAdapter();
     const permissions = createPermissionPolicy({
       allowedEffects: ["read"],
@@ -36,7 +54,7 @@ try {
     });
     const extensionPermissions = createPermissionPolicy({ allowedEffects: ["execute"] });
     const runtime = await createProductionProjectRuntime({
-      environment: process.env,
+      environment: userConfigurationEnvironment,
       extensionPermissions,
       modelTargets,
       permissions,
@@ -47,6 +65,7 @@ try {
         .flatMap((entry) => [entry.name, ...entry.aliases]),
       stateRoot,
       workspaceRoot,
+      workspaceTrust,
     });
     const commandRegistry = createAdamCommandRegistryFromContributions(runtime.contributions);
     const startupNotice = runtime.extensionAvailability.configurationUnavailable
@@ -157,6 +176,17 @@ function parseCommand(arguments_: readonly string[]): TuiCommand {
       : { stateRoot: values.get("--state-root") as string }),
     ...(values.get("--target") === undefined ? {} : { targetId: values.get("--target") as string }),
   };
+}
+
+function loadProjectEnvironment(): void {
+  try {
+    process.loadEnvFile(join(process.cwd(), ".env"));
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return;
+    }
+    throw new TuiConfigurationError("Adam Agent could not load the project .env file.");
+  }
 }
 
 function usage(): string {

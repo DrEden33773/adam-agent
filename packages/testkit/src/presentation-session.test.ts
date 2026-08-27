@@ -24,8 +24,8 @@ import {
   createPermissionPolicy,
   createPresentationPreferences,
   createPresentationSession as createProductPresentationSession,
+  createSessionLifecycle as createRawSessionLifecycle,
   createReadToolRegistry,
-  createSessionLifecycle,
   type ModelDriver,
   ModelDriverError,
   type ModelTargetIdentity,
@@ -38,6 +38,7 @@ import {
 import {
   assemblePromptMessagesV1,
   createInMemorySessionStoreDirectory,
+  createTrustedWorkspaceTrustForTesting,
   digestPromptRequestV1,
   mcpCatalogStaleDurableBarrier,
   mcpTransportFactory,
@@ -84,6 +85,16 @@ const contextProfile: ContextProfile = {
   retainedTargetTokens: 20_000,
   estimatorVersion: 1,
 };
+
+function createSessionLifecycle(
+  options: Parameters<typeof createRawSessionLifecycle>[0],
+): ReturnType<typeof createRawSessionLifecycle> {
+  return createRawSessionLifecycle({
+    ...options,
+    workspaceTrust:
+      options.workspaceTrust ?? createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
+  });
+}
 
 async function createPresentationSession(
   options: Parameters<typeof createProductPresentationSession>[0],
@@ -786,7 +797,11 @@ test("PresentationSession opens an empty project catalog without creating a sess
           sessionThroughSequence: 0,
           operationThrough: [],
         },
-        project: { id: state.authoritative.project.id, label: "workspace" },
+        project: {
+          id: state.authoritative.project.id,
+          label: "workspace",
+          workspaceTrust: { status: "trusted", diagnostic: null },
+        },
         targets: { items: [], defaultTargetId: null, diagnostic: null },
         sessions: { items: [], nextCursor: null },
         active: null,
@@ -2300,7 +2315,11 @@ test("PresentationSession opens an exact target as a process-local draft", async
           sessionThroughSequence: 0,
           operationThrough: [],
         },
-        project: { id: state.authoritative.project.id, label: "workspace" },
+        project: {
+          id: state.authoritative.project.id,
+          label: "workspace",
+          workspaceTrust: { status: "trusted", diagnostic: null },
+        },
         targets: {
           items: [expect.objectContaining({ targetId: targetIdentity.targetId })],
           defaultTargetId: null,

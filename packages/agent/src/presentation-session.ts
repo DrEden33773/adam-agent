@@ -366,6 +366,7 @@ export async function createPresentationSession(
       knownTargets.set(options.targetIdentity.targetId, options.targetIdentity);
     }
     const catalogPage = await options.lifecycle.listProjectSessions({ limit: catalogPageSize });
+    const workspaceTrustSnapshot = await options.lifecycle.inspectWorkspaceTrust();
     const projectPaths = await listProjectPaths(options.workspaceRoot);
     const catalogItems = (
       await Promise.all(
@@ -414,7 +415,14 @@ export async function createPresentationSession(
             sessionThroughSequence: activeSessionThroughSequence,
             operationThrough: operationCursorSnapshot(),
           },
-      project: { id: catalogPage.projectId, label: options.projectLabel },
+      project: {
+        id: workspaceTrustSnapshot.projectId ?? catalogPage.projectId,
+        label: workspaceTrustSnapshot.projectLabel,
+        workspaceTrust: {
+          status: workspaceTrustSnapshot.status,
+          diagnostic: workspaceTrustSnapshot.diagnostic,
+        },
+      },
       targets: {
         items: (modelTargetSnapshot?.targets ?? []).map((target) => {
           const context = configuredTargetContexts.get(target.identity.targetId);
@@ -1494,6 +1502,49 @@ export async function createPresentationSession(
           code: "presentation_closed",
           message: "The presentation session is closed.",
         };
+      }
+      if (command.type === "set_workspace_trust") {
+        const conflict = configurationMutationConflict();
+        if (conflict !== null) {
+          return conflict;
+        }
+        if (command.projectId !== state.authoritative.project.id) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The workspace trust command targets a stale project identity.",
+          };
+        }
+        try {
+          const result = await options.lifecycle.configureWorkspaceTrust({
+            type: command.trusted ? "grant" : "revoke",
+            projectId: command.projectId,
+          });
+          state = {
+            revision: state.revision + 1,
+            authoritative: {
+              ...state.authoritative,
+              project: {
+                id: result.snapshot.projectId ?? state.authoritative.project.id,
+                label: result.snapshot.projectLabel,
+                workspaceTrust: {
+                  status: result.snapshot.status,
+                  diagnostic: result.snapshot.diagnostic,
+                },
+              },
+            },
+            draft: state.draft,
+            transient: state.transient,
+          };
+          publishStateChange();
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The workspace trust configuration could not be saved.",
+          };
+        }
       }
       if (command.type === "set_default_target") {
         const conflict = configurationMutationConflict();
@@ -3307,6 +3358,14 @@ function draftAdmissionRejection(
       status: "rejected",
       code: "authority_rejected",
       message: "One selected Agent Skill requires confirmation before draft admission.",
+    };
+  }
+  if (code === "session_workspace_untrusted") {
+    return {
+      status: "rejected",
+      code: "authority_rejected",
+      message:
+        "This workspace is not trusted. Run adam-agent --trust-workspace in this project, then retry.",
     };
   }
   if (code === "session_persistence_failed") {

@@ -16,6 +16,7 @@ import {
   createPermissionPolicy,
   createPresentationPreferences,
   createSessionLifecycle,
+  createWorkspaceTrust,
   ExtensionConfigurationError,
   ExtensionHostError,
   type JsonValue,
@@ -45,7 +46,11 @@ const userConfigurationEnvironment: NodeJS.ProcessEnv = {
     ? ownerConfigurationRoot
     : resolve(ownerConfigurationRoot),
 };
-if (command.type !== "help" && command.type !== "recover_operation") {
+if (
+  command.type !== "help" &&
+  command.type !== "recover_operation" &&
+  command.type !== "workspace_trust"
+) {
   loadProjectEnvironment();
 }
 const workspaceRoot = process.cwd();
@@ -388,6 +393,10 @@ function writeText(fileDescriptor: number, text: string): void {
 
 type CliCommand =
   | { readonly type: "help" }
+  | {
+      readonly type: "workspace_trust";
+      readonly action: "status" | "grant" | "revoke";
+    }
   | { readonly type: "prompt"; readonly prompt: string; readonly skills?: readonly string[] }
   | { readonly type: "recover_operation"; readonly operationId: string }
   | { readonly type: "resume"; readonly sessionId: string; readonly continue: boolean }
@@ -402,6 +411,52 @@ async function runCliCommand(activeCommand: CliCommand): Promise<void> {
   try {
     if (activeCommand.type === "help") {
       writeText(1, `${cliUsage()}\n`);
+      return;
+    }
+    if (activeCommand.type === "workspace_trust") {
+      const workspaceTrust = createWorkspaceTrust({
+        environment: userConfigurationEnvironment,
+        workspaceRoot,
+      });
+      const current = await workspaceTrust.load();
+      if (activeCommand.action === "status") {
+        writeText(1, `${JSON.stringify(current)}\n`);
+        return;
+      }
+      if (current.projectId === null || current.diagnostic !== null) {
+        writeText(
+          2,
+          `${current.diagnostic?.message ?? "The canonical workspace identity is unavailable."}\n`,
+        );
+        process.exitCode = 1;
+        return;
+      }
+      const lifecycle = createSessionLifecycle({
+        stateRoot,
+        workspaceRoot,
+        workspaceTrust,
+      });
+      let commandSucceeded = false;
+      try {
+        const result = await lifecycle.configureWorkspaceTrust({
+          type: activeCommand.action === "grant" ? "grant" : "revoke",
+          projectId: current.projectId,
+        });
+        writeText(1, `${JSON.stringify(result.snapshot)}\n`);
+        commandSucceeded = true;
+      } catch (error) {
+        writeText(
+          2,
+          `${error instanceof Error ? error.message : "The workspace trust configuration could not be saved."}\n`,
+        );
+        process.exitCode = 1;
+      } finally {
+        const closed = await lifecycle.close();
+        if (closed.status !== "closed" && commandSucceeded) {
+          writeText(2, "The workspace trust administration runtime did not close safely.\n");
+          process.exitCode = 1;
+        }
+      }
       return;
     }
     if (activeCommand.type === "recover_operation") {
@@ -490,6 +545,10 @@ async function createRunLifecycle(modelTargets: ModelTargets): Promise<SessionLi
   return createSessionLifecycle({
     modelTargets,
     preferences: createPresentationPreferences({ environment: userConfigurationEnvironment }),
+    workspaceTrust: createWorkspaceTrust({
+      environment: userConfigurationEnvironment,
+      workspaceRoot,
+    }),
     stateRoot,
     workspaceRoot,
     tools: createCodingToolRegistry({ workspaceRoot, stateRoot, artifactStore }),
@@ -619,6 +678,17 @@ function parseCliCommand(arguments_: readonly string[]): CliCommand {
     }
     return { type: "recover_operation", operationId };
   }
+  if (arguments_.length === 1) {
+    if (arguments_[0] === "--workspace-trust-status") {
+      return { type: "workspace_trust", action: "status" };
+    }
+    if (arguments_[0] === "--trust-workspace") {
+      return { type: "workspace_trust", action: "grant" };
+    }
+    if (arguments_[0] === "--revoke-workspace-trust") {
+      return { type: "workspace_trust", action: "revoke" };
+    }
+  }
   if (arguments_[0] === "--resume") {
     const sessionId = arguments_[1];
     const tail = arguments_.slice(2);
@@ -700,6 +770,7 @@ function cliUsage(): string {
     "       adam-agent --resume <session-id> [--continue]",
     "       adam-agent --branch <parent-session-id> --at <event-position> [--target <target-id>]",
     "       adam-agent --recover-operation <operation-id>",
+    "       adam-agent --workspace-trust-status | --trust-workspace | --revoke-workspace-trust",
     "       adam-agent --help | -h",
     "",
     "From a source checkout:",

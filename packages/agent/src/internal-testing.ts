@@ -48,9 +48,16 @@ export type {
   ProjectLifecycleOwner,
   ProjectLifecycleOwnerLease,
 } from "./project-lifecycle-owner.js";
-export { ProjectLifecycleOwnerError } from "./project-lifecycle-owner.js";
+export {
+  createProjectLifecycleOwner,
+  ProjectLifecycleOwnerError,
+} from "./project-lifecycle-owner.js";
 export { assemblePromptMessagesV1, digestPromptRequestV1 } from "./prompt-assembly.js";
-export { createPresentationPreferencesWithStorageForTesting } from "./secure-user-configuration.js";
+export {
+  createPresentationPreferencesWithStorageForTesting,
+  createTrustedWorkspaceTrustForTesting,
+  createWorkspaceTrustWithStorageForTesting,
+} from "./secure-user-configuration.js";
 export {
   sessionDurableContext,
   sessionDurableOutputLimits,
@@ -73,6 +80,8 @@ export {
   sessionRuntimeNotificationTransform,
   sessionStoreDirectory,
   sessionTitleDeadlineScheduler,
+  type WorkspaceMcpLeaseTransitionBarrier,
+  workspaceMcpLeaseTransitionBarrier,
 } from "./session-lifecycle.js";
 export {
   createInMemorySessionStoreDirectory,

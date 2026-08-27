@@ -25,8 +25,17 @@ export class RepositoryInstructionsError extends Error {
 }
 
 export async function loadInitialRepositoryInstructions(input: {
+  readonly includeProjectSources?: boolean;
   readonly workspaceRoot: string;
 }): Promise<PromptContextRecordV1["repository"]> {
+  if (input.includeProjectSources === false) {
+    return createRepositoryInstructionRevisionV1({
+      revision: 1,
+      activeScopes: ["."],
+      sources: [],
+      diagnostics: [],
+    });
+  }
   return loadRepositoryInstructions({
     workspaceRoot: input.workspaceRoot,
     activeScopes: ["."],

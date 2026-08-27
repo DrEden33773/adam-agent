@@ -69,6 +69,7 @@ import { TargetPicker } from "./target-picker.js";
 import { createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
 import { ToolPreview } from "./tool-preview.js";
+import { WorkspaceTrustPage } from "./workspace-trust-page.js";
 
 export type { ClipboardAdapter, DeadlineScheduler } from "./exit-policy.js";
 
@@ -231,6 +232,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly hide: () => void;
       }
     | undefined;
+  let workspaceTrustPage:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+      }
+    | undefined;
   let skillPalette:
     | {
         readonly close: () => void;
@@ -276,6 +283,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     sessionInspector,
     chronologyPicker,
     resourceReloadPicker,
+    workspaceTrustPage,
     configurationPage,
     sessionPicker,
     targetPicker,
@@ -296,6 +304,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     chronologyPicker = undefined;
     resourceReloadPicker?.hide();
     resourceReloadPicker = undefined;
+    workspaceTrustPage?.hide();
+    workspaceTrustPage = undefined;
     configurationPage?.hide();
     configurationPage = undefined;
     artifactNavigator?.hide();
@@ -1543,6 +1553,92 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     applyConfigurationMutation(mutation.field, mutation.value);
   };
+  const applyWorkspaceTrustMutation = (trusted: boolean, onAdmitted?: () => void): void => {
+    const project = options.presentation.getState().authoritative.project;
+    clearExitWindow();
+    editor.disableSubmit = true;
+    void options.presentation
+      .dispatch({
+        type: "set_workspace_trust",
+        projectId: project.id,
+        trusted,
+      })
+      .then((receipt) => {
+        if (receipt.status === "admitted") {
+          editor.setText("");
+          statusMessage = trusted ? "Workspace trust granted." : "Workspace trust revoked.";
+          onAdmitted?.();
+        } else {
+          statusMessage = receipt.message;
+        }
+      })
+      .catch(() => {
+        statusMessage = "The owner-local workspace trust configuration could not be saved.";
+      })
+      .finally(() => {
+        editor.disableSubmit = false;
+        renderState();
+      });
+  };
+  const showWorkspaceTrustPage = (): void => {
+    const project = options.presentation.getState().authoritative.project;
+    editor.setText("");
+    editor.disableSubmit = false;
+    workspaceTrustPage?.hide();
+    let handle: { hide(): void } | undefined;
+    const close = () => {
+      handle?.hide();
+      workspaceTrustPage = undefined;
+      statusMessage = "Workspace trust unchanged.";
+      tui.setFocus(editor);
+      renderState();
+    };
+    const page = new WorkspaceTrustPage({
+      diagnostic: project.workspaceTrust.diagnostic,
+      onChange(trusted) {
+        applyWorkspaceTrustMutation(trusted, () => {
+          handle?.hide();
+          workspaceTrustPage = undefined;
+          tui.setFocus(editor);
+        });
+      },
+      onClose: close,
+      projectId: project.id,
+      projectLabel: project.label,
+      status: project.workspaceTrust.status,
+      theme,
+    });
+    handle = showOverlay(page, {
+      width: "90%",
+      minWidth: 36,
+      maxHeight: "80%",
+      margin: 1,
+    });
+    workspaceTrustPage = { close, hide: () => handle?.hide() };
+    statusMessage = null;
+    tui.requestRender();
+  };
+  const handleWorkspaceTrustCommand = (argumentsText: string): void => {
+    const project = options.presentation.getState().authoritative.project;
+    if (argumentsText.length === 0) {
+      showWorkspaceTrustPage();
+      return;
+    }
+    if (argumentsText === "status") {
+      editor.setText("");
+      editor.disableSubmit = false;
+      statusMessage = `Workspace trust: ${project.workspaceTrust.status} · ${safeTerminalText(project.label)} · ${safeTerminalText(project.id)}`;
+      renderState();
+      return;
+    }
+    if (argumentsText !== "grant" && argumentsText !== "revoke") {
+      statusMessage = "Usage: /trust [status|grant|revoke]";
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    applyWorkspaceTrustMutation(argumentsText === "grant");
+  };
   editor.onSubmit = (text) => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
@@ -1560,6 +1656,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       if (parsedDraft.kind === "known" && parsedDraft.command.id === "config") {
         handleConfigurationCommand(parsedDraft.argumentsText);
+        return;
+      }
+      if (parsedDraft.kind === "known" && parsedDraft.command.id === "trust") {
+        handleWorkspaceTrustCommand(parsedDraft.argumentsText);
         return;
       }
       if (
@@ -1750,6 +1850,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     if (parsedCommand.kind === "known" && parsedCommand.command.id === "config") {
       handleConfigurationCommand(parsedCommand.argumentsText);
+      return;
+    }
+    if (parsedCommand.kind === "known" && parsedCommand.command.id === "trust") {
+      handleWorkspaceTrustCommand(parsedCommand.argumentsText);
       return;
     }
     if (

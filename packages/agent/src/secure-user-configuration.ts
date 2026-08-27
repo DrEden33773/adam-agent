@@ -1,8 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { type FileHandle, mkdir, open, rename, unlink } from "node:fs/promises";
+import { type FileHandle, mkdir, open, realpath, rename, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import {
   createUserModelPolicyResolver,
   type UserModelPolicyField,
@@ -17,6 +18,8 @@ export type {
 } from "./user-model-policy.js";
 
 const maximumConfigurationBytes = 8 * 1024;
+const maximumWorkspaceTrustBytes = 128 * 1024;
+const maximumTrustedProjectIds = 1_024;
 
 export type PresentationPreferencesDiagnostic = {
   readonly code: "target_configuration_invalid" | "target_configuration_unsafe";
@@ -45,9 +48,50 @@ type UserConfigurationRead =
   | { readonly status: "missing" }
   | { readonly status: "unsafe" };
 
-type UserConfigurationStorage = {
+export type UserConfigurationStorage = {
   read(): Promise<UserConfigurationRead>;
   write(text: string): Promise<void>;
+};
+
+type OwnerConfigurationStorage = UserConfigurationStorage & {
+  runExclusive?<T>(operation: () => Promise<T>): Promise<T>;
+};
+
+export type WorkspaceTrustMcpLease = {
+  release(): Promise<void>;
+};
+
+export class WorkspaceTrustMcpLeaseError extends Error {
+  readonly code = "project_in_use";
+
+  constructor() {
+    super("Another Adam MCP runtime owns this canonical project.");
+    this.name = "WorkspaceTrustMcpLeaseError";
+  }
+}
+
+export type WorkspaceTrustDiagnostic = {
+  readonly code:
+    | "workspace_trust_invalid"
+    | "workspace_trust_unsafe"
+    | "workspace_trust_unavailable";
+  readonly message: string;
+};
+
+export type WorkspaceTrustSnapshot = {
+  readonly projectId: `sha256:${string}` | null;
+  readonly projectLabel: string;
+  readonly status: "trusted" | "untrusted" | "unavailable";
+  readonly diagnostic: WorkspaceTrustDiagnostic | null;
+};
+
+export type WorkspaceTrustController = {
+  acquireMcpLease(): Promise<WorkspaceTrustMcpLease>;
+  load(): Promise<WorkspaceTrustSnapshot>;
+  setTrusted(input: {
+    readonly projectId: string;
+    readonly trusted: boolean;
+  }): Promise<WorkspaceTrustSnapshot>;
 };
 
 export function createPresentationPreferences(options: {
@@ -61,8 +105,43 @@ export function createPresentationPreferences(options: {
   const directoryPath = join(root, "adam-agent");
   const configurationPath = join(directoryPath, "config.json");
   return createPresentationPreferencesFromStorage(
-    createUserConfigurationFileStorage({ configurationPath, directoryPath }),
+    createOwnerConfigurationFileStorage({
+      configurationPath,
+      directoryPath,
+      maximumBytes: maximumConfigurationBytes,
+      temporaryPrefix: ".config",
+    }),
   );
+}
+
+export function createWorkspaceTrust(options: {
+  readonly environment: NodeJS.ProcessEnv;
+  readonly workspaceRoot: string;
+}): WorkspaceTrustController {
+  const { XDG_CONFIG_HOME: configuredRoot } = options.environment;
+  const root =
+    configuredRoot === undefined || configuredRoot.length === 0
+      ? join(homedir(), ".config")
+      : configuredRoot;
+  const directoryPath = join(root, "adam-agent");
+  return createWorkspaceTrustFromStorage({
+    workspaceRoot: options.workspaceRoot,
+    storage: createOwnerConfigurationFileStorage({
+      configurationPath: join(directoryPath, "workspace-trust.json"),
+      directoryPath,
+      maximumBytes: maximumWorkspaceTrustBytes,
+      mutationLockName: ".workspace-trust.lock",
+      temporaryPrefix: ".workspace-trust",
+    }),
+    async acquireMcpLock() {
+      const identity = await resolveCanonicalWorkspaceIdentity(options.workspaceRoot);
+      return acquireOwnerConfigurationLock(
+        directoryPath,
+        `.workspace-mcp-${identity.projectId.slice("sha256:".length)}.lock`,
+        true,
+      );
+    },
+  });
 }
 
 /** Tests only through the internal-testing entry; production uses the owner-only file Adapter. */
@@ -70,6 +149,175 @@ export function createPresentationPreferencesWithStorageForTesting(
   storage: UserConfigurationStorage,
 ): PresentationPreferences {
   return createPresentationPreferencesFromStorage(storage);
+}
+
+/** Tests only through the internal-testing entry; production uses the owner-only file Adapter. */
+export function createWorkspaceTrustWithStorageForTesting(options: {
+  readonly workspaceRoot: string;
+  readonly storage: UserConfigurationStorage;
+}): WorkspaceTrustController {
+  return createWorkspaceTrustFromStorage(options);
+}
+
+/** Keeps established behavior tests focused on their original contract. */
+export function createTrustedWorkspaceTrustForTesting(
+  workspaceRoot: string,
+): WorkspaceTrustController {
+  let text: string | null = null;
+  return createWorkspaceTrustFromStorage({
+    workspaceRoot,
+    storage: {
+      async read() {
+        if (text === null) {
+          const identity = await resolveCanonicalWorkspaceIdentity(workspaceRoot);
+          text = serializeWorkspaceTrust([identity.projectId]);
+        }
+        return { status: "available", text };
+      },
+      async write(nextText) {
+        text = nextText;
+      },
+    },
+  });
+}
+
+function createWorkspaceTrustFromStorage(options: {
+  readonly workspaceRoot: string;
+  readonly storage: OwnerConfigurationStorage;
+  readonly acquireMcpLock?: () => Promise<WorkspaceTrustMcpLease>;
+}): WorkspaceTrustController {
+  let activeMcpLease: WorkspaceTrustMcpLease | undefined;
+  let mcpLeaseAcquisition: Promise<WorkspaceTrustMcpLease> | undefined;
+  const resolveIdentity = () => resolveCanonicalWorkspaceIdentity(options.workspaceRoot);
+  const unavailable = (): WorkspaceTrustSnapshot => ({
+    projectId: null,
+    projectLabel: basename(options.workspaceRoot) || "project",
+    status: "unavailable",
+    diagnostic: {
+      code: "workspace_trust_unavailable",
+      message: "The canonical workspace identity is unavailable.",
+    },
+  });
+  const loadDocument = async (): Promise<
+    | { readonly status: "valid"; readonly trustedProjectIds: readonly `sha256:${string}`[] }
+    | { readonly status: "missing" }
+    | { readonly status: "invalid" }
+    | { readonly status: "unsafe" }
+  > => {
+    const stored = await options.storage.read().catch(() => ({ status: "unsafe" as const }));
+    if (stored.status !== "available") {
+      return { status: stored.status };
+    }
+    return parseWorkspaceTrust(stored.text);
+  };
+  const load = async (): Promise<WorkspaceTrustSnapshot> => {
+    const identity = await resolveIdentity().catch(() => undefined);
+    if (identity === undefined) {
+      return unavailable();
+    }
+    const document = await loadDocument();
+    if (document.status === "missing") {
+      return { ...identity, status: "untrusted", diagnostic: null };
+    }
+    if (document.status === "invalid") {
+      return {
+        ...identity,
+        status: "untrusted",
+        diagnostic: {
+          code: "workspace_trust_invalid",
+          message: "The saved workspace trust configuration is invalid.",
+        },
+      };
+    }
+    if (document.status === "unsafe") {
+      return {
+        ...identity,
+        status: "untrusted",
+        diagnostic: {
+          code: "workspace_trust_unsafe",
+          message: "The saved workspace trust configuration is not an owner-only ordinary file.",
+        },
+      };
+    }
+    return {
+      ...identity,
+      status: document.trustedProjectIds.includes(identity.projectId) ? "trusted" : "untrusted",
+      diagnostic: null,
+    };
+  };
+  return {
+    async acquireMcpLease() {
+      if (activeMcpLease !== undefined || mcpLeaseAcquisition !== undefined) {
+        throw new TypeError("This workspace trust controller already owns the MCP trust lease.");
+      }
+      mcpLeaseAcquisition = options.acquireMcpLock?.() ?? Promise.resolve({ async release() {} });
+      let owned: WorkspaceTrustMcpLease;
+      try {
+        owned = await mcpLeaseAcquisition;
+        activeMcpLease = owned;
+      } finally {
+        mcpLeaseAcquisition = undefined;
+      }
+      let releasePromise: Promise<void> | undefined;
+      return {
+        release() {
+          releasePromise ??= owned.release().then(() => {
+            if (activeMcpLease === owned) {
+              activeMcpLease = undefined;
+            }
+          });
+          return releasePromise;
+        },
+      };
+    },
+    load,
+    async setTrusted(input) {
+      const mutate = async () => {
+        const identity = await resolveIdentity().catch(() => undefined);
+        if (identity === undefined || input.projectId !== identity.projectId) {
+          throw new TypeError("The workspace trust command targets a stale project identity.");
+        }
+        const document = await loadDocument();
+        if (document.status === "invalid" || document.status === "unsafe") {
+          throw new TypeError("The saved workspace trust configuration requires manual repair.");
+        }
+        const trustedProjectIds = new Set(
+          document.status === "valid" ? document.trustedProjectIds : [],
+        );
+        if (input.trusted) {
+          trustedProjectIds.add(identity.projectId);
+        } else {
+          trustedProjectIds.delete(identity.projectId);
+        }
+        const sorted = [...trustedProjectIds].sort();
+        if (sorted.length > maximumTrustedProjectIds) {
+          throw new TypeError("The workspace trust configuration is full.");
+        }
+        await options.storage.write(serializeWorkspaceTrust(sorted));
+        return {
+          ...identity,
+          status: input.trusted ? ("trusted" as const) : ("untrusted" as const),
+          diagnostic: null,
+        };
+      };
+      const mutateDocument = () =>
+        options.storage.runExclusive === undefined
+          ? mutate()
+          : options.storage.runExclusive(mutate);
+      if (activeMcpLease !== undefined) {
+        throw new WorkspaceTrustMcpLeaseError();
+      }
+      if (options.acquireMcpLock === undefined) {
+        return mutateDocument();
+      }
+      const temporaryMcpLease = await options.acquireMcpLock();
+      try {
+        return await mutateDocument();
+      } finally {
+        await temporaryMcpLease.release();
+      }
+    },
+  };
 }
 
 function createPresentationPreferencesFromStorage(
@@ -160,11 +408,30 @@ function createPresentationPreferencesFromStorage(
   };
 }
 
-function createUserConfigurationFileStorage(options: {
+function createOwnerConfigurationFileStorage(options: {
   readonly configurationPath: string;
   readonly directoryPath: string;
-}): UserConfigurationStorage {
+  readonly maximumBytes: number;
+  readonly mutationLockName?: string;
+  readonly temporaryPrefix: string;
+}): OwnerConfigurationStorage {
   return {
+    ...(options.mutationLockName === undefined
+      ? {}
+      : {
+          async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+            const lease = await acquireOwnerConfigurationLock(
+              options.directoryPath,
+              options.mutationLockName as string,
+              false,
+            );
+            try {
+              return await operation();
+            } finally {
+              await lease.release();
+            }
+          },
+        }),
     async read() {
       const directory = await openOwnerDirectory(options.directoryPath).catch(() => undefined);
       if (directory === undefined) {
@@ -187,7 +454,7 @@ function createUserConfigurationFileStorage(options: {
             !stats.isFile() ||
             !Number.isSafeInteger(stats.size) ||
             stats.size <= 0 ||
-            stats.size > maximumConfigurationBytes ||
+            stats.size > options.maximumBytes ||
             stats.uid !== currentEffectiveUserId() ||
             (stats.mode & 0o077) !== 0
           ) {
@@ -208,7 +475,7 @@ function createUserConfigurationFileStorage(options: {
       if (directory === null) {
         throw new TypeError("The user configuration directory is unavailable.");
       }
-      const temporaryPath = join(directoryPath, `.config-${randomUUID()}.tmp`);
+      const temporaryPath = join(directoryPath, `${options.temporaryPrefix}-${randomUUID()}.tmp`);
       let temporary: FileHandle | undefined;
       try {
         const existing = await openOwnerFile(configurationPath).catch(() => undefined);
@@ -255,6 +522,60 @@ function createUserConfigurationFileStorage(options: {
   };
 }
 
+function parseWorkspaceTrust(
+  text: string,
+):
+  | { readonly status: "valid"; readonly trustedProjectIds: readonly `sha256:${string}`[] }
+  | { readonly status: "invalid" } {
+  if (text.length === 0 || Buffer.byteLength(text, "utf8") > maximumWorkspaceTrustBytes) {
+    return { status: "invalid" };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { status: "invalid" };
+  }
+  if (hasDuplicateJsonObjectKey(text) || !isPlainRecord(parsed)) {
+    return { status: "invalid" };
+  }
+  const { schemaVersion, trustedProjectIds } = parsed;
+  if (
+    schemaVersion !== 1 ||
+    Object.keys(parsed).length !== 2 ||
+    !Array.isArray(trustedProjectIds) ||
+    trustedProjectIds.length > maximumTrustedProjectIds ||
+    trustedProjectIds.some(
+      (projectId) => typeof projectId !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(projectId),
+    ) ||
+    new Set(trustedProjectIds).size !== trustedProjectIds.length ||
+    trustedProjectIds.some(
+      (projectId, index) => index > 0 && trustedProjectIds[index - 1] >= projectId,
+    )
+  ) {
+    return { status: "invalid" };
+  }
+  return {
+    status: "valid",
+    trustedProjectIds: trustedProjectIds as readonly `sha256:${string}`[],
+  };
+}
+
+function serializeWorkspaceTrust(trustedProjectIds: readonly `sha256:${string}`[]): string {
+  return `${JSON.stringify({ schemaVersion: 1, trustedProjectIds })}\n`;
+}
+
+export async function resolveCanonicalWorkspaceIdentity(workspaceRoot: string): Promise<{
+  readonly projectId: `sha256:${string}`;
+  readonly projectLabel: string;
+}> {
+  const canonicalRoot = await realpath(workspaceRoot);
+  return {
+    projectId: `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}`,
+    projectLabel: basename(canonicalRoot) || "project",
+  };
+}
+
 async function openOwnerDirectory(path: string): Promise<FileHandle | null> {
   let directory: FileHandle;
   try {
@@ -283,6 +604,110 @@ async function openOwnerFile(path: string): Promise<FileHandle | null> {
   } catch (error) {
     return isNodeError(error) && error.code === "ENOENT" ? null : Promise.reject(error);
   }
+}
+
+async function acquireOwnerConfigurationLock(
+  directoryPath: string,
+  lockName: string,
+  nonblocking: boolean,
+): Promise<WorkspaceTrustMcpLease> {
+  await mkdir(directoryPath, { recursive: true, mode: 0o700 });
+  const directory = await openOwnerDirectory(directoryPath);
+  if (directory === null) {
+    throw new TypeError("The owner configuration directory is unavailable.");
+  }
+  let lease: WorkspaceTrustMcpLease | undefined;
+  let acquisitionError: unknown;
+  try {
+    const lock = await open(
+      join(directoryPath, lockName),
+      constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      0o600,
+    );
+    lease = createConfigurationLockLease(lock);
+    const stats = await lock.stat();
+    if (!stats.isFile() || stats.uid !== currentEffectiveUserId() || (stats.mode & 0o077) !== 0) {
+      throw new TypeError("The owner configuration lock is unsafe.");
+    }
+    const child = spawn("flock", ["--exclusive", ...(nonblocking ? ["--nonblock"] : []), "3"], {
+      stdio: ["ignore", "ignore", "pipe", lock.fd],
+    });
+    await waitForConfigurationLock(child, nonblocking);
+  } catch (error) {
+    acquisitionError = error;
+  }
+  let directoryCloseError: unknown;
+  try {
+    await directory.close();
+  } catch (error) {
+    directoryCloseError = error;
+  }
+  if (acquisitionError === undefined && directoryCloseError === undefined && lease !== undefined) {
+    return lease;
+  }
+  let lockCloseError: unknown;
+  try {
+    await lease?.release();
+  } catch (error) {
+    lockCloseError = error;
+  }
+  const errors = [acquisitionError, directoryCloseError, lockCloseError].filter(
+    (error) => error !== undefined,
+  );
+  if (errors.length === 1) {
+    throw errors[0];
+  }
+  throw new AggregateError(errors, "The owner configuration lock could not be acquired safely.");
+}
+
+function createConfigurationLockLease(lock: FileHandle): WorkspaceTrustMcpLease {
+  let closePromise: Promise<void> | undefined;
+  return {
+    release() {
+      closePromise ??= lock.close();
+      return closePromise;
+    },
+  };
+}
+
+async function waitForConfigurationLock(
+  child: ReturnType<typeof spawn>,
+  nonblocking: boolean,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let stderr = "";
+    let settled = false;
+    let spawnError: TypeError | undefined;
+    const finish = (error?: Error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      if (error === undefined) {
+        resolve();
+      } else {
+        reject(error);
+      }
+    };
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", () => {
+      spawnError = new TypeError("The owner configuration lock is unavailable.");
+    });
+    child.once("close", (code) => {
+      if (spawnError !== undefined) {
+        finish(spawnError);
+      } else if (code === 0) {
+        finish();
+      } else if (nonblocking && code === 1 && stderr.length === 0) {
+        finish(new WorkspaceTrustMcpLeaseError());
+      } else {
+        finish(new TypeError("The owner configuration lock is unavailable."));
+      }
+    });
+  });
 }
 
 function parseConfiguration(text: string): LoadedPresentationPreferences {

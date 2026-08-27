@@ -10,7 +10,9 @@ import {
   createJsonlOperationStore,
   createModelTargets,
   createSessionLifecycle,
+  createWorkspaceTrust,
 } from "@adam-agent/agent";
+import { createTrustedWorkspaceTrustForTesting } from "@adam-agent/agent/internal-testing";
 import { afterEach, expect, test } from "vitest";
 import {
   removeTuiFixtureRoot as rm,
@@ -26,6 +28,7 @@ const productionPath = fileURLToPath(new URL("../dist/main.js", import.meta.url)
 const productionFixturePath = fileURLToPath(
   new URL("../dist/production-main.fixture.js", import.meta.url),
 );
+const cliPath = fileURLToPath(new URL("../../cli/dist/main.js", import.meta.url));
 const productRoot = fileURLToPath(new URL("../../..", import.meta.url));
 const execFile = promisify(execFileCallback);
 const mcpFixturePath = fileURLToPath(
@@ -400,7 +403,12 @@ test("the production TUI composes the Linux clipboard adapter for copy commands"
     if (targetIdentity === undefined) {
       throw new Error("The production clipboard fixture requires the DeepSeek Flash target.");
     }
-    const seedLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const seedLifecycle = createSessionLifecycle({
+      modelTargets,
+      stateRoot,
+      workspaceRoot,
+      workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+    });
     const created = await seedLifecycle.create({ targetIdentity });
     await seedLifecycle.continue({
       sessionId: created.sessionId,
@@ -594,7 +602,12 @@ test("the production TUI reviews real Git changes through the exact public Eve a
   if (targetIdentity === undefined) {
     throw new Error("The registry Eve fixture requires the DeepSeek Flash target.");
   }
-  const seedLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const seedLifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+  });
   const created = await seedLifecycle.create({ targetIdentity });
   await seedLifecycle.close();
   const program = {
@@ -681,7 +694,12 @@ test("a missing configured package disables admission while preserving generic h
   if (targetIdentity === undefined) {
     throw new Error("The missing-extension fixture requires the DeepSeek Flash target.");
   }
-  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+  });
   const created = await lifecycle.create({ targetIdentity });
   await lifecycle.close();
   const operationStore = await createJsonlOperationStore({ stateRoot, workspaceRoot });
@@ -788,7 +806,12 @@ test("the production TUI rehydrates and explicitly recovers one operation after 
   if (targetIdentity === undefined) {
     throw new Error("The operation restart fixture requires the DeepSeek Flash target.");
   }
-  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+  });
   const created = await lifecycle.create({ targetIdentity });
   await lifecycle.close();
   const program = {
@@ -906,6 +929,7 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-mcp-reactivation-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
   const spawnMarker = join(testRoot, "mcp-spawned");
   const closeMarker = join(testRoot, "mcp-closed");
   await mkdir(workspaceRoot);
@@ -925,10 +949,22 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
     arguments: ["--state-root", stateRoot],
     cwd: workspaceRoot,
     entrypoint: productionPath,
-    environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
+    environment: {
+      DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+      XDG_CONFIG_HOME: configRoot,
+    },
   } as const;
 
   try {
+    const workspaceTrust = createWorkspaceTrust({
+      environment: { XDG_CONFIG_HOME: configRoot },
+      workspaceRoot,
+    });
+    const trustStatus = await workspaceTrust.load();
+    if (trustStatus.projectId === null) {
+      throw new Error("The MCP reactivation fixture requires one canonical project identity.");
+    }
+    await workspaceTrust.setTrusted({ projectId: trustStatus.projectId, trusted: true });
     const modelTargets = createModelTargets({
       environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
       fetch: async () =>
@@ -944,7 +980,12 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
     if (targetIdentity === undefined) {
       throw new Error("The MCP reactivation fixture requires the DeepSeek Flash target.");
     }
-    const seedLifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    const seedLifecycle = createSessionLifecycle({
+      modelTargets,
+      stateRoot,
+      workspaceRoot,
+      workspaceTrust,
+    });
     const created = await seedLifecycle.create({ targetIdentity });
     await seedLifecycle.continue({
       sessionId: created.sessionId,
@@ -1013,8 +1054,33 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
     beforeStep = resumed.output().length;
     resumed.write("\r");
     await resumed.waitForCompleteFrameAfter("MCP authority · profile committed", beforeStep);
+    const activeMcpPid = Number(await readFile(spawnMarker, "utf8"));
+    expect(() => process.kill(activeMcpPid, 0)).not.toThrow();
+    let revokeFailure: unknown;
+    try {
+      await execFile(process.execPath, [cliPath, "--revoke-workspace-trust"], {
+        cwd: workspaceRoot,
+        env: {
+          ...process.env,
+          ADAM_AGENT_STATE_ROOT: join(testRoot, "independent-cli-state"),
+          XDG_CONFIG_HOME: configRoot,
+        },
+      });
+    } catch (error) {
+      revokeFailure = error;
+    }
+    expect(revokeFailure).toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("Another Adam MCP runtime owns this canonical project."),
+    });
+    await expect(workspaceTrust.load()).resolves.toMatchObject({ status: "trusted" });
+    expect(() => process.kill(activeMcpPid, 0)).not.toThrow();
+    const closesBeforeRuntimeExit = await readFile(closeMarker, "utf8");
     resumed.write("\u0011");
     await expect(resumed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(
+      waitForFileContents(closeMarker, `${closesBeforeRuntimeExit}closed\n`),
+    ).resolves.toBe(`${closesBeforeRuntimeExit}closed\n`);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
