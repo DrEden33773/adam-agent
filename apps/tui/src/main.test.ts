@@ -569,7 +569,7 @@ test("the production TUI creates from one valid saved exact default without open
   }
 });
 
-test("the production target picker saves its focused exact target separately from session creation", async () => {
+test("the production target picker saves and clears its focused exact default separately from session creation", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-save-target-"));
   const configRoot = join(testRoot, "config");
   const workspaceRoot = join(testRoot, "workspace");
@@ -585,8 +585,26 @@ test("the production target picker saves its focused exact target separately fro
     await waitForPath(configurationPath);
     expect(await readFile(configurationPath, "utf8")).toBe(
       `${JSON.stringify({
-        schemaVersion: 1,
+        schemaVersion: 2,
         defaultTargetId: "deepseek-v4-flash.direct",
+        modelPolicy: {
+          contextWindowTokens: null,
+          maximumOutputTokens: null,
+          automaticCompactionWindowTokens: null,
+        },
+      })}\n`,
+    );
+    fixture.write("\u0013");
+    await fixture.waitFor("Cleared the saved default target");
+    expect(await readFile(configurationPath, "utf8")).toBe(
+      `${JSON.stringify({
+        schemaVersion: 2,
+        defaultTargetId: null,
+        modelPolicy: {
+          contextWindowTokens: null,
+          maximumOutputTokens: null,
+          automaticCompactionWindowTokens: null,
+        },
       })}\n`,
     );
     fixture.write("\u0011");
@@ -594,6 +612,57 @@ test("the production target picker saves its focused exact target separately fro
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).not.toContain("Adam · New session");
     expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production target picker clears a saved default that is absent from the catalog", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-clear-missing-target-"));
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  const configurationPath = join(configDirectory, "config.json");
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+  await mkdir(workspaceRoot);
+  await writeFile(
+    configurationPath,
+    `${JSON.stringify({
+      schemaVersion: 2,
+      defaultTargetId: "removed-target.direct",
+      modelPolicy: {
+        contextWindowTokens: null,
+        maximumOutputTokens: null,
+        automaticCompactionWindowTokens: null,
+      },
+    })}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+
+  try {
+    const fixture = startFixture({ launch: { configRoot }, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    await fixture.waitFor("Clear saved default");
+    fixture.write("clear");
+    await fixture.waitFor("Search: clear");
+    const beforeClear = fixture.output().length;
+    fixture.write("\u001b[A");
+    fixture.write("\r");
+    await fixture.waitForAfter("Cleared the saved default target", beforeClear);
+    const expectedConfiguration = `${JSON.stringify({
+      schemaVersion: 2,
+      defaultTargetId: null,
+      modelPolicy: {
+        contextWindowTokens: null,
+        maximumOutputTokens: null,
+        automaticCompactionWindowTokens: null,
+      },
+    })}\n`;
+    await waitForFileContents(configurationPath, expectedConfiguration);
+    expect(await readFile(configurationPath, "utf8")).toBe(expectedConfiguration);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -778,6 +847,79 @@ test("the production TUI switches an exact draft target without creating durable
 
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI opens owner-local configuration from an exact draft", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-draft-configuration-page-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: { configRoot, startupTargetId: "deepseek-v4-flash.direct" },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforePage = fixture.output().length;
+    fixture.write("/config\r");
+    await fixture.waitForCompleteFrameAfter("User model configuration", beforePage);
+    expect(latestSynchronizedFrame(fixture.output().slice(beforePage)).join("\n")).toContain(
+      "Context window",
+    );
+    const beforeClose = fixture.output().length;
+    fixture.write("\u0003");
+    await fixture.waitForCompleteFrameAfter("Configuration closed.", beforeClose);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI applies one exact draft policy command", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-draft-configuration-command-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: { configRoot, startupTargetId: "deepseek-v4-flash.direct" },
+      scenario: "provider-no-usage",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforeMutation = fixture.output().length;
+    fixture.write("/config output 1234\r");
+    await fixture.waitForAfter("Saved output limit: 1234 tokens.", beforeMutation);
+    const beforePrompt = fixture.output().length;
+    fixture.write("Configured TUI admission\r");
+    await fixture.waitForAfter("Provider usage unavailable.", beforePrompt);
+    await fixture.waitForAfter(" · idle", beforePrompt);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    expect(await readFilesRecursively(stateRoot)).toContain('"maximumOutputTokens":1234');
+    await expect(readFile(join(configRoot, "adam-agent", "config.json"), "utf8")).resolves.toBe(
+      `${JSON.stringify({
+        schemaVersion: 2,
+        defaultTargetId: null,
+        modelPolicy: {
+          contextWindowTokens: null,
+          maximumOutputTokens: 1_234,
+          automaticCompactionWindowTokens: null,
+        },
+      })}\n`,
+    );
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

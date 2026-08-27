@@ -34,12 +34,41 @@ export type TargetDisplay = {
     readonly credentialSource: string;
   };
   readonly thinking: ThinkingCapabilityDisplay | null;
+  readonly context?: {
+    readonly official: ContextProfileDisplay;
+    readonly effective: ContextProfileDisplay | null;
+    readonly source: {
+      readonly contextWindowTokens: "default" | "user";
+      readonly maximumOutputTokens: "default" | "user";
+      readonly compactAtTokens: "default" | "user";
+    };
+    readonly diagnostic: { readonly code: string; readonly message: string } | null;
+  };
+};
+
+export type ContextProfileDisplay = {
+  readonly version: number;
+  readonly contextWindowTokens: number;
+  readonly maximumOutputTokens: number;
+  readonly compactAtTokens: number;
+  readonly postCompactTargetTokens: number;
+  readonly retainedTargetTokens: number;
+  readonly estimatorVersion: number;
+  readonly ordinaryOutputReserveTokens?: number | undefined;
+  readonly compactionSummaryMaximumOutputTokens?: number | undefined;
+};
+
+export type UserModelPolicyDisplay = {
+  readonly contextWindowTokens: number | null;
+  readonly maximumOutputTokens: number | null;
+  readonly automaticCompactionWindowTokens: number | null;
 };
 
 export type TargetCatalogDisplay = {
   readonly items: readonly TargetDisplay[];
   readonly defaultTargetId: string | null;
   readonly diagnostic: { readonly code: string; readonly message: string } | null;
+  readonly configuration?: { readonly modelPolicy: UserModelPolicyDisplay };
 };
 
 export type SessionSummary = {
@@ -715,7 +744,15 @@ export type PresentationCommand =
     }
   | {
       readonly type: "set_default_target";
-      readonly targetId: string;
+      readonly targetId: string | null;
+    }
+  | {
+      readonly type: "set_model_policy";
+      readonly field:
+        | "contextWindowTokens"
+        | "maximumOutputTokens"
+        | "automaticCompactionWindowTokens";
+      readonly value: number | null;
     }
   | {
       readonly type: "load_older_transcript";

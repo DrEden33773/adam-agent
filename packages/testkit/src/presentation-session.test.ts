@@ -2126,7 +2126,7 @@ test("PresentationSession rejects a symlinked default-target directory without h
   }
 });
 
-test("PresentationSession saves one exact default target through a distinct semantic command", async () => {
+test("PresentationSession saves and clears one exact default target through semantic commands", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-save-target-"));
   const configRoot = join(testRoot, "config");
   const stateRoot = join(testRoot, "state");
@@ -2173,9 +2173,33 @@ test("PresentationSession saves one exact default target through a distinct sema
     });
     const configurationPath = join(configRoot, "adam-agent", "config.json");
     await expect(readFile(configurationPath, "utf8")).resolves.toBe(
-      `${JSON.stringify({ schemaVersion: 1, defaultTargetId: targetIdentity.targetId })}\n`,
+      `${JSON.stringify({
+        schemaVersion: 2,
+        defaultTargetId: targetIdentity.targetId,
+        modelPolicy: {
+          contextWindowTokens: null,
+          maximumOutputTokens: null,
+          automaticCompactionWindowTokens: null,
+        },
+      })}\n`,
     );
     expect((await stat(configurationPath)).mode & 0o777).toBe(0o600);
+
+    await expect(
+      presentation.dispatch({ type: "set_default_target", targetId: null }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.targets.defaultTargetId).toBeNull();
+    await expect(readFile(configurationPath, "utf8")).resolves.toBe(
+      `${JSON.stringify({
+        schemaVersion: 2,
+        defaultTargetId: null,
+        modelPolicy: {
+          contextWindowTokens: null,
+          maximumOutputTokens: null,
+          automaticCompactionWindowTokens: null,
+        },
+      })}\n`,
+    );
 
     await presentation.close();
   } finally {

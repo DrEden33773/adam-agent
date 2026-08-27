@@ -164,6 +164,17 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     await writeFile(options.terminalProcessMarker, `${process.pid}\n`, "utf8");
   }
   const modelTargets = createFixtureModelTargets(options);
+  const preferences =
+    options.launch === undefined
+      ? undefined
+      : createPresentationPreferences({
+          environment: {
+            ...process.env,
+            ...(options.launch.configRoot === undefined
+              ? {}
+              : { XDG_CONFIG_HOME: options.launch.configRoot }),
+          },
+        });
   const lifecycle = createSessionLifecycle({
     ...(options.scenario === "mcp-close-unconfirmed"
       ? {
@@ -175,6 +186,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
         }
       : {}),
     ...(modelTargets === undefined ? {} : { modelTargets }),
+    ...(preferences === undefined ? {} : { preferences }),
     permissions: createPermissionPolicy({
       allowedEffects:
         options.scenario === "tool-artifact" || options.scenario === "shell"
@@ -284,14 +296,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
               : { operations: reviewFixture.host.operations, projectChanges: reviewFixture.host }),
             ...(modelTargets === undefined ? {} : { modelTargets }),
             openProject: true,
-            preferences: createPresentationPreferences({
-              environment: {
-                ...process.env,
-                ...(options.launch.configRoot === undefined
-                  ? {}
-                  : { XDG_CONFIG_HOME: options.launch.configRoot }),
-              },
-            }),
+            ...(preferences === undefined ? {} : { preferences }),
             projectLabel: "workspace",
             stateRoot: options.stateRoot,
             workspaceRoot: options.workspaceRoot,

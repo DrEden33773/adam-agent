@@ -35,6 +35,7 @@ import {
 import { ChronologyPicker, completeChronologyBoundaries } from "./chronology-picker.js";
 import { AdamAutocompleteProvider } from "./command-autocomplete.js";
 import { type AdamCommandRegistry, adamCommandRegistry } from "./command-registry.js";
+import { type ConfigurationField, ConfigurationPage } from "./configuration-page.js";
 import {
   type ClipboardAdapter,
   copyDraftToClipboard,
@@ -224,6 +225,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly picker: ResourceReloadPicker;
       }
     | undefined;
+  let configurationPage:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+      }
+    | undefined;
   let skillPalette:
     | {
         readonly close: () => void;
@@ -256,6 +263,46 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly hide: () => void;
       }
     | undefined;
+  type CloseableOverlay = {
+    readonly close: () => void;
+    readonly hide: () => void;
+  };
+  const closeableOverlaysInPrecedence = (): readonly (CloseableOverlay | undefined)[] => [
+    helpNavigator,
+    artifactNavigator,
+    mcpWizard,
+    pathPicker,
+    skillPalette,
+    sessionInspector,
+    chronologyPicker,
+    resourceReloadPicker,
+    configurationPage,
+    sessionPicker,
+    targetPicker,
+    thinkingPicker,
+  ];
+  const focusedCloseableOverlay = (): CloseableOverlay | undefined =>
+    closeableOverlaysInPrecedence().find((overlay) => overlay !== undefined);
+  const hideSessionScopedOverlays = () => {
+    skillPalette?.hide();
+    skillPalette = undefined;
+    pathPicker?.hide();
+    pathPicker = undefined;
+    mcpWizard?.hide();
+    mcpWizard = undefined;
+    sessionInspector?.hide();
+    sessionInspector = undefined;
+    chronologyPicker?.hide();
+    chronologyPicker = undefined;
+    resourceReloadPicker?.hide();
+    resourceReloadPicker = undefined;
+    configurationPage?.hide();
+    configurationPage = undefined;
+    artifactNavigator?.hide();
+    artifactNavigator = undefined;
+    thinkingPicker?.hide();
+    thinkingPicker = undefined;
+  };
   const selectedSkills = new Set<string>();
   const selectedThinkingLevels = new Map<string, string>();
   const expandedReasoningIds = new Set<string>();
@@ -367,22 +414,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       reasoningArtifactReads.clear();
       reasoningArtifactTexts.clear();
       selectedSkills.clear();
-      skillPalette?.hide();
-      skillPalette = undefined;
-      pathPicker?.hide();
-      pathPicker = undefined;
-      mcpWizard?.hide();
-      mcpWizard = undefined;
-      sessionInspector?.hide();
-      sessionInspector = undefined;
-      chronologyPicker?.hide();
-      chronologyPicker = undefined;
-      resourceReloadPicker?.hide();
-      resourceReloadPicker = undefined;
-      artifactNavigator?.hide();
-      artifactNavigator = undefined;
-      thinkingPicker?.hide();
-      thinkingPicker = undefined;
+      hideSessionScopedOverlays();
       if (active !== null) {
         sessionPickerDismissed = false;
         targetPickerDismissed = false;
@@ -545,6 +577,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         tui.requestRender();
       };
       const picker = new TargetPicker({
+        defaultTargetId: state.authoritative.targets.defaultTargetId,
         targets: state.authoritative.targets.items,
         theme,
         mode: targetPickerIntent,
@@ -610,24 +643,30 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
               }
             });
         },
-        onSaveDefault(target) {
-          if (target.readiness.status !== "available") {
+        onSetDefault(target) {
+          if (target !== null && target.readiness.status !== "available") {
             picker.setNotice(
               `The exact target ${target.targetId} is missing its required credential.`,
             );
             tui.requestRender();
             return;
           }
+          const targetId = target?.targetId ?? null;
           void options.presentation
-            .dispatch({ type: "set_default_target", targetId: target.targetId })
+            .dispatch({ type: "set_default_target", targetId })
             .then((receipt) => {
               if (targetPicker?.picker !== picker) {
                 return;
               }
+              if (receipt.status === "admitted") {
+                picker.setDefaultTargetId(targetId);
+              }
               picker.setNotice(
-                receipt.status === "admitted"
-                  ? `Saved ${target.targetId} as the default.`
-                  : receipt.message,
+                receipt.status !== "admitted"
+                  ? receipt.message
+                  : target === null
+                    ? "Cleared the saved default target."
+                    : `Saved ${target.targetId} as the default.`,
               );
               tui.requestRender();
             })
@@ -1424,6 +1463,86 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     helpNavigator = { close, hide: () => handle?.hide(), navigator };
     tui.requestRender();
   };
+  const applyConfigurationMutation = (
+    field: ConfigurationField,
+    value: number | null,
+    onAdmitted?: () => void,
+  ): void => {
+    clearExitWindow();
+    editor.disableSubmit = true;
+    void options.presentation
+      .dispatch({ type: "set_model_policy", field, value })
+      .then((receipt) => {
+        if (receipt.status === "admitted") {
+          editor.setText("");
+          statusMessage = `Saved ${configurationFieldLabel(field)} limit: ${value === null ? "default" : `${value} tokens`}.`;
+          onAdmitted?.();
+        } else {
+          statusMessage = receipt.message;
+        }
+      })
+      .catch(() => {
+        statusMessage = "The owner-local model configuration could not be saved.";
+      })
+      .finally(() => {
+        editor.disableSubmit = false;
+        renderState();
+      });
+  };
+  const showConfigurationPage = (): void => {
+    const state = options.presentation.getState();
+    const configuration = state.authoritative.targets.configuration;
+    if (configuration === undefined) {
+      statusMessage = "Owner-local model configuration is unavailable.";
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    editor.setText("");
+    editor.disableSubmit = false;
+    configurationPage?.hide();
+    let handle: { hide(): void } | undefined;
+    const close = () => {
+      handle?.hide();
+      configurationPage = undefined;
+      statusMessage = "Configuration closed.";
+      tui.setFocus(editor);
+      renderState();
+    };
+    const page = new ConfigurationPage({
+      diagnostic: state.authoritative.targets.diagnostic,
+      modelPolicy: configuration.modelPolicy,
+      onClose: close,
+      onReset(field) {
+        applyConfigurationMutation(field, null, close);
+      },
+      target: targetForState(state),
+      theme,
+    });
+    handle = showOverlay(page, {
+      width: "90%",
+      minWidth: 36,
+      maxHeight: "80%",
+      margin: 1,
+    });
+    configurationPage = { close, hide: () => handle?.hide() };
+    statusMessage = null;
+    tui.requestRender();
+  };
+  const handleConfigurationCommand = (argumentsText: string): void => {
+    if (argumentsText.length === 0) {
+      showConfigurationPage();
+      return;
+    }
+    const mutation = parseConfigurationMutation(argumentsText);
+    if (mutation === null) {
+      statusMessage = "Usage: /config [context|output|compaction <tokens|default>]";
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    applyConfigurationMutation(mutation.field, mutation.value);
+  };
   editor.onSubmit = (text) => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
@@ -1437,6 +1556,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       const parsedDraft = commandRegistry.parse(text);
       if (parsedDraft.kind === "known" && parsedDraft.command.id === "thinking") {
         handleThinkingCommand(parsedDraft.argumentsText);
+        return;
+      }
+      if (parsedDraft.kind === "known" && parsedDraft.command.id === "config") {
+        handleConfigurationCommand(parsedDraft.argumentsText);
         return;
       }
       if (
@@ -1623,6 +1746,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     if (parsedCommand.kind === "known" && parsedCommand.command.id === "thinking") {
       handleThinkingCommand(parsedCommand.argumentsText);
+      return;
+    }
+    if (parsedCommand.kind === "known" && parsedCommand.command.id === "config") {
+      handleConfigurationCommand(parsedCommand.argumentsText);
       return;
     }
     if (
@@ -2270,17 +2397,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     attempt(removeTerminationListeners);
     attempt(clearExitWindow);
     attempt(unsubscribe);
-    attempt(() => sessionPicker?.hide());
-    attempt(() => sessionInspector?.hide());
-    attempt(() => chronologyPicker?.hide());
-    attempt(() => resourceReloadPicker?.hide());
-    attempt(() => skillPalette?.hide());
-    attempt(() => pathPicker?.hide());
-    attempt(() => mcpWizard?.hide());
-    attempt(() => helpNavigator?.hide());
-    attempt(() => artifactNavigator?.hide());
-    attempt(() => targetPicker?.hide());
-    attempt(() => thinkingPicker?.hide());
+    for (const overlay of closeableOverlaysInPrecedence()) {
+      attempt(() => overlay?.hide());
+    }
     attempt(() => permission?.hide());
     attempt(() => working.stop());
     attempt(() => thinking.stop());
@@ -2346,19 +2465,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         if (permission !== undefined) {
           permission.overlay.handleInput(data);
         } else {
-          const closeOverlay =
-            helpNavigator?.close ??
-            artifactNavigator?.close ??
-            mcpWizard?.close ??
-            pathPicker?.close ??
-            skillPalette?.close ??
-            sessionInspector?.close ??
-            chronologyPicker?.close ??
-            resourceReloadPicker?.close ??
-            sessionPicker?.close ??
-            targetPicker?.close ??
-            thinkingPicker?.close;
-          closeOverlay?.();
+          focusedCloseableOverlay()?.close();
         }
       }
       return { consume: true };
@@ -2371,17 +2478,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (
       commandRegistry.matchesInput(data, "rename_session") &&
       permission === undefined &&
-      targetPicker === undefined &&
-      thinkingPicker === undefined &&
-      sessionPicker === undefined &&
-      sessionInspector === undefined &&
-      chronologyPicker === undefined &&
-      resourceReloadPicker === undefined &&
-      skillPalette === undefined &&
-      pathPicker === undefined &&
-      mcpWizard === undefined &&
-      helpNavigator === undefined &&
-      artifactNavigator === undefined
+      focusedCloseableOverlay() === undefined
     ) {
       if (isKeyRepeat(data) || isKeyRelease(data)) {
         return { consume: true };
@@ -2470,23 +2567,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       if (data === "\u0003" && !legacyDuplicateGuard.admit()) {
         return { consume: true };
       }
-      const closeOverlay =
-        permission === undefined
-          ? (helpNavigator?.close ??
-            artifactNavigator?.close ??
-            mcpWizard?.close ??
-            pathPicker?.close ??
-            skillPalette?.close ??
-            sessionInspector?.close ??
-            chronologyPicker?.close ??
-            resourceReloadPicker?.close ??
-            sessionPicker?.close ??
-            targetPicker?.close ??
-            thinkingPicker?.close)
-          : undefined;
+      const closeOverlay = permission === undefined ? focusedCloseableOverlay() : undefined;
       if (closeOverlay !== undefined) {
         clearExitWindow();
-        closeOverlay();
+        closeOverlay.close();
         return { consume: true };
       }
       const active = options.presentation.getState().authoritative.active;
@@ -2574,6 +2658,43 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   } finally {
     removeTerminationListeners();
   }
+}
+
+function parseConfigurationMutation(argumentsText: string): {
+  readonly field: ConfigurationField;
+  readonly value: number | null;
+} | null {
+  const [name, rawValue, extra] = argumentsText.split(/\s+/u);
+  if (name === undefined || rawValue === undefined || extra !== undefined) {
+    return null;
+  }
+  const field: ConfigurationField | undefined =
+    name === "context"
+      ? "contextWindowTokens"
+      : name === "output"
+        ? "maximumOutputTokens"
+        : name === "compaction"
+          ? "automaticCompactionWindowTokens"
+          : undefined;
+  if (field === undefined) {
+    return null;
+  }
+  if (rawValue === "default") {
+    return { field, value: null };
+  }
+  if (!/^[1-9][0-9]*$/u.test(rawValue)) {
+    return null;
+  }
+  const value = Number(rawValue);
+  return Number.isSafeInteger(value) ? { field, value } : null;
+}
+
+function configurationFieldLabel(field: ConfigurationField): string {
+  return field === "contextWindowTokens"
+    ? "context"
+    : field === "maximumOutputTokens"
+      ? "output"
+      : "compaction";
 }
 
 function operationStatusText(operation: OperationDisplay): string {

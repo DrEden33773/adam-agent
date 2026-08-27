@@ -50,6 +50,7 @@ export type {
 } from "./project-lifecycle-owner.js";
 export { ProjectLifecycleOwnerError } from "./project-lifecycle-owner.js";
 export { assemblePromptMessagesV1, digestPromptRequestV1 } from "./prompt-assembly.js";
+export { createPresentationPreferencesWithStorageForTesting } from "./secure-user-configuration.js";
 export {
   sessionDurableContext,
   sessionDurableOutputLimits,

@@ -100,6 +100,7 @@ export async function createProductionProjectRuntime(
     extensionHost: host,
     modelTargets: options.modelTargets,
     permissions: options.permissions,
+    preferences: options.preferences,
     stateRoot: options.stateRoot,
     workspaceRoot: options.workspaceRoot,
   });

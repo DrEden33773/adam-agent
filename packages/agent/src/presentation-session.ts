@@ -262,25 +262,93 @@ export async function createPresentationSession(
       created === undefined
         ? null
         : await options.lifecycle.inspectContextUsage({ sessionId: created.sessionId });
-    const configuredPreferences = await options.preferences?.load();
-    const configuredTarget = modelTargetSnapshot?.targets.find(
-      (target) => target.identity.targetId === configuredPreferences?.defaultTargetId,
-    );
-    const preferenceDiagnostic =
-      configuredPreferences === undefined
-        ? null
-        : (configuredPreferences.diagnostic ??
-          (configuredPreferences.defaultTargetId !== null && configuredTarget === undefined
+    type ConfiguredPreferences = Awaited<ReturnType<PresentationPreferences["load"]>>;
+    type ConfiguredTargetContext = {
+      readonly official: ModelTargetSnapshot["targets"][number]["contextProfile"];
+      readonly effective: ModelTargetSnapshot["targets"][number]["contextProfile"] | null;
+      readonly source: {
+        readonly contextWindowTokens: "default" | "user";
+        readonly maximumOutputTokens: "default" | "user";
+        readonly compactAtTokens: "default" | "user";
+      };
+      readonly diagnostic: { readonly code: string; readonly message: string } | null;
+    };
+    const projectConfiguredTargetContexts = async (
+      preferencesSnapshot: ConfiguredPreferences | undefined,
+    ): Promise<ReadonlyMap<string, ConfiguredTargetContext>> => {
+      const contexts = new Map<string, ConfiguredTargetContext>();
+      if (preferencesSnapshot === undefined || options.preferences === undefined) {
+        return contexts;
+      }
+      for (const target of modelTargetSnapshot?.targets ?? []) {
+        let effective: ModelTargetSnapshot["targets"][number]["contextProfile"] | null = null;
+        let diagnostic: { readonly code: string; readonly message: string } | null =
+          preferencesSnapshot.diagnostic;
+        if (diagnostic === null) {
+          try {
+            effective = await options.preferences.resolveContextProfile(target.contextProfile);
+          } catch {
+            diagnostic = {
+              code: "user_model_configuration_invalid",
+              message: "The saved model configuration is incompatible with this target.",
+            };
+          }
+        }
+        contexts.set(target.identity.targetId, {
+          official: target.contextProfile,
+          effective,
+          source: {
+            contextWindowTokens:
+              preferencesSnapshot.modelPolicy.contextWindowTokens !== null ||
+              (effective !== null &&
+                effective.contextWindowTokens !== target.contextProfile.contextWindowTokens)
+                ? "user"
+                : "default",
+            maximumOutputTokens:
+              preferencesSnapshot.modelPolicy.maximumOutputTokens !== null ||
+              (effective !== null &&
+                effective.maximumOutputTokens !== target.contextProfile.maximumOutputTokens)
+                ? "user"
+                : "default",
+            compactAtTokens:
+              preferencesSnapshot.modelPolicy.automaticCompactionWindowTokens !== null ||
+              (effective !== null &&
+                effective.compactAtTokens !== target.contextProfile.compactAtTokens)
+                ? "user"
+                : "default",
+          },
+          diagnostic,
+        });
+      }
+      return contexts;
+    };
+    const resolvePreferenceDiagnostic = (
+      preferencesSnapshot: ConfiguredPreferences | undefined,
+    ): { readonly code: string; readonly message: string } | null => {
+      if (preferencesSnapshot === undefined) {
+        return null;
+      }
+      const configuredTarget = modelTargetSnapshot?.targets.find(
+        (target) => target.identity.targetId === preferencesSnapshot.defaultTargetId,
+      );
+      return (
+        preferencesSnapshot.diagnostic ??
+        (preferencesSnapshot.defaultTargetId !== null && configuredTarget === undefined
+          ? {
+              code: "target_configuration_invalid",
+              message: "The saved default target is not in the current target catalog.",
+            }
+          : configuredTarget?.readiness.status === "missing"
             ? {
                 code: "target_configuration_invalid",
-                message: "The saved default target is not in the current target catalog.",
+                message: "The saved default target is missing its required credential.",
               }
-            : configuredTarget?.readiness.status === "missing"
-              ? {
-                  code: "target_configuration_invalid",
-                  message: "The saved default target is missing its required credential.",
-                }
-              : null));
+            : null)
+      );
+    };
+    let configuredPreferences = await options.preferences?.load();
+    let configuredTargetContexts = await projectConfiguredTargetContexts(configuredPreferences);
+    let preferenceDiagnostic = resolvePreferenceDiagnostic(configuredPreferences);
     const knownTargets = new Map<string, ModelTargetIdentity>();
     for (const target of modelTargetSnapshot?.targets ?? []) {
       if (target.readiness.status === "available") {
@@ -348,31 +416,37 @@ export async function createPresentationSession(
           },
       project: { id: catalogPage.projectId, label: options.projectLabel },
       targets: {
-        items: (modelTargetSnapshot?.targets ?? []).map((target) => ({
-          targetId: target.identity.targetId,
-          label: target.identity.modelId,
-          route: target.identity.route,
-          certification:
-            target.identity.certification === "certified" ? "Certified" : "Experimental",
-          readiness: target.readiness,
-          thinking:
-            target.thinkingCapability === undefined
-              ? null
-              : {
-                  capabilityId: target.thinkingCapability.capabilityId,
-                  capabilityVersion: target.thinkingCapability.capabilityVersion,
-                  capabilityDigest: target.thinkingCapability.capabilityDigest,
-                  defaultLevelId: target.thinkingCapability.defaultLevelId,
-                  levels: target.thinkingCapability.levels.map((level) => ({
-                    id: level.id,
-                    label: level.label,
-                    effectiveLevelId: level.effectiveLevelId,
-                  })),
-                },
-        })),
-        defaultTargetId:
-          preferenceDiagnostic === null ? (configuredPreferences?.defaultTargetId ?? null) : null,
+        items: (modelTargetSnapshot?.targets ?? []).map((target) => {
+          const context = configuredTargetContexts.get(target.identity.targetId);
+          return {
+            targetId: target.identity.targetId,
+            label: target.identity.modelId,
+            route: target.identity.route,
+            certification:
+              target.identity.certification === "certified" ? "Certified" : "Experimental",
+            readiness: target.readiness,
+            thinking:
+              target.thinkingCapability === undefined
+                ? null
+                : {
+                    capabilityId: target.thinkingCapability.capabilityId,
+                    capabilityVersion: target.thinkingCapability.capabilityVersion,
+                    capabilityDigest: target.thinkingCapability.capabilityDigest,
+                    defaultLevelId: target.thinkingCapability.defaultLevelId,
+                    levels: target.thinkingCapability.levels.map((level) => ({
+                      id: level.id,
+                      label: level.label,
+                      effectiveLevelId: level.effectiveLevelId,
+                    })),
+                  },
+            ...(context === undefined ? {} : { context }),
+          };
+        }),
+        defaultTargetId: configuredPreferences?.defaultTargetId ?? null,
         diagnostic: preferenceDiagnostic,
+        ...(configuredPreferences === undefined
+          ? {}
+          : { configuration: { modelPolicy: configuredPreferences.modelPolicy } }),
       },
       sessions: { items: initialCatalogItems, nextCursor: catalogPage.nextCursor },
       active:
@@ -1384,6 +1458,35 @@ export async function createPresentationSession(
       await handleMetadata(event);
     }
 
+    const refreshConfiguredTargets = async (): Promise<
+      AuthoritativePresentationSnapshot["targets"]
+    > => {
+      configuredPreferences = await options.preferences?.load();
+      configuredTargetContexts = await projectConfiguredTargetContexts(configuredPreferences);
+      preferenceDiagnostic = resolvePreferenceDiagnostic(configuredPreferences);
+      return {
+        ...state.authoritative.targets,
+        items: state.authoritative.targets.items.map((target) => {
+          const context = configuredTargetContexts.get(target.targetId);
+          return context === undefined ? target : { ...target, context };
+        }),
+        defaultTargetId: configuredPreferences?.defaultTargetId ?? null,
+        diagnostic: preferenceDiagnostic,
+        ...(configuredPreferences === undefined
+          ? {}
+          : { configuration: { modelPolicy: configuredPreferences.modelPolicy } }),
+      };
+    };
+
+    const configurationMutationConflict = (): CommandReceipt | null =>
+      activeRun !== undefined || (state.authoritative.active?.pendingInteractions.length ?? 0) > 0
+        ? {
+            status: "rejected",
+            code: "conflict",
+            message: "User configuration can be changed only while the session is idle.",
+          }
+        : null;
+
     const dispatch = async (command: PresentationCommand): Promise<CommandReceipt> => {
       if (closed) {
         return {
@@ -1393,11 +1496,22 @@ export async function createPresentationSession(
         };
       }
       if (command.type === "set_default_target") {
-        const target = state.authoritative.targets.items.find(
-          (candidate) =>
-            candidate.targetId === command.targetId && candidate.readiness.status === "available",
-        );
-        if (target === undefined || options.preferences === undefined) {
+        const conflict = configurationMutationConflict();
+        if (conflict !== null) {
+          return conflict;
+        }
+        const target =
+          command.targetId === null
+            ? null
+            : state.authoritative.targets.items.find(
+                (candidate) =>
+                  candidate.targetId === command.targetId &&
+                  candidate.readiness.status === "available",
+              );
+        if (
+          (command.targetId !== null && target === undefined) ||
+          options.preferences === undefined
+        ) {
           return {
             status: "rejected",
             code: "invalid_command",
@@ -1406,15 +1520,12 @@ export async function createPresentationSession(
         }
         try {
           await options.preferences.setDefaultTarget(command.targetId);
+          const targets = await refreshConfiguredTargets();
           state = {
             revision: state.revision + 1,
             authoritative: {
               ...state.authoritative,
-              targets: {
-                ...state.authoritative.targets,
-                defaultTargetId: command.targetId,
-                diagnostic: null,
-              },
+              targets,
             },
             draft: state.draft,
             transient: state.transient,
@@ -1426,6 +1537,37 @@ export async function createPresentationSession(
             status: "rejected",
             code: "persistence_failed",
             message: "The exact default target could not be saved.",
+          };
+        }
+      }
+      if (command.type === "set_model_policy") {
+        const conflict = configurationMutationConflict();
+        if (conflict !== null) {
+          return conflict;
+        }
+        if (options.preferences === undefined) {
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "User model configuration is not available in this Presentation session.",
+          };
+        }
+        try {
+          await options.preferences.setModelPolicy({ field: command.field, value: command.value });
+          const targets = await refreshConfiguredTargets();
+          state = {
+            revision: state.revision + 1,
+            authoritative: { ...state.authoritative, targets },
+            draft: state.draft,
+            transient: state.transient,
+          };
+          publishStateChange();
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The model configuration could not be saved.",
           };
         }
       }

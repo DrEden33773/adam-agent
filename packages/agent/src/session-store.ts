@@ -117,7 +117,16 @@ export type SessionGenesisRecord = {
           readonly sourceEventPosition: number;
           readonly sourcePrefixDigest: string;
         };
-  };
+  } & (
+    | {
+        readonly recordVersion?: never;
+        readonly contextProfile?: never;
+      }
+    | {
+        readonly recordVersion: 2;
+        readonly contextProfile: ContextProfile;
+      }
+  );
 };
 
 export type SessionMcpWorkspaceConfirmedRecord = {
@@ -1456,41 +1465,47 @@ const contextEvidenceSchema: z.ZodType<ContextEvidenceV1> = z.strictObject({
     )
     .max(512),
 });
+const sessionGenesisV1RecordSchema = z.strictObject({
+  type: z.literal("session_genesis"),
+  sessionId: z.uuid(),
+  projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  targetIdentity: modelTargetIdentitySchema,
+  naming: z
+    .strictObject({
+      profileVersion: z.literal(1),
+      fallbackTitle: z
+        .string()
+        .min(1)
+        .max(1_024)
+        .refine((value) => sessionTitleFallback(value) === value),
+    })
+    .optional(),
+  promptContext: promptContextRecordSchema.optional(),
+  skillContext: skillContextRecordV1Schema.optional(),
+  lineage: z
+    .union([
+      z.strictObject({
+        parentSessionId: z.uuid(),
+        parentEventPosition: z.number().int().positive(),
+        prefixDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+      }),
+      z.strictObject({
+        recordVersion: z.literal(2),
+        parentSessionId: z.uuid(),
+        sourceSessionId: z.uuid(),
+        sourceEventPosition: z.number().int().positive(),
+        sourcePrefixDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+      }),
+    ])
+    .optional(),
+});
+const sessionGenesisV2RecordSchema = sessionGenesisV1RecordSchema.extend({
+  recordVersion: z.literal(2),
+  contextProfile: contextProfileSchema,
+});
 const sessionV3RecordSchema = z.union([
-  z.strictObject({
-    type: z.literal("session_genesis"),
-    sessionId: z.uuid(),
-    projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-    targetIdentity: modelTargetIdentitySchema,
-    naming: z
-      .strictObject({
-        profileVersion: z.literal(1),
-        fallbackTitle: z
-          .string()
-          .min(1)
-          .max(1_024)
-          .refine((value) => sessionTitleFallback(value) === value),
-      })
-      .optional(),
-    promptContext: promptContextRecordSchema.optional(),
-    skillContext: skillContextRecordV1Schema.optional(),
-    lineage: z
-      .union([
-        z.strictObject({
-          parentSessionId: z.uuid(),
-          parentEventPosition: z.number().int().positive(),
-          prefixDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-        }),
-        z.strictObject({
-          recordVersion: z.literal(2),
-          parentSessionId: z.uuid(),
-          sourceSessionId: z.uuid(),
-          sourceEventPosition: z.number().int().positive(),
-          sourcePrefixDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-        }),
-      ])
-      .optional(),
-  }),
+  sessionGenesisV1RecordSchema,
+  sessionGenesisV2RecordSchema,
   z.strictObject({
     type: z.literal("mcp_workspace_confirmed"),
     recordVersion: z.literal(1),
