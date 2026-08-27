@@ -34,6 +34,7 @@ import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/
 import { valid as validSemver } from "semver";
 import { z } from "zod";
 import type { ArtifactStore } from "./artifact-store.js";
+import { inspectMcpConfigurationDocument } from "./mcp-configuration-document.js";
 import type { JsonValue, ToolEffect, ToolRegistry, ToolResult } from "./tool-runtime.js";
 
 type Sha256Digest = `sha256:${string}`;
@@ -368,33 +369,19 @@ export async function inspectMcpConfiguration(
     throw new McpConfigurationError({ cause: error });
   }
 
-  let parsed: unknown;
+  let document: ReturnType<typeof inspectMcpConfigurationDocument>;
   try {
-    if (!isUtf8(bytes)) {
-      throw new TypeError("The MCP configuration is not valid UTF-8.");
-    }
-    parsed = parseJsonWithoutDuplicateKeys(bytes.toString("utf8"));
+    document = inspectMcpConfigurationDocument(bytes);
   } catch (error) {
     throw new McpConfigurationError({ cause: error });
   }
-  if (
-    !isRecord(parsed) ||
-    Object.keys(parsed).length !== 1 ||
-    !isRecord(parsed.mcpServers) ||
-    Object.keys(parsed.mcpServers).length > 8 ||
-    Object.entries(parsed.mcpServers).some(
-      ([serverId, value]) =>
-        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u.test(serverId) ||
-        !isRecord(value) ||
-        Object.keys(value).some((key) => !knownMcpServerConfigurationFields.has(key)),
-    )
-  ) {
+  if (document === undefined) {
     throw new McpConfigurationError();
   }
 
   const source = {
     path: ".mcp.json",
-    digest: `sha256:${createHash("sha256").update(bytes).digest("hex")}`,
+    digest: document.sourceDigest,
   } as const;
   if (confirmedSourceDigest === undefined) {
     return {
@@ -414,11 +401,13 @@ export async function inspectMcpConfiguration(
   let inspections: readonly McpServerConfigurationInspection[];
   try {
     inspections = await Promise.all(
-      Object.entries(parsed.mcpServers)
-        .sort(([left], [right]) => compareCodeUnits(left, right))
-        .map(([serverId, value]) =>
-          inspectMcpServerConfiguration({ canonicalWorkspaceRoot, serverId, value }),
-        ),
+      document.servers.map(({ serverId, configuration }) =>
+        inspectMcpServerConfiguration({
+          canonicalWorkspaceRoot,
+          serverId,
+          value: configuration,
+        }),
+      ),
     );
   } catch (error) {
     throw error instanceof McpConfigurationError
@@ -490,129 +479,6 @@ export async function inspectMcpConfiguration(
   };
 }
 
-function parseJsonWithoutDuplicateKeys(source: string): unknown {
-  let index = 0;
-  const skipWhitespace = () => {
-    while (/\s/u.test(source[index] ?? "")) {
-      index += 1;
-    }
-  };
-  const fail = (): never => {
-    throw new SyntaxError("Invalid or duplicate-key JSON.");
-  };
-  const parseString = (): string => {
-    if (source[index] !== '"') {
-      return fail();
-    }
-    const start = index;
-    index += 1;
-    while (index < source.length) {
-      const character = source[index];
-      if (character === "\\") {
-        index += 2;
-        continue;
-      }
-      index += 1;
-      if (character === '"') {
-        return JSON.parse(source.slice(start, index)) as string;
-      }
-    }
-    return fail();
-  };
-  const parseValue = (depth: number): unknown => {
-    if (depth > 128) {
-      return fail();
-    }
-    skipWhitespace();
-    const character = source[index];
-    if (character === '"') {
-      return parseString();
-    }
-    if (character === "{") {
-      index += 1;
-      skipWhitespace();
-      const entries: [string, unknown][] = [];
-      const keys = new Set<string>();
-      if (source[index] === "}") {
-        index += 1;
-        return Object.fromEntries(entries);
-      }
-      for (;;) {
-        skipWhitespace();
-        const key = parseString();
-        if (keys.has(key)) {
-          return fail();
-        }
-        keys.add(key);
-        skipWhitespace();
-        if (source[index] !== ":") {
-          return fail();
-        }
-        index += 1;
-        entries.push([key, parseValue(depth + 1)]);
-        skipWhitespace();
-        if (source[index] === "}") {
-          index += 1;
-          return Object.fromEntries(entries);
-        }
-        if (source[index] !== ",") {
-          return fail();
-        }
-        index += 1;
-      }
-    }
-    if (character === "[") {
-      index += 1;
-      skipWhitespace();
-      const values: unknown[] = [];
-      if (source[index] === "]") {
-        index += 1;
-        return values;
-      }
-      for (;;) {
-        values.push(parseValue(depth + 1));
-        skipWhitespace();
-        if (source[index] === "]") {
-          index += 1;
-          return values;
-        }
-        if (source[index] !== ",") {
-          return fail();
-        }
-        index += 1;
-      }
-    }
-    for (const [literal, value] of [
-      ["true", true],
-      ["false", false],
-      ["null", null],
-    ] as const) {
-      if (source.startsWith(literal, index)) {
-        index += literal.length;
-        return value;
-      }
-    }
-    const start = index;
-    while (/[0-9eE+.-]/u.test(source[index] ?? "")) {
-      index += 1;
-    }
-    if (index === start) {
-      return fail();
-    }
-    const number = JSON.parse(source.slice(start, index)) as unknown;
-    if (typeof number !== "number" || !Number.isFinite(number)) {
-      return fail();
-    }
-    return number;
-  };
-  const value = parseValue(0);
-  skipWhitespace();
-  if (index !== source.length) {
-    return fail();
-  }
-  return value;
-}
-
 type McpServerConfigurationInspection = {
   readonly server?: McpServerPreview;
   readonly diagnostic?: {
@@ -620,22 +486,6 @@ type McpServerConfigurationInspection = {
     readonly serverId: string;
   };
 };
-
-const knownMcpServerConfigurationFields = new Set([
-  "type",
-  "command",
-  "args",
-  "cwd",
-  "env",
-  "url",
-  "headers",
-  "oauth",
-  "socket",
-  "resources",
-  "prompts",
-  "lifecycle",
-  "credentials",
-]);
 
 const unsupportedMcpServerConfigurationFields = new Set([
   "url",

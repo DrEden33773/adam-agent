@@ -1826,6 +1826,55 @@ test("SessionLifecycle reports a remote MCP entry as inert without exposing endp
   }
 });
 
+test("SessionLifecycle orders MCP diagnostics by server ID without exposing endpoint data", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-diagnostic-order-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const endpoints = [
+    "https://zeta-secret.example.invalid/mcp",
+    "https://alpha-secret.example.invalid/mcp",
+    "https://capital-secret.example.invalid/mcp",
+  ] as const;
+  const configurationSource =
+    '{"mcpServers":{"zeta":{"type":"http","url":"https://zeta-secret.example.invalid/mcp"},"alpha":{"type":"http","url":"https://alpha-secret.example.invalid/mcp"},"Alpha":{"type":"http","url":"https://capital-secret.example.invalid/mcp"}}}';
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, ".mcp.json"), configurationSource);
+
+  try {
+    const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+      stateRoot,
+      workspaceRoot,
+    });
+    const created = await lifecycle.create({ targetIdentity });
+    if (created.mcp === undefined) {
+      throw new Error("The fixture requires an MCP configuration snapshot.");
+    }
+    const confirmed = await lifecycle.configureMcp({
+      type: "confirm_workspace",
+      sessionId: created.sessionId,
+      sourceDigest: created.mcp.source.digest,
+    });
+    const snapshot = confirmed.snapshot.mcp;
+    const serialized = JSON.stringify(snapshot);
+
+    expect(snapshot?.servers).toEqual([]);
+    expect(snapshot?.source.digest).toBe(
+      "sha256:7731e1a173155dde64a639f8da6f7b7edb9c322ee7c84c936d6216e6041564fe",
+    );
+    expect(snapshot?.diagnostics).toEqual(
+      ["Alpha", "alpha", "zeta"].map((serverId) => ({
+        code: "mcp_transport_unsupported",
+        serverId,
+      })),
+    );
+    for (const endpoint of endpoints) {
+      expect(serialized).not.toContain(endpoint);
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle keeps exact server approval separate from process launch", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-server-approval-"));
   const stateRoot = join(testRoot, "state");
