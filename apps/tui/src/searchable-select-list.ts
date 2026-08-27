@@ -15,7 +15,7 @@ export type SearchableSelectItem = {
 };
 
 export class SearchableSelectList {
-  readonly #items: readonly SearchableSelectItem[];
+  #items: readonly SearchableSelectItem[];
   readonly #maxVisible: number;
   readonly #onCancel: () => void;
   readonly #onSelect: (item: SelectItem) => void;
@@ -58,6 +58,11 @@ export class SearchableSelectList {
 
   invalidate(): void {
     this.#list.invalidate();
+  }
+
+  setItems(items: readonly SearchableSelectItem[]): void {
+    this.#items = items;
+    this.#list = this.#createList();
   }
 
   render(width: number): string[] {

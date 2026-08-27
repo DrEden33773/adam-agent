@@ -2,7 +2,7 @@
 
 import { writeSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 import {
   type ArtifactStore,
@@ -14,6 +14,7 @@ import {
   createJsonlOperationStore,
   createModelTargets,
   createPermissionPolicy,
+  createPresentationPreferences,
   createSessionLifecycle,
   ExtensionConfigurationError,
   ExtensionHostError,
@@ -34,6 +35,16 @@ import {
 import { FakeModelDriver } from "@adam-agent/testkit";
 
 const command = parseCliCommand(process.argv.slice(2));
+const { XDG_CONFIG_HOME: inheritedUserConfigurationRoot } = process.env;
+const ownerConfigurationRoot =
+  inheritedUserConfigurationRoot === undefined || inheritedUserConfigurationRoot.length === 0
+    ? join(homedir(), ".config")
+    : inheritedUserConfigurationRoot;
+const userConfigurationEnvironment: NodeJS.ProcessEnv = {
+  XDG_CONFIG_HOME: isAbsolute(ownerConfigurationRoot)
+    ? ownerConfigurationRoot
+    : resolve(ownerConfigurationRoot),
+};
 if (command.type !== "help" && command.type !== "recover_operation") {
   loadProjectEnvironment();
 }
@@ -478,6 +489,7 @@ async function createRunLifecycle(modelTargets: ModelTargets): Promise<SessionLi
   const artifactStore = createLazyFileArtifactStore(join(stateRoot, "artifacts"));
   return createSessionLifecycle({
     modelTargets,
+    preferences: createPresentationPreferences({ environment: userConfigurationEnvironment }),
     stateRoot,
     workspaceRoot,
     tools: createCodingToolRegistry({ workspaceRoot, stateRoot, artifactStore }),

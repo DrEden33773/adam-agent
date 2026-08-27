@@ -340,6 +340,166 @@ describe("one-shot CLI", () => {
     }
   });
 
+  test("applies the owner-local model policy to an ordinary one-shot admission", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-user-configuration-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const configRoot = join(testRoot, "config");
+    const configDirectory = join(configRoot, "adam-agent");
+    await mkdir(workspaceRoot);
+    await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+    await writeFile(
+      join(workspaceRoot, "README.md"),
+      "# Configured CLI\n\nPolicy applied.\n",
+      "utf8",
+    );
+    await writeFile(
+      join(configDirectory, "config.json"),
+      `${JSON.stringify({
+        schemaVersion: 2,
+        defaultTargetId: null,
+        modelPolicy: {
+          contextWindowTokens: null,
+          maximumOutputTokens: 1_234,
+          automaticCompactionWindowTokens: null,
+        },
+      })}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+
+    try {
+      const result = await runCliArguments({
+        args: ["What is this repository?"],
+        cwd: workspaceRoot,
+        environment: { XDG_CONFIG_HOME: configRoot },
+        stateRoot,
+      });
+
+      expect(result).toMatchObject({ exitCode: 0, signal: null, stderr: "" });
+      const firstLine = (await readFile(await onlySessionPath(stateRoot), "utf8")).split("\n")[0];
+      const genesis =
+        firstLine === undefined ? undefined : (JSON.parse(firstLine) as SessionRecord);
+      expect(genesis).toMatchObject({
+        schemaVersion: 3,
+        record: {
+          type: "session_genesis",
+          recordVersion: 2,
+        },
+      });
+      expect(
+        genesis?.schemaVersion === 3 && genesis.record.type === "session_genesis"
+          ? genesis.record.contextProfile
+          : undefined,
+      ).toEqual({
+        version: 1,
+        contextWindowTokens: 32_768,
+        maximumOutputTokens: 1_234,
+        compactAtTokens: 24_576,
+        postCompactTargetTokens: 8_192,
+        retainedTargetTokens: 4_096,
+        estimatorVersion: 1,
+      });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects malformed owner-local model policy before ordinary CLI session allocation", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-invalid-configuration-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const configRoot = join(testRoot, "config");
+    const configDirectory = join(configRoot, "adam-agent");
+    await mkdir(workspaceRoot);
+    await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+    await writeFile(join(configDirectory, "config.json"), '{"schemaVersion":2}\n', {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+
+    try {
+      const result = await runCliArguments({
+        args: ["Do not admit malformed configuration"],
+        cwd: workspaceRoot,
+        environment: { XDG_CONFIG_HOME: configRoot },
+        stateRoot,
+      });
+
+      expect(result).toMatchObject({
+        exitCode: 1,
+        signal: null,
+        stderr: "The user model configuration does not produce a supported context profile.\n",
+      });
+      expect(
+        (await readdir(stateRoot, { recursive: true }).catch(() => [])).some((entry) =>
+          String(entry).includes("/sessions"),
+        ),
+      ).toBe(false);
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("ignores a repository attempt to redirect the owner-local configuration root", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-repository-config-root-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const repositoryConfigRoot = join(workspaceRoot, "repository-config");
+    const repositoryConfigDirectory = join(repositoryConfigRoot, "adam-agent");
+    const userHome = join(testRoot, "home");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(repositoryConfigDirectory, { recursive: true, mode: 0o700 });
+    await mkdir(userHome, { mode: 0o700 });
+    await writeFile(
+      join(workspaceRoot, ".env"),
+      `HOME=${join(workspaceRoot, "repository-home")}\nXDG_CONFIG_HOME=${repositoryConfigRoot}\n`,
+      "utf8",
+    );
+    await writeFile(join(repositoryConfigDirectory, "config.json"), '{"schemaVersion":2}\n', {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+
+    try {
+      const result = await runCliArguments({
+        args: ["Use only inherited owner configuration."],
+        cwd: workspaceRoot,
+        environment: { HOME: userHome, XDG_CONFIG_HOME: undefined },
+        stateRoot,
+      });
+
+      expect(result).toMatchObject({ exitCode: 0, signal: null, stderr: "" });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("freezes the owner-home fallback before loading repository environment", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-repository-home-fallback-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const repositoryHome = join(workspaceRoot, "repository-home");
+    const repositoryConfigDirectory = join(repositoryHome, ".config", "adam-agent");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(repositoryConfigDirectory, { recursive: true, mode: 0o700 });
+    await writeFile(join(workspaceRoot, ".env"), `HOME=${repositoryHome}\n`, "utf8");
+    await writeFile(join(repositoryConfigDirectory, "config.json"), '{"schemaVersion":2}\n', {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+
+    try {
+      const result = await runCliArguments({
+        args: ["Use the process owner's home fallback."],
+        cwd: workspaceRoot,
+        environment: { HOME: undefined, XDG_CONFIG_HOME: undefined },
+        stateRoot,
+      });
+
+      expect(result).toMatchObject({ exitCode: 0, signal: null, stderr: "" });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
   test("prints a provider-truncated partial answer and exits unsuccessfully", async () => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-output-limit-"));
     const workspaceRoot = join(testRoot, "workspace");
@@ -1334,6 +1494,7 @@ async function onlySessionPath(stateRoot: string): Promise<string> {
 async function runCliArguments(options: {
   readonly args: readonly string[];
   readonly cwd: string;
+  readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly stateRoot: string;
 }): Promise<{
   readonly stdout: string;
@@ -1344,7 +1505,7 @@ async function runCliArguments(options: {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(process.execPath, [cliPath, ...options.args], {
       cwd: options.cwd,
-      env: cliEnvironment(options.stateRoot),
+      env: cliEnvironment(options.stateRoot, options.environment ?? {}),
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -1516,7 +1677,7 @@ async function runCli(options: {
 
 function cliEnvironment(
   stateRoot: string,
-  additional: Readonly<Record<string, string>> = {},
+  additional: Readonly<Record<string, string | undefined>> = {},
   includeDefaultTarget = true,
 ): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = { ...process.env };

@@ -4,6 +4,7 @@ export class SessionLifecycleError extends Error {
     | "session_invalid"
     | "session_model_target_incompatible"
     | "session_model_target_unavailable"
+    | "session_user_configuration_invalid"
     | "session_thinking_policy_unsupported"
     | "session_persistence_failed"
     | "session_skill_confirmation_required"
@@ -70,6 +71,8 @@ function sessionLifecycleErrorMessage(code: SessionLifecycleError["code"]): stri
       return "The requested exact model target is not compatible with this session boundary.";
     case "session_model_target_unavailable":
       return "The requested exact model target is not ready in this runtime.";
+    case "session_user_configuration_invalid":
+      return "The user model configuration does not produce a supported context profile.";
     case "session_thinking_policy_unsupported":
       return "The requested thinking level is unavailable for this exact model target.";
     case "session_persistence_failed":

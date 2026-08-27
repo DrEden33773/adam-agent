@@ -21,7 +21,7 @@ import {
   createFileArtifactStore,
   readFileArtifact,
 } from "./artifact-store.js";
-import { isContextProfileSupported } from "./context-profile.js";
+import { type ContextProfile, isContextProfileSupported } from "./context-profile.js";
 import {
   maximumModelResponseContentBytes,
   maximumReferencedModelResponseArtifactBytes,
@@ -156,6 +156,7 @@ import {
   type ToolEffect,
   type ToolRegistry,
 } from "./tool-runtime.js";
+import type { UserModelPolicyResolver } from "./user-model-policy.js";
 
 export type { McpSessionSnapshot } from "./mcp-host.js";
 export { SessionLifecycleError } from "./session-lifecycle-error.js";
@@ -253,6 +254,7 @@ export type SessionLifecycleOptions = {
   readonly extensionHost?: ExtensionHost;
   readonly modelTargets?: ModelTargets;
   readonly permissions?: PermissionPolicy;
+  readonly preferences?: UserModelPolicyResolver;
   readonly workspaceRoot: string;
   readonly stateRoot?: string;
   readonly tools?: ToolRegistry;
@@ -284,6 +286,7 @@ export type SessionContinueResult = {
 
 export type NewSessionDraftSnapshot = {
   readonly targetIdentity: ModelTargetIdentity;
+  readonly contextProfile: ContextProfile;
   readonly skillContext: SkillContextSnapshot;
 };
 
@@ -1522,9 +1525,17 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           },
         };
       }
+      const historicalProfile =
+        promptGenesis === undefined || !isGenesisRecord(promptGenesis)
+          ? undefined
+          : historicalContextProfile(
+              promptGenesis,
+              snapshot.context?.profile,
+              target.contextProfile,
+            );
       if (
-        snapshot.context !== undefined &&
-        JSON.stringify(target.contextProfile) !== JSON.stringify(snapshot.context.profile)
+        historicalProfile === undefined ||
+        !isHistoricalContextProfileSupported(target.contextProfile, historicalProfile)
       ) {
         return {
           status: "rejected",
@@ -1668,6 +1679,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         sequence: 1,
         record: {
           type: "session_genesis",
+          ...(input.resolved === undefined
+            ? {}
+            : { recordVersion: 2 as const, contextProfile: input.resolved.contextProfile }),
           sessionId,
           projectId,
           targetIdentity: input.targetIdentity,
@@ -1704,12 +1718,25 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         throw new SessionLifecycleError("session_invalid");
       }
       const created = await withOwner(async () => {
-        const resolved = await options.modelTargets?.resolve({
+        const officialResolved = await options.modelTargets?.resolve({
           targetId: input.targetIdentity.targetId,
           targetIdentity: input.targetIdentity,
           allowExperimental: input.targetIdentity.certification === "experimental",
           signal: input.signal ?? new AbortController().signal,
         });
+        let resolved = officialResolved;
+        if (officialResolved !== undefined && options.preferences !== undefined) {
+          try {
+            resolved = {
+              ...officialResolved,
+              contextProfile: await options.preferences.resolveContextProfile(
+                officialResolved.contextProfile,
+              ),
+            };
+          } catch {
+            throw new SessionLifecycleError("session_user_configuration_invalid");
+          }
+        }
         if (
           resolved === undefined ||
           !sameModelTargetIdentity(resolved.identity, input.targetIdentity) ||
@@ -1881,6 +1908,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         const parentPromptContext = promptContextRecordFromRecords(parentGenesis, parentPrefix);
         const parentSkillContext = skillContextRecordFromRecords(parentGenesis, parentPrefix);
         let targetIdentity = parent.targetIdentity;
+        let branchContextProfile: ContextProfile | undefined;
         if (input.targetId !== undefined) {
           if (options.modelTargets === undefined) {
             throw new SessionLifecycleError("session_model_target_unavailable");
@@ -1897,14 +1925,76 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           if (target.readiness.status !== "available") {
             throw new SessionLifecycleError("session_model_target_unavailable");
           }
+          targetIdentity = target.identity;
+          if (sameModelTargetIdentity(target.identity, parent.targetIdentity)) {
+            if (!isContextProfileSupported(target.contextProfile)) {
+              throw new SessionLifecycleError("session_model_target_incompatible");
+            }
+            const prefixContext = await contextSnapshotFromLineage(
+              options,
+              lineage,
+              parentGenesis,
+              parentPrefix,
+              artifactCache,
+            );
+            branchContextProfile = historicalContextProfile(
+              parentGenesis,
+              prefixContext?.profile,
+              target.contextProfile,
+            );
+            if (!isHistoricalContextProfileSupported(target.contextProfile, branchContextProfile)) {
+              throw new SessionLifecycleError("session_model_target_incompatible");
+            }
+          } else {
+            if (
+              (await modelResponseTargetsFromBranchContext(lineage, parentPrefix)).some(
+                (identity) => !areReplayProfilesCompatible(target.identity, identity),
+              )
+            ) {
+              throw new SessionLifecycleError("session_model_target_incompatible");
+            }
+            if (options.preferences === undefined) {
+              branchContextProfile = target.contextProfile;
+            } else {
+              try {
+                branchContextProfile = await options.preferences.resolveContextProfile(
+                  target.contextProfile,
+                );
+              } catch {
+                throw new SessionLifecycleError("session_user_configuration_invalid");
+              }
+            }
+          }
+        } else if (options.modelTargets !== undefined) {
+          const targets = await options.modelTargets.snapshot({
+            includeHistoricalProfiles: true,
+            signal: new AbortController().signal,
+          });
+          const target = targets.targets.find((candidate) =>
+            sameModelTargetIdentity(candidate.identity, targetIdentity),
+          );
           if (
-            (await modelResponseTargetsFromBranchContext(lineage, parentPrefix)).some(
-              (identity) => !areReplayProfilesCompatible(target.identity, identity),
-            )
+            target === undefined ||
+            target.readiness.status !== "available" ||
+            !isContextProfileSupported(target.contextProfile)
           ) {
             throw new SessionLifecycleError("session_model_target_incompatible");
           }
-          targetIdentity = target.identity;
+          const prefixContext = await contextSnapshotFromLineage(
+            options,
+            lineage,
+            parentGenesis,
+            parentPrefix,
+            artifactCache,
+          );
+          branchContextProfile = historicalContextProfile(
+            parentGenesis,
+            prefixContext?.profile,
+            target.contextProfile,
+          );
+          if (!isHistoricalContextProfileSupported(target.contextProfile, branchContextProfile)) {
+            throw new SessionLifecycleError("session_model_target_incompatible");
+          }
         }
         const sessionId = randomUUID();
         const store = await sessionStoreDirectoryFrom(options).create(sessionId);
@@ -1917,6 +2007,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           sequence: 1,
           record: {
             type: "session_genesis",
+            ...(branchContextProfile === undefined
+              ? {}
+              : { recordVersion: 2 as const, contextProfile: branchContextProfile }),
             sessionId,
             projectId: parent.projectId,
             targetIdentity,
@@ -2152,8 +2245,13 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (options.modelTargets === undefined) {
           throw new SessionLifecycleError("session_model_target_unavailable");
         }
+        let records = await readSessionRecords(options, input.sessionId);
+        const first = records[0];
+        if (first === undefined || !isGenesisRecord(first)) {
+          throw new SessionLifecycleError("session_invalid");
+        }
         const preparedAdmission = preparedAdmissionTargets.get(input.sessionId);
-        const resolved =
+        let resolved =
           preparedAdmission !== undefined && preparedAdmission.runId === input.runId
             ? preparedAdmission.resolved
             : await options.modelTargets.resolve({
@@ -2162,6 +2260,16 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                 allowExperimental: resumed.snapshot.targetIdentity.certification === "experimental",
                 signal: input.signal ?? new AbortController().signal,
               });
+        if (preparedAdmission === undefined || preparedAdmission.runId !== input.runId) {
+          resolved = {
+            ...resolved,
+            contextProfile: historicalContextProfile(
+              first,
+              resumed.snapshot.context?.profile,
+              resolved.contextProfile,
+            ),
+          };
+        }
         if (
           !sameModelTargetIdentity(resolved.identity, resumed.snapshot.targetIdentity) ||
           resolved.contextProfile.version !== resumed.snapshot.targetIdentity.profileVersion ||
@@ -2178,11 +2286,6 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             : preparedAdmission !== undefined && preparedAdmission.runId === input.runId
               ? preparedAdmission.thinkingPolicy
               : resolveRunThinkingPolicy(resolved, input.thinkingSelection);
-        let records = await readSessionRecords(options, input.sessionId);
-        const first = records[0];
-        if (first === undefined || !isGenesisRecord(first)) {
-          throw new SessionLifecycleError("session_invalid");
-        }
         const persistedPromptContext = promptContextRecordFromRecords(first, records);
         let committedMcpProfile: McpToolProfileV1 | undefined;
         if (
@@ -3360,12 +3463,20 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ) {
           throw new SessionLifecycleError("session_model_target_incompatible");
         }
+        let contextProfile = target.contextProfile;
+        if (options.preferences !== undefined) {
+          try {
+            contextProfile = await options.preferences.resolveContextProfile(target.contextProfile);
+          } catch {
+            throw new SessionLifecycleError("session_user_configuration_invalid");
+          }
+        }
         const projectId = await canonicalProjectId(options.workspaceRoot);
         const extensionSources = await resolveExtensionSkillSources(options);
         const skillContext = await createInitialSkillContextV1({
           artifactStore: createStagedArtifactStore(),
-          effectiveContextTokens: target.contextProfile.contextWindowTokens,
-          estimatorVersion: target.contextProfile.estimatorVersion,
+          effectiveContextTokens: contextProfile.contextWindowTokens,
+          estimatorVersion: contextProfile.estimatorVersion,
           projectId,
           sessionId: randomUUID(),
           userHome: homedir(),
@@ -3374,6 +3485,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         });
         return {
           targetIdentity: input.targetIdentity,
+          contextProfile,
           skillContext: skillContextSnapshot(skillContext),
         };
       });
@@ -4163,6 +4275,46 @@ function mcpProfileDefinitionRegistry(profile: McpToolProfileV1): ToolRegistry {
     definitions: () => adapters.map((adapter) => adapter.definition),
     resolve: (name) => byName.get(name),
   };
+}
+
+function historicalContextProfile(
+  genesis: SessionGenesisRecord,
+  compactedProfile: ContextProfile | undefined,
+  officialProfile: ContextProfile,
+): ContextProfile {
+  return genesis.record.recordVersion === 2
+    ? genesis.record.contextProfile
+    : (compactedProfile ?? officialProfile);
+}
+
+function isHistoricalContextProfileSupported(
+  officialProfile: ContextProfile,
+  historicalProfile: ContextProfile,
+): boolean {
+  if (
+    !isContextProfileSupported(historicalProfile) ||
+    historicalProfile.version !== officialProfile.version ||
+    historicalProfile.estimatorVersion !== officialProfile.estimatorVersion ||
+    historicalProfile.contextWindowTokens > officialProfile.contextWindowTokens ||
+    historicalProfile.maximumOutputTokens > officialProfile.maximumOutputTokens ||
+    historicalProfile.compactAtTokens > officialProfile.compactAtTokens ||
+    historicalProfile.compactAtTokens > Math.floor(historicalProfile.contextWindowTokens * 0.9) ||
+    historicalProfile.postCompactTargetTokens !== officialProfile.postCompactTargetTokens ||
+    historicalProfile.retainedTargetTokens !== officialProfile.retainedTargetTokens ||
+    historicalProfile.ordinaryOutputReserveTokens !== officialProfile.ordinaryOutputReserveTokens
+  ) {
+    return false;
+  }
+  if (officialProfile.compactionSummaryMaximumOutputTokens === undefined) {
+    return historicalProfile.compactionSummaryMaximumOutputTokens === undefined;
+  }
+  return (
+    historicalProfile.compactionSummaryMaximumOutputTokens ===
+    Math.min(
+      officialProfile.compactionSummaryMaximumOutputTokens,
+      historicalProfile.maximumOutputTokens,
+    )
+  );
 }
 
 async function contextSnapshotFromLineage(

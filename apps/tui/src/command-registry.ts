@@ -9,6 +9,7 @@ export type AdamCommandDefinition = {
   readonly id:
     | "artifacts"
     | "clone"
+    | "config"
     | "copy"
     | "diffs"
     | "extension"
@@ -204,6 +205,14 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     name: "thinking",
     summary: "Choose the exact thinking level for the next prompt.",
     usage: "/thinking [level]",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "config",
+    name: "config",
+    summary: "Inspect and tighten owner-local model limits for new sessions.",
+    usage: "/config [context|output|compaction <tokens|default>]",
   },
   {
     aliases: [],
@@ -452,7 +461,7 @@ const keybindingProjections: readonly KeybindingProjection[] = [
     action: "save_default_target",
     adamInputs: ["ctrl+s"],
     keys: "Ctrl+S",
-    description: "Save the focused exact target as the project default",
+    description: "Save the focused exact target, or clear it when already saved",
     section: "application",
   },
   {

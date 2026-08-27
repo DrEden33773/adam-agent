@@ -101,6 +101,9 @@ export {
   type PresentationPreferences,
   type PresentationPreferencesDiagnostic,
   type PresentationPreferencesSnapshot,
+  type UserModelPolicyField,
+  type UserModelPolicyResolver,
+  type UserModelPolicySnapshot,
 } from "./presentation-preferences.js";
 export {
   type CreatePresentationSessionOptions,

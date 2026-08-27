@@ -6,14 +6,17 @@ import { safeTerminalText } from "./safe-terminal-text.js";
 import { SearchableSelectList } from "./searchable-select-list.js";
 import type { AdamTuiTheme } from "./theme.js";
 
+const clearSavedDefaultValue = "\u0000adam-clear-saved-default";
+
 export class TargetPicker implements Component {
   readonly #list: SearchableSelectList;
   readonly #mode: "create" | "transition";
   readonly #onCreate: ((target: TargetDisplay) => void) | undefined;
   readonly #onFork: ((target: TargetDisplay) => void) | undefined;
-  readonly #onSaveDefault: (target: TargetDisplay) => void;
+  readonly #onSetDefault: (target: TargetDisplay | null) => void;
   readonly #targets: ReadonlyMap<string, TargetDisplay>;
   readonly #theme: AdamTuiTheme;
+  #defaultTargetId: string | null;
   #notice: string | null = null;
 
   constructor(options: {
@@ -21,12 +24,13 @@ export class TargetPicker implements Component {
     readonly theme: AdamTuiTheme;
     readonly initialNotice?: string;
     readonly currentTargetId?: string;
+    readonly defaultTargetId: string | null;
     readonly mode?: "create" | "transition";
     readonly onClose: () => void;
     readonly onCreate?: (target: TargetDisplay) => void;
     readonly onFork?: (target: TargetDisplay) => void;
     readonly onSelect: (target: TargetDisplay) => void;
-    readonly onSaveDefault: (target: TargetDisplay) => void;
+    readonly onSetDefault: (target: TargetDisplay | null) => void;
   }) {
     this.#theme = options.theme;
     this.#mode = options.mode ?? "create";
@@ -40,23 +44,18 @@ export class TargetPicker implements Component {
               `Current ${options.currentTargetId} · existing session target immutable`,
             )
         : safeTerminalText(options.initialNotice);
-    this.#onSaveDefault = options.onSaveDefault;
+    this.#defaultTargetId = options.defaultTargetId;
+    this.#onSetDefault = options.onSetDefault;
     this.#targets = new Map(options.targets.map((target) => [target.targetId, target]));
-    const items: SelectItem[] = options.targets.map((target) => ({
-      value: target.targetId,
-      label: safeTerminalText(target.targetId),
-      description: safeTerminalText(
-        `${target.label} · ${target.route} · ${target.certification} · ${target.readiness.status} (${target.readiness.credentialSource})`,
-      ),
-    }));
     this.#list = new SearchableSelectList({
-      items: items.map((item) => ({
-        item,
-        searchText: `${item.label ?? ""} ${item.description ?? ""} ${item.value}`,
-      })),
+      items: this.#items(),
       maxVisible: 8,
       onCancel: options.onClose,
       onSelect: (item) => {
+        if (item.value === clearSavedDefaultValue) {
+          this.#onSetDefault(null);
+          return;
+        }
         const target = this.#targets.get(item.value);
         if (target !== undefined) {
           options.onSelect(target);
@@ -68,6 +67,11 @@ export class TargetPicker implements Component {
 
   setNotice(notice: string): void {
     this.#notice = safeTerminalText(notice);
+  }
+
+  setDefaultTargetId(targetId: string | null): void {
+    this.#defaultTargetId = targetId;
+    this.#list.setItems(this.#items());
   }
 
   handleInput(data: string): void {
@@ -93,8 +97,8 @@ export class TargetPicker implements Component {
       if (target !== undefined) {
         this.#notice = null;
         this.#list.invalidate();
-        // Saving is deliberately distinct from SelectList's Enter action.
-        this.#onSaveDefault(target);
+        // Persisting a default is deliberately distinct from SelectList's Enter action.
+        this.#onSetDefault(target.targetId === this.#defaultTargetId ? null : target);
       }
       return;
     }
@@ -114,9 +118,43 @@ export class TargetPicker implements Component {
       "",
       this.#theme.muted(
         this.#mode === "transition"
-          ? `${adamCommandRegistry.keybinding("new_session_from_target").keys} new session · ${adamCommandRegistry.keybinding("fork_from_target").keys} fork current boundary · ${adamCommandRegistry.keybinding("save_default_target").keys} save default · type search · ↑/↓ move · Esc close · Ctrl+Q exit`
-          : `Enter create · ${adamCommandRegistry.keybinding("save_default_target").keys} save default · type search · ↑/↓ move · Esc close · Ctrl+Q exit`,
+          ? `${adamCommandRegistry.keybinding("new_session_from_target").keys} new session · ${adamCommandRegistry.keybinding("fork_from_target").keys} fork current boundary · ${adamCommandRegistry.keybinding("save_default_target").keys} save/clear default · type search · ↑/↓ move · Esc close · Ctrl+Q exit`
+          : `Enter create · ${adamCommandRegistry.keybinding("save_default_target").keys} save/clear default · type search · ↑/↓ move · Esc close · Ctrl+Q exit`,
       ),
     ];
+  }
+
+  #items(): Array<{
+    readonly item: SelectItem;
+    readonly searchText: string;
+    readonly alwaysVisible?: boolean;
+  }> {
+    const targets = [...this.#targets.values()].map((target) => {
+      const item: SelectItem = {
+        value: target.targetId,
+        label: safeTerminalText(target.targetId),
+        description: safeTerminalText(
+          `${target.label} · ${target.route} · ${target.certification} · ${target.readiness.status} (${target.readiness.credentialSource})`,
+        ),
+      };
+      return {
+        item,
+        searchText: `${item.label ?? ""} ${item.description ?? ""} ${item.value}`,
+      };
+    });
+    return this.#defaultTargetId === null
+      ? targets
+      : [
+          ...targets,
+          {
+            item: {
+              value: clearSavedDefaultValue,
+              label: "Clear saved default",
+              description: safeTerminalText(this.#defaultTargetId),
+            },
+            searchText: "",
+            alwaysVisible: true,
+          },
+        ];
   }
 }
