@@ -105,7 +105,7 @@ function helpContent(
       "",
       ...topics.map(
         (topic, index) =>
-          `${index === selectedTopicIndex ? ">" : " "} ${topic.label}  ${topic.summary}`,
+          `${index === selectedTopicIndex ? ">" : " "} ${theme.keyword(topic.label)}  ${topic.summary}`,
       ),
       "",
       theme.muted("Esc close"),

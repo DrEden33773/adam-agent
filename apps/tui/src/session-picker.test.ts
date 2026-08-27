@@ -1,4 +1,4 @@
-import { Text, TuiMainScreen, visibleWidth } from "@earendil-works/pi-tui";
+import { SelectList, Text, TuiMainScreen, visibleWidth } from "@earendil-works/pi-tui";
 import { expect, test, vi } from "vitest";
 import { McpWizard } from "./mcp-wizard.js";
 import { OverlayFrame } from "./overlay-frame.js";
@@ -37,14 +37,14 @@ test("the pinned New Session row remains a complete narrow-width selection", () 
   expect(rendered.indexOf("New Session")).toBeLessThan(rendered.indexOf("Search:"));
   const inverseStart = "\u001b[48;2;205;214;244m\u001b[38;2;17;17;27m";
   const inverseEnd = "\u001b[39m\u001b[49m";
-  const pinnedLine = lines.find((line) => line.includes("→ New Session"));
+  const pinnedLine = lines.find((line) => line.includes("> New Session"));
   expect(pinnedLine).toBeDefined();
   const pinnedStart = pinnedLine?.indexOf(inverseStart) ?? -1;
   const pinnedEnd = pinnedLine?.indexOf(inverseEnd, pinnedStart + inverseStart.length) ?? -1;
   expect(pinnedStart).toBeGreaterThanOrEqual(0);
   expect(pinnedEnd).toBeGreaterThan(pinnedStart);
   const pinnedContent = pinnedLine?.slice(pinnedStart + inverseStart.length, pinnedEnd) ?? "";
-  expect(pinnedContent).toBe(`→ New Session${" ".repeat(19)}`);
+  expect(pinnedContent).toBe(`> New Session${" ".repeat(19)}`);
   expect(visibleWidth(pinnedContent)).toBe(32);
   expect(rendered).toContain("┌");
   expect(rendered).toContain("└");
@@ -66,11 +66,30 @@ test("the pinned row keeps explicit selection semantics without color", () => {
 
   const lines = new OverlayFrame(picker, theme).render(40);
   const rendered = lines.join("\n");
-  expect(rendered).toContain("→ New Session");
+  expect(rendered).toContain("> New Session");
+  expect(rendered).not.toContain("→ New Session");
   expect(rendered).toContain("Search:");
   expect(rendered).not.toContain("\u001b[38;");
   expect(rendered).not.toContain("\u001b[48;");
   expect(lines.every((line) => visibleWidth(line) <= 40)).toBe(true);
+});
+
+test("the shared selection list uses the same ASCII marker without changing its width", () => {
+  const theme = createAdamTuiTheme(true);
+  const list = new SelectList(
+    [
+      { value: "alpha", label: "Alpha", description: "first" },
+      { value: "beta", label: "Beta", description: "second" },
+    ],
+    2,
+    theme.editor.selectList,
+  );
+
+  const lines = list.render(80);
+  expect(lines[0]).toMatch(/^> Alpha/);
+  expect(lines[0]).not.toContain("→");
+  expect(visibleWidth(lines[0] ?? "")).toBeLessThanOrEqual(80);
+  expect(lines[1]).toMatch(/^ {2}Beta/);
 });
 
 test("the framed picker composites into a synchronized 40-column terminal frame", async () => {

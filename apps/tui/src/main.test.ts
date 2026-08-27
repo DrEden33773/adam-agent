@@ -77,6 +77,124 @@ test("minimum-size mode consumes ordinary editor input while preserving safe exi
   }
 });
 
+test("/exit clears its literal input and reaches the existing TUI cleanup without submission", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-slash-exit-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  const presentationCloseMarker = join(controlRoot, "presentation-closed");
+  const terminal = new VirtualTerminal();
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  const execution = runTuiFixture({
+    clipboard: {
+      async writeText(text) {
+        await writeFile(join(controlRoot, "clipboard.txt"), text, "utf8");
+        return "copied";
+      },
+    },
+    controlRoot,
+    presentationCloseMarker,
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+  try {
+    await terminal.whenStarted();
+    terminal.input("/exit extra\r");
+    await terminal.nextOutputContaining("Usage: /exit");
+    expect(terminal.running()).toBe(true);
+    terminal.input("/exit\r");
+    const outcome = await Promise.race([
+      execution.then(() => "closed" as const),
+      terminal.nextOutputContaining("Unknown command /exit").then(
+        () => "unknown" as const,
+        () => "stopped" as const,
+      ),
+    ]);
+    expect(outcome).not.toBe("unknown");
+    await expect(execution).resolves.toBeUndefined();
+    await expect(readFile(presentationCloseMarker, "utf8")).resolves.toBe("closed\n");
+    await expect(access(join(controlRoot, "clipboard.txt"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/exit');
+    expect(terminal.lifecycle()).toEqual(["started", "stopped"]);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("/exit preserves the existing combined cleanup failure classification", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-slash-exit-failures-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  const terminal = new VirtualTerminal({ throwAfterStop: true });
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const execution = runTuiFixture({
+      clipboard: {
+        close() {
+          throw new Error("Injected clipboard close failure.");
+        },
+        writeText: async () => "copied",
+      },
+      controlRoot,
+      presentationCloseMarker: join(controlRoot, "presentation-closed"),
+      stateRoot,
+      terminal,
+      workspaceRoot,
+    });
+    await terminal.whenStarted();
+    terminal.input("/exit\r");
+    const failure = await execution.catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: "Injected terminal stop failure after restoration." }),
+      expect.objectContaining({ message: "Injected clipboard close failure." }),
+    ]);
+    await expect(readFile(join(controlRoot, "presentation-closed"), "utf8")).resolves.toBe(
+      "closed\n",
+    );
+    expect(terminal.lifecycle()).toEqual(["started", "stopped"]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("/exit remains available during a held run and closes without releasing the model", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-slash-exit-active-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Hold this run\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await fixture.waitFor("Working");
+    fixture.write("/exit\r");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(access(join(controlRoot, "release-model"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the 40, 80, and 120 column layouts expose progressively bounded footer facts", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-responsive-footer-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -469,6 +587,10 @@ function latestSynchronizedFrame(output: string): readonly string[] {
     }
   }
   return lines.map((line) => line ?? "");
+}
+
+function keywordLabel(text: string): string {
+  return `\u001b[1m\u001b[38;2;203;166;247m${text}\u001b[39m\u001b[22m`;
 }
 
 async function inputAndWaitForPhysicalFrame(
@@ -889,6 +1011,7 @@ test("the production TUI applies one exact draft policy command", async () => {
   const stateRoot = join(testRoot, "state");
   const configRoot = join(testRoot, "config");
   await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "1234-file"), "completion decoy\n", "utf8");
 
   try {
     const fixture = startFixture({
@@ -898,8 +1021,24 @@ test("the production TUI applies one exact draft policy command", async () => {
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
-    const beforeMutation = fixture.output().length;
-    fixture.write("/config output 1234\r");
+    let beforeMutation = fixture.output().length;
+    fixture.write("/config con");
+    await fixture.waitForCompleteFrameAfter("context", beforeMutation);
+    fixture.write("\t d");
+    await fixture.waitForCompleteFrameAfter("default", beforeMutation);
+    fixture.write("\t\r");
+    await fixture.waitForAfter("Saved context limit: default.", beforeMutation);
+
+    beforeMutation = fixture.output().length;
+    fixture.write("/config out");
+    await fixture.waitForCompleteFrameAfter("output", beforeMutation);
+    fixture.write("\t 1234");
+    await fixture.waitForCompleteFrameAfter("/config output 1234", beforeMutation);
+    const beforeForcedCompletion = fixture.output().length;
+    fixture.write("\t");
+    await fixture.resize(81, 24);
+    await fixture.waitForCompleteFrameAfter("/config output 1234", beforeForcedCompletion);
+    fixture.write("\r");
     await fixture.waitForAfter("Saved output limit: 1234 tokens.", beforeMutation);
     const beforePrompt = fixture.output().length;
     fixture.write("Configured TUI admission\r");
@@ -944,10 +1083,14 @@ test("the production TUI reports and grants exact owner-local workspace trust", 
     });
     await fixture.waitFor("Adam · New session");
     const beforeStatus = fixture.output().length;
-    fixture.write("/trust status\r");
+    fixture.write("/trust st");
+    await fixture.waitForCompleteFrameAfter("status", beforeStatus);
+    fixture.write("\t\r");
     await fixture.waitForAfter("Workspace trust: untrusted", beforeStatus);
     const beforeGrant = fixture.output().length;
-    fixture.write("/trust grant\r");
+    fixture.write("/trust gr");
+    await fixture.waitForCompleteFrameAfter("grant", beforeGrant);
+    fixture.write("\t\r");
     await fixture.waitForAfter("Workspace trust granted.", beforeGrant);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -1228,14 +1371,15 @@ test("the production TUI shows the project session picker before any target reso
     expect(frame).toContain("└");
     const inverseStart = "\u001b[48;2;205;214;244m\u001b[38;2;17;17;27m";
     const inverseEnd = "\u001b[39m\u001b[49m";
-    const pinnedLine = frame.split("\n").find((line) => line.includes("→ New Session"));
+    const pinnedLine = frame.split("\n").find((line) => line.includes("> New Session"));
     expect(pinnedLine).toBeDefined();
     const pinnedStart = pinnedLine?.indexOf(inverseStart) ?? -1;
     const pinnedEnd = pinnedLine?.indexOf(inverseEnd, pinnedStart + inverseStart.length) ?? -1;
     expect(pinnedStart).toBeGreaterThanOrEqual(0);
     expect(pinnedEnd).toBeGreaterThan(pinnedStart);
     const pinnedContent = pinnedLine?.slice(pinnedStart + inverseStart.length, pinnedEnd) ?? "";
-    expect(pinnedContent).toContain("→ New Session");
+    expect(pinnedContent).toContain("> New Session");
+    expect(pinnedContent).not.toContain("→ New Session");
     expect(pinnedContent).toContain("Choose an exact target");
     expect(pinnedContent.endsWith("  ")).toBe(true);
     expect(visibleWidth(pinnedContent)).toBe(60);
@@ -1389,6 +1533,7 @@ test("the real TUI opens slash Help locally without submitting it to the model",
       fixture.waitForAfter("Skill selection complete.", beforeHelp).then(() => "model" as const),
     ]);
     expectFramedOverlay(fixture.output().slice(beforeHelp), "Adam Help");
+    expect(fixture.output().slice(beforeHelp)).toContain(keywordLabel("Commands"));
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(outcome).toBe("help");
@@ -1892,8 +2037,12 @@ test("slash completion exposes Registry usage as its argument hint", async () =>
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
+    const beforeCompletion = fixture.output().length;
     fixture.write("/he");
-    await fixture.waitFor("/help [topic]");
+    await fixture.waitForAfter("/help [topic]", beforeCompletion);
+    expect(fixture.output().slice(beforeCompletion)).toContain(keywordLabel("/help"));
+    fixture.write("\t\r");
+    await fixture.waitForAfter("Adam Help", beforeCompletion);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -2271,6 +2420,7 @@ test("Tab completes a Help topic argument from the Registry", async () => {
     const beforeCompletion = fixture.output().length;
     fixture.write("/help hot");
     await fixture.waitForAfter("Fixed effective keyboard bindings", beforeCompletion);
+    expect(fixture.output().slice(beforeCompletion)).toContain(keywordLabel("hotkeys"));
     fixture.write("\t\r");
     const outcome = await Promise.race([
       fixture.waitForAfter("Effective Hotkeys", beforeCompletion).then(() => "hotkeys" as const),
@@ -2279,6 +2429,40 @@ test("Tab completes a Help topic argument from the Registry", async () => {
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(outcome).toBe("hotkeys");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("NO_COLOR keeps slash, Help-topic, and first-level Help labels plain", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-help-labels-no-color-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ noColor: true, stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    let beforeAction = fixture.output().length;
+    fixture.write("/help hot");
+    await fixture.waitForCompleteFrameAfter("Fixed effective keyboard bindings", beforeAction);
+    let frame = latestSynchronizedFrame(fixture.output().slice(beforeAction)).join("\n");
+    expect(frame).toContain("> hotkeys");
+    expect(frame).not.toContain("\u001b[38;2;");
+    expect(frame).not.toContain("\u001b[48;2;");
+    fixture.write("\t\r");
+    await fixture.waitForAfter("Effective Hotkeys", beforeAction);
+
+    beforeAction = fixture.output().length;
+    fixture.write("\u001b");
+    await fixture.waitForCompleteFrameAfter("Adam Help", beforeAction);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeAction)).join("\n");
+    expect(frame).toContain("Commands  Command names, arguments, and aliases");
+    expect(frame).toContain("> Hotkeys  Fixed effective keyboard bindings");
+    expect(frame).not.toContain("\u001b[38;2;");
+    expect(frame).not.toContain("\u001b[48;2;");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -2704,6 +2888,30 @@ test("thinking selection changed during a run applies only to the next prompt", 
   }
 });
 
+test("Tab completes a thinking level from the exact current target without model admission", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-thinking-completion-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeCompletion = fixture.output().length;
+    fixture.write("/thinking ma");
+    await fixture.waitForAfter("max", beforeCompletion);
+    fixture.write("\t\r");
+    await fixture.waitForAfter("Thinking Max selected for the next prompt.", beforeCompletion);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(access(join(controlRoot, "model-started"))).rejects.toThrow();
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("slash Thinking opens the framed exact-level selector without admitting a prompt", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-thinking-picker-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -3051,9 +3259,54 @@ test("slash completion exposes only Registry commands available during an active
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout.slice(beforeCompletion)).toContain(
+      "Exit through the authoritative TUI cleanup path.",
+    );
     expect(result.stdout.slice(beforeCompletion)).not.toContain(
       "Set, clear, or regenerate the active session name.",
     );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("active-run finite argument families stay unavailable without forced path fallthrough", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-active-argument-completion-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  for (const path of ["c-file", "g-file", "--c-file", "r-file"]) {
+    await writeFile(join(workspaceRoot, path), "completion decoy\n", "utf8");
+  }
+
+  try {
+    const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Start argument completion hold\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await fixture.waitFor("Working");
+
+    let columns = 80;
+    for (const input of ["/config c", "/trust g", "/name --c", "/instructions r", "/skills r"]) {
+      const beforeInput = fixture.output().length;
+      fixture.write(input);
+      await fixture.waitForCompleteFrameAfter(input, beforeInput);
+      const beforeTab = fixture.output().length;
+      fixture.write("\t");
+      columns += 1;
+      await fixture.resize(columns, 24);
+      await fixture.waitForCompleteFrameAfter(input, beforeTab);
+      fixture.write("z");
+      await fixture.waitForCompleteFrameAfter(`${input}z`, beforeTab);
+      fixture.write("\u0015");
+    }
+
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await fixture.waitFor("Streaming answer");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -3158,7 +3411,9 @@ test("the production editor clears a manual session name through canonical Prese
     fixture.write("/name Temporary name\r");
     await fixture.waitFor("Adam · Temporary name");
     const beforeClear = fixture.output().length;
-    fixture.write("/name --clear\r");
+    fixture.write("/name --");
+    await fixture.waitForCompleteFrameAfter("--generate", beforeClear);
+    fixture.write("\t\r");
     const outcome = await Promise.race([
       fixture.waitForAfter("Adam · New session", beforeClear).then(() => "cleared" as const),
       fixture.waitForAfter("Adam · --clear", beforeClear).then(() => "literal" as const),
@@ -3196,7 +3451,10 @@ test("the real TUI inspects and reloads repository instruction status through Pr
     ]);
     expect(outcome).toBe("status");
     await writeFile(instructionsPath, "# Rules\n\nSecond revision.\n", "utf8");
-    fixture.write("/instructions reload\r");
+    const beforeReload = fixture.output().length;
+    fixture.write("/instructions r");
+    await fixture.waitForCompleteFrameAfter("reload", beforeReload);
+    fixture.write("\t\r");
     await fixture.waitFor("Instructions r2 · scopes . · AGENTS.md · reload available");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -3510,7 +3768,10 @@ test("the real TUI reloads its Skill palette through lifecycle authority", async
       "---\nname: second\ndescription: Second procedure.\n---\nSecond body.\n",
       "utf8",
     );
-    fixture.write("/skills reload");
+    const beforeCompletion = fixture.output().length;
+    fixture.write("/skills r");
+    await fixture.waitForCompleteFrameAfter("reload", beforeCompletion);
+    fixture.write("\t");
     await fixture.waitFor("/skills reload");
     const afterTyping = fixture.output().length;
     fixture.write("\r");
