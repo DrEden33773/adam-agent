@@ -491,6 +491,116 @@ test("SessionLifecycle canonical history projections have package-internal owner
   }
 });
 
+test("MCP configuration documents have one package-internal owner", async () => {
+  const agentSourceRoot = join(productRoot, "packages", "agent", "src");
+  const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
+    .filter((entry) => entry.endsWith(".ts"))
+    .sort();
+  const sources = await Promise.all(
+    sourceFiles.map(async (sourceFile) => ({
+      path: sourceFile,
+      source: await readFile(join(agentSourceRoot, sourceFile), "utf8"),
+    })),
+  );
+  const expectedOwners = {
+    inspectMcpConfigurationDocument: ["mcp-configuration-document.ts"],
+  } as const;
+  const actualOwners = Object.fromEntries(
+    Object.keys(expectedOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) =>
+          new RegExp(`\\bexport\\s+function\\s+${symbol}\\s*\\(`, "u").test(source),
+        )
+        .map(({ path }) => path),
+    ]),
+  );
+  const expectedTypeOwners = {
+    McpConfigurationDocument: ["mcp-configuration-document.ts"],
+  } as const;
+  const actualTypeOwners = Object.fromEntries(
+    Object.keys(expectedTypeOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) => new RegExp(`\\bexport\\s+type\\s+${symbol}\\b`, "u").test(source))
+        .map(({ path }) => path),
+    ]),
+  );
+  const documentSource =
+    sources.find(({ path }) => path === "mcp-configuration-document.ts")?.source ?? "";
+  const mcpHostSource = sources.find(({ path }) => path === "mcp-host.ts")?.source ?? "";
+  const documentConsumers = sources
+    .filter(({ source }) => moduleSpecifiers(source).includes("./mcp-configuration-document.js"))
+    .map(({ path }) => path);
+  const publicFacadeSource = sources.find(({ path }) => path === "index.ts")?.source ?? "";
+  const testingFacadeSource =
+    sources.find(({ path }) => path === "internal-testing.ts")?.source ?? "";
+  const testSourceRoots = (
+    await Promise.all(
+      ["apps", "packages"].map(async (root) =>
+        (
+          await readdir(join(productRoot, root), { withFileTypes: true })
+        )
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => join(productRoot, root, entry.name, "src")),
+      ),
+    )
+  ).flat();
+  const testSources = (
+    await Promise.all(
+      testSourceRoots.map(async (sourceRoot) => {
+        try {
+          return (await readdir(sourceRoot, { recursive: true }))
+            .filter((entry) => entry.endsWith(".test.ts"))
+            .map((entry) => join(sourceRoot, entry));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return [];
+          }
+          throw error;
+        }
+      }),
+    )
+  ).flat();
+  const directTestImports = (
+    await Promise.all(
+      testSources
+        .filter((testPath) => testPath !== fileURLToPath(import.meta.url))
+        .map(async (testPath) =>
+          moduleSpecifiers(await readFile(testPath, "utf8"))
+            .filter((specifier) => /mcp-configuration-document\.js$/u.test(specifier))
+            .map((specifier) => ({
+              path: relative(productRoot, testPath),
+              specifier,
+            })),
+        ),
+    )
+  ).flat();
+
+  expect.soft(actualOwners).toEqual(expectedOwners);
+  expect.soft(actualTypeOwners).toEqual(expectedTypeOwners);
+  expect.soft(documentConsumers).toEqual(["mcp-host.ts"]);
+  expect
+    .soft(
+      runtimeModuleSpecifiers(mcpHostSource).filter(
+        (specifier) => specifier === "./mcp-configuration-document.js",
+      ),
+    )
+    .toEqual(["./mcp-configuration-document.js"]);
+  expect.soft(mcpHostSource.match(/\binspectMcpConfigurationDocument\s*\(/gu)).toHaveLength(1);
+  expect.soft(runtimeModuleSpecifiers(documentSource)).toEqual(["node:buffer", "node:crypto"]);
+  expect.soft(typeOnlyImportSpecifiers(documentSource)).toEqual([]);
+  expect.soft([...moduleSpecifiers(documentSource)].sort()).toEqual(["node:buffer", "node:crypto"]);
+  const packageInternalSymbols = ["inspectMcpConfigurationDocument", "McpConfigurationDocument"];
+  for (const facadeSource of [publicFacadeSource, testingFacadeSource]) {
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./mcp-configuration-document.js");
+    expect
+      .soft(packageInternalSymbols.filter((symbol) => facadeSource.includes(symbol)))
+      .toEqual([]);
+  }
+  expect.soft(directTestImports).toEqual([]);
+});
+
 test("PresentationSession tool projection has one package-internal owner", async () => {
   const agentSourceRoot = join(productRoot, "packages", "agent", "src");
   const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
