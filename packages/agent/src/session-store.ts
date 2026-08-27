@@ -10,7 +10,7 @@ import type { ArtifactReference, ModelResponseArtifactSource } from "./artifact-
 import type { ContextProfile } from "./context-profile.js";
 import type { ContextCallUsage, ContextEvidenceV1, ContextSummaryV1 } from "./durable-context.js";
 import { maximumInlineModelResponseFieldBytes } from "./durable-model-response-policy.js";
-import type { McpToolProfileV1 } from "./mcp-host.js";
+import type { McpToolProfileV1 } from "./mcp-profile-contracts.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import {

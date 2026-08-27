@@ -601,6 +601,181 @@ test("MCP configuration documents have one package-internal owner", async () => 
   expect.soft(directTestImports).toEqual([]);
 });
 
+test("MCP canonical identity and durable Tool Profile contracts have package-internal owners", async () => {
+  const agentSourceRoot = join(productRoot, "packages", "agent", "src");
+  const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
+    .filter((entry) => entry.endsWith(".ts"))
+    .sort();
+  const sources = await Promise.all(
+    sourceFiles.map(async (sourceFile) => ({
+      path: sourceFile,
+      source: await readFile(join(agentSourceRoot, sourceFile), "utf8"),
+    })),
+  );
+  const expectedOwners = {
+    canonicalMcpJson: ["mcp-canonical-identity.ts"],
+    createMcpToolProfileV1: ["mcp-profile-contracts.ts"],
+    digestCanonicalMcpJson: ["mcp-canonical-identity.ts"],
+    isMcpToolProfileV1Valid: ["mcp-profile-contracts.ts"],
+    mcpToolProfileSnapshot: ["mcp-profile-contracts.ts"],
+  } as const;
+  const actualOwners = Object.fromEntries(
+    Object.keys(expectedOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) =>
+          new RegExp(`\\bexport\\s+function\\s+${symbol}\\s*\\(`, "u").test(source),
+        )
+        .map(({ path }) => path),
+    ]),
+  );
+  const expectedTypeOwners = {
+    McpSha256Digest: ["mcp-canonical-identity.ts"],
+    McpSettledServerIdentity: ["mcp-profile-contracts.ts"],
+    McpToolProfileSnapshot: ["mcp-profile-contracts.ts"],
+    McpToolProfileV1: ["mcp-profile-contracts.ts"],
+  } as const;
+  const actualTypeOwners = Object.fromEntries(
+    Object.keys(expectedTypeOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) => new RegExp(`\\bexport\\s+type\\s+${symbol}\\b`, "u").test(source))
+        .map(({ path }) => path),
+    ]),
+  );
+  const canonicalSource =
+    sources.find(({ path }) => path === "mcp-canonical-identity.ts")?.source ?? "";
+  const profileSource =
+    sources.find(({ path }) => path === "mcp-profile-contracts.ts")?.source ?? "";
+  const hostSource = sources.find(({ path }) => path === "mcp-host.ts")?.source ?? "";
+  const historyValidationSource =
+    sources.find(({ path }) => path === "session-history-validation.ts")?.source ?? "";
+  const canonicalConsumers = sources
+    .filter(({ source }) => runtimeModuleSpecifiers(source).includes("./mcp-canonical-identity.js"))
+    .map(({ path }) => path);
+  const profileConsumers = sources
+    .filter(({ source }) => moduleSpecifiers(source).includes("./mcp-profile-contracts.js"))
+    .map(({ path }) => path);
+  const profileRuntimeConsumers = sources
+    .filter(({ source }) => runtimeModuleSpecifiers(source).includes("./mcp-profile-contracts.js"))
+    .map(({ path }) => path);
+  const profileCompatibilityExports = [
+    ...hostSource.matchAll(/export\s*\{([^}]*)\}\s*from\s+"\.\/mcp-profile-contracts\.js"/gu),
+  ]
+    .flatMap((match) =>
+      (match[1] ?? "")
+        .split(",")
+        .map((entry) => entry.trim().replace(/\s+/gu, " "))
+        .filter((entry) => entry.length > 0),
+    )
+    .sort();
+  const publicFacadeSource = sources.find(({ path }) => path === "index.ts")?.source ?? "";
+  const testingFacadeSource =
+    sources.find(({ path }) => path === "internal-testing.ts")?.source ?? "";
+  const testSourceRoots = (
+    await Promise.all(
+      ["apps", "packages"].map(async (root) =>
+        (
+          await readdir(join(productRoot, root), { withFileTypes: true })
+        )
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => join(productRoot, root, entry.name, "src")),
+      ),
+    )
+  ).flat();
+  const testSources = (
+    await Promise.all(
+      testSourceRoots.map(async (sourceRoot) => {
+        try {
+          return (await readdir(sourceRoot, { recursive: true }))
+            .filter((entry) => entry.endsWith(".test.ts"))
+            .map((entry) => join(sourceRoot, entry));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return [];
+          }
+          throw error;
+        }
+      }),
+    )
+  ).flat();
+  const directTestImports = (
+    await Promise.all(
+      testSources
+        .filter((testPath) => testPath !== fileURLToPath(import.meta.url))
+        .map(async (testPath) =>
+          moduleSpecifiers(await readFile(testPath, "utf8"))
+            .filter((specifier) =>
+              /mcp-(?:canonical-identity|profile-contracts)\.js$/u.test(specifier),
+            )
+            .map((specifier) => ({
+              path: relative(productRoot, testPath),
+              specifier,
+            })),
+        ),
+    )
+  ).flat();
+
+  expect.soft(actualOwners).toEqual(expectedOwners);
+  expect.soft(actualTypeOwners).toEqual(expectedTypeOwners);
+  expect.soft(canonicalConsumers).toEqual(["mcp-host.ts", "mcp-profile-contracts.ts"]);
+  expect
+    .soft(profileConsumers)
+    .toEqual([
+      "mcp-host.ts",
+      "prompt-assembly.ts",
+      "session-history-validation.ts",
+      "session-lifecycle.ts",
+      "session-store.ts",
+    ]);
+  expect.soft(profileRuntimeConsumers).toEqual(["mcp-host.ts", "session-history-validation.ts"]);
+  expect.soft(moduleSpecifiers(canonicalSource)).toEqual(["node:crypto"]);
+  expect.soft(runtimeModuleSpecifiers(canonicalSource)).toEqual(["node:crypto"]);
+  expect.soft(typeOnlyImportSpecifiers(canonicalSource)).toEqual([]);
+  expect
+    .soft([...moduleSpecifiers(profileSource)].sort())
+    .toEqual(["./mcp-canonical-identity.js", "./tool-runtime.js"]);
+  expect.soft(runtimeModuleSpecifiers(profileSource)).toEqual(["./mcp-canonical-identity.js"]);
+  expect.soft(typeOnlyImportSpecifiers(profileSource)).toEqual(["./tool-runtime.js"]);
+  expect.soft(moduleSpecifiers(historyValidationSource)).not.toContain("./mcp-host.js");
+  expect.soft(hostSource.match(/\bcreateMcpToolProfileV1\s*\(/gu)).toHaveLength(1);
+  const legacyHostProfileOwnerFragments = [
+    "maximumMcpToolProfileDefinitionBytes",
+    "profileWithoutDigest",
+    "canonicalMcpJson(modelDefinitions)",
+  ];
+  expect
+    .soft(legacyHostProfileOwnerFragments.filter((fragment) => hostSource.includes(fragment)))
+    .toEqual([]);
+  expect
+    .soft(profileCompatibilityExports)
+    .toEqual([
+      "isMcpToolProfileV1Valid",
+      "mcpToolProfileSnapshot",
+      "type McpToolProfileSnapshot",
+      "type McpToolProfileV1",
+    ]);
+  const packagePrivateSymbols = [
+    "McpSettledServerIdentity",
+    "McpSha256Digest",
+    "McpToolProfileSnapshot",
+    "McpToolProfileV1",
+    "canonicalMcpJson",
+    "createMcpToolProfileV1",
+    "digestCanonicalMcpJson",
+    "isMcpToolProfileV1Valid",
+    "mcpToolProfileSnapshot",
+  ];
+  for (const facadeSource of [publicFacadeSource, testingFacadeSource]) {
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./mcp-canonical-identity.js");
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./mcp-profile-contracts.js");
+    expect
+      .soft(packagePrivateSymbols.filter((symbol) => facadeSource.includes(symbol)))
+      .toEqual([]);
+  }
+  expect.soft(directTestImports).toEqual([]);
+});
+
 test("PresentationSession tool projection has one package-internal owner", async () => {
   const agentSourceRoot = join(productRoot, "packages", "agent", "src");
   const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
