@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,8 +6,12 @@ import { join } from "node:path";
 import { expect, test } from "vitest";
 
 import type { DeadlineScheduler } from "./exit-policy.js";
-import { createLinuxClipboardAdapter } from "./linux-clipboard.js";
-import { removeTuiFixtureRoot as rm, waitForPath } from "./tui-filesystem.test-support.js";
+import {
+  createLinuxClipboardAdapter,
+  type LinuxClipboardChild,
+  linuxClipboardSpawn,
+} from "./linux-clipboard.js";
+import { removeTuiFixtureRoot as rm } from "./tui-filesystem.test-support.js";
 
 test("the Linux clipboard adapter copies exact UTF-8 text through wl-copy", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-linux-clipboard-"));
@@ -90,13 +95,9 @@ test("the Linux clipboard adapter falls back to xsel when Wayland and xclip help
 test("the Linux clipboard adapter terminates a helper when its deadline expires", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-linux-clipboard-deadline-"));
   const helperPath = join(testRoot, "wl-copy");
-  const readyPath = join(testRoot, "helper-ready");
-  await writeFile(
-    helperPath,
-    '#!/bin/sh\n: > "$ADAM_TEST_CLIPBOARD_READY"\nwhile :; do :; done\n',
-    { mode: 0o755 },
-  );
+  await writeFile(helperPath, "#!/bin/sh\nwhile :; do :; done\n", { mode: 0o755 });
   let expire: (() => void) | undefined;
+  const spawned = Promise.withResolvers<void>();
   const scheduler: DeadlineScheduler = {
     schedule(_delayMilliseconds, onDeadline) {
       expire = onDeadline;
@@ -108,13 +109,17 @@ test("the Linux clipboard adapter terminates a helper when its deadline expires"
     const adapter = createLinuxClipboardAdapter({
       environment: {
         ...process.env,
-        ADAM_TEST_CLIPBOARD_READY: readyPath,
         PATH: testRoot,
       },
       scheduler,
+      [linuxClipboardSpawn](command, arguments_, options) {
+        const child = spawn(command, [...arguments_], options);
+        child.once("spawn", () => spawned.resolve());
+        return child as LinuxClipboardChild;
+      },
     });
     const result = adapter.writeText("bounded clipboard text");
-    await waitForPath(readyPath);
+    await spawned.promise;
     expect(expire).toBeTypeOf("function");
     expire?.();
 
