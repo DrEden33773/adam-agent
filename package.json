@@ -17,7 +17,7 @@
     "markdown:check": "markdownlint-cli2 \"**/*.md\" \"#node_modules\" \"#dist\" \"#coverage\"",
     "markdown:fix": "markdownlint-cli2 --fix \"**/*.md\" \"#node_modules\" \"#dist\" \"#coverage\"",
     "browser:check": "tsc -p packages/presentation/tsconfig.browser.json --pretty false",
-    "tui": "tsc -b --pretty false && node --env-file-if-exists=.env apps/tui/dist/main.js",
+    "tui": "tsc -b --pretty false && node apps/tui/dist/main.js",
     "quality:check": "pnpm code:check && pnpm markdown:check && pnpm typecheck && pnpm browser:check && pnpm test",
     "quality:fix": "pnpm code:fix && pnpm markdown:fix",
     "test": "tsc -b && vitest run",

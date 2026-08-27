@@ -13,12 +13,14 @@ import {
   createPresentationPreferences,
   createPresentationSession,
   createSessionLifecycle,
+  createWorkspaceTrust,
   type ModelDriver,
   ModelDriverError,
   type ModelTargetIdentity,
   type ModelTargets,
 } from "@adam-agent/agent";
 import {
+  createTrustedWorkspaceTrustForTesting,
   mcpCloseConfirmation,
   type PresentationArtifactReadBarrier,
   preparedDirectDeepSeekV2ContextProfile,
@@ -133,6 +135,7 @@ export type TuiFixtureOptions = {
     readonly configRoot?: string;
     readonly seedTargetIds?: readonly string[];
     readonly startupTargetId?: string;
+    readonly workspaceTrust?: "owner-local";
   };
   readonly presentationCloseMarker?: string;
   readonly scenario?: FixtureScenario;
@@ -194,6 +197,18 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
           : ["read"],
       askedEffects: ["write"],
     }),
+    workspaceTrust:
+      options.launch?.workspaceTrust === "owner-local"
+        ? createWorkspaceTrust({
+            environment: {
+              ...process.env,
+              ...(options.launch.configRoot === undefined
+                ? {}
+                : { XDG_CONFIG_HOME: options.launch.configRoot }),
+            },
+            workspaceRoot: options.workspaceRoot,
+          })
+        : createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
     stateRoot: options.stateRoot,
     workspaceRoot: options.workspaceRoot,
   });

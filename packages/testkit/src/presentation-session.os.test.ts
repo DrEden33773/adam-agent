@@ -5,11 +5,12 @@ import { join } from "node:path";
 import {
   type ContextProfile,
   createPresentationSession,
-  createSessionLifecycle,
+  createSessionLifecycle as createRawSessionLifecycle,
   type ModelTargetIdentity,
   type ModelTargets,
 } from "@adam-agent/agent";
 import {
+  createTrustedWorkspaceTrustForTesting,
   openJsonlSessionStore,
   type SessionRecord,
   sessionLogicalRunStartedBarrier,
@@ -35,6 +36,16 @@ const contextProfile: ContextProfile = {
   retainedTargetTokens: 20_000,
   estimatorVersion: 1,
 };
+
+function createSessionLifecycle(
+  options: Parameters<typeof createRawSessionLifecycle>[0],
+): ReturnType<typeof createRawSessionLifecycle> {
+  return createRawSessionLifecycle({
+    ...options,
+    workspaceTrust:
+      options.workspaceTrust ?? createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
+  });
+}
 
 test("PresentationSession publishes admission only after the durable logical-input record", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-durable-input-"));

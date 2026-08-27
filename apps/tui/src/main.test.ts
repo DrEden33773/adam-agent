@@ -925,6 +925,112 @@ test("the production TUI applies one exact draft policy command", async () => {
   }
 });
 
+test("the production TUI reports and grants exact owner-local workspace trust", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-draft-workspace-trust-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: {
+        configRoot,
+        startupTargetId: "deepseek-v4-flash.direct",
+        workspaceTrust: "owner-local",
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforeStatus = fixture.output().length;
+    fixture.write("/trust status\r");
+    await fixture.waitForAfter("Workspace trust: untrusted", beforeStatus);
+    const beforeGrant = fixture.output().length;
+    fixture.write("/trust grant\r");
+    await fixture.waitForAfter("Workspace trust granted.", beforeGrant);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    const document = JSON.parse(
+      await readFile(join(configRoot, "adam-agent", "workspace-trust.json"), "utf8"),
+    ) as { readonly schemaVersion: number; readonly trustedProjectIds: readonly string[] };
+    expect(document).toEqual({
+      schemaVersion: 1,
+      trustedProjectIds: [expect.stringMatching(/^sha256:[0-9a-f]{64}$/u)],
+    });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI gives copy-pastable guidance for an untrusted draft prompt", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-untrusted-prompt-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: {
+        configRoot,
+        startupTargetId: "deepseek-v4-flash.direct",
+        workspaceTrust: "owner-local",
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforePrompt = fixture.output().length;
+    fixture.write("Do not dispatch this prompt.\r");
+    await fixture.waitForAfter("adam-agent --trust-workspace", beforePrompt);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the workspace trust page defaults to cancel without writing authority", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-workspace-trust-cancel-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: {
+        configRoot,
+        startupTargetId: "deepseek-v4-flash.direct",
+        workspaceTrust: "owner-local",
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforePage = fixture.output().length;
+    fixture.write("/trust\r");
+    await fixture.waitForCompleteFrameAfter("Workspace trust", beforePage);
+    const beforeCancel = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForAfter("Workspace trust unchanged.", beforeCancel);
+    const beforeStatus = fixture.output().length;
+    fixture.write("/trust status\r");
+    await fixture.waitForAfter("Workspace trust: untrusted", beforeStatus);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(
+      access(join(configRoot, "adam-agent", "workspace-trust.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the production TUI clears draft Skill selections when the exact target changes", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-draft-target-skills-"));
   const workspaceRoot = join(testRoot, "workspace");

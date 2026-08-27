@@ -10,6 +10,7 @@ import {
 } from "@adam-agent/agent";
 import {
   createInMemorySessionStoreDirectory,
+  createTrustedWorkspaceTrustForTesting,
   type McpClientTransport,
   type McpTransportFactory,
   type ProjectLifecycleOwner,
@@ -63,6 +64,7 @@ export type ScriptedMcpServer = {
 };
 
 export type ScriptedMcpTransportFactory = McpTransportFactory & {
+  activeCount(serverId: string): number;
   disconnect(serverId: string): void;
   nextClose(serverId: string): Promise<void>;
   notifyToolsChanged(serverId: string): void;
@@ -205,6 +207,9 @@ export function createScriptedMcpTransportFactory(
       };
       return transport;
     },
+    activeCount(serverId) {
+      return active.get(serverId)?.size ?? 0;
+    },
     disconnect(serverId) {
       for (const transport of [...(active.get(serverId) ?? [])]) {
         transport.disconnect();
@@ -309,7 +314,12 @@ function scriptedMcpCall(params: unknown): {
 export function createSessionLifecycleForTesting(
   options: SessionLifecycleOptions,
 ): SessionLifecycle {
-  return createSessionLifecycle({ ...options, [sessionAutomaticTitlesEnabled]: false });
+  return createSessionLifecycle({
+    ...options,
+    workspaceTrust:
+      options.workspaceTrust ?? createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
+    [sessionAutomaticTitlesEnabled]: false,
+  });
 }
 
 export function createInMemorySessionLifecycleHarness(): {
@@ -330,6 +340,8 @@ export function createInMemorySessionLifecycleHarness(): {
       }
       return createSessionLifecycle({
         ...options,
+        workspaceTrust:
+          options.workspaceTrust ?? createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
         [sessionAutomaticTitlesEnabled]: false,
         [sessionProjectLifecycleOwner]: owner,
         [sessionStoreDirectory]: directory,

@@ -14,6 +14,7 @@ import {
   type PermissionPolicy,
   type PresentationPreferences,
   type SessionSnapshot,
+  type WorkspaceTrustController,
 } from "@adam-agent/agent";
 import type { PresentationSession } from "@adam-agent/presentation";
 import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
@@ -28,6 +29,7 @@ export type ProductionProjectRuntimeOptions = {
   readonly reservedCommandNames: readonly string[];
   readonly stateRoot: string;
   readonly workspaceRoot: string;
+  readonly workspaceTrust: WorkspaceTrustController;
 };
 
 export type ProductionProjectRuntime = {
@@ -103,6 +105,7 @@ export async function createProductionProjectRuntime(
     preferences: options.preferences,
     stateRoot: options.stateRoot,
     workspaceRoot: options.workspaceRoot,
+    workspaceTrust: options.workspaceTrust,
   });
   let presentationPromise: Promise<PresentationSession> | undefined;
   let closePromise: Promise<void> | undefined;

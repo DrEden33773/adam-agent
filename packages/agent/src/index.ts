@@ -98,12 +98,17 @@ export {
 } from "./operation-store.js";
 export {
   createPresentationPreferences,
+  createWorkspaceTrust,
   type PresentationPreferences,
   type PresentationPreferencesDiagnostic,
   type PresentationPreferencesSnapshot,
   type UserModelPolicyField,
   type UserModelPolicyResolver,
   type UserModelPolicySnapshot,
+  type WorkspaceTrustController,
+  type WorkspaceTrustDiagnostic,
+  type WorkspaceTrustMcpLease,
+  type WorkspaceTrustSnapshot,
 } from "./presentation-preferences.js";
 export {
   type CreatePresentationSessionOptions,
@@ -132,6 +137,8 @@ export {
   type SessionRuntimeNotification,
   type SessionRuntimeNotificationListener,
   type SessionSnapshot,
+  type WorkspaceTrustCommand,
+  type WorkspaceTrustConfigurationResult,
 } from "./session-lifecycle.js";
 export {
   type CanonicalRuntimeEvent,

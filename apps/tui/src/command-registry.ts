@@ -28,6 +28,7 @@ export type AdamCommandDefinition = {
     | "skills"
     | "target"
     | "thinking"
+    | "trust"
     | "tree";
   readonly name: string;
   readonly summary: string;
@@ -213,6 +214,14 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     name: "config",
     summary: "Inspect and tighten owner-local model limits for new sessions.",
     usage: "/config [context|output|compaction <tokens|default>]",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "trust",
+    name: "trust",
+    summary: "Inspect, grant, or revoke owner-local trust for this exact project.",
+    usage: "/trust [status|grant|revoke]",
   },
   {
     aliases: [],

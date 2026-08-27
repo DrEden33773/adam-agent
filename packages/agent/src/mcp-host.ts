@@ -584,6 +584,22 @@ export type McpRuntimeHost = {
       readonly servers: McpLiveSessionSnapshot["settledServers"];
     }[];
   }>;
+  closeWorkspaceSessions(): Promise<{
+    readonly status: "closed" | "mcp_shutdown_unconfirmed";
+    readonly closedSessions: readonly {
+      readonly sessionId: string;
+      readonly generationId: string;
+      readonly attempt: number;
+      readonly servers: McpLiveSessionSnapshot["settledServers"];
+    }[];
+    readonly unconfirmedSessions: readonly {
+      readonly sessionId: string;
+      readonly generationId: string;
+      readonly attempt: number;
+      readonly catalogDigest?: Sha256Digest;
+      readonly servers: McpLiveSessionSnapshot["settledServers"];
+    }[];
+  }>;
   closeSession(input: { readonly sessionId: string; readonly generationId: string }): Promise<{
     readonly status: "closed" | "mcp_shutdown_unconfirmed";
     readonly attempt: number;
@@ -636,6 +652,7 @@ export type McpRuntimeHost = {
     readonly servers: readonly McpServerPreview[];
     readonly profile: McpToolProfileV1;
   }): Promise<McpLiveSessionSnapshot>;
+  hasWorkspaceSessions(): boolean;
   snapshot(sessionId: string): McpLiveSessionSnapshot | undefined;
   toolRegistry(
     sessionId: string,
@@ -796,6 +813,82 @@ export function createMcpRuntimeHost(options: {
       throw error;
     }
   };
+  const closeOwnedGenerations = async (cause: string) => {
+    const owned = [...generations.values()];
+    for (const generation of owned) {
+      generation.cancelled = true;
+      generation.closing = true;
+      cancelledGenerations.add(generation.generationId);
+      generation.abortController.abort(new Error(cause));
+    }
+    const generationOutcomes = await Promise.all(
+      owned.map(async (generation) => {
+        const settledServers =
+          generation.live?.settledServers ?? generation.prepared?.settledServers ?? [];
+        const closeOutcomes = await Promise.allSettled(generation.slots.map(closeMcpServerSlot));
+        await generation.activation?.catch(() => undefined);
+        const confirmed = closeOutcomes.every((outcome) => outcome.status === "fulfilled");
+        return {
+          confirmed,
+          ...(confirmed && settledServers.length > 0
+            ? {
+                closedSession: {
+                  sessionId: generation.sessionId,
+                  generationId: generation.generationId,
+                  attempt: generation.attempt,
+                  servers: settledServers,
+                },
+              }
+            : {}),
+        };
+      }),
+    );
+    for (const [index, generation] of owned.entries()) {
+      if (
+        generationOutcomes[index]?.confirmed === true &&
+        generations.get(generation.sessionId) === generation
+      ) {
+        generations.delete(generation.sessionId);
+      }
+    }
+    const caches = [...packageCaches.entries()];
+    const cacheOutcomes = await Promise.allSettled(
+      caches.map(([, cache]) => removeMcpPackageCache(cache)),
+    );
+    for (const [index, [sessionId]] of caches.entries()) {
+      if (cacheOutcomes[index]?.status === "fulfilled") {
+        packageCaches.delete(sessionId);
+      }
+    }
+    const status =
+      generationOutcomes.every((outcome) => outcome.confirmed) &&
+      cacheOutcomes.every((outcome) => outcome.status === "fulfilled")
+        ? ("closed" as const)
+        : ("mcp_shutdown_unconfirmed" as const);
+    return {
+      status,
+      closedSessions: generationOutcomes.flatMap((outcome) =>
+        outcome.closedSession === undefined ? [] : [outcome.closedSession],
+      ),
+      unconfirmedSessions: generationOutcomes.flatMap((outcome, index) => {
+        const generation = owned[index];
+        if (outcome.confirmed || generation === undefined) {
+          return [];
+        }
+        const catalogDigest =
+          generation.live?.catalog.digest ?? generation.prepared?.catalog.digest;
+        return [
+          {
+            sessionId: generation.sessionId,
+            generationId: generation.generationId,
+            attempt: generation.attempt,
+            ...(catalogDigest === undefined ? {} : { catalogDigest }),
+            servers: generation.live?.settledServers ?? generation.prepared?.settledServers ?? [],
+          },
+        ];
+      }),
+    };
+  };
   return {
     activate,
     commitActivation(input) {
@@ -864,80 +957,11 @@ export function createMcpRuntimeHost(options: {
         return closePromise;
       }
       accepting = false;
-      const owned = [...generations.values()];
-      for (const generation of owned) {
-        generation.cancelled = true;
-        generation.closing = true;
-        cancelledGenerations.add(generation.generationId);
-        generation.abortController.abort(new Error("MCP runtime host is closing."));
-      }
-      closePromise = (async () => {
-        const generationOutcomes = await Promise.all(
-          owned.map(async (generation) => {
-            const settledServers =
-              generation.live?.settledServers ?? generation.prepared?.settledServers ?? [];
-            const closeOutcomes = await Promise.allSettled(
-              generation.slots.map(closeMcpServerSlot),
-            );
-            await generation.activation?.catch(() => undefined);
-            const confirmed = closeOutcomes.every((outcome) => outcome.status === "fulfilled");
-            return {
-              confirmed,
-              ...(confirmed && settledServers.length > 0
-                ? {
-                    closedSession: {
-                      sessionId: generation.sessionId,
-                      generationId: generation.generationId,
-                      attempt: generation.attempt,
-                      servers: settledServers,
-                    },
-                  }
-                : {}),
-            };
-          }),
-        );
-        for (const [index, generation] of owned.entries()) {
-          if (
-            generationOutcomes[index]?.confirmed === true &&
-            generations.get(generation.sessionId) === generation
-          ) {
-            generations.delete(generation.sessionId);
-          }
-        }
-        const cacheOutcomes = await Promise.allSettled(
-          [...packageCaches.values()].map(removeMcpPackageCache),
-        );
-        const status =
-          generationOutcomes.every((outcome) => outcome.confirmed) &&
-          cacheOutcomes.every((outcome) => outcome.status === "fulfilled")
-            ? ("closed" as const)
-            : ("mcp_shutdown_unconfirmed" as const);
-        return {
-          status,
-          closedSessions: generationOutcomes.flatMap((outcome) =>
-            outcome.closedSession === undefined ? [] : [outcome.closedSession],
-          ),
-          unconfirmedSessions: generationOutcomes.flatMap((outcome, index) => {
-            const generation = owned[index];
-            if (outcome.confirmed || generation === undefined) {
-              return [];
-            }
-            const catalogDigest =
-              generation.live?.catalog.digest ?? generation.prepared?.catalog.digest;
-            return [
-              {
-                sessionId: generation.sessionId,
-                generationId: generation.generationId,
-                attempt: generation.attempt,
-                ...(catalogDigest === undefined ? {} : { catalogDigest }),
-                servers:
-                  generation.live?.settledServers ?? generation.prepared?.settledServers ?? [],
-              },
-            ];
-          }),
-        };
-      })();
+      closePromise = closeOwnedGenerations("MCP runtime host is closing.");
       return closePromise;
+    },
+    async closeWorkspaceSessions() {
+      return closeOwnedGenerations("Workspace trust was revoked.");
     },
     async closeSession(input) {
       const generation = generations.get(input.sessionId);
@@ -1232,6 +1256,9 @@ export function createMcpRuntimeHost(options: {
       }
       generation.prepared = { ...live, profile: mcpToolProfileSnapshot(input.profile) };
       return generation.prepared;
+    },
+    hasWorkspaceSessions() {
+      return generations.size > 0;
     },
     snapshot(sessionId) {
       const generation = generations.get(sessionId);

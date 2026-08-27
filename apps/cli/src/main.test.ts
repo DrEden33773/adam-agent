@@ -6,6 +6,7 @@ import {
   open,
   readdir,
   readFile,
+  realpath,
   rm,
   stat,
   watch,
@@ -18,10 +19,15 @@ import { fileURLToPath } from "node:url";
 import {
   createCodingToolRegistry,
   createSessionLifecycle,
+  createWorkspaceTrust,
   type ModelTargetIdentity,
   type ModelToolDefinition,
 } from "@adam-agent/agent";
-import { openJsonlSessionStore, type SessionRecord } from "@adam-agent/agent/internal-testing";
+import {
+  createTrustedWorkspaceTrustForTesting,
+  openJsonlSessionStore,
+  type SessionRecord,
+} from "@adam-agent/agent/internal-testing";
 import { describe, expect, test } from "vitest";
 
 const cliPath = fileURLToPath(new URL("../dist/main.js", import.meta.url));
@@ -488,13 +494,193 @@ describe("one-shot CLI", () => {
 
     try {
       const result = await runCliArguments({
-        args: ["Use the process owner's home fallback."],
+        args: ["--workspace-trust-status"],
         cwd: workspaceRoot,
         environment: { HOME: undefined, XDG_CONFIG_HOME: undefined },
         stateRoot,
       });
 
       expect(result).toMatchObject({ exitCode: 0, signal: null, stderr: "" });
+      expect(JSON.parse(result.stdout)).toMatchObject({ status: "untrusted", diagnostic: null });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("workspace trust administration persists grant and revoke without session work", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-workspace-trust-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const configRoot = join(testRoot, "config");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(workspaceRoot);
+    const projectId = `sha256:${createHash("sha256").update(workspaceRoot).digest("hex")}`;
+    const environment = { XDG_CONFIG_HOME: configRoot };
+
+    try {
+      const statusBefore = await runCliArguments({
+        args: ["--workspace-trust-status"],
+        cwd: workspaceRoot,
+        environment,
+        stateRoot,
+      });
+      const granted = await runCliArguments({
+        args: ["--trust-workspace"],
+        cwd: workspaceRoot,
+        environment,
+        stateRoot,
+      });
+      const statusAfter = await runCliArguments({
+        args: ["--workspace-trust-status"],
+        cwd: workspaceRoot,
+        environment,
+        stateRoot,
+      });
+      const revoked = await runCliArguments({
+        args: ["--revoke-workspace-trust"],
+        cwd: workspaceRoot,
+        environment,
+        stateRoot,
+      });
+
+      expect([statusBefore, granted, statusAfter, revoked]).toEqual([
+        {
+          exitCode: 0,
+          signal: null,
+          stderr: "",
+          stdout: `${JSON.stringify({ projectId, projectLabel: "workspace", status: "untrusted", diagnostic: null })}\n`,
+        },
+        {
+          exitCode: 0,
+          signal: null,
+          stderr: "",
+          stdout: `${JSON.stringify({ projectId, projectLabel: "workspace", status: "trusted", diagnostic: null })}\n`,
+        },
+        {
+          exitCode: 0,
+          signal: null,
+          stderr: "",
+          stdout: `${JSON.stringify({ projectId, projectLabel: "workspace", status: "trusted", diagnostic: null })}\n`,
+        },
+        {
+          exitCode: 0,
+          signal: null,
+          stderr: "",
+          stdout: `${JSON.stringify({ projectId, projectLabel: "workspace", status: "untrusted", diagnostic: null })}\n`,
+        },
+      ]);
+      await expect(
+        readFile(join(configRoot, "adam-agent", "workspace-trust.json"), "utf8"),
+      ).resolves.toBe(`${JSON.stringify({ schemaVersion: 1, trustedProjectIds: [] })}\n`);
+      expect(await readdir(stateRoot, { recursive: true })).not.toEqual(
+        expect.arrayContaining([expect.stringMatching(/sessions|\.jsonl$/u)]),
+      );
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("workspace trust administration cannot revoke beneath an active MCP runtime lease", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-workspace-trust-owner-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const configRoot = join(testRoot, "config");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(workspaceRoot);
+    const trust = createWorkspaceTrust({
+      environment: { XDG_CONFIG_HOME: configRoot },
+      workspaceRoot,
+    });
+    const initial = await trust.load();
+    if (initial.projectId === null) {
+      throw new Error("The fixture requires one canonical project identity.");
+    }
+    await trust.setTrusted({ projectId: initial.projectId, trusted: true });
+    const lease = await trust.acquireMcpLease();
+
+    try {
+      const result = await runCliArguments({
+        args: ["--revoke-workspace-trust"],
+        cwd: workspaceRoot,
+        environment: { XDG_CONFIG_HOME: configRoot },
+        stateRoot,
+      });
+
+      expect(result).toMatchObject({ exitCode: 1, signal: null, stdout: "" });
+      expect(result.stderr).toContain("Another Adam MCP runtime owns this canonical project.");
+      await expect(
+        readFile(join(configRoot, "adam-agent", "workspace-trust.json"), "utf8"),
+      ).resolves.toBe(
+        `${JSON.stringify({ schemaVersion: 1, trustedProjectIds: [initial.projectId] })}\n`,
+      );
+    } finally {
+      await lease.release();
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("read-only workspace inspection remains available beside an active MCP lease", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-workspace-trust-readonly-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const configRoot = join(testRoot, "config");
+    await mkdir(workspaceRoot);
+    const environment = { XDG_CONFIG_HOME: configRoot };
+    const firstTrust = createWorkspaceTrust({ environment, workspaceRoot });
+    const first = createSessionLifecycle({
+      workspaceRoot,
+      workspaceTrust: firstTrust,
+    });
+    const second = createSessionLifecycle({
+      workspaceRoot,
+      workspaceTrust: createWorkspaceTrust({ environment, workspaceRoot }),
+    });
+
+    try {
+      const firstSnapshot = await first.inspectWorkspaceTrust();
+      if (firstSnapshot.projectId === null) {
+        throw new Error("The fixture requires one canonical project identity.");
+      }
+      await firstTrust.setTrusted({ projectId: firstSnapshot.projectId, trusted: true });
+      const lease = await firstTrust.acquireMcpLease();
+      try {
+        await expect(second.inspectWorkspaceTrust()).resolves.toEqual({
+          ...firstSnapshot,
+          status: "trusted",
+        });
+      } finally {
+        await lease.release();
+      }
+    } finally {
+      await first.close();
+      await second.close();
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("an ordinary untrusted prompt fails before project context, MCP, model, or session work", async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-cli-untrusted-prompt-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    await mkdir(workspaceRoot);
+    await writeFile(join(workspaceRoot, "AGENTS.md"), "MUST_NOT_LOAD\n", "utf8");
+    await writeFile(join(workspaceRoot, ".mcp.json"), "not json\n", "utf8");
+
+    try {
+      const result = await runCliArguments({
+        args: ["Do not dispatch this prompt."],
+        cwd: workspaceRoot,
+        stateRoot,
+        trustWorkspace: false,
+      });
+
+      expect(result).toEqual({
+        exitCode: 1,
+        signal: null,
+        stdout: "",
+        stderr:
+          "This workspace is not trusted. Run adam-agent --trust-workspace in this project, then retry.\n",
+      });
+      expect(await readdir(stateRoot, { recursive: true })).not.toEqual(
+        expect.arrayContaining([expect.stringMatching(/sessions|\.jsonl$/u)]),
+      );
     } finally {
       await rm(testRoot, { recursive: true, force: true });
     }
@@ -1117,9 +1303,12 @@ describe("session lifecycle CLI", () => {
 
     try {
       const tools = createCodingToolRegistry({ stateRoot, workspaceRoot });
-      const created = await createSessionLifecycle({ stateRoot, tools, workspaceRoot }).create({
-        targetIdentity: fakeTargetIdentity,
-      });
+      const created = await createSessionLifecycle({
+        stateRoot,
+        tools,
+        workspaceRoot,
+        workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+      }).create({ targetIdentity: fakeTargetIdentity });
       const readTool = tools.resolve("read_file");
       if (readTool === undefined) {
         throw new Error("Expected the read_file tool.");
@@ -1277,9 +1466,12 @@ describe("session lifecycle CLI", () => {
 
     try {
       const tools = createCodingToolRegistry({ stateRoot, workspaceRoot });
-      const created = await createSessionLifecycle({ stateRoot, tools, workspaceRoot }).create({
-        targetIdentity: fakeTargetIdentity,
-      });
+      const created = await createSessionLifecycle({
+        stateRoot,
+        tools,
+        workspaceRoot,
+        workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+      }).create({ targetIdentity: fakeTargetIdentity });
       const runId = "123e4567-e89b-42d3-a456-426614175000";
       const store = await openJsonlSessionStore<SessionRecord>({
         stateRoot,
@@ -1496,16 +1688,26 @@ async function runCliArguments(options: {
   readonly cwd: string;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly stateRoot: string;
+  readonly trustWorkspace?: boolean;
 }): Promise<{
   readonly stdout: string;
   readonly stderr: string;
   readonly exitCode: number | null;
   readonly signal: NodeJS.Signals | null;
 }> {
+  const environment = cliEnvironment(options.stateRoot, options.environment ?? {});
+  const workspaceTrustAdministration =
+    options.args.length === 1 &&
+    ["--workspace-trust-status", "--trust-workspace", "--revoke-workspace-trust"].includes(
+      options.args[0] ?? "",
+    );
+  if (options.trustWorkspace !== false && !workspaceTrustAdministration) {
+    await trustWorkspaceForCliTest(options.cwd, environment);
+  }
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(process.execPath, [cliPath, ...options.args], {
       cwd: options.cwd,
-      env: cliEnvironment(options.stateRoot, options.environment ?? {}),
+      env: environment,
       stdio: ["ignore", "pipe", "pipe"],
     });
     let stdout = "";
@@ -1537,9 +1739,11 @@ async function interruptCliDuringShell(options: {
 }> {
   await writeFile(options.stdinPath, "y\n", "utf8");
   const input = await open(options.stdinPath, "r");
+  const environment = cliEnvironment(options.stateRoot);
+  await trustWorkspaceForCliTest(options.cwd, environment);
   const child = spawn(process.execPath, [cliPath, "Run the long repository verification command"], {
     cwd: options.cwd,
-    env: cliEnvironment(options.stateRoot),
+    env: environment,
     stdio: [input.fd, "pipe", "pipe"],
   });
   await input.close();
@@ -1581,10 +1785,12 @@ async function interruptCliAtPermission(options: {
   readonly exitCode: number | null;
   readonly signal: NodeJS.Signals | null;
 }> {
+  const environment = cliEnvironment(options.stateRoot);
+  await trustWorkspaceForCliTest(options.cwd, environment);
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(process.execPath, [cliPath, "Run the repository verification command"], {
       cwd: options.cwd,
-      env: cliEnvironment(options.stateRoot),
+      env: environment,
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -1634,6 +1840,15 @@ async function runCli(options: {
   readonly exitCode: number | null;
   readonly signal: NodeJS.Signals | null;
 }> {
+  const environment = cliEnvironment(
+    options.stateRoot,
+    {
+      ADAM_AGENT_CLI_TEST_STDIN: options.stdin,
+      ...options.env,
+    },
+    options.omitDefaultTarget !== true,
+  );
+  await trustWorkspaceForCliTest(options.cwd, environment);
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(
       "/bin/sh",
@@ -1647,14 +1862,7 @@ async function runCli(options: {
       ],
       {
         cwd: options.cwd,
-        env: cliEnvironment(
-          options.stateRoot,
-          {
-            ADAM_AGENT_CLI_TEST_STDIN: options.stdin,
-            ...options.env,
-          },
-          options.omitDefaultTarget !== true,
-        ),
+        env: environment,
         stdio: ["ignore", "pipe", "pipe"],
       },
     );
@@ -1692,6 +1900,7 @@ function cliEnvironment(
   }
   return {
     ...environment,
+    XDG_CONFIG_HOME: join(dirname(stateRoot), "config"),
     ADAM_AGENT_STATE_ROOT: stateRoot,
     ...(includeDefaultTarget &&
     ADAM_AGENT_TARGET === undefined &&
@@ -1701,6 +1910,29 @@ function cliEnvironment(
       : {}),
     ...additional,
   };
+}
+
+async function trustWorkspaceForCliTest(
+  workspaceRoot: string,
+  environment: NodeJS.ProcessEnv,
+): Promise<void> {
+  // biome-ignore lint/complexity/useLiteralKeys: TypeScript requires indexed ProcessEnv access.
+  const configuredRoot = environment["XDG_CONFIG_HOME"];
+  // biome-ignore lint/complexity/useLiteralKeys: TypeScript requires indexed ProcessEnv access.
+  const home = environment["HOME"];
+  const configurationRoot =
+    configuredRoot === undefined || configuredRoot.length === 0
+      ? join(home === undefined || home.length === 0 ? tmpdir() : home, ".config")
+      : configuredRoot;
+  const directory = join(configurationRoot, "adam-agent");
+  const canonicalRoot = await realpath(workspaceRoot);
+  const projectId = `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}`;
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(directory, "workspace-trust.json"),
+    `${JSON.stringify({ schemaVersion: 1, trustedProjectIds: [projectId] })}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
 }
 
 async function waitForFile(path: string): Promise<void> {

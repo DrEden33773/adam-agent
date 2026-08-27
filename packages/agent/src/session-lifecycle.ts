@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -84,6 +83,14 @@ import {
   loadRepositoryInstructions,
   RepositoryInstructionsError,
 } from "./repository-instructions.js";
+import {
+  createWorkspaceTrust,
+  resolveCanonicalWorkspaceIdentity,
+  type WorkspaceTrustController,
+  type WorkspaceTrustMcpLease,
+  WorkspaceTrustMcpLeaseError,
+  type WorkspaceTrustSnapshot,
+} from "./secure-user-configuration.js";
 import {
   type AgentSessionDurableContext,
   type AgentSessionDurableOutputLimits,
@@ -250,6 +257,16 @@ export type SessionRuntimeNotificationTransform = {
   project(notification: SessionRuntimeNotification): readonly SessionRuntimeNotification[];
 };
 
+/** Tests only. Production MCP lease transitions have no observation barrier. */
+export const workspaceMcpLeaseTransitionBarrier = Symbol(
+  "adam-agent.workspace-mcp-lease-transition-barrier",
+);
+
+export type WorkspaceMcpLeaseTransitionBarrier = {
+  activationLeaseReady?(): Promise<void> | void;
+  waitingForRelease(): Promise<void> | void;
+};
+
 export type SessionLifecycleOptions = {
   readonly extensionHost?: ExtensionHost;
   readonly modelTargets?: ModelTargets;
@@ -258,6 +275,7 @@ export type SessionLifecycleOptions = {
   readonly workspaceRoot: string;
   readonly stateRoot?: string;
   readonly tools?: ToolRegistry;
+  readonly workspaceTrust?: WorkspaceTrustController;
   readonly [mcpBootstrapScheduler]?: McpBootstrapScheduler;
   readonly [mcpBeforeToolDispatchBarrier]?: McpBeforeToolDispatchBarrier;
   readonly [mcpDiscoveryScheduler]?: McpDiscoveryScheduler;
@@ -277,6 +295,7 @@ export type SessionLifecycleOptions = {
   readonly [sessionProjectLifecycleOwner]?: ProjectLifecycleOwner;
   readonly [sessionStoreDirectory]?: SessionStoreDirectory<SessionRecord>;
   readonly [sessionRuntimeNotificationTransform]?: SessionRuntimeNotificationTransform;
+  readonly [workspaceMcpLeaseTransitionBarrier]?: WorkspaceMcpLeaseTransitionBarrier;
 };
 
 export type SessionContinueResult = {
@@ -404,6 +423,16 @@ export type McpConfigurationResult = {
   readonly snapshot: CurrentSessionSnapshot;
 };
 
+export type WorkspaceTrustCommand = {
+  readonly type: "grant" | "revoke";
+  readonly projectId: string;
+};
+
+export type WorkspaceTrustConfigurationResult = {
+  readonly status: "updated";
+  readonly snapshot: WorkspaceTrustSnapshot;
+};
+
 export type McpCloseResult = {
   readonly status: "closed" | "mcp_shutdown_unconfirmed";
 };
@@ -462,11 +491,15 @@ export interface SessionLifecycle {
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
   }): Promise<SessionContinueResult>;
   configureMcp(command: McpConfigurationCommand): Promise<McpConfigurationResult>;
+  configureWorkspaceTrust(
+    command: WorkspaceTrustCommand,
+  ): Promise<WorkspaceTrustConfigurationResult>;
   create(input: { readonly targetIdentity: ModelTargetIdentity }): Promise<CurrentSessionSnapshot>;
   decidePermission(command: PermissionDecisionCommand): PermissionDecisionCommandResult;
   enableAutomaticTitles(): void;
   ensureAutomaticTitle(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
   inspect(input: { readonly sessionId: string }): Promise<SessionSnapshot>;
+  inspectWorkspaceTrust(): Promise<WorkspaceTrustSnapshot>;
   inspectContextUsage(input: {
     readonly sessionId: string;
   }): Promise<SessionContextUsageSnapshot | null>;
@@ -602,6 +635,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     });
   const options: SessionLifecycleOptions = {
     ...providedOptions,
+    workspaceTrust:
+      providedOptions.workspaceTrust ??
+      createWorkspaceTrust({
+        environment: process.env,
+        workspaceRoot: providedOptions.workspaceRoot,
+      }),
     [sessionStoreDirectory]: storeDirectory,
     tools:
       providedOptions.tools ??
@@ -630,6 +669,77 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   let lifecycleClosing = false;
   let automaticTitlesEnabled = options[sessionAutomaticTitlesEnabled] ?? true;
   let lifecycleClosePromise: Promise<McpCloseResult> | undefined;
+  let workspaceMcpLeasePromise: Promise<WorkspaceTrustMcpLease> | undefined;
+  let workspaceMcpLeaseReleasePromise: Promise<void> | undefined;
+  let workspaceMcpLeaseFenced = false;
+  let workspaceMcpActivationClaims = 0;
+  const ensureWorkspaceMcpLease = async (): Promise<void> => {
+    if (options.workspaceTrust === undefined) {
+      return;
+    }
+    for (;;) {
+      if (workspaceMcpLeaseFenced) {
+        throw new SessionLifecycleError("project_owner_unavailable");
+      }
+      const release = workspaceMcpLeaseReleasePromise;
+      if (release !== undefined) {
+        await options[workspaceMcpLeaseTransitionBarrier]?.waitingForRelease();
+        await release;
+        continue;
+      }
+      const acquisition = workspaceMcpLeasePromise ?? options.workspaceTrust.acquireMcpLease();
+      workspaceMcpLeasePromise = acquisition;
+      try {
+        await acquisition;
+      } catch (error) {
+        if (workspaceMcpLeasePromise === acquisition) {
+          workspaceMcpLeasePromise = undefined;
+        }
+        if (error instanceof WorkspaceTrustMcpLeaseError) {
+          throw new SessionLifecycleError("project_in_use");
+        }
+        throw error;
+      }
+      if (
+        workspaceMcpLeasePromise === acquisition &&
+        workspaceMcpLeaseReleasePromise === undefined
+      ) {
+        return;
+      }
+    }
+  };
+  const releaseWorkspaceMcpLease = async (): Promise<void> => {
+    if (workspaceMcpLeaseFenced) {
+      throw new SessionLifecycleError("project_owner_unavailable");
+    }
+    if (workspaceMcpLeaseReleasePromise !== undefined) {
+      return workspaceMcpLeaseReleasePromise;
+    }
+    const acquisition = workspaceMcpLeasePromise;
+    if (acquisition === undefined) {
+      return;
+    }
+    const release = (async () => {
+      const lease = await acquisition;
+      try {
+        await lease.release();
+      } catch {
+        workspaceMcpLeaseFenced = true;
+        throw new SessionLifecycleError("project_owner_unavailable");
+      }
+      if (workspaceMcpLeasePromise === acquisition) {
+        workspaceMcpLeasePromise = undefined;
+      }
+    })();
+    workspaceMcpLeaseReleasePromise = release;
+    try {
+      await release;
+    } finally {
+      if (workspaceMcpLeaseReleasePromise === release) {
+        workspaceMcpLeaseReleasePromise = undefined;
+      }
+    }
+  };
   const pendingMcpCatalogDurability = new Map<string, Promise<void>>();
   const preparedAdmissionTargets = new Map<
     string,
@@ -690,6 +800,23 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       ? {}
       : { transportFactory: options[mcpTransportFactory] }),
   });
+  const releaseWorkspaceMcpLeaseIfIdle = async (): Promise<void> => {
+    if (workspaceMcpActivationClaims === 0 && !mcpHost.hasWorkspaceSessions()) {
+      await releaseWorkspaceMcpLease();
+    }
+  };
+  const activateWithWorkspaceMcpLease = async <T>(activation: () => Promise<T>): Promise<T> => {
+    workspaceMcpActivationClaims += 1;
+    try {
+      await ensureWorkspaceMcpLease();
+      await options[workspaceMcpLeaseTransitionBarrier]?.activationLeaseReady?.();
+      await requireTrustedWorkspace();
+      return await activation();
+    } finally {
+      workspaceMcpActivationClaims -= 1;
+      await releaseWorkspaceMcpLeaseIfIdle();
+    }
+  };
   const closePreparedMcpActivation = async (input: {
     readonly sessionId: string;
     readonly generationId: string;
@@ -697,6 +824,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   }): Promise<McpHostError> => {
     try {
       const closed = await mcpHost.closePreparedActivation(input);
+      if (closed.status === "closed") {
+        await releaseWorkspaceMcpLeaseIfIdle();
+      }
       return new McpHostError(
         closed.status === "closed" ? "mcp_start_failed" : "mcp_shutdown_unconfirmed",
         { cause: input.cause, closedServers: closed.servers },
@@ -1214,6 +1344,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         }
         return;
       }
+      await releaseWorkspaceMcpLeaseIfIdle();
       for (const [index, server] of closed.servers.entries()) {
         await store.append({
           schemaVersion: 3,
@@ -1314,22 +1445,24 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         mcpCatalogStateFromLineage(lineage, first, records),
       ]);
     let mcp: McpSessionSnapshot | undefined;
-    try {
-      mcp = await inspectMcpConfiguration(
-        options.workspaceRoot,
-        mcpWorkspaceConfirmation?.sourceDigest,
-        mcpServerApprovals,
-        mcpHost.snapshot(input.sessionId),
-        mcpActivationFailureFromRecords(records),
-        mcpCommittedProfile,
-        mcpCatalogState,
-        mcpActivationFromRecords(records),
-      );
-    } catch (error) {
-      if (error instanceof McpConfigurationError) {
-        throw new SessionLifecycleError("mcp_config_invalid");
+    if ((await inspectWorkspaceTrust()).status === "trusted") {
+      try {
+        mcp = await inspectMcpConfiguration(
+          options.workspaceRoot,
+          mcpWorkspaceConfirmation?.sourceDigest,
+          mcpServerApprovals,
+          mcpHost.snapshot(input.sessionId),
+          mcpActivationFailureFromRecords(records),
+          mcpCommittedProfile,
+          mcpCatalogState,
+          mcpActivationFromRecords(records),
+        );
+      } catch (error) {
+        if (error instanceof McpConfigurationError) {
+          throw new SessionLifecycleError("mcp_config_invalid");
+        }
+        throw error;
       }
-      throw error;
     }
     return {
       ...snapshot,
@@ -1569,6 +1702,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     }
   };
 
+  const inspectWorkspaceTrust = async (): Promise<WorkspaceTrustSnapshot> => {
+    if (options.workspaceTrust !== undefined) {
+      return options.workspaceTrust.load();
+    }
+    const identity = await resolveCanonicalWorkspaceIdentity(options.workspaceRoot);
+    return { ...identity, status: "trusted", diagnostic: null };
+  };
+  const requireTrustedWorkspace = async (): Promise<void> => {
+    if ((await inspectWorkspaceTrust()).status !== "trusted") {
+      throw new SessionLifecycleError("session_workspace_untrusted");
+    }
+  };
+
   const prepareSessionCreation = async (input: {
     readonly targetIdentity: ModelTargetIdentity;
     readonly runId?: string;
@@ -1583,18 +1729,23 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     readonly selectedSkills?: readonly string[];
   }> => {
     input.signal?.throwIfAborted();
+    const workspaceTrust = await inspectWorkspaceTrust();
+    const projectInputsTrusted = workspaceTrust.status === "trusted";
     let mcp: McpSessionSnapshot | undefined;
-    try {
-      mcp = await inspectMcpConfiguration(options.workspaceRoot);
-    } catch (error) {
-      if (error instanceof McpConfigurationError) {
-        throw new SessionLifecycleError("mcp_config_invalid");
+    if (projectInputsTrusted) {
+      try {
+        mcp = await inspectMcpConfiguration(options.workspaceRoot);
+      } catch (error) {
+        if (error instanceof McpConfigurationError) {
+          throw new SessionLifecycleError("mcp_config_invalid");
+        }
+        throw error;
       }
-      throw error;
     }
     const sessionId = randomUUID();
     const projectId = await canonicalProjectId(options.workspaceRoot);
     const repository = await loadInitialRepositoryInstructions({
+      includeProjectSources: projectInputsTrusted,
       workspaceRoot: options.workspaceRoot,
     });
     const skillBudgetContext =
@@ -1614,6 +1765,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       userHome: homedir(),
       workspaceRoot: options.workspaceRoot,
       extensionSources,
+      includeProjectSources: projectInputsTrusted,
     });
     const selectedSkills: string[] = [];
     const skillManifests = new Map<string, SkillResourceManifestV1>();
@@ -1718,6 +1870,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         throw new SessionLifecycleError("session_invalid");
       }
       const created = await withOwner(async () => {
+        await requireTrustedWorkspace();
         const officialResolved = await options.modelTargets?.resolve({
           targetId: input.targetIdentity.targetId,
           targetIdentity: input.targetIdentity,
@@ -2102,6 +2255,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         mcpIdleTimers.clear();
         await Promise.allSettled(mcpIdleOperations.values());
         const hostResult = await mcpHost.close();
+        if (hostResult.status === "closed") {
+          await releaseWorkspaceMcpLeaseIfIdle();
+        }
         await Promise.allSettled(activeMcpConfigurationOperations.values());
         await drainOwnerOperations();
         await drainTitleOperations();
@@ -2196,11 +2352,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       return lifecycleClosePromise;
     },
     async create(input) {
-      return withOwner(async () =>
-        persistPreparedSession(
+      return withOwner(async () => {
+        await requireTrustedWorkspace();
+        return persistPreparedSession(
           await prepareSessionCreation({ targetIdentity: input.targetIdentity }),
-        ),
-      );
+        );
+      });
     },
     async continue(input) {
       if (input.runId !== undefined && !z.uuid().safeParse(input.runId).success) {
@@ -2209,6 +2366,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       disarmMcpIdle(input.sessionId);
       await waitForMcpIdleOperation(input.sessionId);
       const continued = await withOwner(async () => {
+        const workspaceTrusted = (await inspectWorkspaceTrust()).status === "trusted";
         const artifactCache = createArtifactMaterializationCache();
         const resumed = await resumeSession({ sessionId: input.sessionId }, artifactCache);
         if (resumed.status === "rejected") {
@@ -2297,7 +2455,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             persistedPromptContext,
           );
           committedMcpProfile = profile;
-          if (mcpHost.snapshot(input.sessionId)?.profile?.digest !== profile.digest) {
+          if (
+            workspaceTrusted &&
+            mcpHost.snapshot(input.sessionId)?.profile?.digest !== profile.digest
+          ) {
             const mcp = resumed.snapshot.mcp;
             const selectedServers = profile.servers.map((profileServer) => {
               const server = mcp?.servers.find(
@@ -2341,13 +2502,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             let activationPrepared = false;
             let readySettlementDurable = false;
             try {
-              const live = await mcpHost.reactivateToolProfile({
-                sessionId: input.sessionId,
-                generationId,
-                attempt,
-                servers: selectedServers,
-                profile,
-              });
+              const live = await activateWithWorkspaceMcpLease(() =>
+                mcpHost.reactivateToolProfile({
+                  sessionId: input.sessionId,
+                  generationId,
+                  attempt,
+                  servers: selectedServers,
+                  profile,
+                }),
+              );
               activationPrepared = true;
               await options[mcpActivationSettlementBarrier]?.beforeReadySettlement({
                 sessionId: input.sessionId,
@@ -2583,7 +2746,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                 }),
             ...(activePromptContext === undefined
               ? {}
-              : { repositoryWorkspaceRoot: options.workspaceRoot }),
+              : {
+                  repositoryWorkspaceRoot: options.workspaceRoot,
+                  authorizeProjectContextLoad: async () =>
+                    (await inspectWorkspaceTrust()).status === "trusted",
+                }),
             sessionId: resumed.snapshot.sessionId,
             ...(options[sessionLogicalRunStartedBarrier] === undefined &&
             preparedAdmission?.onAdmitted === undefined
@@ -2652,11 +2819,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                   activePromptContext?.recordVersion === 3 && activePromptContext.mcp !== undefined
                     ? combineToolRegistries(
                         options.tools,
-                        mcpHost.toolRegistry(
-                          input.sessionId,
-                          requireMcpCommittedProfile(committedMcpProfile, activePromptContext),
-                          artifactStore,
-                        ),
+                        workspaceTrusted
+                          ? mcpHost.toolRegistry(
+                              input.sessionId,
+                              requireMcpCommittedProfile(committedMcpProfile, activePromptContext),
+                              artifactStore,
+                            )
+                          : mcpProfileDefinitionRegistry(
+                              requireMcpCommittedProfile(committedMcpProfile, activePromptContext),
+                            ),
                       )
                     : options.tools,
               }),
@@ -2739,10 +2910,50 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       );
       return titleSnapshot === undefined ? continued : { ...continued, snapshot: titleSnapshot };
     },
+    async configureWorkspaceTrust(command) {
+      if (activeSession !== undefined || options.workspaceTrust === undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      if (command.type === "revoke") {
+        for (const timer of mcpIdleTimers.values()) {
+          timer.cancel();
+        }
+        mcpIdleTimers.clear();
+        await Promise.allSettled(mcpIdleOperations.values());
+        await Promise.allSettled(pendingMcpCatalogDurability.values());
+        await Promise.allSettled(activeMcpConfigurationOperations.values());
+      }
+      return withOwner(async () => {
+        const current = await inspectWorkspaceTrust();
+        if (
+          current.projectId === null ||
+          current.projectId !== command.projectId ||
+          current.diagnostic !== null
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        if (command.type === "revoke") {
+          const closed = await mcpHost.closeWorkspaceSessions();
+          if (closed.status !== "closed") {
+            throw new SessionLifecycleError("mcp_shutdown_unconfirmed");
+          }
+          await releaseWorkspaceMcpLeaseIfIdle();
+        }
+        const snapshot = await options.workspaceTrust?.setTrusted({
+          projectId: command.projectId,
+          trusted: command.type === "grant",
+        });
+        if (snapshot === undefined) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        return { status: "updated", snapshot };
+      });
+    },
     async configureMcp(command) {
       if (activeSession !== undefined) {
         throw new SessionLifecycleError("session_invalid");
       }
+      await requireTrustedWorkspace();
       await pendingMcpCatalogDurability.get(command.sessionId);
       if (command.type === "cancel_configuration") {
         const before = await inspectSession({ sessionId: command.sessionId });
@@ -2765,7 +2976,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (closed.status !== "closed") {
           throw new SessionLifecycleError("mcp_shutdown_unconfirmed");
         }
+        await releaseWorkspaceMcpLeaseIfIdle();
         return withOwner(async () => {
+          await requireTrustedWorkspace();
           const inspected = await inspectSession({ sessionId: command.sessionId });
           if (inspected.schemaVersion !== 3) {
             throw new SessionLifecycleError("session_invalid");
@@ -2801,6 +3014,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
       let ownerOperation!: Promise<McpConfigurationResult>;
       ownerOperation = withOwner(async () => {
+        await requireTrustedWorkspace();
         await flushPendingMcpCatalogChanges(command.sessionId);
         const inspected = await inspectSession({ sessionId: command.sessionId });
         if (
@@ -2936,21 +3150,22 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           let activationPrepared = false;
           let readySettlementDurable = false;
           try {
-            const live =
+            const live = await activateWithWorkspaceMcpLease(() =>
               reactivationProfile === undefined
-                ? await mcpHost.activate({
+                ? mcpHost.activate({
                     sessionId: command.sessionId,
                     generationId,
                     attempt,
                     servers: selectedServers,
                   })
-                : await mcpHost.reactivateToolProfile({
+                : mcpHost.reactivateToolProfile({
                     sessionId: command.sessionId,
                     generationId,
                     attempt,
                     servers: selectedServers,
                     profile: reactivationProfile,
-                  });
+                  }),
+            );
             activationPrepared = true;
             await options[mcpActivationSettlementBarrier]?.beforeReadySettlement({
               sessionId: command.sessionId,
@@ -3117,12 +3332,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           let activationPrepared = false;
           let readySettlementDurable = false;
           try {
-            const live = await mcpHost.activate({
-              sessionId: command.sessionId,
-              generationId,
-              attempt,
-              servers: selectedServers,
-            });
+            const live = await activateWithWorkspaceMcpLease(() =>
+              mcpHost.activate({
+                sessionId: command.sessionId,
+                generationId,
+                attempt,
+                servers: selectedServers,
+              }),
+            );
             activationPrepared = true;
             await options[mcpActivationSettlementBarrier]?.beforeReadySettlement({
               sessionId: command.sessionId,
@@ -3383,6 +3600,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       await prepareSessionInspection(input.sessionId);
       return inspectSession(input);
     },
+    async inspectWorkspaceTrust() {
+      return inspectWorkspaceTrust();
+    },
     async inspectContextUsage(input) {
       await prepareSessionInspection(input.sessionId);
       return inspectSessionContextUsage(input);
@@ -3444,6 +3664,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     },
     async previewNewSession(input) {
       return withOwner(async () => {
+        const projectInputsTrusted = (await inspectWorkspaceTrust()).status === "trusted";
         if (options.modelTargets === undefined) {
           throw new SessionLifecycleError("session_model_target_unavailable");
         }
@@ -3482,6 +3703,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           userHome: homedir(),
           workspaceRoot: options.workspaceRoot,
           extensionSources,
+          includeProjectSources: projectInputsTrusted,
         });
         return {
           targetIdentity: input.targetIdentity,
@@ -3495,6 +3717,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         throw new SessionLifecycleError("session_invalid");
       }
       return withOwner(async () => {
+        await requireTrustedWorkspace();
         const inspected = await inspectSession({ sessionId: input.sessionId });
         if (
           inspected.schemaVersion !== 3 ||
@@ -3579,6 +3802,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         throw new SessionLifecycleError("session_invalid");
       }
       return withOwner(async () => {
+        await requireTrustedWorkspace();
         const inspected = await inspectSession({ sessionId: input.sessionId });
         if (inspected.schemaVersion !== 3) {
           throw new SessionLifecycleError("session_invalid");
@@ -5509,8 +5733,7 @@ async function skillResourceBytesFromLineage(
 }
 
 async function canonicalProjectId(workspaceRoot: string): Promise<string> {
-  const canonicalRoot = await realpath(workspaceRoot);
-  return `sha256:${createHash("sha256").update(canonicalRoot).digest("hex")}`;
+  return (await resolveCanonicalWorkspaceIdentity(workspaceRoot)).projectId;
 }
 
 async function resolveSkillBudgetContext(

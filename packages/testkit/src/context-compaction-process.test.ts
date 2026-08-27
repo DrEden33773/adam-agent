@@ -11,6 +11,7 @@ import {
   type ModelTargetIdentity,
 } from "@adam-agent/agent";
 import {
+  createTrustedWorkspaceTrustForTesting,
   openJsonlSessionStore,
   type SessionContextCompactionCommittedRecord,
   type SessionContextCompactionInterruptedRecord,
@@ -548,6 +549,7 @@ async function createProcessHarness(prefix: string): Promise<{
   const created = await createSessionLifecycle({
     stateRoot,
     workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
     tools: createReadToolRegistry({ workspaceRoot }),
   }).create({ targetIdentity });
   return {
@@ -584,6 +586,7 @@ async function createSkillProcessHarness(): Promise<{
   const created = await createSessionLifecycle({
     stateRoot,
     workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
     tools: createCodingToolRegistry({ stateRoot, workspaceRoot }),
   }).create({ targetIdentity });
   return {

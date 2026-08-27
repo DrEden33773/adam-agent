@@ -6,6 +6,7 @@ import {
   createModelTargets,
   createPermissionPolicy,
   createPresentationPreferences,
+  createWorkspaceTrust,
 } from "@adam-agent/agent";
 import { expect, test } from "vitest";
 import { createProductionProjectRuntime } from "./project-runtime.js";
@@ -35,6 +36,7 @@ test("the project runtime owns only one Presentation across a concurrent close",
       reservedCommandNames: [],
       stateRoot,
       workspaceRoot,
+      workspaceTrust: createWorkspaceTrust({ environment, workspaceRoot }),
     });
 
     const presentation = runtime.createPresentation({ openProject: true });
