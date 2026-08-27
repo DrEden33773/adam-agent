@@ -706,8 +706,8 @@ test("the production TUI reviews real Git changes through the exact public Eve a
 
     let beforeResize = fixture.output().length;
     await fixture.resize(40, 24);
+    await fixture.waitForCompleteFrameAfter("Completed", beforeResize);
     await fixture.waitForCompleteFrameAfter("/artifacts inspect report", beforeResize);
-    expect(fixture.output().slice(beforeResize)).toContain("/artifacts inspect report");
     beforeResize = fixture.output().length;
     await fixture.resize(80, 24);
     await fixture.waitForCompleteFrameAfter("/artifacts inspect report", beforeResize);
@@ -727,7 +727,7 @@ test("the production TUI reviews real Git changes through the exact public Eve a
     expect(firstResult.stdout).toContain("\u001b[?25h");
 
     const resumed = startFixture({ program, stateRoot, terminalProcessMarker, workspaceRoot });
-    await resumed.waitFor("Completed");
+    await resumed.waitForCompleteFrameAfter("Completed", 0);
     const beforeRestartResize = resumed.output().length;
     await resumed.resize(120, 40);
     await resumed.waitForCompleteFrameAfter(
@@ -1412,7 +1412,7 @@ test("the real terminal positions the IME cursor on CJK and grapheme cell bounda
     for (const expectedColumn of [8, 6, 5, 3]) {
       const beforeMove = fixture.output().length;
       fixture.write("\u001b[D");
-      await fixture.waitForAfter(`\u001b[${expectedColumn}G`, beforeMove);
+      await fixture.waitForAfter(`\u001b[19;${expectedColumn}H`, beforeMove);
     }
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });

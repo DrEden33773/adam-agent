@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-
+import { AppliedViewportTerminal } from "./applied-viewport-terminal.test-support.js";
 import type { FixtureScenario } from "./fixture-scenario.js";
 import { runTuiFixture } from "./test-fixture.js";
 import { VirtualTerminal } from "./virtual-terminal.test-support.js";
@@ -20,6 +20,7 @@ export type TuiFixture = {
   readonly cleanup: () => Promise<void>;
   readonly closed: Promise<TuiFixtureResult>;
   readonly output: () => string;
+  readonly screen: () => readonly string[] | null;
   readonly resize: (columns: number, rows: number) => Promise<void>;
   readonly terminate: (signal: "SIGHUP" | "SIGKILL" | "SIGTERM") => Promise<void>;
   readonly waitFor: (text: string) => Promise<void>;
@@ -100,6 +101,7 @@ function startInProcessTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
     cleanup,
     closed,
     output: () => terminal.output(),
+    screen: () => terminal.lines(),
     resize(columns, rows) {
       const offset = terminal.output().length;
       terminal.resize(columns, rows);
@@ -174,6 +176,17 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
   child.stderr.setEncoding("utf8");
   let stdout = "";
   let stderr = "";
+  const viewport = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  let viewportPending = "";
+  let viewportPendingOffset = 0;
+  const viewportFrames: Array<{ readonly endOffset: number; readonly text: string }> = [];
+  const frameWaiters = new Set<{
+    readonly offset: number;
+    readonly text: string;
+    readonly resolve: () => void;
+    readonly reject: (error: Error) => void;
+    readonly guard: ReturnType<typeof setTimeout>;
+  }>();
   let processClosed = false;
   const processClose = Promise.withResolvers<void>();
   const outputWaiters = new Set<{
@@ -195,6 +208,25 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
         outputWaiters.delete(waiter);
         waiter.resolve();
       }
+    }
+    viewportPending += chunk;
+    const frameEndSequence = "\u001b[?2026l";
+    let frameEnd = viewportPending.indexOf(frameEndSequence);
+    while (frameEnd >= 0) {
+      const consumedLength = frameEnd + frameEndSequence.length;
+      viewport.write(viewportPending.slice(0, consumedLength));
+      viewportPending = viewportPending.slice(consumedLength);
+      viewportPendingOffset += consumedLength;
+      const frame = { endOffset: viewportPendingOffset, text: viewport.lines().join("\n") };
+      viewportFrames.push(frame);
+      for (const waiter of frameWaiters) {
+        if (frame.endOffset > waiter.offset && frame.text.includes(waiter.text)) {
+          clearTimeout(waiter.guard);
+          frameWaiters.delete(waiter);
+          waiter.resolve();
+        }
+      }
+      frameEnd = viewportPending.indexOf(frameEndSequence);
     }
   });
   child.stderr.on("data", (chunk: string) => {
@@ -280,6 +312,15 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
       );
     }
     outputWaiters.clear();
+    for (const waiter of frameWaiters) {
+      clearTimeout(waiter.guard);
+      waiter.reject(
+        new Error(
+          `The TUI process closed before displaying ${waiter.text}. screen: ${JSON.stringify(viewport.lines())}; stderr: ${JSON.stringify(stderr)}`,
+        ),
+      );
+    }
+    frameWaiters.clear();
   };
   void processResult.promise.then(settleOutputWaiters, settleOutputWaiters);
   const waitForAfter = (text: string, offset: number): Promise<void> => {
@@ -313,10 +354,42 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
       outputWaiters.add(waiter);
     });
   };
+  const waitForCompleteFrameAfter = (text: string, offset: number): Promise<void> => {
+    if (viewportFrames.some((frame) => frame.endOffset > offset && frame.text.includes(text))) {
+      return Promise.resolve();
+    }
+    if (processClosed) {
+      return Promise.reject(
+        new Error(
+          `The TUI process already closed without displaying ${text}. screen: ${JSON.stringify(viewport.lines())}; stderr: ${JSON.stringify(stderr)}`,
+        ),
+      );
+    }
+    return new Promise<void>((resolve, reject) => {
+      const waiter = {
+        offset,
+        text,
+        resolve,
+        reject,
+        guard: setTimeout(() => {
+          frameWaiters.delete(waiter);
+          reject(
+            new Error(
+              `The real TUI process did not display ${text}. screen ${viewport.columns}x${viewport.rows}: ${JSON.stringify(viewport.lines())}; stderr: ${JSON.stringify(stderr)}`,
+            ),
+          );
+          void cleanup().catch(() => undefined);
+        }, fixtureFailureMilliseconds),
+      };
+      waiter.guard.unref();
+      frameWaiters.add(waiter);
+    });
+  };
   const fixture: TuiFixture = {
     cleanup,
     closed: result,
     output: () => stdout,
+    screen: () => viewport.lines(),
     async resize(columns, rows) {
       if (input.terminalProcessMarker === undefined) {
         throw new Error("The external TUI fixture requires a terminal process marker to resize.");
@@ -325,6 +398,7 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
       if (!Number.isSafeInteger(processId) || processId <= 0) {
         throw new Error("The external TUI fixture recorded an invalid terminal process identity.");
       }
+      viewport.resize(columns, rows);
       await resizeTerminalProcess(processId, columns, rows);
     },
     async terminate(signal) {
@@ -343,11 +417,7 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
     },
     waitFor: (text) => waitForAfter(text, 0),
     waitForAfter,
-    async waitForCompleteFrameAfter(text, offset) {
-      await waitForAfter(text, offset);
-      const occurrence = stdout.indexOf(text, offset);
-      await waitForAfter("\u001b[?2026l", occurrence + text.length);
-    },
+    waitForCompleteFrameAfter,
     write: (text) => child.stdin.write(text),
   };
   trackFixture(fixture, processClose.promise);

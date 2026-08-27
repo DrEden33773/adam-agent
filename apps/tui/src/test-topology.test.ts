@@ -89,6 +89,20 @@ test("every production overlay family enters Pi through the shared Adam frame", 
   }
 });
 
+test("the production TUI owns one fixed transcript viewport instead of MainScreen scrollback", async () => {
+  const [rendererSource, viewportSource] = await Promise.all([
+    readFile(productionTuiPath, "utf8"),
+    readFile(fileURLToPath(new URL("./transcript-viewport.ts", import.meta.url)), "utf8"),
+  ]);
+
+  expect(rendererSource).toContain("new TuiAltScreen(");
+  expect(rendererSource).toContain("tui.setLayoutRoot(");
+  expect(rendererSource).toContain("new TranscriptViewport()");
+  expect(rendererSource).not.toContain("TuiMainScreen");
+  expect(viewportSource).toContain("class AnchoredScrollView extends ScrollView");
+  expect(viewportSource).toContain("disableFollow: true");
+});
+
 test("the production TUI has one app-private project runtime composition owner", async () => {
   const [productionSources, entrySource, rendererSource, cliSource] = await Promise.all([
     readProductionTuiSources(tuiSourceRoot),

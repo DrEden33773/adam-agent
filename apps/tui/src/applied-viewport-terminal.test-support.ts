@@ -120,6 +120,14 @@ export class AppliedViewportTerminal implements Terminal {
     this.#input.process(data);
   }
 
+  resize(columns: number, rows: number): void {
+    this.#columns = columns;
+    this.#rows = rows;
+    this.#row = 0;
+    this.#column = 0;
+    this.#screen = this.#createBlankScreen();
+  }
+
   lines(): readonly string[] {
     return this.#screen.map((line) => line.join("").replace(/ +$/u, ""));
   }
