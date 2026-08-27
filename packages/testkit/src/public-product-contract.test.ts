@@ -618,6 +618,107 @@ test("PresentationSession tool projection has one package-internal owner", async
   expect.soft(directTestImports).toEqual([]);
 });
 
+test("PresentationSession transcript projection has one package-internal owner", async () => {
+  const agentSourceRoot = join(productRoot, "packages", "agent", "src");
+  const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
+    .filter((entry) => entry.endsWith(".ts"))
+    .sort();
+  const sources = await Promise.all(
+    sourceFiles.map(async (sourceFile) => ({
+      path: sourceFile,
+      source: await readFile(join(agentSourceRoot, sourceFile), "utf8"),
+    })),
+  );
+  const expectedOwners = {
+    projectActiveReasoningSnapshot: ["presentation-transcript-projection.ts"],
+    projectTranscript: ["presentation-transcript-projection.ts"],
+    providerDisplayName: ["presentation-transcript-projection.ts"],
+    reasoningDisplayId: ["presentation-transcript-projection.ts"],
+  } as const;
+  const actualOwners = Object.fromEntries(
+    Object.keys(expectedOwners).map((symbol) => [
+      symbol,
+      sources
+        .filter(({ source }) => new RegExp(`\\bfunction\\s+${symbol}\\s*\\(`, "u").test(source))
+        .map(({ path }) => path),
+    ]),
+  );
+  const projectionSource =
+    sources.find(({ path }) => path === "presentation-transcript-projection.ts")?.source ?? "";
+  const projectionConsumers = sources
+    .filter(({ source }) =>
+      moduleSpecifiers(source).includes("./presentation-transcript-projection.js"),
+    )
+    .map(({ path }) => path);
+  const projectionDependencies = [...moduleSpecifiers(projectionSource)].sort();
+  const projectionRuntimeImports = runtimeModuleSpecifiers(projectionSource);
+  const projectionTypeImports = typeOnlyImportSpecifiers(projectionSource).sort();
+  const publicFacadeSource = sources.find(({ path }) => path === "index.ts")?.source ?? "";
+  const testingFacadeSource =
+    sources.find(({ path }) => path === "internal-testing.ts")?.source ?? "";
+  const testSourceRoots = (
+    await Promise.all(
+      ["apps", "packages"].map(async (root) =>
+        (
+          await readdir(join(productRoot, root), { withFileTypes: true })
+        )
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => join(productRoot, root, entry.name, "src")),
+      ),
+    )
+  ).flat();
+  const testSources = (
+    await Promise.all(
+      testSourceRoots.map(async (sourceRoot) => {
+        try {
+          return (await readdir(sourceRoot, { recursive: true }))
+            .filter((entry) => entry.endsWith(".test.ts"))
+            .map((entry) => join(sourceRoot, entry));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return [];
+          }
+          throw error;
+        }
+      }),
+    )
+  ).flat();
+  const directTestImports = (
+    await Promise.all(
+      testSources
+        .filter((testPath) => testPath !== fileURLToPath(import.meta.url))
+        .map(async (testPath) =>
+          moduleSpecifiers(await readFile(testPath, "utf8"))
+            .filter((specifier) => /presentation-transcript-projection\.js$/u.test(specifier))
+            .map((specifier) => ({
+              path: relative(productRoot, testPath),
+              specifier,
+            })),
+        ),
+    )
+  ).flat();
+
+  expect.soft(actualOwners).toEqual(expectedOwners);
+  expect.soft(projectionConsumers).toEqual(["presentation-session.ts"]);
+  expect.soft(projectionRuntimeImports).toEqual([]);
+  expect
+    .soft(projectionTypeImports)
+    .toEqual(["./agent-session-contracts.js", "./session-store.js", "@adam-agent/presentation"]);
+  expect
+    .soft(projectionDependencies)
+    .toEqual(["./agent-session-contracts.js", "./session-store.js", "@adam-agent/presentation"]);
+  const packageInternalSymbols = Object.keys(expectedOwners);
+  for (const facadeSource of [publicFacadeSource, testingFacadeSource]) {
+    expect
+      .soft(moduleSpecifiers(facadeSource))
+      .not.toContain("./presentation-transcript-projection.js");
+    expect
+      .soft(packageInternalSymbols.filter((symbol) => facadeSource.includes(symbol)))
+      .toEqual([]);
+  }
+  expect.soft(directTestImports).toEqual([]);
+});
+
 test("the runtime module detector covers every value-bearing module form", () => {
   expect(
     runtimeModuleSpecifiers(`
