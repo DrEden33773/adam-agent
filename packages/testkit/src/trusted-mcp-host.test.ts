@@ -26,8 +26,10 @@ import {
   type ModelTargetIdentity,
   type ModelTargets,
   type RuntimeEvent,
+  type ToolEffect,
 } from "@adam-agent/agent";
 import {
+  createInMemorySessionStoreDirectory,
   type McpIdleScheduler,
   mcpActivationSettlementBarrier,
   mcpBeforeToolDispatchBarrier,
@@ -41,6 +43,8 @@ import {
   mcpPackageRegistryUrl,
   mcpRequestScheduler,
   mcpTransportFactory,
+  type SessionRecord,
+  sessionStoreDirectory,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
@@ -269,6 +273,7 @@ function createManualMcpIdleScheduler(): {
 
 async function commitFixtureEchoTool(
   lifecycle: ReturnType<typeof createSessionLifecycle>,
+  effect: ToolEffect = "read",
 ): Promise<{
   readonly sessionId: string;
   readonly qualifiedName: string;
@@ -315,7 +320,7 @@ async function commitFixtureEchoTool(
       {
         qualifiedName: echo.qualifiedName,
         definitionDigest: echo.definitionDigest,
-        effect: "read",
+        effect,
       },
     ],
   });
@@ -4404,6 +4409,108 @@ test("SessionLifecycle commits one discovery-bound MCP Tool Profile before makin
   }
 });
 
+test("SessionLifecycle rejects a persisted MCP Tool Profile whose canonical schema digest is invalid", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-profile-canonical-tamper-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+
+  const {
+    harness,
+    lifecycle: initial,
+    peer: initialPeer,
+  } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
+  let corrupted: ReturnType<typeof createSessionLifecycle> | undefined;
+  try {
+    const committed = await commitFixtureEchoTool(initial);
+    const initialStore = await harness.sessions.open(committed.sessionId);
+    if (initialStore === undefined) {
+      throw new Error("The fixture requires the committed in-memory session store.");
+    }
+    const committedRecords = await initialStore.read();
+    const initialTransportClosed = initialPeer.nextClose("fixture");
+    expect(await initial.close()).toEqual({ status: "closed" });
+    await initialTransportClosed;
+
+    const corruptedDirectory = createInMemorySessionStoreDirectory<SessionRecord>();
+    const corruptedStore = await corruptedDirectory.create(committed.sessionId);
+    let corruptedProfileRecords = 0;
+    for (const entry of committedRecords) {
+      const corruptedEntry: SessionRecord =
+        entry.schemaVersion === 3 && entry.record.type === "mcp_tool_profile_committed"
+          ? {
+              ...entry,
+              record: {
+                ...entry.record,
+                profile: {
+                  ...entry.record.profile,
+                  tools: entry.record.profile.tools.map((tool, index) =>
+                    index === 0
+                      ? {
+                          ...tool,
+                          rawSchema: {
+                            ...tool.rawSchema,
+                            value: { ...tool.rawSchema.value, fixtureTamper: true },
+                          },
+                        }
+                      : tool,
+                  ),
+                },
+              },
+            }
+          : entry;
+      if (corruptedEntry !== entry) {
+        corruptedProfileRecords += 1;
+      }
+      await corruptedStore.append(corruptedEntry);
+    }
+    expect(corruptedProfileRecords).toBe(1);
+
+    let modelResolveCount = 0;
+    const modelTargets: ModelTargets = {
+      async resolve() {
+        modelResolveCount += 1;
+        throw new Error("The model must not resolve an invalid durable MCP Tool Profile.");
+      },
+      async snapshot() {
+        return {
+          targets: [
+            {
+              identity: targetIdentity,
+              readiness: { status: "available", credentialSource: "test" },
+              contextProfile,
+            },
+          ],
+        };
+      },
+    };
+    const corruptedPeer = createScriptedMcpTransportFactory({
+      fixture: ordinaryScriptedMcpServer(),
+    });
+    corrupted = createSessionLifecycle({
+      [mcpTransportFactory]: corruptedPeer,
+      [sessionStoreDirectory]: corruptedDirectory,
+      modelTargets,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    await expect(corrupted.inspect({ sessionId: committed.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+    expect(modelResolveCount).toBe(0);
+    expect(corruptedPeer.requests("fixture")).toEqual([]);
+  } finally {
+    await initial.close();
+    await corrupted?.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle commits MCP after a base-only run and exposes it only to the next run", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-after-base-run-"));
   const stateRoot = join(testRoot, "state");
@@ -5469,6 +5576,139 @@ test("SessionLifecycle rejects a child activation outside its inherited MCP appr
     });
   } finally {
     await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle binds MCP permission arguments to a canonical code-unit digest", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-canonical-arguments-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+
+  let qualifiedName: string | undefined;
+  let modelRequestCount = 0;
+  const driver = new FakeModelDriver(() => {
+    modelRequestCount += 1;
+    if (modelRequestCount === 1) {
+      return [
+        { type: "tool_call_start", id: "mcp-canonical", name: qualifiedName as string },
+        {
+          type: "tool_call_delta",
+          id: "mcp-canonical",
+          json: '{"zeta":{"Zulu":2,"alpha":1},"value":"hello","Alpha":true}',
+        },
+        { type: "tool_call_end", id: "mcp-canonical" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    return [
+      { type: "text_delta", text: "Denied canonical MCP call settled." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const { lifecycle, peer } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["execute"] }),
+      stateRoot,
+      workspaceRoot,
+    },
+    {
+      fixture: {
+        toolPages: [
+          {
+            tools: [
+              {
+                ...scriptedStringTool("echo", {
+                  type: "object",
+                  properties: {
+                    zeta: {
+                      type: "object",
+                      properties: { Zulu: { type: "number" }, alpha: { type: "number" } },
+                      required: ["Zulu", "alpha"],
+                      additionalProperties: false,
+                    },
+                    value: { type: "string" },
+                    Alpha: { type: "boolean" },
+                  },
+                  required: ["zeta", "value", "Alpha"],
+                  additionalProperties: false,
+                }),
+                description: "Echo a value.",
+              },
+            ],
+          },
+        ],
+      },
+    },
+  );
+  let resolvePermissionRequest:
+    | ((event: Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>) => void)
+    | undefined;
+  const permissionRequested = new Promise<
+    Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>
+  >((resolve) => {
+    resolvePermissionRequest = resolve;
+  });
+  lifecycle.subscribe((event) => {
+    if (event.type === "tool_permission_requested" && event.callId === "mcp-canonical") {
+      resolvePermissionRequest?.(event);
+    }
+  });
+  let transportClosed: Promise<void> | undefined;
+
+  try {
+    const committed = await commitFixtureEchoTool(lifecycle, "execute");
+    qualifiedName = committed.qualifiedName;
+    transportClosed = peer.nextClose("fixture");
+    const pendingContinue = lifecycle.continue({
+      sessionId: committed.sessionId,
+      input: { text: "Characterize canonical MCP arguments" },
+      limits: { maxTurns: 2 },
+    });
+    const permissionRequest = await permissionRequested;
+
+    expect(permissionRequest.subject).toMatchObject({
+      type: "mcp_tool",
+      argumentsDigest: "sha256:4cc12dac3291c3482baf1146911db47606ff92ea3c1576c7bec2197b190e5380",
+    });
+    expect(peer.requests("fixture").filter((request) => request.method === "tools/call")).toEqual(
+      [],
+    );
+    expect(
+      lifecycle.decidePermission({ requestId: permissionRequest.requestId, decision: "deny" }),
+    ).toEqual({ status: "accepted" });
+    await expect(pendingContinue).resolves.toMatchObject({
+      result: { status: "completed", answer: "Denied canonical MCP call settled." },
+    });
+    expect(modelRequestCount).toBe(2);
+    expect(peer.requests("fixture").filter((request) => request.method === "tools/call")).toEqual(
+      [],
+    );
+  } finally {
+    const closed = await lifecycle.close();
+    if (transportClosed !== undefined) {
+      await transportClosed;
+    }
+    expect(closed).toEqual({ status: "closed" });
     await rm(testRoot, { recursive: true, force: true });
   }
 });

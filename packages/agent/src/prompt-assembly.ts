@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { z } from "zod";
 import type { ModelMessage } from "./agent-session-contracts.js";
 import type { ContextProfile } from "./context-profile.js";
-import type { McpToolProfileV1 } from "./mcp-host.js";
+import type { McpToolProfileV1 } from "./mcp-profile-contracts.js";
 import type { SkillContextRecordV1 } from "./skills.js";
 import type { ModelToolDefinition, ToolRegistry } from "./tool-runtime.js";
 

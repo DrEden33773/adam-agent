@@ -43,7 +43,6 @@ import {
   type McpIdleScheduler,
   type McpRequestScheduler,
   type McpSessionSnapshot,
-  type McpToolProfileV1,
   type McpTransportFactory,
   mcpBeforeToolDispatchBarrier,
   mcpBootstrapScheduler,
@@ -56,6 +55,7 @@ import {
   mcpRequestScheduler,
   mcpTransportFactory,
 } from "./mcp-host.js";
+import type { McpToolProfileV1 } from "./mcp-profile-contracts.js";
 import {
   type ModelTargetIdentity,
   type ModelTargets,

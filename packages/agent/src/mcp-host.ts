@@ -34,10 +34,30 @@ import { AjvJsonSchemaValidator } from "@modelcontextprotocol/client/validators/
 import { valid as validSemver } from "semver";
 import { z } from "zod";
 import type { ArtifactStore } from "./artifact-store.js";
+import {
+  canonicalMcpJson,
+  digestCanonicalMcpJson,
+  type McpSha256Digest,
+} from "./mcp-canonical-identity.js";
 import { inspectMcpConfigurationDocument } from "./mcp-configuration-document.js";
+import {
+  createMcpToolProfileV1,
+  isMcpToolProfileV1Valid,
+  type McpSettledServerIdentity,
+  type McpToolProfileSnapshot,
+  type McpToolProfileV1,
+  mcpToolProfileSnapshot,
+} from "./mcp-profile-contracts.js";
 import type { JsonValue, ToolEffect, ToolRegistry, ToolResult } from "./tool-runtime.js";
 
-type Sha256Digest = `sha256:${string}`;
+export {
+  isMcpToolProfileV1Valid,
+  type McpToolProfileSnapshot,
+  type McpToolProfileV1,
+  mcpToolProfileSnapshot,
+} from "./mcp-profile-contracts.js";
+
+type Sha256Digest = McpSha256Digest;
 type McpJsonRecord = Readonly<Record<string, unknown>> & {
   readonly $anchor?: unknown;
   readonly $dynamicAnchor?: unknown;
@@ -71,8 +91,6 @@ type McpActivationErrorCode =
   | "mcp_shutdown_unconfirmed"
   | "mcp_start_failed"
   | "mcp_startup_timeout";
-
-const maximumMcpToolProfileDefinitionBytes = 64 * 1024;
 
 export type McpEffectiveBoundsV1 = {
   readonly version: 1;
@@ -216,61 +234,6 @@ export type McpToolDraft = {
   readonly definitionDigest: Sha256Digest;
 };
 
-export type McpToolProfileV1 = {
-  readonly version: 1;
-  readonly generationId: string;
-  readonly sdk: {
-    readonly package: "@modelcontextprotocol/client";
-    readonly version: "2.0.0";
-  };
-  readonly projectorVersion: 1;
-  readonly servers: McpLiveSessionSnapshot["settledServers"];
-  readonly tools: readonly {
-    readonly serverId: string;
-    readonly serverDefinitionDigest: Sha256Digest;
-    readonly originalName: string;
-    readonly qualifiedName: string;
-    readonly definitionDigest: Sha256Digest;
-    readonly modelDescription: string;
-    readonly rawSchema: {
-      readonly dialect: "unstamped" | "2020-12" | "2019-09" | "draft-07" | "draft-06";
-      readonly provenance: "tools/list";
-      readonly value: Readonly<Record<string, unknown>>;
-      readonly digest: Sha256Digest;
-    };
-    readonly modelProjection: {
-      readonly version: 1;
-      readonly schema: Readonly<Record<string, unknown>>;
-      readonly digest: Sha256Digest;
-    };
-    readonly effect: ToolEffect;
-    readonly replay: "never";
-    readonly cancellation: "abort_signal";
-    readonly outputPolicy: {
-      readonly version: 1;
-      readonly maximumInlineBytes: 65_536;
-      readonly maximumRawBytes: 8_388_608;
-      readonly supportedContent: readonly ["text", "structured_json"];
-    };
-  }[];
-  readonly digest: Sha256Digest;
-};
-
-export type McpToolProfileSnapshot = {
-  readonly version: 1;
-  readonly digest: Sha256Digest;
-  readonly projectorVersion: 1;
-  readonly tools: readonly {
-    readonly serverId: string;
-    readonly originalName: string;
-    readonly qualifiedName: string;
-    readonly definitionDigest: Sha256Digest;
-    readonly rawSchemaDigest: Sha256Digest;
-    readonly modelProjectionDigest: Sha256Digest;
-    readonly effect: ToolEffect;
-  }[];
-};
-
 export type McpActivationSnapshot = {
   readonly attempt: number;
   readonly generationId: string;
@@ -289,15 +252,7 @@ export type McpLiveSessionSnapshot = {
     readonly digest: Sha256Digest;
     readonly tools: readonly McpToolDraft[];
   };
-  readonly settledServers: readonly {
-    readonly serverId: string;
-    readonly definitionDigest: Sha256Digest;
-    readonly protocolVersion: string;
-    readonly serverName: string;
-    readonly serverVersion: string;
-    readonly capabilityDigest: Sha256Digest;
-    readonly launchIdentityDigest: Sha256Digest;
-  }[];
+  readonly settledServers: readonly McpSettledServerIdentity[];
   readonly profile?: McpToolProfileSnapshot;
 };
 
@@ -1234,29 +1189,15 @@ export function createMcpRuntimeHost(options: {
           supportedContent: ["text", "structured_json"] as const,
         },
       }));
-      const modelDefinitions = profileTools.map((tool) => ({
-        name: tool.qualifiedName,
-        description: tool.modelDescription,
-        inputSchema: tool.modelProjection.schema,
-      }));
-      if (
-        Buffer.byteLength(canonicalJson(modelDefinitions), "utf8") >
-        maximumMcpToolProfileDefinitionBytes
-      ) {
-        throw new McpHostError("mcp_catalog_invalid");
-      }
-      const profileWithoutDigest = {
-        version: 1,
+      const profile = createMcpToolProfileV1({
         generationId: input.generationId,
-        sdk: { package: "@modelcontextprotocol/client", version: "2.0.0" },
-        projectorVersion: 1,
         servers: generation.live.settledServers,
         tools: profileTools,
-      } as const;
-      return {
-        ...profileWithoutDigest,
-        digest: sha256(canonicalJson(profileWithoutDigest)),
-      };
+      });
+      if (profile === undefined) {
+        throw new McpHostError("mcp_catalog_invalid");
+      }
+      return profile;
     },
     async reactivateToolProfile(input) {
       const live = await activate(input);
@@ -1546,7 +1487,7 @@ async function startMcpGeneration(
       status: "ready",
     },
     readyServerIds: new Set(connections.map((connection) => connection.serverId)),
-    catalog: { status: "ready", digest: sha256(canonicalJson({ version: 1, tools })), tools },
+    catalog: { status: "ready", digest: digestCanonicalMcpJson({ version: 1, tools }), tools },
     settledServers: connections.map((connection) => connection.settlement),
   };
   generation.prepared = live;
@@ -1608,14 +1549,14 @@ async function resolveMcpServerLaunch(
 ): Promise<ResolvedStdioLaunch> {
   if (server.command.kind === "executable") {
     const identity = await inspectMcpExecutableIdentity(server.command.path);
-    if (canonicalJson(identity) !== canonicalJson(server.command.identity)) {
+    if (canonicalMcpJson(identity) !== canonicalMcpJson(server.command.identity)) {
       throw new TypeError("The approved MCP executable identity changed before launch.");
     }
     return {
       path: server.command.path,
       arguments: server.arguments,
       cwd: server.cwd,
-      identityDigest: sha256(canonicalJson({ version: 1, path: server.command.path, identity })),
+      identityDigest: digestCanonicalMcpJson({ version: 1, path: server.command.path, identity }),
     };
   }
   const cacheKey = `${server.command.packageName}@${server.command.version}`;
@@ -1793,20 +1734,18 @@ async function bootstrapExactMcpPackage(
       mcpEffectiveBoundsV1.maximumExecutableBytes,
       effectiveSignal,
     );
-    const identityDigest = sha256(
-      canonicalJson({
-        version: 1,
-        packageName: command.packageName,
-        packageVersion: command.version,
-        integrity: lockedPackage.integrity,
-        dependencyTreeDigest: sha256(canonicalJson({ version: 1, packages: dependencyTree })),
-        binPolicy: command.binPolicy,
-        binRelativePath,
-        binDigest,
-        npmVersion: "11.6.2",
-        lifecycleScripts: "disabled",
-      }),
-    );
+    const identityDigest = digestCanonicalMcpJson({
+      version: 1,
+      packageName: command.packageName,
+      packageVersion: command.version,
+      integrity: lockedPackage.integrity,
+      dependencyTreeDigest: digestCanonicalMcpJson({ version: 1, packages: dependencyTree }),
+      binPolicy: command.binPolicy,
+      binRelativePath,
+      binDigest,
+      npmVersion: "11.6.2",
+      lifecycleScripts: "disabled",
+    });
     await rm(target, { recursive: true, force: true });
     await rename(staging, target);
     const packageRoot = join(target, packageRelativePath);
@@ -2024,7 +1963,7 @@ function createMcpToolAdapter(input: {
       if (!validation.valid || !isRecord(argumentsValue)) {
         return invalidMcpToolInput();
       }
-      const argumentsDigest = sha256(canonicalJson(argumentsValue));
+      const argumentsDigest = digestCanonicalMcpJson(argumentsValue);
       return {
         status: "ready" as const,
         permissionSubject: {
@@ -2183,7 +2122,7 @@ async function executeMcpTool(input: {
         : { structuredContent: result.structuredContent }),
       isError: result.isError === true,
     };
-    const outputBytes = Buffer.from(canonicalJson(output), "utf8");
+    const outputBytes = Buffer.from(canonicalMcpJson(output), "utf8");
     if (outputBytes.byteLength > 8 * 1024 * 1024) {
       return {
         status: "failed",
@@ -2385,7 +2324,7 @@ async function activateServer(
         protocolVersion,
         serverName,
         serverVersion: negotiatedServerVersion,
-        capabilityDigest: sha256(canonicalJson(capabilities)),
+        capabilityDigest: digestCanonicalMcpJson(capabilities),
         launchIdentityDigest: activeTransport.launchIdentityDigest,
       },
     };
@@ -2439,14 +2378,14 @@ async function discoverMcpTools(
         dialect: schemaDialect(inputSchema),
         provenance: "tools/list" as const,
         value: inputSchema,
-        digest: sha256(canonicalJson(inputSchema)),
+        digest: digestCanonicalMcpJson(inputSchema),
       };
       const projected = projectMcpInputSchemaV1(inputSchema);
       assertMcpSchemaAdmissible(projected.schema);
       const modelProjection = {
         version: 1 as const,
         schema: projected.schema,
-        digest: sha256(canonicalJson({ version: 1, schema: projected.schema })),
+        digest: digestCanonicalMcpJson({ version: 1, schema: projected.schema }),
       };
       const qualifiedName = qualifiedToolName(server, tool.name);
       const serverDescription = normalizeMcpServerDescription(tool.description ?? "");
@@ -2456,20 +2395,18 @@ async function discoverMcpTools(
         serverDescription,
         projected.compatibilityHint,
       );
-      const definitionDigest = sha256(
-        canonicalJson({
-          version: 1,
-          serverId: server.serverId,
-          serverDefinitionDigest: server.definitionDigest,
-          originalName: tool.name,
-          qualifiedName,
-          description: serverDescription,
-          rawSchemaDigest: rawSchema.digest,
-          modelProjectionDigest: modelProjection.digest,
-          outputSchemaDigest:
-            tool.outputSchema === undefined ? null : sha256(canonicalJson(tool.outputSchema)),
-        }),
-      );
+      const definitionDigest = digestCanonicalMcpJson({
+        version: 1,
+        serverId: server.serverId,
+        serverDefinitionDigest: server.definitionDigest,
+        originalName: tool.name,
+        qualifiedName,
+        description: serverDescription,
+        rawSchemaDigest: rawSchema.digest,
+        modelProjectionDigest: modelProjection.digest,
+        outputSchemaDigest:
+          tool.outputSchema === undefined ? null : digestCanonicalMcpJson(tool.outputSchema),
+      });
       return [
         {
           draft: {
@@ -2760,7 +2697,8 @@ function projectMcpRootChoice(
       }
       const candidates = branchPropertySets.map((candidate) => candidate[name]);
       properties[name] = candidates.every(
-        (candidate) => candidate !== undefined && canonicalJson(candidate) === canonicalJson(value),
+        (candidate) =>
+          candidate !== undefined && canonicalMcpJson(candidate) === canonicalMcpJson(value),
       )
         ? value
         : {};
@@ -2839,7 +2777,7 @@ async function listAllTools(
       },
     );
     for (const tool of page.tools) {
-      const definitionBytes = Buffer.byteLength(canonicalJson(tool), "utf8");
+      const definitionBytes = Buffer.byteLength(canonicalMcpJson(tool), "utf8");
       aggregateDefinitionBytes += definitionBytes;
       if (seenNames.has(tool.name)) {
         throw new McpHostError("mcp_catalog_invalid", { serverId });
@@ -3365,7 +3303,7 @@ async function createExecutableServerPreview(input: {
         requestedEnvironmentNames,
         startupEffects: ["execute", "network"],
         limits: mcpEffectiveBoundsV1,
-        definitionDigest: sha256(canonicalJson(definition)),
+        definitionDigest: digestCanonicalMcpJson(definition),
       },
     };
   }
@@ -3412,7 +3350,7 @@ async function createExecutableServerPreview(input: {
       requestedEnvironmentNames,
       startupEffects: ["execute"],
       limits: mcpEffectiveBoundsV1,
-      definitionDigest: sha256(canonicalJson(definition)),
+      definitionDigest: digestCanonicalMcpJson(definition),
     },
   };
 }
@@ -3579,20 +3517,6 @@ function sameMcpExecutableStat(left: BigIntStats, right: BigIntStats): boolean {
   );
 }
 
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((entry) => canonicalJson(entry)).join(",")}]`;
-  }
-  return `{${Object.entries(value)
-    .filter(([, entry]) => entry !== undefined)
-    .sort(([left], [right]) => compareCodeUnits(left, right))
-    .map(([key, entry]) => `${JSON.stringify(key)}:${canonicalJson(entry)}`)
-    .join(",")}}`;
-}
-
 function compareCodeUnits(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
@@ -3670,53 +3594,6 @@ function schemaDialect(
     return "draft-06";
   }
   throw new TypeError("MCP schema dialect is unsupported.");
-}
-
-export function mcpToolProfileSnapshot(profile: McpToolProfileV1): McpToolProfileSnapshot {
-  return {
-    version: 1,
-    digest: profile.digest,
-    projectorVersion: profile.projectorVersion,
-    tools: profile.tools.map((tool) => ({
-      serverId: tool.serverId,
-      originalName: tool.originalName,
-      qualifiedName: tool.qualifiedName,
-      definitionDigest: tool.definitionDigest,
-      rawSchemaDigest: tool.rawSchema.digest,
-      modelProjectionDigest: tool.modelProjection.digest,
-      effect: tool.effect,
-    })),
-  };
-}
-
-export function isMcpToolProfileV1Valid(profile: McpToolProfileV1): boolean {
-  const { digest, ...withoutDigest } = profile;
-  return (
-    profile.version === 1 &&
-    profile.sdk.package === "@modelcontextprotocol/client" &&
-    profile.sdk.version === "2.0.0" &&
-    profile.projectorVersion === 1 &&
-    profile.tools.length >= 1 &&
-    profile.tools.length <= 20 &&
-    new Set(profile.tools.map((tool) => tool.qualifiedName)).size === profile.tools.length &&
-    profile.tools.every(
-      (tool) =>
-        profile.servers.some(
-          (server) =>
-            server.serverId === tool.serverId &&
-            server.definitionDigest === tool.serverDefinitionDigest,
-        ) &&
-        tool.rawSchema.digest === sha256(canonicalJson(tool.rawSchema.value)) &&
-        tool.modelProjection.digest ===
-          sha256(canonicalJson({ version: 1, schema: tool.modelProjection.schema })) &&
-        tool.modelDescription.length <= 2 * 1024,
-    ) &&
-    digest === sha256(canonicalJson(withoutDigest))
-  );
-}
-
-function sha256(value: string): Sha256Digest {
-  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
 }
 
 function asError(error: unknown): Error {

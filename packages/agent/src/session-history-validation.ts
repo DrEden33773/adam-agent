@@ -11,7 +11,7 @@ import {
   digestContextRecordPrefix,
   reduceContextEvidence,
 } from "./durable-context.js";
-import { isMcpToolProfileV1Valid } from "./mcp-host.js";
+import { isMcpToolProfileV1Valid } from "./mcp-profile-contracts.js";
 import { sameModelTargetIdentity } from "./model-targets.js";
 import {
   commitMcpToolProfileV3,
