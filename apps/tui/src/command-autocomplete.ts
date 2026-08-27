@@ -18,17 +18,23 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
   readonly #getProjectPaths: () => readonly string[];
   readonly #getRunActive: () => boolean;
   readonly #getSkills: () => readonly SkillCompletion[];
+  readonly #getThinkingLevelIds: () => readonly string[];
+  readonly #keyword: (text: string) => string;
   readonly #registry: AdamCommandRegistry;
 
   constructor(options: {
     readonly getProjectPaths: () => readonly string[];
     readonly getRunActive: () => boolean;
     readonly getSkills: () => readonly SkillCompletion[];
+    readonly getThinkingLevelIds?: () => readonly string[];
+    readonly keyword?: (text: string) => string;
     readonly registry?: AdamCommandRegistry;
   }) {
     this.#getProjectPaths = options.getProjectPaths;
     this.#getRunActive = options.getRunActive;
     this.#getSkills = options.getSkills;
+    this.#getThinkingLevelIds = options.getThinkingLevelIds ?? (() => []);
+    this.#keyword = options.keyword ?? ((text) => text);
     this.#registry = options.registry ?? adamCommandRegistry;
   }
 
@@ -65,7 +71,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
           : this.#registry.suggest(query).filter((command) => availableCommands.includes(command));
       const items = commands.map<AutocompleteItem>((command) => ({
         value: `/${command.name}`,
-        label: `/${command.name}`,
+        label: this.#keyword(`/${command.name}`),
         description: `${command.usage} · ${command.summary}`,
       }));
       return Promise.resolve(items.length === 0 ? null : { items, prefix: beforeCursor });
@@ -78,26 +84,47 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
         .filter((topic) => topic.id.startsWith(helpPrefix))
         .map<AutocompleteItem>((topic) => ({
           value: topic.id,
-          label: topic.id,
+          label: this.#keyword(topic.id),
           description: topic.summary,
         }));
       return Promise.resolve(
         helpItems.length === 0 ? null : { items: helpItems, prefix: helpPrefix },
       );
     }
-    const skillPrefix =
-      cursorLine === 0 ? /^\/skills[ \t]+([^\s]*)$/.exec(beforeCursor)?.[1] : undefined;
-    if (skillPrefix !== undefined) {
-      const skillItems = this.#getSkills()
-        .filter((skill) => skill.qualifiedId.startsWith(skillPrefix))
-        .map<AutocompleteItem>((skill) => ({
-          value: skill.qualifiedId,
-          label: skill.qualifiedId,
-          description: safeTerminalText(skill.description),
-        }));
-      return Promise.resolve(
-        skillItems.length === 0 ? null : { items: skillItems, prefix: skillPrefix },
-      );
+    const argumentMatch = cursorLine === 0 ? /^\/([a-z]+)[ \t]+(.*)$/u.exec(beforeCursor) : null;
+    if (argumentMatch !== null) {
+      const commandName = argumentMatch[1] ?? "";
+      const argumentsText = argumentMatch[2] ?? "";
+      const runActive = this.#getRunActive();
+      const parsed = this.#registry.parse(`/${commandName}`);
+      if (parsed.kind !== "known" || !this.#registry.isAvailable(parsed.command, { runActive })) {
+        return Promise.resolve(null);
+      }
+      const resolution = this.#registry.argumentCompletions(commandName, argumentsText, {
+        runActive,
+        thinkingLevelIds: this.#getThinkingLevelIds(),
+      });
+      const completion = resolution.kind === "owned" ? resolution.completion : null;
+      if (completion?.exact === true) {
+        return Promise.resolve(null);
+      }
+      const skillItems =
+        commandName === "skills" && !/\s/u.test(argumentsText)
+          ? this.#getSkills()
+              .filter((skill) => skill.qualifiedId.startsWith(argumentsText))
+              .map<AutocompleteItem>((skill) => ({
+                value: skill.qualifiedId,
+                label: skill.qualifiedId,
+                description: safeTerminalText(skill.description),
+              }))
+          : [];
+      const items = [...(completion?.items ?? []), ...skillItems];
+      if (items.length > 0) {
+        return Promise.resolve({ items, prefix: completion?.prefix ?? argumentsText });
+      }
+      if (resolution.kind === "owned") {
+        return Promise.resolve(null);
+      }
     }
     const mention = /(?:^|[^A-Za-z0-9_$\\])(\$([a-z0-9-]*))$/u.exec(beforeCursor);
     const mentionPrefix = mention?.[1];

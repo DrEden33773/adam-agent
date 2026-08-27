@@ -1,5 +1,18 @@
+diff --git a/dist/components/select-list.js b/dist/components/select-list.js
+index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..a3e433040844ff81205ed55edb7713241410bcc3 100644
+--- a/dist/components/select-list.js
++++ b/dist/components/select-list.js
+@@ -88,7 +88,7 @@ export class SelectList {
+         }
+     }
+     renderItem(item, isSelected, width, descriptionSingleLine, primaryColumnWidth) {
+-        const prefix = isSelected ? "→ " : "  ";
++        const prefix = isSelected ? "> " : "  ";
+         const prefixWidth = visibleWidth(prefix);
+         if (descriptionSingleLine && width > 40) {
+             const effectivePrimaryColumnWidth = Math.max(1, Math.min(primaryColumnWidth, width - prefixWidth - 4));
 diff --git a/dist/tui-main-screen.js b/dist/tui-main-screen.js
-index 05279f4699c298ca345785dd2f896a33d8271f4a..499a30b92b1145b19f4b8021ee420f22321a792e 100644
+index 05279f4699c298ca345785dd2f896a33d8271f4a..f58d756b859074bb7043e7b9c23d50c4f1f24c59 100644
 --- a/dist/tui-main-screen.js
 +++ b/dist/tui-main-screen.js
 @@ -220,6 +220,38 @@ export class TuiMainScreen extends TuiBase {

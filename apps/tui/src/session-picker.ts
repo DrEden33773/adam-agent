@@ -179,7 +179,7 @@ function renderColumns(
   selected: boolean,
   width: number,
 ): string {
-  const prefix = selected ? "→ " : "  ";
+  const prefix = selected ? "> " : "  ";
   const available = Math.max(0, width - visibleWidth(prefix));
   if (width <= 40) {
     return prefix + truncateToWidth(label, available, "");

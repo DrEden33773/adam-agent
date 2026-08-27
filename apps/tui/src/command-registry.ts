@@ -12,6 +12,7 @@ export type AdamCommandDefinition = {
     | "config"
     | "copy"
     | "diffs"
+    | "exit"
     | "extension"
     | "fork"
     | "help"
@@ -74,6 +75,21 @@ export type AdamCommandParseResult =
       readonly kind: "known";
     };
 
+export type AdamArgumentCompletion = {
+  readonly label: string;
+  readonly value: string;
+};
+
+export type AdamArgumentCompletions = {
+  readonly exact: boolean;
+  readonly items: readonly AdamArgumentCompletion[];
+  readonly prefix: string;
+};
+
+export type AdamArgumentCompletionResolution =
+  | { readonly kind: "not_owned" }
+  | { readonly completion: AdamArgumentCompletions | null; readonly kind: "owned" };
+
 export class AdamCommandRegistry {
   readonly #commands: readonly AdamCommandDefinition[];
   readonly #commandsByName: ReadonlyMap<string, AdamCommandDefinition>;
@@ -101,6 +117,35 @@ export class AdamCommandRegistry {
 
   helpTopics(): readonly AdamHelpTopicDefinition[] {
     return fixedHelpTopics;
+  }
+
+  argumentCompletions(
+    commandName: string,
+    argumentsText: string,
+    context: { readonly runActive: boolean; readonly thinkingLevelIds: readonly string[] },
+  ): AdamArgumentCompletionResolution {
+    const command = this.#commandsByName.get(commandName);
+    if (command === undefined || !finiteArgumentCommandIds.has(command.id)) {
+      return { kind: "not_owned" };
+    }
+    if (!this.isAvailable(command, context)) {
+      return { completion: null, kind: "owned" };
+    }
+    let completion: AdamArgumentCompletions | null;
+    if (command?.id === "name") {
+      completion = completeSingleFiniteArgument(argumentsText, ["--clear", "--generate"]);
+    } else if (command.id === "thinking") {
+      completion = completeSingleFiniteArgument(argumentsText, context.thinkingLevelIds);
+    } else if (command.id === "instructions" || command.id === "skills") {
+      completion = completeSingleFiniteArgument(argumentsText, ["reload"]);
+    } else if (command.id === "config") {
+      completion = completeConfigurationArguments(argumentsText);
+    } else if (command.id === "trust") {
+      completion = completeSingleFiniteArgument(argumentsText, ["status", "grant", "revoke"]);
+    } else {
+      completion = null;
+    }
+    return { completion, kind: "owned" };
   }
 
   footerHint(): string {
@@ -182,6 +227,14 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     name: "copy",
     summary: "Copy the last assistant response.",
     usage: "/copy",
+  },
+  {
+    aliases: [],
+    availability: "always",
+    id: "exit",
+    name: "exit",
+    summary: "Exit through the authoritative TUI cleanup path.",
+    usage: "/exit",
   },
   {
     aliases: [],
@@ -553,6 +606,45 @@ const fixedHelpTopics: readonly AdamHelpTopicDefinition[] = [
   { id: "editor", label: "Editor", summary: "Pi Editor navigation and editing bindings" },
   { id: "safety", label: "Safety", summary: "Permissions, trust, and isolation boundaries" },
 ];
+
+const finiteArgumentCommandIds: ReadonlySet<AdamCommandDefinition["id"]> = new Set([
+  "config",
+  "help",
+  "instructions",
+  "name",
+  "skills",
+  "thinking",
+  "trust",
+]);
+
+function completeSingleFiniteArgument(
+  argumentsText: string,
+  values: readonly string[],
+  exactIsComplete = true,
+): AdamArgumentCompletions | null {
+  if (/\s/u.test(argumentsText)) {
+    return null;
+  }
+  if (exactIsComplete && values.includes(argumentsText)) {
+    return { exact: true, items: [], prefix: argumentsText };
+  }
+  const items = values
+    .filter((value) => value.startsWith(argumentsText))
+    .map((value) => ({ label: value, value }));
+  return items.length === 0 ? null : { exact: false, items, prefix: argumentsText };
+}
+
+function completeConfigurationArguments(argumentsText: string): AdamArgumentCompletions | null {
+  const fields = ["context", "output", "compaction"] as const;
+  if (!/\s/u.test(argumentsText)) {
+    return completeSingleFiniteArgument(argumentsText, fields, false);
+  }
+  const valueMatch = /^(context|output|compaction)[ \t]+([^\s]*)$/u.exec(argumentsText);
+  if (valueMatch === null) {
+    return null;
+  }
+  return completeSingleFiniteArgument(valueMatch[2] ?? "", ["default"]);
+}
 
 function rankSuggestions<Entry>(
   entries: readonly Entry[],

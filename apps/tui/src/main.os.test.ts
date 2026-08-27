@@ -168,6 +168,84 @@ test("real TUI starts on an authoritative empty session and restores the termina
   }
 });
 
+test("the production PTY persists owner-only config and trust, completes a finite action, and exits through slash exit", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-b10-a3-production-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      program: {
+        arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
+        cwd: workspaceRoot,
+        entrypoint: productionPath,
+        environment: {
+          DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+          XDG_CONFIG_HOME: configRoot,
+        },
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitForCompleteFrameAfter("Adam · New session", 0);
+
+    let beforeAction = fixture.output().length;
+    fixture.write("/trust st");
+    await fixture.waitForCompleteFrameAfter("> status", beforeAction);
+    const completionFrame = fixture.output().slice(beforeAction);
+    expect(completionFrame).toContain("> status");
+    expect(completionFrame).not.toContain("→ status");
+    fixture.write("\t\r");
+    await fixture.waitForAfter("Workspace trust: untrusted", beforeAction);
+
+    beforeAction = fixture.output().length;
+    fixture.write("/trust gr");
+    await fixture.waitForCompleteFrameAfter("> grant", beforeAction);
+    fixture.write("\t\r");
+    await fixture.waitForAfter("Workspace trust granted.", beforeAction);
+
+    beforeAction = fixture.output().length;
+    fixture.write("/config output 1234\r");
+    await fixture.waitForAfter("Saved output limit: 1234 tokens.", beforeAction);
+    beforeAction = fixture.output().length;
+    fixture.write("/config\r");
+    await fixture.waitForCompleteFrameAfter("User model configuration", beforeAction);
+    const configurationFrame = fixture.output().slice(beforeAction);
+    expect(configurationFrame).toContain("> Context window");
+    expect(configurationFrame).toContain("Output limit");
+    expect(configurationFrame).toContain("saved 1234 tokens");
+    beforeAction = fixture.output().length;
+    fixture.write("\u001b");
+    await fixture.waitForAfter("Configuration closed.", beforeAction);
+
+    fixture.write("/exit\r");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("\u001b[?2004l");
+    expect(result.stdout).toContain("\u001b[?2026l");
+    expect(result.stdout).toContain("\u001b[?25h");
+
+    const configurationPath = join(configDirectory, "config.json");
+    const trustPath = join(configDirectory, "workspace-trust.json");
+    expect((await stat(configDirectory)).mode & 0o777).toBe(0o700);
+    expect((await stat(configurationPath)).mode & 0o777).toBe(0o600);
+    expect((await stat(trustPath)).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(await readFile(configurationPath, "utf8"))).toMatchObject({
+      schemaVersion: 2,
+      modelPolicy: { maximumOutputTokens: 1_234 },
+    });
+    expect(JSON.parse(await readFile(trustPath, "utf8"))).toMatchObject({
+      schemaVersion: 1,
+      trustedProjectIds: [expect.stringMatching(/^sha256:[0-9a-f]{64}$/u)],
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("real PTY streams Ctrl+T provider reasoning without taking terminal mouse selection", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-pty-"));
   const workspaceRoot = join(testRoot, "workspace");

@@ -856,7 +856,11 @@ function createFixtureModelTargets(options: {
               "started\n",
               "utf8",
             );
-            await waitForFile(options.controlRoot as string, "release-model");
+            if (
+              !(await waitForFile(options.controlRoot as string, "release-model", request.signal))
+            ) {
+              throw request.signal.reason;
+            }
           }
           yield { type: "tool_call_start", id: "edit-file", name: "edit_file" };
           yield {
@@ -1037,18 +1041,26 @@ function createFixtureModelTargets(options: {
           text: "Inspect ",
         };
         await writeFile(join(options.controlRoot as string, "model-started"), "started\n", "utf8");
-        await waitForFile(options.controlRoot as string, "release-reasoning");
+        if (
+          !(await waitForFile(options.controlRoot as string, "release-reasoning", request.signal))
+        ) {
+          throw request.signal.reason;
+        }
         yield {
           type: "reasoning_delta",
           id: "provider-reasoning-0",
           text: "the evidence.",
         };
-        await waitForFile(options.controlRoot as string, "release-model");
+        if (!(await waitForFile(options.controlRoot as string, "release-model", request.signal))) {
+          throw request.signal.reason;
+        }
         yield { type: "reasoning_end", id: "provider-reasoning-0" };
         yield { type: "text_delta", text: "Reasoning answer." };
       } else {
         await writeFile(join(options.controlRoot as string, "model-started"), "started\n", "utf8");
-        await waitForFile(options.controlRoot as string, "release-model");
+        if (!(await waitForFile(options.controlRoot as string, "release-model", request.signal))) {
+          throw request.signal.reason;
+        }
         yield {
           type: "text_delta",
           text: `# Streaming answer\n\n**Markdown ready.**\n\nThinking policy: ${request.thinkingPolicy?.requestedLevelId ?? "none"}.`,

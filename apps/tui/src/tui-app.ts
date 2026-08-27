@@ -140,6 +140,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             (state.authoritative.active?.pendingInteractions.length ?? 0) > 0
           );
         },
+        getThinkingLevelIds: () => {
+          const state = options.presentation.getState();
+          const targetId = state.authoritative.active?.session.targetId ?? state.draft?.targetId;
+          return (
+            state.authoritative.targets.items
+              .find((target) => target.targetId === targetId)
+              ?.thinking?.levels.map((level) => level.id) ?? []
+          );
+        },
         getSkills: () =>
           (
             options.presentation.getState().authoritative.active?.skills?.items ??
@@ -150,6 +159,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             name: skill.name,
             qualifiedId: skill.qualifiedId,
           })),
+        keyword: theme.keyword,
         registry: commandRegistry,
       }),
     );
@@ -1639,6 +1649,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     applyWorkspaceTrustMutation(argumentsText === "grant");
   };
+  let stopFromCommand: (() => void) | undefined;
+  const handleExitCommand = (argumentsText: string): void => {
+    if (argumentsText.length > 0) {
+      statusMessage = "Usage: /exit";
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    editor.setText("");
+    stopFromCommand?.();
+  };
   editor.onSubmit = (text) => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
@@ -1650,6 +1671,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         return;
       }
       const parsedDraft = commandRegistry.parse(text);
+      if (parsedDraft.kind === "known" && parsedDraft.command.id === "exit") {
+        handleExitCommand(parsedDraft.argumentsText);
+        return;
+      }
       if (parsedDraft.kind === "known" && parsedDraft.command.id === "thinking") {
         handleThinkingCommand(parsedDraft.argumentsText);
         return;
@@ -1805,6 +1830,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       statusMessage = `/${parsedCommand.command.name} is unavailable while a run is active.`;
       editor.disableSubmit = false;
       renderState();
+      return;
+    }
+    if (parsedCommand.kind === "known" && parsedCommand.command.id === "exit") {
+      handleExitCommand(parsedCommand.argumentsText);
       return;
     }
     if (parsedCommand.kind === "not_command" && runActive) {
@@ -2545,6 +2574,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     } else {
       exited.reject(new AggregateError(failures, "The TUI could not close every owned resource."));
     }
+  };
+  stopFromCommand = () => {
+    void stop(true);
   };
   const handleTerminationSignal = (signal: "SIGHUP" | "SIGTERM") => {
     process.exitCode = signal === "SIGHUP" ? 129 : 143;
