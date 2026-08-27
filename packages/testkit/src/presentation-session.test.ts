@@ -9888,6 +9888,126 @@ test("PresentationSession preserves failed and output-limited run notices", asyn
   }
 });
 
+test("PresentationSession maps canonical failure codes to bounded safe run notices", async () => {
+  const scenarios = [
+    {
+      code: "tool_effect_indeterminate",
+      error: {
+        code: "tool_effect_indeterminate",
+        reason: "mcp_protocol_error",
+        message: "private indeterminate detail",
+      },
+      expectedMessage: "A tool effect requires inspection before continuing.",
+    },
+    {
+      code: "session_persistence_failed",
+      error: {
+        code: "session_persistence_failed",
+        message: "private persistence detail",
+      },
+      expectedMessage: "The session could not make its result durable.",
+    },
+    {
+      code: "context_window_unrecoverable",
+      error: {
+        code: "context_window_unrecoverable",
+        message: "private context detail",
+      },
+      expectedMessage: "The run could not continue within its context limits.",
+    },
+    {
+      code: "token_limit_exceeded",
+      error: {
+        code: "token_limit_exceeded",
+        message: "private token detail",
+      },
+      expectedMessage: "The run could not continue within its context limits.",
+    },
+    {
+      code: "skill_activation_failed",
+      error: {
+        code: "skill_activation_failed",
+        message: "private Skill detail",
+      },
+      expectedMessage: "The requested Skill activation failed.",
+    },
+    {
+      code: "model_protocol_invalid",
+      error: {
+        code: "model_protocol_invalid",
+        message: "private model detail",
+      },
+      expectedMessage: "The model run failed.",
+    },
+  ] as const;
+
+  for (const [index, scenario] of scenarios.entries()) {
+    const testRoot = await mkdtemp(
+      join(tmpdir(), `adam-agent-presentation-safe-${scenario.code}-`),
+    );
+    const stateRoot = join(testRoot, "state");
+    const workspaceRoot = join(testRoot, "workspace");
+    await mkdir(workspaceRoot);
+    const harness = createInMemorySessionLifecycleHarness();
+    const lifecycle = harness.createLifecycle({
+      modelTargets: settledModelTargets(),
+      stateRoot,
+      workspaceRoot,
+    });
+
+    try {
+      const created = await lifecycle.create({ targetIdentity });
+      const records = await harness.sessions.open(created.sessionId);
+      const genesis = (await records?.read())?.[0];
+      if (genesis === undefined) {
+        throw new Error("Expected the canonical session genesis.");
+      }
+      const projectedRecords: readonly SessionRecord[] = [
+        genesis,
+        {
+          schemaVersion: 3,
+          sequence: 2,
+          record: {
+            type: "runtime_event",
+            runId: `123e4567-e89b-42d3-a456-42661417400${index}`,
+            event: {
+              type: "session_settled",
+              result: { status: "failed", error: scenario.error },
+            },
+          },
+        },
+      ];
+      const presentation = await createPresentationSession({
+        lifecycle,
+        projectLabel: "workspace",
+        sessionId: created.sessionId,
+        stateRoot,
+        workspaceRoot,
+        [presentationSessionRecordReader]: async () => projectedRecords,
+      });
+      try {
+        const notice = presentation
+          .getState()
+          .authoritative.active?.transcript.items.find(
+            (item) => item.type === "session_notice" && item.status === "failed",
+          );
+        expect(notice).toMatchObject({
+          type: "session_notice",
+          status: "failed",
+          code: scenario.code,
+          message: scenario.expectedMessage,
+        });
+        expect(JSON.stringify(notice)).not.toContain(scenario.error.message);
+      } finally {
+        await presentation.close();
+      }
+    } finally {
+      await lifecycle.close();
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  }
+});
+
 test("PresentationSession preserves a bounded tool failure cause", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-tool-failure-"));
   const stateRoot = join(testRoot, "state");
