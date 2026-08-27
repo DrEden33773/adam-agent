@@ -7888,9 +7888,25 @@ test("PresentationSession projects one live pending permission with its inline t
       throw new Error("Expected an active session.");
     }
     const pendingVisible = Promise.withResolvers<void>();
+    const deniedVisible = Promise.withResolvers<void>();
+    let deniedProjection:
+      | { readonly pendingInteractionCount: number; readonly tool: unknown }
+      | undefined;
     const unsubscribePresentation = presentation.subscribe(() => {
-      if (presentation.getState().authoritative.active?.pendingInteractions.length === 1) {
+      const active = presentation.getState().authoritative.active;
+      if (active?.pendingInteractions.length === 1) {
         pendingVisible.resolve();
+      }
+      const deniedTool = active?.transcript.items.find(
+        (item) =>
+          item.type === "tool_call" && item.callId === "pending-read" && item.status === "denied",
+      );
+      if (active?.pendingInteractions.length === 0 && deniedTool !== undefined) {
+        deniedProjection = {
+          pendingInteractionCount: active.pendingInteractions.length,
+          tool: deniedTool,
+        };
+        deniedVisible.resolve();
       }
     });
     const continuation = lifecycle.continue({
@@ -7900,6 +7916,8 @@ test("PresentationSession projects one live pending permission with its inline t
     });
     await permissionRequested.promise;
     let failureGuard: ReturnType<typeof setTimeout> | undefined;
+    let deniedFailureGuard: ReturnType<typeof setTimeout> | undefined;
+    let permissionSettled = false;
     try {
       await Promise.race([
         pendingVisible.promise,
@@ -7929,11 +7947,43 @@ test("PresentationSession projects one live pending permission with its inline t
           changePreviewRef: null,
         },
       ]);
+      if (requestId === undefined) {
+        throw new Error("Expected the pending permission request identity.");
+      }
+      await expect(
+        presentation.dispatch({ type: "decide_permission", requestId, decision: "deny" }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      permissionSettled = true;
+      await Promise.race([
+        deniedVisible.promise,
+        new Promise<never>((_resolve, reject) => {
+          deniedFailureGuard = setTimeout(
+            () => reject(new Error("The denied Presentation state was never published.")),
+            5_000,
+          );
+        }),
+      ]);
+      expect(deniedProjection).toMatchObject({
+        pendingInteractionCount: 0,
+        tool: {
+          type: "tool_call",
+          callId: "pending-read",
+          status: "denied",
+          outcome: {
+            status: "failed",
+            code: "permission_denied",
+            message: "Permission denied for tool: read_file",
+          },
+        },
+      });
     } finally {
       if (failureGuard !== undefined) {
         clearTimeout(failureGuard);
       }
-      if (requestId !== undefined) {
+      if (deniedFailureGuard !== undefined) {
+        clearTimeout(deniedFailureGuard);
+      }
+      if (!permissionSettled && requestId !== undefined) {
         lifecycle.decidePermission({ requestId, decision: "deny" });
       }
       await continuation;
