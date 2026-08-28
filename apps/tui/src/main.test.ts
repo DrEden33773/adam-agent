@@ -3673,6 +3673,7 @@ test("repeated completed reasoning folds keep the selected block visible without
     await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
+    await waitForPhysicalText(terminal, "Adam · Streaming session");
     const durableStateBeforeFolds = await readFilesRecursively(stateRoot);
 
     for (let cycle = 0; cycle < 4; cycle += 1) {
@@ -3880,6 +3881,7 @@ test("live reasoning growth preserves reading until the user returns to the tail
     await writeFile(join(controlRoot, "release-live-completion"), "release\n", "utf8");
     await waitForPath(join(controlRoot, "reasoning-live-completed"));
     await terminal.nextFrame(beforeCompletionFrame);
+    await waitForPhysicalText(terminal, "Live reasoning answer.");
     await waitForPhysicalText(terminal, " · idle");
     expect(terminal.lines().join("\n")).toContain("Live reasoning answer.");
   } finally {
