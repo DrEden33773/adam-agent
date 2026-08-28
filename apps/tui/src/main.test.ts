@@ -1284,12 +1284,10 @@ test("the production TUI admits owner-local workspace trust before session or ta
     expect(fixture.screen()?.join("\n") ?? "").toContain("> Yes — Trust and continue");
     fixture.write("\r");
     const trustReceiptPath = join(controlRoot, "workspace-trust-dispatch-settled");
-    await waitForPath(trustReceiptPath);
-    await expect(readFile(trustReceiptPath, "utf8")).resolves.toBe("admitted\n");
+    await expect(waitForFileContents(trustReceiptPath, "admitted\n")).resolves.toBe("admitted\n");
     await waitForPath(join(configRoot, "adam-agent", "workspace-trust.json"));
     const createReceiptPath = join(controlRoot, "create-session-dispatch-settled");
-    await waitForPath(createReceiptPath);
-    await expect(readFile(createReceiptPath, "utf8")).resolves.toBe("admitted\n");
+    await expect(waitForFileContents(createReceiptPath, "admitted\n")).resolves.toBe("admitted\n");
     await fixture.resize(42, 12);
     const admittedNarrow = fixture.screen()?.join("\n") ?? "";
     expect(admittedNarrow).not.toContain("Workspace trust required");
