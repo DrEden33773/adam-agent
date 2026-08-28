@@ -5203,7 +5203,7 @@ test("a real read tool is rendered as a bounded Pi-style tool card", async () =>
   }
 });
 
-test("Ctrl+O toggles bounded authoritative tool details", async () => {
+test("Kitty Ctrl+O repeat and release phases toggle bounded tool details only once", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tool-details-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -5224,13 +5224,21 @@ test("Ctrl+O toggles bounded authoritative tool details", async () => {
     expect(fixture.output()).toContain("10 │ line10");
     expect(fixture.output()).not.toContain("11 │ line11");
     expect(fixture.output()).not.toContain("provider model response");
+    let beforeResize = fixture.output().length;
+    await fixture.resize(80, 40);
+    const resizedFrame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(resizedFrame.match(/Ctrl\+O expand/gu)).toHaveLength(1);
+    beforeResize = fixture.output().length;
+    await fixture.resize(80, 24);
+    await fixture.waitForAfter("\u001b[?2026l", beforeResize);
     const beforeToolView = fixture.output().length;
     fixture.write("\u001b[5~");
     await fixture.waitForAfter("\u001b[?2026l", beforeToolView);
     const collapsedToolRow = fixture.screen()?.findIndex((line) => line.includes("read README.md"));
     expect(collapsedToolRow).toBeGreaterThanOrEqual(0);
+    expect((fixture.screen()?.join("\n") ?? "").match(/Ctrl\+O expand/gu)).toHaveLength(1);
     const beforeExpand = fixture.output().length;
-    fixture.write("\u000f");
+    fixture.write("\u001b[111;5:1u\u001b[111;5:2u\u001b[111;5:2u\u001b[111;5:3u");
     await fixture.waitForAfter("\u001b[?2026l", beforeExpand);
     let screen = fixture.screen()?.join("\n") ?? "";
     expect(fixture.screen()?.findIndex((line) => line.includes("read README.md"))).toBe(
@@ -5256,11 +5264,128 @@ test("Ctrl+O toggles bounded authoritative tool details", async () => {
     fixture.write("\u000f");
     await fixture.waitForAfter("\u001b[?2026l", beforeCollapse);
     screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toContain("84 bytes");
+    expect(screen).toContain("read README.md · Ctrl+O expand");
     expect(screen).not.toContain("provider model response");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Ctrl+O targets the visible tool card and keeps other cards independently collapsed", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tool-target-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  for (let card = 1; card <= 3; card += 1) {
+    await writeFile(
+      join(workspaceRoot, `tool-${card}.txt`),
+      `${Array.from(
+        { length: 12 },
+        (_, index) => `tool${card}-line${String(index + 1).padStart(2, "0")}`,
+      ).join("\n")}\n`,
+      "utf8",
+    );
+  }
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 18 });
+  const execution = runTuiFixture({
+    scenario: "tool-multiple",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    await waitForPhysicalText(terminal, "Multiple tool answer 3.");
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[H");
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[6~");
+    let screen = terminal.lines().join("\n");
+    expect(screen).toContain("read tool-1.txt · Ctrl+O expand");
+    expect(screen.match(/Ctrl\+O expand/gu)).toHaveLength(1);
+    expect(screen).not.toContain("read tool-3.txt");
+    const collapsedToolRow = terminal.lines().findIndex((line) => line.includes("read tool-1.txt"));
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u000f");
+    screen = terminal.lines().join("\n");
+    expect(terminal.lines().findIndex((line) => line.includes("read tool-1.txt"))).toBe(
+      collapsedToolRow,
+    );
+    expect(screen).toContain("read tool-1.txt · Ctrl+O fold");
+    for (let page = 0; page < 4; page += 1) {
+      await inputAndWaitForPhysicalFrame(terminal, "\u001b[6~");
+    }
+    screen = terminal.lines().join("\n");
+    expect(screen).toContain("tool1-line12");
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[F");
+    screen = terminal.lines().join("\n");
+    expect(screen).toContain("Multiple tool answer 3.");
+    expect(screen).toContain("2 more projected lines");
+    expect(screen).not.toContain("tool3-line12");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("tool disclosure resets across session switches without changing durable JSONL", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tool-session-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  for (let card = 1; card <= 3; card += 1) {
+    await writeFile(
+      join(workspaceRoot, `tool-${card}.txt`),
+      `${Array.from(
+        { length: 12 },
+        (_, index) => `tool${card}-line${String(index + 1).padStart(2, "0")}`,
+      ).join("\n")}\n`,
+      "utf8",
+    );
+  }
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 18 });
+  const execution = runTuiFixture({
+    scenario: "tool-multiple",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    await waitForPhysicalText(terminal, "Adam · Tool disclosure source session");
+    const durableStateBeforeDisclosure = await readFilesRecursively(stateRoot);
+    await inputAndWaitForPhysicalFrame(terminal, "\u000f");
+    expect(terminal.lines().join("\n")).toContain("Ctrl+O fold");
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[F");
+    await inputAndWaitForPhysicalFrame(terminal, "/resume");
+    await inputAndWaitForPhysicalFrame(terminal, "\r");
+    await waitForPhysicalText(terminal, "Select a project session");
+    await inputAndWaitForPhysicalFrame(terminal, "Tool disclosure switch session");
+    await inputAndWaitForPhysicalFrame(terminal, "\r");
+    await waitForPhysicalText(terminal, "Adam · Tool disclosure switch session");
+
+    await inputAndWaitForPhysicalFrame(terminal, "/resume");
+    await inputAndWaitForPhysicalFrame(terminal, "\r");
+    await waitForPhysicalText(terminal, "Select a project session");
+    await inputAndWaitForPhysicalFrame(terminal, "Tool disclosure source session");
+    await inputAndWaitForPhysicalFrame(terminal, "\r");
+    await waitForPhysicalText(terminal, "Adam · Tool disclosure source session");
+    await inputAndWaitForPhysicalFrame(terminal, "\u000f");
+    const screen = terminal.lines().join("\n");
+    expect(screen).toContain("read tool-3.txt · Ctrl+O fold");
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeDisclosure);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -5613,8 +5738,10 @@ test("tool subjects keep their full bounded value only in the 120-column layout"
 
     let beforeResize = fixture.output().length;
     await fixture.resize(120, 40);
-    let frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    const wideFrameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+    let frame = wideFrameLines.join("\n");
     expect(frame).toContain("bounded-secondary-provenance-and-wide-tail");
+    expect(wideFrameLines.find((line) => line.includes("$ printf"))).toContain("Ctrl+O expand");
 
     beforeResize = fixture.output().length;
     await fixture.resize(80, 24);
@@ -5624,7 +5751,14 @@ test("tool subjects keep their full bounded value only in the 120-column layout"
     expect(frameLines.find((line) => line.includes("$ printf"))).not.toContain(
       "bounded-secondary-provenance-and-wide-tail",
     );
+    expect(frameLines.find((line) => line.includes("$ printf"))).toContain("Ctrl+O expand");
     expect(frame).toContain("shell-card-fixture-with-bounded-secondary-provenance-and-wide-tail");
+
+    beforeResize = fixture.output().length;
+    await fixture.resize(40, 40);
+    await fixture.waitForAfter("\u001b[?2026l", beforeResize);
+    const narrowFrameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+    expect(narrowFrameLines.find((line) => line.includes("$ printf"))).toContain("Ctrl+O expand");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {

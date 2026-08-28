@@ -65,7 +65,7 @@ export class ToolPreview implements Component {
         ? [
             this.#expanded
               ? `${hiddenLines} projected lines omitted`
-              : `${hiddenLines} more projected lines · Ctrl+O expand`,
+              : `${hiddenLines} more projected lines`,
           ]
         : []),
       ...(preview.omittedBytes > 0
@@ -116,7 +116,7 @@ export class ToolPreview implements Component {
         ? [
             boundedLine(
               this.#theme.muted(
-                `… ${hiddenLines} more diff lines${this.#expanded ? " omitted" : " · Ctrl+O expand"}`,
+                `… ${hiddenLines} more diff lines${this.#expanded ? " omitted" : ""}`,
               ),
               width,
             ),
