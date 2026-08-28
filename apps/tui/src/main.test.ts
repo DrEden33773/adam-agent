@@ -570,7 +570,9 @@ function latestSynchronizedFrame(output: string): readonly string[] {
   const frame = output
     .slice(start + "\u001b[?2026h".length, end)
     .replace("\u001b[2J\u001b[H\u001b[3J", "");
-  const absoluteRows = [...frame.matchAll(new RegExp(`${"\u001b"}\\[(\\d+);1H`, "gu"))];
+  const absoluteRows = [
+    ...frame.matchAll(new RegExp(`${"\u001b"}\\[(\\d+);1H${"\u001b"}\\[2K`, "gu")),
+  ];
   if (absoluteRows.length === 0) {
     return frame.split("\r\n");
   }
@@ -580,13 +582,11 @@ function latestSynchronizedFrame(output: string): readonly string[] {
     const contentStart = (match.index ?? 0) + match[0].length;
     const contentEnd = absoluteRows[index + 1]?.index ?? frame.length;
     const content = frame.slice(contentStart, contentEnd);
-    if (content === "\u001b[2K") {
-      lines[row] = "";
-    } else if (content.length > 0) {
-      lines[row] = content.startsWith("\u001b[2K") ? content.slice("\u001b[2K".length) : content;
-    }
+    lines[row] = content
+      .replace(new RegExp(`${"\u001b"}\\[\\d+;\\d+H`, "gu"), "")
+      .replace(new RegExp(`${"\u001b"}\\[\\?25[hl]`, "gu"), "");
   }
-  return lines.map((line) => line ?? "");
+  return Array.from({ length: lines.length }, (_, index) => lines[index] ?? "");
 }
 
 function keywordLabel(text: string): string {
@@ -600,6 +600,15 @@ async function inputAndWaitForPhysicalFrame(
   const frame = terminal.frame;
   terminal.input(input);
   await terminal.nextFrame(frame);
+}
+
+async function waitForPhysicalText(
+  terminal: AppliedViewportTerminal,
+  expected: string,
+): Promise<void> {
+  while (!terminal.lines().join("\n").includes(expected)) {
+    await terminal.nextFrame(terminal.frame);
+  }
 }
 
 function expectFramedOverlay(output: string, title: string): void {
@@ -617,9 +626,9 @@ function expectFramedOverlay(output: string, title: string): void {
 }
 
 function lastAbsoluteCursorColumn(output: string): number | undefined {
-  const absoluteColumn = new RegExp(`${String.fromCharCode(27)}\\[(\\d+)G`, "gu");
+  const absoluteColumn = new RegExp(`${String.fromCharCode(27)}\\[(?:(\\d+)G|\\d+;(\\d+)H)`, "gu");
   return [...output.matchAll(absoluteColumn)]
-    .map((match) => Number.parseInt(match[1] as string, 10))
+    .map((match) => Number.parseInt((match[1] ?? match[2]) as string, 10))
     .at(-1);
 }
 
@@ -2716,6 +2725,37 @@ test("slash Tree opens a read-only browser over visible complete chronology boun
   }
 });
 
+test("read-only Tree selection focuses a loaded conversation without mutating durable chronology", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tree-focus-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 12 });
+  const execution = runTuiFixture({ scenario: "history", stateRoot, terminal, workspaceRoot });
+
+  try {
+    await terminal.nextFrame(0);
+    await waitForPhysicalText(terminal, "History answer.");
+    const durableStateBeforeFocus = await readFilesRecursively(stateRoot);
+    await inputAndWaitForPhysicalFrame(terminal, "/tree\r");
+    await waitForPhysicalText(terminal, "Active chronology · read only");
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[B");
+    await inputAndWaitForPhysicalFrame(terminal, "\r");
+    expect(terminal.lines().join("\n")).toContain("History prompt 2");
+    await inputAndWaitForPhysicalFrame(terminal, "\r");
+
+    expect(terminal.lines().join("\n")).not.toContain("Active chronology · read only");
+    expect(terminal.lines().join("\n")).toContain("History prompt 2");
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeFocus);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("prompt history navigation restores the exact draft after returning past newest", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-history-draft-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -2968,7 +3008,8 @@ test("Thinking selector keeps keyboard focus visible without color", async () =>
 
     const beforeClose = fixture.output().length;
     fixture.write("\u001b");
-    await fixture.waitForAfter("Next thinking High", beforeClose);
+    await fixture.waitForAfter("\u001b[?2026l", beforeClose);
+    expect(fixture.screen()?.join("\n")).toContain("Next thinking High");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -3044,14 +3085,14 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     await fixture.resize(40, 12);
     let lines = latestSynchronizedFrame(fixture.output().slice(beforeFrame));
     frame = lines.join("\n");
-    expect(frame).toContain("Inspect ");
+    expect(frame).toContain("▾ Thinking");
     expect(lines.every((line) => visibleWidth(line) <= 40)).toBe(true);
 
-    await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
-    await fixture.waitFor("Inspect the evidence.");
     beforeFrame = fixture.output().length;
+    await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
     await fixture.resize(120, 40);
-    lines = latestSynchronizedFrame(fixture.output().slice(beforeFrame));
+    await fixture.waitForAfter("Inspect the evidence.", beforeFrame);
+    lines = fixture.screen() ?? [];
     expect(lines.join("\n")).toContain("Inspect the evidence.");
     expect(lines.every((line) => visibleWidth(line) <= 120)).toBe(true);
 
@@ -3089,6 +3130,50 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("repeated completed reasoning folds keep the selected block visible without duplicating durable output", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-viewport-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 40, rows: 12 });
+  const execution = runTuiFixture({
+    controlRoot,
+    scenario: "reasoning-streaming",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("Reason before answering\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
+    await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
+    await waitForPhysicalText(terminal, "Reasoning answer.");
+    await waitForPhysicalText(terminal, "Adam · Streaming session");
+    const durableStateBeforeFolds = await readFilesRecursively(stateRoot);
+
+    for (let cycle = 0; cycle < 4; cycle += 1) {
+      await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+      expect(terminal.lines().join("\n")).toContain("▾ Thinking done · adam");
+      await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+      expect(terminal.lines().join("\n")).toContain("▸ Thinking done · adam");
+    }
+
+    const durableState = await readFilesRecursively(stateRoot);
+    expect(durableState).toBe(durableStateBeforeFolds);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -3192,12 +3277,13 @@ test("provider reasoning disclosure keeps explicit markers without color", async
     await fixture.resize(40, 12);
     const frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
     expect(frame).toContain("▾ Thinking");
-    expect(frame).toContain("Inspect ");
     expect(frame).not.toContain("\u001b[38;2;");
     expect(frame).not.toContain("\u001b[48;2;");
+    const beforeCompletion = fixture.output().length;
     await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await fixture.waitFor("Reasoning answer.");
+    await fixture.resize(80, 24);
+    await fixture.waitForAfter("Reasoning answer.", beforeCompletion);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -4001,18 +4087,26 @@ test("Ctrl+O toggles bounded authoritative tool details", async () => {
     expect(fixture.output()).not.toContain("provider model response");
     const beforeExpand = fixture.output().length;
     fixture.write("\u000f");
-    await fixture.waitForAfter("12 │ line12", beforeExpand);
-    await fixture.waitForAfter("read_file · read · completed · replay safe", beforeExpand);
-    await fixture.waitForAfter("provider model response", beforeExpand);
-    await fixture.waitForAfter("duration unavailable", beforeExpand);
+    await fixture.waitForAfter("\u001b[?2026l", beforeExpand);
+    let screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("12 │ line12");
+    const beforeDetails = fixture.output().length;
+    fixture.write("\u001b[6~");
+    await fixture.waitForAfter("\u001b[?2026l", beforeDetails);
+    screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("read_file · read · completed · replay safe");
+    expect(screen).toContain("provider model response");
+    expect(screen).toContain("duration unavailable");
     await fixture.resize(39, 11);
-    const beforeRestore = fixture.output().length;
     await fixture.resize(80, 24);
-    await fixture.waitForAfter("provider model response", beforeRestore);
+    screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("provider model response");
     const beforeCollapse = fixture.output().length;
     fixture.write("\u000f");
-    await fixture.waitForAfter("84 bytes", beforeCollapse);
-    expect(fixture.output().slice(beforeCollapse)).not.toContain("provider model response");
+    await fixture.waitForAfter("\u001b[?2026l", beforeCollapse);
+    screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("84 bytes");
+    expect(screen).not.toContain("provider model response");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {

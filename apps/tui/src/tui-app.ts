@@ -1,6 +1,7 @@
 import type {
   ActiveSessionDisplay,
   ArtifactReference,
+  BranchSourceBoundary,
   OperationDisplay,
   PresentationSession,
   PresentationTransientState,
@@ -24,8 +25,8 @@ import {
   Spacer,
   type Terminal,
   Text,
-  type TUI,
-  TuiMainScreen,
+  TuiAltScreen,
+  VStack,
 } from "@earendil-works/pi-tui";
 import {
   ArtifactNavigator,
@@ -69,6 +70,7 @@ import { TargetPicker } from "./target-picker.js";
 import { createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
 import { ToolPreview } from "./tool-preview.js";
+import { TranscriptViewport } from "./transcript-viewport.js";
 import { WorkspaceTrustPage } from "./workspace-trust-page.js";
 
 export type { ClipboardAdapter, DeadlineScheduler } from "./exit-policy.js";
@@ -100,7 +102,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     options.presentation.getState().authoritative.targets.defaultTargetId;
   let newSessionSelected =
     options.presentation.getState().authoritative.sessions.items.length === 0;
-  const tui: TUI = new TuiMainScreen(terminal, true);
+  const tui = new TuiAltScreen(terminal, true, undefined, { mouse: false });
   const theme = createAdamTuiTheme();
   const showOverlay = (component: Component, overlayOptions: OverlayOptions) => {
     const renderOptions = resolvePhysicalOverlayWidth(
@@ -123,7 +125,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     () => physicalTerminal.columns,
   );
   const header = new Text();
-  const transcript = new Container();
+  const transcriptViewport = new TranscriptViewport();
+  const transcript = transcriptViewport.document;
   const editorSlot = new Container();
   const createEditor = (active: ActiveSessionDisplay | null): Editor => {
     const created = new Editor(tui, theme.editor, { paddingX: 1 });
@@ -187,6 +190,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const legacyDuplicateGuard = new LegacyDuplicateGuard(deadlineScheduler);
   let previousRunActive: boolean | undefined;
   let toolDetailsExpanded = false;
+  let pendingOperationBaseline: {
+    readonly sessionId: string;
+    readonly operationIds: ReadonlySet<string>;
+  } | null = null;
   let statusMessage: string | null = options.startupNotice ?? null;
   let permission:
     | {
@@ -328,7 +335,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const expandedReasoningIds = new Set<string>();
   const reasoningArtifactReads = new Set<string>();
   const reasoningArtifactTexts = new Map<string, string>();
-  let previousActiveSessionId = options.presentation.getState().authoritative.active?.session.id;
+  let previousActiveSessionId: string | undefined;
   let sessionPickerDismissed = false;
   let sessionPickerRequested = false;
   let targetPickerDismissed = false;
@@ -337,14 +344,48 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let defaultTargetAttempted = false;
   let defaultTargetRejected = false;
   let startupTargetFailure: string | null = null;
-  root.addChild(header);
-  root.addChild(new Spacer(1));
-  root.addChild(transcript);
   editorSlot.addChild(editor);
-  root.addChild(editorSlot);
-  root.addChild(statusLine);
-  root.addChild(footer);
-  tui.addChild(root);
+  const supportedRoot = new VStack([
+    header,
+    {
+      component: new Spacer(1),
+      visible: (viewport) => viewport.height > 12,
+    },
+    {
+      component: transcriptViewport.scrollView,
+      basis: 0,
+      grow: 1,
+      minSize: 1,
+    },
+    {
+      component: new VStack([
+        editorSlot,
+        { component: statusLine, visible: () => statusMessage !== null },
+        footer,
+      ]),
+      basis: "auto",
+      minSize: 1,
+      shrink: 1,
+    },
+  ]);
+  tui.setLayoutRoot(
+    new VStack([
+      {
+        component: supportedRoot,
+        basis: 0,
+        grow: 1,
+        minSize: 1,
+        visible: () => terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows),
+      },
+      {
+        component: root,
+        basis: 0,
+        grow: 1,
+        minSize: 1,
+        visible: () => !terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows),
+      },
+    ]),
+  );
   tui.setFocus(editor);
 
   const synchronizePromptHistory = (active: ActiveSessionDisplay | null) => {
@@ -429,7 +470,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
     synchronizePromptHistory(active);
-    if (active?.session.id !== previousActiveSessionId) {
+    const activeSessionChanged = active?.session.id !== previousActiveSessionId;
+    if (activeSessionChanged) {
+      transcriptViewport.followEnd();
+      pendingOperationBaseline = null;
       expandedReasoningIds.clear();
       reasoningArtifactReads.clear();
       reasoningArtifactTexts.clear();
@@ -748,7 +792,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         )}`,
       ),
     );
-    transcript.clear();
+    transcriptViewport.clear();
     const visibleRunningOperations = new Set<string>();
     let activeReasoningVisible = false;
     const durableReasoningIds = new Set<string>();
@@ -773,9 +817,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       if (!expanded) {
         if (reasoning.status === "active") {
           transcript.addChild(thinking);
+          transcriptViewport.setAnchor(reasoningAnchorId(reasoning.id), thinking, 1);
         } else {
           transcript.addChild(new Spacer(1));
-          transcript.addChild(new ResponsiveLine(title));
+          const collapsed = new ResponsiveLine(title);
+          transcript.addChild(collapsed);
+          transcriptViewport.setAnchor(reasoningAnchorId(reasoning.id), collapsed);
         }
         return;
       }
@@ -793,9 +840,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       content.addChild(reasoning.status === "active" ? thinking : new ResponsiveLine(title));
       content.addChild(new Markdown(safeTerminalText(text), 0, 0, theme.markdown));
       transcript.addChild(new Spacer(1));
-      transcript.addChild(new RoundedFrame(content, theme.editor.borderColor));
+      const expandedFrame = new RoundedFrame(content, theme.editor.borderColor);
+      transcript.addChild(expandedFrame);
+      transcriptViewport.setAnchor(
+        reasoningAnchorId(reasoning.id),
+        expandedFrame,
+        reasoning.status === "active" ? 2 : 1,
+      );
     };
     let previousWasAssistant = false;
+    let currentPromptAnchor: Component | undefined;
     for (const item of active?.transcript.items ?? []) {
       if (item.type === "user_message") {
         if (previousWasAssistant) {
@@ -806,6 +860,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           new Text(theme.userText(`${theme.userMarker}${safeTerminalText(item.text)}`)),
         );
         transcript.addChild(user);
+        currentPromptAnchor = user;
         previousWasAssistant = false;
       } else if (item.type === "assistant_message") {
         transcript.addChild(new Spacer(1));
@@ -880,6 +935,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         }
         transcript.addChild(new Spacer(1));
         transcript.addChild(tool);
+        transcriptViewport.setAnchor(toolAnchorId(item.id), tool, 1);
         previousWasAssistant = false;
       } else if (item.type === "compaction_marker") {
         transcript.addChild(new Spacer(1));
@@ -931,23 +987,30 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           } else {
             card.addChild(new ResponsiveLine(theme.toolOutput(safeTerminalText(status))));
           }
-          card.addChild(new ResponsiveLine(theme.muted("Extension")));
+          const actions = operationActionText(operation);
+          if (actions.length > 0) {
+            card.addChild(new ResponsiveLine(theme.muted(actions)));
+          }
           card.addChild(
             new Text(
               theme.muted(
                 safeTerminalText(
-                  `${operation.provenance.extensionId}@${operation.provenance.extensionVersion}`,
+                  `Extension · ${operation.provenance.extensionId}@${operation.provenance.extensionVersion}`,
                 ),
               ),
             ),
           );
-          card.addChild(new ResponsiveLine(theme.muted("Contribution")));
           card.addChild(
-            new Text(theme.muted(safeTerminalText(operation.provenance.contributionId))),
+            new Text(
+              theme.muted(
+                safeTerminalText(`Contribution · ${operation.provenance.contributionId}`),
+              ),
+            ),
           );
-          card.addChild(new ResponsiveLine(theme.muted("Presentation")));
           card.addChild(
-            new ResponsiveLine(theme.muted(safeTerminalText(operation.provenance.presentation))),
+            new Text(
+              theme.muted(safeTerminalText(`Presentation · ${operation.provenance.presentation}`)),
+            ),
           );
           card.addChild(new ResponsiveLine(theme.muted("Operation ID")));
           card.addChild(new ResponsiveLine(theme.muted(safeTerminalText(operation.operationId))));
@@ -962,19 +1025,43 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
               ),
             );
           }
-          const actions = operationActionText(operation);
-          if (actions.length > 0) {
-            card.addChild(new ResponsiveLine(theme.muted(actions)));
-          }
         }
         transcript.addChild(card);
+        transcriptViewport.setAnchor(operationAnchorId(item.operationId), card, 1);
         previousWasAssistant = false;
+      }
+      if (item.branchBoundary !== null) {
+        const anchor = currentPromptAnchor ?? transcript.children.at(0);
+        if (anchor !== undefined) {
+          transcriptViewport.setAnchor(
+            chronologyAnchorId(item.branchBoundary),
+            anchor,
+            anchor === currentPromptAnchor ? 1 : 0,
+          );
+        }
       }
     }
     for (const [operationId, loader] of operationLoaders) {
       if (!visibleRunningOperations.has(operationId)) {
         loader.stop();
         operationLoaders.delete(operationId);
+      }
+    }
+    if (
+      pendingOperationBaseline !== null &&
+      active?.session.id === pendingOperationBaseline.sessionId
+    ) {
+      const operation = active.linkedOperations.findLast(
+        (candidate) => !pendingOperationBaseline?.operationIds.has(candidate.operationId),
+      );
+      if (operation !== undefined) {
+        pendingOperationBaseline = null;
+        transcriptViewport.focus(operationAnchorId(operation.operationId), terminal.columns);
+      }
+    } else if (activeSessionChanged && active !== null) {
+      const operation = active.linkedOperations.at(-1);
+      if (operation !== undefined) {
+        transcriptViewport.focus(operationAnchorId(operation.operationId), terminal.columns);
       }
     }
     const transientReasoning = state.transient?.reasoning;
@@ -1306,6 +1393,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       },
       onSelect(source) {
         if (mode === "read_only") {
+          close();
+          const anchorId = chronologyAnchorId(source.boundary);
+          let focused = transcriptViewport.focus(anchorId, terminal.columns);
+          if (!focused) {
+            renderState();
+            tui.renderNow();
+            focused = transcriptViewport.focus(anchorId, terminal.columns);
+          }
+          if (!focused) {
+            statusMessage = "The selected chronology boundary is no longer visible.";
+            renderState();
+          }
+          tui.renderNow(true);
           return;
         }
         const current = options.presentation.getState().authoritative.active;
@@ -1849,6 +1949,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       parsedCommand.command.extensionCommand !== undefined
     ) {
       const extensionCommand = parsedCommand.command.extensionCommand;
+      pendingOperationBaseline = {
+        sessionId: active.session.id,
+        operationIds: new Set(active.linkedOperations.map((operation) => operation.operationId)),
+      };
       void options.presentation
         .dispatch({
           type: "start_project_changes",
@@ -1861,14 +1965,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             editor.setText("");
             statusMessage = `${safeTerminalText(parsedCommand.command.summary)} admitted.`;
           } else {
+            pendingOperationBaseline = null;
             statusMessage = receipt.message;
           }
+          renderState();
         })
         .catch(() => {
+          pendingOperationBaseline = null;
           editor.disableSubmit = false;
           statusMessage = "The extension command could not be admitted safely.";
-        })
-        .finally(() => {
           renderState();
         });
       return;
@@ -2388,6 +2493,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         .then((receipt) => {
           if (receipt.status === "admitted") {
             editor.setText("");
+            renderState();
+            tui.renderNow();
+            const current = options.presentation.getState().authoritative.active;
+            const oldest =
+              current?.session.id === active.session.id
+                ? completeChronologyBoundaries(current.transcript.items).at(0)
+                : undefined;
+            if (oldest !== undefined) {
+              transcriptViewport.focus(chronologyAnchorId(oldest.boundary), terminal.columns);
+              tui.renderNow(true);
+            }
           } else {
             editor.disableSubmit = false;
           }
@@ -2481,6 +2597,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     const nextTarget = targetForState(state);
     const nextThinkingLevel = selectedThinkingLevel(nextTarget);
+    transcriptViewport.followEnd();
     void options.presentation
       .dispatch({
         type: "submit_prompt",
@@ -2609,6 +2726,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (commandRegistry.matchesInput(data, "toggle_tool_details")) {
       toolDetailsExpanded = !toolDetailsExpanded;
       renderState();
+      tui.renderNow();
+      const latestTool = options.presentation
+        .getState()
+        .authoritative.active?.transcript.items.findLast((item) => item.type === "tool_call");
+      if (latestTool !== undefined) {
+        transcriptViewport.focus(toolAnchorId(latestTool.id), terminal.columns);
+        tui.renderNow();
+      }
       return { consume: true };
     }
     if (
@@ -2628,6 +2753,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         );
       if (operation !== undefined) {
         clearExitWindow();
+        transcriptViewport.focus(operationAnchorId(operation.operationId), terminal.columns);
         statusMessage = "Recovering the linked operation from durable evidence…";
         renderState();
         void options.presentation
@@ -2660,6 +2786,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       if (expandedReasoningIds.delete(reasoning.id)) {
         renderState();
+        tui.renderNow();
+        transcriptViewport.focus(reasoningAnchorId(reasoning.id), terminal.columns);
+        tui.renderNow();
         return { consume: true };
       }
       expandedReasoningIds.add(reasoning.id);
@@ -2694,6 +2823,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         );
       }
       renderState();
+      tui.renderNow();
+      transcriptViewport.focus(reasoningAnchorId(reasoning.id), terminal.columns);
+      tui.renderNow();
       return { consume: true };
     }
     if (commandRegistry.matchesInput(data, "interrupt")) {
@@ -2718,6 +2850,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       );
       if (!runActive && !cancelSettling && cancellableOperation !== undefined) {
         clearExitWindow();
+        transcriptViewport.focus(
+          operationAnchorId(cancellableOperation.operationId),
+          terminal.columns,
+        );
         statusMessage = "Requesting cancellation of the linked operation…";
         renderState();
         void options.presentation
@@ -2823,6 +2959,22 @@ function parseConfigurationMutation(argumentsText: string): {
   }
   const value = Number(rawValue);
   return Number.isSafeInteger(value) ? { field, value } : null;
+}
+
+function reasoningAnchorId(reasoningId: string): string {
+  return `reasoning:${reasoningId}`;
+}
+
+function chronologyAnchorId(boundary: BranchSourceBoundary): string {
+  return `chronology:${boundary.sessionId}:${boundary.sequence}`;
+}
+
+function toolAnchorId(toolId: string): string {
+  return `tool:${toolId}`;
+}
+
+function operationAnchorId(operationId: string): string {
+  return `operation:${operationId}`;
 }
 
 function configurationFieldLabel(field: ConfigurationField): string {

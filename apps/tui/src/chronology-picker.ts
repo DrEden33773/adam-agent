@@ -91,7 +91,7 @@ export class ChronologyPicker implements Component {
           return;
         }
         const boundary = this.#boundaries.get(item.value);
-        if (boundary !== undefined && this.#mode === "fork") {
+        if (boundary !== undefined) {
           options.onSelect(boundary);
         }
       },
@@ -122,7 +122,7 @@ export class ChronologyPicker implements Component {
       "",
       this.#theme.muted(
         this.#mode === "read_only"
-          ? "type search · ↑/↓ inspect complete boundary · Enter load older · Esc close · Ctrl+Q exit"
+          ? "type search · Enter focus or load older · ↑/↓ move · Esc close · Ctrl+Q exit"
           : "type search · Enter fork or load older · ↑/↓ move · Esc close · Ctrl+Q exit",
       ),
     ];
