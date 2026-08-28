@@ -8,9 +8,12 @@ export type AdamCommandDefinition = {
   readonly availability: "always" | "idle";
   readonly id:
     | "artifacts"
+    | "attach"
+    | "cancelattach"
     | "clone"
     | "config"
     | "copy"
+    | "detach"
     | "diffs"
     | "exit"
     | "extension"
@@ -122,7 +125,11 @@ export class AdamCommandRegistry {
   argumentCompletions(
     commandName: string,
     argumentsText: string,
-    context: { readonly runActive: boolean; readonly thinkingLevelIds: readonly string[] },
+    context: {
+      readonly attachmentsAvailable?: boolean;
+      readonly runActive: boolean;
+      readonly thinkingLevelIds: readonly string[];
+    },
   ): AdamArgumentCompletionResolution {
     const command = this.#commandsByName.get(commandName);
     if (command === undefined || !finiteArgumentCommandIds.has(command.id)) {
@@ -179,7 +186,13 @@ export class AdamCommandRegistry {
       : { argumentsText, command, kind: "known" };
   }
 
-  isAvailable(command: AdamCommandDefinition, state: { readonly runActive: boolean }): boolean {
+  isAvailable(
+    command: AdamCommandDefinition,
+    state: { readonly attachmentsAvailable?: boolean; readonly runActive: boolean },
+  ): boolean {
+    if (composerCommandIds.has(command.id) && state.attachmentsAvailable === false) {
+      return false;
+    }
     return command.availability === "always" || !state.runActive;
   }
 
@@ -203,7 +216,37 @@ export class AdamCommandRegistry {
   }
 }
 
+const composerCommandIds = new Set<AdamCommandDefinition["id"]>([
+  "attach",
+  "detach",
+  "cancelattach",
+]);
+
 const builtInCommands: readonly AdamCommandDefinition[] = [
+  {
+    aliases: [],
+    availability: "idle",
+    id: "attach",
+    name: "attach",
+    summary: "Stage one exact local file as a linked input resource.",
+    usage: "/attach <path>",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "detach",
+    name: "detach",
+    summary: "Remove one staged input resource by its visible index.",
+    usage: "/detach <index>",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "cancelattach",
+    name: "cancelattach",
+    summary: "Cancel one copying input resource by its visible index.",
+    usage: "/cancelattach <index>",
+  },
   {
     aliases: [],
     availability: "always",

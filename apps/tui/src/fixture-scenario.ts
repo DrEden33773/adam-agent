@@ -10,6 +10,7 @@ export const fixtureScenarios = [
   "deadline",
   "draft-admission-cancellation",
   "history",
+  "input-resource-copying",
   "mcp-close-unconfirmed",
   "mutation",
   "mutation-long-preview",

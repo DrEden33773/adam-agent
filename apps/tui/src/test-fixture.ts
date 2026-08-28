@@ -27,6 +27,7 @@ import {
   preparedDirectDeepSeekV2ContextProfile,
   presentationArtifactReadBarrier,
   presentationHistoryPageSize,
+  turnComposerStageBarrier,
 } from "@adam-agent/agent/internal-testing";
 import type { PresentationSession } from "@adam-agent/presentation";
 import { ProcessTerminal, type Terminal } from "@earendil-works/pi-tui";
@@ -233,6 +234,18 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
 
   try {
     const previewBarrier = previewReadBarrier(options);
+    const composerBarrier =
+      options.scenario === "input-resource-copying" && options.controlRoot !== undefined
+        ? {
+            async afterOpen() {
+              await writeFile(
+                join(options.controlRoot as string, "input-resource-copying"),
+                "copying\n",
+              );
+              await waitForFile(options.controlRoot as string, "release-input-resource-copy");
+            },
+          }
+        : undefined;
     for (const seedTargetId of options.launch?.seedTargetIds ?? []) {
       const seeded = await lifecycle.create({
         targetIdentity: requireLaunchTargetIdentity(seedTargetId),
@@ -377,6 +390,9 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
             projectLabel: "workspace",
             stateRoot: options.stateRoot,
             workspaceRoot: options.workspaceRoot,
+            ...(composerBarrier === undefined
+              ? {}
+              : { [turnComposerStageBarrier]: composerBarrier }),
           }
         : options.scenario === "session-selection-history"
           ? {
@@ -392,6 +408,9 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
               projectLabel: "workspace",
               stateRoot: options.stateRoot,
               workspaceRoot: options.workspaceRoot,
+              ...(composerBarrier === undefined
+                ? {}
+                : { [turnComposerStageBarrier]: composerBarrier }),
             }
           : resumedSessionId === undefined
             ? {
@@ -410,6 +429,9 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
                 ...(previewBarrier === undefined
                   ? {}
                   : { [presentationArtifactReadBarrier]: previewBarrier }),
+                ...(composerBarrier === undefined
+                  ? {}
+                  : { [turnComposerStageBarrier]: composerBarrier }),
               }
             : {
                 lifecycle,
@@ -432,6 +454,9 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
                 ...(previewBarrier === undefined
                   ? {}
                   : { [presentationArtifactReadBarrier]: previewBarrier }),
+                ...(composerBarrier === undefined
+                  ? {}
+                  : { [turnComposerStageBarrier]: composerBarrier }),
               },
     );
     const clipboard = options.clipboard ?? clipboardAdapter(options);
@@ -1114,6 +1139,9 @@ function createFixtureModelTargets(options: {
         }
         yield { type: "text_delta", text: "Edit complete." };
       } else if (options.scenario === "cancellation") {
+        if (options.controlRoot !== undefined) {
+          await writeFile(join(options.controlRoot, "model-started"), "started\n", "utf8");
+        }
         await new Promise<void>((resolve) => {
           if (request.signal.aborted) {
             resolve();

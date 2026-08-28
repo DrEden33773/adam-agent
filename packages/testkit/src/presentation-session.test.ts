@@ -34,12 +34,14 @@ import {
   type OperationSnapshot,
   type OperationStore,
   type SessionLifecycle,
+  type ToolRegistry,
 } from "@adam-agent/agent";
 import {
   assemblePromptMessagesV1,
   createInMemorySessionStoreDirectory,
   createTrustedWorkspaceTrustForTesting,
   digestPromptRequestV1,
+  inputResourceIngestBarrier,
   mcpCatalogStaleDurableBarrier,
   mcpTransportFactory,
   openJsonlSessionStore,
@@ -58,6 +60,7 @@ import {
   sessionRuntimeNotificationTransform,
   sessionStoreDirectory,
   sessionTitleDeadlineScheduler,
+  turnComposerStageBarrier,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import {
@@ -807,6 +810,12 @@ test("PresentationSession opens an empty project catalog without creating a sess
         active: null,
       },
       draft: null,
+      composer: {
+        attachmentAvailable: false,
+        unavailableReason: "New session required for attachments",
+        sealed: false,
+        resources: [],
+      },
       transient: null,
     });
     expect(state.authoritative.project.id).toMatch(/^sha256:[0-9a-f]{64}$/u);
@@ -1011,6 +1020,729 @@ test("PresentationSession admits exact thinking choices for draft and active pro
   } finally {
     await presentation?.close();
     await fixture.close();
+  }
+});
+
+test("PresentationSession stages one draft resource before sealing the admitted turn", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-turn-composer-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "outside notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "sealed composer bytes\n", "utf8");
+  const copying = Promise.withResolvers<void>();
+  const releaseCopy = Promise.withResolvers<void>();
+  const requests: Parameters<ModelDriver["stream"]>[0][] = [];
+  const driver = new FakeModelDriver((request) => {
+    requests.push(request);
+    return [
+      { type: "text_delta", text: "Composer fixture answer." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  let sourceResolutionsDuringAdmission = 0;
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [inputResourceIngestBarrier]: {
+      afterResolved() {
+        sourceResolutionsDuringAdmission += 1;
+      },
+    },
+  });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    openProject: true,
+    projectLabel: "workspace",
+    stateRoot,
+    workspaceRoot,
+    [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    [turnComposerStageBarrier]: {
+      async afterOpen() {
+        copying.resolve();
+        await releaseCopy.promise;
+      },
+    },
+  });
+
+  try {
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    const stage = presentation.dispatch({ type: "stage_input_resource", path: selectedPath });
+    await expect(
+      Promise.race([
+        copying.promise.then(() => "copying" as const),
+        stage.then(() => "settled" as const),
+      ]),
+    ).resolves.toBe("copying");
+    expect(presentation.getState().composer).toMatchObject({
+      attachmentAvailable: true,
+      sealed: false,
+      resources: [{ displayName: "outside notes.txt", state: "copying" }],
+    });
+
+    releaseCopy.resolve();
+    await expect(stage).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer).toMatchObject({
+      attachmentAvailable: true,
+      sealed: false,
+      resources: [
+        {
+          byteCount: 22,
+          displayName: "outside notes.txt",
+          state: "ready",
+          support: "utf8_text",
+        },
+      ],
+    });
+    await rm(selectedPath);
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Read the linked notes only if needed.",
+        skills: [],
+        thinkingSelection: null,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(sourceResolutionsDuringAdmission).toBe(0);
+    expect(requests.at(0)?.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: "user",
+          content: expect.stringContaining('"displayName":"outside notes.txt"'),
+        }),
+      ]),
+    );
+    expect(presentation.getState().composer.resources).toEqual([]);
+  } finally {
+    releaseCopy.resolve();
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession removes a ready resource before sealing the draft", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-remove-resource-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "remove-me.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "must not be linked\n", "utf8");
+  const requests: Parameters<ModelDriver["stream"]>[0][] = [];
+  const driver = new FakeModelDriver((request) => {
+    requests.push(request);
+    return [
+      { type: "text_delta", text: "Removal fixture answer." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    openProject: true,
+    projectLabel: "workspace",
+    stateRoot,
+    workspaceRoot,
+    [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+  });
+
+  try {
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    await expect(
+      presentation.dispatch({ type: "stage_input_resource", path: selectedPath }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    const resourceId = presentation.getState().composer.resources[0]?.id;
+    if (resourceId === undefined) {
+      throw new Error("Expected one ready resource in the composer.");
+    }
+
+    await expect(
+      presentation.dispatch({ type: "remove_input_resource", resourceId }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer.resources).toEqual([]);
+
+    await presentation.dispatch({
+      type: "submit_draft_prompt",
+      text: "Send without the removed resource.",
+      skills: [],
+      thinkingSelection: null,
+    });
+    expect(requests.at(0)?.messages).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ content: expect.stringContaining("remove-me.txt") }),
+      ]),
+    );
+  } finally {
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession cancels a copying resource and excludes it from seal", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-cancel-resource-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "cancel-me.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "cancelled composer bytes\n", "utf8");
+  const copying = Promise.withResolvers<void>();
+  const releaseCopy = Promise.withResolvers<void>();
+  const modelTargets = settledModelTargets("Cancellation fixture answer.");
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    openProject: true,
+    projectLabel: "workspace",
+    stateRoot,
+    workspaceRoot,
+    [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    [turnComposerStageBarrier]: {
+      async afterOpen() {
+        copying.resolve();
+        await releaseCopy.promise;
+      },
+    },
+  });
+
+  try {
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    const stage = presentation.dispatch({ type: "stage_input_resource", path: selectedPath });
+    await copying.promise;
+    const resourceId = presentation.getState().composer.resources[0]?.id;
+    if (resourceId === undefined) {
+      throw new Error("Expected one copying resource in the composer.");
+    }
+
+    const cancellation = presentation.dispatch({
+      type: "cancel_input_resource",
+      resourceId,
+    });
+    expect(presentation.getState().composer.resources).toMatchObject([
+      { id: resourceId, state: "cancelled" },
+    ]);
+    releaseCopy.resolve();
+    await expect(cancellation).resolves.toMatchObject({ status: "admitted" });
+    await stage;
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Send after cancelling the resource.",
+        skills: [],
+        thinkingSelection: null,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer.resources).toEqual([]);
+  } finally {
+    releaseCopy.resolve();
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps a failed resource visible until a fresh selection replaces it", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-retry-resource-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "retry-notes.txt");
+  await mkdir(workspaceRoot);
+  let providerCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    providerCalls += 1;
+    return [
+      { type: "text_delta", text: "Retry fixture answer." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    openProject: true,
+    projectLabel: "workspace",
+    stateRoot,
+    workspaceRoot,
+    [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+  });
+
+  try {
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    await presentation.dispatch({ type: "stage_input_resource", path: selectedPath });
+    expect(presentation.getState().composer.resources).toMatchObject([
+      { displayName: "retry-notes.txt", state: "failed" },
+    ]);
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Do not send a failed selection.",
+        skills: [],
+        thinkingSelection: null,
+      }),
+    ).resolves.toMatchObject({ status: "rejected" });
+    expect(providerCalls).toBe(0);
+
+    const failedId = presentation.getState().composer.resources[0]?.id;
+    if (failedId === undefined) {
+      throw new Error("Expected the failed resource identity.");
+    }
+    await presentation.dispatch({ type: "remove_input_resource", resourceId: failedId });
+    await writeFile(selectedPath, "fresh retry bytes\n", "utf8");
+    await presentation.dispatch({ type: "stage_input_resource", path: selectedPath });
+    expect(presentation.getState().composer.resources).toMatchObject([
+      { displayName: "retry-notes.txt", state: "ready", support: "utf8_text" },
+    ]);
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Send the fresh selection.",
+        skills: [],
+        thinkingSelection: null,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(providerCalls).toBeGreaterThan(0);
+  } finally {
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession cancels stale copying work before publishing a newer draft", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-stale-resource-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "stale-notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "stale composer bytes\n", "utf8");
+  const copying = Promise.withResolvers<void>();
+  const aborted = Promise.withResolvers<void>();
+  const releaseCopy = Promise.withResolvers<void>();
+  const modelTargets = settledModelTargets();
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    openProject: true,
+    projectLabel: "workspace",
+    stateRoot,
+    workspaceRoot,
+    [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    [turnComposerStageBarrier]: {
+      async afterOpen({ signal }) {
+        copying.resolve();
+        await Promise.race([
+          new Promise<void>((resolve) => {
+            signal.addEventListener(
+              "abort",
+              () => {
+                aborted.resolve();
+                resolve();
+              },
+              { once: true },
+            );
+          }),
+          releaseCopy.promise,
+        ]);
+      },
+    },
+  });
+
+  try {
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    const staleStage = presentation.dispatch({
+      type: "stage_input_resource",
+      path: selectedPath,
+    });
+    await copying.promise;
+    const newerDraft = presentation.dispatch({
+      type: "create_session",
+      targetId: targetIdentity.targetId,
+    });
+
+    await expect(
+      Promise.race([
+        aborted.promise.then(() => "aborted" as const),
+        newerDraft.then(() => "switched" as const),
+      ]),
+    ).resolves.toBe("aborted");
+    releaseCopy.resolve();
+    await staleStage;
+    await expect(newerDraft).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer.resources).toEqual([]);
+  } finally {
+    releaseCopy.resolve();
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession rejects input-resource mutations after sealing the draft", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-sealed-resource-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "sealed-notes.txt");
+  const otherPath = join(testRoot, "other-notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "sealed composer bytes\n", "utf8");
+  await writeFile(otherPath, "must remain unstaged\n", "utf8");
+  const ingestOpened = Promise.withResolvers<void>();
+  const releaseIngest = Promise.withResolvers<void>();
+  const modelTargets = settledModelTargets("Sealed composer fixture answer.");
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [inputResourceIngestBarrier]: {
+      async afterOpened() {
+        ingestOpened.resolve();
+        await releaseIngest.promise;
+      },
+    },
+  });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    openProject: true,
+    projectLabel: "workspace",
+    stateRoot,
+    workspaceRoot,
+    [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+  });
+
+  try {
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    await presentation.dispatch({ type: "stage_input_resource", path: selectedPath });
+    const resourceId = presentation.getState().composer.resources[0]?.id;
+    if (resourceId === undefined) {
+      throw new Error("Expected one ready resource before sealing the draft.");
+    }
+
+    const submission = presentation.dispatch({
+      type: "submit_draft_prompt",
+      text: "Seal this exact resource selection.",
+      skills: [],
+      thinkingSelection: null,
+    });
+    await ingestOpened.promise;
+    expect(presentation.getState().composer.sealed).toBe(true);
+    await expect(
+      presentation.dispatch({ type: "stage_input_resource", path: otherPath }),
+    ).resolves.toMatchObject({ status: "rejected", code: "conflict" });
+    await expect(
+      presentation.dispatch({ type: "remove_input_resource", resourceId }),
+    ).resolves.toMatchObject({ status: "rejected", code: "conflict" });
+    await expect(
+      presentation.dispatch({ type: "cancel_input_resource", resourceId }),
+    ).resolves.toMatchObject({ status: "rejected", code: "conflict" });
+
+    releaseIngest.resolve();
+    await expect(submission).resolves.toMatchObject({ status: "admitted" });
+  } finally {
+    releaseIngest.resolve();
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession cancels resource staging while a turn is sealing", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-cancel-seal-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "slow-seal-notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "cancel before canonical admission\n", "utf8");
+  const copying = Promise.withResolvers<void>();
+  const aborted = Promise.withResolvers<void>();
+  const releaseCopy = Promise.withResolvers<void>();
+  const requests: Parameters<ModelDriver["stream"]>[0][] = [];
+  const driver = new FakeModelDriver((request) => {
+    requests.push(request);
+    return [
+      { type: "text_delta", text: "Cancellation fixture answer." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const created = await lifecycle.create({ targetIdentity });
+  await lifecycle.continue({ sessionId: created.sessionId, input: { text: "Initial turn." } });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    projectLabel: "workspace",
+    sessionId: created.sessionId,
+    stateRoot,
+    workspaceRoot,
+    [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    [turnComposerStageBarrier]: {
+      async afterOpen({ signal }) {
+        copying.resolve();
+        await Promise.race([
+          new Promise<void>((resolve) => {
+            signal.addEventListener(
+              "abort",
+              () => {
+                aborted.resolve();
+                resolve();
+              },
+              { once: true },
+            );
+          }),
+          releaseCopy.promise,
+        ]);
+      },
+    },
+  });
+
+  try {
+    const stage = presentation.dispatch({ type: "stage_input_resource", path: selectedPath });
+    await copying.promise;
+    const submission = presentation.dispatch({
+      type: "submit_prompt",
+      sessionId: created.sessionId,
+      text: "This turn must never be admitted.",
+      skills: [],
+      thinkingSelection: null,
+    });
+    expect(presentation.getState().composer.sealed).toBe(true);
+
+    await expect(
+      presentation.dispatch({ type: "cancel_run", sessionId: created.sessionId }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await aborted.promise;
+    releaseCopy.resolve();
+    await stage;
+    await expect(submission).resolves.toEqual({
+      status: "rejected",
+      code: "not_available",
+      message: "Input-resource sealing was cancelled.",
+    });
+    expect(requests.some((request) => JSON.stringify(request).includes("must never"))).toBe(false);
+    const records = (await (await harness.sessions.open(created.sessionId))?.read()) ?? [];
+    expect(records.some((record) => JSON.stringify(record).includes("must never"))).toBe(false);
+  } finally {
+    releaseCopy.resolve();
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession clears staged resources when selecting another session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-select-resource-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "session-local-notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "belongs only to the first session\n", "utf8");
+  const modelTargets = settledModelTargets("Session selection fixture answer.");
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const first = await lifecycle.create({ targetIdentity });
+  const second = await lifecycle.create({ targetIdentity });
+  await lifecycle.continue({
+    sessionId: first.sessionId,
+    input: { text: "First session." },
+  });
+  await lifecycle.continue({
+    sessionId: second.sessionId,
+    input: { text: "Second session." },
+  });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    projectLabel: "workspace",
+    sessionId: first.sessionId,
+    stateRoot,
+    workspaceRoot,
+    [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+  });
+
+  try {
+    await presentation.dispatch({ type: "stage_input_resource", path: selectedPath });
+    expect(presentation.getState().composer.resources).toHaveLength(1);
+
+    await expect(
+      presentation.dispatch({ type: "select_session", sessionId: second.sessionId }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer.resources).toEqual([]);
+  } finally {
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession keeps a historical six-tool session attachment-disabled", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-historical-attachments-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelTargets = settledModelTargets("Historical fixture answer.");
+  const currentTools = createCodingToolRegistry({ stateRoot, workspaceRoot });
+  const historicalTools: ToolRegistry = {
+    definitions: () =>
+      currentTools.definitions().filter((definition) => definition.name !== "read_input_resource"),
+    resolve(name) {
+      return name === "read_input_resource" ? undefined : currentTools.resolve(name);
+    },
+  };
+  const historicalLifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    tools: historicalTools,
+    workspaceRoot,
+  });
+  const created = await historicalLifecycle.create({ targetIdentity });
+  await historicalLifecycle.continue({
+    sessionId: created.sessionId,
+    input: { text: "Historical text-only session." },
+  });
+  await historicalLifecycle.close();
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    projectLabel: "workspace",
+    sessionId: created.sessionId,
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    expect(presentation.getState().composer).toMatchObject({
+      attachmentAvailable: false,
+      unavailableReason: "New session required for attachments",
+      resources: [],
+    });
+    await expect(
+      presentation.dispatch({ type: "stage_input_resource", path: join(testRoot, "ignored.txt") }),
+    ).resolves.toEqual({
+      status: "rejected",
+      code: "not_available",
+      message: "New session required for attachments",
+    });
+  } finally {
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession rejects a staged occurrence beyond the composer run bound", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-resource-count-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "bounded-notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "one bounded occurrence\n", "utf8");
+  const modelTargets = settledModelTargets("Resource-count fixture answer.");
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    openProject: true,
+    projectLabel: "workspace",
+    stateRoot,
+    workspaceRoot,
+    [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+  });
+
+  try {
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    for (let index = 0; index < 8; index += 1) {
+      await expect(
+        presentation.dispatch({ type: "stage_input_resource", path: selectedPath }),
+      ).resolves.toMatchObject({ status: "admitted" });
+    }
+    await expect(
+      presentation.dispatch({ type: "stage_input_resource", path: selectedPath }),
+    ).resolves.toMatchObject({ status: "rejected", code: "not_available" });
+    expect(presentation.getState().composer.resources).toHaveLength(8);
+  } finally {
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
   }
 });
 
@@ -2332,6 +3064,12 @@ test("PresentationSession opens an exact target as a process-local draft", async
         targetId: targetIdentity.targetId,
         projectPaths: expect.objectContaining({ items: [], omittedCount: 0 }),
         skills: expect.objectContaining({ items: [], reloadAvailable: false }),
+      },
+      composer: {
+        attachmentAvailable: true,
+        unavailableReason: null,
+        sealed: false,
+        resources: [],
       },
       transient: null,
     });

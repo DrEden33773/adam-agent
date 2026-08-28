@@ -15,6 +15,7 @@ type SkillCompletion = {
 
 export class AdamAutocompleteProvider implements AutocompleteProvider {
   readonly triggerCharacters = ["$"];
+  readonly #getAttachmentsAvailable: () => boolean;
   readonly #getProjectPaths: () => readonly string[];
   readonly #getRunActive: () => boolean;
   readonly #getSkills: () => readonly SkillCompletion[];
@@ -23,6 +24,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
   readonly #registry: AdamCommandRegistry;
 
   constructor(options: {
+    readonly getAttachmentsAvailable?: () => boolean;
     readonly getProjectPaths: () => readonly string[];
     readonly getRunActive: () => boolean;
     readonly getSkills: () => readonly SkillCompletion[];
@@ -30,6 +32,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     readonly keyword?: (text: string) => string;
     readonly registry?: AdamCommandRegistry;
   }) {
+    this.#getAttachmentsAvailable = options.getAttachmentsAvailable ?? (() => true);
     this.#getProjectPaths = options.getProjectPaths;
     this.#getRunActive = options.getRunActive;
     this.#getSkills = options.getSkills;
@@ -55,11 +58,12 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
       !beforeCursor.includes("\t")
     ) {
       const query = beforeCursor.slice(1);
-      const availableCommands = this.#registry
-        .entries()
-        .filter((command) =>
-          this.#registry.isAvailable(command, { runActive: this.#getRunActive() }),
-        );
+      const availableCommands = this.#registry.entries().filter((command) =>
+        this.#registry.isAvailable(command, {
+          attachmentsAvailable: this.#getAttachmentsAvailable(),
+          runActive: this.#getRunActive(),
+        }),
+      );
       const prefixMatches = availableCommands.filter(
         (command) =>
           command.name.startsWith(query) ||
@@ -97,10 +101,17 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
       const argumentsText = argumentMatch[2] ?? "";
       const runActive = this.#getRunActive();
       const parsed = this.#registry.parse(`/${commandName}`);
-      if (parsed.kind !== "known" || !this.#registry.isAvailable(parsed.command, { runActive })) {
+      if (
+        parsed.kind !== "known" ||
+        !this.#registry.isAvailable(parsed.command, {
+          attachmentsAvailable: this.#getAttachmentsAvailable(),
+          runActive,
+        })
+      ) {
         return Promise.resolve(null);
       }
       const resolution = this.#registry.argumentCompletions(commandName, argumentsText, {
+        attachmentsAvailable: this.#getAttachmentsAvailable(),
         runActive,
         thinkingLevelIds: this.#getThinkingLevelIds(),
       });

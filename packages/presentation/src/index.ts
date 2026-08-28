@@ -654,6 +654,20 @@ export type NewSessionDraftDisplay = {
   readonly projectPaths: ProjectPathCatalogDisplay;
 };
 
+export type TurnComposerDisplay = {
+  readonly attachmentAvailable: boolean;
+  readonly unavailableReason: string | null;
+  readonly sealed: boolean;
+  readonly resources: readonly {
+    readonly id: string;
+    readonly displayName: string;
+    readonly state: "queued" | "copying" | "ready" | "failed" | "cancelled" | "removed";
+    readonly byteCount: number | null;
+    readonly support: "unsupported_binary" | "utf8_text" | null;
+    readonly diagnostic: string | null;
+  }[];
+};
+
 export type AuthoritativePresentationSnapshot = {
   readonly schemaVersion: 1;
   readonly continuity:
@@ -692,6 +706,7 @@ export type PresentationDisplayState = {
   readonly revision: number;
   readonly authoritative: AuthoritativePresentationSnapshot;
   readonly draft: NewSessionDraftDisplay | null;
+  readonly composer: TurnComposerDisplay;
   readonly transient: PresentationTransientState | null;
 };
 
@@ -850,6 +865,18 @@ export type PresentationCommand =
       readonly thinkingSelection: ThinkingPolicySelectionDisplay | null;
     }
   | {
+      readonly type: "stage_input_resource";
+      readonly path: string;
+    }
+  | {
+      readonly type: "update_draft_text";
+      readonly text: string;
+    }
+  | {
+      readonly type: "remove_input_resource" | "cancel_input_resource";
+      readonly resourceId: string;
+    }
+  | {
       readonly type: "cancel_run";
       readonly sessionId: string | null;
     }
@@ -899,6 +926,7 @@ export function reconcilePresentationUpdate(
       revision: state.revision + 1,
       authoritative: update.snapshot,
       draft: update.snapshot.active === null ? state.draft : null,
+      composer: state.composer,
       transient: null,
     };
   }
@@ -914,6 +942,7 @@ export function reconcilePresentationUpdate(
         continuity: { status: "repairing", reason: "gap" },
       },
       draft: state.draft,
+      composer: state.composer,
       transient: null,
     };
   }
@@ -923,6 +952,7 @@ export function reconcilePresentationUpdate(
       revision: state.revision + 1,
       authoritative: state.authoritative,
       draft: state.draft,
+      composer: state.composer,
       transient: {
         activity: state.transient?.activity ?? "working",
         assistant: state.transient?.assistant ?? null,
@@ -935,6 +965,7 @@ export function reconcilePresentationUpdate(
     revision: state.revision + 1,
     authoritative: state.authoritative,
     draft: state.draft,
+    composer: state.composer,
     transient: {
       activity: "replying",
       assistant: {

@@ -105,3 +105,7 @@ export {
   type SessionV3Record,
 } from "./session-store.js";
 export { createCodingToolRegistryForTesting } from "./tool-runtime.js";
+export {
+  type TurnComposerStageBarrier,
+  turnComposerStageBarrier,
+} from "./turn-composer.js";

@@ -480,13 +480,21 @@ test("minimum-size Ctrl+C still aborts one active run without arming exit", asyn
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-minimum-abort-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
   await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
 
   try {
-    const fixture = startFixture({ scenario: "cancellation", stateRoot, workspaceRoot });
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "cancellation",
+      stateRoot,
+      workspaceRoot,
+    });
     await fixture.waitFor("Adam · New session");
     fixture.write("Cancel from minimum mode\r");
     await fixture.waitFor("Working");
+    await waitForPath(join(controlRoot, "model-started"));
     await fixture.resize(39, 11);
     fixture.write("\u0003");
     const beforeRestore = fixture.output().length;
@@ -726,7 +734,12 @@ test("the production TUI selects an exact available target before creating an em
   await mkdir(workspaceRoot);
 
   try {
-    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    const fixture = startFixture({
+      launch: {},
+      scenario: "provider-no-usage",
+      stateRoot,
+      workspaceRoot,
+    });
     await fixture.waitForCompleteFrameAfter("Select an exact model target", 0);
     expectFramedOverlay(fixture.output(), "Select an exact model target");
     await fixture.waitFor("deepseek-v4-flash.direct");
@@ -954,6 +967,180 @@ test("the production TUI keeps an edited new-session draft out of persistence un
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).toContain("deepseek-v4-flash.direct · Certified");
     expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI stages and sends one linked input resource", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-linked-input-resource-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const selectedPath = join(testRoot, "outside-notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "linked TUI bytes\n", "utf8");
+
+  try {
+    const fixture = startFixture({
+      launch: {},
+      scenario: "provider-no-usage",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    const beforeAttach = fixture.output().length;
+    fixture.write(`/attach ${selectedPath}\r`);
+    await expect(
+      Promise.race([
+        fixture
+          .waitForCompleteFrameAfter("ready · outside-notes.txt · 17 bytes", beforeAttach)
+          .then(() => "ready" as const),
+        fixture
+          .waitForAfter("Unknown command /attach", beforeAttach)
+          .then(() => "unknown" as const),
+      ]),
+    ).resolves.toBe("ready");
+
+    const beforePrompt = fixture.output().length;
+    fixture.write("Use the linked notes if needed.\r");
+    await fixture.waitForAfter("Provider usage unavailable.", beforePrompt);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const durable = await readFilesRecursively(stateRoot);
+    expect(durable).toContain('"displayName":"outside-notes.txt"');
+    expect(durable).not.toContain(selectedPath);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI removes a ready linked input resource by its visible index", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-remove-input-resource-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const selectedPath = join(testRoot, "discard-notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "discard these bytes\n", "utf8");
+
+  try {
+    const fixture = startFixture({
+      launch: {},
+      scenario: "provider-no-usage",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write(`/attach ${selectedPath}\r`);
+    await fixture.waitFor("ready · discard-notes.txt · 20 bytes");
+
+    const beforeRemove = fixture.output().length;
+    fixture.write("/detach 1\r");
+    await expect(
+      Promise.race([
+        fixture
+          .waitForAfter("Input resource removed.", beforeRemove)
+          .then(() => "removed" as const),
+        fixture
+          .waitForAfter("Unknown command /detach", beforeRemove)
+          .then(() => "unknown" as const),
+      ]),
+    ).resolves.toBe("removed");
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("discard-notes.txt");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI cancels a copying input resource by its visible index", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-cancel-input-resource-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  const selectedPath = join(testRoot, "slow-notes.txt");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  await writeFile(selectedPath, "slow linked bytes\n", "utf8");
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      launch: {},
+      scenario: "input-resource-copying",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write(`/attach ${selectedPath}\r`);
+    await waitForPath(join(controlRoot, "input-resource-copying"));
+    await fixture.waitFor("copying · slow-notes.txt · size pending");
+
+    const beforeCancel = fixture.output().length;
+    fixture.write("/cancelattach 1\r");
+    await expect(
+      Promise.race([
+        fixture
+          .waitForAfter("cancelled · slow-notes.txt", beforeCancel)
+          .then(() => "cancelled" as const),
+        fixture
+          .waitForAfter("Unknown command /cancelattach", beforeCancel)
+          .then(() => "unknown" as const),
+      ]),
+    ).resolves.toBe("cancelled");
+    await writeFile(join(controlRoot, "release-input-resource-copy"), "release\n", "utf8");
+    await fixture.waitFor("Input resource cancelled.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await writeFile(join(controlRoot, "release-input-resource-copy"), "release\n", "utf8").catch(
+      () => undefined,
+    );
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("linked input resources stay sanitized, colorless, and bounded at supported widths", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-safe-input-resource-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const selectedPath = join(testRoot, "unsafe\u0085name.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "safe display bytes\n", "utf8");
+
+  try {
+    const fixture = startFixture({
+      launch: {},
+      noColor: true,
+      scenario: "provider-no-usage",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write(`/attach ${selectedPath}\r`);
+    await fixture.waitFor("ready · unsafe�name.txt · 19 bytes");
+
+    for (const columns of [40, 80, 120]) {
+      const beforeResize = fixture.output().length;
+      await fixture.resize(columns, 40);
+      const frame = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+      expect(frame.join("\n")).toContain("Linked input resources");
+      expect(frame.join("\n")).not.toContain("\u0085");
+      expect(frame.join("\n")).not.toContain("\u001b[38;2;");
+      expect(frame.join("\n")).not.toContain("\u001b[48;2;");
+      expect(frame.every((line) => visibleWidth(line) <= columns)).toBe(true);
+    }
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -6163,13 +6350,21 @@ test("Ctrl+C cancels one active run and repeated input cannot arm exit while set
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-cancel-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
   await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
 
   try {
-    const fixture = startFixture({ scenario: "cancellation", stateRoot, workspaceRoot });
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "cancellation",
+      stateRoot,
+      workspaceRoot,
+    });
     await fixture.waitFor("Adam · New session");
     fixture.write("Cancel this run\r");
     await fixture.waitFor("Working");
+    await waitForPath(join(controlRoot, "model-started"));
     fixture.write("\u0003\u0003");
     await fixture.waitFor("cancelled");
     expect(fixture.output()).not.toContain("Press Ctrl+C again");

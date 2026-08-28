@@ -36,7 +36,11 @@ import {
 } from "./artifact-navigator.js";
 import { ChronologyPicker, completeChronologyBoundaries } from "./chronology-picker.js";
 import { AdamAutocompleteProvider } from "./command-autocomplete.js";
-import { type AdamCommandRegistry, adamCommandRegistry } from "./command-registry.js";
+import {
+  type AdamCommandParseResult,
+  type AdamCommandRegistry,
+  adamCommandRegistry,
+} from "./command-registry.js";
 import { type ConfigurationField, ConfigurationPage } from "./configuration-page.js";
 import {
   type ClipboardAdapter,
@@ -241,6 +245,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const created = new Editor(tui, theme.editor, { paddingX: 1 });
     created.setAutocompleteProvider(
       new AdamAutocompleteProvider({
+        getAttachmentsAvailable: () => options.presentation.getState().composer.attachmentAvailable,
         getProjectPaths: () =>
           options.presentation.getState().authoritative.active?.projectPaths.items ??
           options.presentation.getState().draft?.projectPaths.items ??
@@ -1279,6 +1284,33 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         transcriptViewport.focus(operationAnchorId(operation.operationId), terminal.columns);
       }
     }
+    if (state.composer.resources.length > 0) {
+      transcript.addChild(new Spacer(1));
+      const resources = new Box(1, 1, theme.toolBackground);
+      resources.addChild(new ResponsiveLine(theme.toolTitle("Linked input resources")));
+      for (const [index, resource] of state.composer.resources.entries()) {
+        const size = resource.byteCount === null ? "size pending" : `${resource.byteCount} bytes`;
+        const support = resource.support === null ? "support pending" : resource.support;
+        resources.addChild(
+          new ResponsiveLine(
+            theme.toolOutput(
+              safeTerminalText(
+                `${index + 1} · ${resource.state} · ${resource.displayName} · ${size} · ${support}`,
+              ),
+            ),
+          ),
+        );
+        if (resource.diagnostic !== null) {
+          resources.addChild(
+            new ResponsiveLine(theme.muted(safeTerminalText(resource.diagnostic))),
+          );
+        }
+      }
+      resources.addChild(
+        new ResponsiveLine(theme.muted("/detach <index> · /cancelattach <index>")),
+      );
+      transcript.addChild(resources);
+    }
     const transientReasoning = state.transient?.reasoning;
     if (
       transientReasoning !== null &&
@@ -1545,6 +1577,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     tui.requestRender();
   };
   editor.onChange = () => {
+    void options.presentation.dispatch({
+      type: "update_draft_text",
+      text: editor.getExpandedText(),
+    });
     if (statusNotice?.lifetime === "until_edit" || statusNotice?.lifetime === "until_next_action") {
       clearNotice();
       renderState();
@@ -2110,6 +2146,139 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     editor.setText("");
     stopFromCommand?.();
   };
+  const handleAttachCommand = (path: string, sessionId?: string): void => {
+    const composer = options.presentation.getState().composer;
+    if (path.length === 0) {
+      showNotice("warning", "Usage: /attach <path>", "until_edit", sessionId);
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    if (!composer.attachmentAvailable) {
+      showNotice(
+        "warning",
+        composer.unavailableReason ?? "Input resources are unavailable for this session.",
+        "until_edit",
+        sessionId,
+      );
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    editor.setText("");
+    editor.disableSubmit = false;
+    const actionId = showNotice("progress", "Staging input resource…", "until_replaced", sessionId);
+    void options.presentation
+      .dispatch({ type: "stage_input_resource", path })
+      .then((receipt) => {
+        if (receipt.status === "admitted") {
+          settleNotice(
+            actionId,
+            "success",
+            "Input resource staged.",
+            "until_next_action",
+            sessionId,
+          );
+        } else {
+          settleNotice(actionId, "error", receipt.message, "until_edit", sessionId);
+        }
+      })
+      .catch(() => {
+        settleNotice(
+          actionId,
+          "error",
+          "The selected input resource could not be staged.",
+          "until_edit",
+          sessionId,
+        );
+      })
+      .finally(() => {
+        renderState();
+      });
+    renderState();
+  };
+  const handleStagedResourceCommand = (command: {
+    readonly action: "remove_input_resource" | "cancel_input_resource";
+    readonly failure: string;
+    readonly indexText: string;
+    readonly progress: string;
+    readonly sessionId: string | undefined;
+    readonly success: string;
+    readonly usage: string;
+  }): void => {
+    const index = Number(command.indexText);
+    const resource = options.presentation.getState().composer.resources[index - 1];
+    if (!Number.isSafeInteger(index) || index < 1 || resource === undefined) {
+      showNotice("warning", command.usage, "until_edit", command.sessionId);
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    editor.setText("");
+    const actionId = showNotice("progress", command.progress, "until_replaced", command.sessionId);
+    void options.presentation
+      .dispatch({ type: command.action, resourceId: resource.id })
+      .then((receipt) => {
+        if (receipt.status === "admitted") {
+          settleNotice(
+            actionId,
+            "success",
+            command.success,
+            "until_next_action",
+            command.sessionId,
+          );
+        } else {
+          settleNotice(actionId, "error", receipt.message, "until_edit", command.sessionId);
+        }
+      })
+      .catch(() => {
+        settleNotice(actionId, "error", command.failure, "until_edit", command.sessionId);
+      })
+      .finally(() => {
+        editor.disableSubmit = false;
+        renderState();
+      });
+  };
+  const handleDetachCommand = (indexText: string, sessionId?: string): void => {
+    handleStagedResourceCommand({
+      action: "remove_input_resource",
+      failure: "The input resource could not be removed.",
+      indexText,
+      progress: "Removing input resource…",
+      sessionId,
+      success: "Input resource removed.",
+      usage: "Usage: /detach <visible-index>",
+    });
+  };
+  const handleCancelAttachmentCommand = (indexText: string, sessionId?: string): void => {
+    handleStagedResourceCommand({
+      action: "cancel_input_resource",
+      failure: "The input resource could not be cancelled.",
+      indexText,
+      progress: "Cancelling input resource…",
+      sessionId,
+      success: "Input resource cancelled.",
+      usage: "Usage: /cancelattach <visible-index>",
+    });
+  };
+  const handleAttachmentCommand = (parsed: AdamCommandParseResult, sessionId?: string): boolean => {
+    if (parsed.kind !== "known") {
+      return false;
+    }
+    if (parsed.command.id === "attach") {
+      handleAttachCommand(parsed.argumentsText, sessionId);
+      return true;
+    }
+    if (parsed.command.id === "detach") {
+      handleDetachCommand(parsed.argumentsText, sessionId);
+      return true;
+    }
+    if (parsed.command.id === "cancelattach") {
+      handleCancelAttachmentCommand(parsed.argumentsText, sessionId);
+      return true;
+    }
+    return false;
+  };
   editor.onSubmit = (text) => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
@@ -2136,6 +2305,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       if (parsedDraft.kind === "known" && parsedDraft.command.id === "trust") {
         handleWorkspaceTrustCommand(parsedDraft.argumentsText);
+        return;
+      }
+      if (handleAttachmentCommand(parsedDraft)) {
         return;
       }
       if (
@@ -2300,11 +2472,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     if (
       parsedCommand.kind === "known" &&
-      !commandRegistry.isAvailable(parsedCommand.command, { runActive })
+      !commandRegistry.isAvailable(parsedCommand.command, {
+        attachmentsAvailable: state.composer.attachmentAvailable,
+        runActive,
+      })
     ) {
+      const attachmentUnavailable =
+        parsedCommand.command.id === "attach" ||
+        parsedCommand.command.id === "detach" ||
+        parsedCommand.command.id === "cancelattach";
       showNotice(
         "warning",
-        `/${parsedCommand.command.name} is unavailable while a run is active.`,
+        attachmentUnavailable
+          ? (state.composer.unavailableReason ??
+              "Input resources are unavailable for this session.")
+          : `/${parsedCommand.command.name} is unavailable while a run is active.`,
         "until_edit",
         active.session.id,
       );
@@ -2770,6 +2952,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         .finally(() => {
           tui.requestRender();
         });
+      return;
+    }
+    if (handleAttachmentCommand(parsedCommand, active.session.id)) {
       return;
     }
     if (

@@ -33,9 +33,9 @@ import {
 import {
   InputResourceError,
   type InputResourceOccurrenceV1,
+  type InputResourceSelectionV1,
   ingestLocalInputResourcesV1,
   inputResourceLimitsV1,
-  type LocalInputResourceSelectionV1,
 } from "./input-resources.js";
 import {
   createMcpRuntimeHost,
@@ -480,7 +480,7 @@ export type SessionCommand =
       readonly runId?: string;
       readonly signal?: AbortSignal;
       readonly thinkingSelection?: ThinkingPolicySelectionV1;
-      readonly resourceSelections?: readonly LocalInputResourceSelectionV1[];
+      readonly resourceSelections?: readonly InputResourceSelectionV1[];
     }
   | ({
       readonly type: "branch";
@@ -497,7 +497,7 @@ export interface SessionLifecycle {
     readonly runId?: string;
     readonly signal?: AbortSignal;
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
-    readonly resourceSelections?: readonly LocalInputResourceSelectionV1[];
+    readonly resourceSelections?: readonly InputResourceSelectionV1[];
     readonly onAdmitted?: (receipt: SessionAdmissionReceipt) => void;
   }): Promise<SessionContinueResult>;
   branch(input: SessionBranchInput): Promise<CurrentSessionSnapshot>;
@@ -509,7 +509,7 @@ export interface SessionLifecycle {
     readonly runId?: string;
     readonly signal?: AbortSignal;
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
-    readonly resourceSelections?: readonly LocalInputResourceSelectionV1[];
+    readonly resourceSelections?: readonly InputResourceSelectionV1[];
   }): Promise<SessionContinueResult>;
   configureMcp(command: McpConfigurationCommand): Promise<McpConfigurationResult>;
   configureWorkspaceTrust(
@@ -2767,14 +2767,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             readonly [sessionDurableOutputLimits]?: AgentSessionDurableOutputLimits;
           }
         )[sessionDurableOutputLimits];
-        const artifactStore = await createFileArtifactStore({
-          root: join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
-        });
+        const artifactRoot = join(effectiveSessionStateRoot(options.stateRoot), "artifacts");
+        const artifactStore = await createFileArtifactStore({ root: artifactRoot });
         await validateVisibleInputResourceArtifacts(artifactStore, visibleInputResources);
         const inputResources =
           input.resourceSelections === undefined
             ? []
             : await ingestLocalInputResourcesV1({
+                artifactRoot,
                 artifactStore,
                 ...(options[inputResourceIngestBarrier]?.afterResolved === undefined
                   ? {}
@@ -6406,7 +6406,7 @@ async function materializeModelResponseArtifacts(
   return { contents, logicalReferencedBytes, records: materialized };
 }
 
-function effectiveSessionStateRoot(configured: string | undefined): string {
+export function effectiveSessionStateRoot(configured: string | undefined): string {
   if (configured !== undefined) {
     return configured;
   }
