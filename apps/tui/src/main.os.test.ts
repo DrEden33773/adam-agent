@@ -734,7 +734,7 @@ test("the production TUI reviews real Git changes through the exact public Eve a
       "eve-reviewer.local-worktree-review@1",
       beforeRestartResize,
     );
-    const restartedFrame = resumed.output().slice(beforeRestartResize);
+    const restartedFrame = resumed.screen()?.join("\n") ?? "";
     expect(restartedFrame.match(/eve-reviewer\.local-worktree-review@1/gu) ?? []).toHaveLength(1);
     expect(restartedFrame).toContain("Report · eve-reviewer.review-result@1");
     resumed.write("\u0011");
