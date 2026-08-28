@@ -806,6 +806,15 @@ function observeTuiDispatch(
         );
         return settled;
       }
+      if (command.type === "clear_session_manual_name" && controlRoot !== undefined) {
+        const settled = await receipt;
+        await writeFile(
+          join(controlRoot, "clear-session-name-dispatch-settled"),
+          `${settled.status}\n`,
+          "utf8",
+        );
+        return settled;
+      }
       if (!observeDispatch) {
         return receipt;
       }

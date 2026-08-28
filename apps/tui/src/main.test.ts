@@ -4626,24 +4626,30 @@ test("the production editor clears a manual session name through canonical Prese
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-clear-name-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
   await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
 
   try {
-    const fixture = startFixture({ stateRoot, workspaceRoot });
+    const fixture = startFixture({ controlRoot, stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     fixture.write("/name Temporary name\r");
     await fixture.waitFor("Adam · Temporary name");
     const beforeClear = fixture.output().length;
     fixture.write("/name --");
     await fixture.waitForCompleteFrameAfter("--generate", beforeClear);
-    fixture.write("\t\r");
-    const outcome = await Promise.race([
-      fixture.waitForAfter("Adam · New session", beforeClear).then(() => "cleared" as const),
-      fixture.waitForAfter("Adam · --clear", beforeClear).then(() => "literal" as const),
-    ]);
+    fixture.write("\t");
+    await fixture.resize(81, 24);
+    await fixture.waitForCompleteFrameAfter("/name --clear", beforeClear);
+    const beforeSubmit = fixture.output().length;
+    fixture.write("\r");
+    await expect(
+      waitForFileContents(join(controlRoot, "clear-session-name-dispatch-settled"), "admitted\n"),
+    ).resolves.toBe("admitted\n");
+    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeSubmit);
     fixture.write("\u0011");
     await fixture.closed;
-    expect(outcome).toBe("cleared");
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("Adam · --clear");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
