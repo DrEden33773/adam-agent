@@ -100,6 +100,14 @@ export type RunTuiOptions = {
   readonly mouse?: boolean;
 };
 
+type TuiNotice = {
+  readonly actionId: number;
+  readonly kind: "error" | "info" | "progress" | "success" | "warning";
+  readonly lifetime: "until_edit" | "until_next_action" | "until_replaced";
+  readonly sessionId?: string;
+  readonly text: string;
+};
+
 export async function runTui(options: RunTuiOptions): Promise<void> {
   const physicalTerminal = options.terminal ?? new ProcessTerminal();
   const terminal = new RightEdgeGuardTerminal(physicalTerminal);
@@ -110,18 +118,92 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     options.presentation.getState().authoritative.targets.defaultTargetId;
   let newSessionSelected =
     options.presentation.getState().authoritative.sessions.items.length === 0;
-  let statusMessage: string | null = options.startupNotice ?? null;
+  let noticeActionId = 0;
+  let statusNotice: TuiNotice | null = null;
+  const beginNoticeAction = (): number => {
+    noticeActionId += 1;
+    statusNotice = null;
+    return noticeActionId;
+  };
+  const showNotice = (
+    kind: TuiNotice["kind"],
+    text: string,
+    lifetime: TuiNotice["lifetime"],
+    sessionId?: string,
+  ): number => {
+    const actionId = beginNoticeAction();
+    statusNotice = {
+      actionId,
+      kind,
+      lifetime,
+      ...(sessionId === undefined ? {} : { sessionId }),
+      text,
+    };
+    return actionId;
+  };
+  const settleNotice = (
+    actionId: number,
+    kind: TuiNotice["kind"],
+    text: string,
+    lifetime: TuiNotice["lifetime"],
+    sessionId?: string,
+  ): boolean => {
+    if (
+      actionId !== noticeActionId ||
+      (sessionId !== undefined &&
+        options.presentation.getState().authoritative.active?.session.id !== sessionId)
+    ) {
+      return false;
+    }
+    statusNotice = {
+      actionId,
+      kind,
+      lifetime,
+      ...(sessionId === undefined ? {} : { sessionId }),
+      text,
+    };
+    return true;
+  };
+  const settleNoticeClear = (actionId: number): boolean => {
+    if (actionId !== noticeActionId) {
+      return false;
+    }
+    beginNoticeAction();
+    return true;
+  };
+  const clearNotice = (): void => {
+    beginNoticeAction();
+  };
+  if (options.startupNotice !== undefined) {
+    showNotice("info", options.startupNotice, "until_replaced");
+  }
   let requestPolicyRender: () => void = () => undefined;
   const tui = new TuiAltScreen(terminal, true, undefined, {
     mouse: options.mouse ?? true,
     async copySelection(text) {
+      const actionId = beginNoticeAction();
       const result = await copySelectionToClipboard(text, options.clipboard, deadlineScheduler);
       if (result === "too_large") {
-        statusMessage = "Selection is larger than 1 MiB and was not copied.";
+        settleNotice(
+          actionId,
+          "warning",
+          "Selection is larger than 1 MiB and was not copied.",
+          "until_edit",
+        );
       } else if (result === "unsupported") {
-        statusMessage = "Clipboard unavailable; selection was not copied.";
+        settleNotice(
+          actionId,
+          "error",
+          "Clipboard unavailable; selection was not copied.",
+          "until_edit",
+        );
       } else if (result === "failed") {
-        statusMessage = "Clipboard copy failed; selection was not copied.";
+        settleNotice(
+          actionId,
+          "error",
+          "Clipboard copy failed; selection was not copied.",
+          "until_edit",
+        );
       }
       if (result !== "copied") {
         requestPolicyRender();
@@ -204,13 +286,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let projectedHistorySessionId = options.presentation.getState().authoritative.active?.session.id;
   const statusLine = new Text();
   const footer = new ResponsiveText(() => physicalTerminal.columns);
-  const viewportHintLine = new ResponsiveText(() => physicalTerminal.columns);
-  viewportHintLine.setText({
-    wide: theme.muted("Wheel/PageUp/PageDown scroll · Ctrl+T fold"),
-    standard: theme.muted("Wheel/PageUp/PageDown scroll · Ctrl+T fold"),
-    narrow: theme.muted("Wheel/PgUp/PgDn · Ctrl+T"),
-  });
-  let viewportHintVisible = false;
   const working = new Loader(tui, theme.toolTitle, theme.muted, "Working", { intervalMs: 80 });
   const thinking = new Loader(tui, theme.keyword, theme.muted, "Thinking", { intervalMs: 80 });
   thinking.stop();
@@ -421,12 +496,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     {
       component: new VStack([
         editorSlot,
-        { component: statusLine, visible: () => statusMessage !== null },
-        footer,
         {
-          component: viewportHintLine,
-          visible: (viewport) => viewport.height >= 18 && viewportHintVisible,
+          component: statusLine,
+          visible: () => statusNotice !== null,
         },
+        footer,
       ]),
       basis: "auto",
       minSize: 1,
@@ -534,7 +608,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const renderState = () => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
-    viewportHintVisible = false;
+    if (statusNotice?.sessionId !== undefined && statusNotice.sessionId !== active?.session.id) {
+      clearNotice();
+    }
     synchronizePromptHistory(active);
     const activeSessionChanged = active?.session.id !== previousActiveSessionId;
     if (activeSessionChanged) {
@@ -618,12 +694,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       !sessionPickerDismissed
     ) {
       let handle: { hide(): void } | undefined;
-      const close = () => {
+      const close = (selectedSessionId?: string) => {
         handle?.hide();
         sessionPicker = undefined;
         sessionPickerRequested = false;
         sessionPickerDismissed = true;
-        statusMessage = "Session selection closed.";
+        clearNotice();
+        if (selectedSessionId !== undefined) {
+          showNotice("success", "Session selected.", "until_next_action", selectedSessionId);
+        }
         tui.setFocus(editor);
         tui.requestRender();
       };
@@ -631,7 +710,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         sessions: state.authoritative.sessions.items,
         hasMore: state.authoritative.sessions.nextCursor !== null,
         theme,
-        onClose: close,
+        onClose: () => close(),
         onNewSession() {
           newSessionSelected = true;
           sessionPickerRequested = false;
@@ -650,7 +729,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                 expandedReasoningIds.clear();
                 reasoningArtifactReads.clear();
                 reasoningArtifactTexts.clear();
-                close();
+                close(session.id);
                 renderState();
               } else if (sessionPicker?.picker === picker) {
                 picker.setNotice(receipt.message);
@@ -720,7 +799,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         targetPicker = undefined;
         targetPickerRequested = false;
         targetPickerDismissed = true;
-        statusMessage = "Target selection closed.";
+        clearNotice();
         tui.setFocus(editor);
         tui.requestRender();
       };
@@ -870,11 +949,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       targetPicker = { close, picker, hide: () => handle?.hide() };
     }
     header.setText(
-      theme.primary(
-        `Adam · ${safeTerminalText(
+      `${theme.brand("Adam")}${theme.primary(" · ")}${theme.sessionTitle(
+        safeTerminalText(
           active?.session.label ?? (state.draft === null ? "No session" : "New session"),
-        )}`,
-      ),
+        ),
+      )}`,
     );
     transcriptViewport.clear();
     largeReasoningBoundaryOwners.clear();
@@ -1335,9 +1414,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`;
       const olderHistorySummary =
         active.transcript.olderCursor === null ? "" : " · older history available";
-      viewportHintVisible =
-        (state.transient?.reasoning ?? null) !== null ||
-        active.transcript.items.some((item) => item.type === "reasoning_block");
       footer.setText({
         wide: theme.muted(
           `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
@@ -1350,7 +1426,30 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         ),
       });
     }
-    statusLine.setText(statusMessage === null ? "" : theme.muted(safeTerminalText(statusMessage)));
+    if (statusNotice !== null) {
+      const prefix =
+        statusNotice.kind === "success"
+          ? "✓"
+          : statusNotice.kind === "error"
+            ? "✗"
+            : statusNotice.kind === "warning"
+              ? "!"
+              : statusNotice.kind === "progress"
+                ? "…"
+                : "•";
+      const noticeText = `${prefix} ${safeTerminalText(statusNotice.text)}`;
+      const style =
+        statusNotice.kind === "success"
+          ? theme.statusSuccess
+          : statusNotice.kind === "error"
+            ? theme.statusError
+            : statusNotice.kind === "warning"
+              ? theme.statusWarning
+              : theme.statusInfo;
+      statusLine.setText(style(noticeText));
+    } else {
+      statusLine.setText("");
+    }
     tui.requestRender();
   };
   const handleThinkingCommand = (argumentsText: string): void => {
@@ -1360,7 +1459,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     editor.setText("");
     editor.disableSubmit = false;
     if (capability === null || capability === undefined) {
-      statusMessage = "Thinking policy is unavailable for this exact target.";
+      showNotice("error", "Thinking policy is unavailable for this exact target.", "until_edit");
       renderState();
       return;
     }
@@ -1372,18 +1471,26 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           candidate.label.toLocaleLowerCase() === requested,
       );
       if (level === undefined) {
-        statusMessage = `Thinking level ${safeTerminalText(argumentsText)} is unavailable · choose ${capability.levels.map((candidate) => candidate.id).join(", ")}.`;
+        showNotice(
+          "warning",
+          `Thinking level ${safeTerminalText(argumentsText)} is unavailable · choose ${capability.levels.map((candidate) => candidate.id).join(", ")}.`,
+          "until_edit",
+        );
         renderState();
         return;
       }
       selectedThinkingLevels.set(capability.capabilityId, level.id);
-      statusMessage = `Thinking ${safeTerminalText(level.label)} selected for the next prompt.`;
+      showNotice(
+        "success",
+        `Thinking ${safeTerminalText(level.label)} selected for the next prompt.`,
+        "until_next_action",
+      );
       renderState();
       return;
     }
     const selected = selectedThinkingLevel(target);
     if (selected === undefined) {
-      statusMessage = "The exact target has no valid default thinking level.";
+      showNotice("error", "The exact target has no valid default thinking level.", "until_edit");
       renderState();
       return;
     }
@@ -1405,7 +1512,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           return;
         }
         selectedThinkingLevels.set(capability.capabilityId, level.id);
-        statusMessage = `Thinking ${safeTerminalText(level.label)} selected for the next prompt.`;
+        showNotice(
+          "success",
+          `Thinking ${safeTerminalText(level.label)} selected for the next prompt.`,
+          "until_next_action",
+        );
         close();
         renderState();
       },
@@ -1418,10 +1529,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       margin: 1,
     });
     thinkingPicker = { close, hide: () => handle?.hide() };
-    statusMessage = null;
+    clearNotice();
     tui.requestRender();
   };
   editor.onChange = () => {
+    if (statusNotice?.lifetime === "until_edit" || statusNotice?.lifetime === "until_next_action") {
+      clearNotice();
+      renderState();
+    }
     if (exitArm.armed) {
       clearExitWindow();
       renderState();
@@ -1474,7 +1589,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     const boundaries = completeChronologyBoundaries(active.transcript.items);
     if (boundaries.length === 0 && active.transcript.olderCursor === null) {
-      statusMessage = "No complete authoritative chronology boundary is available.";
+      showNotice(
+        "warning",
+        "No complete authoritative chronology boundary is available.",
+        "until_next_action",
+        active.session.id,
+      );
       renderState();
       return;
     }
@@ -1531,7 +1651,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             focused = transcriptViewport.focus(anchorId, terminal.columns);
           }
           if (!focused) {
-            statusMessage = "The selected chronology boundary is no longer visible.";
+            showNotice(
+              "error",
+              "The selected chronology boundary is no longer visible.",
+              "until_next_action",
+              active.session.id,
+            );
             renderState();
           }
           tui.renderNow(true);
@@ -1582,7 +1707,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const showArtifactNavigator = (diffs: boolean, expectedSessionId: string): void => {
     const current = options.presentation.getState().authoritative.active;
     if (current?.session.id !== expectedSessionId) {
-      statusMessage = "The active session changed before its output picker opened.";
+      showNotice(
+        "error",
+        "The active session changed before its output picker opened.",
+        "until_next_action",
+      );
       renderState();
       return;
     }
@@ -1591,9 +1720,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       : activeChronologyArtifacts(current.transcript.items, current.linkedOperations);
     const olderCursor = current.transcript.olderCursor;
     if (entries.length === 0 && olderCursor === null) {
-      statusMessage = diffs
-        ? "No settled diffs are visible in the active chronology."
-        : "No artifacts are visible in the active chronology.";
+      showNotice(
+        "info",
+        diffs
+          ? "No settled diffs are visible in the active chronology."
+          : "No artifacts are visible in the active chronology.",
+        "until_next_action",
+        current.session.id,
+      );
       renderState();
       return;
     }
@@ -1665,7 +1799,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         handle?.hide();
       },
     };
-    statusMessage = null;
+    clearNotice();
     tui.requestRender();
   };
   const showHelpNavigator = (commandId: "help" | "hotkeys", argumentsText: string): void => {
@@ -1676,11 +1810,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         : (commandRegistry.helpTopics().find((topic) => topic.id === requestedTopic)?.id ?? "root");
     if (requestedTopic.length > 0 && initialPage === "root") {
       const suggestions = commandRegistry.suggestHelpTopics(requestedTopic);
-      statusMessage = `Unknown Help topic ${safeTerminalText(requestedTopic)}${
-        suggestions.length === 0
-          ? ""
-          : ` · Did you mean ${suggestions.map((topic) => topic.id).join(", ")}?`
-      }`;
+      showNotice(
+        "warning",
+        `Unknown Help topic ${safeTerminalText(requestedTopic)}${
+          suggestions.length === 0
+            ? ""
+            : ` · Did you mean ${suggestions.map((topic) => topic.id).join(", ")}?`
+        }`,
+        "until_edit",
+      );
       editor.disableSubmit = false;
       renderState();
       return;
@@ -1719,19 +1857,34 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   ): void => {
     clearExitWindow();
     editor.disableSubmit = true;
+    const actionId = showNotice(
+      "progress",
+      `Saving ${configurationFieldLabel(field)} limit…`,
+      "until_replaced",
+    );
     void options.presentation
       .dispatch({ type: "set_model_policy", field, value })
       .then((receipt) => {
         if (receipt.status === "admitted") {
           editor.setText("");
-          statusMessage = `Saved ${configurationFieldLabel(field)} limit: ${value === null ? "default" : `${value} tokens`}.`;
           onAdmitted?.();
+          settleNotice(
+            actionId,
+            "success",
+            `Saved ${configurationFieldLabel(field)} limit: ${value === null ? "default" : `${value} tokens`}.`,
+            "until_next_action",
+          );
         } else {
-          statusMessage = receipt.message;
+          settleNotice(actionId, "error", receipt.message, "until_edit");
         }
       })
       .catch(() => {
-        statusMessage = "The owner-local model configuration could not be saved.";
+        settleNotice(
+          actionId,
+          "error",
+          "The owner-local model configuration could not be saved.",
+          "until_edit",
+        );
       })
       .finally(() => {
         editor.disableSubmit = false;
@@ -1742,7 +1895,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const state = options.presentation.getState();
     const configuration = state.authoritative.targets.configuration;
     if (configuration === undefined) {
-      statusMessage = "Owner-local model configuration is unavailable.";
+      showNotice("error", "Owner-local model configuration is unavailable.", "until_edit");
       editor.disableSubmit = false;
       renderState();
       return;
@@ -1751,19 +1904,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     editor.disableSubmit = false;
     configurationPage?.hide();
     let handle: { hide(): void } | undefined;
-    const close = () => {
+    const close = (preserveNotice = false) => {
       handle?.hide();
       configurationPage = undefined;
-      statusMessage = "Configuration closed.";
+      if (!preserveNotice) {
+        clearNotice();
+      }
       tui.setFocus(editor);
       renderState();
     };
     const page = new ConfigurationPage({
       diagnostic: state.authoritative.targets.diagnostic,
       modelPolicy: configuration.modelPolicy,
-      onClose: close,
+      onClose: () => close(),
       onReset(field) {
-        applyConfigurationMutation(field, null, close);
+        applyConfigurationMutation(field, null, () => close(true));
       },
       target: targetForState(state),
       theme,
@@ -1775,7 +1930,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       margin: 1,
     });
     configurationPage = { close, hide: () => handle?.hide() };
-    statusMessage = null;
+    clearNotice();
     tui.requestRender();
   };
   const handleConfigurationCommand = (argumentsText: string): void => {
@@ -1785,7 +1940,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     const mutation = parseConfigurationMutation(argumentsText);
     if (mutation === null) {
-      statusMessage = "Usage: /config [context|output|compaction <tokens|default>]";
+      showNotice(
+        "warning",
+        "Usage: /config [context|output|compaction <tokens|default>]",
+        "until_edit",
+      );
       editor.disableSubmit = false;
       renderState();
       return;
@@ -1806,6 +1965,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     clearExitWindow();
     editor.disableSubmit = true;
     workspaceTrustMutationPending = true;
+    const actionId = showNotice(
+      "progress",
+      trusted ? "Saving workspace trust…" : "Revoking workspace trust…",
+      "until_replaced",
+    );
     void options.presentation
       .dispatch({
         type: "set_workspace_trust",
@@ -1815,16 +1979,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       .then((receipt) => {
         if (receipt.status === "admitted") {
           editor.setText("");
-          statusMessage = trusted ? "Workspace trust granted." : "Workspace trust revoked.";
           callbacks.onAdmitted?.();
+          settleNotice(
+            actionId,
+            "success",
+            trusted ? "Workspace trust granted." : "Workspace trust revoked.",
+            "until_next_action",
+          );
         } else {
-          statusMessage = receipt.message;
+          settleNotice(actionId, "error", receipt.message, "until_edit");
           callbacks.onRejected?.(receipt.message);
         }
       })
       .catch(() => {
         const message = "The owner-local workspace trust configuration could not be saved.";
-        statusMessage = message;
+        settleNotice(actionId, "error", message, "until_edit");
         callbacks.onRejected?.(message);
       })
       .finally(() => {
@@ -1849,7 +2018,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         stopFromCommand?.();
         return;
       }
-      statusMessage = "Workspace trust unchanged.";
+      clearNotice();
       tui.setFocus(editor);
       renderState();
     };
@@ -1890,7 +2059,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       margin: 1,
     });
     workspaceTrustPage = { close, hide: () => handle?.hide(), mode, page };
-    statusMessage = null;
+    clearNotice();
     tui.requestRender();
   };
   const handleWorkspaceTrustCommand = (argumentsText: string): void => {
@@ -1902,12 +2071,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (argumentsText === "status") {
       editor.setText("");
       editor.disableSubmit = false;
-      statusMessage = `Workspace trust: ${project.workspaceTrust.status} · ${safeTerminalText(project.label)} · ${safeTerminalText(project.id)}`;
+      showNotice(
+        "info",
+        `Workspace trust: ${project.workspaceTrust.status} · ${safeTerminalText(project.label)} · ${safeTerminalText(project.id)}`,
+        "until_next_action",
+      );
       renderState();
       return;
     }
     if (argumentsText !== "grant" && argumentsText !== "revoke") {
-      statusMessage = "Usage: /trust [status|grant|revoke]";
+      showNotice("warning", "Usage: /trust [status|grant|revoke]", "until_edit");
       editor.disableSubmit = false;
       renderState();
       return;
@@ -1917,7 +2090,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let stopFromCommand: (() => void) | undefined;
   const handleExitCommand = (argumentsText: string): void => {
     if (argumentsText.length > 0) {
-      statusMessage = "Usage: /exit";
+      showNotice("warning", "Usage: /exit", "until_edit");
       editor.disableSubmit = false;
       renderState();
       return;
@@ -1931,6 +2104,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (text.trim().length === 0) {
       return;
     }
+    beginNoticeAction();
     if (active === null) {
       if (state.draft === null) {
         return;
@@ -2026,17 +2200,25 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       if (parsedDraft.kind === "unknown") {
         const suggestions = commandRegistry.suggest(parsedDraft.name);
-        statusMessage = `Unknown command /${parsedDraft.name}${
-          suggestions.length === 0
-            ? ""
-            : ` · Did you mean ${suggestions.map((command) => `/${command.name}`).join(", ")}?`
-        }`;
+        showNotice(
+          "warning",
+          `Unknown command /${parsedDraft.name}${
+            suggestions.length === 0
+              ? ""
+              : ` · Did you mean ${suggestions.map((command) => `/${command.name}`).join(", ")}?`
+          }`,
+          "until_edit",
+        );
         editor.disableSubmit = false;
         renderState();
         return;
       }
       if (parsedDraft.kind === "known") {
-        statusMessage = `/${parsedDraft.command.name} needs a session. Submit the first prompt or use /resume.`;
+        showNotice(
+          "warning",
+          `/${parsedDraft.command.name} needs a session. Submit the first prompt or use /resume.`,
+          "until_edit",
+        );
         editor.disableSubmit = false;
         renderState();
         return;
@@ -2045,6 +2227,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       editor.disableSubmit = true;
       const draftTarget = targetForState(state);
       const draftThinkingLevel = selectedThinkingLevel(draftTarget);
+      const submitActionId = showNotice(
+        "progress",
+        "Submitting the first prompt…",
+        "until_replaced",
+      );
       void options.presentation
         .dispatch({
           type: "submit_draft_prompt",
@@ -2056,15 +2243,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           if (receipt.status === "admitted") {
             editor.setText("");
             selectedSkills.clear();
+            settleNoticeClear(submitActionId);
           } else {
             editor.setText(text);
-            statusMessage = receipt.message;
+            settleNotice(submitActionId, "error", receipt.message, "until_edit");
             editor.disableSubmit = false;
           }
         })
         .catch(() => {
           editor.setText(text);
-          statusMessage = "The first prompt could not be admitted to a durable session.";
+          settleNotice(
+            submitActionId,
+            "error",
+            "The first prompt could not be admitted to a durable session.",
+            "until_edit",
+          );
           editor.disableSubmit = false;
         })
         .finally(() => {
@@ -2079,11 +2272,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const parsedCommand = commandRegistry.parse(text);
     if (parsedCommand.kind === "unknown") {
       const suggestions = commandRegistry.suggest(parsedCommand.name);
-      statusMessage = `Unknown command /${parsedCommand.name}${
-        suggestions.length === 0
-          ? ""
-          : ` · Did you mean ${suggestions.map((command) => `/${command.name}`).join(", ")}?`
-      }`;
+      showNotice(
+        "warning",
+        `Unknown command /${parsedCommand.name}${
+          suggestions.length === 0
+            ? ""
+            : ` · Did you mean ${suggestions.map((command) => `/${command.name}`).join(", ")}?`
+        }`,
+        "until_edit",
+        active.session.id,
+      );
       editor.disableSubmit = false;
       renderState();
       return;
@@ -2092,7 +2290,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       parsedCommand.kind === "known" &&
       !commandRegistry.isAvailable(parsedCommand.command, { runActive })
     ) {
-      statusMessage = `/${parsedCommand.command.name} is unavailable while a run is active.`;
+      showNotice(
+        "warning",
+        `/${parsedCommand.command.name} is unavailable while a run is active.`,
+        "until_edit",
+        active.session.id,
+      );
       editor.disableSubmit = false;
       renderState();
       return;
@@ -2102,7 +2305,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return;
     }
     if (parsedCommand.kind === "not_command" && runActive) {
-      statusMessage = "A run is active; use a local read-only command or Ctrl+C to abort.";
+      showNotice(
+        "warning",
+        "A run is active; use a local read-only command or Ctrl+C to abort.",
+        "until_edit",
+        active.session.id,
+      );
       editor.disableSubmit = false;
       renderState();
       return;
@@ -2118,6 +2326,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         sessionId: active.session.id,
         operationIds: new Set(active.linkedOperations.map((operation) => operation.operationId)),
       };
+      const extensionActionId = showNotice(
+        "progress",
+        `Admitting ${safeTerminalText(parsedCommand.command.summary)}…`,
+        "until_replaced",
+        active.session.id,
+      );
       void options.presentation
         .dispatch({
           type: "start_project_changes",
@@ -2128,17 +2342,35 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           editor.disableSubmit = false;
           if (receipt.status === "admitted") {
             editor.setText("");
-            statusMessage = `${safeTerminalText(parsedCommand.command.summary)} admitted.`;
+            settleNotice(
+              extensionActionId,
+              "success",
+              `${safeTerminalText(parsedCommand.command.summary)} admitted.`,
+              "until_next_action",
+              active.session.id,
+            );
           } else {
             pendingOperationBaseline = null;
-            statusMessage = receipt.message;
+            settleNotice(
+              extensionActionId,
+              "error",
+              receipt.message,
+              "until_edit",
+              active.session.id,
+            );
           }
           renderState();
         })
         .catch(() => {
           pendingOperationBaseline = null;
           editor.disableSubmit = false;
-          statusMessage = "The extension command could not be admitted safely.";
+          settleNotice(
+            extensionActionId,
+            "error",
+            "The extension command could not be admitted safely.",
+            "until_edit",
+            active.session.id,
+          );
           renderState();
         });
       return;
@@ -2165,7 +2397,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         (candidate) => candidate.qualifiedId === parsedCommand.argumentsText,
       );
       if (skill === undefined) {
-        statusMessage = `Skill ${safeTerminalText(parsedCommand.argumentsText)} is not available.`;
+        showNotice(
+          "warning",
+          `Skill ${safeTerminalText(parsedCommand.argumentsText)} is not available.`,
+          "until_edit",
+          active.session.id,
+        );
         editor.disableSubmit = false;
         renderState();
         return;
@@ -2174,8 +2411,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       if (selected) {
         selectedSkills.add(skill.qualifiedId);
       }
-      statusMessage = `${safeTerminalText(skill.qualifiedId)} ${selected ? "selected" : "cleared"} for the next prompt.`;
       editor.setText("");
+      showNotice(
+        "success",
+        `${safeTerminalText(skill.qualifiedId)} ${selected ? "selected" : "cleared"} for the next prompt.`,
+        "until_next_action",
+        active.session.id,
+      );
       editor.disableSubmit = false;
       renderState();
       return;
@@ -2187,7 +2429,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     ) {
       editor.setText("");
       editor.disableSubmit = false;
-      statusMessage = "Finding last assistant response for copy…";
+      const copyActionId = showNotice(
+        "progress",
+        "Finding last assistant response for copy…",
+        "until_replaced",
+        active.session.id,
+      );
       renderState();
       void copyLastAssistantResponse({
         clipboard: options.clipboard,
@@ -2196,11 +2443,25 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         sessionId: active.session.id,
       }).then(
         (resultMessage) => {
-          statusMessage = resultMessage;
+          settleNotice(
+            copyActionId,
+            resultMessage === "Copied last assistant response." ? "success" : "error",
+            resultMessage,
+            resultMessage === "Copied last assistant response."
+              ? "until_next_action"
+              : "until_replaced",
+            active.session.id,
+          );
           renderState();
         },
         () => {
-          statusMessage = "The last assistant response could not be read safely for copy.";
+          settleNotice(
+            copyActionId,
+            "error",
+            "The last assistant response could not be read safely for copy.",
+            "until_replaced",
+            active.session.id,
+          );
           renderState();
         },
       );
@@ -2304,7 +2565,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : []),
       ];
       if (resources.length === 0) {
-        statusMessage = "No project resource authority is currently eligible for reload.";
+        showNotice(
+          "info",
+          "No project resource authority is currently eligible for reload.",
+          "until_next_action",
+          active.session.id,
+        );
         renderState();
         return;
       }
@@ -2342,25 +2608,50 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             tui.requestRender();
             return;
           }
+          const reloadActionId = showNotice(
+            "progress",
+            `Reloading ${safeTerminalText(resource.label)}…`,
+            "until_replaced",
+            active.session.id,
+          );
           void options.presentation
             .dispatch(command)
             .then((receipt) => {
               if (receipt.status === "admitted") {
-                statusMessage =
+                settleNotice(
+                  reloadActionId,
+                  "success",
                   resource.id === "instructions"
                     ? "Reloaded repository instructions."
                     : resource.id === "skills"
                       ? "Reloaded Skills."
-                      : "Revalidated the MCP catalog.";
+                      : "Revalidated the MCP catalog.",
+                  "until_next_action",
+                  active.session.id,
+                );
                 close();
                 renderState();
               } else if (resourceReloadPicker?.picker === picker) {
+                settleNotice(
+                  reloadActionId,
+                  "error",
+                  receipt.message,
+                  "until_edit",
+                  active.session.id,
+                );
                 picker.setNotice(receipt.message);
                 tui.requestRender();
               }
             })
             .catch(() => {
               if (resourceReloadPicker?.picker === picker) {
+                settleNotice(
+                  reloadActionId,
+                  "error",
+                  "The selected resource authority could not be reloaded.",
+                  "until_edit",
+                  active.session.id,
+                );
                 picker.setNotice("The selected resource authority could not be reloaded.");
                 tui.requestRender();
               }
@@ -2422,6 +2713,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       parsedCommand.command.id === "name" &&
       parsedCommand.argumentsText === "--clear"
     ) {
+      const clearNameActionId = showNotice(
+        "progress",
+        "Clearing the manual session name…",
+        "until_replaced",
+        active.session.id,
+      );
       void options.presentation
         .dispatch({
           type: "clear_session_manual_name",
@@ -2430,12 +2727,33 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         .then((receipt) => {
           if (receipt.status === "admitted") {
             editor.setText("");
+            settleNotice(
+              clearNameActionId,
+              "success",
+              "Manual session name cleared.",
+              "until_next_action",
+              active.session.id,
+            );
           } else {
             editor.disableSubmit = false;
+            settleNotice(
+              clearNameActionId,
+              "error",
+              receipt.message,
+              "until_edit",
+              active.session.id,
+            );
           }
         })
         .catch(() => {
           editor.disableSubmit = false;
+          settleNotice(
+            clearNameActionId,
+            "error",
+            "The manual session name could not be cleared.",
+            "until_edit",
+            active.session.id,
+          );
         })
         .finally(() => {
           tui.requestRender();
@@ -2447,19 +2765,44 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       parsedCommand.command.id === "name" &&
       parsedCommand.argumentsText === "--generate"
     ) {
+      const generateTitleActionId = showNotice(
+        "progress",
+        "Regenerating the session title…",
+        "until_replaced",
+        active.session.id,
+      );
       void options.presentation
         .dispatch({ type: "regenerate_session_title", sessionId: active.session.id })
         .then((receipt) => {
           if (receipt.status === "admitted") {
             editor.setText("");
+            settleNotice(
+              generateTitleActionId,
+              "success",
+              "Session title regenerated.",
+              "until_next_action",
+              active.session.id,
+            );
           } else {
             editor.disableSubmit = false;
-            statusMessage = receipt.message;
+            settleNotice(
+              generateTitleActionId,
+              "error",
+              receipt.message,
+              "until_edit",
+              active.session.id,
+            );
           }
         })
         .catch(() => {
           editor.disableSubmit = false;
-          statusMessage = "The session title could not be regenerated.";
+          settleNotice(
+            generateTitleActionId,
+            "error",
+            "The session title could not be regenerated.",
+            "until_edit",
+            active.session.id,
+          );
         })
         .finally(() => {
           renderState();
@@ -2471,8 +2814,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       parsedCommand.command.id === "instructions" &&
       parsedCommand.argumentsText.length === 0
     ) {
-      statusMessage = repositoryStatusText(active.repositoryInstructions);
       editor.setText("");
+      showNotice(
+        "info",
+        repositoryStatusText(active.repositoryInstructions),
+        "until_next_action",
+        active.session.id,
+      );
       editor.disableSubmit = false;
       renderState();
       return;
@@ -2482,6 +2830,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       parsedCommand.command.id === "instructions" &&
       parsedCommand.argumentsText === "reload"
     ) {
+      const instructionsActionId = showNotice(
+        "progress",
+        "Reloading repository instructions…",
+        "until_replaced",
+        active.session.id,
+      );
       void options.presentation
         .dispatch({
           type: "reload_repository_instructions",
@@ -2490,17 +2844,36 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         .then((receipt) => {
           if (receipt.status === "admitted") {
             editor.setText("");
-            statusMessage = repositoryStatusText(
-              options.presentation.getState().authoritative.active?.repositoryInstructions ?? null,
+            settleNotice(
+              instructionsActionId,
+              "success",
+              repositoryStatusText(
+                options.presentation.getState().authoritative.active?.repositoryInstructions ??
+                  null,
+              ),
+              "until_next_action",
+              active.session.id,
             );
           } else {
             editor.disableSubmit = false;
-            statusMessage = receipt.message;
+            settleNotice(
+              instructionsActionId,
+              "error",
+              receipt.message,
+              "until_edit",
+              active.session.id,
+            );
           }
         })
         .catch(() => {
           editor.disableSubmit = false;
-          statusMessage = "Repository instructions could not be reloaded safely.";
+          settleNotice(
+            instructionsActionId,
+            "error",
+            "Repository instructions could not be reloaded safely.",
+            "until_edit",
+            active.session.id,
+          );
         })
         .finally(() => {
           renderState();
@@ -2512,24 +2885,41 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       parsedCommand.command.id === "skills" &&
       parsedCommand.argumentsText === "reload"
     ) {
+      const skillsActionId = showNotice(
+        "progress",
+        "Reloading the Skill catalog…",
+        "until_replaced",
+        active.session.id,
+      );
       void options.presentation
         .dispatch({ type: "reload_skills", sessionId: active.session.id })
         .then((receipt) => {
           if (receipt.status === "admitted") {
             editor.setText("");
             const skills = options.presentation.getState().authoritative.active?.skills;
-            statusMessage =
+            settleNotice(
+              skillsActionId,
+              "success",
               skills === null || skills === undefined
                 ? "Skills unavailable"
-                : `Skills r${skills.revision} · ${skills.items.length} visible · ${skills.overflow.omittedCount} omitted · ${skills.diagnostics.length} diagnostics`;
+                : `Skills r${skills.revision} · ${skills.items.length} visible · ${skills.overflow.omittedCount} omitted · ${skills.diagnostics.length} diagnostics`,
+              "until_next_action",
+              active.session.id,
+            );
           } else {
             editor.disableSubmit = false;
-            statusMessage = receipt.message;
+            settleNotice(skillsActionId, "error", receipt.message, "until_edit", active.session.id);
           }
         })
         .catch(() => {
           editor.disableSubmit = false;
-          statusMessage = "The Skill catalog could not be reloaded safely.";
+          settleNotice(
+            skillsActionId,
+            "error",
+            "The Skill catalog could not be reloaded safely.",
+            "until_edit",
+            active.session.id,
+          );
         })
         .finally(() => {
           renderState();
@@ -2544,7 +2934,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       editor.setText("");
       editor.disableSubmit = false;
       if (active.mcp === null) {
-        statusMessage = "No project MCP configuration is available.";
+        showNotice(
+          "info",
+          "No project MCP configuration is available.",
+          "until_next_action",
+          active.session.id,
+        );
         renderState();
         return;
       }
@@ -2688,11 +3083,22 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     ) {
       const source = completeChronologyBoundaries(active.transcript.items).at(-1);
       if (source === undefined) {
-        statusMessage = "No complete authoritative chronology boundary is visible.";
+        showNotice(
+          "warning",
+          "No complete authoritative chronology boundary is visible.",
+          "until_next_action",
+          active.session.id,
+        );
         editor.disableSubmit = false;
         renderState();
         return;
       }
+      const cloneActionId = showNotice(
+        "progress",
+        "Cloning the latest complete chronology boundary…",
+        "until_replaced",
+        active.session.id,
+      );
       void options.presentation
         .dispatch({
           type: "branch_session",
@@ -2704,13 +3110,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           if (receipt.status === "admitted") {
             editor.setText("");
             editor.disableSubmit = false;
+            settleNoticeClear(cloneActionId);
           } else {
-            statusMessage = receipt.message;
+            settleNotice(cloneActionId, "error", receipt.message, "until_edit", active.session.id);
             editor.disableSubmit = false;
           }
         })
         .catch(() => {
-          statusMessage = "The latest complete boundary could not be cloned.";
+          settleNotice(
+            cloneActionId,
+            "error",
+            "The latest complete boundary could not be cloned.",
+            "until_edit",
+            active.session.id,
+          );
           editor.disableSubmit = false;
         })
         .finally(() => {
@@ -2755,7 +3168,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return;
     }
     if (parsedCommand.kind === "known") {
-      statusMessage = `Usage: ${parsedCommand.command.usage}`;
+      showNotice(
+        "warning",
+        `Usage: ${parsedCommand.command.usage}`,
+        "until_edit",
+        active.session.id,
+      );
       editor.disableSubmit = false;
       renderState();
       return;
@@ -2763,6 +3181,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const nextTarget = targetForState(state);
     const nextThinkingLevel = selectedThinkingLevel(nextTarget);
     transcriptViewport.followEnd();
+    const promptActionId = beginNoticeAction();
     void options.presentation
       .dispatch({
         type: "submit_prompt",
@@ -2775,13 +3194,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         if (receipt.status === "admitted") {
           editor.setText("");
           selectedSkills.clear();
+          settleNoticeClear(promptActionId);
         } else {
-          statusMessage = receipt.message;
+          settleNotice(promptActionId, "error", receipt.message, "until_edit", active.session.id);
           editor.disableSubmit = false;
         }
       })
       .catch(() => {
         editor.disableSubmit = false;
+        settleNotice(
+          promptActionId,
+          "error",
+          "The prompt could not be admitted safely.",
+          "until_edit",
+          active.session.id,
+        );
       })
       .finally(() => {
         tui.requestRender();
@@ -2921,17 +3348,33 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       if (operation !== undefined) {
         clearExitWindow();
         transcriptViewport.focus(operationAnchorId(operation.operationId), terminal.columns);
-        statusMessage = "Recovering the linked operation from durable evidence…";
+        const recoveryActionId = showNotice(
+          "progress",
+          "Recovering the linked operation from durable evidence…",
+          "until_replaced",
+          options.presentation.getState().authoritative.active?.session.id,
+        );
         renderState();
         void options.presentation
           .dispatch({ type: "recover_operation", operationId: operation.operationId })
           .then((receipt) => {
-            statusMessage =
-              receipt.status === "admitted" ? "Operation recovery admitted." : receipt.message;
+            settleNotice(
+              recoveryActionId,
+              receipt.status === "admitted" ? "success" : "error",
+              receipt.status === "admitted" ? "Operation recovery admitted." : receipt.message,
+              receipt.status === "admitted" ? "until_next_action" : "until_edit",
+              options.presentation.getState().authoritative.active?.session.id,
+            );
             renderState();
           })
           .catch(() => {
-            statusMessage = "The linked operation could not be recovered safely.";
+            settleNotice(
+              recoveryActionId,
+              "error",
+              "The linked operation could not be recovered safely.",
+              "until_edit",
+              options.presentation.getState().authoritative.active?.session.id,
+            );
             renderState();
           });
         return { consume: true };
@@ -2962,7 +3405,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         ) ??
         reasoningCandidates.at(-1);
       if (reasoning === undefined || reasoning === null) {
-        statusMessage = "No provider reasoning block is available.";
+        showNotice(
+          "info",
+          "No provider reasoning block is available.",
+          "until_next_action",
+          active?.session.id,
+        );
         renderState();
         return { consume: true };
       }
@@ -2987,6 +3435,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       ) {
         reasoningArtifactReads.add(reasoning.id);
         const sessionId = active?.session.id;
+        const reasoningReadActionId = beginNoticeAction();
         void options.presentation.dispatch({ type: "read_artifact", artifact, range: null }).then(
           (receipt) => {
             reasoningArtifactReads.delete(reasoning.id);
@@ -2997,13 +3446,25 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             ) {
               reasoningArtifactTexts.set(reasoning.id, receipt.resource.text);
             } else if (receipt.status === "rejected") {
-              statusMessage = receipt.message;
+              settleNotice(
+                reasoningReadActionId,
+                "error",
+                receipt.message,
+                "until_edit",
+                sessionId,
+              );
             }
             renderState();
           },
           () => {
             reasoningArtifactReads.delete(reasoning.id);
-            statusMessage = "Provider reasoning could not be read safely.";
+            settleNotice(
+              reasoningReadActionId,
+              "error",
+              "Provider reasoning could not be read safely.",
+              "until_edit",
+              sessionId,
+            );
             renderState();
           },
         );
@@ -3038,7 +3499,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           operationAnchorId(cancellableOperation.operationId),
           terminal.columns,
         );
-        statusMessage = "Requesting cancellation of the linked operation…";
+        const cancellationActionId = showNotice(
+          "progress",
+          "Requesting cancellation of the linked operation…",
+          "until_replaced",
+          active?.session.id,
+        );
         renderState();
         void options.presentation
           .dispatch({
@@ -3046,12 +3512,23 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             operationId: cancellableOperation.operationId,
           })
           .then((receipt) => {
-            statusMessage =
-              receipt.status === "admitted" ? "Operation cancellation requested." : receipt.message;
+            settleNotice(
+              cancellationActionId,
+              receipt.status === "admitted" ? "success" : "error",
+              receipt.status === "admitted" ? "Operation cancellation requested." : receipt.message,
+              receipt.status === "admitted" ? "until_next_action" : "until_edit",
+              active?.session.id,
+            );
             renderState();
           })
           .catch(() => {
-            statusMessage = "The linked operation could not be cancelled safely.";
+            settleNotice(
+              cancellationActionId,
+              "error",
+              "The linked operation could not be cancelled safely.",
+              "until_edit",
+              active?.session.id,
+            );
             renderState();
           });
         return { consume: true };
