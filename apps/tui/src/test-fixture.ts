@@ -252,12 +252,25 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
         name: "Selected project session",
       });
     }
+    if (options.scenario === "reasoning-artifact-session-race") {
+      const switchTarget = await lifecycle.create({ targetIdentity });
+      await lifecycle.continue({
+        sessionId: switchTarget.sessionId,
+        input: { text: "Switch target reasoning prompt" },
+      });
+      await lifecycle.setSessionManualName({
+        sessionId: switchTarget.sessionId,
+        name: "Switch target session",
+      });
+    }
     const resumedSessionId =
       options.scenario === "resume" ||
       options.scenario === "history" ||
       options.scenario === "artifact-history" ||
       options.scenario === "copy-older-assistant" ||
       options.scenario === "reasoning-multiple" ||
+      options.scenario === "reasoning-large-multiple" ||
+      options.scenario === "reasoning-artifact-session-race" ||
       options.scenario === "target-navigation" ||
       options.scenario === "unsafe-history"
         ? await lifecycle.create({ targetIdentity }).then(async (created) => {
@@ -287,13 +300,25 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
               ]) {
                 await lifecycle.continue({ sessionId: created.sessionId, input: { text } });
               }
-            } else if (options.scenario === "reasoning-multiple") {
+            } else if (
+              options.scenario === "reasoning-multiple" ||
+              options.scenario === "reasoning-large-multiple"
+            ) {
               for (let block = 1; block <= 3; block += 1) {
                 await lifecycle.continue({
                   sessionId: created.sessionId,
                   input: { text: `Inspect seeded reasoning block ${block}` },
                 });
               }
+            } else if (options.scenario === "reasoning-artifact-session-race") {
+              await lifecycle.continue({
+                sessionId: created.sessionId,
+                input: { text: "Reasoning source prompt" },
+              });
+              await lifecycle.setSessionManualName({
+                sessionId: created.sessionId,
+                name: "Reasoning source session",
+              });
             } else if (options.scenario === "resume") {
               await lifecycle.continue({
                 sessionId: created.sessionId,
@@ -688,6 +713,12 @@ function observeTuiDispatch(
       options.scenario === "tool-artifact" ||
       options.scenario === "artifact-backed-assistant" ||
       options.scenario === "artifact-page-race" ||
+      options.scenario === "reasoning-artifact" ||
+      options.scenario === "reasoning-artifact-race" ||
+      options.scenario === "reasoning-artifact-reorder" ||
+      options.scenario === "reasoning-artifact-session-race" ||
+      options.scenario === "reasoning-large-multiple" ||
+      options.scenario === "reasoning-large-live" ||
       options.scenario === "review-completed" ||
       options.scenario === "review-recovery");
   if (
@@ -762,15 +793,27 @@ function observeTuiDispatch(
         );
       }
       if (command.type === "read_artifact") {
-        artifactReadCount += 1;
+        const artifactReadOrdinal = ++artifactReadCount;
         await writeFile(
-          join(controlRoot as string, `artifact-read-${artifactReadCount}`),
+          join(controlRoot as string, `artifact-read-${artifactReadOrdinal}`),
           `${command.range?.offset ?? 0}\n`,
+          "utf8",
+        );
+        await writeFile(
+          join(controlRoot as string, `artifact-read-${artifactReadOrdinal}-range`),
+          command.range === null
+            ? "complete\n"
+            : `${command.range.offset}:${command.range.maximumBytes}\n`,
+          "utf8",
+        );
+        await writeFile(
+          join(controlRoot as string, `artifact-read-${artifactReadOrdinal}-id`),
+          `${command.artifact.id}\n`,
           "utf8",
         );
         const settled = await receipt;
         await writeFile(
-          join(controlRoot as string, `artifact-read-${artifactReadCount}-settled`),
+          join(controlRoot as string, `artifact-read-${artifactReadOrdinal}-settled`),
           "settled\n",
           "utf8",
         );
@@ -799,7 +842,13 @@ function observeTuiDispatch(
         const state = presentation.getState();
         if (
           !reasoningSettlementObserved &&
-          options.scenario === "reasoning-streaming" &&
+          (options.scenario === "reasoning-streaming" ||
+            options.scenario === "reasoning-artifact" ||
+            options.scenario === "reasoning-artifact-race" ||
+            options.scenario === "reasoning-artifact-reorder" ||
+            options.scenario === "reasoning-artifact-session-race" ||
+            options.scenario === "reasoning-large-multiple" ||
+            options.scenario === "reasoning-large-live") &&
           controlRoot !== undefined &&
           state.authoritative.active?.session.status === "settled" &&
           state.transient === null
@@ -1119,7 +1168,12 @@ function createFixtureModelTargets(options: {
           type: "text_delta",
           text: "\u001b]52;c;YXR0YWNr\u0007Visible \u001b[2Janswer.",
         };
-      } else if (options.scenario === "reasoning-artifact") {
+      } else if (
+        options.scenario === "reasoning-artifact" ||
+        options.scenario === "reasoning-artifact-race" ||
+        options.scenario === "reasoning-artifact-reorder" ||
+        options.scenario === "reasoning-artifact-session-race"
+      ) {
         yield {
           type: "reasoning_start",
           id: "provider-reasoning-0",
@@ -1159,6 +1213,57 @@ function createFixtureModelTargets(options: {
           request.signal.addEventListener("abort", () => resolve(), { once: true });
         });
         throw request.signal.reason;
+      } else if (options.scenario === "reasoning-large-live") {
+        yield {
+          type: "reasoning_start",
+          id: "provider-reasoning-0",
+          artifactType: "provider_reasoning",
+        };
+        yield {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: `Live large reasoning head\n${"l".repeat(255 * 1024)}`,
+        };
+        await writeFile(
+          join(options.controlRoot as string, "reasoning-large-ready"),
+          "ready\n",
+          "utf8",
+        );
+        if (
+          !(await waitForFile(
+            options.controlRoot as string,
+            "release-reasoning-large-growth",
+            request.signal,
+          ))
+        ) {
+          throw request.signal.reason;
+        }
+        yield {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: `\nLive large reasoning crossed threshold\n${"g".repeat(3 * 1024)}`,
+        };
+        await writeFile(
+          join(options.controlRoot as string, "reasoning-large-grown"),
+          "grown\n",
+          "utf8",
+        );
+        if (
+          !(await waitForFile(
+            options.controlRoot as string,
+            "release-reasoning-large-completion",
+            request.signal,
+          ))
+        ) {
+          throw request.signal.reason;
+        }
+        yield { type: "reasoning_end", id: "provider-reasoning-0" };
+        yield { type: "text_delta", text: "Large live reasoning answer." };
+        await writeFile(
+          join(options.controlRoot as string, "reasoning-large-completed"),
+          "completed\n",
+          "utf8",
+        );
       } else if (options.scenario === "reasoning-live-viewport") {
         yield {
           type: "reasoning_start",
@@ -1239,7 +1344,10 @@ function createFixtureModelTargets(options: {
         }
         yield { type: "reasoning_end", id: "provider-reasoning-0" };
         yield { type: "text_delta", text: "Reasoning answer." };
-      } else if (options.scenario === "reasoning-multiple") {
+      } else if (
+        options.scenario === "reasoning-multiple" ||
+        options.scenario === "reasoning-large-multiple"
+      ) {
         reasoningViewportOrdinal += 1;
         yield {
           type: "reasoning_start",
@@ -1249,11 +1357,16 @@ function createFixtureModelTargets(options: {
         yield {
           type: "reasoning_delta",
           id: "provider-reasoning-0",
-          text: Array.from(
-            { length: 8 },
-            (_, index) =>
-              `Reasoning block ${reasoningViewportOrdinal} line ${String(index + 1).padStart(2, "0")}`,
-          ).join("\n"),
+          text:
+            options.scenario === "reasoning-large-multiple"
+              ? `Large reasoning block ${reasoningViewportOrdinal}\n${String(
+                  reasoningViewportOrdinal,
+                ).repeat(270_000)}`
+              : Array.from(
+                  { length: 8 },
+                  (_, index) =>
+                    `Reasoning block ${reasoningViewportOrdinal} line ${String(index + 1).padStart(2, "0")}`,
+                ).join("\n"),
         };
         yield { type: "reasoning_end", id: "provider-reasoning-0" };
         yield {
@@ -1386,7 +1499,10 @@ function previewReadBarrier(options: {
 }): PresentationArtifactReadBarrier | undefined {
   if (
     (options.scenario !== "mutation-delayed-preview" &&
-      options.scenario !== "artifact-page-race") ||
+      options.scenario !== "artifact-page-race" &&
+      options.scenario !== "reasoning-artifact-race" &&
+      options.scenario !== "reasoning-artifact-reorder" &&
+      options.scenario !== "reasoning-artifact-session-race") ||
     options.controlRoot === undefined
   ) {
     return undefined;
@@ -1395,6 +1511,29 @@ function previewReadBarrier(options: {
   return {
     async beforeRead() {
       readCount += 1;
+      if (
+        options.scenario === "reasoning-artifact-race" ||
+        options.scenario === "reasoning-artifact-session-race"
+      ) {
+        if (readCount === 1) {
+          await writeFile(
+            join(options.controlRoot as string, "reasoning-page-read-pending"),
+            "pending\n",
+          );
+          await waitForFile(options.controlRoot as string, "release-reasoning-page-read");
+        }
+        return;
+      }
+      if (options.scenario === "reasoning-artifact-reorder") {
+        if (readCount === 3) {
+          await writeFile(
+            join(options.controlRoot as string, "reasoning-page-3-pending"),
+            "pending\n",
+          );
+          await waitForFile(options.controlRoot as string, "release-reasoning-page-3");
+        }
+        return;
+      }
       if (options.scenario === "artifact-page-race") {
         if (readCount === 1) {
           return;

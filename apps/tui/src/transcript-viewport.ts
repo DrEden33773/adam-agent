@@ -5,9 +5,12 @@ import {
   type ScrollViewScrollToOptions,
 } from "@earendil-works/pi-tui";
 
+type AnchorMetric = number | ((width: number) => number);
+
 type Anchor = {
   readonly component: Component;
-  readonly line: number;
+  readonly line: AnchorMetric;
+  readonly height?: AnchorMetric;
 };
 
 type ViewportPosition = {
@@ -21,6 +24,7 @@ class AnchoredScrollView extends ScrollView {
   readonly #desiredScrollTop: () => number | null;
   readonly #releasePosition: () => void;
   #contentWidth = 1;
+  #onScrollDirection: ((direction: "up" | "down") => void) | undefined;
 
   constructor(
     component: Component,
@@ -79,7 +83,11 @@ class AnchoredScrollView extends ScrollView {
 
   override scrollBy(lines: number): number {
     this.#releasePosition();
-    return super.scrollBy(lines);
+    const moved = super.scrollBy(lines);
+    if (lines !== 0) {
+      this.#onScrollDirection?.(lines < 0 ? "up" : "down");
+    }
+    return moved;
   }
 
   override scrollToStart(): void {
@@ -90,6 +98,10 @@ class AnchoredScrollView extends ScrollView {
   override scrollToEnd(): void {
     this.#releasePosition();
     super.scrollToEnd();
+  }
+
+  setScrollListener(listener: ((direction: "up" | "down") => void) | undefined): void {
+    this.#onScrollDirection = listener;
   }
 }
 
@@ -114,16 +126,33 @@ export class TranscriptViewport {
     this.#semanticAnchors.clear();
   }
 
-  setAnchor(id: string, component: Component, line = 0): void {
+  setAnchor(id: string, component: Component, line: AnchorMetric = 0, height?: AnchorMetric): void {
     if (!this.#anchors.has(id)) {
-      this.#anchors.set(id, { component, line: Math.max(0, Math.trunc(line)) });
+      this.#anchors.set(id, {
+        component,
+        line: normalizeMetric(line),
+        ...(height === undefined ? {} : { height: normalizeMetric(height) }),
+      });
     }
   }
 
-  setSemanticAnchor(id: string, component: Component, line = 0): void {
+  setSemanticAnchor(
+    id: string,
+    component: Component,
+    line: AnchorMetric = 0,
+    height?: AnchorMetric,
+  ): void {
     if (!this.#semanticAnchors.has(id)) {
-      this.#semanticAnchors.set(id, { component, line: Math.max(0, Math.trunc(line)) });
+      this.#semanticAnchors.set(id, {
+        component,
+        line: normalizeMetric(line),
+        ...(height === undefined ? {} : { height: normalizeMetric(height) }),
+      });
     }
+  }
+
+  setScrollListener(listener: ((direction: "up" | "down") => void) | undefined): void {
+    this.scrollView.setScrollListener(listener);
   }
 
   preserveAnchorRow(id: string, width: number): boolean {
@@ -169,10 +198,7 @@ export class TranscriptViewport {
         if (top === null) {
           return null;
         }
-        const height = Math.max(
-          1,
-          anchor.component.render(Math.max(1, width)).length - anchor.line,
-        );
+        const height = this.#anchorHeight(anchor, width);
         return { id, top, bottom: top + height };
       })
       .filter(
@@ -235,10 +261,7 @@ export class TranscriptViewport {
         if (top === null) {
           return null;
         }
-        const height = Math.max(
-          1,
-          anchor.component.render(Math.max(1, width)).length - anchor.line,
-        );
+        const height = this.#anchorHeight(anchor, width);
         return { anchorId, height, top };
       })
       .filter((position): position is NonNullable<typeof position> => position !== null)
@@ -278,17 +301,23 @@ export class TranscriptViewport {
     if (anchorTop === null) {
       return null;
     }
-    const height = Math.max(
-      1,
-      anchor.component.render(Math.max(1, this.scrollView.contentWidth)).length - anchor.line,
-    );
+    const height = this.#anchorHeight(anchor, this.scrollView.contentWidth);
     const screenRow = Math.min(position.screenRow, Math.max(0, this.scrollView.viewportHeight - 1));
     return anchorTop + Math.min(position.lineOffset, height - 1) - screenRow;
   }
 
   #anchorTop(anchor: Anchor, width: number): number | null {
     const index = this.document.children.indexOf(anchor.component);
-    return index < 0 ? null : this.#lineOffset(index, anchor.line, width);
+    return index < 0 ? null : this.#lineOffset(index, resolveMetric(anchor.line, width), width);
+  }
+
+  #anchorHeight(anchor: Anchor, width: number): number {
+    return Math.max(
+      1,
+      anchor.height === undefined
+        ? anchor.component.render(Math.max(1, width)).length - resolveMetric(anchor.line, width)
+        : resolveMetric(anchor.height, width),
+    );
   }
 
   #lineOffset(index: number, anchorLine: number, width: number): number {
@@ -300,4 +329,13 @@ export class TranscriptViewport {
       anchorLine
     );
   }
+}
+
+function normalizeMetric(metric: AnchorMetric): AnchorMetric {
+  return typeof metric === "number" ? Math.max(0, Math.trunc(metric)) : metric;
+}
+
+function resolveMetric(metric: AnchorMetric, width: number): number {
+  const value = typeof metric === "number" ? metric : metric(Math.max(1, width));
+  return Math.max(0, Math.trunc(value));
 }

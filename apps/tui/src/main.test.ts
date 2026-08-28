@@ -1,4 +1,13 @@
-import { access, mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import {
+  access,
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rename,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
@@ -3547,26 +3556,592 @@ test("Ctrl+T reads artifact-backed provider reasoning without placing it in the 
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-artifact-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
   await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
 
   try {
-    const fixture = startFixture({ scenario: "reasoning-artifact", stateRoot, workspaceRoot });
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "reasoning-artifact",
+      stateRoot,
+      workspaceRoot,
+    });
     await fixture.waitFor("Adam · New session");
     const beforePrompt = fixture.output().length;
     fixture.write("Store provider reasoning out of line\r");
     await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforePrompt);
+    await waitForPath(join(controlRoot, "reasoning-session-settled"));
     let frame = latestSynchronizedFrame(fixture.output().slice(beforePrompt)).join("\n");
     expect(frame).not.toContain("Artifact reasoning evidence");
+    const durableStateBeforeExpand = await readFilesRecursively(stateRoot);
 
     const beforeExpand = fixture.output().length;
     fixture.write("\u0014");
-    await fixture.waitForCompleteFrameAfter("Artifact reasoning evidence", beforeExpand);
+    await waitForPath(join(controlRoot, "artifact-read-1-range"));
+    await expect(readFile(join(controlRoot, "artifact-read-1-range"), "utf8")).resolves.toBe(
+      "0:16384\n",
+    );
+    await waitForPath(join(controlRoot, "artifact-read-1-settled"));
+    await fixture.waitForCompleteFrameAfter(
+      "Large reasoning · plain view · 1-16384 of 270028 bytes",
+      beforeExpand,
+    );
     frame = latestSynchronizedFrame(fixture.output().slice(beforeExpand)).join("\n");
-    expect(frame).toContain("✓ ▾ Thinking done · adam");
+    expect(frame).toContain("Large reasoning · plain view");
+    const beforePageDown = fixture.output().length;
+    fixture.write("\u001b[6~");
+    await fixture.waitForCompleteFrameAfter("Reasoning bytes 1-16384", beforePageDown);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforePageDown)).join("\n");
+    expect(frame).toContain("More reasoning below");
+    const beforeSecondPageDown = fixture.output().length;
+    fixture.write("\u001b[6~");
+    await fixture.waitForCompleteFrameAfter("Artifact reasoning evidence", beforeSecondPageDown);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeSecondPageDown)).join("\n");
     expect(frame).toContain("Artifact reasoning evidence");
+    expect(frame).toContain("Reasoning bytes 1-16384");
+
+    fixture.write("\u001b[<65;20;5M".repeat(250));
+    await expect(
+      waitForFileContents(join(controlRoot, "artifact-read-2-range"), "16384:16384\n"),
+    ).resolves.toBe("16384:16384\n");
+    await waitForPath(join(controlRoot, "artifact-read-2-settled"));
+    await fixture.waitFor("Reasoning bytes 16385-32768");
+    const beforeNarrowResize = fixture.output().length;
+    await fixture.resize(40, 18);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeNarrowResize)).join("\n");
+    expect(frame).toContain("Reasoning bytes 16385-32768");
+    const beforeWideResize = fixture.output().length;
+    await fixture.resize(80, 24);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeWideResize)).join("\n");
+    expect(frame).toContain("Reasoning bytes 16385-32768");
+    const beforeFold = fixture.output().length;
+    fixture.write("\u0014");
+    await fixture.waitForCompleteFrameAfter("Artifact reasoning answer.", beforeFold);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeFold)).join("\n");
+    expect(frame).toContain("Thinking done · adam");
+    expect(frame).not.toContain("Large reasoning · plain view");
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeExpand);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("continued scrolling loads only the adjacent oversized reasoning range", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-adjacent-range-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    controlRoot,
+    scenario: "reasoning-artifact",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("Traverse provider reasoning ranges\r");
+    await waitForPath(join(controlRoot, "reasoning-session-settled"));
+    await waitForPhysicalText(terminal, "Thinking done · adam");
+    const durableStateBeforeNavigation = await readFilesRecursively(stateRoot);
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await waitForPath(join(controlRoot, "artifact-read-1-settled"));
+    await waitForPhysicalText(terminal, "Large reasoning · plain view · 1-16384 of 270028 bytes");
+
+    terminal.input("\u001b[<65;40;5M".repeat(250));
+    await expect(
+      waitForFileContents(join(controlRoot, "artifact-read-2-range"), "16384:16384\n"),
+    ).resolves.toBe("16384:16384\n");
+    await waitForPath(join(controlRoot, "artifact-read-2-settled"));
+    await waitForPhysicalText(terminal, "Reasoning bytes 16385-32768");
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeNavigation);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("oversized reasoning evicts offscreen ranges by bytes and reloads them on upward traversal", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-range-lru-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    controlRoot,
+    scenario: "reasoning-artifact",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  const navigateToUncachedRange = async (readOrdinal: number, offset: number) => {
+    terminal.input("\u001b[<65;40;5M".repeat(250));
+    await expect(
+      waitForFileContents(
+        join(controlRoot, `artifact-read-${readOrdinal}-range`),
+        `${offset}:16384\n`,
+      ),
+    ).resolves.toBe(`${offset}:16384\n`);
+    await waitForPath(join(controlRoot, `artifact-read-${readOrdinal}-settled`));
+    await waitForPhysicalText(terminal, `Reasoning bytes ${offset + 1}-${offset + 16_384}`);
+  };
+  const navigateToCachedPreviousRange = async (offset: number) => {
+    const expected = `Reasoning bytes ${offset + 1}-${offset + 16_384}`;
+    for (let step = 0; step < 64; step += 1) {
+      await inputAndWaitForPhysicalFrame(terminal, "\u001b[5~");
+      const screen = terminal.lines().join("\n");
+      if (screen.includes(expected)) {
+        return;
+      }
+      if (screen.includes("↑ More reasoning above · Wheel/PageUp")) {
+        await waitForPhysicalText(terminal, expected);
+        return;
+      }
+    }
+    throw new Error(`PageUp did not reach ${expected}.`);
+  };
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("Exercise bounded reasoning range eviction\r");
+    await waitForPath(join(controlRoot, "reasoning-session-settled"));
+    await waitForPhysicalText(terminal, "Thinking done · adam");
+    const durableStateBeforeNavigation = await readFilesRecursively(stateRoot);
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await waitForPath(join(controlRoot, "artifact-read-1-settled"));
+    await waitForPhysicalText(terminal, "Large reasoning · plain view · 1-16384 of 270028 bytes");
+
+    for (let page = 1; page <= 9; page += 1) {
+      await navigateToUncachedRange(page + 1, page * 16_384);
+    }
+
+    for (let page = 8; page >= 2; page -= 1) {
+      await navigateToCachedPreviousRange(page * 16_384);
+    }
+    terminal.input("\u001b[<64;40;5M".repeat(250));
+    await expect(
+      waitForFileContents(join(controlRoot, "artifact-read-11-range"), "16384:16384\n"),
+    ).resolves.toBe("16384:16384\n");
+    await waitForPath(join(controlRoot, "artifact-read-11-settled"));
+    await waitForPhysicalText(terminal, "Reasoning bytes 16385-32768");
+    terminal.input("\u001b[<64;40;5M".repeat(250));
+    await expect(
+      waitForFileContents(join(controlRoot, "artifact-read-12-range"), "0:16384\n"),
+    ).resolves.toBe("0:16384\n");
+    await waitForPath(join(controlRoot, "artifact-read-12-settled"));
+    await waitForPhysicalText(terminal, "Reasoning bytes 1-16384");
+
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeNavigation);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a late downward reasoning range cannot replace the page selected while it was pending", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-reorder-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    controlRoot,
+    scenario: "reasoning-artifact-reorder",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("Keep a reordered reasoning range out of the viewport\r");
+    await waitForPath(join(controlRoot, "reasoning-session-settled"));
+    await waitForPhysicalText(terminal, "Thinking done · adam");
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await waitForPath(join(controlRoot, "artifact-read-1-settled"));
+    await waitForPhysicalText(terminal, "Large reasoning · plain view · 1-16384 of 270028 bytes");
+    terminal.input("\u001b[<65;40;5M".repeat(250));
+    await waitForPath(join(controlRoot, "artifact-read-2-settled"));
+    await waitForPhysicalText(terminal, "Reasoning bytes 16385-32768");
+
+    terminal.input("\u001b[<65;40;5M".repeat(250));
+    await waitForPath(join(controlRoot, "reasoning-page-3-pending"));
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[<64;40;5M".repeat(250));
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[6~");
+    const durableStateBeforeRelease = await readFilesRecursively(stateRoot);
+    const screenBeforeRelease = terminal.lines().join("\n");
+    const frameBeforeRelease = terminal.frame;
+    await writeFile(join(controlRoot, "release-reasoning-page-3"), "release\n", "utf8");
+    await waitForPath(join(controlRoot, "artifact-read-3-settled"));
+    await terminal.nextFrame(frameBeforeRelease);
+
+    const screenAfterLateRange = terminal.lines().join("\n");
+    expect(screenAfterLateRange).toBe(screenBeforeRelease);
+    expect(screenAfterLateRange).not.toContain("Reasoning bytes 32769-49152");
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeRelease);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("multiple oversized reasoning blocks share one byte-bounded range cache", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-multi-lru-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 18 });
+  const execution = runTuiFixture({
+    controlRoot,
+    scenario: "reasoning-large-multiple",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  const loadNextRange = async (readOrdinal: number, offset: number) => {
+    terminal.input("\u001b[<65;40;5M".repeat(250));
+    await expect(
+      waitForFileContents(
+        join(controlRoot, `artifact-read-${readOrdinal}-range`),
+        `${offset}:16384\n`,
+      ),
+    ).resolves.toBe(`${offset}:16384\n`);
+    await waitForPath(join(controlRoot, `artifact-read-${readOrdinal}-settled`));
+    await waitForPhysicalText(terminal, `Reasoning bytes ${offset + 1}-${offset + 16_384}`);
+  };
+  const expectReadFromBlock = async (readOrdinal: number, block: number) => {
+    const artifactId = (
+      await readFile(join(controlRoot, `artifact-read-${readOrdinal}-id`), "utf8")
+    ).trim();
+    const artifact = await readFile(
+      join(stateRoot, "artifacts", artifactId.replace(/^sha256:/u, "")),
+      "utf8",
+    );
+    expect(artifact.startsWith(`Large reasoning block ${block}\n`)).toBe(true);
+  };
+  const focusTurn = async (answer: number) => {
+    const prompt = `Inspect seeded reasoning block ${answer}`;
+    await inputAndWaitForPhysicalFrame(terminal, "/tree\r");
+    await waitForPhysicalText(terminal, "Active chronology · read only");
+    await inputAndWaitForPhysicalFrame(terminal, `block ${answer}`);
+    await waitForPhysicalText(terminal, `Search: block ${answer}`);
+    await inputAndWaitForPhysicalFrame(terminal, "\r");
+    expect(terminal.lines().join("\n")).not.toContain("Active chronology · read only");
+    expect(terminal.lines().join("\n")).toContain(prompt);
+    for (let step = 0; step < 10; step += 1) {
+      if (terminal.lines().join("\n").includes("Thinking done")) {
+        return;
+      }
+      await inputAndWaitForPhysicalFrame(terminal, "\u001b[<65;40;5M");
+    }
+    throw new Error(`The focused turn did not reveal its reasoning fold: ${prompt}.`);
+  };
+
+  try {
+    await terminal.nextFrame(0);
+    await waitForPhysicalText(terminal, "Multiple reasoning answer 3.");
+    const durableStateBeforeNavigation = await readFilesRecursively(stateRoot);
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await waitForPath(join(controlRoot, "artifact-read-1-settled"));
+    await waitForPhysicalText(terminal, "Large reasoning · plain view · 1-16384 of 270024 bytes");
+    await expectReadFromBlock(1, 3);
+    for (let page = 1; page <= 5; page += 1) {
+      await loadNextRange(page + 1, page * 16_384);
+    }
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+
+    await focusTurn(2);
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await expect(
+      waitForFileContents(join(controlRoot, "artifact-read-7-range"), "0:16384\n"),
+    ).resolves.toBe("0:16384\n");
+    await waitForPath(join(controlRoot, "artifact-read-7-settled"));
+    await expectReadFromBlock(7, 2);
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[6~");
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[6~");
+    await loadNextRange(8, 16_384);
+    await loadNextRange(9, 32_768);
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+
+    await focusTurn(3);
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await expect(
+      waitForFileContents(join(controlRoot, "artifact-read-10-range"), "0:16384\n"),
+    ).resolves.toBe("0:16384\n");
+    await waitForPath(join(controlRoot, "artifact-read-10-settled"));
+    await expectReadFromBlock(10, 3);
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[6~");
+
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeNavigation);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("folding oversized reasoning rejects a late range before a clean retry", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-range-race-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    controlRoot,
+    scenario: "reasoning-artifact-race",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("Hold one provider reasoning range\r");
+    await waitForPath(join(controlRoot, "reasoning-session-settled"));
+    await waitForPhysicalText(terminal, "Thinking done · adam");
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await waitForPath(join(controlRoot, "reasoning-page-read-pending"));
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    expect(terminal.lines().join("\n")).toContain("Thinking done · adam");
+    expect(terminal.lines().join("\n")).not.toContain("Large reasoning · plain view");
+    const durableStateBeforeRelease = await readFilesRecursively(stateRoot);
+    await writeFile(join(controlRoot, "release-reasoning-page-read"), "release\n", "utf8");
+    await waitForPath(join(controlRoot, "artifact-read-1-settled"));
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[5~");
+    expect(terminal.lines().join("\n")).not.toContain("Artifact reasoning evidence");
+    expect(terminal.lines().join("\n")).not.toContain("Large reasoning · plain view");
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await expect(
+      waitForFileContents(join(controlRoot, "artifact-read-2-range"), "0:16384\n"),
+    ).resolves.toBe("0:16384\n");
+    await waitForPath(join(controlRoot, "artifact-read-2-settled"));
+    await waitForPhysicalText(terminal, "Large reasoning · plain view · 1-16384 of 270028 bytes");
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeRelease);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("switching sessions rejects a late oversized reasoning range from the prior session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-session-race-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    controlRoot,
+    scenario: "reasoning-artifact-session-race",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    await waitForPhysicalText(terminal, "Adam · Reasoning source session");
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await waitForPath(join(controlRoot, "reasoning-page-read-pending"));
+
+    await inputAndWaitForPhysicalFrame(terminal, "/resume\r");
+    await waitForPhysicalText(terminal, "Select a project session");
+    await inputAndWaitForPhysicalFrame(terminal, "Switch target session\r");
+    await waitForPhysicalText(terminal, "Adam · Switch target session");
+    expect(terminal.lines().join("\n")).not.toContain("Large reasoning · plain view");
+    const durableStateBeforeRelease = await readFilesRecursively(stateRoot);
+
+    await writeFile(join(controlRoot, "release-reasoning-page-read"), "release\n", "utf8");
+    await waitForPath(join(controlRoot, "artifact-read-1-settled"));
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[5~");
+    const screenAfterLateRange = terminal.lines().join("\n");
+    expect(screenAfterLateRange).toContain("Adam · Switch target session");
+    expect(screenAfterLateRange).not.toContain("Large reasoning · plain view");
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeRelease);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test.each(["missing", "truncated", "same-size corrupt"] as const)(
+  "a %s oversized reasoning artifact fails locally and retries after repair",
+  async (failure) => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-unavailable-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const controlRoot = join(testRoot, "control");
+    await mkdir(workspaceRoot);
+    await mkdir(controlRoot);
+
+    try {
+      const fixture = startFixture({
+        controlRoot,
+        scenario: "reasoning-artifact",
+        stateRoot,
+        workspaceRoot,
+      });
+      await fixture.waitFor("Adam · New session");
+      const beforePrompt = fixture.output().length;
+      fixture.write("Recover one unavailable reasoning range\r");
+      await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforePrompt);
+      await waitForPath(join(controlRoot, "reasoning-session-settled"));
+      const artifactRoot = join(stateRoot, "artifacts");
+      const artifactRelativePaths = (await readdir(artifactRoot, { recursive: true })).filter(
+        (path): path is string => typeof path === "string" && !path.endsWith(".tmp"),
+      );
+      expect(artifactRelativePaths).toHaveLength(1);
+      const artifactPath = join(artifactRoot, artifactRelativePaths[0] as string);
+      const artifactBytes = await readFile(artifactPath);
+      const jsonlRelativePaths = (await readdir(stateRoot, { recursive: true })).filter(
+        (path): path is string => typeof path === "string" && path.endsWith(".jsonl"),
+      );
+      expect(jsonlRelativePaths.length).toBeGreaterThan(0);
+      const jsonlBefore = await Promise.all(
+        jsonlRelativePaths.map((path) => readFile(join(stateRoot, path), "utf8")),
+      );
+      await chmod(artifactPath, 0o600);
+      if (failure === "missing") {
+        await rename(artifactPath, `${artifactPath}.missing`);
+      } else if (failure === "truncated") {
+        await writeFile(artifactPath, "truncated", "utf8");
+      } else {
+        await writeFile(artifactPath, Buffer.alloc(artifactBytes.length, 0x78));
+      }
+
+      const beforeFailure = fixture.output().length;
+      fixture.write("\u0014");
+      await waitForPath(join(controlRoot, "artifact-read-1-settled"));
+      const beforeFailureScroll = fixture.output().length;
+      fixture.write("\u001b[6~");
+      await fixture.waitForAfter("\u001b[?2026l", beforeFailureScroll);
+      fixture.write("\u001b[6~");
+      await fixture.waitForCompleteFrameAfter("Reasoning range unavailable", beforeFailure);
+      if (failure === "missing") {
+        await rename(`${artifactPath}.missing`, artifactPath);
+      } else {
+        await writeFile(artifactPath, artifactBytes);
+      }
+      await chmod(artifactPath, 0o400);
+      fixture.write("\u0014");
+      const beforeRetry = fixture.output().length;
+      fixture.write("\u0014");
+      await expect(
+        waitForFileContents(join(controlRoot, "artifact-read-2-range"), "0:16384\n"),
+      ).resolves.toBe("0:16384\n");
+      await waitForPath(join(controlRoot, "artifact-read-2-settled"));
+      await fixture.waitForCompleteFrameAfter(
+        "Large reasoning · plain view · 1-16384 of 270028 bytes",
+        beforeRetry,
+      );
+      await expect(
+        Promise.all(jsonlRelativePaths.map((path) => readFile(join(stateRoot, path), "utf8"))),
+      ).resolves.toEqual(jsonlBefore);
+
+      fixture.write("\u0011");
+      await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test("live reasoning crosses atomically into the bounded plain view without durable UI state", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-live-large-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    controlRoot,
+    scenario: "reasoning-large-live",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("Cross the live reasoning display threshold\r");
+    await waitForPath(join(controlRoot, "reasoning-large-ready"));
+    await waitForPhysicalText(terminal, "Thinking · provider reasoning · adam");
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    expect(terminal.lines().join("\n")).not.toContain("Large reasoning · plain view");
+    const durableStateBeforeFolds = await readFilesRecursively(stateRoot);
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    expect(terminal.lines().join("\n")).not.toContain("Large reasoning · plain view");
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeFolds);
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[F");
+
+    const frameBeforeGrowth = terminal.frame;
+    await writeFile(join(controlRoot, "release-reasoning-large-growth"), "release\n", "utf8");
+    await waitForPath(join(controlRoot, "reasoning-large-grown"));
+    await terminal.nextFrame(frameBeforeGrowth);
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeFolds);
+    expect((await readdir(controlRoot)).some((path) => /^artifact-read-/u.test(path))).toBe(false);
+
+    const frameBeforeCompletion = terminal.frame;
+    await writeFile(join(controlRoot, "release-reasoning-large-completion"), "release\n", "utf8");
+    await waitForPath(join(controlRoot, "reasoning-large-completed"));
+    await waitForPath(join(controlRoot, "reasoning-session-settled"));
+    await terminal.nextFrame(frameBeforeCompletion);
+    expect((await readdir(controlRoot)).some((path) => /^artifact-read-/u.test(path))).toBe(false);
+    const durableStateBeforeArtifactNavigation = await readFilesRecursively(stateRoot);
+    terminal.input("\u001b[<64;40;5M".repeat(500));
+    await expect(
+      waitForFileContents(join(controlRoot, "artifact-read-1-range"), "229376:16384\n"),
+    ).resolves.toBe("229376:16384\n");
+    await waitForPath(join(controlRoot, "artifact-read-1-settled"));
+    await waitForPhysicalText(terminal, "Reasoning bytes 229377-245760");
+    expect(await readFilesRecursively(stateRoot)).toBe(durableStateBeforeArtifactNavigation);
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await waitForPhysicalText(terminal, "Large live reasoning answer.");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
     await rm(testRoot, { recursive: true, force: true });
   }
 });
