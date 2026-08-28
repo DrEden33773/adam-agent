@@ -32,6 +32,103 @@ type ChildObservation = {
 
 const childObservations = new WeakMap<ChildProcess, ChildObservation>();
 
+test("SessionLifecycle cold resume keeps a Direct DeepSeek v2 session on its historical profile", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-deepseek-v2-cold-resume-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const historicalIdentity = { ...targetIdentity, profileVersion: 2 } as const;
+  const requests: unknown[] = [];
+  const modelTargets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(answerOnlyDeepSeekStream, {
+        headers: { "content-type": "text/event-stream" },
+        status: 200,
+      });
+    },
+  });
+  const tools = createCodingToolRegistry({ stateRoot, workspaceRoot });
+  const first = createSessionLifecycle({ modelTargets, stateRoot, tools, workspaceRoot });
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const created = await first.create({ targetIdentity: historicalIdentity });
+    await expect(
+      first.continue({
+        sessionId: created.sessionId,
+        input: { text: "Record one historical turn." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Hello, Adam." },
+      snapshot: { targetIdentity: historicalIdentity },
+    });
+    await first.close();
+
+    cold = createSessionLifecycle({ modelTargets, stateRoot, tools, workspaceRoot });
+    await expect(
+      cold.continue({
+        sessionId: created.sessionId,
+        input: { text: "Continue the historical session." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Hello, Adam." },
+      snapshot: { targetIdentity: historicalIdentity },
+    });
+
+    expect(
+      requests.map((request) => {
+        const body = request as {
+          readonly max_tokens?: number;
+          readonly messages?: readonly { readonly role?: string; readonly content?: string }[];
+          readonly model?: string;
+          readonly tools?: readonly { readonly function?: { readonly name?: string } }[];
+        };
+        return {
+          maxTokens: body.max_tokens,
+          model: body.model,
+          toolNames: body.tools?.map((tool) => tool.function?.name),
+          userMessages: body.messages
+            ?.filter((message) => message.role === "user")
+            .map((message) => message.content),
+        };
+      }),
+    ).toEqual([
+      {
+        maxTokens: 384_000,
+        model: "deepseek-v4-flash",
+        toolNames: [
+          "read_file",
+          "write_file",
+          "edit_file",
+          "run_shell",
+          "activate_skill",
+          "read_skill_resource",
+        ],
+        userMessages: ["Record one historical turn."],
+      },
+      {
+        maxTokens: 384_000,
+        model: "deepseek-v4-flash",
+        toolNames: [
+          "read_file",
+          "write_file",
+          "edit_file",
+          "run_shell",
+          "activate_skill",
+          "read_skill_resource",
+        ],
+        userMessages: ["Record one historical turn.", "Continue the historical session."],
+      },
+    ]);
+  } finally {
+    await cold?.close();
+    await first.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle rejects a competing project writer before model dispatch and takes over after owner death", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-owner-"));
   const stateRoot = join(testRoot, "state");

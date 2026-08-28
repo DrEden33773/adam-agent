@@ -138,7 +138,7 @@ async function createThinkingPolicyPresentationFixture(prefix: string) {
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const policyTargetIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 2 };
+  const policyTargetIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 3 };
   const productionTargets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
   });

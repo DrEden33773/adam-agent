@@ -502,7 +502,7 @@ test("SessionLifecycle snapshots one thinking policy and reuses it across tool c
   await writeFile(join(workspaceRoot, "README.md"), "# Adam\n", "utf8");
   const policyTargetIdentity: ModelTargetIdentity = {
     ...targetIdentity,
-    profileVersion: 2,
+    profileVersion: 3,
   };
   const productionTargets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
@@ -617,7 +617,7 @@ test("SessionLifecycle rejects an unsupported thinking level before draft persis
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const policyTargetIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 2 };
+  const policyTargetIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 3 };
   const productionTargets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
   });
@@ -686,7 +686,7 @@ test("SessionLifecycle rejects a thinking capability minted for another exact ta
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const policyTargetIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 2 };
+  const policyTargetIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 3 };
   const productionTargets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
   });
@@ -755,7 +755,7 @@ test("SessionLifecycle cold recovery reuses the durable thinking snapshot withou
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const policyTargetIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 2 };
+  const policyTargetIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 3 };
   const productionTargets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
   });
@@ -854,7 +854,7 @@ test("SessionLifecycle rejects a stale durable thinking profile before recovery 
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const policyTargetIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 2 };
+  const policyTargetIdentity: ModelTargetIdentity = { ...targetIdentity, profileVersion: 3 };
   const productionTargets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
   });
@@ -2033,7 +2033,7 @@ test("SessionLifecycle branches to an explicit compatible exact target only when
         status: 200,
       }),
   });
-  const currentTargetIdentity = { ...targetIdentity, profileVersion: 2 };
+  const currentTargetIdentity = { ...targetIdentity, profileVersion: 3 };
   const harness = createInMemorySessionLifecycleHarness();
 
   try {

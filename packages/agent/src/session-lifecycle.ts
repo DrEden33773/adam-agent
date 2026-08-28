@@ -58,6 +58,7 @@ import type { McpToolProfileV1 } from "./mcp-profile-contracts.js";
 import {
   type ModelTargetIdentity,
   type ModelTargets,
+  modelTargetUsesContextProfile,
   sameModelTargetIdentity,
 } from "./model-targets.js";
 import {
@@ -1636,7 +1637,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       );
       if (
         target === undefined ||
-        target.contextProfile.version !== snapshot.targetIdentity.profileVersion ||
+        !modelTargetUsesContextProfile(snapshot.targetIdentity, target.contextProfile) ||
         !isContextProfileSupported(target.contextProfile)
       ) {
         return {
@@ -1893,7 +1894,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (
           resolved === undefined ||
           !sameModelTargetIdentity(resolved.identity, input.targetIdentity) ||
-          resolved.contextProfile.version !== input.targetIdentity.profileVersion ||
+          !modelTargetUsesContextProfile(input.targetIdentity, resolved.contextProfile) ||
           !isContextProfileSupported(resolved.contextProfile)
         ) {
           throw new SessionLifecycleError("session_model_target_incompatible");
@@ -2430,7 +2431,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         }
         if (
           !sameModelTargetIdentity(resolved.identity, resumed.snapshot.targetIdentity) ||
-          resolved.contextProfile.version !== resumed.snapshot.targetIdentity.profileVersion ||
+          !modelTargetUsesContextProfile(
+            resumed.snapshot.targetIdentity,
+            resolved.contextProfile,
+          ) ||
           !isContextProfileSupported(resolved.contextProfile)
         ) {
           throw new SessionLifecycleError("session_model_target_incompatible");
@@ -3679,7 +3683,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           throw new SessionLifecycleError("session_model_target_unavailable");
         }
         if (
-          target.contextProfile.version !== input.targetIdentity.profileVersion ||
+          !modelTargetUsesContextProfile(input.targetIdentity, target.contextProfile) ||
           !isContextProfileSupported(target.contextProfile)
         ) {
           throw new SessionLifecycleError("session_model_target_incompatible");

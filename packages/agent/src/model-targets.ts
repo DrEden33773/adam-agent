@@ -157,8 +157,12 @@ const directDeepSeekV1Targets: readonly ModelTargetIdentity[] = Object.freeze([
 const directDeepSeekV2Targets: readonly ModelTargetIdentity[] = Object.freeze(
   directDeepSeekV1Targets.map((identity) => Object.freeze({ ...identity, profileVersion: 2 })),
 );
-const currentDirectDeepSeekTargets = directDeepSeekV2Targets;
+const directDeepSeekV3Targets: readonly ModelTargetIdentity[] = Object.freeze(
+  directDeepSeekV2Targets.map((identity) => Object.freeze({ ...identity, profileVersion: 3 })),
+);
+const currentDirectDeepSeekTargets = directDeepSeekV3Targets;
 const supportedDirectDeepSeekTargets = Object.freeze([
+  ...directDeepSeekV3Targets,
   ...directDeepSeekV2Targets,
   ...directDeepSeekV1Targets,
 ]);
@@ -350,7 +354,7 @@ function directDeepSeekContextProfileFor(identity: ModelTargetIdentity): Context
   if (identity.profileVersion === 1) {
     return directDeepSeekContextProfileV1;
   }
-  if (identity.profileVersion === 2) {
+  if (identity.profileVersion === 2 || identity.profileVersion === 3) {
     return preparedDirectDeepSeekV2ContextProfile;
   }
   throw new RangeError("The Direct DeepSeek context profile is not supported.");
@@ -369,4 +373,18 @@ export function sameModelTargetIdentity(
     left.profileVersion === right.profileVersion &&
     left.certification === right.certification
   );
+}
+
+export function modelTargetUsesContextProfile(
+  identity: ModelTargetIdentity,
+  contextProfile: ContextProfile,
+): boolean {
+  const expectedContextProfileVersion =
+    identity.vendor === "deepseek" &&
+    identity.route === "direct" &&
+    (identity.modelId === "deepseek-v4-flash" || identity.modelId === "deepseek-v4-pro") &&
+    identity.profileVersion === 3
+      ? 2
+      : identity.profileVersion;
+  return contextProfile.version === expectedContextProfileVersion;
 }

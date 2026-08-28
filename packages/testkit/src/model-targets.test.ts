@@ -56,7 +56,7 @@ test("an exact Direct DeepSeek target returns a public answer-only model driver"
       vendor: "deepseek",
       modelId: "deepseek-v4-flash",
       route: "direct",
-      profileVersion: 2,
+      profileVersion: 3,
       certification: "certified",
     },
     requests: [
@@ -95,12 +95,12 @@ test("an exact Direct DeepSeek target exposes only its real thinking policy choi
 
   expect(target.thinkingCapability).toMatchObject({
     schemaVersion: 1,
-    capabilityId: "deepseek-chat-thinking:deepseek-v4-flash.direct:target-profile-2",
+    capabilityId: "deepseek-chat-thinking:deepseek-v4-flash.direct:target-profile-3",
     capabilityVersion: 1,
     targetIdentity: target.identity,
     providerProfile: {
       id: "@ai-sdk/deepseek/chat",
-      version: "3.0.28",
+      version: "3.0.30",
       requestPath: "provider_options.deepseek",
     },
     supportsOff: true,
@@ -113,7 +113,7 @@ test("an exact Direct DeepSeek target exposes only its real thinking policy choi
       { id: "max", label: "Max", effectiveLevelId: "max" },
     ],
     reasoningArtifact: "provider_reasoning",
-    capabilityDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+    capabilityDigest: "sha256:0af69c6828ddc0f68e6ae38c0203c855288df76ac56c2431b4570b96b7603287",
   });
   expect(target.thinkingCapability.levels.map((level) => level.id)).not.toEqual(
     expect.arrayContaining(["medium", "xhigh"]),
@@ -437,6 +437,247 @@ test.each(["deepseek-v4-flash", "deepseek-v4-pro"] as const)(
   },
 );
 
+test.each([
+  {
+    label: "Flash",
+    targetId: "deepseek-v4-flash.direct",
+    modelId: "deepseek-v4-flash",
+    capabilityId: "deepseek-chat-thinking:deepseek-v4-flash.direct:target-profile-2",
+    v2Digest: "sha256:81aa965c6378ee4995f6e7e1dab30e6086ab0508ced7b55b4b63a3dd5da913a8",
+    v1Digest: "sha256:66929505ba3695e601c820a2bb1213c2959045813f5f91a74755622b3032c31f",
+  },
+  {
+    label: "Pro",
+    targetId: "deepseek-v4-pro.direct",
+    modelId: "deepseek-v4-pro",
+    capabilityId: "deepseek-chat-thinking:deepseek-v4-pro.direct:target-profile-2",
+    v2Digest: "sha256:ab5c6d78a323ef6092af2a09dfd83c2d098e14fb02eaa50606e3f25e867771f0",
+    v1Digest: "sha256:a2ffdfea3729204de7a348287e0e2bb43c949f88881433ab9e77210da326ba5a",
+  },
+] as const)(
+  "the historical Direct DeepSeek $label v2 capability and reasoning-tool contract remain fixed",
+  async ({ targetId, modelId, capabilityId, v2Digest, v1Digest }) => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-deepseek-v2-characterization-"));
+    await writeFile(join(workspaceRoot, "README.md"), "# Adam Agent\n", "utf8");
+    const requests: unknown[] = [];
+    let requestCount = 0;
+    const targets = createModelTargets({
+      environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+      fetch: async (_input, init) => {
+        requests.push(JSON.parse(String(init?.body)));
+        requestCount += 1;
+        return new Response(
+          requestCount === 1 ? reasoningToolDeepSeekStream : finalAnswerDeepSeekStream,
+          { headers: { "content-type": "text/event-stream" }, status: 200 },
+        );
+      },
+    });
+    const historicalV2Identity: ModelTargetIdentity = {
+      targetId,
+      vendor: "deepseek",
+      modelId,
+      route: "direct",
+      profileVersion: 2,
+      certification: "certified",
+    };
+    const resolved = await targets.resolve({
+      targetId,
+      targetIdentity: historicalV2Identity,
+      allowExperimental: false,
+      signal: new AbortController().signal,
+    });
+    const historicalV1 = await targets.resolve({
+      targetId,
+      targetIdentity: { ...historicalV2Identity, profileVersion: 1 },
+      allowExperimental: false,
+      signal: new AbortController().signal,
+    });
+    const events: RuntimeEvent[] = [];
+    const session = new AgentSession({
+      maximumOutputTokens: resolved.contextProfile.maximumOutputTokens,
+      model: resolved.driver,
+      tools: createReadToolRegistry({ workspaceRoot }),
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      store: createInMemorySessionStore(),
+    });
+    session.subscribe((event) => events.push(event));
+
+    try {
+      await expect(session.run({ text: "Read the project name" })).resolves.toEqual({
+        status: "completed",
+        answer: "The project is Adam Agent.",
+      });
+      expect(resolved.thinkingCapability).toEqual({
+        schemaVersion: 1,
+        capabilityId,
+        capabilityVersion: 1,
+        capabilityDigest: v2Digest,
+        targetIdentity: historicalV2Identity,
+        providerProfile: {
+          id: "@ai-sdk/deepseek/chat",
+          version: "3.0.28",
+          requestPath: "provider_options.deepseek",
+        },
+        supportsOff: true,
+        defaultLevelId: "high",
+        providerDefault: { effectiveLevelId: "high", mutable: true },
+        levels: [
+          {
+            id: "off",
+            label: "Off",
+            effectiveLevelId: "off",
+            mapping: {
+              requestPath: "provider_options.deepseek",
+              thinkingType: "disabled",
+            },
+          },
+          {
+            id: "low",
+            label: "Low",
+            effectiveLevelId: "low",
+            mapping: {
+              requestPath: "provider_options.deepseek",
+              thinkingType: "enabled",
+              reasoningEffort: "low",
+            },
+          },
+          {
+            id: "high",
+            label: "High",
+            effectiveLevelId: "high",
+            mapping: {
+              requestPath: "provider_options.deepseek",
+              thinkingType: "enabled",
+              reasoningEffort: "high",
+            },
+          },
+          {
+            id: "max",
+            label: "Max",
+            effectiveLevelId: "max",
+            mapping: {
+              requestPath: "provider_options.deepseek",
+              thinkingType: "enabled",
+              reasoningEffort: "max",
+            },
+          },
+        ],
+        reasoningArtifact: "provider_reasoning",
+      });
+      expect(historicalV1.thinkingCapability).toMatchObject({
+        capabilityDigest: v1Digest,
+        providerProfile: { id: "@ai-sdk/deepseek/chat", version: "3.0.28" },
+        targetIdentity: { ...historicalV2Identity, profileVersion: 1 },
+      });
+      expect(requests).toEqual([
+        expect.objectContaining({
+          model: modelId,
+          max_tokens: 384_000,
+          messages: expect.arrayContaining([{ role: "user", content: "Read the project name" }]),
+        }),
+        expect.objectContaining({
+          model: modelId,
+          max_tokens: 384_000,
+          messages: expect.arrayContaining([
+            expect.objectContaining({
+              role: "assistant",
+              reasoning_content: "I need the README.",
+            }),
+            {
+              role: "tool",
+              tool_call_id: "read-project",
+              content:
+                '{"status":"completed","output":{"path":"README.md","content":"# Adam Agent\\n","truncated":false}}',
+            },
+          ]),
+        }),
+      ]);
+      expect(events).toContainEqual({
+        type: "tool_completed",
+        callId: "read-project",
+        name: "read_file",
+        output: { path: "README.md", content: "# Adam Agent\n", truncated: false },
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test("AgentSession uses current Direct DeepSeek Flash v3 while historical profiles remain exact", async () => {
+  const requests: unknown[] = [];
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(answerOnlyDeepSeekStream, {
+        headers: { "content-type": "text/event-stream" },
+        status: 200,
+      });
+    },
+  });
+  const current = await targets.resolve({
+    targetId: "deepseek-v4-flash.direct",
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+  const historicalV2 = await targets.resolve({
+    targetId: "deepseek-v4-flash.direct",
+    targetIdentity: { ...current.identity, profileVersion: 2 },
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+  const historicalV1 = await targets.resolve({
+    targetId: "deepseek-v4-flash.direct",
+    targetIdentity: { ...current.identity, profileVersion: 1 },
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+  const session = new AgentSession({
+    maximumOutputTokens: current.contextProfile.maximumOutputTokens,
+    model: current.driver,
+    store: createInMemorySessionStore(),
+  });
+
+  await expect(session.run({ text: "Introduce yourself" })).resolves.toEqual({
+    status: "completed",
+    answer: "Hello, Adam.",
+  });
+  expect(current).toMatchObject({
+    identity: { profileVersion: 3 },
+    contextProfile: { version: 2, maximumOutputTokens: 384_000 },
+    thinkingCapability: {
+      capabilityId: "deepseek-chat-thinking:deepseek-v4-flash.direct:target-profile-3",
+      providerProfile: { id: "@ai-sdk/deepseek/chat", version: "3.0.30" },
+    },
+  });
+  expect(historicalV2).toMatchObject({
+    identity: { profileVersion: 2 },
+    contextProfile: { version: 2, maximumOutputTokens: 384_000 },
+    thinkingCapability: {
+      capabilityId: "deepseek-chat-thinking:deepseek-v4-flash.direct:target-profile-2",
+      capabilityDigest: "sha256:81aa965c6378ee4995f6e7e1dab30e6086ab0508ced7b55b4b63a3dd5da913a8",
+      providerProfile: { id: "@ai-sdk/deepseek/chat", version: "3.0.28" },
+    },
+  });
+  expect(historicalV1).toMatchObject({
+    identity: { profileVersion: 1 },
+    contextProfile: { version: 1, maximumOutputTokens: 32_768 },
+    thinkingCapability: {
+      capabilityId: "deepseek-chat-thinking:deepseek-v4-flash.direct:target-profile-1",
+      capabilityDigest: "sha256:66929505ba3695e601c820a2bb1213c2959045813f5f91a74755622b3032c31f",
+      providerProfile: { id: "@ai-sdk/deepseek/chat", version: "3.0.28" },
+    },
+  });
+  expect(requests).toEqual([
+    expect.objectContaining({
+      model: "deepseek-v4-flash",
+      max_tokens: 384_000,
+      messages: expect.arrayContaining([{ role: "user", content: "Introduce yourself" }]),
+    }),
+  ]);
+});
+
 test("AgentSession keeps tool execution and replay state while using the unified driver", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-model-target-"));
   await writeFile(join(workspaceRoot, "README.md"), "# Adam Agent\n", "utf8");
@@ -453,11 +694,12 @@ test("AgentSession keeps tool execution and replay state while using the unified
       );
     },
   });
-  const { driver } = await targets.resolve({
+  const resolved = await targets.resolve({
     targetId: "deepseek-v4-pro.direct",
     allowExperimental: false,
     signal: new AbortController().signal,
   });
+  const { driver } = resolved;
   const store = createInMemorySessionStore();
   const session = new AgentSession({
     maximumOutputTokens: 32_768,
@@ -475,6 +717,15 @@ test("AgentSession keeps tool execution and replay state while using the unified
     expect({ result, requestCount }).toEqual({
       result: { status: "completed", answer: "The project is Adam Agent." },
       requestCount: 2,
+    });
+    expect(resolved).toMatchObject({
+      identity: { profileVersion: 3 },
+      contextProfile: { version: 2, maximumOutputTokens: 384_000 },
+      thinkingCapability: {
+        capabilityId: "deepseek-chat-thinking:deepseek-v4-pro.direct:target-profile-3",
+        capabilityDigest: "sha256:5deb10622dcda4511c80faa9bb8920fe0750f67c4b63c18b4bf75975bb4fa5f2",
+        providerProfile: { id: "@ai-sdk/deepseek/chat", version: "3.0.30" },
+      },
     });
     expect(events).toContainEqual({
       type: "tool_completed",
@@ -1351,7 +1602,7 @@ test("the target snapshot reports exact Certified identities and safe credential
           vendor: "deepseek",
           modelId: "deepseek-v4-flash",
           route: "direct",
-          profileVersion: 2,
+          profileVersion: 3,
           certification: "certified",
         },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
@@ -1371,7 +1622,7 @@ test("the target snapshot reports exact Certified identities and safe credential
           vendor: "deepseek",
           modelId: "deepseek-v4-flash",
           route: "direct",
-          profileVersion: 2,
+          profileVersion: 3,
           certification: "certified",
         }),
       },
@@ -1381,7 +1632,7 @@ test("the target snapshot reports exact Certified identities and safe credential
           vendor: "deepseek",
           modelId: "deepseek-v4-pro",
           route: "direct",
-          profileVersion: 2,
+          profileVersion: 3,
           certification: "certified",
         },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
@@ -1401,7 +1652,7 @@ test("the target snapshot reports exact Certified identities and safe credential
           vendor: "deepseek",
           modelId: "deepseek-v4-pro",
           route: "direct",
-          profileVersion: 2,
+          profileVersion: 3,
           certification: "certified",
         }),
       },
@@ -1441,7 +1692,7 @@ function expectedDirectDeepSeekThinkingCapability(targetIdentity: ModelTargetIde
     targetIdentity,
     providerProfile: {
       id: "@ai-sdk/deepseek/chat",
-      version: "3.0.28",
+      version: targetIdentity.profileVersion >= 3 ? "3.0.30" : "3.0.28",
       requestPath: "provider_options.deepseek",
     },
     supportsOff: true,
@@ -1492,7 +1743,7 @@ function expectedDirectDeepSeekThinkingCapability(targetIdentity: ModelTargetIde
   };
 }
 
-test("current Direct DeepSeek v2 selection retains exact historical v1 resolution", async () => {
+test("current Direct DeepSeek v3 selection retains exact historical v2 and v1 resolution", async () => {
   const targets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
   });
@@ -1501,7 +1752,16 @@ test("current Direct DeepSeek v2 selection retains exact historical v1 resolutio
     allowExperimental: false,
     signal: new AbortController().signal,
   });
-  const historical = await targets.resolve({
+  const historicalV2 = await targets.resolve({
+    targetId: "deepseek-v4-flash.direct",
+    targetIdentity: {
+      ...current.identity,
+      profileVersion: 2,
+    },
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+  const historicalV1 = await targets.resolve({
     targetId: "deepseek-v4-flash.direct",
     targetIdentity: {
       ...current.identity,
@@ -1512,10 +1772,14 @@ test("current Direct DeepSeek v2 selection retains exact historical v1 resolutio
   });
 
   expect(current).toMatchObject({
+    identity: { profileVersion: 3 },
+    contextProfile: { version: 2, maximumOutputTokens: 384_000 },
+  });
+  expect(historicalV2).toMatchObject({
     identity: { profileVersion: 2 },
     contextProfile: { version: 2, maximumOutputTokens: 384_000 },
   });
-  expect(historical).toMatchObject({
+  expect(historicalV1).toMatchObject({
     identity: { profileVersion: 1 },
     contextProfile: { version: 1, maximumOutputTokens: 32_768 },
   });
@@ -1523,6 +1787,8 @@ test("current Direct DeepSeek v2 selection retains exact historical v1 resolutio
     targets.snapshot({ includeHistoricalProfiles: true, signal: new AbortController().signal }),
   ).resolves.toMatchObject({
     targets: [
+      { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 3 } },
+      { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 3 } },
       { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 2 } },
       { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 2 } },
       { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 1 } },
