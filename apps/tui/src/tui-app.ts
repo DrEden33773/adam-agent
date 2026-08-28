@@ -40,6 +40,7 @@ import { type ConfigurationField, ConfigurationPage } from "./configuration-page
 import {
   type ClipboardAdapter,
   copyDraftToClipboard,
+  copySelectionToClipboard,
   copyTextToClipboard,
   type DeadlineScheduler,
   ExitArm,
@@ -90,6 +91,7 @@ export type RunTuiOptions = {
   readonly terminal?: Terminal;
   readonly clipboard?: ClipboardAdapter;
   readonly deadlineScheduler?: DeadlineScheduler;
+  readonly mouse?: boolean;
 };
 
 export async function runTui(options: RunTuiOptions): Promise<void> {
@@ -102,7 +104,25 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     options.presentation.getState().authoritative.targets.defaultTargetId;
   let newSessionSelected =
     options.presentation.getState().authoritative.sessions.items.length === 0;
-  const tui = new TuiAltScreen(terminal, true, undefined, { mouse: false });
+  let statusMessage: string | null = options.startupNotice ?? null;
+  let requestPolicyRender: () => void = () => undefined;
+  const tui = new TuiAltScreen(terminal, true, undefined, {
+    mouse: options.mouse ?? true,
+    async copySelection(text) {
+      const result = await copySelectionToClipboard(text, options.clipboard, deadlineScheduler);
+      if (result === "too_large") {
+        statusMessage = "Selection is larger than 1 MiB and was not copied.";
+      } else if (result === "unsupported") {
+        statusMessage = "Clipboard unavailable; selection was not copied.";
+      } else if (result === "failed") {
+        statusMessage = "Clipboard copy failed; selection was not copied.";
+      }
+      if (result !== "copied") {
+        requestPolicyRender();
+      }
+      return result === "copied";
+    },
+  });
   const theme = createAdamTuiTheme();
   const showOverlay = (component: Component, overlayOptions: OverlayOptions) => {
     const renderOptions = resolvePhysicalOverlayWidth(
@@ -178,6 +198,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let projectedHistorySessionId = options.presentation.getState().authoritative.active?.session.id;
   const statusLine = new Text();
   const footer = new ResponsiveText(() => physicalTerminal.columns);
+  const viewportHintLine = new ResponsiveText(() => physicalTerminal.columns);
+  viewportHintLine.setText({
+    wide: theme.muted("Wheel/PageUp/PageDown scroll · Ctrl+T fold"),
+    standard: theme.muted("Wheel/PageUp/PageDown scroll · Ctrl+T fold"),
+    narrow: theme.muted("Wheel/PgUp/PgDn · Ctrl+T"),
+  });
+  let viewportHintVisible = false;
   const working = new Loader(tui, theme.toolTitle, theme.muted, "Working", { intervalMs: 80 });
   const thinking = new Loader(tui, theme.keyword, theme.muted, "Thinking", { intervalMs: 80 });
   thinking.stop();
@@ -185,7 +212,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let workingVisible = false;
   let thinkingVisible = false;
   let cancelSettling = false;
-  let requestPolicyRender: () => void = () => undefined;
   const exitArm = new ExitArm(deadlineScheduler, () => requestPolicyRender());
   const legacyDuplicateGuard = new LegacyDuplicateGuard(deadlineScheduler);
   let previousRunActive: boolean | undefined;
@@ -194,7 +220,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     readonly sessionId: string;
     readonly operationIds: ReadonlySet<string>;
   } | null = null;
-  let statusMessage: string | null = options.startupNotice ?? null;
   let permission:
     | {
         readonly overlay: PermissionOverlay;
@@ -365,6 +390,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         editorSlot,
         { component: statusLine, visible: () => statusMessage !== null },
         footer,
+        {
+          component: viewportHintLine,
+          visible: (viewport) => viewport.height >= 18 && viewportHintVisible,
+        },
       ]),
       basis: "auto",
       minSize: 1,
@@ -472,6 +501,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const renderState = () => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
+    viewportHintVisible = false;
     synchronizePromptHistory(active);
     const activeSessionChanged = active?.session.id !== previousActiveSessionId;
     if (activeSessionChanged) {
@@ -838,11 +868,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         if (reasoning.status === "active") {
           transcript.addChild(thinking);
           transcriptViewport.setAnchor(reasoningAnchorId(reasoning.id), thinking, 1);
+          transcriptViewport.setSemanticAnchor(transcriptItemAnchorId(reasoning.id), thinking);
         } else {
           transcript.addChild(new Spacer(1));
           const collapsed = new ResponsiveLine(title);
           transcript.addChild(collapsed);
           transcriptViewport.setAnchor(reasoningAnchorId(reasoning.id), collapsed);
+          transcriptViewport.setSemanticAnchor(transcriptItemAnchorId(reasoning.id), collapsed);
         }
         return;
       }
@@ -867,10 +899,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         expandedFrame,
         reasoning.status === "active" ? 2 : 1,
       );
+      transcriptViewport.setSemanticAnchor(transcriptItemAnchorId(reasoning.id), expandedFrame);
     };
     let previousWasAssistant = false;
     let currentPromptAnchor: Component | undefined;
     for (const item of active?.transcript.items ?? []) {
+      let itemAnchor: Component | undefined;
       if (item.type === "user_message") {
         if (previousWasAssistant) {
           transcript.addChild(new Spacer(1));
@@ -880,20 +914,23 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           new Text(theme.userText(`${theme.userMarker}${safeTerminalText(item.text)}`)),
         );
         transcript.addChild(user);
+        itemAnchor = user;
         currentPromptAnchor = user;
         previousWasAssistant = false;
       } else if (item.type === "assistant_message") {
         transcript.addChild(new Spacer(1));
         if (item.text !== null) {
-          transcript.addChild(new Markdown(safeTerminalText(item.text), 0, 0, theme.markdown));
+          const assistant = new Markdown(safeTerminalText(item.text), 0, 0, theme.markdown);
+          transcript.addChild(assistant);
+          itemAnchor = assistant;
         } else if (item.artifact !== null) {
-          transcript.addChild(
-            new Text(
-              theme.muted(
-                `Assistant response stored as artifact · ${item.artifact.byteCount} bytes · /artifacts to inspect`,
-              ),
+          const assistant = new Text(
+            theme.muted(
+              `Assistant response stored as artifact · ${item.artifact.byteCount} bytes · /artifacts to inspect`,
             ),
           );
+          transcript.addChild(assistant);
+          itemAnchor = assistant;
         }
         previousWasAssistant = true;
       } else if (item.type === "reasoning_block") {
@@ -955,17 +992,18 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         }
         transcript.addChild(new Spacer(1));
         transcript.addChild(tool);
+        itemAnchor = tool;
         transcriptViewport.setAnchor(toolAnchorId(item.id), tool, 1);
         previousWasAssistant = false;
       } else if (item.type === "compaction_marker") {
         transcript.addChild(new Spacer(1));
-        transcript.addChild(
-          new Text(
-            theme.muted(
-              `Context compacted · window ${item.windowNumber} · through ${item.sourceThrough} · retained from ${item.retainedFrom}`,
-            ),
+        const marker = new Text(
+          theme.muted(
+            `Context compacted · window ${item.windowNumber} · through ${item.sourceThrough} · retained from ${item.retainedFrom}`,
           ),
         );
+        transcript.addChild(marker);
+        itemAnchor = marker;
         previousWasAssistant = false;
       } else if (item.type === "session_notice") {
         const message =
@@ -975,7 +1013,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
               ? item.reason
               : `${item.code}: ${item.message}`;
         transcript.addChild(new Spacer(1));
-        transcript.addChild(new Text(theme.muted(safeTerminalText(message))));
+        const notice = new Text(theme.muted(safeTerminalText(message)));
+        transcript.addChild(notice);
+        itemAnchor = notice;
         previousWasAssistant = false;
       } else if (item.type === "operation_link") {
         const operation = active?.linkedOperations.find(
@@ -1047,8 +1087,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           }
         }
         transcript.addChild(card);
+        itemAnchor = card;
         transcriptViewport.setAnchor(operationAnchorId(item.operationId), card, 1);
         previousWasAssistant = false;
+      }
+      if (itemAnchor !== undefined) {
+        transcriptViewport.setSemanticAnchor(transcriptItemAnchorId(item.id), itemAnchor);
       }
       if (item.branchBoundary !== null) {
         const anchor = currentPromptAnchor ?? transcript.children.at(0);
@@ -1231,6 +1275,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`;
       const olderHistorySummary =
         active.transcript.olderCursor === null ? "" : " · older history available";
+      viewportHintVisible =
+        (state.transient?.reasoning ?? null) !== null ||
+        active.transcript.items.some((item) => item.type === "reasoning_block");
       footer.setText({
         wide: theme.muted(
           `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
@@ -2782,16 +2829,18 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return { consume: true };
     }
     if (commandRegistry.matchesInput(data, "toggle_tool_details")) {
-      toolDetailsExpanded = !toolDetailsExpanded;
-      renderState();
-      tui.renderNow();
       const latestTool = options.presentation
         .getState()
         .authoritative.active?.transcript.items.findLast((item) => item.type === "tool_call");
       if (latestTool !== undefined) {
-        transcriptViewport.focus(toolAnchorId(latestTool.id), terminal.columns);
-        tui.renderNow();
+        const anchorId = toolAnchorId(latestTool.id);
+        if (!transcriptViewport.preserveAnchorRow(anchorId, terminal.columns)) {
+          transcriptViewport.focusOnNextLayout(anchorId);
+        }
       }
+      toolDetailsExpanded = !toolDetailsExpanded;
+      renderState();
+      tui.renderNow();
       return { consume: true };
     }
     if (
@@ -2834,18 +2883,35 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       const state = options.presentation.getState();
       const active = state.authoritative.active;
+      const transientReasoning = state.transient?.reasoning ?? null;
+      const durableReasoning =
+        active?.transcript.items.filter((item) => item.type === "reasoning_block") ?? [];
+      const reasoningCandidates =
+        transientReasoning === null ||
+        durableReasoning.some((candidate) => candidate.id === transientReasoning.id)
+          ? durableReasoning
+          : [...durableReasoning, transientReasoning];
+      const visibleAnchorId = transcriptViewport.selectVisibleAnchor(
+        reasoningCandidates.map((candidate) => reasoningAnchorId(candidate.id)),
+        terminal.columns,
+      );
       const reasoning =
-        state.transient?.reasoning ??
-        active?.transcript.items.findLast((item) => item.type === "reasoning_block");
+        (transientReasoning?.status === "active" ? transientReasoning : null) ??
+        reasoningCandidates.find(
+          (candidate) => reasoningAnchorId(candidate.id) === visibleAnchorId,
+        ) ??
+        reasoningCandidates.at(-1);
       if (reasoning === undefined || reasoning === null) {
         statusMessage = "No provider reasoning block is available.";
         renderState();
         return { consume: true };
       }
+      const anchorId = reasoningAnchorId(reasoning.id);
+      if (!transcriptViewport.preserveAnchorRow(anchorId, terminal.columns)) {
+        transcriptViewport.focusOnNextLayout(anchorId);
+      }
       if (expandedReasoningIds.delete(reasoning.id)) {
         renderState();
-        tui.renderNow();
-        transcriptViewport.focus(reasoningAnchorId(reasoning.id), terminal.columns);
         tui.renderNow();
         return { consume: true };
       }
@@ -2881,8 +2947,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         );
       }
       renderState();
-      tui.renderNow();
-      transcriptViewport.focus(reasoningAnchorId(reasoning.id), terminal.columns);
       tui.renderNow();
       return { consume: true };
     }
@@ -3021,6 +3085,10 @@ function parseConfigurationMutation(argumentsText: string): {
 
 function reasoningAnchorId(reasoningId: string): string {
   return `reasoning:${reasoningId}`;
+}
+
+function transcriptItemAnchorId(itemId: string): string {
+  return `item:${itemId}`;
 }
 
 function chronologyAnchorId(boundary: BranchSourceBoundary): string {

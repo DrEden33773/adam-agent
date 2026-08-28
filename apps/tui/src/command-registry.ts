@@ -482,7 +482,8 @@ const keybindingProjections: readonly KeybindingProjection[] = [
     action: "toggle_reasoning",
     adamInputs: ["ctrl+t"],
     keys: "Ctrl+T",
-    description: "Expand or collapse the active, otherwise latest, provider reasoning block",
+    description:
+      "Expand or collapse active reasoning, otherwise the centered or nearest visible block",
     section: "application",
   },
   {

@@ -139,6 +139,7 @@ export type TuiFixtureOptions = {
     readonly workspaceTrust?: "owner-local" | "unavailable";
     readonly workspaceTrustMutation?: "reject";
   };
+  readonly mouse?: boolean;
   readonly presentationCloseMarker?: string;
   readonly scenario?: FixtureScenario;
   readonly stateRoot: string;
@@ -256,6 +257,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       options.scenario === "history" ||
       options.scenario === "artifact-history" ||
       options.scenario === "copy-older-assistant" ||
+      options.scenario === "reasoning-multiple" ||
       options.scenario === "target-navigation" ||
       options.scenario === "unsafe-history"
         ? await lifecycle.create({ targetIdentity }).then(async (created) => {
@@ -284,6 +286,13 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
                 "Later copy prompt two",
               ]) {
                 await lifecycle.continue({ sessionId: created.sessionId, input: { text } });
+              }
+            } else if (options.scenario === "reasoning-multiple") {
+              for (let block = 1; block <= 3; block += 1) {
+                await lifecycle.continue({
+                  sessionId: created.sessionId,
+                  input: { text: `Inspect seeded reasoning block ${block}` },
+                });
               }
             } else if (options.scenario === "resume") {
               await lifecycle.continue({
@@ -427,6 +436,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
           }
         : {}),
       ...(deadlineScheduler === undefined ? {} : { deadlineScheduler }),
+      ...(options.mouse === undefined ? {} : { mouse: options.mouse }),
       presentation: tuiPresentation,
       ...(options.launch === undefined
         ? {
@@ -689,6 +699,7 @@ function observeTuiDispatch(
     return presentation;
   }
   let artifactReadCount = 0;
+  let reasoningSettlementObserved = false;
   return {
     async close() {
       await presentation.close();
@@ -782,7 +793,21 @@ function observeTuiDispatch(
       return receipt;
     },
     getState: () => presentation.getState(),
-    subscribe: (onChange) => presentation.subscribe(onChange),
+    subscribe: (onChange) =>
+      presentation.subscribe(() => {
+        onChange();
+        const state = presentation.getState();
+        if (
+          !reasoningSettlementObserved &&
+          options.scenario === "reasoning-streaming" &&
+          controlRoot !== undefined &&
+          state.authoritative.active?.session.status === "settled" &&
+          state.transient === null
+        ) {
+          reasoningSettlementObserved = true;
+          void writeFile(join(controlRoot, "reasoning-session-settled"), "settled\n", "utf8");
+        }
+      }),
   };
 }
 
@@ -846,12 +871,15 @@ function createFixtureModelTargets(options: {
     return undefined;
   }
   if (
-    (options.scenario === "streaming" || options.scenario === "reasoning-streaming") &&
+    (options.scenario === "streaming" ||
+      options.scenario === "reasoning-streaming" ||
+      options.scenario === "reasoning-live-viewport") &&
     options.controlRoot === undefined
   ) {
     throw new TypeError("The streaming fixtures require --control-root.");
   }
   let artifactResponseOrdinal = 0;
+  let reasoningViewportOrdinal = 0;
   const model: ModelDriver = {
     async *stream(request) {
       if (request.tools.length === 0) {
@@ -913,6 +941,7 @@ function createFixtureModelTargets(options: {
         yield { type: "text_delta", text: "Write complete." };
       } else if (
         options.scenario === "mutation" ||
+        options.scenario === "mutation-long-preview" ||
         options.scenario === "mutation-after-release" ||
         options.scenario === "mutation-after-release-with-continuation-barrier" ||
         options.scenario === "mutation-delayed-preview"
@@ -943,7 +972,20 @@ function createFixtureModelTargets(options: {
                 {
                   kind: "update",
                   path: "edit.txt",
-                  edits: [{ oldText: "before", newText: "after" }],
+                  edits: [
+                    options.scenario === "mutation-long-preview"
+                      ? {
+                          oldText: Array.from(
+                            { length: 20 },
+                            (_, index) => `before-${String(index + 1).padStart(2, "0")}`,
+                          ).join("\n"),
+                          newText: Array.from(
+                            { length: 20 },
+                            (_, index) => `after-${String(index + 1).padStart(2, "0")}`,
+                          ).join("\n"),
+                        }
+                      : { oldText: "before", newText: "after" },
+                  ],
                 },
               ],
             }),
@@ -1117,6 +1159,59 @@ function createFixtureModelTargets(options: {
           request.signal.addEventListener("abort", () => resolve(), { once: true });
         });
         throw request.signal.reason;
+      } else if (options.scenario === "reasoning-live-viewport") {
+        yield {
+          type: "reasoning_start",
+          id: "provider-reasoning-0",
+          artifactType: "provider_reasoning",
+        };
+        yield {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: Array.from(
+            { length: 30 },
+            (_, index) => `Reasoning live line ${String(index + 1).padStart(2, "0")}`,
+          ).join("\n"),
+        };
+        await writeFile(
+          join(options.controlRoot as string, "reasoning-live-ready"),
+          "ready\n",
+          "utf8",
+        );
+        if (
+          !(await waitForFile(options.controlRoot as string, "release-live-growth", request.signal))
+        ) {
+          throw request.signal.reason;
+        }
+        yield {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: `\n${Array.from(
+            { length: 10 },
+            (_, index) => `Reasoning live line ${String(index + 31).padStart(2, "0")}`,
+          ).join("\n")}`,
+        };
+        await writeFile(
+          join(options.controlRoot as string, "reasoning-live-grown"),
+          "grown\n",
+          "utf8",
+        );
+        if (
+          !(await waitForFile(
+            options.controlRoot as string,
+            "release-live-completion",
+            request.signal,
+          ))
+        ) {
+          throw request.signal.reason;
+        }
+        yield { type: "reasoning_end", id: "provider-reasoning-0" };
+        yield { type: "text_delta", text: "Live reasoning answer." };
+        await writeFile(
+          join(options.controlRoot as string, "reasoning-live-completed"),
+          "completed\n",
+          "utf8",
+        );
       } else if (options.scenario === "reasoning-streaming") {
         yield {
           type: "reasoning_start",
@@ -1144,6 +1239,46 @@ function createFixtureModelTargets(options: {
         }
         yield { type: "reasoning_end", id: "provider-reasoning-0" };
         yield { type: "text_delta", text: "Reasoning answer." };
+      } else if (options.scenario === "reasoning-multiple") {
+        reasoningViewportOrdinal += 1;
+        yield {
+          type: "reasoning_start",
+          id: "provider-reasoning-0",
+          artifactType: "provider_reasoning",
+        };
+        yield {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: Array.from(
+            { length: 8 },
+            (_, index) =>
+              `Reasoning block ${reasoningViewportOrdinal} line ${String(index + 1).padStart(2, "0")}`,
+          ).join("\n"),
+        };
+        yield { type: "reasoning_end", id: "provider-reasoning-0" };
+        yield {
+          type: "text_delta",
+          text: `Multiple reasoning answer ${reasoningViewportOrdinal}.`,
+        };
+      } else if (options.scenario === "reasoning-viewport") {
+        reasoningViewportOrdinal += 1;
+        yield {
+          type: "reasoning_start",
+          id: "provider-reasoning-0",
+          artifactType: "provider_reasoning",
+        };
+        for (let index = 0; index < 40; index += 1) {
+          yield {
+            type: "reasoning_delta",
+            id: "provider-reasoning-0",
+            text: `${index === 0 ? "" : "\n"}Reasoning viewport turn ${reasoningViewportOrdinal} line ${String(index + 1).padStart(2, "0")}`,
+          };
+        }
+        yield { type: "reasoning_end", id: "provider-reasoning-0" };
+        yield {
+          type: "text_delta",
+          text: `Reasoning viewport answer ${reasoningViewportOrdinal}.`,
+        };
       } else {
         await writeFile(join(options.controlRoot as string, "model-started"), "started\n", "utf8");
         if (!(await waitForFile(options.controlRoot as string, "release-model", request.signal))) {
