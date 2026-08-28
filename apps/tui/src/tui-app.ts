@@ -253,6 +253,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     | {
         readonly close: () => void;
         readonly hide: () => void;
+        readonly mode: "manage" | "startup";
+        readonly page: WorkspaceTrustPage;
       }
     | undefined;
   let skillPalette:
@@ -344,6 +346,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let defaultTargetAttempted = false;
   let defaultTargetRejected = false;
   let startupTargetFailure: string | null = null;
+  let workspaceTrustMutationPending = false;
   editorSlot.addChild(editor);
   const supportedRoot = new VStack([
     header,
@@ -496,9 +499,24 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         throughSequence: continuity.status === "current" ? continuity.sessionThroughSequence : null,
       });
     }
+    const startupTrustBlocked = state.authoritative.project.workspaceTrust.status !== "trusted";
+    if (startupTrustBlocked) {
+      sessionPicker?.hide();
+      sessionPicker = undefined;
+      targetPicker?.hide();
+      targetPicker = undefined;
+      if (workspaceTrustPage?.mode !== "startup") {
+        showWorkspaceTrustPage("startup");
+      }
+    } else if (workspaceTrustPage?.mode === "startup") {
+      workspaceTrustPage.hide();
+      workspaceTrustPage = undefined;
+      tui.setFocus(editor);
+    }
     const needsSessionChoice =
       active === null && state.authoritative.sessions.items.length > 0 && !newSessionSelected;
     if (
+      !startupTrustBlocked &&
       active === null &&
       !needsSessionChoice &&
       startupTargetId !== null &&
@@ -530,6 +548,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       sessionPicker = undefined;
       tui.setFocus(editor);
     } else if (
+      !startupTrustBlocked &&
       (needsSessionChoice || sessionPickerRequested) &&
       sessionPicker === undefined &&
       !sessionPickerDismissed
@@ -621,6 +640,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       });
       sessionPicker = { close, picker, hide: () => handle?.hide() };
     } else if (
+      !startupTrustBlocked &&
       targetPicker === undefined &&
       !targetPickerDismissed &&
       (targetPickerRequested ||
@@ -1151,7 +1171,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           });
       }
     }
-    if (active === null && state.draft === null) {
+    if (startupTrustBlocked || (active === null && state.draft === null)) {
       editor.disableSubmit = true;
     } else {
       editor.disableSubmit = false;
@@ -1164,6 +1184,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           }`,
         ),
       );
+    } else if (startupTrustBlocked) {
+      footer.setText(theme.muted("Choose No to exit or explicitly trust this exact project"));
     } else if (active === null && state.draft === null) {
       footer.setText(theme.muted("Choose an exact model target to create a session"));
     } else if (active === null && state.draft !== null) {
@@ -1663,10 +1685,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     applyConfigurationMutation(mutation.field, mutation.value);
   };
-  const applyWorkspaceTrustMutation = (trusted: boolean, onAdmitted?: () => void): void => {
+  const applyWorkspaceTrustMutation = (
+    trusted: boolean,
+    callbacks: {
+      readonly onAdmitted?: () => void;
+      readonly onRejected?: (message: string) => void;
+    } = {},
+  ): void => {
+    if (workspaceTrustMutationPending) {
+      return;
+    }
     const project = options.presentation.getState().authoritative.project;
     clearExitWindow();
     editor.disableSubmit = true;
+    workspaceTrustMutationPending = true;
     void options.presentation
       .dispatch({
         type: "set_workspace_trust",
@@ -1677,39 +1709,65 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         if (receipt.status === "admitted") {
           editor.setText("");
           statusMessage = trusted ? "Workspace trust granted." : "Workspace trust revoked.";
-          onAdmitted?.();
+          callbacks.onAdmitted?.();
         } else {
           statusMessage = receipt.message;
+          callbacks.onRejected?.(receipt.message);
         }
       })
       .catch(() => {
-        statusMessage = "The owner-local workspace trust configuration could not be saved.";
+        const message = "The owner-local workspace trust configuration could not be saved.";
+        statusMessage = message;
+        callbacks.onRejected?.(message);
       })
       .finally(() => {
+        workspaceTrustMutationPending = false;
         editor.disableSubmit = false;
         renderState();
       });
   };
-  const showWorkspaceTrustPage = (): void => {
+  const showWorkspaceTrustPage = (mode: "manage" | "startup" = "manage"): void => {
     const project = options.presentation.getState().authoritative.project;
     editor.setText("");
-    editor.disableSubmit = false;
+    editor.disableSubmit = mode === "startup";
     workspaceTrustPage?.hide();
     let handle: { hide(): void } | undefined;
+    let page: WorkspaceTrustPage;
     const close = () => {
       handle?.hide();
-      workspaceTrustPage = undefined;
+      if (workspaceTrustPage?.page === page) {
+        workspaceTrustPage = undefined;
+      }
+      if (mode === "startup") {
+        stopFromCommand?.();
+        return;
+      }
       statusMessage = "Workspace trust unchanged.";
       tui.setFocus(editor);
       renderState();
     };
-    const page = new WorkspaceTrustPage({
+    page = new WorkspaceTrustPage({
       diagnostic: project.workspaceTrust.diagnostic,
+      mode,
       onChange(trusted) {
-        applyWorkspaceTrustMutation(trusted, () => {
-          handle?.hide();
-          workspaceTrustPage = undefined;
-          tui.setFocus(editor);
+        page.setNotice("Saving the owner-local trust decision…");
+        tui.requestRender();
+        applyWorkspaceTrustMutation(trusted, {
+          ...(mode === "manage"
+            ? {
+                onAdmitted: () => {
+                  handle?.hide();
+                  if (workspaceTrustPage?.page === page) {
+                    workspaceTrustPage = undefined;
+                  }
+                  tui.setFocus(editor);
+                },
+              }
+            : {}),
+          onRejected(message) {
+            page.setNotice(message);
+            tui.requestRender();
+          },
         });
       },
       onClose: close,
@@ -1719,12 +1777,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       theme,
     });
     handle = showOverlay(page, {
-      width: "90%",
+      width: mode === "startup" ? "80%" : "90%",
       minWidth: 36,
       maxHeight: "80%",
       margin: 1,
     });
-    workspaceTrustPage = { close, hide: () => handle?.hide() };
+    workspaceTrustPage = { close, hide: () => handle?.hide(), mode, page };
     statusMessage = null;
     tui.requestRender();
   };

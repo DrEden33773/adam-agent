@@ -36,7 +36,8 @@ export type StartTuiFixtureOptions = {
     readonly configRoot?: string;
     readonly seedTargetIds?: readonly string[];
     readonly startupTargetId?: string;
-    readonly workspaceTrust?: "owner-local";
+    readonly workspaceTrust?: "owner-local" | "unavailable";
+    readonly workspaceTrustMutation?: "reject";
   };
   readonly noColor?: boolean;
   readonly program?: {

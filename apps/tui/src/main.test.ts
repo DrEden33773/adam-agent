@@ -1073,15 +1073,20 @@ test("the production TUI applies one exact draft policy command", async () => {
   }
 });
 
-test("the production TUI reports and grants exact owner-local workspace trust", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-draft-workspace-trust-"));
+test("the production TUI admits owner-local workspace trust before session or target selection", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-startup-workspace-trust-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   const configRoot = join(testRoot, "config");
+  const controlRoot = join(testRoot, "control");
   await mkdir(workspaceRoot);
+  await mkdir(stateRoot);
+  await mkdir(controlRoot);
+  await mkdir(join(configRoot, "adam-agent"), { recursive: true, mode: 0o700 });
 
   try {
     const fixture = startFixture({
+      controlRoot,
       launch: {
         configRoot,
         startupTargetId: "deepseek-v4-flash.direct",
@@ -1090,17 +1095,40 @@ test("the production TUI reports and grants exact owner-local workspace trust", 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
-    const beforeStatus = fixture.output().length;
-    fixture.write("/trust st");
-    await fixture.waitForCompleteFrameAfter("status", beforeStatus);
-    fixture.write("\t\r");
-    await fixture.waitForAfter("Workspace trust: untrusted", beforeStatus);
-    const beforeGrant = fixture.output().length;
-    fixture.write("/trust gr");
-    await fixture.waitForCompleteFrameAfter("grant", beforeGrant);
-    fixture.write("\t\r");
-    await fixture.waitForAfter("Workspace trust granted.", beforeGrant);
+    await fixture.waitForCompleteFrameAfter("Workspace trust required", 0);
+    const gate = fixture.screen()?.join("\n") ?? "";
+    expect(gate).toContain("No — Exit Adam");
+    expect(gate).toContain("Yes — Trust and continue");
+    expect(gate).not.toContain("Select a project session");
+    expect(gate).not.toContain("Select an exact model target");
+    expect(gate).not.toContain("Adam · New session");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+    await expect(
+      access(join(configRoot, "adam-agent", "workspace-trust.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+
+    await fixture.resize(40, 12);
+    const narrowGate = fixture.screen()?.join("\n") ?? "";
+    expect(narrowGate).toContain("No — Exit Adam");
+    expect(narrowGate).toContain("Yes — Trust and continue");
+    fixture.write("\u001b[B");
+    await fixture.resize(41, 12);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("> Yes — Trust and continue");
+    fixture.write("\r");
+    const trustReceiptPath = join(controlRoot, "workspace-trust-dispatch-settled");
+    await waitForPath(trustReceiptPath);
+    await expect(readFile(trustReceiptPath, "utf8")).resolves.toBe("admitted\n");
+    await waitForPath(join(configRoot, "adam-agent", "workspace-trust.json"));
+    const createReceiptPath = join(controlRoot, "create-session-dispatch-settled");
+    await waitForPath(createReceiptPath);
+    await expect(readFile(createReceiptPath, "utf8")).resolves.toBe("admitted\n");
+    await fixture.resize(42, 12);
+    const admittedNarrow = fixture.screen()?.join("\n") ?? "";
+    expect(admittedNarrow).not.toContain("Workspace trust required");
+    expect(admittedNarrow).toContain("draft · idle");
+    expect(admittedNarrow).toContain("deepseek-v4-flash.direct");
+    await fixture.resize(80, 24);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("Adam · New session");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
@@ -1117,12 +1145,13 @@ test("the production TUI reports and grants exact owner-local workspace trust", 
   }
 });
 
-test("the production TUI gives copy-pastable guidance for an untrusted draft prompt", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-untrusted-prompt-"));
+test("the startup workspace trust gate defaults No to clean exit without authority or session state", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-startup-trust-no-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   const configRoot = join(testRoot, "config");
   await mkdir(workspaceRoot);
+  await mkdir(stateRoot);
 
   try {
     const fixture = startFixture({
@@ -1134,24 +1163,59 @@ test("the production TUI gives copy-pastable guidance for an untrusted draft pro
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
-    const beforePrompt = fixture.output().length;
-    fixture.write("Do not dispatch this prompt.\r");
-    await fixture.waitForAfter("adam-agent --trust-workspace", beforePrompt);
-    fixture.write("\u0011");
+    await fixture.waitForCompleteFrameAfter("Workspace trust required", 0);
+    fixture.write("\r");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+    await expect(
+      access(join(configRoot, "adam-agent", "workspace-trust.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("unavailable startup trust stays fail closed and Escape exits without owner state", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-startup-trust-unavailable-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  await mkdir(workspaceRoot);
+  await mkdir(stateRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: {
+        configRoot,
+        startupTargetId: "deepseek-v4-flash.direct",
+        workspaceTrust: "unavailable",
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitForCompleteFrameAfter("Workspace trust required", 0);
+    const gate = fixture.screen()?.join("\n") ?? "";
+    expect(gate).toContain("workspace · unavailable");
+    expect(gate).toContain("No — Exit Adam");
+    expect(gate).not.toContain("Yes — Trust and continue");
+    fixture.write("\u001b");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(
+      access(join(configRoot, "adam-agent", "workspace-trust.json")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
     expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
 });
 
-test("the workspace trust page defaults to cancel without writing authority", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-workspace-trust-cancel-"));
+test("a failed startup trust mutation remains visibly blocked and creates no session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-startup-trust-failure-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   const configRoot = join(testRoot, "config");
   await mkdir(workspaceRoot);
+  await mkdir(stateRoot);
 
   try {
     const fixture = startFixture({
@@ -1159,25 +1223,58 @@ test("the workspace trust page defaults to cancel without writing authority", as
         configRoot,
         startupTargetId: "deepseek-v4-flash.direct",
         workspaceTrust: "owner-local",
+        workspaceTrustMutation: "reject",
       },
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
-    const beforePage = fixture.output().length;
-    fixture.write("/trust\r");
-    await fixture.waitForCompleteFrameAfter("Workspace trust", beforePage);
-    const beforeCancel = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForAfter("Workspace trust unchanged.", beforeCancel);
-    const beforeStatus = fixture.output().length;
-    fixture.write("/trust status\r");
-    await fixture.waitForAfter("Workspace trust: untrusted", beforeStatus);
+    await fixture.waitForCompleteFrameAfter("Workspace trust required", 0);
+    const beforeGrant = fixture.output().length;
+    fixture.write("\u001b[B\r");
+    await fixture.waitForCompleteFrameAfter("Injected trust mutation rejection.", beforeGrant);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("Workspace trust required");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-    await expect(
-      access(join(configRoot, "adam-agent", "workspace-trust.json")),
-    ).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("startup trust persists across restart and revocation restores the admission gate", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-startup-trust-restart-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  await mkdir(workspaceRoot);
+
+  const launch = {
+    configRoot,
+    startupTargetId: "deepseek-v4-flash.direct",
+    workspaceTrust: "owner-local" as const,
+  };
+  try {
+    const first = startFixture({ launch, stateRoot, workspaceRoot });
+    await first.waitForCompleteFrameAfter("Workspace trust required", 0);
+    first.write("\u001b[B\r");
+    await first.waitForCompleteFrameAfter("Adam · New session", 0);
+    first.write("\u0011");
+    await expect(first.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    const restarted = startFixture({ launch, stateRoot, workspaceRoot });
+    await restarted.waitForCompleteFrameAfter("Adam · New session", 0);
+    expect(restarted.screen()?.join("\n") ?? "").not.toContain("Workspace trust required");
+    const beforeRevoke = restarted.output().length;
+    restarted.write("/trust revoke\r");
+    await restarted.waitForCompleteFrameAfter("Workspace trust required", beforeRevoke);
+    expect(restarted.screen()?.join("\n") ?? "").toContain("No — Exit Adam");
+    restarted.write("\r");
+    await expect(restarted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    const document = JSON.parse(
+      await readFile(join(configRoot, "adam-agent", "workspace-trust.json"), "utf8"),
+    ) as { readonly schemaVersion: number; readonly trustedProjectIds: readonly string[] };
+    expect(document).toEqual({ schemaVersion: 1, trustedProjectIds: [] });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -3450,7 +3547,7 @@ test("permission settlement restores an existing ordinary overlay as the exact f
   try {
     const fixture = startFixture({
       controlRoot,
-      scenario: "mutation-after-release",
+      scenario: "mutation-after-release-with-continuation-barrier",
       stateRoot,
       workspaceRoot,
     });
@@ -3466,7 +3563,10 @@ test("permission settlement restores an existing ordinary overlay as the exact f
     await fixture.waitForCompleteFrameAfter("Permission required", beforePermission);
     const beforeRestore = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
-    await fixture.waitForCompleteFrameAfter("Session facts", beforeRestore);
+    await waitForPath(join(controlRoot, "model-continuation-ready"));
+    const beforeRestoredFrame = fixture.output().length;
+    await writeFile(join(controlRoot, "release-model-continuation"), "release\n", "utf8");
+    await fixture.waitForCompleteFrameAfter("Session facts", beforeRestoredFrame);
     const restoredOutput = fixture.output().slice(beforeRestore);
     expect(restoredOutput.lastIndexOf("\u001b[?25l")).toBeGreaterThan(
       restoredOutput.lastIndexOf("\u001b[?25h"),
