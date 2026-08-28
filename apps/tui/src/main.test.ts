@@ -5514,6 +5514,9 @@ test("an older asynchronous copy receipt cannot replace newer Usage feedback", a
     await terminal.whenStarted();
     terminal.input("Read the README\r");
     await terminal.nextSynchronizedFrameContaining("Read complete");
+    const resultOccurrence = terminal.output().lastIndexOf("Read complete");
+    expect(resultOccurrence).toBeGreaterThanOrEqual(0);
+    await terminal.nextSynchronizedFrameContaining(" · idle", resultOccurrence);
     terminal.input("/copy\r");
     await copyStarted.promise;
     terminal.input("/exit extra\r");
@@ -5565,6 +5568,9 @@ test("an older asynchronous copy receipt cannot survive a newer overlay action",
     await terminal.whenStarted();
     terminal.input("Read the README\r");
     await terminal.nextSynchronizedFrameContaining("Read complete");
+    const resultOccurrence = terminal.output().lastIndexOf("Read complete");
+    expect(resultOccurrence).toBeGreaterThanOrEqual(0);
+    await terminal.nextSynchronizedFrameContaining(" · idle", resultOccurrence);
     terminal.input("/copy\r");
     await copyStarted.promise;
     terminal.input("/session\r");
