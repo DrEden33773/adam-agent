@@ -323,6 +323,7 @@ test("real PTY streams Ctrl+T reasoning and restores application mouse modes on 
     const beforeAnswer = fixture.output().length;
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
+    await fixture.waitForCompleteFrameAfter(" · idle", beforeAnswer);
     fixture.write("\u001b[F");
     await fixture.waitForCompleteFrameAfter("Reasoning answer.", beforeAnswer);
     fixture.write("\u0011");
