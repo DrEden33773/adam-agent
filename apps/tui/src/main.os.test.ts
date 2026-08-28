@@ -165,10 +165,11 @@ test("real TUI starts on an authoritative empty session and restores the termina
   try {
     const fixture = startFixture({ external: true, stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
+    const startupScreen = fixture.screen()?.join("\n") ?? "";
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).toContain("Adam · New session");
+    expect(startupScreen).toContain("Adam · New session");
     expect(result.stdout).toContain("fake.local · Certified");
     expect(result.stdout).toContain("\u001b[?2004h");
     expect(result.stdout).toContain("\u001b[?2004l");
@@ -232,8 +233,11 @@ test("the production PTY persists owner-only config and trust, completes a finit
     expect(configurationFrame).toContain("Output limit");
     expect(configurationFrame).toContain("saved 1234 tokens");
     beforeAction = fixture.output().length;
-    fixture.write("\u001b");
-    await fixture.waitForAfter("Configuration closed.", beforeAction);
+    fixture.write("\u001b[27;1;27~");
+    fixture.write("configuration focus restored");
+    await fixture.waitForAfter("configuration focus restored", beforeAction);
+    expect(fixture.output().slice(beforeAction)).not.toContain("Configuration closed.");
+    fixture.write("\u0015");
 
     fixture.write("/exit\r");
     const result = await fixture.closed;

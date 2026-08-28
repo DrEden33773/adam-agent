@@ -132,6 +132,7 @@ const contextProfile: ContextProfile = {
 export type TuiFixtureOptions = {
   readonly clipboard?: ClipboardAdapter;
   readonly controlRoot?: string;
+  readonly deadlineScheduler?: DeadlineScheduler;
   readonly launch?: {
     readonly configRoot?: string;
     readonly seedTargetIds?: readonly string[];
@@ -411,7 +412,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
               },
     );
     const clipboard = options.clipboard ?? clipboardAdapter(options);
-    const deadlineScheduler = controlledDeadlineScheduler(options);
+    const deadlineScheduler = options.deadlineScheduler ?? controlledDeadlineScheduler(options);
     const tuiPresentation = observeTuiDispatch(presentation, options);
     const closeRuntime = async () => {
       let presentationFailure: unknown;

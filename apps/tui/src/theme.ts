@@ -13,6 +13,7 @@ export type AdamSyntaxTheme = Readonly<
 
 export type AdamTuiTheme = {
   readonly allow: (text: string) => string;
+  readonly brand: (text: string) => string;
   readonly danger: (text: string) => string;
   readonly deny: (text: string) => string;
   readonly editor: EditorTheme;
@@ -21,7 +22,12 @@ export type AdamTuiTheme = {
   readonly markdown: MarkdownTheme;
   readonly muted: (text: string) => string;
   readonly primary: (text: string) => string;
+  readonly statusError: (text: string) => string;
+  readonly statusInfo: (text: string) => string;
+  readonly statusSuccess: (text: string) => string;
+  readonly statusWarning: (text: string) => string;
   readonly subject: (text: string) => string;
+  readonly sessionTitle: (text: string) => string;
   readonly syntax: AdamSyntaxTheme;
   readonly lineNumber: (text: string) => string;
   readonly diffAddition: (text: string) => string;
@@ -62,9 +68,15 @@ export function createAdamTuiTheme(noColor = noColorRequested()): AdamTuiTheme {
 
   return {
     primary: text,
+    brand: bold(mauve),
     muted,
+    statusError: red,
+    statusInfo: muted,
+    statusSuccess: green,
+    statusWarning: yellow,
     keyword: bold(mauve),
     subject: blue,
+    sessionTitle: green,
     lineNumber: overlay,
     diffAddition: green,
     diffDeletion: red,

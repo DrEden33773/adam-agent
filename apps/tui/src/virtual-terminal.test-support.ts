@@ -131,6 +131,13 @@ export class VirtualTerminal implements Terminal {
     if (this.#viewport.frame > beforeFrame) {
       const frame = { endOffset: this.#output.length, text: this.#viewport.lines().join("\n") };
       this.#frames.push(frame);
+      for (const waiter of this.#waiters) {
+        if (frame.endOffset > waiter.offset && frame.text.includes(waiter.text)) {
+          clearTimeout(waiter.guard);
+          this.#waiters.delete(waiter);
+          waiter.resolve();
+        }
+      }
       for (const waiter of this.#frameWaiters) {
         if (frame.endOffset > waiter.offset && frame.text.includes(waiter.text)) {
           clearTimeout(waiter.guard);
@@ -182,7 +189,10 @@ export class VirtualTerminal implements Terminal {
   }
 
   nextOutputContaining(text: string, offset = 0): Promise<void> {
-    if (this.#output.indexOf(text, offset) >= 0) {
+    if (
+      this.#output.indexOf(text, offset) >= 0 ||
+      this.#frames.some((frame) => frame.endOffset > offset && frame.text.includes(text))
+    ) {
       return Promise.resolve();
     }
     if (this.#state === "stopped") {

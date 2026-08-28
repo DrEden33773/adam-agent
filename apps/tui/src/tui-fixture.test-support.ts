@@ -220,6 +220,13 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
       viewportPendingOffset += consumedLength;
       const frame = { endOffset: viewportPendingOffset, text: viewport.lines().join("\n") };
       viewportFrames.push(frame);
+      for (const waiter of outputWaiters) {
+        if (frame.endOffset > waiter.offset && frame.text.includes(waiter.text)) {
+          clearTimeout(waiter.guard);
+          outputWaiters.delete(waiter);
+          waiter.resolve();
+        }
+      }
       for (const waiter of frameWaiters) {
         if (frame.endOffset > waiter.offset && frame.text.includes(waiter.text)) {
           clearTimeout(waiter.guard);
@@ -325,7 +332,10 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
   };
   void processResult.promise.then(settleOutputWaiters, settleOutputWaiters);
   const waitForAfter = (text: string, offset: number): Promise<void> => {
-    if (stdout.indexOf(text, offset) >= 0) {
+    if (
+      stdout.indexOf(text, offset) >= 0 ||
+      viewportFrames.some((frame) => frame.endOffset > offset && frame.text.includes(text))
+    ) {
       return Promise.resolve();
     }
     if (processClosed) {

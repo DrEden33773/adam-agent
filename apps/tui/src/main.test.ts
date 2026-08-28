@@ -161,6 +161,62 @@ test("/exit clears its literal input and reaches the existing TUI cleanup withou
   }
 });
 
+test("Usage feedback remains actionable until editor correction begins", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-usage-lifetime-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/exit extra\r");
+    await fixture.waitForCompleteFrameAfter("! Usage: /exit", 0);
+    expect(latestSynchronizedFrame(fixture.output()).join("\n")).toContain(
+      "\u001b[38;2;249;226;175m! Usage: /exit\u001b[39m",
+    );
+    await fixture.resize(40, 24);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("! Usage: /exit");
+    expect((fixture.screen() ?? []).every((line) => visibleWidth(line) <= 40)).toBe(true);
+    await fixture.resize(120, 24);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("! Usage: /exit");
+    expect((fixture.screen() ?? []).every((line) => visibleWidth(line) <= 120)).toBe(true);
+    const beforeCorrection = fixture.output().length;
+    fixture.write("/e");
+    await fixture.waitForCompleteFrameAfter("/e", beforeCorrection);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeCorrection)).join("\n");
+
+    expect(frame).not.toContain("Usage: /exit");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Usage feedback keeps its semantic marker without color", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-usage-no-color-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ noColor: true, stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforeUsage = fixture.output().length;
+    fixture.write("/exit extra\r");
+    await fixture.waitForCompleteFrameAfter("! Usage: /exit", beforeUsage);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeUsage)).join("\n");
+
+    expect(frame).toContain("! Usage: /exit");
+    expect(frame).not.toContain("\u001b[38;2;");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("/exit preserves the existing combined cleanup failure classification", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-slash-exit-failures-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -685,6 +741,54 @@ test("the production TUI selects an exact available target before creating an em
   }
 });
 
+test("the session header distinguishes the Adam brand from the session title", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-session-header-colors-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: { startupTargetId: "deepseek-v4-flash.direct" },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const frame = latestSynchronizedFrame(fixture.output()).join("\n");
+    expect(frame).toContain("\u001b[1m\u001b[38;2;203;166;247mAdam\u001b[39m\u001b[22m");
+    expect(frame).toContain("\u001b[38;2;166;227;161mNew session\u001b[39m");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("NO_COLOR keeps the semantically split session header plain", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-session-header-no-color-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: { startupTargetId: "deepseek-v4-flash.direct" },
+      noColor: true,
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const frame = latestSynchronizedFrame(fixture.output()).join("\n");
+    expect(frame).toContain("Adam · New session");
+    expect(frame).not.toContain("\u001b[38;2;203;166;247m");
+    expect(frame).not.toContain("\u001b[38;2;166;227;161m");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("Escape closes the target picker before idle Ctrl+C can arm exit", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-target-picker-escape-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -724,7 +828,7 @@ test("the production TUI creates from one valid saved exact default without open
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).toContain("Adam · New session");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("Adam · New session");
     expect(result.stdout).not.toContain("Select an exact model target");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -1014,6 +1118,37 @@ test("the production TUI switches an exact draft target without creating durable
   }
 });
 
+test("canceling target selection restores the editor without status noise", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-cancel-draft-target-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: { startupTargetId: "deepseek-v4-flash.direct" },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforeTarget = fixture.output().length;
+    fixture.write("/target\r");
+    await fixture.waitForCompleteFrameAfter("Select an exact model target", beforeTarget);
+    fixture.write("\u001b[27;1;27~");
+    fixture.write("target focus restored");
+    await fixture.waitForCompleteFrameAfter("target focus restored", beforeTarget);
+    const restoredFrame = fixture.screen()?.join("\n") ?? "";
+    expect(restoredFrame).toContain("Adam · New session");
+    expect(restoredFrame).not.toContain("Select an exact model target");
+    expect(restoredFrame).not.toContain("Target selection closed.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the production TUI opens owner-local configuration from an exact draft", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-draft-configuration-page-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -1036,7 +1171,9 @@ test("the production TUI opens owner-local configuration from an exact draft", a
     );
     const beforeClose = fixture.output().length;
     fixture.write("\u0003");
-    await fixture.waitForCompleteFrameAfter("Configuration closed.", beforeClose);
+    fixture.write("configuration focus restored");
+    await fixture.waitForCompleteFrameAfter("configuration focus restored", beforeClose);
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("Configuration closed.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
@@ -1170,6 +1307,36 @@ test("the production TUI admits owner-local workspace trust before session or ta
       schemaVersion: 1,
       trustedProjectIds: [expect.stringMatching(/^sha256:[0-9a-f]{64}$/u)],
     });
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("canceling workspace trust management restores the editor without status noise", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-cancel-workspace-trust-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: { startupTargetId: "deepseek-v4-flash.direct" },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforeTrust = fixture.output().length;
+    fixture.write("/trust\r");
+    await fixture.waitForCompleteFrameAfter("Workspace trust", beforeTrust);
+    fixture.write("\u001b[27;1;27~");
+    fixture.write("trust focus restored");
+    await fixture.waitForCompleteFrameAfter("trust focus restored", beforeTrust);
+    const restoredFrame = fixture.screen()?.join("\n") ?? "";
+    expect(restoredFrame).toContain("Adam · New session");
+    expect(restoredFrame).not.toContain("Workspace trust unchanged.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -1648,7 +1815,7 @@ test("the production editor renames the active session through canonical Present
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
-    expect(result.stdout).toContain("Adam · Release triage");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("Adam · Release triage");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -2769,6 +2936,37 @@ test("slash Resume opens the project session catalog from an active session", as
   }
 });
 
+test("successful session selection feedback expires when editing begins", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-session-feedback-lifetime-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      scenario: "session-selection-history",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select a project session");
+    fixture.write("Selected");
+    await fixture.waitFor("Search: Selected");
+    const beforeSelection = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("✓ Session selected.", beforeSelection);
+    const beforeDraft = fixture.output().length;
+    fixture.write("A later draft");
+    await fixture.waitForCompleteFrameAfter("A later draft", beforeDraft);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeDraft)).join("\n");
+
+    expect(frame).not.toContain("Session selected.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("slash New requires an exact target before creating another session", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-active-new-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -3243,8 +3441,10 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     fixture.write("/session\r");
     await fixture.waitFor("Session facts");
     beforeFrame = fixture.output().length;
-    fixture.write("\u001b");
-    await fixture.waitForAfter("Copied last assistant response.", beforeFrame);
+    fixture.write("\u001b[27;1;27~");
+    fixture.write("session inspector focus restored");
+    await fixture.waitForCompleteFrameAfter("session inspector focus restored", beforeFrame);
+    fixture.write("\u0015");
 
     fixture.write("/resume\r");
     await fixture.waitFor("Select a project session");
@@ -3326,14 +3526,15 @@ test("mouse wheel scrolls expanded reasoning and the transcript remains movable 
     terminal.input("Inspect a long reasoning block\r");
     await waitForPhysicalText(terminal, "Reasoning viewport answer 1.");
     expect(terminal.output()).toContain("\u001b[?1000h");
-    expect(terminal.lines().join("\n")).toContain("Wheel/PageUp/PageDown scroll · Ctrl+T fold");
+    expect(terminal.lines().join("\n")).not.toContain("Wheel/PageUp/PageDown scroll · Ctrl+T fold");
+    expect(terminal.lines().join("\n")).toContain("▸ Thinking done · adam · Ctrl+T expand");
     const collapsedTitleRow = terminal
       .lines()
       .findIndex((line) => line.includes("▸ Thinking done"));
     expect(collapsedTitleRow).toBeGreaterThanOrEqual(0);
 
     await inputAndWaitForPhysicalFrame(terminal, "\u0014");
-    expect(terminal.lines().join("\n")).toContain("▾ Thinking done · adam");
+    expect(terminal.lines().join("\n")).toContain("▾ Thinking done · adam · Ctrl+T fold");
     expect(terminal.lines().join("\n")).toContain("Reasoning viewport turn 1 line 01");
     expect(terminal.lines().findIndex((line) => line.includes("▾ Thinking done"))).toBe(
       collapsedTitleRow,
@@ -3343,9 +3544,50 @@ test("mouse wheel scrolls expanded reasoning and the transcript remains movable 
     expect(terminal.lines().join("\n")).toContain("Reasoning viewport turn 1 line 20");
 
     await inputAndWaitForPhysicalFrame(terminal, "\u0014");
-    expect(terminal.lines().join("\n")).toContain("▸ Thinking done · adam");
+    expect(terminal.lines().join("\n")).toContain("▸ Thinking done · adam · Ctrl+T expand");
     await inputAndWaitForPhysicalFrame(terminal, "\u001b[<64;20;5M".repeat(20));
     expect(terminal.lines().join("\n")).toContain("Inspect a long reasoning block");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a conditional notice row preserves the scrolled transcript anchor when it appears and clears", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-notice-viewport-anchor-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    scenario: "reasoning-viewport",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("Inspect notice viewport stability\r");
+    await waitForPhysicalText(terminal, "Reasoning viewport answer 1.");
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[<65;20;5M".repeat(12));
+    const anchoredLine = terminal
+      .lines()
+      .find((line) => line.includes("Reasoning viewport turn 1 line"));
+    expect(anchoredLine).toBeDefined();
+    const anchoredRow = terminal.lines().indexOf(anchoredLine ?? "");
+
+    terminal.input("/exit extra\r");
+    await waitForPhysicalText(terminal, "! Usage: /exit");
+    expect(terminal.lines().indexOf(anchoredLine ?? "")).toBe(anchoredRow);
+
+    await inputAndWaitForPhysicalFrame(terminal, "/e");
+    expect(terminal.lines().join("\n")).not.toContain("Usage: /exit");
+    expect(terminal.lines().indexOf(anchoredLine ?? "")).toBe(anchoredRow);
   } finally {
     if (terminal.running()) {
       terminal.input("\u0011");
@@ -3594,10 +3836,6 @@ test("Ctrl+T reads artifact-backed provider reasoning without placing it in the 
     await fixture.waitForCompleteFrameAfter("Reasoning bytes 1-16384", beforePageDown);
     frame = latestSynchronizedFrame(fixture.output().slice(beforePageDown)).join("\n");
     expect(frame).toContain("More reasoning below");
-    const beforeSecondPageDown = fixture.output().length;
-    fixture.write("\u001b[6~");
-    await fixture.waitForCompleteFrameAfter("Artifact reasoning evidence", beforeSecondPageDown);
-    frame = latestSynchronizedFrame(fixture.output().slice(beforeSecondPageDown)).join("\n");
     expect(frame).toContain("Artifact reasoning evidence");
     expect(frame).toContain("Reasoning bytes 1-16384");
 
@@ -4323,6 +4561,7 @@ test("permission preempts Help and restores its exact page after settlement", as
     const beforeRestore = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
     await fixture.waitForAfter("Effective Hotkeys", beforeRestore);
+    await fixture.waitForAfter(" · idle", beforeRestore);
     const beforeParent = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
     await fixture.waitForAfter("Adam Help", beforeParent);
@@ -4377,7 +4616,7 @@ test("permission settlement restores an existing ordinary overlay as the exact f
     await fixture.resize(120, 40);
     const frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
     expect(frame).not.toContain("Session facts");
-    expect(frame).toContain("Adam · New session");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("Adam · New session");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -5119,6 +5358,112 @@ test("slash Copy copies the last inline assistant response without persisting a 
   }
 });
 
+test("an older asynchronous copy receipt cannot replace newer Usage feedback", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-copy-notice-generation-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const terminal = new VirtualTerminal();
+  const copyStarted = Promise.withResolvers<void>();
+  const copyResult = Promise.withResolvers<"copied" | "failed" | "unsupported">();
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "README.md"), "copy fixture\n", "utf8");
+
+  const execution = runTuiFixture({
+    clipboard: {
+      async writeText() {
+        copyStarted.resolve();
+        return copyResult.promise;
+      },
+    },
+    deadlineScheduler: {
+      schedule() {
+        return { cancel() {} };
+      },
+    },
+    scenario: "read",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+  try {
+    await terminal.whenStarted();
+    terminal.input("Read the README\r");
+    await terminal.nextSynchronizedFrameContaining("Read complete");
+    terminal.input("/copy\r");
+    await copyStarted.promise;
+    terminal.input("/exit extra\r");
+    await terminal.nextSynchronizedFrameContaining("! Usage: /exit");
+    const beforeCopyReceipt = terminal.output().length;
+    copyResult.resolve("copied");
+    await terminal.nextSynchronizedFrameContaining("! Usage: /exit", beforeCopyReceipt);
+
+    terminal.input("\u0011");
+    await expect(execution).resolves.toBeUndefined();
+  } finally {
+    copyResult.resolve("failed");
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an older asynchronous copy receipt cannot survive a newer overlay action", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-copy-overlay-generation-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const terminal = new VirtualTerminal();
+  const copyStarted = Promise.withResolvers<void>();
+  const copyResult = Promise.withResolvers<"copied" | "failed" | "unsupported">();
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "README.md"), "copy fixture\n", "utf8");
+
+  const execution = runTuiFixture({
+    clipboard: {
+      async writeText() {
+        copyStarted.resolve();
+        return copyResult.promise;
+      },
+    },
+    deadlineScheduler: {
+      schedule() {
+        return { cancel() {} };
+      },
+    },
+    scenario: "read",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+  try {
+    await terminal.whenStarted();
+    terminal.input("Read the README\r");
+    await terminal.nextSynchronizedFrameContaining("Read complete");
+    terminal.input("/copy\r");
+    await copyStarted.promise;
+    terminal.input("/session\r");
+    await terminal.nextSynchronizedFrameContaining("Session facts");
+    const beforeCopyReceipt = terminal.output().length;
+    copyResult.resolve("copied");
+    await terminal.nextSynchronizedFrameContaining("Session facts", beforeCopyReceipt);
+    const beforeClose = terminal.output().length;
+    terminal.input("\u001b[27;1;27~");
+    await terminal.nextSynchronizedFrameContaining("Adam · Streaming session", beforeClose);
+
+    expect(terminal.lines().join("\n")).not.toContain("Copied last assistant response.");
+    terminal.input("\u0011");
+    await expect(execution).resolves.toBeUndefined();
+  } finally {
+    copyResult.resolve("failed");
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("slash Copy never truncates a large inline assistant response", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-copy-large-assistant-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -5842,13 +6187,9 @@ test("slash Fork restores the selected boundary prompt in the child editor", asy
     await fixture.waitForAfter("Fork from a boundary", beforeFork);
     const beforeSelection = fixture.output().length;
     fixture.write("\r");
-    const outcome = await Promise.race([
-      fixture.waitForAfter("Adam · Branch of ", beforeSelection).then(() => "fork" as const),
-      fixture.waitForAfter("History answer.", beforeSelection).then(() => "model" as const),
-    ]);
+    await fixture.waitForCompleteFrameAfter("Adam · Branch of ", beforeSelection);
     fixture.write("\u0011");
     await fixture.closed;
-    expect(outcome).toBe("fork");
     expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("History prompt 3");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
