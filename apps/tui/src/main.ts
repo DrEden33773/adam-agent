@@ -94,6 +94,7 @@ try {
           clipboard,
           closeRuntime,
           commandRegistry,
+          mouse: command.mouse,
           presentation,
           ...(startupNotice === undefined ? {} : { startupNotice }),
           targetStatus: {
@@ -123,6 +124,7 @@ try {
           clipboard,
           closeRuntime,
           commandRegistry,
+          mouse: command.mouse,
           presentation,
           ...(startupNotice === undefined ? {} : { startupNotice }),
           ...(startupTargetId === undefined ? {} : { startupTargetId }),
@@ -143,6 +145,7 @@ type TuiCommand =
   | { readonly type: "help" }
   | {
       readonly type: "run";
+      readonly mouse: boolean;
       readonly resumeSessionId?: string;
       readonly stateRoot?: string;
       readonly targetId?: string;
@@ -153,8 +156,19 @@ function parseCommand(arguments_: readonly string[]): TuiCommand {
     return { type: "help" };
   }
   const values = new Map<string, string>();
-  for (let index = 0; index < arguments_.length; index += 2) {
+  let mouse = true;
+  let mouseOptionSeen = false;
+  for (let index = 0; index < arguments_.length; ) {
     const option = arguments_[index];
+    if (option === "--no-mouse") {
+      if (mouseOptionSeen) {
+        throw new TuiConfigurationError("The TUI arguments are invalid.");
+      }
+      mouse = false;
+      mouseOptionSeen = true;
+      index += 1;
+      continue;
+    }
     const value = arguments_[index + 1];
     if (
       option === undefined ||
@@ -165,9 +179,11 @@ function parseCommand(arguments_: readonly string[]): TuiCommand {
       throw new TuiConfigurationError("The TUI arguments are invalid.");
     }
     values.set(option, value);
+    index += 2;
   }
   return {
     type: "run",
+    mouse,
     ...(values.get("--resume") === undefined
       ? {}
       : { resumeSessionId: values.get("--resume") as string }),
@@ -193,12 +209,13 @@ function usage(): string {
   return [
     "Adam Agent TUI",
     "",
-    "Usage: adam-agent-tui [--target <exact-target-id> | --resume <session-id>] [--state-root <path>]",
+    "Usage: adam-agent-tui [--target <exact-target-id> | --resume <session-id>] [--state-root <path>] [--no-mouse]",
     "",
     "From a source checkout:",
     "  pnpm tui",
     "  pnpm tui --target deepseek-v4-flash.direct",
     "  pnpm tui --resume <session-id>",
+    "  pnpm tui --no-mouse",
     "",
     "Under the default policy, built-in write and execute tools require call-scoped approval.",
     "Built-in file tools reject lexical traversal and symlink escape from the workspace.",

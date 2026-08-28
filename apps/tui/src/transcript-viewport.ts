@@ -5,19 +5,38 @@ import {
   type ScrollViewScrollToOptions,
 } from "@earendil-works/pi-tui";
 
+type Anchor = {
+  readonly component: Component;
+  readonly line: number;
+};
+
+type ViewportPosition = {
+  readonly anchorId: string;
+  readonly lineOffset: number;
+  readonly screenRow: number;
+};
+
 class AnchoredScrollView extends ScrollView {
-  readonly #focusedScrollTop: () => number | null;
-  readonly #releaseFocus: () => void;
+  readonly #captureBeforeWidthChange: () => void;
+  readonly #desiredScrollTop: () => number | null;
+  readonly #releasePosition: () => void;
   #contentWidth = 1;
 
   constructor(
     component: Component,
-    focusedScrollTop: () => number | null,
-    releaseFocus: () => void,
+    desiredScrollTop: () => number | null,
+    releasePosition: () => void,
+    captureBeforeWidthChange: () => void,
   ) {
-    super(component, { follow: "end", overscroll: "chain", primary: true });
-    this.#focusedScrollTop = focusedScrollTop;
-    this.#releaseFocus = releaseFocus;
+    super(component, {
+      follow: "end",
+      overscroll: "chain",
+      primary: true,
+      scrollbar: "auto",
+    });
+    this.#desiredScrollTop = desiredScrollTop;
+    this.#releasePosition = releasePosition;
+    this.#captureBeforeWidthChange = captureBeforeWidthChange;
   }
 
   get contentWidth(): number {
@@ -25,7 +44,11 @@ class AnchoredScrollView extends ScrollView {
   }
 
   override getContentWidth(width: number): number {
-    this.#contentWidth = super.getContentWidth(width);
+    const nextWidth = super.getContentWidth(width);
+    if (nextWidth !== this.#contentWidth) {
+      this.#captureBeforeWidthChange();
+      this.#contentWidth = nextWidth;
+    }
     return this.#contentWidth;
   }
 
@@ -35,7 +58,7 @@ class AnchoredScrollView extends ScrollView {
     requestRender: () => void,
   ): void {
     super.updateLayout(contentHeight, viewportHeight, requestRender);
-    const scrollTop = this.#focusedScrollTop();
+    const scrollTop = this.#desiredScrollTop();
     if (scrollTop !== null) {
       super.scrollTo(scrollTop, { disableFollow: true });
     }
@@ -50,41 +73,45 @@ class AnchoredScrollView extends ScrollView {
   }
 
   override scrollTo(scrollTop: number, options?: ScrollViewScrollToOptions): void {
-    this.#releaseFocus();
+    this.#releasePosition();
     super.scrollTo(scrollTop, options);
   }
 
   override scrollBy(lines: number): number {
-    this.#releaseFocus();
+    this.#releasePosition();
     return super.scrollBy(lines);
   }
 
   override scrollToStart(): void {
-    this.#releaseFocus();
+    this.#releasePosition();
     super.scrollToStart();
   }
 
   override scrollToEnd(): void {
-    this.#releaseFocus();
+    this.#releasePosition();
     super.scrollToEnd();
   }
 }
 
 export class TranscriptViewport {
   readonly document = new Container();
-  readonly #anchors = new Map<string, { readonly component: Component; readonly line: number }>();
-  #focusedAnchorId: string | null = null;
+  readonly #anchors = new Map<string, Anchor>();
+  readonly #semanticAnchors = new Map<string, Anchor>();
+  #pendingPosition: ViewportPosition | null = null;
   readonly scrollView = new AnchoredScrollView(
     this.document,
-    () => this.#focusedScrollTop(),
+    () => this.#desiredScrollTop(),
     () => {
-      this.#focusedAnchorId = null;
+      this.#pendingPosition = null;
     },
+    () => this.#captureSemanticPosition(),
   );
 
   clear(): void {
+    this.#captureSemanticPosition();
     this.document.clear();
     this.#anchors.clear();
+    this.#semanticAnchors.clear();
   }
 
   setAnchor(id: string, component: Component, line = 0): void {
@@ -93,34 +120,175 @@ export class TranscriptViewport {
     }
   }
 
-  focus(id: string, width: number): boolean {
-    this.#focusedAnchorId = id;
+  setSemanticAnchor(id: string, component: Component, line = 0): void {
+    if (!this.#semanticAnchors.has(id)) {
+      this.#semanticAnchors.set(id, { component, line: Math.max(0, Math.trunc(line)) });
+    }
+  }
+
+  preserveAnchorRow(id: string, width: number): boolean {
     const anchor = this.#anchors.get(id);
     if (anchor === undefined) {
       return false;
     }
-    const index = this.document.children.indexOf(anchor.component);
-    if (index < 0) {
+    const anchorTop = this.#anchorTop(anchor, width);
+    if (anchorTop === null) {
       return false;
     }
-    const scrollTop = this.#lineOffset(index, anchor.line, width);
+    const screenRow = anchorTop - this.scrollView.scrollTop;
+    if (screenRow < 0 || screenRow >= this.scrollView.viewportHeight) {
+      return false;
+    }
+    this.#pendingPosition = {
+      anchorId: id,
+      lineOffset: 0,
+      screenRow,
+    };
+    return true;
+  }
+
+  focusOnNextLayout(id: string, screenRow = 0): void {
+    this.#pendingPosition = {
+      anchorId: id,
+      lineOffset: 0,
+      screenRow: Math.max(0, Math.trunc(screenRow)),
+    };
+  }
+
+  selectVisibleAnchor(ids: readonly string[], width: number): string | null {
+    const viewportStart = this.scrollView.scrollTop;
+    const viewportEnd = viewportStart + this.scrollView.viewportHeight;
+    const viewportCenter = viewportStart + Math.max(0, this.scrollView.viewportHeight - 1) / 2;
+    const visible = ids
+      .map((id) => {
+        const anchor = this.#anchors.get(id);
+        if (anchor === undefined) {
+          return null;
+        }
+        const top = this.#anchorTop(anchor, width);
+        if (top === null) {
+          return null;
+        }
+        const height = Math.max(
+          1,
+          anchor.component.render(Math.max(1, width)).length - anchor.line,
+        );
+        return { id, top, bottom: top + height };
+      })
+      .filter(
+        (candidate): candidate is NonNullable<typeof candidate> =>
+          candidate !== null && candidate.bottom > viewportStart && candidate.top < viewportEnd,
+      );
+    const coveringCenter = visible.find(
+      (candidate) => candidate.top <= viewportCenter && candidate.bottom > viewportCenter,
+    );
+    if (coveringCenter !== undefined) {
+      return coveringCenter.id;
+    }
+    return (
+      visible.sort((left, right) => {
+        const leftDistance = Math.min(
+          Math.abs(viewportCenter - left.top),
+          Math.abs(viewportCenter - (left.bottom - 1)),
+        );
+        const rightDistance = Math.min(
+          Math.abs(viewportCenter - right.top),
+          Math.abs(viewportCenter - (right.bottom - 1)),
+        );
+        return leftDistance - rightDistance;
+      })[0]?.id ?? null
+    );
+  }
+
+  focus(id: string, width: number): boolean {
+    const anchor = this.#anchors.get(id);
+    if (anchor === undefined) {
+      return false;
+    }
+    const scrollTop = this.#anchorTop(anchor, width);
+    if (scrollTop === null) {
+      return false;
+    }
+    this.#pendingPosition = { anchorId: id, lineOffset: 0, screenRow: 0 };
     this.scrollView.focus(scrollTop);
     return true;
   }
 
   followEnd(): void {
-    this.#focusedAnchorId = null;
+    this.#pendingPosition = null;
     this.scrollView.resumeFollowingEnd();
   }
 
-  #focusedScrollTop(): number | null {
+  #captureSemanticPosition(): void {
+    if (
+      this.#pendingPosition !== null ||
+      this.scrollView.isFollowingEnd ||
+      this.#semanticAnchors.size === 0
+    ) {
+      return;
+    }
+    const width = this.scrollView.contentWidth;
+    const scrollTop = this.scrollView.scrollTop;
+    const positions = [...this.#semanticAnchors.entries()]
+      .map(([anchorId, anchor]) => {
+        const top = this.#anchorTop(anchor, width);
+        if (top === null) {
+          return null;
+        }
+        const height = Math.max(
+          1,
+          anchor.component.render(Math.max(1, width)).length - anchor.line,
+        );
+        return { anchorId, height, top };
+      })
+      .filter((position): position is NonNullable<typeof position> => position !== null)
+      .sort((left, right) => left.top - right.top);
+    const covering = positions.find(
+      (position) => position.top <= scrollTop && position.top + position.height > scrollTop,
+    );
+    if (covering !== undefined) {
+      this.#pendingPosition = {
+        anchorId: covering.anchorId,
+        lineOffset: scrollTop - covering.top,
+        screenRow: 0,
+      };
+      return;
+    }
+    const below = positions.find((position) => position.top > scrollTop);
+    if (below !== undefined) {
+      this.#pendingPosition = {
+        anchorId: below.anchorId,
+        lineOffset: 0,
+        screenRow: below.top - scrollTop,
+      };
+    }
+  }
+
+  #desiredScrollTop(): number | null {
+    const position = this.#pendingPosition;
+    if (position === null) {
+      return null;
+    }
     const anchor =
-      this.#focusedAnchorId === null ? undefined : this.#anchors.get(this.#focusedAnchorId);
+      this.#anchors.get(position.anchorId) ?? this.#semanticAnchors.get(position.anchorId);
     if (anchor === undefined) {
       return null;
     }
+    const anchorTop = this.#anchorTop(anchor, this.scrollView.contentWidth);
+    if (anchorTop === null) {
+      return null;
+    }
+    const height = Math.max(
+      1,
+      anchor.component.render(Math.max(1, this.scrollView.contentWidth)).length - anchor.line,
+    );
+    const screenRow = Math.min(position.screenRow, Math.max(0, this.scrollView.viewportHeight - 1));
+    return anchorTop + Math.min(position.lineOffset, height - 1) - screenRow;
+  }
+
+  #anchorTop(anchor: Anchor, width: number): number | null {
     const index = this.document.children.indexOf(anchor.component);
-    return index < 0 ? null : this.#lineOffset(index, anchor.line, this.scrollView.contentWidth);
+    return index < 0 ? null : this.#lineOffset(index, anchor.line, width);
   }
 
   #lineOffset(index: number, anchorLine: number, width: number): number {

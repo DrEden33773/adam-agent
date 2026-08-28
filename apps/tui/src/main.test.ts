@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, expect, test } from "vitest";
 import { AppliedViewportTerminal } from "./applied-viewport-terminal.test-support.js";
+import { copySelectionToClipboard, selectionCopyMaximumBytes } from "./exit-policy.js";
 import { runTuiFixture } from "./test-fixture.js";
 import {
   readFilesRecursively,
@@ -19,6 +20,27 @@ import { VirtualTerminal } from "./virtual-terminal.test-support.js";
 
 afterEach(async () => {
   await cleanupActiveTuiFixtures();
+});
+
+test("selection copy rejects text above 1 MiB without truncating or invoking the clipboard", async () => {
+  let clipboardCalls = 0;
+  const result = await copySelectionToClipboard(
+    "界".repeat(Math.floor(selectionCopyMaximumBytes / 3) + 1),
+    {
+      async writeText() {
+        clipboardCalls += 1;
+        return "copied";
+      },
+    },
+    {
+      schedule() {
+        throw new Error("An oversized selection must fail before scheduling clipboard work.");
+      },
+    },
+  );
+
+  expect(result).toBe("too_large");
+  expect(clipboardCalls).toBe(0);
 });
 
 test("minimum-size rendering preserves the draft and returns to the supported layout", async () => {
@@ -3222,7 +3244,10 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforeFrame);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
     expect(frame).not.toContain("Inspect the evidence.");
+    const beforeReopenToggle = fixture.output().length;
     fixture.write("\u0014");
+    await fixture.waitForAfter("\u001b[?2026l", beforeReopenToggle);
+    fixture.write("\u001b[6~");
     await fixture.waitForAfter("Inspect the evidence.", beforeFrame);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -3253,8 +3278,7 @@ test("repeated completed reasoning folds keep the selected block visible without
     await waitForPath(join(controlRoot, "model-started"));
     await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await waitForPhysicalText(terminal, "Reasoning answer.");
-    await waitForPhysicalText(terminal, "Adam · Streaming session");
+    await waitForPath(join(controlRoot, "reasoning-session-settled"));
     const durableStateBeforeFolds = await readFilesRecursively(stateRoot);
 
     for (let cycle = 0; cycle < 4; cycle += 1) {
@@ -3266,6 +3290,205 @@ test("repeated completed reasoning folds keep the selected block visible without
 
     const durableState = await readFilesRecursively(stateRoot);
     expect(durableState).toBe(durableStateBeforeFolds);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("mouse wheel scrolls expanded reasoning and the transcript remains movable after folding", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-mouse-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    scenario: "reasoning-viewport",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("Inspect a long reasoning block\r");
+    await waitForPhysicalText(terminal, "Reasoning viewport answer 1.");
+    expect(terminal.output()).toContain("\u001b[?1000h");
+    expect(terminal.lines().join("\n")).toContain("Wheel/PageUp/PageDown scroll · Ctrl+T fold");
+    const collapsedTitleRow = terminal
+      .lines()
+      .findIndex((line) => line.includes("▸ Thinking done"));
+    expect(collapsedTitleRow).toBeGreaterThanOrEqual(0);
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    expect(terminal.lines().join("\n")).toContain("▾ Thinking done · adam");
+    expect(terminal.lines().join("\n")).toContain("Reasoning viewport turn 1 line 01");
+    expect(terminal.lines().findIndex((line) => line.includes("▾ Thinking done"))).toBe(
+      collapsedTitleRow,
+    );
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[<65;20;5M".repeat(20));
+    expect(terminal.lines().join("\n")).toContain("Reasoning viewport turn 1 line 20");
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    expect(terminal.lines().join("\n")).toContain("▸ Thinking done · adam");
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[<64;20;5M".repeat(20));
+    expect(terminal.lines().join("\n")).toContain("Inspect a long reasoning block");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("mouse drag copies current-screen text through the bounded Adam clipboard", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-mouse-selection-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const copied = Promise.withResolvers<string>();
+  const execution = runTuiFixture({
+    clipboard: {
+      async writeText(text) {
+        copied.resolve(text);
+        return "copied";
+      },
+    },
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("\u001b[<0;2;2M\u001b[<32;5;2M\u001b[<0;5;2m");
+    await expect(copied.promise).resolves.toContain("Adam");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("mouse capture can be disabled without removing keyboard viewport controls", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-no-mouse-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    mouse: false,
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    expect(terminal.output()).not.toContain("\u001b[?1000h");
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[5~");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("live reasoning growth preserves reading until the user returns to the tail", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-live-reasoning-viewport-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    controlRoot,
+    scenario: "reasoning-live-viewport",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("Inspect live reasoning growth\r");
+    await waitForPath(join(controlRoot, "reasoning-live-ready"));
+    await waitForPhysicalText(terminal, "Thinking · provider reasoning · adam");
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[<65;40;5M".repeat(4));
+    const firstVisibleReadingLine = terminal
+      .lines()
+      .find((line) => line.includes("Reasoning live line"));
+    expect(firstVisibleReadingLine).toBeDefined();
+
+    const beforeGrowthFrame = terminal.frame;
+    await writeFile(join(controlRoot, "release-live-growth"), "release\n", "utf8");
+    await waitForPath(join(controlRoot, "reasoning-live-grown"));
+    await terminal.nextFrame(beforeGrowthFrame);
+    expect(terminal.lines()).toContain(firstVisibleReadingLine);
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[F");
+    expect(terminal.lines().join("\n")).toContain("Reasoning live line 40");
+    const beforeCompletionFrame = terminal.frame;
+    await writeFile(join(controlRoot, "release-live-completion"), "release\n", "utf8");
+    await waitForPath(join(controlRoot, "reasoning-live-completed"));
+    await terminal.nextFrame(beforeCompletionFrame);
+    await waitForPhysicalText(terminal, " · idle");
+    expect(terminal.lines().join("\n")).toContain("Live reasoning answer.");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Ctrl+T targets visible reasoning before a newer offscreen block", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-target-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 18 });
+  const execution = runTuiFixture({
+    scenario: "reasoning-multiple",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    await waitForPhysicalText(terminal, "Multiple reasoning answer 3.");
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[<64;40;5M".repeat(20));
+    expect(terminal.lines().join("\n")).toContain("Multiple reasoning answer 1.");
+    expect(terminal.lines().join("\n")).not.toContain("Multiple reasoning answer 3.");
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    const screen = terminal.lines().join("\n");
+    expect(screen).toContain("Reasoning block 1 line 01");
+    expect(screen).not.toContain("Reasoning block 3 line 01");
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[<65;40;5M".repeat(30));
+    expect(terminal.lines().join("\n")).toContain("Multiple reasoning answer 3.");
+    await inputAndWaitForPhysicalFrame(terminal, "\u0014");
+    expect(terminal.lines().join("\n")).toContain("Reasoning block 3 line 01");
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[<64;40;5M".repeat(30));
+    expect(terminal.lines().join("\n")).toContain("Reasoning block 1 line 01");
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[<65;40;5M".repeat(30));
+    expect(terminal.lines().join("\n")).toContain("Reasoning block 3 line 01");
   } finally {
     if (terminal.running()) {
       terminal.input("\u0011");
@@ -3380,6 +3603,8 @@ test("provider reasoning disclosure keeps explicit markers without color", async
     await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
     await fixture.resize(80, 24);
+    await fixture.waitForAfter(" · idle", beforeCompletion);
+    fixture.write("\u001b[F");
     await fixture.waitForAfter("Reasoning answer.", beforeCompletion);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -4185,14 +4410,26 @@ test("Ctrl+O toggles bounded authoritative tool details", async () => {
     expect(fixture.output()).toContain("10 │ line10");
     expect(fixture.output()).not.toContain("11 │ line11");
     expect(fixture.output()).not.toContain("provider model response");
+    const beforeToolView = fixture.output().length;
+    fixture.write("\u001b[5~");
+    await fixture.waitForAfter("\u001b[?2026l", beforeToolView);
+    const collapsedToolRow = fixture.screen()?.findIndex((line) => line.includes("read README.md"));
+    expect(collapsedToolRow).toBeGreaterThanOrEqual(0);
     const beforeExpand = fixture.output().length;
     fixture.write("\u000f");
     await fixture.waitForAfter("\u001b[?2026l", beforeExpand);
     let screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toContain("12 │ line12");
+    expect(fixture.screen()?.findIndex((line) => line.includes("read README.md"))).toBe(
+      collapsedToolRow,
+    );
     const beforeDetails = fixture.output().length;
     fixture.write("\u001b[6~");
     await fixture.waitForAfter("\u001b[?2026l", beforeDetails);
+    screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("12 │ line12");
+    const beforeMetadata = fixture.output().length;
+    fixture.write("\u001b[6~");
+    await fixture.waitForAfter("\u001b[?2026l", beforeMetadata);
     screen = fixture.screen()?.join("\n") ?? "";
     expect(screen).toContain("read_file · read · completed · replay safe");
     expect(screen).toContain("provider model response");
@@ -4225,6 +4462,8 @@ test("a settled write card previews numbered content from its canonical change a
     await fixture.waitFor("Adam · New session");
     fixture.write("Create a TypeScript file\r");
     await fixture.waitFor("Permission required");
+    await fixture.waitFor("Preview 1-8 of");
+    fixture.write("\u001b[6~");
     await fixture.waitFor("+export const value12 = 12;");
     const beforeAllow = fixture.output().length;
     fixture.write("\r");
@@ -4702,6 +4941,53 @@ test("a mutation permission shows its canonical diff and Enter allows the exact 
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("permission owns wheel input and scrolls its long preview without moving the transcript", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-permission-wheel-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const original = `${Array.from(
+    { length: 20 },
+    (_, index) => `before-${String(index + 1).padStart(2, "0")}`,
+  ).join("\n")}\n`;
+  await writeFile(join(workspaceRoot, "edit.txt"), original, "utf8");
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    scenario: "mutation-long-preview",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("Inspect a long permission preview\r");
+    await waitForPhysicalText(terminal, "Permission required");
+    await waitForPhysicalText(terminal, "Preview 1-8 of");
+    const transcriptHeaderRow = terminal
+      .lines()
+      .findIndex((line) => line.includes("Adam · New session"));
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[<65;40;12M".repeat(4));
+    const scrolled = terminal.lines().join("\n");
+    expect(scrolled).toContain("Permission required");
+    expect(scrolled).toMatch(/Preview (?:1[0-9]|2[0-9])-/u);
+    expect(terminal.lines().findIndex((line) => line.includes("Adam · New session"))).toBe(
+      transcriptHeaderRow,
+    );
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b");
+    await waitForPhysicalText(terminal, "denied");
+    await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe(original);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
     await rm(testRoot, { recursive: true, force: true });
   }
 });

@@ -260,7 +260,7 @@ test("the production PTY persists owner-only config and trust, completes a finit
   }
 });
 
-test("real PTY streams Ctrl+T provider reasoning without taking terminal mouse selection", async () => {
+test("real PTY streams Ctrl+T reasoning and restores application mouse modes on exit", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-reasoning-pty-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -285,8 +285,10 @@ test("real PTY streams Ctrl+T provider reasoning without taking terminal mouse s
     await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
     await fixture.waitFor("Inspect the evidence.");
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await fixture.waitFor("Thinking done · adam");
-    await fixture.waitFor("Reasoning answer.");
+    await waitForPath(join(controlRoot, "reasoning-session-settled"));
+    const beforeTail = fixture.output().length;
+    fixture.write("\u001b[F");
+    await fixture.waitForCompleteFrameAfter("Reasoning answer.", beforeTail);
     fixture.write("\u0011");
     const result = await fixture.closed;
 
@@ -298,8 +300,11 @@ test("real PTY streams Ctrl+T provider reasoning without taking terminal mouse s
     expect(result.stdout).toContain("╮");
     expect(result.stdout).toContain("╰");
     expect(result.stdout).toContain("╯");
-    expect(result.stdout).not.toContain("\u001b[?1000h");
-    expect(result.stdout).not.toContain("\u001b[?1006h");
+    expect(result.stdout).toContain("Thinking done · adam");
+    expect(result.stdout).toContain("\u001b[?1000h");
+    expect(result.stdout).toContain("\u001b[?1006h");
+    expect(result.stdout).toContain("\u001b[?1000l");
+    expect(result.stdout).toContain("\u001b[?1006l");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -421,6 +426,7 @@ test("the production TUI entry exposes its usage contract", async () => {
     expect(result.stdout).toContain("pnpm tui --target deepseek-v4-flash.direct");
     expect(result.stdout).not.toContain("pnpm tui --target fake.local");
     expect(result.stdout).toContain("pnpm tui --resume <session-id>");
+    expect(result.stdout).toContain("pnpm tui --no-mouse");
     expect(result.stdout).toContain(
       "Under the default policy, built-in write and execute tools require call-scoped approval.",
     );
@@ -428,6 +434,45 @@ test("the production TUI entry exposes its usage contract", async () => {
     expect(result.stdout).toContain("Session state and artifacts are owner-only local files.");
     expect(result.stdout).toContain("Adam does not provide an OS, process, or network sandbox.");
     await expect(stat(stateRoot)).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production --no-mouse escape hatch reaches startup without mouse capture", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-no-mouse-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      program: {
+        arguments: [
+          "--no-mouse",
+          "--target",
+          "deepseek-v4-flash.direct",
+          "--state-root",
+          stateRoot,
+        ],
+        cwd: workspaceRoot,
+        entrypoint: productionPath,
+        environment: {
+          DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+          XDG_CONFIG_HOME: configRoot,
+        },
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitForCompleteFrameAfter("Workspace trust required", 0);
+    fixture.write("\r");
+    const result = await fixture.closed;
+
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).not.toContain("\u001b[?1000h");
+    expect(result.stdout).not.toContain("\u001b[?1006h");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

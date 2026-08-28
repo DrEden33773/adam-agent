@@ -9,6 +9,8 @@ export type ClipboardAdapter = {
   writeText(text: string): Promise<"copied" | "failed" | "unsupported">;
 };
 
+export const selectionCopyMaximumBytes = 1024 * 1024;
+
 export const nodeDeadlineScheduler: DeadlineScheduler = {
   schedule(delayMilliseconds, onDeadline) {
     const timer = setTimeout(onDeadline, delayMilliseconds);
@@ -110,6 +112,17 @@ export async function copyTextToClipboard(
   } finally {
     guard?.cancel();
   }
+}
+
+export async function copySelectionToClipboard(
+  text: string,
+  adapter: ClipboardAdapter | undefined,
+  scheduler: DeadlineScheduler,
+): Promise<"copied" | "failed" | "unsupported" | "too_large" | null> {
+  if (Buffer.byteLength(text, "utf8") > selectionCopyMaximumBytes) {
+    return "too_large";
+  }
+  return copyTextToClipboard(text, adapter, scheduler);
 }
 
 function boundedUtf8(value: string, maximumBytes: number): string {
