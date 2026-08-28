@@ -48,6 +48,12 @@ import {
   nodeDeadlineScheduler,
 } from "./exit-policy.js";
 import { HelpNavigator, type HelpPage } from "./help-navigator.js";
+import {
+  isLargeReasoning,
+  type LargeReasoningView,
+  LargeReasoningViewStore,
+  largeReasoningBoundaryAnchorId,
+} from "./large-reasoning-view.js";
 import { mcpAdvanceCommand } from "./mcp-advance.js";
 import { McpWizard } from "./mcp-wizard.js";
 import { OverlayFrame } from "./overlay-frame.js";
@@ -68,7 +74,7 @@ import { SessionInspector, type SessionRunStatus } from "./session-inspector.js"
 import { SessionPicker } from "./session-picker.js";
 import { SkillPalette } from "./skill-palette.js";
 import { TargetPicker } from "./target-picker.js";
-import { createAdamTuiTheme } from "./theme.js";
+import { type AdamTuiTheme, createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
 import { ToolPreview } from "./tool-preview.js";
 import { TranscriptViewport } from "./transcript-viewport.js";
@@ -362,6 +368,33 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const expandedReasoningIds = new Set<string>();
   const reasoningArtifactReads = new Set<string>();
   const reasoningArtifactTexts = new Map<string, string>();
+  const largeReasoningBoundaryOwners = new Map<
+    string,
+    { readonly direction: "up" | "down"; readonly reasoningId: string }
+  >();
+  const largeReasoningViews = new LargeReasoningViewStore({
+    onChange: (focusAnchorId) => {
+      if (focusAnchorId !== undefined) {
+        transcriptViewport.focusOnNextLayout(focusAnchorId);
+      }
+      requestPolicyRender();
+    },
+    presentation: options.presentation,
+  });
+  transcriptViewport.setScrollListener((direction) => {
+    largeReasoningViews.noteViewportMovement(direction);
+    const visibleBoundary = transcriptViewport.selectVisibleAnchor(
+      [...largeReasoningBoundaryOwners.entries()]
+        .filter(([, owner]) => owner.direction === direction)
+        .map(([anchorId]) => anchorId),
+      transcriptViewport.scrollView.contentWidth,
+    );
+    const owner =
+      visibleBoundary === null ? undefined : largeReasoningBoundaryOwners.get(visibleBoundary);
+    if (owner !== undefined) {
+      largeReasoningViews.navigate(owner.reasoningId, owner.direction);
+    }
+  });
   let previousActiveSessionId: string | undefined;
   let sessionPickerDismissed = false;
   let sessionPickerRequested = false;
@@ -510,6 +543,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       expandedReasoningIds.clear();
       reasoningArtifactReads.clear();
       reasoningArtifactTexts.clear();
+      largeReasoningViews.clear();
       selectedSkills.clear();
       hideSessionScopedOverlays();
       if (active !== null) {
@@ -843,6 +877,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       ),
     );
     transcriptViewport.clear();
+    largeReasoningBoundaryOwners.clear();
     const visibleRunningOperations = new Set<string>();
     let activeReasoningVisible = false;
     const durableReasoningIds = new Set<string>();
@@ -850,8 +885,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       reasoning: ReasoningBlockDisplay | NonNullable<PresentationTransientState["reasoning"]>,
       artifact: ArtifactReference | null,
     ): void => {
-      if (reasoning.text !== null && reasoning.text.length > 0) {
+      const oversized = isLargeReasoning({ artifact, text: reasoning.text });
+      if (reasoning.text !== null && reasoning.text.length > 0 && !oversized) {
         reasoningArtifactTexts.set(reasoning.id, reasoning.text);
+      } else if (oversized) {
+        reasoningArtifactTexts.delete(reasoning.id);
       }
       const expanded = expandedReasoningIds.has(reasoning.id);
       const title = reasoningFoldTitle({
@@ -865,6 +903,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         thinking.setMessage(title);
       }
       if (!expanded) {
+        largeReasoningViews.close(reasoning.id);
         if (reasoning.status === "active") {
           transcript.addChild(thinking);
           transcriptViewport.setAnchor(reasoningAnchorId(reasoning.id), thinking, 1);
@@ -877,6 +916,27 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           transcriptViewport.setSemanticAnchor(transcriptItemAnchorId(reasoning.id), collapsed);
         }
         return;
+      }
+      if (oversized) {
+        const view = largeReasoningViews.sync({
+          artifact,
+          id: reasoning.id,
+          preferEnd: transcriptViewport.scrollView.isFollowingEnd,
+          text: reasoning.text,
+        });
+        if (view !== null) {
+          renderLargeReasoning({
+            contentTitle: reasoning.status === "active" ? thinking : new ResponsiveLine(title),
+            reasoningId: reasoning.id,
+            theme,
+            transcript,
+            transcriptViewport,
+            view,
+            boundaryOwners: largeReasoningBoundaryOwners,
+            active: reasoning.status === "active",
+          });
+          return;
+        }
       }
       const text =
         reasoning.text ??
@@ -2911,6 +2971,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         transcriptViewport.focusOnNextLayout(anchorId);
       }
       if (expandedReasoningIds.delete(reasoning.id)) {
+        largeReasoningViews.close(reasoning.id);
         renderState();
         tui.renderNow();
         return { consume: true };
@@ -2918,6 +2979,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       expandedReasoningIds.add(reasoning.id);
       const artifact = "artifact" in reasoning ? reasoning.artifact : null;
       if (
+        !isLargeReasoning({ artifact, text: reasoning.text }) &&
         reasoning.text === null &&
         artifact !== null &&
         !reasoningArtifactTexts.has(reasoning.id) &&
@@ -3089,6 +3151,129 @@ function reasoningAnchorId(reasoningId: string): string {
 
 function transcriptItemAnchorId(itemId: string): string {
   return `item:${itemId}`;
+}
+
+function renderLargeReasoning(options: {
+  readonly active: boolean;
+  readonly boundaryOwners: Map<
+    string,
+    { readonly direction: "up" | "down"; readonly reasoningId: string }
+  >;
+  readonly contentTitle: Component;
+  readonly reasoningId: string;
+  readonly theme: AdamTuiTheme;
+  readonly transcript: Container;
+  readonly transcriptViewport: TranscriptViewport;
+  readonly view: LargeReasoningView;
+}): void {
+  const content = new Container();
+  content.addChild(options.contentTitle);
+  const firstPage = options.view.pages[0];
+  const lastPage = options.view.pages.at(-1);
+  const visibleRange =
+    firstPage === undefined || lastPage === undefined
+      ? `0 of ${options.view.totalByteCount} bytes`
+      : `${firstPage.offset + 1}-${lastPage.offset + lastPage.byteCount} of ${options.view.totalByteCount} bytes`;
+  content.addChild(
+    new Text(options.theme.keyword(`Large reasoning · plain view · ${visibleRange}`)),
+  );
+  const availableDirections = [
+    ...(options.view.moreAbove ? ["↑ More reasoning above"] : []),
+    ...(options.view.moreBelow ? ["↓ More reasoning below"] : []),
+  ];
+  if (availableDirections.length > 0) {
+    content.addChild(new Text(options.theme.muted(availableDirections.join(" · "))));
+  }
+  const trackedChildren: {
+    readonly anchorId: string;
+    readonly child: Component;
+    readonly height?: (width: number) => number;
+    readonly kind: "page" | "up" | "down";
+  }[] = [];
+  const addBoundary = (direction: "up" | "down", text: string) => {
+    const child = new Text(options.theme.muted(text));
+    const anchorId = largeReasoningBoundaryAnchorId(options.reasoningId, direction);
+    content.addChild(child);
+    trackedChildren.push({ anchorId, child, kind: direction });
+  };
+  if (options.view.loadingInitial) {
+    content.addChild(new Text(options.theme.muted("Loading bounded reasoning range…")));
+  } else if (options.view.failureInitial) {
+    content.addChild(
+      new Text(options.theme.danger("Reasoning range unavailable · Ctrl+T retry loading")),
+    );
+  } else {
+    if (options.view.failureAbove) {
+      addBoundary("up", "More reasoning above unavailable · Wheel/PageUp retry");
+    } else if (options.view.loadingAbove) {
+      addBoundary("up", "Loading reasoning above…");
+    } else if (options.view.moreAbove) {
+      addBoundary("up", "↑ More reasoning above · Wheel/PageUp");
+    }
+    for (const page of options.view.pages) {
+      const pageRange = new Text(
+        options.theme.muted(`Reasoning bytes ${page.offset + 1}-${page.offset + page.byteCount}`),
+      );
+      const pageText = new Text(safeTerminalText(page.text));
+      content.addChild(pageRange);
+      content.addChild(pageText);
+      trackedChildren.push({
+        anchorId: page.anchorId,
+        child: pageRange,
+        height: (width) =>
+          pageRange.render(roundedFrameInnerWidth(width)).length +
+          pageText.render(roundedFrameInnerWidth(width)).length,
+        kind: "page",
+      });
+    }
+    if (options.view.failureBelow) {
+      addBoundary("down", "More reasoning below unavailable · Wheel/PageDown retry");
+    } else if (options.view.loadingBelow) {
+      addBoundary("down", "Loading reasoning below…");
+    } else if (options.view.moreBelow) {
+      addBoundary("down", "↓ More reasoning below · Wheel/PageDown");
+    }
+  }
+  options.transcript.addChild(new Spacer(1));
+  const frame = new RoundedFrame(content, options.theme.editor.borderColor);
+  options.transcript.addChild(frame);
+  options.transcriptViewport.setAnchor(
+    reasoningAnchorId(options.reasoningId),
+    frame,
+    options.active ? 2 : 1,
+  );
+  options.transcriptViewport.setSemanticAnchor(transcriptItemAnchorId(options.reasoningId), frame);
+  for (const tracked of trackedChildren) {
+    const line = (width: number) => framedChildLine(content, tracked.child, width);
+    const height =
+      tracked.height ??
+      ((width: number) => tracked.child.render(roundedFrameInnerWidth(width)).length);
+    if (tracked.kind === "page") {
+      options.transcriptViewport.setSemanticAnchor(tracked.anchorId, frame, line, height);
+      continue;
+    }
+    options.transcriptViewport.setAnchor(tracked.anchorId, frame, line, height);
+    options.boundaryOwners.set(tracked.anchorId, {
+      direction: tracked.kind,
+      reasoningId: options.reasoningId,
+    });
+  }
+}
+
+function framedChildLine(content: Container, child: Component, width: number): number {
+  const innerWidth = roundedFrameInnerWidth(width);
+  const childIndex = content.children.indexOf(child);
+  const borderRows = width < 4 ? 0 : 1;
+  return (
+    borderRows +
+    content.children
+      .slice(0, Math.max(0, childIndex))
+      .reduce((rows, candidate) => rows + candidate.render(innerWidth).length, 0)
+  );
+}
+
+function roundedFrameInnerWidth(width: number): number {
+  return Math.max(1, width < 4 ? width : width - 4);
 }
 
 function chronologyAnchorId(boundary: BranchSourceBoundary): string {
