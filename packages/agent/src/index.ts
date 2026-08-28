@@ -48,6 +48,13 @@ export {
   type ExtensionProjectChangesStartOptions,
   type ExtensionStateSnapshot,
 } from "./extension-host.js";
+export {
+  InputResourceError,
+  type InputResourceOccurrenceV1,
+  type InputResourcePageV1,
+  inputResourceLimitsV1,
+  type LocalInputResourceSelectionV1,
+} from "./input-resources.js";
 export { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
 export {
   createModelTargets,

@@ -10,6 +10,11 @@ import type { ArtifactReference, ModelResponseArtifactSource } from "./artifact-
 import type { ContextProfile } from "./context-profile.js";
 import type { ContextCallUsage, ContextEvidenceV1, ContextSummaryV1 } from "./durable-context.js";
 import { maximumInlineModelResponseFieldBytes } from "./durable-model-response-policy.js";
+import {
+  type InputResourceOccurrenceV1,
+  inputResourceLimitsV1,
+  inputResourceOccurrenceV1Schema,
+} from "./input-resources.js";
 import type { McpToolProfileV1 } from "./mcp-profile-contracts.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
@@ -258,6 +263,7 @@ export type SessionLogicalRunStartedRecord = {
   readonly sequence: number;
   readonly record: {
     readonly type: "logical_run_started";
+    readonly recordVersion?: 1;
     readonly runId: string;
     readonly userMessage: string;
     readonly naming?: {
@@ -273,6 +279,7 @@ export type SessionLogicalRunStartedRecord = {
       readonly maxTokens?: number;
     };
     readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
+    readonly inputResources?: readonly InputResourceOccurrenceV1[];
   };
 };
 
@@ -488,6 +495,27 @@ export type SessionSkillResourceReadCommittedRecord = {
   };
 };
 
+export type SessionInputResourceReadCommittedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "input_resource_read_committed";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly callId: string;
+    readonly occurrenceId: string;
+    readonly displayName: string;
+    readonly offset: number;
+    readonly byteCount: number;
+    readonly totalByteCount: number;
+    readonly eof: boolean;
+    readonly nextCursor: string | null;
+    readonly digest: Sha256Digest;
+    readonly pageDigest: Sha256Digest;
+    readonly content: string;
+  };
+};
+
 export type SessionProviderAttemptStartedRecord = {
   readonly schemaVersion: 3;
   readonly sequence: number;
@@ -652,6 +680,7 @@ export type SessionContextCompactionCommittedRecord = {
     readonly projectionVersion: 1;
     readonly sourceDigest: `sha256:${string}`;
     readonly replacementDigest: `sha256:${string}`;
+    readonly inputResources?: readonly InputResourceOccurrenceV1[];
     readonly summary: ContextSummaryV1;
     readonly evidence: ContextEvidenceV1;
     readonly usage?: ContextCallUsage;
@@ -760,6 +789,7 @@ export type SessionV3Record =
   | SessionPathContextCommittedRecord
   | SessionPathContextFailedRecord
   | SessionSkillResourceReadCommittedRecord
+  | SessionInputResourceReadCommittedRecord
   | SessionProviderAttemptStartedRecord
   | SessionProviderAttemptInterruptedRecord
   | SessionModelResponseCompletedRecord
@@ -822,6 +852,7 @@ const ordinaryRunErrorCodeSchema = z.enum([
   "model_response_too_large",
   "replay_envelope_too_large",
   "invalid_run_limits",
+  "input_resource_invalid",
   "run_already_active",
   "session_persistence_failed",
   "turn_limit_exceeded",
@@ -1003,6 +1034,16 @@ const v2ToolErrorSchema = z.discriminatedUnion("code", [
 const currentToolErrorSchema = z.union([
   v2ToolErrorSchema,
   z.strictObject({
+    code: z.enum([
+      "input_resource_corrupt",
+      "input_resource_cursor_invalid",
+      "input_resource_not_visible",
+      "input_resource_quota_exceeded",
+      "input_resource_unsupported",
+    ]),
+    message: z.string(),
+  }),
+  z.strictObject({
     code: z.literal("tool_effect_indeterminate"),
     reason: z.enum([
       "mcp_request_timeout",
@@ -1121,6 +1162,10 @@ const mcpPermissionSubjectSchema = z.strictObject({
   definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
 });
+const inputResourcePermissionSubjectSchema = z.strictObject({
+  type: z.literal("input_resource"),
+  occurrenceId: z.string().min(1).max(256),
+});
 const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("file"), path: z.string() }),
   z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
@@ -1128,6 +1173,7 @@ const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
   patchPermissionSubjectSchema,
   skillPermissionSubjectSchema,
   mcpPermissionSubjectSchema,
+  inputResourcePermissionSubjectSchema,
   z.strictObject({
     type: z.literal("command"),
     command: z.string(),
@@ -1674,6 +1720,7 @@ const sessionV3RecordSchema = z.union([
   }),
   z.strictObject({
     type: z.literal("logical_run_started"),
+    recordVersion: z.literal(1).optional(),
     runId: z.uuid(),
     userMessage: z.string().max(512 * 1024),
     naming: z
@@ -1701,6 +1748,11 @@ const sessionV3RecordSchema = z.union([
       .optional(),
     limits: sessionRunLimitsSchema.optional(),
     thinkingPolicy: thinkingPolicySnapshotV1Schema.optional(),
+    inputResources: z
+      .array(inputResourceOccurrenceV1Schema)
+      .min(1)
+      .max(inputResourceLimitsV1.maximumOccurrencesPerRun)
+      .optional(),
   }),
   z.strictObject({
     type: z.literal("session_manual_name_set"),
@@ -1875,6 +1927,22 @@ const sessionV3RecordSchema = z.union([
     executionToken: z.string().max(16_384).optional(),
   }),
   z.strictObject({
+    type: z.literal("input_resource_read_committed"),
+    recordVersion: z.literal(1),
+    runId: z.uuid(),
+    callId: z.string().min(1).max(256),
+    occurrenceId: z.string().min(1).max(256),
+    displayName: z.string().min(1).max(inputResourceLimitsV1.maximumDisplayNameBytes),
+    offset: z.number().int().nonnegative().max(inputResourceLimitsV1.maximumFileBytes),
+    byteCount: z.number().int().nonnegative().max(inputResourceLimitsV1.maximumReadPageBytes),
+    totalByteCount: z.number().int().nonnegative().max(inputResourceLimitsV1.maximumFileBytes),
+    eof: z.boolean(),
+    nextCursor: z.string().min(1).max(1_024).nullable(),
+    digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    pageDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    content: z.string().max(inputResourceLimitsV1.maximumReadPageBytes),
+  }),
+  z.strictObject({
     type: z.literal("provider_attempt_started"),
     runId: z.uuid(),
     turn: z.number().int().positive(),
@@ -2018,6 +2086,7 @@ const sessionV3RecordSchema = z.union([
     projectionVersion: z.literal(1),
     sourceDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
     replacementDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    inputResources: z.array(inputResourceOccurrenceV1Schema).optional(),
     summary: contextSummarySchema,
     evidence: contextEvidenceSchema,
     usage: responseUsageSchema.optional(),

@@ -69,9 +69,18 @@ export type SkillArtifactSource = {
   readonly provenance: "skill_ingestion";
 };
 
+export type InputResourceArtifactSourceV1 = {
+  readonly type: "input_resource";
+  readonly schemaVersion: 1;
+  readonly occurrenceId: string;
+  readonly runId: string;
+  readonly provenance: "user_local_file";
+};
+
 export type ArtifactSource =
   | ChangePreviewArtifactSource
   | ExtensionArtifactSource
+  | InputResourceArtifactSourceV1
   | McpToolResultArtifactSourceV1
   | ModelResponseArtifactSource
   | SkillArtifactSource

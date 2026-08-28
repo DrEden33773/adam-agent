@@ -63,6 +63,8 @@ export {
   sessionDurableOutputLimits,
 } from "./session-durable-context.js";
 export {
+  type InputResourceIngestBarrier,
+  inputResourceIngestBarrier,
   type McpActivationSettlementBarrier,
   type McpCatalogStaleDurableBarrier,
   type McpCatalogStaleObservationBarrier,

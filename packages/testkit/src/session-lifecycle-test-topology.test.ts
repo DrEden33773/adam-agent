@@ -14,7 +14,18 @@ const testkitSourcePath = fileURLToPath(new URL(".", import.meta.url));
 
 const operatingSystemTestNames = [
   "SessionLifecycle cold resume keeps a Direct DeepSeek v2 session on its historical profile",
+  "SessionLifecycle cold resume reads an immutable input resource after its source is deleted",
+  "SessionLifecycle follows one selected symlink without persisting its source path",
   "SessionLifecycle rejects a competing project writer before model dispatch and takes over after owner death",
+  "SessionLifecycle rejects a corrupt immutable input resource before cold provider projection",
+  "SessionLifecycle rejects a dangling selected symlink before provider dispatch",
+  "SessionLifecycle rejects a final symlink substituted after controlled resolution",
+  "SessionLifecycle rejects a looping selected symlink before provider dispatch",
+  "SessionLifecycle rejects a missing immutable input resource before cold provider projection",
+  "SessionLifecycle rejects a selected FIFO without waiting for a writer",
+  "SessionLifecycle rejects an input resource above the exact eight MiB file bound",
+  "SessionLifecycle rejects input resources above the exact sixteen MiB run aggregate",
+  "SessionLifecycle rejects input resources above the exact sixty-four MiB lineage aggregate",
   "SessionLifecycle real-process continuation preserves a completed safe read and starts a new attempt",
   "SessionLifecycle real-process restart marks a killed structured patch as indeterminate without replay",
   "SessionLifecycle real-process branch writes independently, survives restart, and stays project-scoped",
@@ -45,10 +56,12 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
   expect
     .soft(uniqueRuntimeModuleSpecifiers(operatingSystemSource))
     .toEqual([
+      "./index.js",
       "./session-lifecycle.test-support.js",
       "@adam-agent/agent",
       "@adam-agent/agent/internal-testing",
       "node:child_process",
+      "node:crypto",
       "node:fs/promises",
       "node:os",
       "node:path",
@@ -59,7 +72,7 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
   expect.soft(runtimeImportedBindings(operatingSystemSource, "vitest")).toEqual(["expect", "test"]);
   expect
     .soft(runtimeImportedBindings(operatingSystemSource, "node:child_process"))
-    .toEqual(["spawn"]);
+    .toEqual(["execFileSync", "spawn"]);
   expect
     .soft(uniqueRuntimeModuleSpecifiers(supportSource))
     .toEqual(["@adam-agent/agent", "@adam-agent/agent/internal-testing"]);
@@ -133,9 +146,9 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
 
   const behaviorNames = declaredTestNames(behaviorSource);
   const operatingSystemNames = declaredTestNames(operatingSystemSource);
-  expect.soft(behaviorNames).toHaveLength(58);
+  expect.soft(behaviorNames).toHaveLength(70);
   expect.soft(operatingSystemNames).toEqual([...operatingSystemTestNames].sort());
-  expect.soft(operatingSystemNames).toHaveLength(5);
+  expect.soft(operatingSystemNames).toHaveLength(16);
   expect.soft(operatingSystemTestNames.filter((name) => behaviorNames.includes(name))).toEqual([]);
   const combinedNames = [...behaviorNames, ...operatingSystemNames];
   expect.soft(new Set(combinedNames).size).toBe(combinedNames.length);

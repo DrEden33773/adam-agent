@@ -1,5 +1,6 @@
 import type { ArtifactReference, ChangePreviewArtifactSource } from "./artifact-store.js";
 import type { ContextCallUsage } from "./durable-context.js";
+import type { InputResourceOccurrenceV1 } from "./input-resources.js";
 import type { ModelDriverErrorCategory } from "./model-driver-error.js";
 import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import type {
@@ -13,6 +14,7 @@ import type {
 export type UserInput = {
   readonly text: string;
   readonly skills?: readonly string[];
+  readonly inputResources?: readonly InputResourceOccurrenceV1[];
 };
 
 export type RunOptions = {
@@ -115,6 +117,7 @@ export type RunResult =
               | "model_response_too_large"
               | "replay_envelope_too_large"
               | "invalid_run_limits"
+              | "input_resource_invalid"
               | "run_already_active"
               | "session_persistence_failed"
               | "turn_limit_exceeded"

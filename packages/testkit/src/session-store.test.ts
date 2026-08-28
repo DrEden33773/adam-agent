@@ -297,6 +297,38 @@ test("SessionStore adapters read legacy v1 records and current v2 patch records"
   }
 });
 
+test("SessionStore adapters do not widen the historical v2 tool-error schema", async () => {
+  const { testRoot, stores } = await createContractStores(
+    "adam-agent-session-v2-input-resource-error-",
+    "session-v2-input-resource-error",
+  );
+  const invalidRecord = {
+    schemaVersion: 2,
+    runId,
+    sequence: 1,
+    event: {
+      type: "tool_failed",
+      callId: "historical-call",
+      name: "read_input_resource",
+      error: {
+        code: "input_resource_not_visible",
+        message: "This error did not exist in the historical v2 contract.",
+      },
+    },
+  } as const;
+
+  try {
+    for (const [name, store] of stores) {
+      await expect(store.append(invalidRecord), name).rejects.toMatchObject({
+        name: "SessionStoreError",
+        code: "session_log_invalid",
+      });
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionStore adapters keep the v1 event contract unchanged", async () => {
   const { testRoot, stores } = await createContractStores(
     "adam-agent-session-v1-contract-",

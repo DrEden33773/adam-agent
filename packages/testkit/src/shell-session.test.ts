@@ -16,7 +16,7 @@ import { expect, test } from "vitest";
 
 import { FakeModelDriver } from "./index.js";
 
-test("the default coding registry exposes the six prompt-v2 tools", async () => {
+test("the default coding registry exposes the seven current prompt tools", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-coding-registry-"));
 
   try {
@@ -50,6 +50,7 @@ test("the default coding registry exposes the six prompt-v2 tools", async () => 
         "run_shell",
         "activate_skill",
         "read_skill_resource",
+        "read_input_resource",
       ],
       listFiles: undefined,
       searchText: undefined,

@@ -3270,6 +3270,7 @@ describe("AgentSession", () => {
           "run_shell",
           "activate_skill",
           "read_skill_resource",
+          "read_input_resource",
         ],
         commitOrder: ["first-started", "first-released", "write-completed"],
         results: [

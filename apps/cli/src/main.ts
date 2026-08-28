@@ -306,6 +306,9 @@ function formatPermissionPrompt(
   if (event.subject.type === "mcp_tool") {
     return `Allow ${event.name} from MCP server ${quoteForTerminal(event.subject.serverId)} [y/N] `;
   }
+  if (event.subject.type === "input_resource") {
+    return `Allow ${event.name} for linked input resource ${quoteForTerminal(event.subject.occurrenceId)} [y/N] `;
+  }
   return `Allow ${event.name} for ${quoteForTerminal(event.subject.path)} [y/N] `;
 }
 

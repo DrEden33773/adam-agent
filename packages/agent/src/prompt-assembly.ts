@@ -641,14 +641,10 @@ export function isPromptContextCompatible(
 ): boolean {
   try {
     const supported = promptContextSnapshot(createPromptContextV1(tools));
-    const toolProfileCompatible =
-      context.profileVersion === 1
-        ? context.toolProfile.definitions.every((recorded) =>
-            supported.toolProfile.definitions.some(
-              (current) => current.name === recorded.name && current.digest === recorded.digest,
-            ),
-          )
-        : canonicalJson(context.toolProfile) === canonicalJson(supported.toolProfile);
+    const toolProfileCompatible = isOrderedToolProfileSubset(
+      context.toolProfile.definitions,
+      supported.toolProfile.definitions,
+    );
     return (
       (context.profileVersion === 1 ||
         context.profileVersion === 2 ||
@@ -669,18 +665,33 @@ export function isPromptContextRecordCompatible(
 ): boolean {
   try {
     const currentToolProfile = createPromptContextV1(tools).toolProfile;
-    const compatibleTools =
-      context.recordVersion === 1
-        ? context.toolProfile.definitions.every((recorded) =>
-            currentToolProfile.definitions.some(
-              (current) => current.name === recorded.name && current.digest === recorded.digest,
-            ),
-          )
-        : canonicalJson(context.toolProfile) === canonicalJson(currentToolProfile);
+    const compatibleTools = isOrderedToolProfileSubset(
+      context.toolProfile.definitions,
+      currentToolProfile.definitions,
+    );
     return isPromptContextRecordValid(context) && compatibleTools;
   } catch {
     return false;
   }
+}
+
+function isOrderedToolProfileSubset(
+  recordedDefinitions: readonly { readonly name: string; readonly digest: string }[],
+  currentDefinitions: readonly { readonly name: string; readonly digest: string }[],
+): boolean {
+  let currentIndex = 0;
+  for (const recorded of recordedDefinitions) {
+    let current = currentDefinitions[currentIndex];
+    while (current !== undefined && current.name !== recorded.name) {
+      currentIndex += 1;
+      current = currentDefinitions[currentIndex];
+    }
+    if (current === undefined || current.digest !== recorded.digest) {
+      return false;
+    }
+    currentIndex += 1;
+  }
+  return true;
 }
 
 export function isPromptContextRecordValid(context: PromptContextRecord): boolean {

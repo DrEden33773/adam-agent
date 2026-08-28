@@ -31,6 +31,13 @@ import {
   withInternalExtensionSkillSourcesCurrent,
 } from "./extension-host.js";
 import {
+  InputResourceError,
+  type InputResourceOccurrenceV1,
+  ingestLocalInputResourcesV1,
+  inputResourceLimitsV1,
+  type LocalInputResourceSelectionV1,
+} from "./input-resources.js";
+import {
   createMcpRuntimeHost,
   inspectMcpConfiguration,
   type McpBeforeToolDispatchBarrier,
@@ -159,6 +166,7 @@ import {
   type ThinkingPolicySnapshotV1,
 } from "./thinking-policy.js";
 import {
+  bindInputResourceToolRegistry,
   createCodingToolRegistry,
   type PermissionPolicy,
   type ToolEffect,
@@ -258,6 +266,14 @@ export type SessionRuntimeNotificationTransform = {
   project(notification: SessionRuntimeNotification): readonly SessionRuntimeNotification[];
 };
 
+/** Tests only. Production input-resource ingest has no observation barrier. */
+export const inputResourceIngestBarrier = Symbol("adam-agent.input-resource-ingest-barrier");
+
+export type InputResourceIngestBarrier = {
+  afterResolved?(): Promise<void> | void;
+  afterOpened?(): Promise<void> | void;
+};
+
 /** Tests only. Production MCP lease transitions have no observation barrier. */
 export const workspaceMcpLeaseTransitionBarrier = Symbol(
   "adam-agent.workspace-mcp-lease-transition-barrier",
@@ -296,6 +312,7 @@ export type SessionLifecycleOptions = {
   readonly [sessionProjectLifecycleOwner]?: ProjectLifecycleOwner;
   readonly [sessionStoreDirectory]?: SessionStoreDirectory<SessionRecord>;
   readonly [sessionRuntimeNotificationTransform]?: SessionRuntimeNotificationTransform;
+  readonly [inputResourceIngestBarrier]?: InputResourceIngestBarrier;
   readonly [workspaceMcpLeaseTransitionBarrier]?: WorkspaceMcpLeaseTransitionBarrier;
 };
 
@@ -463,6 +480,7 @@ export type SessionCommand =
       readonly runId?: string;
       readonly signal?: AbortSignal;
       readonly thinkingSelection?: ThinkingPolicySelectionV1;
+      readonly resourceSelections?: readonly LocalInputResourceSelectionV1[];
     }
   | ({
       readonly type: "branch";
@@ -479,6 +497,7 @@ export interface SessionLifecycle {
     readonly runId?: string;
     readonly signal?: AbortSignal;
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
+    readonly resourceSelections?: readonly LocalInputResourceSelectionV1[];
     readonly onAdmitted?: (receipt: SessionAdmissionReceipt) => void;
   }): Promise<SessionContinueResult>;
   branch(input: SessionBranchInput): Promise<CurrentSessionSnapshot>;
@@ -490,6 +509,7 @@ export interface SessionLifecycle {
     readonly runId?: string;
     readonly signal?: AbortSignal;
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
+    readonly resourceSelections?: readonly LocalInputResourceSelectionV1[];
   }): Promise<SessionContinueResult>;
   configureMcp(command: McpConfigurationCommand): Promise<McpConfigurationResult>;
   configureWorkspaceTrust(
@@ -1934,6 +1954,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           runId,
           ...(input.limits === undefined ? {} : { limits: input.limits }),
           ...(input.signal === undefined ? {} : { signal: input.signal }),
+          ...(input.resourceSelections === undefined
+            ? {}
+            : { resourceSelections: input.resourceSelections }),
           ...(input.thinkingSelection === undefined
             ? {}
             : { thinkingSelection: input.thinkingSelection }),
@@ -2361,9 +2384,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       });
     },
     async continue(input) {
-      if (input.runId !== undefined && !z.uuid().safeParse(input.runId).success) {
+      if (
+        (input.runId !== undefined && !z.uuid().safeParse(input.runId).success) ||
+        (input.resourceSelections !== undefined && input.input === undefined) ||
+        input.input?.inputResources !== undefined
+      ) {
         throw new SessionLifecycleError("session_invalid");
       }
+      const effectiveRunId =
+        input.resourceSelections === undefined ? input.runId : (input.runId ?? randomUUID());
       disarmMcpIdle(input.sessionId);
       await waitForMcpIdleOperation(input.sessionId);
       const continued = await withOwner(async () => {
@@ -2677,6 +2706,18 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           first,
           replayRecords,
         );
+        const inputResourceLineageBytes = await inputResourceBytesFromLineage(
+          lineage,
+          first,
+          replayRecords,
+        );
+        const visibleInputResources = await inputResourcesFromLineage(
+          lineage,
+          first,
+          replayRecords,
+        );
+        await validateCompactionInputResources(lineage, first, replayRecords);
+        validateInputResourceReadLineage(replayRecords, visibleInputResources);
         const [inheritedMessages, inheritedEvidence] = await Promise.all([
           createBranchMessages(options, lineage, records, artifactCache),
           lineage.createInheritedContextEvidence(records),
@@ -2690,14 +2731,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             ? undefined
             : requireRecoveredThinkingPolicy(resolved, resumeState.thinkingPolicy);
         if (
-          input.runId !== undefined &&
+          effectiveRunId !== undefined &&
           (input.input === undefined ||
             resumeState !== undefined ||
             replayRecords.some(
               (record) =>
                 record.schemaVersion === 3 &&
                 "runId" in record.record &&
-                record.record.runId === input.runId,
+                record.record.runId === effectiveRunId,
             ))
         ) {
           throw new SessionLifecycleError("session_invalid");
@@ -2729,6 +2770,47 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         const artifactStore = await createFileArtifactStore({
           root: join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
         });
+        await validateVisibleInputResourceArtifacts(artifactStore, visibleInputResources);
+        const inputResources =
+          input.resourceSelections === undefined
+            ? []
+            : await ingestLocalInputResourcesV1({
+                artifactStore,
+                ...(options[inputResourceIngestBarrier]?.afterResolved === undefined
+                  ? {}
+                  : { afterResolved: options[inputResourceIngestBarrier].afterResolved }),
+                ...(options[inputResourceIngestBarrier]?.afterOpened === undefined
+                  ? {}
+                  : { afterOpened: options[inputResourceIngestBarrier].afterOpened }),
+                runId: effectiveRunId as string,
+                selections: input.resourceSelections,
+                signal: input.signal ?? new AbortController().signal,
+              });
+        input.signal?.throwIfAborted();
+        const runInput =
+          input.input === undefined || inputResources.length === 0
+            ? input.input
+            : { ...input.input, inputResources };
+        const runtimeInputResources = [...visibleInputResources, ...inputResources];
+        if (runtimeInputResources.length > inputResourceLimitsV1.maximumOccurrencesPerLineage) {
+          throw new InputResourceError(
+            "input_resource_count_exceeded",
+            "The selected input resources exceed the v1 session-lineage occurrence limit.",
+          );
+        }
+        const runtimeInputResourceBytes = runtimeInputResources.reduce(
+          (total, occurrence) => total + occurrence.artifact.byteCount,
+          0,
+        );
+        if (
+          !Number.isSafeInteger(runtimeInputResourceBytes) ||
+          runtimeInputResourceBytes > inputResourceLimitsV1.maximumAggregateBytesPerLineage
+        ) {
+          throw new InputResourceError(
+            "input_resource_aggregate_too_large",
+            "The selected input resources exceed the v1 session-lineage aggregate byte limit.",
+          );
+        }
         const sessionDependencies = {
           artifactStore,
           model: resolved.driver,
@@ -2736,13 +2818,21 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           [sessionDurableContext]: {
             ...(initialMessages.length === 0 ? {} : { hasInheritedMessages: true }),
             nextSequence: (replayRecords.at(-1)?.sequence ?? resumed.snapshot.lastSequence) + 1,
-            ...(input.runId === undefined ? {} : { newRunId: input.runId }),
+            ...(effectiveRunId === undefined ? {} : { newRunId: effectiveRunId }),
+            ...(runtimeInputResources.length === 0
+              ? {}
+              : { inputResources: runtimeInputResources }),
             projectId: resumed.snapshot.projectId,
             referencedModelResponseArtifactBytes,
             skillResourceLineageBytes,
+            inputResourceLineageBytes,
             ...(resumeState === undefined
               ? {}
               : {
+                  inputResourceRunBytes: inputResourceBytesForRun(
+                    replayRecords,
+                    resumeState.agentState.runId,
+                  ),
                   skillResourceRunBytes: skillResourceBytesForRun(
                     replayRecords,
                     resumeState.agentState.runId,
@@ -2819,7 +2909,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ...(options.tools === undefined
             ? {}
             : {
-                tools:
+                tools: bindInputResourceToolRegistry(
                   activePromptContext?.recordVersion === 3 && activePromptContext.mcp !== undefined
                     ? combineToolRegistries(
                         options.tools,
@@ -2834,6 +2924,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                             ),
                       )
                     : options.tools,
+                  { artifactStore, occurrences: runtimeInputResources },
+                ),
               }),
           ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
         };
@@ -2869,13 +2961,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         activeSessionSettlement = sessionSettlement;
         try {
           const runLimits = resumeState?.limits ?? input.limits;
-          const result = await session.run(
-            input.input ?? { text: resumeState?.userMessage ?? "" },
-            {
-              ...(input.signal === undefined ? {} : { signal: input.signal }),
-              ...(runLimits === undefined ? {} : { limits: runLimits }),
-            },
-          );
+          const result = await session.run(runInput ?? { text: resumeState?.userMessage ?? "" }, {
+            ...(input.signal === undefined ? {} : { signal: input.signal }),
+            ...(runLimits === undefined ? {} : { limits: runLimits }),
+          });
           await flushPendingMcpCatalogChanges(input.sessionId);
           const snapshot = await inspectSession({ sessionId: input.sessionId }, artifactCache);
           if (snapshot.schemaVersion !== 3) {
@@ -5572,36 +5661,59 @@ function createAgentResumeState(
                 subject: permissionEvent.subject,
               }
             : undefined;
-        const committedResource = currentRecords.find(
+        const committedSkillResource = currentRecords.find(
           (candidate) =>
             candidate.sequence > responseRecord.sequence &&
             candidate.record.type === "skill_resource_read_committed" &&
             candidate.record.runId === runId &&
             candidate.record.callId === call.id,
         );
+        const committedInputResource = currentRecords.find(
+          (candidate) =>
+            candidate.sequence > responseRecord.sequence &&
+            candidate.record.type === "input_resource_read_committed" &&
+            candidate.record.runId === runId &&
+            candidate.record.callId === call.id,
+        );
         const replayResult =
-          committedResource?.record.type === "skill_resource_read_committed"
+          committedSkillResource?.record.type === "skill_resource_read_committed"
             ? {
                 status: "completed" as const,
                 output: {
-                  qualifiedId: committedResource.record.qualifiedId,
-                  activationIndex: committedResource.record.activationIndex,
-                  catalogRevision: committedResource.record.catalogRevision,
-                  manifestRevision: committedResource.record.manifestRevision,
-                  path: committedResource.record.path,
-                  offset: committedResource.record.offset,
-                  byteCount: committedResource.record.byteCount,
-                  totalByteCount: committedResource.record.totalByteCount,
-                  eof: committedResource.record.eof,
-                  fileDigest: committedResource.record.fileDigest,
-                  pageDigest: committedResource.record.pageDigest,
-                  content: committedResource.record.content,
-                  ...(committedResource.record.executionToken === undefined
+                  qualifiedId: committedSkillResource.record.qualifiedId,
+                  activationIndex: committedSkillResource.record.activationIndex,
+                  catalogRevision: committedSkillResource.record.catalogRevision,
+                  manifestRevision: committedSkillResource.record.manifestRevision,
+                  path: committedSkillResource.record.path,
+                  offset: committedSkillResource.record.offset,
+                  byteCount: committedSkillResource.record.byteCount,
+                  totalByteCount: committedSkillResource.record.totalByteCount,
+                  eof: committedSkillResource.record.eof,
+                  fileDigest: committedSkillResource.record.fileDigest,
+                  pageDigest: committedSkillResource.record.pageDigest,
+                  content: committedSkillResource.record.content,
+                  ...(committedSkillResource.record.executionToken === undefined
                     ? {}
-                    : { executionToken: committedResource.record.executionToken }),
+                    : { executionToken: committedSkillResource.record.executionToken }),
                 },
               }
-            : undefined;
+            : committedInputResource?.record.type === "input_resource_read_committed"
+              ? {
+                  status: "completed" as const,
+                  output: {
+                    occurrenceId: committedInputResource.record.occurrenceId,
+                    displayName: committedInputResource.record.displayName,
+                    offset: committedInputResource.record.offset,
+                    byteCount: committedInputResource.record.byteCount,
+                    totalByteCount: committedInputResource.record.totalByteCount,
+                    eof: committedInputResource.record.eof,
+                    nextCursor: committedInputResource.record.nextCursor,
+                    digest: committedInputResource.record.digest,
+                    pageDigest: committedInputResource.record.pageDigest,
+                    content: committedInputResource.record.content,
+                  },
+                }
+              : undefined;
         pendingToolCalls.push({
           call,
           requested,
@@ -5734,6 +5846,166 @@ async function skillResourceBytesFromLineage(
     throw new SessionLifecycleError("session_invalid");
   }
   return total;
+}
+
+function inputResourceBytesForRun(records: readonly SessionRecord[], runId: string): number {
+  const total = records.reduce(
+    (sum, record) =>
+      record.schemaVersion === 3 &&
+      record.record.type === "input_resource_read_committed" &&
+      record.record.runId === runId
+        ? sum + record.record.byteCount
+        : sum,
+    0,
+  );
+  if (
+    !Number.isSafeInteger(total) ||
+    total < 0 ||
+    total > inputResourceLimitsV1.maximumMaterializedBytesPerRun
+  ) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return total;
+}
+
+async function inputResourceBytesFromLineage(
+  lineage: SessionLineageTraversal,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<number> {
+  const ownBytes = records.reduce(
+    (sum, record) =>
+      record.schemaVersion === 3 && record.record.type === "input_resource_read_committed"
+        ? sum + record.record.byteCount
+        : sum,
+    0,
+  );
+  const inheritedBytes =
+    genesis.record.lineage === undefined
+      ? 0
+      : await (async () => {
+          const { parentGenesis, prefixRecords } =
+            await lineage.readValidatedLineagePrefix(genesis);
+          return inputResourceBytesFromLineage(lineage, parentGenesis, prefixRecords);
+        })();
+  const total = inheritedBytes + ownBytes;
+  if (
+    !Number.isSafeInteger(total) ||
+    total < 0 ||
+    total > inputResourceLimitsV1.maximumMaterializedBytesPerLineage
+  ) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return total;
+}
+
+async function inputResourcesFromLineage(
+  lineage: SessionLineageTraversal,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<readonly InputResourceOccurrenceV1[]> {
+  const inherited =
+    genesis.record.lineage === undefined
+      ? []
+      : await (async () => {
+          const { parentGenesis, prefixRecords } =
+            await lineage.readValidatedLineagePrefix(genesis);
+          return inputResourcesFromLineage(lineage, parentGenesis, prefixRecords);
+        })();
+  const own = records.flatMap((record) =>
+    record.schemaVersion === 3 && record.record.type === "logical_run_started"
+      ? (record.record.inputResources ?? [])
+      : [],
+  );
+  const visible = [...inherited, ...own];
+  const occurrenceIds = new Set(visible.map((occurrence) => occurrence.occurrenceId));
+  const aggregateBytes = visible.reduce(
+    (total, occurrence) => total + occurrence.artifact.byteCount,
+    0,
+  );
+  if (
+    visible.length > inputResourceLimitsV1.maximumOccurrencesPerLineage ||
+    occurrenceIds.size !== visible.length ||
+    !Number.isSafeInteger(aggregateBytes) ||
+    aggregateBytes > inputResourceLimitsV1.maximumAggregateBytesPerLineage
+  ) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return visible;
+}
+
+async function validateCompactionInputResources(
+  lineage: SessionLineageTraversal,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<void> {
+  for (const checkpoint of records) {
+    if (
+      checkpoint.schemaVersion !== 3 ||
+      checkpoint.record.type !== "context_compaction_committed"
+    ) {
+      continue;
+    }
+    const checkpointRecord = checkpoint.record;
+    const expected = await inputResourcesFromLineage(
+      lineage,
+      genesis,
+      records.filter((record) => record.sequence <= checkpointRecord.sourceThrough),
+    );
+    if (!isDeepStrictEqual(checkpointRecord.inputResources ?? [], expected)) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+  }
+}
+
+function validateInputResourceReadLineage(
+  records: readonly SessionRecord[],
+  visible: readonly InputResourceOccurrenceV1[],
+): void {
+  const occurrences = new Map(visible.map((occurrence) => [occurrence.occurrenceId, occurrence]));
+  for (const record of records) {
+    if (record.schemaVersion !== 3 || record.record.type !== "input_resource_read_committed") {
+      continue;
+    }
+    const occurrence = occurrences.get(record.record.occurrenceId);
+    if (
+      occurrence === undefined ||
+      record.record.displayName !== occurrence.displayName ||
+      record.record.digest !== occurrence.digest ||
+      record.record.totalByteCount !== occurrence.artifact.byteCount
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+  }
+}
+
+async function validateVisibleInputResourceArtifacts(
+  artifactStore: ArtifactStore,
+  occurrences: readonly InputResourceOccurrenceV1[],
+): Promise<void> {
+  for (const occurrence of occurrences) {
+    let bytes: Uint8Array | undefined;
+    try {
+      bytes = await artifactStore.read(occurrence.artifact.id, {
+        maximumBytes: inputResourceLimitsV1.maximumFileBytes,
+      });
+    } catch {
+      throw new InputResourceError(
+        "input_resource_corrupt",
+        "An immutable input-resource artifact failed integrity validation.",
+      );
+    }
+    if (
+      bytes === undefined ||
+      bytes.byteLength !== occurrence.artifact.byteCount ||
+      `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== occurrence.digest
+    ) {
+      throw new InputResourceError(
+        "input_resource_corrupt",
+        "An immutable input-resource artifact is missing or does not match its descriptor.",
+      );
+    }
+  }
 }
 
 async function canonicalProjectId(workspaceRoot: string): Promise<string> {

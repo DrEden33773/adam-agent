@@ -1,5 +1,6 @@
 import type { ModelMessage } from "./agent-session-contracts.js";
 import type { ContextEvidenceV1 } from "./durable-context.js";
+import type { InputResourceOccurrenceV1 } from "./input-resources.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import type { PromptContextRecord } from "./prompt-assembly.js";
 import type {
@@ -22,6 +23,9 @@ export type AgentSessionDurableOutputLimits = {
 export type AgentSessionDurableContext = {
   readonly hasInheritedMessages?: boolean | undefined;
   readonly inheritedEvidence?: ContextEvidenceV1 | undefined;
+  readonly inputResources?: readonly InputResourceOccurrenceV1[] | undefined;
+  readonly inputResourceLineageBytes?: number;
+  readonly inputResourceRunBytes?: number;
   readonly initialMessages?: readonly ModelMessage[];
   readonly nextSequence: number;
   readonly newRunId?: string;

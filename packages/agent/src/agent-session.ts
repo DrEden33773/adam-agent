@@ -43,6 +43,13 @@ import {
   maximumModelResponseContentBytes,
   maximumReferencedModelResponseArtifactBytes,
 } from "./durable-model-response-policy.js";
+import {
+  createInputResourceProjectionMessageV1,
+  inputResourceLimitsV1,
+  inputResourceOccurrenceV1Schema,
+  inputResourcePageV1Schema,
+  projectInputResourcesV1,
+} from "./input-resources.js";
 import { ModelDriverError } from "./model-driver-error.js";
 import {
   assemblePromptMessagesV1,
@@ -155,6 +162,8 @@ export class AgentSession {
   #referencedModelResponseArtifactBytes: number;
   #skillResourceRunBytes: number;
   #skillResourceLineageBytes: number;
+  #inputResourceRunBytes: number;
+  #inputResourceLineageBytes: number;
   #pendingPermission:
     | {
         readonly requestId: string;
@@ -192,6 +201,8 @@ export class AgentSession {
       this.#durableContext?.referencedModelResponseArtifactBytes ?? 0;
     this.#skillResourceRunBytes = this.#durableContext?.skillResourceRunBytes ?? 0;
     this.#skillResourceLineageBytes = this.#durableContext?.skillResourceLineageBytes ?? 0;
+    this.#inputResourceRunBytes = this.#durableContext?.inputResourceRunBytes ?? 0;
+    this.#inputResourceLineageBytes = this.#durableContext?.inputResourceLineageBytes ?? 0;
     this.#contextProfile = dependencies.contextProfile;
     const maximumOutputTokens =
       dependencies.contextProfile?.maximumOutputTokens ?? dependencies.maximumOutputTokens;
@@ -299,6 +310,15 @@ export class AgentSession {
         },
       };
     }
+    if (!areInputResourcesValid(input.inputResources)) {
+      return {
+        status: "failed",
+        error: {
+          code: "input_resource_invalid",
+          message: "Input resources must use the exact bounded v1 immutable descriptor schema.",
+        },
+      };
+    }
     if (this.#activeAbortController !== undefined) {
       return {
         status: "failed",
@@ -341,6 +361,9 @@ export class AgentSession {
             sequence: logicalRunStartedSequence,
             record: {
               type: "logical_run_started",
+              ...(input.inputResources === undefined || input.inputResources.length === 0
+                ? {}
+                : { recordVersion: 1 as const, inputResources: input.inputResources }),
               runId: this.#activeRunId,
               userMessage: input.text,
               ...(isFirstLogicalRun && !genesisHasFallback
@@ -407,6 +430,7 @@ export class AgentSession {
     explicitSkills: readonly { readonly selection: string; readonly requestId: string }[],
   ): Promise<RunResult> {
     const resume = this.#durableContext?.resume;
+    const projectedUserMessage = projectInputResourcesV1(input.text, input.inputResources);
     if (resume === undefined) {
       await this.#emit({ type: "user_message", text: input.text });
       if (signal.aborted) {
@@ -433,7 +457,10 @@ export class AgentSession {
     }
     const messages: ModelMessage[] =
       resume === undefined
-        ? [...(this.#durableContext?.initialMessages ?? []), { role: "user", content: input.text }]
+        ? [
+            ...(this.#durableContext?.initialMessages ?? []),
+            { role: "user", content: projectedUserMessage },
+          ]
         : resume.messages.map((message) => ({ ...message }));
     const toolResultsById = new Map<
       string,
@@ -1344,7 +1371,16 @@ export class AgentSession {
       } else {
         unknownCalls += 1;
       }
-      const replacementMessages = [...compacted.replacementMessages, ...retainedMessages];
+      const inputResourceMessages =
+        this.#durableContext?.inputResources === undefined ||
+        this.#durableContext.inputResources.length === 0
+          ? []
+          : [createInputResourceProjectionMessageV1(this.#durableContext.inputResources)];
+      const replacementMessages = [
+        ...compacted.replacementMessages,
+        ...inputResourceMessages,
+        ...retainedMessages,
+      ];
       const replacementTooLarge =
         this.#estimatePromptTokens(
           this.#assemblePromptMessages(replacementMessages),
@@ -1424,6 +1460,10 @@ export class AgentSession {
           projectionVersion: 1,
           sourceDigest,
           replacementDigest: digestContextMessages(replacementMessages),
+          ...(durableContext.inputResources === undefined ||
+          durableContext.inputResources.length === 0
+            ? {}
+            : { inputResources: durableContext.inputResources }),
           summary: compacted.summary,
           evidence,
           ...(compacted.usage === undefined ? {} : { usage: compacted.usage }),
@@ -1946,7 +1986,10 @@ export class AgentSession {
       scope: "call",
       subject: preparedCall.permissionSubject,
     };
-    const policyDecision = this.#permissions?.decide(permissionInput) ?? "deny";
+    const policyDecision =
+      preparedPermissionSubject.type === "input_resource"
+        ? "allow"
+        : (this.#permissions?.decide(permissionInput) ?? "deny");
     if (signal.aborted) {
       return this.#settleCancelled();
     }
@@ -2027,7 +2070,11 @@ export class AgentSession {
         ? await this.#activateModelSelectedSkill(call)
         : call.name === "read_skill_resource"
           ? await this.#readSkillResource(call)
-          : await preparedCall.execute({ signal, callId: call.id, toolName: call.name });
+          : call.name === "read_input_resource"
+            ? await this.#readInputResource(call, () =>
+                preparedCall.execute({ signal, callId: call.id, toolName: call.name }),
+              )
+            : await preparedCall.execute({ signal, callId: call.id, toolName: call.name });
     toolResultsById.set(call.id, { call, result });
     await this.#appendToolResult(messages, call, result);
     if (result.status === "failed" && result.error.code === "tool_effect_indeterminate") {
@@ -2363,6 +2410,74 @@ export class AgentSession {
         ...(page.executionToken === undefined ? {} : { executionToken: page.executionToken }),
       },
     };
+  }
+
+  async #readInputResource(
+    call: ToolCall,
+    execute: () => Promise<ToolResult>,
+  ): Promise<ToolResult> {
+    const runId = this.#activeRunId;
+    const result = await execute();
+    if (result.status === "failed") {
+      return result;
+    }
+    const parsed = inputResourcePageV1Schema.safeParse(result.output);
+    const page = parsed.success ? parsed.data : undefined;
+    const occurrence = this.#durableContext?.inputResources?.find(
+      (candidate) => candidate.occurrenceId === page?.occurrenceId,
+    );
+    if (
+      runId === undefined ||
+      page === undefined ||
+      occurrence === undefined ||
+      page.displayName !== occurrence.displayName ||
+      page.digest !== occurrence.digest ||
+      page.totalByteCount !== occurrence.artifact.byteCount ||
+      page.offset + page.byteCount > page.totalByteCount ||
+      page.eof !== (page.offset + page.byteCount === page.totalByteCount) ||
+      Buffer.byteLength(page.content, "utf8") !== page.byteCount ||
+      `sha256:${createHash("sha256").update(page.content, "utf8").digest("hex")}` !==
+        page.pageDigest
+    ) {
+      return inputResourceReadFailure(
+        "input_resource_corrupt",
+        "The immutable input-resource page did not match canonical resource truth.",
+      );
+    }
+    if (
+      this.#inputResourceRunBytes + page.byteCount >
+        inputResourceLimitsV1.maximumMaterializedBytesPerRun ||
+      this.#inputResourceLineageBytes + page.byteCount >
+        inputResourceLimitsV1.maximumMaterializedBytesPerLineage
+    ) {
+      return inputResourceReadFailure(
+        "input_resource_quota_exceeded",
+        "The input-resource materialization quota for this run or session lineage would be exceeded.",
+      );
+    }
+    await this.#appendRecord({
+      schemaVersion: 3,
+      sequence: this.#nextSequence,
+      record: {
+        type: "input_resource_read_committed",
+        recordVersion: 1,
+        runId,
+        callId: call.id,
+        occurrenceId: page.occurrenceId,
+        displayName: page.displayName,
+        offset: page.offset,
+        byteCount: page.byteCount,
+        totalByteCount: page.totalByteCount,
+        eof: page.eof,
+        nextCursor: page.nextCursor,
+        digest: page.digest,
+        pageDigest: page.pageDigest,
+        content: page.content,
+      },
+    });
+    this.#inputResourceRunBytes += page.byteCount;
+    this.#inputResourceLineageBytes += page.byteCount;
+    return { status: "completed", output: page };
   }
 
   async #preflightRepositoryInstructions(
@@ -3493,6 +3608,16 @@ function areSkillSelectionsValid(selections: UserInput["skills"]): boolean {
   );
 }
 
+function areInputResourcesValid(resources: UserInput["inputResources"]): boolean {
+  return (
+    resources === undefined ||
+    (Array.isArray(resources) &&
+      resources.length <= 8 &&
+      resources.every((resource) => inputResourceOccurrenceV1Schema.safeParse(resource).success) &&
+      new Set(resources.map((resource) => resource.occurrenceId)).size === resources.length)
+  );
+}
+
 function skillActivationFailure(
   message: string,
   ambiguity?: {
@@ -3520,6 +3645,13 @@ function skillResourceFailure(
     | "skill_resource_quota_exceeded"
     | "skill_resource_unavailable"
     | "unsupported_binary_resource",
+  message: string,
+): Extract<ToolResult, { readonly status: "failed" }> {
+  return { status: "failed", error: { code, message } };
+}
+
+function inputResourceReadFailure(
+  code: "input_resource_corrupt" | "input_resource_quota_exceeded",
   message: string,
 ): Extract<ToolResult, { readonly status: "failed" }> {
   return { status: "failed", error: { code, message } };

@@ -8,6 +8,13 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 
 import type { ArtifactStore } from "./artifact-store.js";
+import {
+  InputResourceError,
+  type InputResourceOccurrenceV1,
+  inputResourceLimitsV1,
+  inputResourcePageV1Schema,
+  readInputResourcePageV1,
+} from "./input-resources.js";
 import { createMutationCoordinator, type MutationCoordinator } from "./mutation-coordinator.js";
 import { createPatchRecoveryStore } from "./patch-recovery-store.js";
 import {
@@ -77,6 +84,11 @@ export type ToolResult =
               | "unsupported_binary_resource"
               | "resource_page_too_small"
               | "skill_resource_quota_exceeded"
+              | "input_resource_corrupt"
+              | "input_resource_cursor_invalid"
+              | "input_resource_not_visible"
+              | "input_resource_quota_exceeded"
+              | "input_resource_unsupported"
               | "artifact_store_failed"
               | "mcp_protocol_error"
               | "mcp_output_invalid"
@@ -238,6 +250,10 @@ export type PermissionSubject =
       readonly operation: "activate" | "read_resource";
       readonly qualifiedId: string;
       readonly path?: string | undefined;
+    }
+  | {
+      readonly type: "input_resource";
+      readonly occurrenceId: string;
     }
   | {
       readonly type: "mcp_tool";
@@ -904,6 +920,10 @@ function createCodingToolRegistryInternal(options: {
     },
     "safe",
   );
+  const inputResourceAdapter = createInputResourceToolAdapter({
+    artifactStore: options.artifactStore,
+    occurrences: [],
+  });
   const adapters = [
     requireAdapter(readTools, "read_file"),
     requireAdapter(mutationTools, "write_file"),
@@ -911,6 +931,7 @@ function createCodingToolRegistryInternal(options: {
     shellAdapter,
     activateSkillAdapter,
     readSkillResourceAdapter,
+    inputResourceAdapter,
   ];
   const adaptersByName = new Map(adapters.map((adapter) => [adapter.definition.name, adapter]));
 
@@ -920,6 +941,116 @@ function createCodingToolRegistryInternal(options: {
     },
     resolve(name) {
       return adaptersByName.get(name);
+    },
+  };
+}
+
+const inputResourceOccurrenceIdSchema = z.string().min(1).max(256);
+const readInputResourceInputSchema = z.strictObject({
+  occurrenceId: inputResourceOccurrenceIdSchema,
+  cursor: z.string().min(1).max(1_024).optional(),
+  maxByteCount: z.number().int().min(1).max(inputResourceLimitsV1.maximumReadPageBytes).optional(),
+});
+function createInputResourceToolAdapter(options: {
+  readonly artifactStore: ArtifactStore | undefined;
+  readonly occurrences: readonly InputResourceOccurrenceV1[];
+}): ToolAdapter {
+  const occurrences = new Map(options.occurrences.map((entry) => [entry.occurrenceId, entry]));
+  return identifyToolAdapter(
+    {
+      definition: {
+        name: "read_input_resource",
+        description:
+          "Read one bounded strict UTF-8 page from an immutable linked input resource visible in this session history.",
+        inputSchema: z.toJSONSchema(readInputResourceInputSchema),
+      },
+      outputSchema: inputResourcePageV1Schema,
+      effect: "read",
+      cancellation: "abort_signal",
+      maximumResult: { maximumBytes: inputResourceLimitsV1.maximumReadPageBytes },
+      prepare(argumentsJson) {
+        const parsedArguments = parseInput(readInputResourceInputSchema, argumentsJson);
+        if (!parsedArguments.success) {
+          return invalidToolInput();
+        }
+        const occurrence = occurrences.get(parsedArguments.data.occurrenceId);
+        return {
+          status: "ready",
+          permissionSubject: {
+            type: "input_resource",
+            occurrenceId: parsedArguments.data.occurrenceId,
+          },
+          async execute(context) {
+            context.signal.throwIfAborted();
+            if (options.artifactStore === undefined) {
+              return inputResourceFailure(
+                new InputResourceError(
+                  "input_resource_corrupt",
+                  "The immutable input-resource artifact store is unavailable.",
+                ),
+              );
+            }
+            try {
+              const output = await readInputResourcePageV1({
+                artifactStore: options.artifactStore,
+                occurrence,
+                occurrenceId: parsedArguments.data.occurrenceId,
+                ...(parsedArguments.data.cursor === undefined
+                  ? {}
+                  : { cursor: parsedArguments.data.cursor }),
+                ...(parsedArguments.data.maxByteCount === undefined
+                  ? {}
+                  : { maxByteCount: parsedArguments.data.maxByteCount }),
+              });
+              context.signal.throwIfAborted();
+              return { status: "completed", output };
+            } catch (error) {
+              if (error instanceof InputResourceError) {
+                return inputResourceFailure(error);
+              }
+              return inputResourceFailure(
+                new InputResourceError(
+                  "input_resource_corrupt",
+                  "The immutable input resource could not be read safely.",
+                ),
+              );
+            }
+          },
+        };
+      },
+    },
+    "safe",
+  );
+}
+
+function inputResourceFailure(error: InputResourceError): FailedToolResult {
+  const code =
+    error.code === "input_resource_cursor_invalid"
+      ? "input_resource_cursor_invalid"
+      : error.code === "input_resource_not_visible"
+        ? "input_resource_not_visible"
+        : error.code === "input_resource_unsupported"
+          ? "input_resource_unsupported"
+          : "input_resource_corrupt";
+  return { status: "failed", error: { code, message: error.message } };
+}
+
+export function bindInputResourceToolRegistry(
+  registry: ToolRegistry,
+  options: {
+    readonly artifactStore: ArtifactStore;
+    readonly occurrences: readonly InputResourceOccurrenceV1[];
+  },
+): ToolRegistry {
+  const adapter = createInputResourceToolAdapter(options);
+  const definitions = registry.definitions();
+  if (!definitions.some((definition) => definition.name === adapter.definition.name)) {
+    return registry;
+  }
+  return {
+    definitions: () => definitions,
+    resolve(name) {
+      return name === adapter.definition.name ? adapter : registry.resolve(name);
     },
   };
 }
