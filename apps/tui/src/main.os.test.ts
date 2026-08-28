@@ -1370,6 +1370,46 @@ test("Kitty Ctrl+C repeat and release phases cannot confirm an armed exit", asyn
   }
 });
 
+test("Kitty Ctrl+O repeat and release phases expand one tool card only once", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-kitty-tool-phases-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, "README.md"),
+    `${Array.from({ length: 12 }, (_, index) => `line${String(index + 1).padStart(2, "0")}`).join(
+      "\n",
+    )}\n`,
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({
+      external: true,
+      noColor: true,
+      scenario: "read",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Read the README\r");
+    await fixture.waitFor("Read complete.");
+    const beforeToolView = fixture.output().length;
+    fixture.write("\u001b[5~");
+    await fixture.waitForAfter("\u001b[?2026l", beforeToolView);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("read README.md · Ctrl+O expand");
+    const beforeToggle = fixture.output().length;
+    fixture.write("\u001b[111;5:1u\u001b[111;5:2u\u001b[111;5:2u\u001b[111;5:3ux");
+    await fixture.waitForAfter("x", beforeToggle);
+    const screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("read README.md · Ctrl+O fold");
+    fixture.write("\u0015\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("unsupported clipboard is reported after terminal restoration without blocking exit", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-clipboard-unsupported-"));
   const workspaceRoot = join(testRoot, "workspace");

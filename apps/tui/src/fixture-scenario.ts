@@ -43,6 +43,7 @@ export const fixtureScenarios = [
   "streaming",
   "target-navigation",
   "tool-artifact",
+  "tool-multiple",
   "unsafe-history",
   "unsafe-output",
   "write",

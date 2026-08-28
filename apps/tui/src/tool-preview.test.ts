@@ -4,7 +4,7 @@ import { expect, test } from "vitest";
 import { createAdamTuiTheme } from "./theme.js";
 import { ToolPreview } from "./tool-preview.js";
 
-test("ToolPreview shows ten numbered code lines before the global expansion", () => {
+test("ToolPreview shows ten numbered code lines in its collapsed view", () => {
   const preview: ToolPreviewDisplay = {
     kind: "read_text",
     language: "typescript",
@@ -20,7 +20,8 @@ test("ToolPreview shows ten numbered code lines before the global expansion", ()
   expect(collapsed.join("\n")).toContain(" 1 │ const value1 = 1;");
   expect(collapsed.join("\n")).toContain("10 │ const value10 = 10;");
   expect(collapsed.join("\n")).not.toContain("value11");
-  expect(collapsed.join("\n")).toContain("2 more projected lines · Ctrl+O expand");
+  expect(collapsed.join("\n")).toContain("2 more projected lines");
+  expect(collapsed.join("\n")).not.toContain("Ctrl+O");
 
   const expanded = new ToolPreview(preview, true, createAdamTuiTheme(true)).render(32);
   expect(expanded.join("\n")).toContain("12 │ const value12 = 12;");

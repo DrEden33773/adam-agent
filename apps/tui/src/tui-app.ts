@@ -26,6 +26,7 @@ import {
   type Terminal,
   Text,
   TuiAltScreen,
+  truncateToWidth,
   VStack,
 } from "@earendil-works/pi-tui";
 import {
@@ -296,7 +297,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const exitArm = new ExitArm(deadlineScheduler, () => requestPolicyRender());
   const legacyDuplicateGuard = new LegacyDuplicateGuard(deadlineScheduler);
   let previousRunActive: boolean | undefined;
-  let toolDetailsExpanded = false;
+  const expandedToolIds = new Set<string>();
   let pendingOperationBaseline: {
     readonly sessionId: string;
     readonly operationIds: ReadonlySet<string>;
@@ -617,6 +618,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       transcriptViewport.followEnd();
       pendingOperationBaseline = null;
       expandedReasoningIds.clear();
+      expandedToolIds.clear();
       reasoningArtifactReads.clear();
       reasoningArtifactTexts.clear();
       largeReasoningViews.clear();
@@ -1077,10 +1079,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         renderReasoning(item, item.artifact);
         previousWasAssistant = false;
       } else if (item.type === "tool_call") {
+        const expanded = expandedToolIds.has(item.id);
         const tool = new Box(1, 1, theme.toolBackground);
         const subject = item.subject?.value;
         const label = safeTerminalText(item.label);
-        const title =
+        const baseTitle =
           item.kind === "shell"
             ? subject === undefined
               ? "$"
@@ -1088,15 +1091,24 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             : subject === undefined
               ? label
               : `${label} ${safeTerminalText(subject)}`;
-        tool.addChild(new ResponsiveLine(theme.toolTitle(title)));
+        const action = `Ctrl+O ${expanded ? "fold" : "expand"}`;
+        const titleWithAction = (baseWidth: number): string =>
+          theme.toolTitle(`${truncateToWidth(baseTitle, baseWidth)} · ${action}`);
+        const toolTitle = new ResponsiveText(() => physicalTerminal.columns);
+        toolTitle.setText({
+          narrow: titleWithAction(14),
+          standard: titleWithAction(32),
+          wide: theme.toolTitle(`${baseTitle} · ${action}`),
+        });
+        tool.addChild(toolTitle);
         if (item.preview !== null) {
-          tool.addChild(new ToolPreview(item.preview, toolDetailsExpanded, theme));
+          tool.addChild(new ToolPreview(item.preview, expanded, theme));
         }
         const detail = item.resultSummary ?? toolStatusText(item.status, item.outcome?.status);
         if (detail !== null) {
           tool.addChild(new ResponsiveLine(theme.toolOutput(safeTerminalText(detail))));
         }
-        if (toolDetailsExpanded) {
+        if (expanded) {
           const replay = item.source?.replay ?? "unavailable";
           tool.addChild(
             new Text(theme.muted(safeTerminalText(`safe summary · ${detail ?? "unavailable"}`))),
@@ -3316,16 +3328,29 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return { consume: true };
     }
     if (commandRegistry.matchesInput(data, "toggle_tool_details")) {
-      const latestTool = options.presentation
-        .getState()
-        .authoritative.active?.transcript.items.findLast((item) => item.type === "tool_call");
-      if (latestTool !== undefined) {
-        const anchorId = toolAnchorId(latestTool.id);
-        if (!transcriptViewport.preserveAnchorRow(anchorId, terminal.columns)) {
-          transcriptViewport.focusOnNextLayout(anchorId);
-        }
+      if (isKeyRepeat(data) || isKeyRelease(data)) {
+        return { consume: true };
       }
-      toolDetailsExpanded = !toolDetailsExpanded;
+      const tools =
+        options.presentation
+          .getState()
+          .authoritative.active?.transcript.items.filter((item) => item.type === "tool_call") ?? [];
+      const visibleAnchorId = transcriptViewport.selectVisibleAnchor(
+        tools.map((tool) => toolAnchorId(tool.id)),
+        terminal.columns,
+      );
+      const tool =
+        tools.find((candidate) => toolAnchorId(candidate.id) === visibleAnchorId) ?? tools.at(-1);
+      if (tool === undefined) {
+        return { consume: true };
+      }
+      const anchorId = toolAnchorId(tool.id);
+      if (!transcriptViewport.preserveAnchorRow(anchorId, terminal.columns)) {
+        transcriptViewport.focusOnNextLayout(anchorId);
+      }
+      if (!expandedToolIds.delete(tool.id)) {
+        expandedToolIds.add(tool.id);
+      }
       renderState();
       tui.renderNow();
       return { consume: true };

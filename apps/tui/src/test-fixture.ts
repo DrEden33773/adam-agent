@@ -264,6 +264,17 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
         name: "Switch target session",
       });
     }
+    if (options.scenario === "tool-multiple") {
+      const switchTarget = await lifecycle.create({ targetIdentity });
+      await lifecycle.continue({
+        sessionId: switchTarget.sessionId,
+        input: { text: "Seeded project session for tool disclosure switch" },
+      });
+      await lifecycle.setSessionManualName({
+        sessionId: switchTarget.sessionId,
+        name: "Tool disclosure switch session",
+      });
+    }
     const resumedSessionId =
       options.scenario === "resume" ||
       options.scenario === "history" ||
@@ -273,6 +284,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       options.scenario === "reasoning-large-multiple" ||
       options.scenario === "reasoning-artifact-session-race" ||
       options.scenario === "target-navigation" ||
+      options.scenario === "tool-multiple" ||
       options.scenario === "unsafe-history"
         ? await lifecycle.create({ targetIdentity }).then(async (created) => {
             if (options.scenario === "history") {
@@ -311,6 +323,17 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
                   input: { text: `Inspect seeded reasoning block ${block}` },
                 });
               }
+            } else if (options.scenario === "tool-multiple") {
+              for (let card = 1; card <= 3; card += 1) {
+                await lifecycle.continue({
+                  sessionId: created.sessionId,
+                  input: { text: `Inspect seeded tool card ${card}` },
+                });
+              }
+              await lifecycle.setSessionManualName({
+                sessionId: created.sessionId,
+                name: "Tool disclosure source session",
+              });
             } else if (options.scenario === "reasoning-artifact-session-race") {
               await lifecycle.continue({
                 sessionId: created.sessionId,
@@ -930,6 +953,7 @@ function createFixtureModelTargets(options: {
   }
   let artifactResponseOrdinal = 0;
   let reasoningViewportOrdinal = 0;
+  let toolPreviewOrdinal = 0;
   const model: ModelDriver = {
     async *stream(request) {
       if (request.tools.length === 0) {
@@ -971,6 +995,25 @@ function createFixtureModelTargets(options: {
           return;
         }
         yield { type: "text_delta", text: "Read complete." };
+      } else if (options.scenario === "tool-multiple") {
+        const latest = request.messages.at(-1);
+        if (latest?.role === "user") {
+          toolPreviewOrdinal += 1;
+          yield {
+            type: "tool_call_start",
+            id: `read-multiple-${toolPreviewOrdinal}`,
+            name: "read_file",
+          };
+          yield {
+            type: "tool_call_delta",
+            id: `read-multiple-${toolPreviewOrdinal}`,
+            json: JSON.stringify({ path: `tool-${toolPreviewOrdinal}.txt` }),
+          };
+          yield { type: "tool_call_end", id: `read-multiple-${toolPreviewOrdinal}` };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: `Multiple tool answer ${toolPreviewOrdinal}.` };
       } else if (options.scenario === "write") {
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {
