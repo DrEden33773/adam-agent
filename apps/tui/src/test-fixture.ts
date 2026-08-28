@@ -58,7 +58,7 @@ const launchTargetIdentities: readonly ModelTargetIdentity[] = [
     vendor: "deepseek",
     modelId: "deepseek-v4-flash",
     route: "direct",
-    profileVersion: 2,
+    profileVersion: 3,
     certification: "certified",
   },
   {
@@ -66,7 +66,7 @@ const launchTargetIdentities: readonly ModelTargetIdentity[] = [
     vendor: "deepseek",
     modelId: "deepseek-v4-pro",
     route: "direct",
-    profileVersion: 2,
+    profileVersion: 3,
     certification: "certified",
   },
 ];
@@ -79,7 +79,7 @@ const fixtureThinkingCapabilities = new Map(
       targetIdentity: identity,
       providerProfile: {
         id: "@ai-sdk/deepseek/chat" as const,
-        version: "3.0.28" as const,
+        version: identity.profileVersion >= 3 ? ("3.0.30" as const) : ("3.0.28" as const),
         requestPath: "provider_options.deepseek" as const,
       },
       supportsOff: true as const,
@@ -1475,7 +1475,7 @@ function createFixtureModelTargets(options: {
         identity,
         driver: model,
         contextProfile:
-          identity.profileVersion === 2 ? preparedDirectDeepSeekV2ContextProfile : contextProfile,
+          identity.profileVersion >= 2 ? preparedDirectDeepSeekV2ContextProfile : contextProfile,
         ...(thinkingCapability === undefined ? {} : { thinkingCapability }),
       };
     },

@@ -13,6 +13,7 @@ import {
   type RuntimeEvent,
 } from "@adam-agent/agent";
 import { expect, test } from "vitest";
+import { createSessionLifecycleForTests as createSessionLifecycle } from "./session-lifecycle.test-support.js";
 
 const {
   DEEPSEEK_API_KEY: apiKey,
@@ -110,6 +111,84 @@ liveTest(
     }
   },
   120_000,
+);
+
+liveTest(
+  "current Direct DeepSeek Flash v3 completes one reasoning and read-tool round trip",
+  async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-live-deepseek-v3-"));
+    const stateRoot = join(testRoot, "state");
+    const workspaceRoot = join(testRoot, "workspace");
+    const events: RuntimeEvent[] = [];
+    try {
+      await mkdir(workspaceRoot);
+      await writeFile(join(workspaceRoot, "README.md"), "# Aurora Compass\n", "utf8");
+      const modelTargets = createModelTargets({
+        environment: { DEEPSEEK_API_KEY: liveApiKey },
+        deadlineMs: 90_000,
+      });
+      const target = (
+        await modelTargets.snapshot({ signal: new AbortController().signal })
+      ).targets.find(({ identity }) => identity.targetId === "deepseek-v4-flash.direct");
+      if (target === undefined) {
+        throw new Error("Expected the current Direct DeepSeek Flash target.");
+      }
+      const lifecycle = createSessionLifecycle({
+        modelTargets,
+        permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+        stateRoot,
+        tools: createReadToolRegistry({ workspaceRoot }),
+        workspaceRoot,
+      });
+      lifecycle.subscribe((event) => events.push(event));
+
+      try {
+        const created = await lifecycle.create({ targetIdentity: target.identity });
+        const continued = await lifecycle.continue({
+          sessionId: created.sessionId,
+          input: {
+            text: "Use read_file to read README.md, then reply with only the H1 project name.",
+          },
+        });
+
+        expect({
+          result: continued.result,
+          targetIdentity: continued.snapshot.targetIdentity,
+        }).toEqual({
+          result: { status: "completed", answer: expect.stringContaining("Aurora Compass") },
+          targetIdentity: expect.objectContaining({
+            targetId: "deepseek-v4-flash.direct",
+            profileVersion: 3,
+          }),
+        });
+        expect(events).toContainEqual({
+          type: "tool_requested",
+          callId: expect.any(String),
+          name: "read_file",
+        });
+        expect(events).toContainEqual({
+          type: "model_reasoning_started",
+          id: expect.any(String),
+          artifactType: "provider_reasoning",
+        });
+        expect(
+          events.some(
+            (event) => event.type === "model_reasoning_updated" && event.text.trim().length > 0,
+          ),
+        ).toBe(true);
+        expect(events).toContainEqual({
+          type: "model_reasoning_settled",
+          id: expect.any(String),
+          status: "completed",
+        });
+      } finally {
+        await lifecycle.close();
+      }
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+  180_000,
 );
 
 liveTest(

@@ -13,6 +13,7 @@ const topologySuitePath = fileURLToPath(import.meta.url);
 const testkitSourcePath = fileURLToPath(new URL(".", import.meta.url));
 
 const operatingSystemTestNames = [
+  "SessionLifecycle cold resume keeps a Direct DeepSeek v2 session on its historical profile",
   "SessionLifecycle rejects a competing project writer before model dispatch and takes over after owner death",
   "SessionLifecycle real-process continuation preserves a completed safe read and starts a new attempt",
   "SessionLifecycle real-process restart marks a killed structured patch as indeterminate without replay",
@@ -134,7 +135,7 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
   const operatingSystemNames = declaredTestNames(operatingSystemSource);
   expect.soft(behaviorNames).toHaveLength(58);
   expect.soft(operatingSystemNames).toEqual([...operatingSystemTestNames].sort());
-  expect.soft(operatingSystemNames).toHaveLength(4);
+  expect.soft(operatingSystemNames).toHaveLength(5);
   expect.soft(operatingSystemTestNames.filter((name) => behaviorNames.includes(name))).toEqual([]);
   const combinedNames = [...behaviorNames, ...operatingSystemNames];
   expect.soft(new Set(combinedNames).size).toBe(combinedNames.length);

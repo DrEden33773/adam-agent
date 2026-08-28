@@ -22,7 +22,7 @@ export type ThinkingCapabilityV1 = {
   readonly targetIdentity: ModelTargetIdentity;
   readonly providerProfile: {
     readonly id: "@ai-sdk/deepseek/chat";
-    readonly version: "3.0.28";
+    readonly version: "3.0.28" | "3.0.30";
     readonly requestPath: "provider_options.deepseek";
   };
   readonly supportsOff: true;
@@ -91,7 +91,7 @@ export function createDirectDeepSeekThinkingCapability(
     targetIdentity,
     providerProfile: {
       id: "@ai-sdk/deepseek/chat" as const,
-      version: "3.0.28" as const,
+      version: targetIdentity.profileVersion >= 3 ? ("3.0.30" as const) : ("3.0.28" as const),
       requestPath: "provider_options.deepseek" as const,
     },
     supportsOff: true as const,
