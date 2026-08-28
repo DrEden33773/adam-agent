@@ -38,6 +38,18 @@ afterEach(async () => {
   await cleanupActiveTuiFixtures();
 });
 
+async function trustWorkspace(configRoot: string, workspaceRoot: string): Promise<void> {
+  const workspaceTrust = createWorkspaceTrust({
+    environment: { XDG_CONFIG_HOME: configRoot },
+    workspaceRoot,
+  });
+  const snapshot = await workspaceTrust.load();
+  if (snapshot.projectId === null) {
+    throw new Error("The production TUI fixture requires one canonical project identity.");
+  }
+  await workspaceTrust.setTrusted({ projectId: snapshot.projectId, trusted: true });
+}
+
 async function writeRecoverableReviewPackage(packageRoot: string): Promise<void> {
   await mkdir(packageRoot, { recursive: true });
   await writeFile(
@@ -190,7 +202,15 @@ test("the production PTY persists owner-only config and trust, completes a finit
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitForCompleteFrameAfter("Adam · New session", 0);
+    await fixture.waitForCompleteFrameAfter("Workspace trust required", 0);
+    const admissionFrame = fixture.screen()?.join("\n") ?? "";
+    expect(admissionFrame).toContain("No — Exit Adam");
+    expect(admissionFrame).toContain("Yes — Trust and continue");
+    expect(admissionFrame).not.toContain("Adam · New session");
+    expect(admissionFrame).not.toContain("Select an exact model target");
+    const beforeAdmission = fixture.output().length;
+    fixture.write("\u001b[B\r");
+    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeAdmission);
 
     let beforeAction = fixture.output().length;
     fixture.write("/trust st");
@@ -199,13 +219,7 @@ test("the production PTY persists owner-only config and trust, completes a finit
     expect(completionFrame).toContain("> status");
     expect(completionFrame).not.toContain("→ status");
     fixture.write("\t\r");
-    await fixture.waitForAfter("Workspace trust: untrusted", beforeAction);
-
-    beforeAction = fixture.output().length;
-    fixture.write("/trust gr");
-    await fixture.waitForCompleteFrameAfter("> grant", beforeAction);
-    fixture.write("\t\r");
-    await fixture.waitForAfter("Workspace trust granted.", beforeAction);
+    await fixture.waitForAfter("Workspace trust: trusted", beforeAction);
 
     beforeAction = fixture.output().length;
     fixture.write("/config output 1234\r");
@@ -455,6 +469,7 @@ test("the production TUI composes the Linux clipboard adapter for copy commands"
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-clipboard-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
   const helperPath = join(testRoot, "wl-copy");
   const clipboardMarker = join(testRoot, "clipboard.txt");
   const assistantText = "Production clipboard response.";
@@ -464,6 +479,7 @@ test("the production TUI composes the Linux clipboard adapter for copy commands"
   });
 
   try {
+    await trustWorkspace(configRoot, workspaceRoot);
     const modelTargets = createModelTargets({
       environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
       fetch: async () =>
@@ -504,6 +520,7 @@ test("the production TUI composes the Linux clipboard adapter for copy commands"
           ADAM_TEST_CLIPBOARD_MARKER: clipboardMarker,
           DEEPSEEK_API_KEY: "test-deepseek-key",
           PATH: `${testRoot}:${inheritedPath}`,
+          XDG_CONFIG_HOME: configRoot,
         },
       },
       stateRoot,
@@ -530,15 +547,20 @@ test("the production TUI entry reaches a credentialed exact-target session witho
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-startup-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
   await mkdir(workspaceRoot);
 
   try {
+    await trustWorkspace(configRoot, workspaceRoot);
     const fixture = startFixture({
       program: {
         arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
         cwd: workspaceRoot,
         entrypoint: productionPath,
-        environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
+        environment: {
+          DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+          XDG_CONFIG_HOME: configRoot,
+        },
       },
       stateRoot,
       workspaceRoot,
@@ -571,6 +593,7 @@ test("the production TUI exposes one enabled extension Skill in the first-prompt
   await writeReviewExtensionConfiguration(configDirectory, packageRoot, { block: false });
 
   try {
+    await trustWorkspace(configRoot, workspaceRoot);
     const fixture = startFixture({
       program: {
         arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
@@ -696,6 +719,7 @@ test("the production TUI reviews real Git changes through the exact public Eve a
   } as const;
 
   try {
+    await trustWorkspace(configRoot, workspaceRoot);
     const fixture = startFixture({ program, stateRoot, terminalProcessMarker, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     await fixture.resize(120, 40);
@@ -732,6 +756,10 @@ test("the production TUI reviews real Git changes through the exact public Eve a
     await resumed.resize(120, 40);
     await resumed.waitForCompleteFrameAfter(
       "eve-reviewer.local-worktree-review@1",
+      beforeRestartResize,
+    );
+    await resumed.waitForCompleteFrameAfter(
+      "Report · eve-reviewer.review-result@1",
       beforeRestartResize,
     );
     const restartedFrame = resumed.screen()?.join("\n") ?? "";
@@ -801,6 +829,7 @@ test("a missing configured package disables admission while preserving generic h
   });
 
   try {
+    await trustWorkspace(configRoot, workspaceRoot);
     await host.loadConfiguredExtensions();
     const reference = await host.operations.startLinked({
       contributionId: "fixture.recoverable-review@1",
@@ -900,6 +929,7 @@ test("the production TUI rehydrates and explicitly recovers one operation after 
   } as const;
 
   try {
+    await trustWorkspace(configRoot, workspaceRoot);
     const interrupted = startFixture({
       program,
       stateRoot,

@@ -13,6 +13,7 @@ export const fixtureScenarios = [
   "mcp-close-unconfirmed",
   "mutation",
   "mutation-after-release",
+  "mutation-after-release-with-continuation-barrier",
   "mutation-delayed-preview",
   "provider-no-usage",
   "provider-usage",

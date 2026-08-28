@@ -18,6 +18,7 @@ import {
   ModelDriverError,
   type ModelTargetIdentity,
   type ModelTargets,
+  type WorkspaceTrustController,
 } from "@adam-agent/agent";
 import {
   createTrustedWorkspaceTrustForTesting,
@@ -135,7 +136,8 @@ export type TuiFixtureOptions = {
     readonly configRoot?: string;
     readonly seedTargetIds?: readonly string[];
     readonly startupTargetId?: string;
-    readonly workspaceTrust?: "owner-local";
+    readonly workspaceTrust?: "owner-local" | "unavailable";
+    readonly workspaceTrustMutation?: "reject";
   };
   readonly presentationCloseMarker?: string;
   readonly scenario?: FixtureScenario;
@@ -208,7 +210,9 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
             },
             workspaceRoot: options.workspaceRoot,
           })
-        : createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
+        : options.launch?.workspaceTrust === "unavailable"
+          ? unavailableWorkspaceTrust()
+          : createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
     stateRoot: options.stateRoot,
     workspaceRoot: options.workspaceRoot,
   });
@@ -447,6 +451,29 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
   }
 }
 
+function unavailableWorkspaceTrust(): WorkspaceTrustController {
+  const snapshot = {
+    projectId: null,
+    projectLabel: "workspace",
+    status: "unavailable" as const,
+    diagnostic: {
+      code: "workspace_trust_unavailable" as const,
+      message: "The canonical workspace identity is unavailable.",
+    },
+  };
+  return {
+    async acquireMcpLease() {
+      return { async release() {} };
+    },
+    async load() {
+      return snapshot;
+    },
+    async setTrusted() {
+      throw new TypeError("The canonical workspace identity is unavailable.");
+    },
+  };
+}
+
 async function createReviewOperationFixture(
   stateRoot: string,
   workspaceRoot: string,
@@ -636,11 +663,14 @@ function observeTuiDispatch(
   presentation: PresentationSession,
   options: {
     readonly controlRoot?: string;
+    readonly launch?: TuiFixtureOptions["launch"];
     readonly presentationCloseMarker?: string;
     readonly scenario?: FixtureScenario;
   },
 ): PresentationSession {
   const controlRoot = options.controlRoot;
+  const rejectWorkspaceTrustMutation = options.launch?.workspaceTrustMutation === "reject";
+  const observeWorkspaceTrustAdmission = options.launch?.workspaceTrust === "owner-local";
   const observeNamingDispatch = controlRoot !== undefined;
   const observeDispatch =
     controlRoot !== undefined &&
@@ -650,7 +680,12 @@ function observeTuiDispatch(
       options.scenario === "artifact-page-race" ||
       options.scenario === "review-completed" ||
       options.scenario === "review-recovery");
-  if (!observeNamingDispatch && !observeDispatch && options.presentationCloseMarker === undefined) {
+  if (
+    !observeNamingDispatch &&
+    !observeDispatch &&
+    !rejectWorkspaceTrustMutation &&
+    options.presentationCloseMarker === undefined
+  ) {
     return presentation;
   }
   let artifactReadCount = 0;
@@ -662,7 +697,40 @@ function observeTuiDispatch(
       }
     },
     dispatch: async (command) => {
+      if (command.type === "set_workspace_trust" && rejectWorkspaceTrustMutation) {
+        return {
+          status: "rejected",
+          code: "persistence_failed",
+          message: "Injected trust mutation rejection.",
+        };
+      }
       const receipt = presentation.dispatch(command);
+      if (
+        command.type === "set_workspace_trust" &&
+        controlRoot !== undefined &&
+        observeWorkspaceTrustAdmission
+      ) {
+        const settled = await receipt;
+        await writeFile(
+          join(controlRoot, "workspace-trust-dispatch-settled"),
+          `${settled.status}\n`,
+          "utf8",
+        );
+        return settled;
+      }
+      if (
+        command.type === "create_session" &&
+        controlRoot !== undefined &&
+        observeWorkspaceTrustAdmission
+      ) {
+        const settled = await receipt;
+        await writeFile(
+          join(controlRoot, "create-session-dispatch-settled"),
+          `${settled.status}\n`,
+          "utf8",
+        );
+        return settled;
+      }
       if (command.type === "set_session_manual_name" && controlRoot !== undefined) {
         const settled = await receipt;
         await writeFile(
@@ -846,11 +914,15 @@ function createFixtureModelTargets(options: {
       } else if (
         options.scenario === "mutation" ||
         options.scenario === "mutation-after-release" ||
+        options.scenario === "mutation-after-release-with-continuation-barrier" ||
         options.scenario === "mutation-delayed-preview"
       ) {
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {
-          if (options.scenario === "mutation-after-release") {
+          if (
+            options.scenario === "mutation-after-release" ||
+            options.scenario === "mutation-after-release-with-continuation-barrier"
+          ) {
             await writeFile(
               join(options.controlRoot as string, "model-started"),
               "started\n",
@@ -879,6 +951,22 @@ function createFixtureModelTargets(options: {
           yield { type: "tool_call_end", id: "edit-file" };
           yield { type: "finish", reason: "tool_calls" };
           return;
+        }
+        if (options.scenario === "mutation-after-release-with-continuation-barrier") {
+          await writeFile(
+            join(options.controlRoot as string, "model-continuation-ready"),
+            "ready\n",
+            "utf8",
+          );
+          if (
+            !(await waitForFile(
+              options.controlRoot as string,
+              "release-model-continuation",
+              request.signal,
+            ))
+          ) {
+            throw request.signal.reason;
+          }
         }
         yield { type: "text_delta", text: "Edit complete." };
       } else if (options.scenario === "cancellation") {
