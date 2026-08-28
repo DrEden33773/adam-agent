@@ -4,10 +4,12 @@ import { open, realpath } from "node:fs/promises";
 import { basename } from "node:path";
 
 import { z } from "zod";
-import type {
-  ArtifactReference,
-  ArtifactStore,
-  InputResourceArtifactSourceV1,
+import {
+  type ArtifactReference,
+  type ArtifactStore,
+  type InputResourceArtifactSourceV1,
+  publishFileArtifactStage,
+  type StagedArtifactReference,
 } from "./artifact-store.js";
 
 export const inputResourceLimitsV1 = {
@@ -28,6 +30,19 @@ export type LocalInputResourceSelectionV1 = {
   readonly type: "local_file";
   readonly path: string;
 };
+
+export type StagedInputResourceSelectionV1 = {
+  readonly type: "staged_artifact";
+  readonly staged: StagedArtifactReference;
+  readonly displayName: string;
+  readonly digest: `sha256:${string}`;
+  readonly mediaHint: "binary" | "text";
+  readonly support: "unsupported_binary" | "utf8_text";
+};
+
+export type InputResourceSelectionV1 =
+  | LocalInputResourceSelectionV1
+  | StagedInputResourceSelectionV1;
 
 export type InputResourceOccurrenceV1 = {
   readonly occurrenceId: string;
@@ -90,11 +105,12 @@ export class InputResourceError extends Error {
 }
 
 export async function ingestLocalInputResourcesV1(input: {
+  readonly artifactRoot?: string;
   readonly artifactStore: ArtifactStore;
   readonly afterResolved?: () => Promise<void> | void;
   readonly afterOpened?: () => Promise<void> | void;
   readonly runId: string;
-  readonly selections: readonly LocalInputResourceSelectionV1[];
+  readonly selections: readonly InputResourceSelectionV1[];
   readonly signal: AbortSignal;
 }): Promise<readonly InputResourceOccurrenceV1[]> {
   if (input.selections.length > inputResourceLimitsV1.maximumOccurrencesPerRun) {
@@ -107,27 +123,27 @@ export async function ingestLocalInputResourcesV1(input: {
   let aggregateBytes = 0;
   for (const [index, selection] of input.selections.entries()) {
     input.signal.throwIfAborted();
-    if (
-      selection.type !== "local_file" ||
-      selection.path.length === 0 ||
-      selection.path.includes("\0") ||
-      Buffer.byteLength(selection.path, "utf8") > inputResourceLimitsV1.maximumSelectedPathBytes
-    ) {
-      throw new InputResourceError(
-        "input_resource_invalid_selection",
-        "The selected local input-resource path is invalid.",
-      );
-    }
     const occurrenceId = `${input.runId}:input:${index + 1}`;
-    const ingested = await ingestOneLocalFile({
-      artifactStore: input.artifactStore,
-      ...(input.afterResolved === undefined ? {} : { afterResolved: input.afterResolved }),
-      ...(input.afterOpened === undefined ? {} : { afterOpened: input.afterOpened }),
-      occurrenceId,
-      path: selection.path,
-      runId: input.runId,
-      signal: input.signal,
-    });
+    const ingested =
+      selection.type === "staged_artifact"
+        ? await promoteStagedInputResource({
+            ...(input.afterOpened === undefined ? {} : { afterOpened: input.afterOpened }),
+            artifactRoot: input.artifactRoot,
+            artifactStore: input.artifactStore,
+            occurrenceId,
+            runId: input.runId,
+            selection,
+            signal: input.signal,
+          })
+        : await ingestSelectedLocalFile({
+            artifactStore: input.artifactStore,
+            ...(input.afterResolved === undefined ? {} : { afterResolved: input.afterResolved }),
+            ...(input.afterOpened === undefined ? {} : { afterOpened: input.afterOpened }),
+            occurrenceId,
+            selection,
+            runId: input.runId,
+            signal: input.signal,
+          });
     aggregateBytes += ingested.artifact.byteCount;
     if (aggregateBytes > inputResourceLimitsV1.maximumAggregateBytesPerRun) {
       throw new InputResourceError(
@@ -138,6 +154,107 @@ export async function ingestLocalInputResourcesV1(input: {
     occurrences.push(ingested);
   }
   return occurrences;
+}
+
+async function ingestSelectedLocalFile(input: {
+  readonly artifactStore: ArtifactStore;
+  readonly afterResolved?: () => Promise<void> | void;
+  readonly afterOpened?: () => Promise<void> | void;
+  readonly occurrenceId: string;
+  readonly selection: LocalInputResourceSelectionV1;
+  readonly runId: string;
+  readonly signal: AbortSignal;
+}): Promise<InputResourceOccurrenceV1> {
+  if (
+    input.selection.path.length === 0 ||
+    input.selection.path.includes("\0") ||
+    Buffer.byteLength(input.selection.path, "utf8") > inputResourceLimitsV1.maximumSelectedPathBytes
+  ) {
+    throw new InputResourceError(
+      "input_resource_invalid_selection",
+      "The selected local input-resource path is invalid.",
+    );
+  }
+  return ingestOneLocalFile({
+    artifactStore: input.artifactStore,
+    ...(input.afterResolved === undefined ? {} : { afterResolved: input.afterResolved }),
+    ...(input.afterOpened === undefined ? {} : { afterOpened: input.afterOpened }),
+    occurrenceId: input.occurrenceId,
+    path: input.selection.path,
+    runId: input.runId,
+    signal: input.signal,
+  });
+}
+
+async function promoteStagedInputResource(input: {
+  readonly artifactRoot: string | undefined;
+  readonly artifactStore: ArtifactStore;
+  readonly afterOpened?: () => Promise<void> | void;
+  readonly occurrenceId: string;
+  readonly runId: string;
+  readonly selection: StagedInputResourceSelectionV1;
+  readonly signal: AbortSignal;
+}): Promise<InputResourceOccurrenceV1> {
+  const { selection } = input;
+  const validMedia =
+    (selection.support === "utf8_text" &&
+      selection.mediaHint === "text" &&
+      selection.staged.mediaType === "text/plain; charset=utf-8") ||
+    (selection.support === "unsupported_binary" &&
+      selection.mediaHint === "binary" &&
+      selection.staged.mediaType === "application/octet-stream");
+  if (
+    input.artifactRoot === undefined ||
+    selection.displayName.length === 0 ||
+    Buffer.byteLength(selection.displayName, "utf8") >
+      inputResourceLimitsV1.maximumDisplayNameBytes ||
+    selection.staged.id !== selection.digest ||
+    selection.staged.byteCount > inputResourceLimitsV1.maximumFileBytes ||
+    !validMedia
+  ) {
+    throw new InputResourceError(
+      "input_resource_invalid_selection",
+      "The provisional input-resource selection is invalid.",
+    );
+  }
+  input.signal.throwIfAborted();
+  await input.afterOpened?.();
+  input.signal.throwIfAborted();
+  const source: InputResourceArtifactSourceV1 = {
+    type: "input_resource",
+    schemaVersion: 1,
+    occurrenceId: input.occurrenceId,
+    runId: input.runId,
+    provenance: "user_local_file",
+  };
+  try {
+    await publishFileArtifactStage({
+      artifactStore: input.artifactStore,
+      root: input.artifactRoot,
+      source,
+      staged: selection.staged,
+    });
+  } catch {
+    throw new InputResourceError(
+      "input_resource_io_failed",
+      "The provisional input resource could not be promoted safely.",
+    );
+  }
+  input.signal.throwIfAborted();
+  return {
+    occurrenceId: input.occurrenceId,
+    displayName: selection.displayName,
+    artifact: {
+      id: selection.digest,
+      mediaType: selection.staged.mediaType as InputResourceOccurrenceV1["artifact"]["mediaType"],
+      byteCount: selection.staged.byteCount,
+    },
+    digest: selection.digest,
+    mediaHint: selection.mediaHint,
+    provenance: "user_local_file",
+    support: selection.support,
+    mode: "link",
+  };
 }
 
 async function ingestOneLocalFile(input: {
@@ -275,7 +392,7 @@ async function ingestOneLocalFile(input: {
     }
     return {
       occurrenceId: input.occurrenceId,
-      displayName: safeDisplayName(input.path),
+      displayName: safeInputResourceDisplayNameV1(input.path),
       artifact: { id: digest, mediaType, byteCount: identity.size },
       digest,
       mediaHint: strictUtf8 ? "text" : "binary",
@@ -288,7 +405,7 @@ async function ingestOneLocalFile(input: {
   }
 }
 
-function safeDisplayName(path: string): string {
+export function safeInputResourceDisplayNameV1(path: string): string {
   let retained = "";
   for (const character of basename(path)) {
     const codePoint = character.codePointAt(0) ?? 0;

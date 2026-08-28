@@ -38,6 +38,38 @@ afterEach(async () => {
   await cleanupActiveTuiFixtures();
 });
 
+test("the real TUI process restores the terminal after staging one input resource", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-resource-process-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const selectedPath = join(testRoot, "process-notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "process resource bytes\n", "utf8");
+
+  try {
+    const fixture = startFixture({
+      external: true,
+      noColor: true,
+      scenario: "provider-no-usage",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write(`/attach ${selectedPath}\r`);
+    await fixture.waitFor("ready · process-notes.txt · 23 bytes");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("\u001b[?2004h");
+    expect(result.stdout).toContain("\u001b[?2004l");
+    expect(result.stdout.indexOf("\u001b[?2004h")).toBeLessThan(
+      result.stdout.lastIndexOf("\u001b[?2004l"),
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 async function trustWorkspace(configRoot: string, workspaceRoot: string): Promise<void> {
   const workspaceTrust = createWorkspaceTrust({
     environment: { XDG_CONFIG_HOME: configRoot },
@@ -1465,10 +1497,13 @@ test("the real terminal delivers Ctrl+C interruption without arming exit", async
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-cancel-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
   await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
 
   try {
     const fixture = startFixture({
+      controlRoot,
       external: true,
       scenario: "cancellation",
       stateRoot,
@@ -1477,6 +1512,7 @@ test("the real terminal delivers Ctrl+C interruption without arming exit", async
     await fixture.waitFor("Adam · New session");
     fixture.write("Cancel this run\r");
     await fixture.waitFor("Working");
+    await waitForPath(join(controlRoot, "model-started"));
     fixture.write("\u0003\u0003");
     await fixture.waitFor("cancelled");
     expect(fixture.output()).not.toContain("Press Ctrl+C again");

@@ -24,6 +24,7 @@ import type { RuntimeEvent } from "./agent-session-contracts.js";
 import { readFileArtifact, readFileArtifactRange } from "./artifact-store.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
 import type { ExtensionHost } from "./extension-host.js";
+import { createFileTurnComposerResourceStager } from "./input-resource-staging.js";
 import {
   type ModelTargetIdentity,
   type ModelTargetSnapshot,
@@ -57,6 +58,7 @@ import {
 } from "./session-history-folds.js";
 import {
   type CurrentSessionSnapshot,
+  effectiveSessionStateRoot,
   type SessionContextUsageSnapshot,
   type SessionLifecycle,
   SessionLifecycleError,
@@ -64,6 +66,13 @@ import {
   type SessionRuntimeNotification,
 } from "./session-lifecycle.js";
 import { readJsonlSessionRecords, type SessionRecord } from "./session-store.js";
+import {
+  createTurnComposer,
+  type TurnComposer,
+  TurnComposerError,
+  type TurnComposerStageBarrier,
+  turnComposerStageBarrier,
+} from "./turn-composer.js";
 
 /** Tests only. Production hydration has no artificial publication barrier. */
 export const presentationHydrationBarrier = Symbol("adam-agent.presentation-hydration-barrier");
@@ -114,6 +123,7 @@ type PresentationSessionBaseOptions = {
   readonly [presentationSessionRecordReader]?: PresentationSessionRecordReader;
   readonly [presentationHistoryPageSize]?: number;
   readonly [presentationCatalogPageSize]?: number;
+  readonly [turnComposerStageBarrier]?: TurnComposerStageBarrier;
 };
 
 type PresentationSessionRecordOptions = Pick<
@@ -473,6 +483,10 @@ export async function createPresentationSession(
               mcp: projectMcp(created),
             },
     };
+    let attachmentAvailable = initialDraft !== null || sessionSupportsInputResources(created);
+    let attachmentUnavailableReason = attachmentAvailable
+      ? null
+      : "New session required for attachments";
     let state: PresentationDisplayState = {
       revision: 1,
       authoritative,
@@ -484,6 +498,12 @@ export async function createPresentationSession(
               skills: projectSkillContext(initialDraft.skillContext, false),
               projectPaths,
             },
+      composer: {
+        attachmentAvailable,
+        unavailableReason: attachmentUnavailableReason,
+        sealed: false,
+        resources: [],
+      },
       transient: null,
     };
     let draftTargetIdentity: ModelTargetIdentity | null = initialDraft?.targetIdentity ?? null;
@@ -493,6 +513,7 @@ export async function createPresentationSession(
       metadataThrough.set(`mcp_configuration_changed:${created.sessionId}`, created.lastSequence);
     }
     const listeners = new Set<() => void>();
+    let closed = false;
     const publishStateChange = (): void => {
       for (const listener of listeners) {
         try {
@@ -502,7 +523,35 @@ export async function createPresentationSession(
         }
       }
     };
-    let closed = false;
+    let turnComposer: TurnComposer;
+    const projectTurnComposer = (): PresentationDisplayState["composer"] => {
+      const snapshot = turnComposer?.snapshot() ?? { sealed: false, resources: [] };
+      return {
+        attachmentAvailable,
+        unavailableReason: attachmentUnavailableReason,
+        sealed: snapshot.sealed,
+        resources: snapshot.resources,
+      };
+    };
+    turnComposer = await createTurnComposer({
+      onChange() {
+        if (closed) {
+          return;
+        }
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          composer: projectTurnComposer(),
+        };
+        publishStateChange();
+      },
+      stager: await createFileTurnComposerResourceStager({
+        artifactRoot: join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
+        ...(options[turnComposerStageBarrier] === undefined
+          ? {}
+          : { stageBarrier: options[turnComposerStageBarrier] }),
+      }),
+    });
     const operationAdmissions = new Set<Promise<void>>();
     const operationRefreshes = new Set<Promise<void>>();
     const operationObservers = new Map<string, AbortController>();
@@ -544,6 +593,7 @@ export async function createPresentationSession(
           },
         },
         draft: state.draft,
+        composer: state.composer,
         transient: state.transient,
       };
       publishStateChange();
@@ -583,6 +633,7 @@ export async function createPresentationSession(
             active: { ...active, linkedOperationsTruncated: true },
           },
           draft: state.draft,
+          composer: state.composer,
           transient: state.transient,
         };
         publishStateChange();
@@ -628,6 +679,7 @@ export async function createPresentationSession(
           },
         },
         draft: state.draft,
+        composer: state.composer,
         transient: state.transient,
       };
       publishStateChange();
@@ -702,6 +754,7 @@ export async function createPresentationSession(
               continuity: { status: "repairing", reason: "reconnect" },
             },
             draft: state.draft,
+            composer: state.composer,
             transient: state.transient,
           };
           publishStateChange();
@@ -748,6 +801,7 @@ export async function createPresentationSession(
               },
             },
             draft: state.draft,
+            composer: state.composer,
             transient: state.transient,
           };
           publishStateChange();
@@ -770,6 +824,7 @@ export async function createPresentationSession(
               },
             },
             draft: state.draft,
+            composer: state.composer,
             transient: state.transient,
           };
           publishStateChange();
@@ -813,6 +868,7 @@ export async function createPresentationSession(
             },
           },
           draft: state.draft,
+          composer: state.composer,
           transient: state.transient,
         };
         publishStateChange();
@@ -862,7 +918,7 @@ export async function createPresentationSession(
       | {
           sessionId: string | null;
           readonly controller: AbortController;
-          readonly settlement: Promise<void>;
+          settlement: Promise<void> | null;
         }
       | undefined;
     let snapshotActivationQueue = Promise.resolve();
@@ -930,6 +986,10 @@ export async function createPresentationSession(
       activeSessionThroughSequence = activeSequence;
       transcript = activatedTranscript;
       loadedTranscriptStart = activatedLoadedTranscriptStart;
+      attachmentAvailable = sessionSupportsInputResources(snapshot);
+      attachmentUnavailableReason = attachmentAvailable
+        ? null
+        : "New session required for attachments";
       state = {
         revision: state.revision + 1,
         authoritative: {
@@ -965,6 +1025,7 @@ export async function createPresentationSession(
           },
         },
         draft: null,
+        composer: projectTurnComposer(),
         transient: null,
       };
       draftTargetIdentity = null;
@@ -1023,6 +1084,7 @@ export async function createPresentationSession(
           active: { ...current, session: refreshedSummary },
         },
         draft: state.draft,
+        composer: state.composer,
         transient: state.transient,
       };
       publishStateChange();
@@ -1057,6 +1119,7 @@ export async function createPresentationSession(
           active: { ...current, mcp: projectMcp(inspected) },
         },
         draft: state.draft,
+        composer: state.composer,
         transient: state.transient,
       };
       publishStateChange();
@@ -1100,6 +1163,7 @@ export async function createPresentationSession(
                 revision: state.revision + 1,
                 authoritative: state.authoritative,
                 draft: state.draft,
+                composer: state.composer,
                 transient: { activity: "working", assistant: null, reasoning: null },
               };
               publishStateChange();
@@ -1108,6 +1172,7 @@ export async function createPresentationSession(
                 revision: state.revision + 1,
                 authoritative: state.authoritative,
                 draft: state.draft,
+                composer: state.composer,
                 transient: { activity: "using_tool", assistant: null, reasoning: null },
               };
               publishStateChange();
@@ -1117,6 +1182,7 @@ export async function createPresentationSession(
                 revision: state.revision + 1,
                 authoritative: state.authoritative,
                 draft: state.draft,
+                composer: state.composer,
                 transient: {
                   activity: "working",
                   assistant: state.transient?.assistant ?? null,
@@ -1144,6 +1210,7 @@ export async function createPresentationSession(
                   revision: state.revision + 1,
                   authoritative: state.authoritative,
                   draft: state.draft,
+                  composer: state.composer,
                   transient: {
                     activity: state.transient?.activity ?? "working",
                     assistant: state.transient?.assistant ?? null,
@@ -1214,6 +1281,7 @@ export async function createPresentationSession(
                     },
                   },
                   draft: state.draft,
+                  composer: state.composer,
                   transient: state.transient,
                 };
                 publishStateChange();
@@ -1238,6 +1306,7 @@ export async function createPresentationSession(
                   continuity: { status: "repairing", reason: "gap" },
                 },
                 draft: state.draft,
+                composer: state.composer,
                 transient: null,
               };
               publishStateChange();
@@ -1285,6 +1354,7 @@ export async function createPresentationSession(
                   continuity: { status: "repairing", reason: "gap" },
                 },
                 draft: state.draft,
+                composer: state.composer,
                 transient: null,
               };
               publishStateChange();
@@ -1363,6 +1433,7 @@ export async function createPresentationSession(
                 },
               },
               draft: state.draft,
+              composer: state.composer,
               transient: isAssistantTerminalEvent(event)
                 ? null
                 : recoveredReasoning === undefined
@@ -1396,6 +1467,7 @@ export async function createPresentationSession(
                 },
               },
               draft: state.draft,
+              composer: state.composer,
               transient: null,
             };
             publishStateChange();
@@ -1455,6 +1527,7 @@ export async function createPresentationSession(
               },
             },
             draft: state.draft,
+            composer: state.composer,
             transient: null,
           };
           publishStateChange();
@@ -1534,6 +1607,7 @@ export async function createPresentationSession(
               },
             },
             draft: state.draft,
+            composer: state.composer,
             transient: state.transient,
           };
           publishStateChange();
@@ -1579,6 +1653,7 @@ export async function createPresentationSession(
               targets,
             },
             draft: state.draft,
+            composer: state.composer,
             transient: state.transient,
           };
           publishStateChange();
@@ -1610,6 +1685,7 @@ export async function createPresentationSession(
             revision: state.revision + 1,
             authoritative: { ...state.authoritative, targets },
             draft: state.draft,
+            composer: state.composer,
             transient: state.transient,
           };
           publishStateChange();
@@ -1654,6 +1730,9 @@ export async function createPresentationSession(
         operationRepairs.clear();
         operationCursors.clear();
         activeSessionThroughSequence = 0;
+        await turnComposer.clear();
+        attachmentAvailable = true;
+        attachmentUnavailableReason = null;
         state = {
           revision: state.revision + 1,
           authoritative: {
@@ -1670,6 +1749,7 @@ export async function createPresentationSession(
             skills: projectSkillContext(preview.skillContext, false),
             projectPaths,
           },
+          composer: projectTurnComposer(),
           transient: null,
         };
         draftTargetIdentity = targetIdentity;
@@ -1705,6 +1785,7 @@ export async function createPresentationSession(
             }
             snapshot = resumed.snapshot;
           }
+          await turnComposer.clear();
           await activateSnapshot(snapshot);
           return { status: "admitted", commandId: randomUUID(), resource: null };
         } catch {
@@ -1714,6 +1795,75 @@ export async function createPresentationSession(
             message: "The session could not be selected.",
           };
         }
+      }
+      if (command.type === "stage_input_resource") {
+        if (!attachmentAvailable) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: attachmentUnavailableReason ?? "Input resources are not available.",
+          };
+        }
+        if (activeRun !== undefined || state.composer.sealed) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "An input resource cannot be staged while the current turn is sealed.",
+          };
+        }
+        try {
+          await turnComposer.stage(command.path);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "The selected input resource could not be staged.",
+          };
+        }
+      }
+      if (command.type === "update_draft_text") {
+        if (activeRun !== undefined || state.composer.sealed) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "The current turn text cannot change while the turn is sealed.",
+          };
+        }
+        turnComposer.setText(command.text);
+        return { status: "admitted", commandId: randomUUID(), resource: null };
+      }
+      if (command.type === "remove_input_resource") {
+        if (activeRun !== undefined || state.composer.sealed) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "An input resource cannot be removed while the current turn is sealed.",
+          };
+        }
+        return (await turnComposer.remove(command.resourceId))
+          ? { status: "admitted", commandId: randomUUID(), resource: null }
+          : {
+              status: "rejected",
+              code: "stale_interaction",
+              message: "The input resource is no longer present in the current composer.",
+            };
+      }
+      if (command.type === "cancel_input_resource") {
+        if (activeRun !== undefined || state.composer.sealed) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "An input resource cannot be cancelled while the current turn is sealed.",
+          };
+        }
+        return (await turnComposer.cancel(command.resourceId))
+          ? { status: "admitted", commandId: randomUUID(), resource: null }
+          : {
+              status: "rejected",
+              code: "stale_interaction",
+              message: "The input resource is no longer cancellable in the current composer.",
+            };
       }
       if (command.type === "submit_prompt") {
         if (
@@ -1743,6 +1893,37 @@ export async function createPresentationSession(
         }
         const controller = new AbortController();
         const commandId = randomUUID();
+        const runState = {
+          sessionId: command.sessionId,
+          controller,
+          settlement: null as Promise<void> | null,
+        };
+        activeRun = runState;
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          transient: { activity: "working", assistant: null, reasoning: null },
+        };
+        publishStateChange();
+        let sealedDraft: Awaited<ReturnType<TurnComposer["seal"]>>;
+        try {
+          turnComposer.setText(command.text);
+          sealedDraft = await turnComposer.seal(controller.signal);
+        } catch (error) {
+          if (activeRun === runState) {
+            activeRun = undefined;
+          }
+          state = { ...state, revision: state.revision + 1, transient: null };
+          publishStateChange();
+          return {
+            status: "rejected",
+            code: "not_available",
+            message:
+              error instanceof TurnComposerError
+                ? error.message
+                : "The current turn could not be sealed safely.",
+          };
+        }
         const admission = Promise.withResolvers<void>();
         const admissionAfterSequence =
           state.authoritative.continuity.status === "current"
@@ -1754,7 +1935,7 @@ export async function createPresentationSession(
             notification.runId === commandId &&
             notification.throughSequence > admissionAfterSequence &&
             notification.event.type === "user_message" &&
-            notification.event.text === command.text
+            notification.event.text === sealedDraft.text
           ) {
             admission.resolve();
           }
@@ -1763,13 +1944,16 @@ export async function createPresentationSession(
         const continuation = options.lifecycle.continue({
           sessionId: command.sessionId,
           input: {
-            text: command.text,
+            text: sealedDraft.text,
             ...(skillResolution.qualifiedIds.length === 0
               ? {}
               : { skills: skillResolution.qualifiedIds }),
           },
           runId: commandId,
           signal: controller.signal,
+          ...(sealedDraft.selections.length === 0
+            ? {}
+            : { resourceSelections: sealedDraft.selections }),
           ...(command.thinkingSelection === null
             ? {}
             : { thinkingSelection: command.thinkingSelection }),
@@ -1790,15 +1974,11 @@ export async function createPresentationSession(
             }
           })
           .finally(() => {
-            if (activeRun?.settlement === settlement) {
+            if (activeRun === runState) {
               activeRun = undefined;
             }
           });
-        activeRun = {
-          sessionId: command.sessionId,
-          controller,
-          settlement,
-        };
+        runState.settlement = settlement;
         const admitted = await Promise.race([
           admission.promise.then(() => ({ status: "admitted" as const })),
           continuation.then(
@@ -1816,6 +1996,7 @@ export async function createPresentationSession(
         unsubscribeAdmission();
         if (admitted.status === "rejected") {
           await settlement;
+          turnComposer.unseal();
           return (
             thinkingPolicyAdmissionRejection(admissionFailure) ?? {
               status: "rejected",
@@ -1824,6 +2005,7 @@ export async function createPresentationSession(
             }
           );
         }
+        await turnComposer.clear();
         return { status: "admitted", commandId, resource: null };
       }
       if (command.type === "submit_draft_prompt") {
@@ -1860,24 +2042,52 @@ export async function createPresentationSession(
         }
         const controller = new AbortController();
         const commandId = randomUUID();
-        const admission = Promise.withResolvers<string>();
-        let admittedSessionId: string | null = null;
+        const runState = {
+          sessionId: null as string | null,
+          controller,
+          settlement: null as Promise<void> | null,
+        };
+        activeRun = runState;
         state = {
           ...state,
           revision: state.revision + 1,
           transient: { activity: "working", assistant: null, reasoning: null },
         };
         publishStateChange();
+        let sealedDraft: Awaited<ReturnType<TurnComposer["seal"]>>;
+        try {
+          turnComposer.setText(command.text);
+          sealedDraft = await turnComposer.seal(controller.signal);
+        } catch (error) {
+          if (activeRun === runState) {
+            activeRun = undefined;
+          }
+          state = { ...state, revision: state.revision + 1, transient: null };
+          publishStateChange();
+          return {
+            status: "rejected",
+            code: "not_available",
+            message:
+              error instanceof TurnComposerError
+                ? error.message
+                : "The current turn could not be sealed safely.",
+          };
+        }
+        const admission = Promise.withResolvers<string>();
+        let admittedSessionId: string | null = null;
         const continuation = options.lifecycle.admit({
           targetIdentity,
           input: {
-            text: command.text,
+            text: sealedDraft.text,
             ...(skillResolution.qualifiedIds.length === 0
               ? {}
               : { skills: skillResolution.qualifiedIds }),
           },
           runId: commandId,
           signal: controller.signal,
+          ...(sealedDraft.selections.length === 0
+            ? {}
+            : { resourceSelections: sealedDraft.selections }),
           ...(command.thinkingSelection === null
             ? {}
             : { thinkingSelection: command.thinkingSelection }),
@@ -1906,7 +2116,7 @@ export async function createPresentationSession(
             }
           })
           .finally(() => {
-            if (activeRun?.settlement === settlement) {
+            if (activeRun === runState) {
               activeRun = undefined;
             }
             if (
@@ -1919,11 +2129,7 @@ export async function createPresentationSession(
               publishStateChange();
             }
           });
-        activeRun = {
-          sessionId: null,
-          controller,
-          settlement,
-        };
+        runState.settlement = settlement;
         let admissionFailure: unknown;
         const admitted = await Promise.race([
           admission.promise.then((sessionId) => ({ status: "admitted" as const, sessionId })),
@@ -1941,20 +2147,23 @@ export async function createPresentationSession(
         ]);
         if (admitted.status === "rejected") {
           await settlement;
+          turnComposer.unseal();
           return draftAdmissionRejection(admissionFailure);
         }
-        if (activeRun?.settlement === settlement) {
-          activeRun.sessionId = admitted.sessionId;
+        if (activeRun === runState) {
+          runState.sessionId = admitted.sessionId;
         }
         const admittedSnapshot = await options.lifecycle.inspect({ sessionId: admitted.sessionId });
         if (admittedSnapshot.schemaVersion !== 3) {
           await settlement;
+          turnComposer.unseal();
           return {
             status: "rejected",
             code: "persistence_failed",
             message: "The admitted draft session could not be read from durable history.",
           };
         }
+        await turnComposer.clear();
         await activateSnapshot(admittedSnapshot);
         return { status: "admitted", commandId, resource: null };
       }
@@ -1988,6 +2197,7 @@ export async function createPresentationSession(
               : { sourceBoundary: command.sourceBoundary }),
             ...(command.targetId === null ? {} : { targetId: command.targetId }),
           });
+          await turnComposer.clear();
           await activateSnapshot(snapshot);
           return { status: "admitted", commandId: randomUUID(), resource: null };
         } catch {
@@ -2042,7 +2252,10 @@ export async function createPresentationSession(
             };
       }
       if (command.type === "cancel_run") {
-        if (activeRun?.sessionId !== command.sessionId) {
+        if (
+          activeRun === undefined ||
+          (state.authoritative.active?.session.id ?? null) !== command.sessionId
+        ) {
           return {
             status: "rejected",
             code: "stale_interaction",
@@ -2193,6 +2406,7 @@ export async function createPresentationSession(
                     },
                   },
                   draft: state.draft,
+                  composer: state.composer,
                   transient: state.transient,
                 };
                 publishStateChange();
@@ -2231,6 +2445,7 @@ export async function createPresentationSession(
             },
           },
           draft: state.draft,
+          composer: state.composer,
           transient: state.transient,
         };
         publishStateChange();
@@ -2277,6 +2492,7 @@ export async function createPresentationSession(
               },
             },
             draft: state.draft,
+            composer: state.composer,
             transient: state.transient,
           };
           publishStateChange();
@@ -2746,6 +2962,7 @@ export async function createPresentationSession(
         }
         closed = true;
         activeRun?.controller.abort();
+        await turnComposer.close();
         for (const observer of operationObservers.values()) {
           observer.abort();
         }
@@ -2800,6 +3017,14 @@ async function settleOwnedOperationForClose(
   if (settled.status === "running" || settled.status === "cancel_requested") {
     throw new Error("The owned extension operation did not reach durable settlement on close.");
   }
+}
+
+function sessionSupportsInputResources(snapshot: CurrentSessionSnapshot | undefined): boolean {
+  return (
+    snapshot?.promptContext?.toolProfile.definitions.some(
+      (definition) => definition.name === "read_input_resource",
+    ) === true
+  );
 }
 
 type ProjectedOperationCollection = {

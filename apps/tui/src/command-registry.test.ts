@@ -1,5 +1,28 @@
 import { expect, test } from "vitest";
-import { createAdamCommandRegistryFromContributions } from "./command-registry.js";
+import {
+  adamCommandRegistry,
+  createAdamCommandRegistryFromContributions,
+} from "./command-registry.js";
+
+test("the TUI Registry hides attachment actions for a historical text-only session", () => {
+  const attachmentCommands = adamCommandRegistry
+    .entries()
+    .filter(
+      (command) =>
+        command.id === "attach" || command.id === "detach" || command.id === "cancelattach",
+    );
+
+  expect(attachmentCommands).toHaveLength(3);
+  expect(
+    attachmentCommands.every(
+      (command) =>
+        !adamCommandRegistry.isAvailable(command, {
+          attachmentsAvailable: false,
+          runActive: false,
+        }),
+    ),
+  ).toBe(true);
+});
 
 test("the TUI Registry exposes only descriptor commands backed by project changes", () => {
   const registry = createAdamCommandRegistryFromContributions([

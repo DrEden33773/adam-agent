@@ -52,8 +52,10 @@ export {
   InputResourceError,
   type InputResourceOccurrenceV1,
   type InputResourcePageV1,
+  type InputResourceSelectionV1,
   inputResourceLimitsV1,
   type LocalInputResourceSelectionV1,
+  type StagedInputResourceSelectionV1,
 } from "./input-resources.js";
 export { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
 export {

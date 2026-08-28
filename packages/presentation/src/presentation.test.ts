@@ -63,12 +63,20 @@ const emptySnapshot: AuthoritativePresentationSnapshot = {
   },
 };
 
+const emptyComposer = {
+  attachmentAvailable: false,
+  unavailableReason: "New session required for attachments",
+  sealed: false,
+  resources: [],
+} as const;
+
 describe("presentation reconciliation", () => {
   it("replaces a transient assistant delta with durable completion", () => {
     const initial: PresentationDisplayState = {
       revision: 1,
       authoritative: emptySnapshot,
       draft: null,
+      composer: emptyComposer,
       transient: null,
     };
 
@@ -83,6 +91,7 @@ describe("presentation reconciliation", () => {
       revision: 2,
       authoritative: emptySnapshot,
       draft: null,
+      composer: emptyComposer,
       transient: {
         activity: "replying",
         assistant: {
@@ -149,6 +158,7 @@ describe("presentation reconciliation", () => {
       revision: 3,
       authoritative: completedSnapshot,
       draft: null,
+      composer: emptyComposer,
       transient: null,
     });
   });
@@ -158,6 +168,7 @@ describe("presentation reconciliation", () => {
       revision: 7,
       authoritative: emptySnapshot,
       draft: null,
+      composer: emptyComposer,
       transient: null,
     };
 
@@ -175,6 +186,7 @@ describe("presentation reconciliation", () => {
         continuity: { status: "repairing", reason: "gap" },
       },
       draft: null,
+      composer: emptyComposer,
       transient: null,
     });
   });
@@ -184,6 +196,7 @@ describe("presentation reconciliation", () => {
       revision: 3,
       authoritative: emptySnapshot,
       draft: null,
+      composer: emptyComposer,
       transient: {
         activity: "working",
         assistant: null,

@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, link, mkdir, open, readFile, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, link, mkdir, open, readFile, rmdir, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import type { ModelTargetIdentity } from "./model-targets.js";
@@ -101,6 +102,125 @@ export type ArtifactStore = {
   }): Promise<ArtifactReference<TSource>>;
   read(id: string, options?: { readonly maximumBytes?: number }): Promise<Uint8Array | undefined>;
 };
+
+export type StagedArtifactReference = {
+  readonly stagingId: string;
+  readonly id: `sha256:${string}`;
+  readonly mediaType: string;
+  readonly byteCount: number;
+};
+
+export type ArtifactStagingStore = {
+  write(input: {
+    readonly bytes: Uint8Array;
+    readonly mediaType: string;
+  }): Promise<StagedArtifactReference>;
+  discard(reference: StagedArtifactReference): Promise<void>;
+  close(): Promise<void>;
+};
+
+export async function createFileArtifactStagingStore(options: {
+  readonly root: string;
+}): Promise<ArtifactStagingStore> {
+  const root = resolve(options.root);
+  const stagingRoot = join(root, ".input-resource-staging");
+  const owned = new Set<string>();
+
+  return {
+    async write(input) {
+      await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
+      await chmod(stagingRoot, 0o700);
+      const bytes = Buffer.from(input.bytes);
+      const digest = createHash("sha256").update(bytes).digest("hex");
+      const stagingId = randomUUID();
+      const file = await open(join(stagingRoot, stagingId), "wx", 0o600);
+      try {
+        await file.writeFile(bytes);
+        await file.chmod(0o400);
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      owned.add(stagingId);
+      return {
+        stagingId,
+        id: `sha256:${digest}`,
+        mediaType: input.mediaType,
+        byteCount: bytes.byteLength,
+      };
+    },
+    async discard(reference) {
+      requireStagingId(reference.stagingId);
+      owned.delete(reference.stagingId);
+      await unlinkTemporary(join(stagingRoot, reference.stagingId));
+      await removeEmptyDirectory(stagingRoot);
+    },
+    async close() {
+      const retained = [...owned];
+      owned.clear();
+      await Promise.all(retained.map((stagingId) => unlinkTemporary(join(stagingRoot, stagingId))));
+      await removeEmptyDirectory(stagingRoot);
+    },
+  };
+}
+
+export async function publishFileArtifactStage<TSource extends ArtifactSource>(options: {
+  readonly artifactStore: ArtifactStore;
+  readonly root: string;
+  readonly staged: StagedArtifactReference;
+  readonly source: TSource;
+}): Promise<ArtifactReference<TSource>> {
+  requireStagingId(options.staged.stagingId);
+  const expectedDigest = parseArtifactId(options.staged.id);
+  const stagingPath = join(
+    resolve(options.root),
+    ".input-resource-staging",
+    options.staged.stagingId,
+  );
+  let bytes: Uint8Array | undefined;
+  let file: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    file = await open(
+      stagingPath,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+    const identity = await file.stat();
+    if (!identity.isFile() || identity.size !== options.staged.byteCount) {
+      throw new Error("The provisional artifact does not match its sealed size.");
+    }
+    bytes = await file.readFile();
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "ENOENT") {
+      throw error;
+    }
+    bytes = await options.artifactStore.read(options.staged.id, {
+      maximumBytes: options.staged.byteCount,
+    });
+  } finally {
+    await file?.close();
+  }
+  if (
+    bytes === undefined ||
+    bytes.byteLength !== options.staged.byteCount ||
+    createHash("sha256").update(bytes).digest("hex") !== expectedDigest
+  ) {
+    throw new Error("The provisional artifact does not match its sealed digest.");
+  }
+  const published = await options.artifactStore.write({
+    bytes,
+    mediaType: options.staged.mediaType,
+    source: options.source,
+  });
+  if (
+    published.id !== options.staged.id ||
+    published.byteCount !== options.staged.byteCount ||
+    published.mediaType !== options.staged.mediaType
+  ) {
+    throw new Error("The promoted artifact does not match its provisional reference.");
+  }
+  await unlinkTemporary(stagingPath);
+  return published;
+}
 
 export async function createFileArtifactStore(options: {
   readonly root: string;
@@ -315,6 +435,14 @@ async function unlinkTemporary(path: string): Promise<void> {
   });
 }
 
+async function removeEmptyDirectory(path: string): Promise<void> {
+  await rmdir(path).catch((error: unknown) => {
+    if (!isNodeError(error) || (error.code !== "ENOENT" && error.code !== "ENOTEMPTY")) {
+      throw error;
+    }
+  });
+}
+
 async function syncDirectory(path: string): Promise<void> {
   const directory = await open(path, "r");
   try {
@@ -330,6 +458,12 @@ function parseArtifactId(id: string): string {
     throw new Error("The artifact ID is invalid.");
   }
   return match[1];
+}
+
+function requireStagingId(id: string): void {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(id)) {
+    throw new Error("The provisional artifact staging ID is invalid.");
+  }
 }
 
 function isNodeError(error: unknown): error is NodeJS.ErrnoException {
