@@ -1,5 +1,16 @@
-import { type ChildProcess, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  symlink,
+  truncate,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,10 +20,17 @@ import {
   createModelTargets,
   createPermissionPolicy,
   createReadToolRegistry,
+  type ModelTargets,
   SessionLifecycleError,
+  type ToolRegistry,
 } from "@adam-agent/agent";
-import { openJsonlSessionStore, type SessionRecord } from "@adam-agent/agent/internal-testing";
+import {
+  inputResourceIngestBarrier,
+  openJsonlSessionStore,
+  type SessionRecord,
+} from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
+import { FakeModelDriver } from "./index.js";
 import {
   sessionLifecycleAnswerOnlyDeepSeekStream as answerOnlyDeepSeekStream,
   sessionLifecycleBasePrompt as basePrompt,
@@ -32,6 +50,622 @@ type ChildObservation = {
 
 const childObservations = new WeakMap<ChildProcess, ChildObservation>();
 
+test("SessionLifecycle cold resume reads an immutable input resource after its source is deleted", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-cold-resume-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "cold-source.txt");
+  const runId = "30000000-0000-4000-8000-000000000011";
+  const occurrenceId = `${runId}:input:1`;
+  const content = "Cold resume keeps these immutable bytes.\n";
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, content, "utf8");
+  let providerCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    providerCalls += 1;
+    if (providerCalls === 1) {
+      return [
+        { type: "text_delta", text: "The immutable resource is linked." },
+        { type: "finish", reason: "stop" },
+      ];
+    }
+    if (providerCalls === 2) {
+      expect(request.messages.filter((message) => message.role === "user")[0]?.content).toContain(
+        occurrenceId,
+      );
+      return [
+        { type: "tool_call_start", id: "cold-resource-call", name: "read_input_resource" },
+        {
+          type: "tool_call_delta",
+          id: "cold-resource-call",
+          json: JSON.stringify({ occurrenceId }),
+        },
+        { type: "tool_call_end", id: "cold-resource-call" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.at(-1)).toMatchObject({
+      role: "tool",
+      name: "read_input_resource",
+      result: { status: "completed", output: { occurrenceId, content } },
+    });
+    return [
+      { type: "text_delta", text: "The deleted source is still readable." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: targetIdentity,
+        driver,
+        contextProfile: {
+          version: 1,
+          contextWindowTokens: 1_000_000,
+          maximumOutputTokens: 32_768,
+          compactAtTokens: 800_000,
+          postCompactTargetTokens: 200_000,
+          retainedTargetTokens: 20_000,
+          estimatorVersion: 1,
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: {
+              version: 1,
+              contextWindowTokens: 1_000_000,
+              maximumOutputTokens: 32_768,
+              compactAtTokens: 800_000,
+              postCompactTargetTokens: 200_000,
+              retainedTargetTokens: 20_000,
+              estimatorVersion: 1,
+            },
+          },
+        ],
+      };
+    },
+  };
+  const first = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const admitted = await first.admit({
+      targetIdentity,
+      input: { text: "Link this source." },
+      resourceSelections: [{ type: "local_file", path: selectedPath }],
+      runId,
+    });
+    await first.close();
+    await unlink(selectedPath);
+
+    cold = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    await expect(
+      cold.continue({
+        sessionId: admitted.snapshot.sessionId,
+        input: { text: "Read the linked source after restart." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The deleted source is still readable." },
+    });
+    expect(providerCalls).toBe(3);
+  } finally {
+    await cold?.close();
+    await first.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a corrupt immutable input resource before cold provider projection", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-corrupt-resume-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "corrupt-source.txt");
+  const content = "Integrity must remain exact.\n";
+  const digest = createHash("sha256").update(content, "utf8").digest("hex");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, content, "utf8");
+  let providerCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    providerCalls += 1;
+    return [
+      { type: "text_delta", text: "Linked." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const contextProfile = {
+    version: 1 as const,
+    contextWindowTokens: 1_000_000,
+    maximumOutputTokens: 32_768,
+    compactAtTokens: 800_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+    estimatorVersion: 1 as const,
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const first = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const admitted = await first.admit({
+      targetIdentity,
+      input: { text: "Link integrity evidence." },
+      resourceSelections: [{ type: "local_file", path: selectedPath }],
+    });
+    await first.close();
+    const artifactPath = join(stateRoot, "artifacts", digest);
+    await chmod(artifactPath, 0o600);
+    await writeFile(artifactPath, "same-size-corrupt-bytes!!\n", "utf8");
+
+    cold = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    await expect(
+      cold.continue({
+        sessionId: admitted.snapshot.sessionId,
+        input: { text: "Do not project corrupt bytes." },
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_corrupt" });
+    expect(providerCalls).toBe(1);
+  } finally {
+    await cold?.close();
+    await first.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a missing immutable input resource before cold provider projection", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-missing-resume-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "missing-source.txt");
+  const content = "The immutable artifact must remain present.\n";
+  const digest = createHash("sha256").update(content, "utf8").digest("hex");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, content, "utf8");
+  let providerCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    providerCalls += 1;
+    return [
+      { type: "text_delta", text: "Linked." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const contextProfile = {
+    version: 1 as const,
+    contextWindowTokens: 1_000_000,
+    maximumOutputTokens: 32_768,
+    compactAtTokens: 800_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+    estimatorVersion: 1 as const,
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const first = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const admitted = await first.admit({
+      targetIdentity,
+      input: { text: "Link presence evidence." },
+      resourceSelections: [{ type: "local_file", path: selectedPath }],
+    });
+    await first.close();
+    await unlink(join(stateRoot, "artifacts", digest));
+
+    cold = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    await expect(
+      cold.continue({
+        sessionId: admitted.snapshot.sessionId,
+        input: { text: "Do not project a missing artifact." },
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_corrupt" });
+    expect(providerCalls).toBe(1);
+  } finally {
+    await cold?.close();
+    await first.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a selected FIFO without waiting for a writer", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-fifo-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const fifoPath = join(testRoot, "selected.pipe");
+  await mkdir(workspaceRoot);
+  execFileSync("mkfifo", [fifoPath]);
+  let providerCalls = 0;
+  const contextProfile = {
+    version: 1 as const,
+    contextWindowTokens: 1_000_000,
+    maximumOutputTokens: 32_768,
+    compactAtTokens: 800_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+    estimatorVersion: 1 as const,
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: targetIdentity,
+        driver: new FakeModelDriver(() => {
+          providerCalls += 1;
+          return [{ type: "finish", reason: "stop" }];
+        }),
+        contextProfile,
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Reject the FIFO." },
+        resourceSelections: [{ type: "local_file", path: fifoPath }],
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_invalid_selection" });
+    expect(providerCalls).toBe(0);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects an input resource above the exact eight MiB file bound", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-file-bound-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "too-large.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "", "utf8");
+  await truncate(selectedPath, 8 * 1024 * 1024 + 1);
+  let providerCalls = 0;
+  const modelTargets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async () => {
+      providerCalls += 1;
+      throw new Error("Provider dispatch is forbidden for an over-limit resource.");
+    },
+  });
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Reject this over-limit resource." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_too_large" });
+    expect(providerCalls).toBe(0);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects input resources above the exact sixteen MiB run aggregate", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-aggregate-bound-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const firstPath = join(testRoot, "first.txt");
+  const secondPath = join(testRoot, "second.txt");
+  const overflowPath = join(testRoot, "overflow.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(firstPath, "", "utf8");
+  await writeFile(secondPath, "", "utf8");
+  await writeFile(overflowPath, "x", "utf8");
+  await truncate(firstPath, 8 * 1024 * 1024);
+  await truncate(secondPath, 8 * 1024 * 1024);
+  let providerCalls = 0;
+  const modelTargets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async () => {
+      providerCalls += 1;
+      throw new Error("Provider dispatch is forbidden for aggregate overflow.");
+    },
+  });
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Reject the aggregate overflow." },
+        resourceSelections: [
+          { type: "local_file", path: firstPath },
+          { type: "local_file", path: secondPath },
+          { type: "local_file", path: overflowPath },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_aggregate_too_large" });
+    expect(providerCalls).toBe(0);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects input resources above the exact sixty-four MiB lineage aggregate", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-lineage-aggregate-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const firstPath = join(testRoot, "first.txt");
+  const secondPath = join(testRoot, "second.txt");
+  const overflowPath = join(testRoot, "overflow.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(firstPath, "", "utf8");
+  await writeFile(secondPath, "", "utf8");
+  await writeFile(overflowPath, "x", "utf8");
+  await truncate(firstPath, 8 * 1024 * 1024);
+  await truncate(secondPath, 8 * 1024 * 1024);
+  let providerCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    providerCalls += 1;
+    return [
+      { type: "text_delta", text: "Accepted the exact lineage byte boundary." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const contextProfile = {
+    version: 1 as const,
+    contextWindowTokens: 1_000_000,
+    maximumOutputTokens: 32_768,
+    compactAtTokens: 800_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+    estimatorVersion: 1 as const,
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    let lastSequence = created.lastSequence;
+    for (let index = 0; index < 4; index += 1) {
+      const continued = await lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: `Commit lineage byte batch ${index + 1}.` },
+        resourceSelections: [
+          { type: "local_file", path: firstPath },
+          { type: "local_file", path: secondPath },
+        ],
+      });
+      lastSequence = continued.snapshot.lastSequence;
+    }
+
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Reject the lineage aggregate overflow." },
+        resourceSelections: [{ type: "local_file", path: overflowPath }],
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_aggregate_too_large" });
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      lastSequence,
+    });
+    expect(providerCalls).toBe(4);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle follows one selected symlink without persisting its source path", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-symlink-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const targetPath = join(testRoot, "private-target.txt");
+  const selectedPath = join(testRoot, "selected-link.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(targetPath, "selected through one controlled symlink\n", "utf8");
+  await symlink(targetPath, selectedPath);
+  const requests: unknown[] = [];
+  const modelTargets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(answerOnlyDeepSeekStream, {
+        headers: { "content-type": "text/event-stream" },
+        status: 200,
+      });
+    },
+  });
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const admitted = await lifecycle.admit({
+      targetIdentity,
+      input: { text: "Link the explicitly selected file." },
+      resourceSelections: [{ type: "local_file", path: selectedPath }],
+    });
+    expect(admitted.result).toMatchObject({ status: "completed" });
+    expect(JSON.stringify(requests)).not.toContain(testRoot);
+    const store = await openJsonlSessionStore({
+      stateRoot,
+      workspaceRoot,
+      sessionId: admitted.snapshot.sessionId,
+    });
+    const serializedRecords = JSON.stringify(await store.read());
+    expect(serializedRecords).not.toContain(testRoot);
+    expect(serializedRecords).toContain('"displayName":"selected-link.txt"');
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a dangling selected symlink before provider dispatch", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-dangling-symlink-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "dangling-link.txt");
+  await mkdir(workspaceRoot);
+  await symlink(join(testRoot, "missing-target.txt"), selectedPath);
+  let providerCalls = 0;
+  const modelTargets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async () => {
+      providerCalls += 1;
+      throw new Error("Provider dispatch is forbidden for a dangling symlink.");
+    },
+  });
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Reject the dangling selection." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_invalid_selection" });
+    expect(providerCalls).toBe(0);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a looping selected symlink before provider dispatch", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-looping-symlink-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "looping-link.txt");
+  await mkdir(workspaceRoot);
+  await symlink(selectedPath, selectedPath);
+  let providerCalls = 0;
+  const modelTargets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async () => {
+      providerCalls += 1;
+      throw new Error("Provider dispatch is forbidden for a looping symlink.");
+    },
+  });
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Reject the looping selection." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_invalid_selection" });
+    expect(providerCalls).toBe(0);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a final symlink substituted after controlled resolution", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-symlink-race-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const targetPath = join(testRoot, "accepted-target.txt");
+  const replacementPath = join(testRoot, "replacement.txt");
+  const selectedPath = join(testRoot, "selected-link.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(targetPath, "accepted target\n", "utf8");
+  await writeFile(replacementPath, "must not be followed\n", "utf8");
+  await symlink(targetPath, selectedPath);
+  let providerCalls = 0;
+  const modelTargets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async () => {
+      providerCalls += 1;
+      throw new Error("Provider dispatch is forbidden after final-path substitution.");
+    },
+  });
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [inputResourceIngestBarrier]: {
+      async afterResolved() {
+        await unlink(targetPath);
+        await symlink(replacementPath, targetPath);
+      },
+    },
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Do not follow a substituted final symlink." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_invalid_selection" });
+    expect(providerCalls).toBe(0);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle cold resume keeps a Direct DeepSeek v2 session on its historical profile", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-deepseek-v2-cold-resume-"));
   const stateRoot = join(testRoot, "state");
@@ -49,8 +683,26 @@ test("SessionLifecycle cold resume keeps a Direct DeepSeek v2 session on its his
       });
     },
   });
-  const tools = createCodingToolRegistry({ stateRoot, workspaceRoot });
-  const first = createSessionLifecycle({ modelTargets, stateRoot, tools, workspaceRoot });
+  const currentTools = createCodingToolRegistry({ stateRoot, workspaceRoot });
+  const historicalToolNames = new Set([
+    "read_file",
+    "write_file",
+    "edit_file",
+    "run_shell",
+    "activate_skill",
+    "read_skill_resource",
+  ]);
+  const historicalTools: ToolRegistry = {
+    definitions: () =>
+      currentTools.definitions().filter((definition) => historicalToolNames.has(definition.name)),
+    resolve: (name) => (historicalToolNames.has(name) ? currentTools.resolve(name) : undefined),
+  };
+  const first = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    tools: historicalTools,
+    workspaceRoot,
+  });
   let cold: ReturnType<typeof createSessionLifecycle> | undefined;
 
   try {
@@ -66,7 +718,7 @@ test("SessionLifecycle cold resume keeps a Direct DeepSeek v2 session on its his
     });
     await first.close();
 
-    cold = createSessionLifecycle({ modelTargets, stateRoot, tools, workspaceRoot });
+    cold = createSessionLifecycle({ modelTargets, stateRoot, tools: currentTools, workspaceRoot });
     await expect(
       cold.continue({
         sessionId: created.sessionId,

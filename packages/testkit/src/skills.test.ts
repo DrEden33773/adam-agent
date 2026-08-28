@@ -623,6 +623,7 @@ test("SessionLifecycle bounds unknown frontmatter fields and reports allowed-too
       "run_shell",
       "activate_skill",
       "read_skill_resource",
+      "read_input_resource",
     ]);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -680,6 +681,7 @@ test("SessionLifecycle admits audited Skill metadata arrays without granting lis
       "run_shell",
       "activate_skill",
       "read_skill_resource",
+      "read_input_resource",
     ]);
   } finally {
     if (previousHome === undefined) {

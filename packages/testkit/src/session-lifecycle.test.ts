@@ -1,5 +1,15 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  symlink,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,6 +20,7 @@ import {
   createMutationToolRegistry,
   createPermissionPolicy,
   createReadToolRegistry,
+  type LocalInputResourceSelectionV1,
   type ModelDriver,
   type ModelMessage,
   type ModelTargetIdentity,
@@ -20,14 +31,19 @@ import {
   type ThinkingPolicySelectionV1,
 } from "@adam-agent/agent";
 import {
+  createInMemorySessionStoreDirectory,
+  inputResourceIngestBarrier,
   openJsonlSessionStore,
   type ProjectLifecycleOwner,
   ProjectLifecycleOwnerError,
   preparedDirectDeepSeekV2ContextProfile,
   type SessionRecord,
+  type SessionStoreDirectory,
+  sessionAutomaticTitlesEnabled,
   sessionCloseDrainBarrier,
   sessionLogicalRunStartedBarrier,
   sessionProjectLifecycleOwner,
+  sessionStoreDirectory,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
@@ -423,7 +439,7 @@ function snapshotWithLastPromptProjection<Snapshot extends { readonly promptCont
 }
 
 const introductionRequestDigest =
-  "sha256:b8f5b0a402f635a8353c4f77a332c8acd7a44399820db9848a1f8d3678961adb" as const;
+  "sha256:0782707796dafcb2988d1eadadddc3de09e48ef4a1760ab57a4be9a983b9a181" as const;
 const permissionRequestDigest =
   "sha256:341baabb2a66d516430fc49f39c3c408a15dae8a47608ad543a3bb888431b01c" as const;
 
@@ -1236,6 +1252,1198 @@ test("SessionLifecycle freezes draft Skill resources before allocating durable s
   }
 });
 
+test("SessionLifecycle commits one selected input resource before its descriptor reaches the model", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-input-resource-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "Aurora notes.txt");
+  const content = "Aurora Compass is ready.\n";
+  const bytes = Buffer.from(content, "utf8");
+  const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}` as const;
+  const artifactId = digest;
+  const runId = "10000000-0000-4000-8000-000000000011";
+  const occurrenceId = `${runId}:input:1`;
+  const descriptor = {
+    occurrenceId,
+    displayName: "Aurora notes.txt",
+    artifact: {
+      id: artifactId,
+      mediaType: "text/plain; charset=utf-8",
+      byteCount: bytes.byteLength,
+    },
+    digest,
+    mediaHint: "text" as const,
+    provenance: "user_local_file" as const,
+    support: "utf8_text" as const,
+    mode: "link" as const,
+  };
+  const descriptorProjection = `Linked input resources (descriptor-only; use read_input_resource to read supported immutable content):\n${JSON.stringify([descriptor])}`;
+  const pageDigest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, bytes);
+  const harness = createInMemorySessionLifecycleHarness();
+  let durableCommitSettled = false;
+  let providerCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    providerCalls += 1;
+    expect(durableCommitSettled).toBe(true);
+    if (providerCalls === 1) {
+      expect(request.messages.at(-1)).toEqual({
+        role: "user",
+        content: `Read the linked note.\n\n${descriptorProjection}`,
+      });
+      expect(request.tools.map((tool) => tool.name)).toContain("read_input_resource");
+      return [
+        { type: "tool_call_start", id: "resource-call-1", name: "read_input_resource" },
+        {
+          type: "tool_call_delta",
+          id: "resource-call-1",
+          json: JSON.stringify({ occurrenceId, maxByteCount: 64 }),
+        },
+        { type: "tool_call_end", id: "resource-call-1" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.at(-1)).toEqual({
+      role: "tool",
+      callId: "resource-call-1",
+      name: "read_input_resource",
+      result: {
+        status: "completed",
+        output: {
+          occurrenceId,
+          displayName: "Aurora notes.txt",
+          offset: 0,
+          byteCount: bytes.byteLength,
+          totalByteCount: bytes.byteLength,
+          eof: true,
+          nextCursor: null,
+          digest,
+          pageDigest,
+          content,
+        },
+      },
+    });
+    return [
+      { type: "text_delta", text: "The linked note says Aurora Compass is ready." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionLogicalRunStartedBarrier]: {
+      async afterDurableRecord(started) {
+        const store = await harness.sessions.open(started.sessionId);
+        if (store === undefined) {
+          throw new Error("Expected the admitted input-resource session store.");
+        }
+        expect(await store.read()).toEqual(
+          expect.arrayContaining([
+            {
+              schemaVersion: 3,
+              sequence: started.sequence,
+              record: {
+                type: "logical_run_started",
+                recordVersion: 1,
+                runId,
+                userMessage: "Read the linked note.",
+                naming: {
+                  profileVersion: 1,
+                  fallbackTitle: "Read the linked note.",
+                },
+                inputResources: [descriptor],
+              },
+            },
+          ]),
+        );
+        await expect(
+          readFile(join(stateRoot, "artifacts", artifactId.slice("sha256:".length))),
+        ).resolves.toEqual(bytes);
+        durableCommitSettled = true;
+      },
+    },
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Read the linked note." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+        runId,
+      }),
+    ).resolves.toMatchObject({
+      result: {
+        status: "completed",
+        answer: "The linked note says Aurora Compass is ready.",
+      },
+    });
+    expect(providerCalls).toBe(2);
+    const store = await harness.sessions.open(
+      (await harness.sessions.listSessionIds())[0] as string,
+    );
+    expect(await store?.read()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          record: {
+            type: "input_resource_read_committed",
+            recordVersion: 1,
+            runId,
+            callId: "resource-call-1",
+            occurrenceId,
+            displayName: "Aurora notes.txt",
+            offset: 0,
+            byteCount: bytes.byteLength,
+            totalByteCount: bytes.byteLength,
+            eof: true,
+            nextCursor: null,
+            digest,
+            pageDigest,
+            content,
+          },
+        }),
+      ]),
+    );
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle follows a stable byte cursor across strict UTF-8 input-resource pages", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-input-resource-pages-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "multibyte.txt");
+  const content = "A界BC好D";
+  const runId = "10000000-0000-4000-8000-000000000012";
+  const occurrenceId = `${runId}:input:1`;
+  const cursor = `input-resource:v1:${Buffer.from(JSON.stringify([occurrenceId, 5]), "utf8").toString("base64url")}`;
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, content, "utf8");
+  let providerCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    providerCalls += 1;
+    if (providerCalls === 1) {
+      return [
+        { type: "tool_call_start", id: "page-1", name: "read_input_resource" },
+        {
+          type: "tool_call_delta",
+          id: "page-1",
+          json: JSON.stringify({ occurrenceId, maxByteCount: 5 }),
+        },
+        { type: "tool_call_end", id: "page-1" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (providerCalls === 2) {
+      expect(request.messages.at(-1)).toMatchObject({
+        role: "tool",
+        callId: "page-1",
+        result: {
+          status: "completed",
+          output: {
+            occurrenceId,
+            offset: 0,
+            byteCount: 5,
+            totalByteCount: 10,
+            eof: false,
+            nextCursor: cursor,
+            content: "A界B",
+          },
+        },
+      });
+      return [
+        { type: "tool_call_start", id: "page-2", name: "read_input_resource" },
+        {
+          type: "tool_call_delta",
+          id: "page-2",
+          json: JSON.stringify({ occurrenceId, cursor, maxByteCount: 5 }),
+        },
+        { type: "tool_call_end", id: "page-2" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.at(-1)).toMatchObject({
+      role: "tool",
+      callId: "page-2",
+      result: {
+        status: "completed",
+        output: {
+          occurrenceId,
+          offset: 5,
+          byteCount: 5,
+          totalByteCount: 10,
+          eof: true,
+          nextCursor: null,
+          content: "C好D",
+        },
+      },
+    });
+    return [
+      { type: "text_delta", text: "Both pages were stable." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Read both byte pages." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+        runId,
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Both pages were stable." },
+    });
+    expect(providerCalls).toBe(3);
+    const store = await harness.sessions.open(
+      (await harness.sessions.listSessionIds())[0] as string,
+    );
+    expect(
+      (await store?.read())?.filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "input_resource_read_committed",
+      ),
+    ).toMatchObject([
+      { record: { callId: "page-1", offset: 0, byteCount: 5, nextCursor: cursor } },
+      { record: { callId: "page-2", offset: 5, byteCount: 5, nextCursor: null } },
+    ]);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle enforces the exact one MiB materialized-output budget per run", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-input-resource-quota-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "quota.txt");
+  const content = "q".repeat(64 * 1024);
+  const runId = "10000000-0000-4000-8000-000000000013";
+  const occurrenceId = `${runId}:input:1`;
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, content, "utf8");
+  let providerCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    providerCalls += 1;
+    if (providerCalls === 1) {
+      return [
+        ...Array.from({ length: 17 }, (_, index) => {
+          const callId = `quota-${index + 1}`;
+          return [
+            { type: "tool_call_start" as const, id: callId, name: "read_input_resource" },
+            {
+              type: "tool_call_delta" as const,
+              id: callId,
+              json: JSON.stringify({ occurrenceId, maxByteCount: 64 * 1024 }),
+            },
+            { type: "tool_call_end" as const, id: callId },
+          ];
+        }).flat(),
+        { type: "finish" as const, reason: "tool_calls" as const },
+      ];
+    }
+    const toolMessages = request.messages.filter((message) => message.role === "tool");
+    expect(toolMessages).toHaveLength(17);
+    expect(toolMessages.at(-1)).toEqual({
+      role: "tool",
+      callId: "quota-17",
+      name: "read_input_resource",
+      result: {
+        status: "failed",
+        error: {
+          code: "input_resource_quota_exceeded",
+          message:
+            "The input-resource materialization quota for this run or session lineage would be exceeded.",
+        },
+      },
+    });
+    return [
+      { type: "text_delta", text: "The seventeenth page was rejected." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Exercise the exact materialized-output budget." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+        runId,
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The seventeenth page was rejected." },
+    });
+    const store = await harness.sessions.open(
+      (await harness.sessions.listSessionIds())[0] as string,
+    );
+    expect(
+      (await store?.read())?.filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "input_resource_read_committed",
+      ),
+    ).toHaveLength(16);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle enforces the exact eight MiB materialized-output budget per lineage", async () => {
+  const testRoot = await mkdtemp(
+    join(tmpdir(), "adam-agent-session-input-resource-lineage-quota-"),
+  );
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "lineage-quota.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "q".repeat(64 * 1024), "utf8");
+  let activeOccurrenceId = "";
+  let activeReadCount = 0;
+  let expectQuotaFailure = false;
+  let activeBatchIssued = false;
+  let ordinaryProviderCalls = 0;
+  let compactionProviderCalls = 0;
+  let toolCallOrdinal = 0;
+  const driver = new FakeModelDriver((request) => {
+    if (request.tools.length === 0) {
+      compactionProviderCalls += 1;
+      return [
+        {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Preserve the linked input-resource lineage quota.",
+            constraints: [],
+            progress: [],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: ["Continue exact quota accounting."],
+            nextSafeAction: "Continue the next bounded run.",
+          }),
+        },
+        { type: "usage", inputTokens: 700_000, outputTokens: 32 },
+        { type: "finish", reason: "stop" },
+      ];
+    }
+    ordinaryProviderCalls += 1;
+    if (!activeBatchIssued) {
+      activeBatchIssued = true;
+      return [
+        ...Array.from({ length: activeReadCount }, () => {
+          toolCallOrdinal += 1;
+          const callId = `lineage-quota-${toolCallOrdinal}`;
+          return [
+            { type: "tool_call_start" as const, id: callId, name: "read_input_resource" },
+            {
+              type: "tool_call_delta" as const,
+              id: callId,
+              json: JSON.stringify({
+                occurrenceId: activeOccurrenceId,
+                maxByteCount: 64 * 1024,
+              }),
+            },
+            { type: "tool_call_end" as const, id: callId },
+          ];
+        }).flat(),
+        { type: "finish" as const, reason: "tool_calls" as const },
+      ];
+    }
+    return [
+      {
+        type: "text_delta",
+        text: expectQuotaFailure
+          ? "The lineage quota rejected another page."
+          : "The run materialized one MiB.",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    for (let index = 1; index <= 8; index += 1) {
+      const runId = `20000000-0000-4000-8000-${index.toString().padStart(12, "0")}`;
+      activeOccurrenceId = `${runId}:input:1`;
+      activeReadCount = 16;
+      expectQuotaFailure = false;
+      activeBatchIssued = false;
+      await expect(
+        lifecycle.continue({
+          sessionId: created.sessionId,
+          input: { text: `Materialize lineage MiB ${index}.` },
+          resourceSelections: [{ type: "local_file", path: selectedPath }],
+          runId,
+        }),
+      ).resolves.toMatchObject({ result: { status: "completed" } });
+    }
+    const overflowRunId = "20000000-0000-4000-8000-000000000009";
+    activeOccurrenceId = `${overflowRunId}:input:1`;
+    activeReadCount = 1;
+    expectQuotaFailure = true;
+    activeBatchIssued = false;
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Reject another lineage materialization page." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+        runId: overflowRunId,
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The lineage quota rejected another page." },
+    });
+    const store = await openJsonlSessionStore({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    const records = await store.read();
+    expect(
+      records.filter(
+        (record) =>
+          record.schemaVersion === 3 && record.record.type === "input_resource_read_committed",
+      ),
+    ).toHaveLength(128);
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          record: expect.objectContaining({
+            type: "runtime_event",
+            event: expect.objectContaining({
+              type: "tool_failed",
+              error: expect.objectContaining({ code: "input_resource_quota_exceeded" }),
+            }),
+          }),
+        }),
+      ]),
+    );
+    expect(ordinaryProviderCalls).toBe(18);
+    expect(compactionProviderCalls).toBeGreaterThan(0);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle preserves duplicate selections as ordered occurrences over one artifact", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-input-resource-duplicate-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "shared.txt");
+  const content = "same immutable bytes\n";
+  const digest = `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
+  const runId = "20000000-0000-4000-8000-000000000011";
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, content, "utf8");
+  let projectedOccurrences: readonly {
+    readonly occurrenceId: string;
+    readonly artifact: { readonly id: string };
+  }[] = [];
+  const driver = new FakeModelDriver((request) => {
+    const user = request.messages.at(-1);
+    if (user?.role !== "user") {
+      throw new Error("Expected the duplicate resource descriptor request.");
+    }
+    projectedOccurrences = JSON.parse(user.content.split("\n").at(-1) ?? "[]") as readonly {
+      readonly occurrenceId: string;
+      readonly artifact: { readonly id: string };
+    }[];
+    return [
+      { type: "text_delta", text: "Both occurrences are visible." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const admitted = await lifecycle.admit({
+      targetIdentity,
+      input: { text: "Keep both links." },
+      resourceSelections: [
+        { type: "local_file", path: selectedPath },
+        { type: "local_file", path: selectedPath },
+      ],
+      runId,
+    });
+    expect(projectedOccurrences).toHaveLength(2);
+    expect(projectedOccurrences.map((entry) => entry.occurrenceId)).toEqual([
+      `${runId}:input:1`,
+      `${runId}:input:2`,
+    ]);
+    expect(projectedOccurrences.map((entry) => entry.artifact.id)).toEqual([digest, digest]);
+    const store = await harness.sessions.open(admitted.snapshot.sessionId);
+    const logicalRun = (await store?.read())?.find(
+      (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
+    );
+    const durableOccurrences =
+      logicalRun?.schemaVersion === 3 && logicalRun.record.type === "logical_run_started"
+        ? logicalRun.record.inputResources
+        : undefined;
+    expect(durableOccurrences).toHaveLength(2);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a ninth input-resource occurrence before provider dispatch", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-input-resource-count-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "bounded.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "bounded\n", "utf8");
+  let providerCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    providerCalls += 1;
+    return [{ type: "finish", reason: "stop" }];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Reject the ninth link." },
+        resourceSelections: Array.from({ length: 9 }, () => ({
+          type: "local_file" as const,
+          path: selectedPath,
+        })),
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_count_exceeded" });
+    expect(providerCalls).toBe(0);
+    const sessionIds = await harness.sessions.listSessionIds();
+    expect(sessionIds).toHaveLength(1);
+    const store = await harness.sessions.open(sessionIds[0] as string);
+    expect(await store?.read()).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          record: expect.objectContaining({ type: "logical_run_started" }),
+        }),
+      ]),
+    );
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a sixty-fifth lineage input-resource occurrence before logical commit", async () => {
+  const testRoot = await mkdtemp(
+    join(tmpdir(), "adam-agent-session-input-resource-lineage-count-"),
+  );
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const selectedPath = join(testRoot, "lineage-resource.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "lineage\n", "utf8");
+  let providerCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    providerCalls += 1;
+    return [
+      { type: "text_delta", text: "Accepted bounded lineage resources." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const selections = Array.from(
+      { length: 8 },
+      (): LocalInputResourceSelectionV1 => ({ type: "local_file", path: selectedPath }),
+    );
+    let lastSequence = created.lastSequence;
+    for (let index = 0; index < 8; index += 1) {
+      const continued = await lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: `Commit lineage resource batch ${index + 1}.` },
+        resourceSelections: selections,
+      });
+      lastSequence = continued.snapshot.lastSequence;
+    }
+
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Reject lineage occurrence 65." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_count_exceeded" });
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      lastSequence,
+    });
+    expect(providerCalls).toBe(8);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle leaves only a safe orphan when input-resource logical commit fails", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-input-resource-orphan-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "orphan.txt");
+  const content = "Published before the failed reference.\n";
+  const digest = createHash("sha256").update(content, "utf8").digest("hex");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, content, "utf8");
+  let providerCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    providerCalls += 1;
+    return [{ type: "finish", reason: "stop" }];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const backing = createInMemorySessionStoreDirectory<SessionRecord>();
+  const wrapStore = (
+    store: Awaited<ReturnType<SessionStoreDirectory<SessionRecord>["create"]>>,
+  ) => ({
+    async append(record: SessionRecord) {
+      if (record.schemaVersion === 3 && record.record.type === "logical_run_started") {
+        throw new Error("logical commit failed");
+      }
+      await store.append(record);
+    },
+    read: () => store.read(),
+  });
+  const failingDirectory: SessionStoreDirectory<SessionRecord> = {
+    async create(sessionId) {
+      return wrapStore(await backing.create(sessionId));
+    },
+    listSessionEntries: () => backing.listSessionEntries(),
+    listSessionIds: () => backing.listSessionIds(),
+    async open(sessionId) {
+      const store = await backing.open(sessionId);
+      return store === undefined ? undefined : wrapStore(store);
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionAutomaticTitlesEnabled]: false,
+    [sessionStoreDirectory]: failingDirectory,
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Fail this logical reference." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+      }),
+    ).resolves.toMatchObject({
+      result: {
+        status: "failed",
+        error: { code: "session_persistence_failed" },
+      },
+    });
+    expect(providerCalls).toBe(0);
+    await expect(readFile(join(stateRoot, "artifacts", digest))).resolves.toEqual(
+      Buffer.from(content, "utf8"),
+    );
+    const sessionIds = await backing.listSessionIds();
+    const store = await backing.open(sessionIds[0] as string);
+    expect(await store?.read()).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          record: expect.objectContaining({ type: "logical_run_started" }),
+        }),
+      ]),
+    );
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle cancellation settles input-resource ingest without a durable reference", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-input-resource-cancel-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "cancel.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "cancel before resource bytes are published\n", "utf8");
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const controller = new AbortController();
+  let providerCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    providerCalls += 1;
+    return [{ type: "finish", reason: "stop" }];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [inputResourceIngestBarrier]: {
+      async afterOpened() {
+        entered.resolve();
+        await release.promise;
+      },
+    },
+  });
+
+  try {
+    const admission = lifecycle.admit({
+      targetIdentity,
+      input: { text: "Cancel this resource ingest." },
+      resourceSelections: [{ type: "local_file", path: selectedPath }],
+      signal: controller.signal,
+    });
+    await entered.promise;
+    controller.abort();
+    release.resolve();
+    await expect(admission).rejects.toMatchObject({ name: "AbortError" });
+    expect(providerCalls).toBe(0);
+    await expect(readdir(join(stateRoot, "artifacts"))).resolves.toEqual([]);
+    const sessionIds = await harness.sessions.listSessionIds();
+    const store = await harness.sessions.open(sessionIds[0] as string);
+    expect(await store?.read()).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          record: expect.objectContaining({ type: "logical_run_started" }),
+        }),
+      ]),
+    );
+  } finally {
+    release.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a source truncated after its accepted descriptor is opened", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-input-resource-short-read-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "changing.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "accepted size then truncated\n", "utf8");
+  let providerCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    providerCalls += 1;
+    return [{ type: "finish", reason: "stop" }];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [inputResourceIngestBarrier]: {
+      async afterOpened() {
+        await truncate(selectedPath, 0);
+      },
+    },
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Do not admit a changing resource." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+      }),
+    ).rejects.toMatchObject({ code: "input_resource_io_failed" });
+    expect(providerCalls).toBe(0);
+    await expect(readdir(join(stateRoot, "artifacts"))).resolves.toEqual([]);
+    const sessionIds = await harness.sessions.listSessionIds();
+    const store = await harness.sessions.open(sessionIds[0] as string);
+    expect(await store?.read()).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          record: expect.objectContaining({ type: "logical_run_started" }),
+        }),
+      ]),
+    );
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle prefix branch exposes only input-resource occurrences inside its boundary", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-input-resource-branch-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const firstPath = join(testRoot, "first.txt");
+  const laterPath = join(testRoot, "later.txt");
+  const firstRunId = "40000000-0000-4000-8000-000000000011";
+  const laterRunId = "40000000-0000-4000-8000-000000000012";
+  const firstOccurrenceId = `${firstRunId}:input:1`;
+  const laterOccurrenceId = `${laterRunId}:input:1`;
+  await mkdir(workspaceRoot);
+  await writeFile(firstPath, "first prefix bytes\n", "utf8");
+  await writeFile(laterPath, "later parent bytes\n", "utf8");
+  let providerCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    providerCalls += 1;
+    if (providerCalls <= 2) {
+      return [
+        { type: "text_delta", text: `Parent turn ${providerCalls}.` },
+        { type: "finish", reason: "stop" },
+      ];
+    }
+    if (providerCalls === 3) {
+      const userDescriptors = request.messages
+        .filter((message) => message.role === "user")
+        .map((message) => message.content)
+        .join("\n");
+      expect(userDescriptors).toContain(firstOccurrenceId);
+      expect(userDescriptors).not.toContain(laterOccurrenceId);
+      return [
+        { type: "tool_call_start", id: "prefix-visible", name: "read_input_resource" },
+        {
+          type: "tool_call_delta",
+          id: "prefix-visible",
+          json: JSON.stringify({ occurrenceId: firstOccurrenceId }),
+        },
+        { type: "tool_call_end", id: "prefix-visible" },
+        { type: "tool_call_start", id: "prefix-hidden", name: "read_input_resource" },
+        {
+          type: "tool_call_delta",
+          id: "prefix-hidden",
+          json: JSON.stringify({ occurrenceId: laterOccurrenceId }),
+        },
+        { type: "tool_call_end", id: "prefix-hidden" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    const results = request.messages.filter((message) => message.role === "tool");
+    expect(results).toEqual([
+      expect.objectContaining({
+        callId: "prefix-visible",
+        result: expect.objectContaining({
+          status: "completed",
+          output: expect.objectContaining({ content: "first prefix bytes\n" }),
+        }),
+      }),
+      expect.objectContaining({
+        callId: "prefix-hidden",
+        result: {
+          status: "failed",
+          error: {
+            code: "input_resource_not_visible",
+            message:
+              "The requested input-resource occurrence is not visible in this session history.",
+          },
+        },
+      }),
+    ]);
+    return [
+      { type: "text_delta", text: "Only the prefix resource is available." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const first = await lifecycle.admit({
+      targetIdentity,
+      input: { text: "Link the prefix resource." },
+      resourceSelections: [{ type: "local_file", path: firstPath }],
+      runId: firstRunId,
+    });
+    await lifecycle.continue({
+      sessionId: first.snapshot.sessionId,
+      input: { text: "Link the later resource." },
+      resourceSelections: [{ type: "local_file", path: laterPath }],
+      runId: laterRunId,
+    });
+    const branch = await lifecycle.branch({
+      parentSessionId: first.snapshot.sessionId,
+      atSequence: first.snapshot.lastSequence,
+    });
+    await expect(
+      lifecycle.continue({
+        sessionId: branch.sessionId,
+        input: { text: "Read only the prefix resource." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Only the prefix resource is available." },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle links binary bytes but returns typed unsupported materialization", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-input-resource-binary-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "binary.dat");
+  const runId = "50000000-0000-4000-8000-000000000011";
+  const occurrenceId = `${runId}:input:1`;
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, Buffer.from([0xff, 0xfe, 0x00, 0x41]));
+  let providerCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    providerCalls += 1;
+    if (providerCalls === 1) {
+      const user = request.messages.at(-1);
+      expect(user?.role === "user" ? user.content : "").toContain('"support":"unsupported_binary"');
+      return [
+        { type: "tool_call_start", id: "binary-resource", name: "read_input_resource" },
+        {
+          type: "tool_call_delta",
+          id: "binary-resource",
+          json: JSON.stringify({ occurrenceId }),
+        },
+        { type: "tool_call_end", id: "binary-resource" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.at(-1)).toEqual({
+      role: "tool",
+      callId: "binary-resource",
+      name: "read_input_resource",
+      result: {
+        status: "failed",
+        error: {
+          code: "input_resource_unsupported",
+          message: "The requested input resource is not supported as strict UTF-8 text.",
+        },
+      },
+    });
+    return [
+      { type: "text_delta", text: "The linked resource is unsupported binary." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity,
+        input: { text: "Inspect the binary link." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+        runId,
+      }),
+    ).resolves.toMatchObject({
+      result: {
+        status: "completed",
+        answer: "The linked resource is unsupported binary.",
+      },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle rejects invalid draft run limits before allocating durable session identity", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-draft-limits-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -1342,7 +2550,7 @@ test("SessionLifecycle paginates prompt-admitted sessions while hiding genesis-o
   }
 });
 
-test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill snapshot and six tools", async () => {
+test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill snapshot and seven tools", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-skills-genesis-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -1381,6 +2589,7 @@ test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill s
               { name: "run_shell" },
               { name: "activate_skill" },
               { name: "read_skill_resource" },
+              { name: "read_input_resource" },
             ],
           },
         },

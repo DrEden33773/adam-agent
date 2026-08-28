@@ -207,10 +207,26 @@ const expectedCodingTools = [
       additionalProperties: false,
     },
   },
+  {
+    name: "read_input_resource",
+    description:
+      "Read one bounded strict UTF-8 page from an immutable linked input resource visible in this session history.",
+    inputSchema: {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: {
+        occurrenceId: { type: "string", minLength: 1, maxLength: 256 },
+        cursor: { type: "string", minLength: 1, maxLength: 1_024 },
+        maxByteCount: { type: "integer", minimum: 1, maximum: 65_536 },
+      },
+      required: ["occurrenceId"],
+      additionalProperties: false,
+    },
+  },
 ] as const;
 const expectedHistoricalCodingTools = expectedCodingTools.slice(0, 4);
 
-test("a newly created v3 session sends code-owned prompts before the current user request with the exact six-tool profile", async () => {
+test("a newly created v3 session sends code-owned prompts before the current user request with the exact seven-tool profile", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-prompt-assembly-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -403,8 +419,12 @@ test("a new v3 session persists bounded prompt and Skill identity without exposi
           name: "read_skill_resource",
           digest: "sha256:f587f4937385fe2b264838ba6ba6518ee133b7e242dd65c5fb5c1641dbbc35f9",
         },
+        {
+          name: "read_input_resource",
+          digest: "sha256:682b2ff206b5456ecaa4fc96384c3a9531475cca89b70776f13619ee80492d52",
+        },
       ],
-      digest: "sha256:27247bbcab93568bbd415d0a22e9360ab04f36a0c4f4ad253aa40c5e8ab68824",
+      digest: "sha256:b25da1fc060ca3e6f923e946f0f54bdfd7e7c7732ef9703d23da468ef95fb194",
     },
     repository: {
       version: 1,
@@ -528,6 +548,7 @@ test("v3 accounting compacts for the assembled messages and tools while keeping 
         "run_shell",
         "activate_skill",
         "read_skill_resource",
+        "read_input_resource",
       ],
     ]);
     expect(requests[0]?.messages[0]).not.toEqual({ role: "system", content: basePrompt });
@@ -939,7 +960,7 @@ test("a v1 branch inherits its parent prompt identity across a cold continuation
   }
 });
 
-test("resume rejects a changed historical v1 Tool Profile before model use", async () => {
+test("resume rejects a changed historical v1 Tool Profile entry before model use", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-prompt-tool-mismatch-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -948,12 +969,25 @@ test("resume rejects a changed historical v1 Tool Profile before model use", asy
   const created = await createSessionLifecycle({ stateRoot, workspaceRoot, tools }).create({
     targetIdentity,
   });
-  const reorderedTools: ToolRegistry = {
+  const changedReadDefinition = {
+    ...(tools
+      .definitions()
+      .find((definition) => definition.name === "read_file") as ModelRequest["tools"][number]),
+    description: "Changed historical read definition.",
+  };
+  const changedTools: ToolRegistry = {
     definitions() {
-      return [...tools.definitions()].reverse();
+      return tools
+        .definitions()
+        .map((definition) =>
+          definition.name === "read_file" ? changedReadDefinition : definition,
+        );
     },
     resolve(name) {
-      return tools.resolve(name);
+      const adapter = tools.resolve(name);
+      return name === "read_file" && adapter !== undefined
+        ? { ...adapter, definition: changedReadDefinition }
+        : adapter;
     },
   };
   let modelWasResolved = false;
@@ -981,7 +1015,7 @@ test("resume rejects a changed historical v1 Tool Profile before model use", asy
         modelTargets,
         stateRoot,
         workspaceRoot,
-        tools: reorderedTools,
+        tools: changedTools,
       }).resume({ sessionId: created.sessionId }),
     ).resolves.toMatchObject({
       status: "rejected",
@@ -989,6 +1023,65 @@ test("resume rejects a changed historical v1 Tool Profile before model use", asy
         code: "prompt_profile_incompatible",
         message: "The exact recorded prompt and tool profile is not supported by this runtime.",
       },
+    });
+    expect(modelWasResolved).toBe(false);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("resume rejects a reordered historical Tool Profile before model use", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-prompt-tool-reordered-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const tools = createCodingToolRegistry({ stateRoot, workspaceRoot });
+  const created = await createSessionLifecycle({ stateRoot, workspaceRoot, tools }).create({
+    targetIdentity,
+  });
+  const reorderedTools: ToolRegistry = {
+    definitions() {
+      const definitions = tools.definitions();
+      return [definitions[1], definitions[0], ...definitions.slice(2)].filter(
+        (definition): definition is ModelRequest["tools"][number] => definition !== undefined,
+      );
+    },
+    resolve(name) {
+      return tools.resolve(name);
+    },
+  };
+  let modelWasResolved = false;
+
+  try {
+    await expect(
+      createSessionLifecycle({
+        modelTargets: {
+          async resolve() {
+            modelWasResolved = true;
+            throw new Error("The reordered prompt profile must fail before model resolution.");
+          },
+          async snapshot() {
+            return {
+              targets: [
+                {
+                  identity: targetIdentity,
+                  readiness: {
+                    status: "available",
+                    credentialSource: "deterministic test",
+                  },
+                  contextProfile,
+                },
+              ],
+            };
+          },
+        },
+        stateRoot,
+        workspaceRoot,
+        tools: reorderedTools,
+      }).resume({ sessionId: created.sessionId }),
+    ).resolves.toMatchObject({
+      status: "rejected",
+      error: { code: "prompt_profile_incompatible" },
     });
     expect(modelWasResolved).toBe(false);
   } finally {
@@ -1292,11 +1385,11 @@ test("a v3 provider attempt persists only the safe exact request projection dige
     expect({ continuedPromptContext, inspectedPromptContext }).toMatchObject({
       continuedPromptContext: {
         lastRequestProjectionDigest:
-          "sha256:3dc6acf2688749a8dab86df0305ff06ceb3554529b63aabf374e91bcb3a1c298",
+          "sha256:9e981d5b1658c5ab788d702d2ac4c8c76d018ac4ea1a299e06ca3992360cd8f3",
       },
       inspectedPromptContext: {
         lastRequestProjectionDigest:
-          "sha256:3dc6acf2688749a8dab86df0305ff06ceb3554529b63aabf374e91bcb3a1c298",
+          "sha256:9e981d5b1658c5ab788d702d2ac4c8c76d018ac4ea1a299e06ca3992360cd8f3",
       },
     });
     expect(JSON.stringify({ continued, inspected })).not.toContain("Inspect the project.");

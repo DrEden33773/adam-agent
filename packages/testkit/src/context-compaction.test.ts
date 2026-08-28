@@ -18,6 +18,7 @@ import {
   OpenAICompatibleModelDriver,
   type RuntimeEvent,
   type SessionStore,
+  type ToolRegistry,
 } from "@adam-agent/agent";
 import {
   type ContextProfile,
@@ -3476,6 +3477,131 @@ test("AgentSession never retries a context overflow after ordinary output has be
       (record) => record.schemaVersion === 3 && record.record.type === "context_compaction_started",
     ),
   ).toHaveLength(0);
+});
+
+test("SessionLifecycle retains canonical input-resource identity for reread after compaction", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-compaction-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const selectedPath = join(testRoot, "compaction-resource.txt");
+  const content = "Canonical resource bytes survive compaction.\n";
+  const runId = "50000000-0000-4000-8000-000000000011";
+  const occurrenceId = `${runId}:input:1`;
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, content, "utf8");
+  const compactionProfile: ContextProfile = {
+    ...contextProfile,
+    compactAtTokens: 900,
+    postCompactTargetTokens: 800,
+    retainedTargetTokens: 0,
+  };
+  let compactionCalls = 0;
+  let ordinaryCalls = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        compactionCalls += 1;
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Read the linked evidence after compaction.",
+            constraints: [],
+            progress: [],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: ["Read the linked evidence."],
+            nextSafeAction: "Use the resource tool.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 600, outputTokens: 30 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCalls += 1;
+      expect(JSON.stringify(request.messages)).toContain(occurrenceId);
+      if (ordinaryCalls === 1) {
+        yield {
+          type: "tool_call_start",
+          id: "resource-after-compaction",
+          name: "read_input_resource",
+        };
+        yield {
+          type: "tool_call_delta",
+          id: "resource-after-compaction",
+          json: JSON.stringify({ occurrenceId }),
+        };
+        yield { type: "tool_call_end", id: "resource-after-compaction" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      expect(request.messages.at(-1)).toMatchObject({
+        role: "tool",
+        callId: "resource-after-compaction",
+        name: "read_input_resource",
+        result: { status: "completed", output: { occurrenceId, content } },
+      });
+      yield { type: "text_delta", text: "The canonical resource remained readable." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile: compactionProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile: compactionProfile,
+          },
+        ],
+      };
+    },
+  };
+  const currentTools = createCodingToolRegistry({ stateRoot, workspaceRoot });
+  const tools: ToolRegistry = {
+    definitions: () =>
+      currentTools.definitions().filter((definition) => definition.name === "read_input_resource"),
+    resolve: (name) => (name === "read_input_resource" ? currentTools.resolve(name) : undefined),
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, tools, workspaceRoot });
+
+  try {
+    const admitted = await lifecycle.admit({
+      targetIdentity,
+      input: {
+        text: `Keep the linked resource canonical. ${"Summarize this filler. ".repeat(220)}`,
+      },
+      resourceSelections: [{ type: "local_file", path: selectedPath }],
+      runId,
+    });
+    expect(admitted).toMatchObject({
+      result: { status: "completed", answer: "The canonical resource remained readable." },
+      snapshot: { context: { checkpoint: { status: "committed" } } },
+    });
+    expect({ compactionCalls, ordinaryCalls }).toEqual({ compactionCalls: 1, ordinaryCalls: 2 });
+    const store = await openJsonlSessionStore({
+      stateRoot,
+      workspaceRoot,
+      sessionId: admitted.snapshot.sessionId,
+    });
+    expect(await store.read()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          record: expect.objectContaining({
+            type: "context_compaction_committed",
+            inputResources: [expect.objectContaining({ occurrenceId })],
+          }),
+        }),
+      ]),
+    );
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
 });
 
 test("SessionLifecycle restarts and branches from one committed context checkpoint", async () => {

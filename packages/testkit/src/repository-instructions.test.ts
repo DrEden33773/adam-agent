@@ -214,8 +214,12 @@ test("root AGENTS.md is frozen in revision 1 and projected as untrusted user con
             name: "read_skill_resource",
             digest: "sha256:f587f4937385fe2b264838ba6ba6518ee133b7e242dd65c5fb5c1641dbbc35f9",
           },
+          {
+            name: "read_input_resource",
+            digest: "sha256:682b2ff206b5456ecaa4fc96384c3a9531475cca89b70776f13619ee80492d52",
+          },
         ],
-        digest: "sha256:27247bbcab93568bbd415d0a22e9360ab04f36a0c4f4ad253aa40c5e8ab68824",
+        digest: "sha256:b25da1fc060ca3e6f923e946f0f54bdfd7e7c7732ef9703d23da468ef95fb194",
       },
       repository: {
         version: 1,

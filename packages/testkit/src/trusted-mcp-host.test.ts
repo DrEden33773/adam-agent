@@ -5007,6 +5007,7 @@ test("SessionLifecycle keeps user-assigned MCP effect authority over server anno
       "run_shell",
       "activate_skill",
       "read_skill_resource",
+      "read_input_resource",
       qualifiedName,
     ]);
     expect(requests[0]?.tools.find((tool) => tool.name === qualifiedName)?.description).toBe(

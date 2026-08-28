@@ -11,6 +11,13 @@ import {
   digestContextRecordPrefix,
   reduceContextEvidence,
 } from "./durable-context.js";
+import {
+  createInputResourceProjectionMessageV1,
+  decodeInputResourceCursorV1,
+  encodeInputResourceCursorV1,
+  type InputResourceOccurrenceV1,
+  inputResourceLimitsV1,
+} from "./input-resources.js";
 import { isMcpToolProfileV1Valid } from "./mcp-profile-contracts.js";
 import { sameModelTargetIdentity } from "./model-targets.js";
 import {
@@ -136,9 +143,12 @@ export function validateCurrentSessionHistory(
     }
   >();
   const committedSkillResourceReads = new Set<string>();
+  const committedInputResourceReads = new Set<string>();
+  const visibleInputResources = new Map<string, InputResourceOccurrenceV1>();
   const publishedSkillActivations = new Set<number>();
   const publishedSkillRevocations = new Set<number>();
   let skillResourceRunBytes = 0;
+  let inputResourceRunBytes = 0;
   let manualSessionName: string | null = null;
   let automaticTitleEligible = false;
   let automaticTitleSlotClosed = false;
@@ -417,7 +427,9 @@ export function validateCurrentSessionHistory(
         toolStates = new Map();
         skillPermissions.clear();
         committedSkillResourceReads.clear();
+        committedInputResourceReads.clear();
         skillResourceRunBytes = 0;
+        inputResourceRunBytes = 0;
       }
       if (
         run !== undefined ||
@@ -425,9 +437,13 @@ export function validateCurrentSessionHistory(
         sawUserMessage ||
         record.skills?.some(
           (selection, index) => selection.requestId !== `${record.runId}:skill:${index + 1}`,
-        )
+        ) ||
+        !areLogicalInputResourcesValid(record, visibleInputResources)
       ) {
         throw new SessionLifecycleError("session_invalid");
+      }
+      for (const resource of record.inputResources ?? []) {
+        visibleInputResources.set(resource.occurrenceId, resource);
       }
       run = record;
       continue;
@@ -781,6 +797,73 @@ export function validateCurrentSessionHistory(
         throw new SessionLifecycleError("session_invalid");
       }
       committedSkillResourceReads.add(record.callId);
+      continue;
+    }
+    if (record.type === "input_resource_read_committed") {
+      const toolState = toolStates.get(record.callId);
+      const occurrence = visibleInputResources.get(record.occurrenceId);
+      let argumentsValue:
+        | { occurrenceId?: unknown; cursor?: unknown; maxByteCount?: unknown }
+        | undefined;
+      try {
+        argumentsValue = JSON.parse(toolState?.call.argumentsJson ?? "") as typeof argumentsValue;
+      } catch {
+        argumentsValue = undefined;
+      }
+      let requestedOffset: number | undefined;
+      try {
+        requestedOffset =
+          typeof argumentsValue?.occurrenceId === "string" &&
+          (argumentsValue.cursor === undefined || typeof argumentsValue.cursor === "string")
+            ? decodeInputResourceCursorV1(argumentsValue.cursor, argumentsValue.occurrenceId)
+            : undefined;
+      } catch {
+        requestedOffset = undefined;
+      }
+      const requestedMaximum =
+        typeof argumentsValue?.maxByteCount === "number"
+          ? argumentsValue.maxByteCount
+          : inputResourceLimitsV1.defaultReadPageBytes;
+      if (
+        run === undefined ||
+        record.runId !== run.runId ||
+        attemptState?.status !== "completed" ||
+        attemptState.response?.response.finishReason !== "tool_calls" ||
+        toolState?.call.name !== "read_input_resource" ||
+        !toolState.requested ||
+        !toolState.started ||
+        toolState.terminal ||
+        toolState.decision !== "allow" ||
+        committedInputResourceReads.has(record.callId) ||
+        argumentsValue?.occurrenceId !== record.occurrenceId ||
+        requestedOffset !== record.offset ||
+        !Number.isSafeInteger(requestedMaximum) ||
+        record.byteCount > requestedMaximum ||
+        (occurrence === undefined
+          ? genesis.record.lineage === undefined
+          : record.displayName !== occurrence.displayName ||
+            record.digest !== occurrence.digest ||
+            record.totalByteCount !== occurrence.artifact.byteCount) ||
+        record.offset + record.byteCount > record.totalByteCount ||
+        record.eof !== (record.offset + record.byteCount === record.totalByteCount) ||
+        record.nextCursor !==
+          (record.eof
+            ? null
+            : encodeInputResourceCursorV1(record.occurrenceId, record.offset + record.byteCount)) ||
+        Buffer.byteLength(record.content, "utf8") !== record.byteCount ||
+        `sha256:${createHash("sha256").update(record.content, "utf8").digest("hex")}` !==
+          record.pageDigest
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      inputResourceRunBytes += record.byteCount;
+      if (
+        !Number.isSafeInteger(inputResourceRunBytes) ||
+        inputResourceRunBytes > inputResourceLimitsV1.maximumMaterializedBytesPerRun
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      committedInputResourceReads.add(record.callId);
       continue;
     }
     if (record.type === "session_manual_name_set") {
@@ -1459,6 +1542,9 @@ function validateContextCompactionHistory(
     );
     const replacement = [
       createContextProjectionMessage(record.summary, record.evidence),
+      ...(record.inputResources === undefined || record.inputResources.length === 0
+        ? []
+        : [createInputResourceProjectionMessageV1(record.inputResources)]),
       ...modelMessagesFromCanonicalRecords(retainedRecords),
     ];
     if (
@@ -1558,6 +1644,39 @@ function hasNonEmptyModelResponseText(field: string | SessionModelResponseField)
     : field.storage === "inline"
       ? field.text.length > 0
       : field.reference.byteCount > 0;
+}
+
+function areLogicalInputResourcesValid(
+  record: SessionLogicalRunStartedRecord["record"],
+  visible: ReadonlyMap<string, InputResourceOccurrenceV1>,
+): boolean {
+  const resources = record.inputResources ?? [];
+  if (resources.length === 0) {
+    return true;
+  }
+  if (record.recordVersion !== 1) {
+    return false;
+  }
+  const combined = [...visible.values(), ...resources];
+  const occurrenceIds = new Set(combined.map((resource) => resource.occurrenceId));
+  const aggregateBytes = combined.reduce((sum, resource) => sum + resource.artifact.byteCount, 0);
+  return (
+    occurrenceIds.size === combined.length &&
+    combined.length <= inputResourceLimitsV1.maximumOccurrencesPerLineage &&
+    Number.isSafeInteger(aggregateBytes) &&
+    aggregateBytes <= inputResourceLimitsV1.maximumAggregateBytesPerLineage &&
+    resources.every(
+      (resource, index) =>
+        resource.occurrenceId === `${record.runId}:input:${index + 1}` &&
+        resource.artifact.id === resource.digest &&
+        ((resource.support === "utf8_text" &&
+          resource.mediaHint === "text" &&
+          resource.artifact.mediaType === "text/plain; charset=utf-8") ||
+          (resource.support === "unsupported_binary" &&
+            resource.mediaHint === "binary" &&
+            resource.artifact.mediaType === "application/octet-stream")),
+    )
+  );
 }
 
 function isMatchingStartedAttempt(

@@ -1,5 +1,9 @@
 import type { ModelMessage } from "./agent-session-contracts.js";
 import { createContextProjectionMessage, digestContextMessages } from "./durable-context.js";
+import {
+  createInputResourceProjectionMessageV1,
+  projectInputResourcesV1,
+} from "./input-resources.js";
 import { SessionLifecycleError } from "./session-lifecycle-error.js";
 import type { SessionModelResponseField, SessionRecord } from "./session-store.js";
 
@@ -22,6 +26,10 @@ export function modelMessagesFromCompleteRecords(
     );
     const replacement = [
       createContextProjectionMessage(checkpointRecord.summary, checkpointRecord.evidence),
+      ...(checkpointRecord.inputResources === undefined ||
+      checkpointRecord.inputResources.length === 0
+        ? []
+        : [createInputResourceProjectionMessageV1(checkpointRecord.inputResources)]),
       ...modelMessagesFromCanonicalRecords(retainedRecords),
     ];
     if (digestContextMessages(replacement) !== checkpointRecord.replacementDigest) {
@@ -41,7 +49,10 @@ export function modelMessagesFromCanonicalRecords(
   const messages: ModelMessage[] = [];
   for (const record of currentRecords) {
     if (record.record.type === "logical_run_started") {
-      messages.push({ role: "user", content: record.record.userMessage });
+      messages.push({
+        role: "user",
+        content: projectInputResourcesV1(record.record.userMessage, record.record.inputResources),
+      });
       continue;
     }
     if (record.record.type !== "model_response_completed") {
