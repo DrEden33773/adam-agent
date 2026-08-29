@@ -2695,6 +2695,35 @@ test("the idle footer exposes Registry-driven interaction hints", async () => {
   }
 });
 
+test("the production TUI toggles and displays authoritative read-only Plan status", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-status-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
+
+    fixture.write("/plan\r");
+    await fixture.waitFor("Plan exploring · read-only");
+    let frame = latestSynchronizedFrame(fixture.output()).join("\n");
+    expect(frame).toContain("Plan exploring · read-only");
+
+    const beforeExit = fixture.output().length;
+    fixture.write("/plan\r");
+    await fixture.waitForAfter("Exited read-only Plan.", beforeExit);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeExit)).join("\n");
+    expect(frame).not.toContain("Plan exploring · read-only");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the footer exposes authoritative project context and run facts", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-footer-facts-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -4139,6 +4168,7 @@ test("Ctrl+T reads artifact-backed provider reasoning without placing it in the 
     fixture.write("Store provider reasoning out of line\r");
     await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforePrompt);
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
+    await fixture.waitFor("Adam · Streaming session");
     let frame = latestSynchronizedFrame(fixture.output().slice(beforePrompt)).join("\n");
     expect(frame).not.toContain("Artifact reasoning evidence");
     const durableStateBeforeExpand = await readFilesRecursively(stateRoot);
@@ -4213,6 +4243,7 @@ test("continued scrolling loads only the adjacent oversized reasoning range", as
     terminal.input("Traverse provider reasoning ranges\r");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
     await waitForPhysicalText(terminal, "Thinking done · adam");
+    await waitForPhysicalText(terminal, "Adam · Streaming session");
     const durableStateBeforeNavigation = await readFilesRecursively(stateRoot);
     await inputAndWaitForPhysicalFrame(terminal, "\u0014");
     await waitForPath(join(controlRoot, "artifact-read-1-settled"));
@@ -4282,6 +4313,7 @@ test("oversized reasoning evicts offscreen ranges by bytes and reloads them on u
     terminal.input("Exercise bounded reasoning range eviction\r");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
     await waitForPhysicalText(terminal, "Thinking done · adam");
+    await waitForPhysicalText(terminal, "Adam · Streaming session");
     const durableStateBeforeNavigation = await readFilesRecursively(stateRoot);
     await inputAndWaitForPhysicalFrame(terminal, "\u0014");
     await waitForPath(join(controlRoot, "artifact-read-1-settled"));
@@ -4338,6 +4370,7 @@ test("a late downward reasoning range cannot replace the page selected while it 
     terminal.input("Keep a reordered reasoning range out of the viewport\r");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
     await waitForPhysicalText(terminal, "Thinking done · adam");
+    await waitForPhysicalText(terminal, "Adam · Streaming session");
     await inputAndWaitForPhysicalFrame(terminal, "\u0014");
     await waitForPath(join(controlRoot, "artifact-read-1-settled"));
     await waitForPhysicalText(terminal, "Large reasoning · plain view · 1-16384 of 270028 bytes");
@@ -4491,6 +4524,7 @@ test("folding oversized reasoning rejects a late range before a clean retry", as
     terminal.input("Hold one provider reasoning range\r");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
     await waitForPhysicalText(terminal, "Thinking done · adam");
+    await waitForPhysicalText(terminal, "Adam · Streaming session");
     await inputAndWaitForPhysicalFrame(terminal, "\u0014");
     await waitForPath(join(controlRoot, "reasoning-page-read-pending"));
 
@@ -4625,7 +4659,9 @@ test.each(["missing", "truncated", "same-size corrupt"] as const)(
         await writeFile(artifactPath, artifactBytes);
       }
       await chmod(artifactPath, 0o400);
+      const beforeRetryClose = fixture.output().length;
       fixture.write("\u0014");
+      await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforeRetryClose);
       const beforeRetry = fixture.output().length;
       fixture.write("\u0014");
       await expect(

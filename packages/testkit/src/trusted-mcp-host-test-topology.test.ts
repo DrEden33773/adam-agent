@@ -108,7 +108,7 @@ test("MCP deterministic and operating-system contracts keep separate harness own
 
   const behaviorNames = declaredTestNames(behaviorSource);
   const operatingSystemNames = declaredTestNames(operatingSystemSource);
-  expect.soft(behaviorNames).toHaveLength(79);
+  expect.soft(behaviorNames).toHaveLength(81);
   expect.soft(operatingSystemNames).toHaveLength(19);
   expect.soft(operatingSystemNames).toEqual([...operatingSystemTestNames].sort());
   expect.soft(operatingSystemTestNames.filter((name) => behaviorNames.includes(name))).toEqual([]);

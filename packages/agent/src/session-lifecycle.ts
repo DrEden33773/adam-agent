@@ -69,6 +69,7 @@ import {
   modelTargetUsesContextProfile,
   sameModelTargetIdentity,
 } from "./model-targets.js";
+import { createReadOnlyPlanToolProfileV1, type PlanEligibleToolProfileV1 } from "./plan-mode.js";
 import {
   createProjectLifecycleOwner,
   type ProjectLifecycleOwner,
@@ -116,6 +117,7 @@ import {
   isGenesisRecord,
   type ModelResponseArtifactDegradation,
   type ModelResponseArtifactInspection,
+  planCycleSnapshotFromRecords,
   promptContextRecordFromRecords,
   sessionNamingStateFromRecords,
   skillContextRecordFromRecords,
@@ -488,6 +490,13 @@ export type SessionCommand =
     } & SessionBranchInput)
   | { readonly type: "reload_repository_instructions"; readonly sessionId: string }
   | { readonly type: "reload_skills"; readonly sessionId: string }
+  | { readonly type: "enter_plan"; readonly sessionId: string }
+  | {
+      readonly type: "exit_plan";
+      readonly sessionId: string;
+      readonly cycleId: string;
+      readonly revision: number;
+    }
   | McpConfigurationCommand;
 
 export interface SessionLifecycle {
@@ -520,6 +529,12 @@ export interface SessionLifecycle {
   decidePermission(command: PermissionDecisionCommand): PermissionDecisionCommandResult;
   enableAutomaticTitles(): void;
   ensureAutomaticTitle(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
+  enterPlan(input: { readonly sessionId: string }): Promise<CurrentSessionSnapshot>;
+  exitPlan(input: {
+    readonly sessionId: string;
+    readonly cycleId: string;
+    readonly revision: number;
+  }): Promise<CurrentSessionSnapshot>;
   inspect(input: { readonly sessionId: string }): Promise<SessionSnapshot>;
   inspectWorkspaceTrust(): Promise<WorkspaceTrustSnapshot>;
   inspectContextUsage(input: {
@@ -1435,6 +1450,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     validateCurrentSessionHistory(first, records, options.workspaceRoot);
     await lineage.validateSessionLineage(first, records);
     await validateMcpAuthorityFromLineage(lineage, first, records);
+    await validatePlanToolProfilesFromLineage(options, lineage, first, records);
     await skillResourceBytesFromLineage(lineage, first, records);
     const artifactInspection = await inspectModelResponseArtifactLineage(
       options,
@@ -2213,6 +2229,24 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           },
         };
         await store.append(genesis);
+        let nextSequence = 2;
+        const parentPlan = planCycleSnapshotFromRecords(parentPrefix);
+        if (parentPlan !== undefined) {
+          await store.append({
+            schemaVersion: 3,
+            sequence: nextSequence,
+            record: {
+              type: "plan_cycle_inherited",
+              recordVersion: 1,
+              cycleId: parentPlan.cycleId,
+              revision: parentPlan.revision,
+              policyVersion: parentPlan.policyVersion,
+              eligibleToolProfile: parentPlan.eligibleToolProfile,
+              source: { sessionId: sourceSessionId, throughSequence: sourceEventPosition },
+            },
+          });
+          nextSequence += 1;
+        }
         const extensionSources = await resolveExtensionSkillSources(options);
         if (hasSkillPromptContext(parentPromptContext) && parentSkillContext !== undefined) {
           const reconciled = reconcileExtensionSkillContextV1({
@@ -2224,7 +2258,6 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               parentPromptContext,
               reconciled.context,
             );
-            let nextSequence = 2;
             await store.append({
               schemaVersion: 3,
               sequence: nextSequence,
@@ -2824,6 +2857,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               ? {}
               : { inputResources: runtimeInputResources }),
             projectId: resumed.snapshot.projectId,
+            ...(resumed.snapshot.plan === undefined ? {} : { plan: resumed.snapshot.plan }),
             referencedModelResponseArtifactBytes,
             skillResourceLineageBytes,
             inputResourceLineageBytes,
@@ -4177,6 +4211,82 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         return { status: "updated", snapshot };
       });
     },
+    async enterPlan(input) {
+      if (activeSession !== undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return withOwner(async () => {
+        const inspected = await inspectSession({ sessionId: input.sessionId });
+        if (
+          inspected.schemaVersion !== 3 ||
+          (inspected.status !== "idle" && inspected.status !== "settled") ||
+          inspected.plan !== undefined
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        if (
+          inspected.promptContext?.toolProfile.definitions.some(
+            (definition) => definition.name === "search_repository",
+          ) !== true
+        ) {
+          throw new SessionLifecycleError("session_plan_unavailable");
+        }
+        const records = await readSessionRecords(options, input.sessionId);
+        const eligibleToolProfile = readOnlyPlanToolProfile(inspected, options.tools);
+        const store = await openSessionStore(options, input.sessionId);
+        await store.append({
+          schemaVersion: 3,
+          sequence: (records.at(-1)?.sequence ?? 0) + 1,
+          record: {
+            type: "plan_cycle_entered",
+            recordVersion: 1,
+            cycleId: randomUUID(),
+            revision: 1,
+            policyVersion: "plan-policy.read-v1",
+            eligibleToolProfile,
+          },
+        });
+        const snapshot = await inspectSession({ sessionId: input.sessionId });
+        if (snapshot.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        return snapshot;
+      });
+    },
+    async exitPlan(input) {
+      if (activeSession !== undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return withOwner(async () => {
+        const inspected = await inspectSession({ sessionId: input.sessionId });
+        if (
+          inspected.schemaVersion !== 3 ||
+          (inspected.status !== "idle" && inspected.status !== "settled") ||
+          inspected.plan?.cycleId !== input.cycleId ||
+          inspected.plan.revision !== input.revision
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const records = await readSessionRecords(options, input.sessionId);
+        const store = await openSessionStore(options, input.sessionId);
+        await store.append({
+          schemaVersion: 3,
+          sequence: (records.at(-1)?.sequence ?? 0) + 1,
+          record: {
+            type: "plan_cycle_exited",
+            recordVersion: 1,
+            cycleId: input.cycleId,
+            revision: input.revision + 1,
+            reason: "user_cancelled",
+          },
+        });
+        const snapshot = await inspectSession({ sessionId: input.sessionId });
+        if (snapshot.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        return snapshot;
+      });
+    },
     async setSessionManualName(input) {
       if (activeSession !== undefined) {
         throw new SessionLifecycleError("session_invalid");
@@ -4784,7 +4894,23 @@ async function validatePromptProjectionDigests(
       skillContext,
       activeSkillContents,
     );
-    const tools = context.toolProfile.definitions.map(({ definition }) => definition);
+    const plan = planCycleSnapshotFromRecords(prefix);
+    const tools =
+      plan === undefined
+        ? context.toolProfile.definitions.map(({ definition }) => definition)
+        : plan.eligibleToolProfile.definitions.map((eligible) => {
+            const definition = context.toolProfile.definitions.find(
+              (candidate) => candidate.name === eligible.name,
+            )?.definition;
+            if (
+              definition === undefined ||
+              plan.eligibleToolProfile.source.version !== context.toolProfile.version ||
+              plan.eligibleToolProfile.source.digest !== context.toolProfile.digest
+            ) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+            return definition;
+          });
     if (
       digestPromptRequestV1(messages, tools) !==
       entry.record.promptProjection.requestProjectionDigest
@@ -6481,6 +6607,113 @@ async function openSessionStore(
     throw new SessionLifecycleError("session_not_found");
   }
   return store;
+}
+
+function readOnlyPlanToolProfile(
+  snapshot: CurrentSessionSnapshot,
+  tools: ToolRegistry | undefined,
+): PlanEligibleToolProfileV1 {
+  const source = snapshot.promptContext?.toolProfile;
+  if (source === undefined || tools === undefined) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return readOnlyPlanToolProfileFromAuthority(
+    source,
+    tools,
+    snapshot.mcp?.workspaceConfirmed === true ? snapshot.mcp.profile : undefined,
+  );
+}
+
+function readOnlyPlanToolProfileFromAuthority(
+  source: NonNullable<CurrentSessionSnapshot["promptContext"]>["toolProfile"],
+  tools: ToolRegistry,
+  mcpProfile:
+    | {
+        readonly digest: `sha256:${string}`;
+        readonly tools: readonly {
+          readonly qualifiedName: string;
+          readonly definitionDigest: `sha256:${string}`;
+          readonly effect: ToolEffect;
+        }[];
+      }
+    | undefined,
+): PlanEligibleToolProfileV1 {
+  const mcpTools = new Map(
+    mcpProfile?.tools.map((tool) => [tool.qualifiedName, tool] as const) ?? [],
+  );
+  const definitions: PlanEligibleToolProfileV1["definitions"][number][] = [];
+  for (const definition of source.definitions) {
+    const mcp = mcpTools.get(definition.name);
+    if (mcp !== undefined) {
+      if (mcp.effect === "read") {
+        definitions.push({
+          name: definition.name,
+          definitionDigest: mcp.definitionDigest,
+          effect: mcp.effect,
+          source: "mcp",
+        });
+      }
+      continue;
+    }
+    const adapter = tools.resolve(definition.name);
+    if (adapter === undefined || !/^sha256:[0-9a-f]{64}$/u.test(adapter.definitionDigest)) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    if (adapter.effect === "read") {
+      definitions.push({
+        name: definition.name,
+        definitionDigest: adapter.definitionDigest as `sha256:${string}`,
+        effect: adapter.effect,
+        source: "builtin",
+      });
+    }
+  }
+  return createReadOnlyPlanToolProfileV1({
+    source: { version: source.version, digest: source.digest },
+    definitions,
+  });
+}
+
+async function validatePlanToolProfilesFromLineage(
+  options: SessionLifecycleOptions,
+  lineage: SessionLineageTraversal,
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+): Promise<void> {
+  if (options.tools === undefined) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  for (const entry of records) {
+    if (
+      entry.schemaVersion !== 3 ||
+      (entry.record.type !== "plan_cycle_entered" && entry.record.type !== "plan_cycle_inherited")
+    ) {
+      continue;
+    }
+    const prefix = records.filter((candidate) => candidate.sequence < entry.sequence);
+    const promptContext = promptContextRecordFromRecords(genesis, prefix);
+    if (promptContext === undefined) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const mcpProfile = await mcpCommittedProfileFromLineage(lineage, genesis, prefix);
+    if (
+      (promptContext.recordVersion === 3 && promptContext.mcp !== undefined) !==
+        (mcpProfile !== undefined) ||
+      (promptContext.recordVersion === 3 &&
+        promptContext.mcp !== undefined &&
+        promptContext.mcp.profileDigest !== mcpProfile?.digest)
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const expected = readOnlyPlanToolProfileFromAuthority(
+      promptContext.toolProfile,
+      options.tools,
+      mcpProfile,
+    );
+    if (!isDeepStrictEqual(entry.record.eligibleToolProfile, expected)) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+  }
 }
 
 function draftSkillSelectionsAreValid(selections: readonly string[]): boolean {

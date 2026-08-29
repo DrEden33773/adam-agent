@@ -20,6 +20,7 @@ import {
 } from "./input-resources.js";
 import { isMcpToolProfileV1Valid } from "./mcp-profile-contracts.js";
 import { sameModelTargetIdentity } from "./model-targets.js";
+import { isReadOnlyPlanToolProfileV1Valid } from "./plan-mode.js";
 import {
   commitMcpToolProfileV3,
   hasSkillPromptContext,
@@ -159,6 +160,8 @@ export function validateCurrentSessionHistory(
       }
     | undefined;
   const titleGenerationIds = new Set<string>();
+  let activePlanCycleId: string | undefined;
+  let activePlanRevision: number | undefined;
   const activatableRepositoryRevisions = new Map<number, ValidatedToolState>();
   const publishedRepositoryRevisions = new Set<number>();
   let mcpWorkspaceConfirmation: SessionMcpWorkspaceConfirmedRecord["record"] | undefined;
@@ -178,6 +181,58 @@ export function validateCurrentSessionHistory(
     const record = entry.record;
     if (record.type === "session_genesis") {
       throw new SessionLifecycleError("session_invalid");
+    }
+    if (record.type === "plan_cycle_entered") {
+      if (
+        run !== undefined ||
+        activePlanCycleId !== undefined ||
+        !isReadOnlyPlanToolProfileV1Valid(record.eligibleToolProfile) ||
+        record.eligibleToolProfile.source.version !== activePromptContext?.toolProfile.version ||
+        record.eligibleToolProfile.source.digest !== activePromptContext.toolProfile.digest
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      activePlanCycleId = record.cycleId;
+      activePlanRevision = record.revision;
+      continue;
+    }
+    if (record.type === "plan_cycle_inherited") {
+      const lineage = genesis.record.lineage;
+      const sourceSessionId =
+        lineage !== undefined && "sourceSessionId" in lineage
+          ? lineage.sourceSessionId
+          : lineage?.parentSessionId;
+      const sourceSequence =
+        lineage !== undefined && "sourceEventPosition" in lineage
+          ? lineage.sourceEventPosition
+          : lineage?.parentEventPosition;
+      if (
+        run !== undefined ||
+        activePlanCycleId !== undefined ||
+        lineage === undefined ||
+        record.source.sessionId !== sourceSessionId ||
+        record.source.throughSequence !== sourceSequence ||
+        !isReadOnlyPlanToolProfileV1Valid(record.eligibleToolProfile) ||
+        record.eligibleToolProfile.source.version !== activePromptContext?.toolProfile.version ||
+        record.eligibleToolProfile.source.digest !== activePromptContext.toolProfile.digest
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      activePlanCycleId = record.cycleId;
+      activePlanRevision = record.revision;
+      continue;
+    }
+    if (record.type === "plan_cycle_exited") {
+      if (
+        run !== undefined ||
+        record.cycleId !== activePlanCycleId ||
+        record.revision !== (activePlanRevision ?? 0) + 1
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      activePlanCycleId = undefined;
+      activePlanRevision = undefined;
+      continue;
     }
     if (record.type === "mcp_workspace_confirmed") {
       if (run !== undefined || mcpWorkspaceConfirmation !== undefined) {

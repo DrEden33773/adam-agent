@@ -828,6 +828,257 @@ test("PresentationSession opens an empty project catalog without creating a sess
   }
 });
 
+test("PresentationSession durably enters a read-only Plan cycle and rehydrates its exact identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-enter-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    await expect(
+      presentation.dispatch({ type: "enter_plan", sessionId: created.sessionId }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    const entered = presentation.getState().authoritative.active?.plan;
+    expect(entered).toMatchObject({
+      state: "exploring",
+      cycleId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+      revision: 1,
+      policyVersion: "plan-policy.read-v1",
+    });
+
+    await presentation.close();
+    presentation = undefined;
+    await lifecycle.close();
+    lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+    presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    expect(presentation.getState().authoritative.active?.plan).toEqual(entered);
+  } finally {
+    await presentation?.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession freezes the exact eligible read-only Tool Profile for a Plan cycle", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-profile-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    await expect(
+      presentation.dispatch({ type: "enter_plan", sessionId: created.sessionId }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    const profile = presentation.getState().authoritative.active?.plan?.eligibleToolProfile;
+    expect(profile).toMatchObject({
+      version: 1,
+      source: {
+        version: created.promptContext?.toolProfile.version,
+        digest: created.promptContext?.toolProfile.digest,
+      },
+      digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+    });
+    expect(profile?.definitions).toEqual(
+      [
+        "read_file",
+        "search_repository",
+        "activate_skill",
+        "read_skill_resource",
+        "read_input_resource",
+      ].map((name) => ({
+        name,
+        definitionDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        effect: "read",
+        source: "builtin",
+      })),
+    );
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession exits one Plan cycle and enters a distinct later cycle", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-repeat-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    await presentation.dispatch({ type: "enter_plan", sessionId: created.sessionId });
+    const first = presentation.getState().authoritative.active?.plan;
+    if (first === undefined) {
+      throw new Error("Expected the first Plan cycle.");
+    }
+
+    await expect(
+      presentation.dispatch({
+        type: "exit_plan",
+        sessionId: created.sessionId,
+        cycleId: first.cycleId,
+        revision: first.revision,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().authoritative.active?.plan).toBeUndefined();
+
+    await expect(
+      presentation.dispatch({ type: "enter_plan", sessionId: created.sessionId }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    const second = presentation.getState().authoritative.active?.plan;
+    expect(second).toMatchObject({
+      state: "exploring",
+      revision: 1,
+      policyVersion: "plan-policy.read-v1",
+      eligibleToolProfile: first.eligibleToolProfile,
+    });
+    expect(second?.cycleId).not.toBe(first.cycleId);
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession gives new-session guidance when a historical profile cannot enter Plan", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-historical-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const currentTools = createCodingToolRegistry({ stateRoot, workspaceRoot });
+  const historicalTools: ToolRegistry = {
+    definitions: () =>
+      currentTools.definitions().filter((definition) => definition.name !== "search_repository"),
+    resolve(name) {
+      return name === "search_repository" ? undefined : currentTools.resolve(name);
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const historicalLifecycle = harness.createLifecycle({
+    stateRoot,
+    tools: historicalTools,
+    workspaceRoot,
+  });
+  const created = await historicalLifecycle.create({ targetIdentity });
+  await historicalLifecycle.close();
+  const lifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    await expect(
+      presentation.dispatch({ type: "enter_plan", sessionId: created.sessionId }),
+    ).resolves.toEqual({
+      status: "rejected",
+      code: "not_available",
+      message:
+        "Plan is unavailable in this historical Tool Profile. Start a new session to use Plan.",
+    });
+    expect(presentation.getState().authoritative.active?.plan).toBeUndefined();
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession rejects a stale Plan-cycle command without changing durable state", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-stale-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    await presentation.dispatch({ type: "enter_plan", sessionId: created.sessionId });
+    const current = presentation.getState().authoritative.active?.plan;
+    if (current === undefined) {
+      throw new Error("Expected an active Plan cycle.");
+    }
+
+    await expect(
+      presentation.dispatch({
+        type: "exit_plan",
+        sessionId: created.sessionId,
+        cycleId: current.cycleId,
+        revision: current.revision + 1,
+      }),
+    ).resolves.toEqual({
+      status: "rejected",
+      code: "stale_interaction",
+      message: "The selected Plan cycle is no longer current.",
+    });
+    expect(presentation.getState().authoritative.active?.plan).toEqual(current);
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      lastSequence: current.revision + 1,
+      plan: current,
+    });
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("PresentationSession projects exact target identity and readiness for project launch", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-targets-"));
   const stateRoot = join(testRoot, "state");

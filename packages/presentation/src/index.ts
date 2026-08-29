@@ -373,6 +373,23 @@ export type ActiveSessionDisplay = {
   readonly skills: SkillCatalogDisplay | null;
   readonly projectPaths: ProjectPathCatalogDisplay;
   readonly mcp: McpDisplay | null;
+  readonly plan?: {
+    readonly state: "exploring";
+    readonly cycleId: string;
+    readonly revision: number;
+    readonly policyVersion: "plan-policy.read-v1";
+    readonly eligibleToolProfile: {
+      readonly version: 1;
+      readonly source: { readonly version: 1; readonly digest: `sha256:${string}` };
+      readonly definitions: readonly {
+        readonly name: string;
+        readonly definitionDigest: `sha256:${string}`;
+        readonly effect: "read" | "write" | "execute" | "network" | "delegate" | "administrative";
+        readonly source: "builtin" | "mcp";
+      }[];
+      readonly digest: `sha256:${string}`;
+    };
+  };
 };
 
 export type OperationCursor = {
@@ -767,6 +784,16 @@ export type PresentationCommand =
   | {
       readonly type: "create_session";
       readonly targetId: string;
+    }
+  | {
+      readonly type: "enter_plan";
+      readonly sessionId: string;
+    }
+  | {
+      readonly type: "exit_plan";
+      readonly sessionId: string;
+      readonly cycleId: string;
+      readonly revision: number;
     }
   | {
       readonly type: "set_default_target";

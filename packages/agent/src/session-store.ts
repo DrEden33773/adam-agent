@@ -19,6 +19,7 @@ import type { McpToolProfileV1 } from "./mcp-profile-contracts.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import { imageInputLimitsV1, type ProjectedContentUsageV1 } from "./model-user-content.js";
+import type { PlanEligibleToolProfileV1, PlanPolicyVersion } from "./plan-mode.js";
 import {
   type PromptContextRecord,
   type PromptContextRecordV1,
@@ -291,6 +292,48 @@ export type SessionManualNameSetRecord = {
     readonly type: "session_manual_name_set";
     readonly recordVersion: 1;
     readonly name: string;
+  };
+};
+
+export type SessionPlanCycleEnteredRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "plan_cycle_entered";
+    readonly recordVersion: 1;
+    readonly cycleId: string;
+    readonly revision: 1;
+    readonly policyVersion: PlanPolicyVersion;
+    readonly eligibleToolProfile: PlanEligibleToolProfileV1;
+  };
+};
+
+export type SessionPlanCycleExitedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "plan_cycle_exited";
+    readonly recordVersion: 1;
+    readonly cycleId: string;
+    readonly revision: number;
+    readonly reason: "user_cancelled";
+  };
+};
+
+export type SessionPlanCycleInheritedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "plan_cycle_inherited";
+    readonly recordVersion: 1;
+    readonly cycleId: string;
+    readonly revision: number;
+    readonly policyVersion: PlanPolicyVersion;
+    readonly eligibleToolProfile: PlanEligibleToolProfileV1;
+    readonly source: {
+      readonly sessionId: string;
+      readonly throughSequence: number;
+    };
   };
 };
 
@@ -801,6 +844,9 @@ export type SessionV3Record =
   | SessionMcpToolProfileCommittedRecord
   | SessionMcpCatalogStateChangedRecord
   | SessionLogicalRunStartedRecord
+  | SessionPlanCycleEnteredRecord
+  | SessionPlanCycleExitedRecord
+  | SessionPlanCycleInheritedRecord
   | SessionManualNameSetRecord
   | SessionManualNameClearedRecord
   | SessionTitleGenerationStartedRecord
@@ -1598,6 +1644,26 @@ const sessionGenesisV2RecordSchema = sessionGenesisV1RecordSchema.extend({
   recordVersion: z.literal(2),
   contextProfile: contextProfileSchema,
 });
+const sha256DigestSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/u) as z.ZodType<Sha256Digest>;
+const planEligibleToolProfileV1Schema: z.ZodType<PlanEligibleToolProfileV1> = z.strictObject({
+  version: z.literal(1),
+  source: z.strictObject({
+    version: z.literal(1),
+    digest: sha256DigestSchema,
+  }),
+  definitions: z
+    .array(
+      z.strictObject({
+        name: z.string().min(1).max(256),
+        definitionDigest: sha256DigestSchema,
+        effect: z.enum(["read", "write", "execute", "network", "delegate", "administrative"]),
+        source: z.enum(["builtin", "mcp"]),
+      }),
+    )
+    .min(1)
+    .max(64),
+  digest: sha256DigestSchema,
+});
 const sessionV3RecordSchema = z.union([
   sessionGenesisV1RecordSchema,
   sessionGenesisV2RecordSchema,
@@ -1802,6 +1868,33 @@ const sessionV3RecordSchema = z.union([
       .min(1)
       .max(inputResourceLimitsV1.maximumOccurrencesPerRun)
       .optional(),
+  }),
+  z.strictObject({
+    type: z.literal("plan_cycle_entered"),
+    recordVersion: z.literal(1),
+    cycleId: z.uuid(),
+    revision: z.literal(1),
+    policyVersion: z.literal("plan-policy.read-v1"),
+    eligibleToolProfile: planEligibleToolProfileV1Schema,
+  }),
+  z.strictObject({
+    type: z.literal("plan_cycle_exited"),
+    recordVersion: z.literal(1),
+    cycleId: z.uuid(),
+    revision: z.number().int().positive(),
+    reason: z.literal("user_cancelled"),
+  }),
+  z.strictObject({
+    type: z.literal("plan_cycle_inherited"),
+    recordVersion: z.literal(1),
+    cycleId: z.uuid(),
+    revision: z.number().int().positive(),
+    policyVersion: z.literal("plan-policy.read-v1"),
+    eligibleToolProfile: planEligibleToolProfileV1Schema,
+    source: z.strictObject({
+      sessionId: z.uuid(),
+      throughSequence: z.number().int().positive(),
+    }),
   }),
   z.strictObject({
     type: z.literal("session_manual_name_set"),
