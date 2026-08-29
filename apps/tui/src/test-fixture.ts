@@ -1041,6 +1041,20 @@ function createFixtureModelTargets(options: {
           return;
         }
         yield { type: "text_delta", text: "Read complete." };
+      } else if (options.scenario === "search") {
+        const latest = request.messages.at(-1);
+        if (latest?.role === "user") {
+          yield { type: "tool_call_start", id: "search-repository", name: "search_repository" };
+          yield {
+            type: "tool_call_delta",
+            id: "search-repository",
+            json: '{"kind":"content","query":"orchard"}',
+          };
+          yield { type: "tool_call_end", id: "search-repository" };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: "Search complete." };
       } else if (options.scenario === "tool-multiple") {
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {

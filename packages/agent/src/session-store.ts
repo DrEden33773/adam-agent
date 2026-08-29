@@ -444,7 +444,7 @@ export type SessionPathContextCommittedRecord = {
     readonly trigger: {
       readonly runId: string;
       readonly callId: string;
-      readonly name: "read_file" | "write_file" | "edit_file";
+      readonly name: "read_file" | "search_repository" | "write_file" | "edit_file";
       readonly argumentsDigest: Sha256Digest;
       readonly disposition: "read_continue" | "mutation_retry_required";
     };
@@ -465,7 +465,7 @@ export type SessionPathContextFailedRecord = {
     readonly trigger: {
       readonly runId: string;
       readonly callId: string;
-      readonly name: "read_file" | "write_file" | "edit_file";
+      readonly name: "read_file" | "search_repository" | "write_file" | "edit_file";
       readonly argumentsDigest: Sha256Digest;
       readonly disposition: "unavailable";
     };
@@ -765,7 +765,7 @@ export type SessionRepositoryInstructionsCommittedRecord = {
     readonly trigger?: {
       readonly runId: string;
       readonly callId: string;
-      readonly name: "read_file" | "write_file" | "edit_file";
+      readonly name: "read_file" | "search_repository" | "write_file" | "edit_file";
       readonly argumentsDigest: Sha256Digest;
       readonly disposition: "read_continue" | "mutation_retry_required";
     };
@@ -784,7 +784,7 @@ export type SessionRepositoryInstructionsFailedRecord = {
     readonly trigger?: {
       readonly runId: string;
       readonly callId: string;
-      readonly name: "read_file" | "write_file" | "edit_file";
+      readonly name: "read_file" | "search_repository" | "write_file" | "edit_file";
       readonly argumentsDigest: Sha256Digest;
       readonly disposition: "unavailable";
     };
@@ -1927,7 +1927,7 @@ const sessionV3RecordSchema = z.union([
     trigger: z.strictObject({
       runId: z.uuid(),
       callId: z.string().min(1).max(256),
-      name: z.enum(["read_file", "write_file", "edit_file"]),
+      name: z.enum(["read_file", "search_repository", "write_file", "edit_file"]),
       argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
       disposition: z.enum(["read_continue", "mutation_retry_required"]),
     }),
@@ -1943,7 +1943,7 @@ const sessionV3RecordSchema = z.union([
     trigger: z.strictObject({
       runId: z.uuid(),
       callId: z.string().min(1).max(256),
-      name: z.enum(["read_file", "write_file", "edit_file"]),
+      name: z.enum(["read_file", "search_repository", "write_file", "edit_file"]),
       argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
       disposition: z.literal("unavailable"),
     }),
@@ -2035,7 +2035,7 @@ const sessionV3RecordSchema = z.union([
       .strictObject({
         runId: z.uuid(),
         callId: z.string().min(1).max(256),
-        name: z.enum(["read_file", "write_file", "edit_file"]),
+        name: z.enum(["read_file", "search_repository", "write_file", "edit_file"]),
         argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
         disposition: z.enum(["read_continue", "mutation_retry_required"]),
       })
@@ -2051,7 +2051,7 @@ const sessionV3RecordSchema = z.union([
       .strictObject({
         runId: z.uuid(),
         callId: z.string().min(1).max(256),
-        name: z.enum(["read_file", "write_file", "edit_file"]),
+        name: z.enum(["read_file", "search_repository", "write_file", "edit_file"]),
         argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
         disposition: z.literal("unavailable"),
       })

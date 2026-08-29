@@ -145,6 +145,7 @@ export type AgentSessionDependencies = AgentSessionBaseDependencies &
   );
 
 export class AgentSession {
+  readonly #runtimeSessionId = randomUUID();
   readonly #listeners = new Set<RuntimeEventListener>();
   readonly #notificationListeners = new Set<RuntimeEventNotificationListener>();
   #nextNotification = 1;
@@ -232,7 +233,7 @@ export class AgentSession {
     const durablePromptContext = this.#durableContext?.promptContext;
     const selectedToolNames =
       durablePromptContext === undefined
-        ? ["read_file", "write_file", "edit_file", "run_shell"]
+        ? ["read_file", "search_repository", "write_file", "edit_file", "run_shell"]
         : durablePromptContext.toolProfile.definitions.map((definition) => definition.name);
     this.#tools =
       this.#durableContext !== undefined && durablePromptContext === undefined
@@ -1945,7 +1946,13 @@ export class AgentSession {
     if (adapter === undefined) {
       const result: ToolResult = {
         status: "failed",
-        error: { code: "unknown_tool", message: `Unknown tool: ${call.name}` },
+        error: {
+          code: "unknown_tool",
+          message:
+            call.name === "search_repository"
+              ? "Repository search is unavailable in this historical Tool Profile. Start a new session to use search_repository."
+              : `Unknown tool: ${call.name}`,
+        },
       };
       toolResultsById.set(call.id, { call, result });
       await this.#appendToolResult(messages, call, result);
@@ -2129,16 +2136,21 @@ export class AgentSession {
     if (signal.aborted) {
       return this.#settleCancelled();
     }
+    const executionContext = {
+      signal,
+      callId: call.id,
+      toolName: call.name,
+      sessionId: this.#durableContext?.sessionId ?? this.#runtimeSessionId,
+      toolProfileDigest: this.#promptContext?.toolProfile.digest ?? "prompt-profile-v0",
+    } as const;
     const result =
       call.name === "activate_skill"
         ? await this.#activateModelSelectedSkill(call)
         : call.name === "read_skill_resource"
           ? await this.#readSkillResource(call)
           : call.name === "read_input_resource"
-            ? await this.#readInputResource(call, () =>
-                preparedCall.execute({ signal, callId: call.id, toolName: call.name }),
-              )
-            : await preparedCall.execute({ signal, callId: call.id, toolName: call.name });
+            ? await this.#readInputResource(call, () => preparedCall.execute(executionContext))
+            : await preparedCall.execute(executionContext);
     toolResultsById.set(call.id, { call, result });
     await this.#appendToolResult(messages, call, result);
     if (result.status === "failed" && result.error.code === "tool_effect_indeterminate") {
@@ -2621,7 +2633,10 @@ export class AgentSession {
     if (
       context === undefined ||
       workspaceRoot === undefined ||
-      (call.name !== "read_file" && call.name !== "write_file" && call.name !== "edit_file")
+      (call.name !== "read_file" &&
+        call.name !== "search_repository" &&
+        call.name !== "write_file" &&
+        call.name !== "edit_file")
     ) {
       return undefined;
     }
@@ -2694,7 +2709,7 @@ export class AgentSession {
     if (runId === undefined) {
       throw new TypeError("Repository activation requires one active run.");
     }
-    const mutation = call.name !== "read_file";
+    const mutation = call.name !== "read_file" && call.name !== "search_repository";
     await this.#appendRecord({
       schemaVersion: 3,
       sequence: this.#nextSequence,
@@ -2797,7 +2812,7 @@ export class AgentSession {
           trigger: {
             runId,
             callId: call.id,
-            name: call.name as "read_file" | "write_file" | "edit_file",
+            name: call.name as "read_file" | "search_repository" | "write_file" | "edit_file",
             argumentsDigest: `sha256:${createHash("sha256")
               .update(call.argumentsJson, "utf8")
               .digest("hex")}`,
@@ -2814,7 +2829,7 @@ export class AgentSession {
       | PromptContextRecordV2
       | PromptContextRecordV3;
     nextPromptContext = replacePromptSkillsV2(nextPromptContext, nextSkillContext);
-    const mutation = call.name !== "read_file";
+    const mutation = call.name !== "read_file" && call.name !== "search_repository";
     await this.#appendRecord({
       schemaVersion: 3,
       sequence: this.#nextSequence,
@@ -2831,7 +2846,7 @@ export class AgentSession {
         trigger: {
           runId,
           callId: call.id,
-          name: call.name as "read_file" | "write_file" | "edit_file",
+          name: call.name as "read_file" | "search_repository" | "write_file" | "edit_file",
           argumentsDigest: `sha256:${createHash("sha256")
             .update(call.argumentsJson, "utf8")
             .digest("hex")}`,

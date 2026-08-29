@@ -23,6 +23,10 @@ import {
   type PatchFileSystem,
   PatchTransactionError,
 } from "./patch-transaction.js";
+import {
+  createRepositorySearchToolAdapter,
+  type RepositorySearchBackend,
+} from "./repository-search.js";
 
 export type ToolEffect = "read" | "write" | "execute" | "network" | "delegate" | "administrative";
 
@@ -89,6 +93,9 @@ export type ToolResult =
               | "input_resource_not_visible"
               | "input_resource_quota_exceeded"
               | "input_resource_unsupported"
+              | "search_cursor_invalid"
+              | "search_cursor_stale"
+              | "search_quota_exceeded"
               | "artifact_store_failed"
               | "mcp_protocol_error"
               | "mcp_output_invalid"
@@ -196,6 +203,8 @@ type ToolExecutionContext = {
   readonly signal: AbortSignal;
   readonly callId: string;
   readonly toolName: string;
+  readonly sessionId: string;
+  readonly toolProfileDigest: string;
 };
 
 class ToolExecutionError extends Error {
@@ -417,6 +426,13 @@ const runShellOutputSchema = z.strictObject({
 });
 
 export function createReadToolRegistry(options: { readonly workspaceRoot: string }): ToolRegistry {
+  return createReadToolRegistryInternal(options);
+}
+
+function createReadToolRegistryInternal(options: {
+  readonly workspaceRoot: string;
+  readonly repositorySearchBackend?: RepositorySearchBackend;
+}): ToolRegistry {
   const workspaceRoot = resolve(options.workspaceRoot);
   const readFileAdapter = identifyToolAdapter(
     {
@@ -463,7 +479,18 @@ export function createReadToolRegistry(options: { readonly workspaceRoot: string
     },
     "safe",
   );
-  const adapters = new Map([[readFileAdapter.definition.name, readFileAdapter]]);
+  const repositorySearchAdapter = identifyToolAdapter(
+    createRepositorySearchToolAdapter({
+      workspaceRoot,
+      ...(options.repositorySearchBackend === undefined
+        ? {}
+        : { backendForTesting: options.repositorySearchBackend }),
+    }),
+    "safe",
+  );
+  const adapters = new Map(
+    [readFileAdapter, repositorySearchAdapter].map((adapter) => [adapter.definition.name, adapter]),
+  );
 
   return {
     definitions() {
@@ -720,7 +747,8 @@ export function createCodingToolRegistryForTesting(options: {
   readonly stateRoot?: string;
   readonly artifactStore?: ArtifactStore;
   readonly shellLimits?: ShellRuntimeLimits;
-  readonly patchFileSystem: PatchFileSystem;
+  readonly patchFileSystem?: PatchFileSystem;
+  readonly repositorySearchBackend?: RepositorySearchBackend;
 }): ToolRegistry {
   return createCodingToolRegistryInternal(options);
 }
@@ -731,6 +759,7 @@ function createCodingToolRegistryInternal(options: {
   readonly artifactStore?: ArtifactStore;
   readonly shellLimits?: ShellRuntimeLimits;
   readonly patchFileSystem?: PatchFileSystem;
+  readonly repositorySearchBackend?: RepositorySearchBackend;
 }): ToolRegistry {
   const workspaceRoot = resolve(options.workspaceRoot);
   const shellLimits = options.shellLimits ?? defaultShellRuntimeLimits;
@@ -739,7 +768,12 @@ function createCodingToolRegistryInternal(options: {
     command: z.string().min(1),
     timeoutMs: z.number().int().positive().max(shellLimits.timeoutMs).optional(),
   });
-  const readTools = createReadToolRegistry({ workspaceRoot });
+  const readTools = createReadToolRegistryInternal({
+    workspaceRoot,
+    ...(options.repositorySearchBackend === undefined
+      ? {}
+      : { repositorySearchBackend: options.repositorySearchBackend }),
+  });
   const mutationTools = createMutationToolRegistryInternal({
     workspaceRoot,
     ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
@@ -926,6 +960,7 @@ function createCodingToolRegistryInternal(options: {
   });
   const adapters = [
     requireAdapter(readTools, "read_file"),
+    requireAdapter(readTools, "search_repository"),
     requireAdapter(mutationTools, "write_file"),
     requireAdapter(mutationTools, "edit_file"),
     shellAdapter,

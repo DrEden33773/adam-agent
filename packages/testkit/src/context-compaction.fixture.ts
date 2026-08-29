@@ -31,8 +31,8 @@ const contextProfile: ContextProfile = {
   version: 1,
   contextWindowTokens: 20_000,
   maximumOutputTokens: 100,
-  compactAtTokens: 2_000,
-  postCompactTargetTokens: 1_600,
+  compactAtTokens: 4_000,
+  postCompactTargetTokens: 3_000,
   retainedTargetTokens: 100,
   estimatorVersion: 1,
 };

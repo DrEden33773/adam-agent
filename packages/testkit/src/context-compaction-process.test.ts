@@ -543,7 +543,7 @@ async function createProcessHarness(prefix: string): Promise<{
   await mkdir(workspaceRoot);
   await writeFile(
     join(workspaceRoot, "context.txt"),
-    `${"process context line\n".repeat(500)}PROCESS_RAW_CONTEXT_TAIL`,
+    `${"process context line\n".repeat(1_200)}PROCESS_RAW_CONTEXT_TAIL`,
     "utf8",
   );
   const created = await createSessionLifecycle({

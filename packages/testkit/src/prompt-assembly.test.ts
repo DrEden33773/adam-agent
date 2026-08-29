@@ -49,6 +49,55 @@ const contextProfile: ContextProfile = {
   estimatorVersion: 1,
 };
 
+const expectedSearchRepositoryTool = {
+  name: "search_repository",
+  description:
+    "Search repository content or paths with search-repository.v1. Results use ignore/hidden/symlink and 8 KiB binary rules, deterministic relevance plus same-tier Git ranking, at most 50 results per 16 KiB page, and runtime-local immutable cursors bounded to 8 live snapshots, 16 MiB aggregate, 4,096 results and 4 MiB each, 16,384 ranked candidates, 64 MiB raw bytes, 100,000 raw records, 200,000 work records, and 10 minutes idle. Results are discovery evidence; reread current content with read_file before relying on it.",
+  inputSchema: {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    oneOf: [
+      {
+        type: "object",
+        properties: {
+          kind: { type: "string", const: "content" },
+          query: { type: "string", minLength: 1, maxLength: 4_096 },
+          mode: { type: "string", enum: ["literal", "regex"] },
+          case: { type: "string", enum: ["smart", "sensitive", "insensitive"] },
+          include: {
+            maxItems: 16,
+            type: "array",
+            items: { type: "string", minLength: 1, maxLength: 512 },
+          },
+          exclude: {
+            maxItems: 16,
+            type: "array",
+            items: { type: "string", minLength: 1, maxLength: 512 },
+          },
+          context: { type: "integer", minimum: 0, maximum: 3 },
+          path: { type: "string", minLength: 1, maxLength: 4_096 },
+          limit: { type: "integer", minimum: 1, maximum: 50 },
+          cursor: { type: "string", minLength: 1, maxLength: 1_024 },
+        },
+        required: ["kind", "query"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
+        properties: {
+          kind: { type: "string", const: "path" },
+          query: { type: "string", minLength: 1, maxLength: 4_096 },
+          mode: { type: "string", enum: ["fuzzy", "glob"] },
+          path: { type: "string", minLength: 1, maxLength: 4_096 },
+          limit: { type: "integer", minimum: 1, maximum: 50 },
+          cursor: { type: "string", minLength: 1, maxLength: 1_024 },
+        },
+        required: ["kind", "query"],
+        additionalProperties: false,
+      },
+    ],
+  },
+} as const;
+
 const expectedCodingTools = [
   {
     name: "read_file",
@@ -61,6 +110,7 @@ const expectedCodingTools = [
       additionalProperties: false,
     },
   },
+  expectedSearchRepositoryTool,
   {
     name: "write_file",
     description:
@@ -224,9 +274,9 @@ const expectedCodingTools = [
     },
   },
 ] as const;
-const expectedHistoricalCodingTools = expectedCodingTools.slice(0, 4);
+const expectedTransientCodingTools = expectedCodingTools.slice(0, 5);
 
-test("a newly created v3 session sends code-owned prompts before the current user request with the exact seven-tool profile", async () => {
+test("a newly created v3 session sends code-owned prompts before the current user request with the exact eight-tool profile", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-prompt-assembly-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -367,8 +417,8 @@ test.each([
       answer: "Permission observed.",
     });
     expect(requests.map((request) => request.tools)).toEqual([
-      [expectedCodingTools[0]],
-      [expectedCodingTools[0]],
+      [expectedCodingTools[0], expectedCodingTools[1]],
+      [expectedCodingTools[0], expectedCodingTools[1]],
     ]);
   } finally {
     await rm(workspaceRoot, { recursive: true, force: true });
@@ -400,6 +450,10 @@ test("a new v3 session persists bounded prompt and Skill identity without exposi
           digest: "sha256:84c7b9fde73815162c795cd0a12361061332b903018efe55266598639014cff3",
         },
         {
+          name: "search_repository",
+          digest: "sha256:d55a2ababa77640301923a1867f8d0c457e012ef1f7ab50e6bfd6ac697e07812",
+        },
+        {
           name: "write_file",
           digest: "sha256:5ed8fbf39d91e2b6a3fd9a10454b80cdef473d2d98d61d90d776a73c3356e939",
         },
@@ -424,7 +478,7 @@ test("a new v3 session persists bounded prompt and Skill identity without exposi
           digest: "sha256:682b2ff206b5456ecaa4fc96384c3a9531475cca89b70776f13619ee80492d52",
         },
       ],
-      digest: "sha256:b25da1fc060ca3e6f923e946f0f54bdfd7e7c7732ef9703d23da468ef95fb194",
+      digest: "sha256:373ca18a3d00a82eacf0168e76848a6eae7e002b074f97c254981595608d4d1b",
     },
     repository: {
       version: 1,
@@ -498,10 +552,10 @@ test("v3 accounting compacts for the assembled messages and tools while keeping 
   });
   const accountingProfile: ContextProfile = {
     ...contextProfile,
-    contextWindowTokens: 4_000,
+    contextWindowTokens: 5_000,
     maximumOutputTokens: 100,
-    compactAtTokens: 2_000,
-    postCompactTargetTokens: 1_800,
+    compactAtTokens: 3_000,
+    postCompactTargetTokens: 2_500,
     retainedTargetTokens: 0,
   };
   const accountingInput = `Account for the assembled request. ${"context ".repeat(800)}`;
@@ -543,6 +597,7 @@ test("v3 accounting compacts for the assembled messages and tools while keeping 
       [],
       [
         "read_file",
+        "search_repository",
         "write_file",
         "edit_file",
         "run_shell",
@@ -558,7 +613,7 @@ test("v3 accounting compacts for the assembled messages and tools while keeping 
   }
 });
 
-test("transient v1 base and four coding tools reduce the profile-v2 ordinary output clamp", async () => {
+test("transient v1 base and five coding tools reduce the profile-v2 ordinary output clamp", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-prompt-output-clamp-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -598,8 +653,8 @@ test("transient v1 base and four coding tools reduce the profile-v2 ordinary out
         { role: "system", content: basePrompt },
         { role: "user", content: "Clamp v1." },
       ],
-      tools: expectedHistoricalCodingTools,
-      maximumOutputTokens: 7_007,
+      tools: expectedTransientCodingTools,
+      maximumOutputTokens: 6_563,
     });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -778,11 +833,9 @@ test("a pre-B6 schema-v3 session keeps historical prompt profile v0", async () =
     expect(observedRequests[1]?.messages).toEqual([
       { role: "user", content: "Continue the historical branch." },
     ]);
-    expect(observedRequests[0]?.tools.map((tool) => tool.name)).toEqual([
-      "read_file",
-      "write_file",
-      "edit_file",
-      "run_shell",
+    expect(observedRequests.map((request) => request.tools.map((tool) => tool.name))).toEqual([
+      ["read_file", "write_file", "edit_file", "run_shell"],
+      ["read_file", "write_file", "edit_file", "run_shell"],
     ]);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -1385,11 +1438,11 @@ test("a v3 provider attempt persists only the safe exact request projection dige
     expect({ continuedPromptContext, inspectedPromptContext }).toMatchObject({
       continuedPromptContext: {
         lastRequestProjectionDigest:
-          "sha256:9e981d5b1658c5ab788d702d2ac4c8c76d018ac4ea1a299e06ca3992360cd8f3",
+          "sha256:89ecb6411851333748a10d0c28842015beb46d0ba5ce03f864533401f38a633d",
       },
       inspectedPromptContext: {
         lastRequestProjectionDigest:
-          "sha256:9e981d5b1658c5ab788d702d2ac4c8c76d018ac4ea1a299e06ca3992360cd8f3",
+          "sha256:89ecb6411851333748a10d0c28842015beb46d0ba5ce03f864533401f38a633d",
       },
     });
     expect(JSON.stringify({ continued, inspected })).not.toContain("Inspect the project.");

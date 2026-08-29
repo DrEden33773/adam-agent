@@ -4587,6 +4587,7 @@ test.each(["missing", "truncated", "same-size corrupt"] as const)(
       fixture.write("Recover one unavailable reasoning range\r");
       await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforePrompt);
       await waitForPath(join(controlRoot, "reasoning-session-settled"));
+      await fixture.waitFor("Adam · Streaming session");
       const artifactRoot = join(stateRoot, "artifacts");
       const artifactRelativePaths = (await readdir(artifactRoot, { recursive: true })).filter(
         (path): path is string => typeof path === "string" && !path.endsWith(".tmp"),
@@ -5527,6 +5528,29 @@ test("a real read tool is rendered as a bounded Pi-style tool card", async () =>
     await fixture.waitFor("Read complete");
     await fixture.waitFor("1 │ # Fixture");
     await fixture.waitFor("3 │ Readable content.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a real repository search is rendered as one bounded read-like tool card", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-search-tool-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "alpha.ts"), "export const orchard = 1;\n", "utf8");
+  await writeFile(join(workspaceRoot, "beta.ts"), "export const orchard = 2;\n", "utf8");
+
+  try {
+    const fixture = startFixture({ noColor: true, scenario: "search", stateRoot, workspaceRoot });
+    await fixture.waitForCompleteFrameAfter("Adam · New session", 0);
+    await fixture.waitForCompleteFrameAfter(" · idle", 0);
+    fixture.write("Search orchard\r");
+    await fixture.waitFor("Search complete.");
+    expect(fixture.output()).toContain("search .");
+    expect(fixture.output()).toContain("2 results");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
