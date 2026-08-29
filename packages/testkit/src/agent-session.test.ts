@@ -37,6 +37,7 @@ import {
 import {
   createCodingToolRegistryForTesting,
   createPromptContextV1,
+  type SessionRecord,
   sessionDurableContext,
 } from "@adam-agent/agent/internal-testing";
 import { describe, expect, expectTypeOf, test } from "vitest";
@@ -313,7 +314,15 @@ describe("AgentSession", () => {
     );
     const artifactId = `sha256:${createHash("sha256").update(bytes).digest("hex")}` as const;
     const occurrence = imageOccurrence(artifactId, bytes.byteLength, "lazy-image");
-    const artifactStore = inMemoryImageArtifactStore(artifactId, bytes);
+    const underlyingArtifactStore = inMemoryImageArtifactStore(artifactId, bytes);
+    let artifactReads = 0;
+    const artifactStore: ArtifactStore = {
+      write: (input) => underlyingArtifactStore.write(input),
+      async read(id, options) {
+        artifactReads += 1;
+        return underlyingArtifactStore.read(id, options);
+      },
+    };
     let call = 0;
     const model = new FakeModelDriver((request) => {
       call += 1;
@@ -375,6 +384,7 @@ describe("AgentSession", () => {
       ];
     });
     const tools = createCodingToolRegistry({ artifactStore, workspaceRoot: "/workspace" });
+    const store = createInMemorySessionStore<SessionRecord>();
     const dependencies = {
       artifactStore,
       maximumOutputTokens: 4_096,
@@ -385,7 +395,7 @@ describe("AgentSession", () => {
       },
       model,
       permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
-      store: createInMemorySessionStore(),
+      store: store as unknown as AgentSessionDependencies["store"],
       tools,
       [sessionDurableContext]: {
         inputResources: [occurrence],
@@ -412,7 +422,31 @@ describe("AgentSession", () => {
       status: "completed",
       answer: "The lazy image arrived as the real tool result.",
     });
-    expect(call).toBe(2);
+    expect({ call, artifactReads }).toEqual({ call: 2, artifactReads: 2 });
+    expect(
+      (await store.read())
+        .filter(
+          (record) =>
+            record.schemaVersion === 3 && record.record.type === "provider_attempt_started",
+        )
+        .map((record) =>
+          record.schemaVersion === 3 && record.record.type === "provider_attempt_started"
+            ? record.record.projectedContent
+            : undefined,
+        ),
+    ).toEqual([
+      undefined,
+      {
+        version: 1,
+        imageToolResults: {
+          count: 1,
+          byteCount: bytes.byteLength,
+          pixelCount: 1,
+          maximumWidth: 1,
+          maximumHeight: 1,
+        },
+      },
+    ]);
   });
 
   test("a provider reasoning block streams as structural runtime facts before the answer", async () => {

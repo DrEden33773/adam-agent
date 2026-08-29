@@ -5,6 +5,7 @@ import { AiSdkModelDriver } from "./ai-sdk-model-driver.js";
 import type { ContextProfile } from "./context-profile.js";
 import { DirectDeepSeekResponsesModelDriver } from "./deepseek-responses-model-driver.js";
 import {
+  createDirectDeepSeekResponsesThinkingCapability,
   createDirectDeepSeekThinkingCapability,
   type ThinkingCapabilityV1,
 } from "./thinking-policy.js";
@@ -433,7 +434,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
           connectionTest: "supported" as const,
           modalityProfile: directDeepSeekVisionResponsesV2ModalityProfile,
           upstreamLifecycle: "experimental" as const,
-          thinkingCapability: createDirectDeepSeekThinkingCapability(identity),
+          thinkingCapability: createDirectDeepSeekResponsesThinkingCapability(identity),
           driver: new DirectDeepSeekResponsesModelDriver({
             apiKey: options.environment.DEEPSEEK_API_KEY as string,
             baseURL: "https://api.deepseek.com",
@@ -509,7 +510,12 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
                     upstreamLifecycle: "experimental" as const,
                   }
                 : {}),
-            thinkingCapability: createDirectDeepSeekThinkingCapability(identity),
+            thinkingCapability: sameModelTargetIdentity(
+              identity,
+              directDeepSeekVisionResponsesV2Target,
+            )
+              ? createDirectDeepSeekResponsesThinkingCapability(identity)
+              : createDirectDeepSeekThinkingCapability(identity),
           })),
           {
             identity: experimentalGatewayTarget,

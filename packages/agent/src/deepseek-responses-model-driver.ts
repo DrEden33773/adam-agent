@@ -316,7 +316,12 @@ async function* normalizeResponsesEvents(
           | { readonly usage?: unknown; readonly status?: unknown }
           | undefined;
         const usage = response?.usage as
-          | { readonly input_tokens?: unknown; readonly output_tokens?: unknown }
+          | {
+              readonly input_tokens?: unknown;
+              readonly output_tokens?: unknown;
+              readonly input_tokens_details?: unknown;
+              readonly output_tokens_details?: unknown;
+            }
           | undefined;
         if (usage !== undefined) {
           if (typeof usage.input_tokens !== "number" || typeof usage.output_tokens !== "number") {
@@ -326,11 +331,31 @@ async function* normalizeResponsesEvents(
             type: "usage",
             inputTokens: usage.input_tokens,
             outputTokens: usage.output_tokens,
+            ...(typeof (
+              usage.input_tokens_details as { readonly cached_tokens?: unknown } | undefined
+            )?.cached_tokens === "number"
+              ? {
+                  cachedInputTokens: (
+                    usage.input_tokens_details as { readonly cached_tokens: number }
+                  ).cached_tokens,
+                }
+              : {}),
+            ...(typeof (
+              usage.output_tokens_details as { readonly reasoning_tokens?: unknown } | undefined
+            )?.reasoning_tokens === "number"
+              ? {
+                  reasoningTokens: (
+                    usage.output_tokens_details as { readonly reasoning_tokens: number }
+                  ).reasoning_tokens,
+                }
+              : {}),
           };
         }
         const reason =
           event.type === "response.completed"
-            ? "stop"
+            ? calls.size > 0
+              ? "tool_calls"
+              : "stop"
             : event.type === "response.incomplete"
               ? "length"
               : "unknown";
@@ -351,7 +376,23 @@ async function* normalizeResponsesEvents(
 }
 
 async function responseError(response: Response, apiKey: string): Promise<ModelDriverError> {
-  const summary = (await response.text()).split(apiKey).join("[REDACTED]").slice(0, 512);
+  const raw = await readBoundedErrorBody(response);
+  let providerCode: string | undefined;
+  let providerMessage: string | undefined;
+  try {
+    const decoded = JSON.parse(raw) as {
+      readonly error?: { readonly code?: unknown; readonly message?: unknown };
+    };
+    providerCode =
+      typeof decoded.error?.code === "string"
+        ? decoded.error.code.split(apiKey).join("[REDACTED]").slice(0, 128)
+        : undefined;
+    providerMessage =
+      typeof decoded.error?.message === "string" ? decoded.error.message : undefined;
+  } catch {
+    providerMessage = undefined;
+  }
+  const summary = (providerMessage ?? raw).split(apiKey).join("[REDACTED]").slice(0, 512);
   const category =
     response.status === 401
       ? "authentication"
@@ -369,8 +410,43 @@ async function responseError(response: Response, apiKey: string): Promise<ModelD
   return new ModelDriverError(category, "The model provider rejected the Responses request.", {
     cause: undefined,
     status: response.status,
+    ...(providerCode === undefined ? {} : { providerCode }),
+    ...(response.headers.get("x-request-id") === null
+      ? {}
+      : { requestId: response.headers.get("x-request-id")?.slice(0, 128) }),
     ...(summary.length === 0 ? {} : { responseSummary: summary }),
   });
+}
+
+async function readBoundedErrorBody(response: Response): Promise<string> {
+  if (response.body === null) {
+    return "";
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      bytes += value.byteLength;
+      if (bytes > 256 * 1024) {
+        throw protocolError("The model provider error response exceeded Adam's limit.");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const combined = new Uint8Array(bytes);
+  let offset = 0;
+  for (const chunk of chunks) {
+    combined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(combined);
 }
 
 function protocolError(message: string, cause?: unknown): ModelDriverError {

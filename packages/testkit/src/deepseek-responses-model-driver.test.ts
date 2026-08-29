@@ -1,4 +1,5 @@
 import type { ModelRequest } from "@adam-agent/agent";
+import { ModelDriverError } from "@adam-agent/agent";
 import { DirectDeepSeekResponsesModelDriverForTesting } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
@@ -133,3 +134,129 @@ test("Direct Responses preserves function call identity and emits the image in i
     ],
   });
 });
+
+test("Direct Responses streams reasoning and fragmented function arguments with tool-call finish truth", async () => {
+  const driver = new DirectDeepSeekResponsesModelDriverForTesting({
+    apiKey: "test-secret",
+    baseURL: "https://api.deepseek.com",
+    maximumOutputTokens: 4_096,
+    model: "deepseek-v4-flash-vision-exp",
+    fetch: async () =>
+      new Response(
+        [
+          'data: {"type":"response.reasoning_text.delta","delta":"inspect"}\n\n',
+          'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"item-1","call_id":"call-1","name":"read_input_resource"}}\n\n',
+          'data: {"type":"response.function_call_arguments.delta","item_id":"item-1","delta":"{\\"occurrenceId\\":"}\n\n',
+          'data: {"type":"response.function_call_arguments.delta","item_id":"item-1","delta":"\\"image-1\\"}"}\n\n',
+          'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"item-1"}}\n\n',
+          'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":9,"output_tokens":4,"input_tokens_details":{"cached_tokens":2},"output_tokens_details":{"reasoning_tokens":3}}}}\n\n',
+        ].join(""),
+        { status: 200 },
+      ),
+  });
+  const events = [];
+  for await (const event of driver.stream({
+    messages: [{ role: "user", content: "inspect" }],
+    tools: [],
+    maximumOutputTokens: 2_048,
+    signal: new AbortController().signal,
+  })) {
+    events.push(event);
+  }
+
+  expect(events).toEqual([
+    {
+      type: "reasoning_start",
+      id: "provider-reasoning-0",
+      artifactType: "provider_reasoning",
+    },
+    { type: "reasoning_delta", id: "provider-reasoning-0", text: "inspect" },
+    { type: "tool_call_start", id: "call-1", name: "read_input_resource" },
+    { type: "tool_call_delta", id: "call-1", json: '{"occurrenceId":' },
+    { type: "tool_call_delta", id: "call-1", json: '"image-1"}' },
+    { type: "tool_call_end", id: "call-1" },
+    { type: "reasoning_end", id: "provider-reasoning-0" },
+    {
+      type: "usage",
+      inputTokens: 9,
+      outputTokens: 4,
+      cachedInputTokens: 2,
+      reasoningTokens: 3,
+    },
+    { type: "finish", reason: "tool_calls", rawReason: "completed" },
+  ]);
+});
+
+test("Direct Responses preserves caller cancellation during the provider request", async () => {
+  const started = Promise.withResolvers<AbortSignal>();
+  const driver = new DirectDeepSeekResponsesModelDriverForTesting({
+    apiKey: "test-secret",
+    baseURL: "https://api.deepseek.com",
+    maximumOutputTokens: 4_096,
+    model: "deepseek-v4-flash-vision-exp",
+    fetch: async (_input, init) => {
+      const signal = init?.signal as AbortSignal;
+      started.resolve(signal);
+      return await new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    },
+  });
+  const controller = new AbortController();
+  const error = collectError(
+    driver.stream({
+      messages: [{ role: "user", content: "cancel" }],
+      tools: [],
+      maximumOutputTokens: 2_048,
+      signal: controller.signal,
+    }),
+  );
+  await started.promise;
+  controller.abort(new DOMException("cancelled", "AbortError"));
+
+  await expect(error).resolves.toMatchObject({ category: "aborted" });
+});
+
+test("Direct Responses classifies bounded provider errors without retaining its credential", async () => {
+  const driver = new DirectDeepSeekResponsesModelDriverForTesting({
+    apiKey: "test-secret",
+    baseURL: "https://api.deepseek.com",
+    maximumOutputTokens: 4_096,
+    model: "deepseek-v4-flash-vision-exp",
+    fetch: async () =>
+      Response.json(
+        { error: { code: "billing_error", message: "balance test-secret" } },
+        { status: 402 },
+      ),
+  });
+  const error = await collectError(
+    driver.stream({
+      messages: [{ role: "user", content: "fail" }],
+      tools: [],
+      maximumOutputTokens: 2_048,
+      signal: new AbortController().signal,
+    }),
+  );
+
+  expect(error).toMatchObject({
+    category: "billing",
+    status: 402,
+    providerCode: "billing_error",
+    responseSummary: "balance [REDACTED]",
+  });
+  expect(JSON.stringify(error)).not.toContain("test-secret");
+});
+
+async function collectError(stream: AsyncIterable<unknown>): Promise<ModelDriverError> {
+  try {
+    for await (const _event of stream) {
+      // Consume until failure.
+    }
+  } catch (error) {
+    if (error instanceof ModelDriverError) {
+      return error;
+    }
+    throw error;
+  }
+  throw new Error("Expected the model driver to fail.");
+}

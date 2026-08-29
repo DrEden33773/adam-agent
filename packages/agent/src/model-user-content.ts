@@ -38,7 +38,8 @@ export { imageInputLimitsV1 } from "./image-input.js";
 
 export type ProjectedContentUsageV1 = {
   readonly version: 1;
-  readonly explicitUserImages: ProjectedExplicitUserImageUsageV1;
+  readonly explicitUserImages?: ProjectedExplicitUserImageUsageV1 | undefined;
+  readonly imageToolResults?: ProjectedExplicitUserImageUsageV1 | undefined;
 };
 
 type ProjectedExplicitUserImageUsageV1 = {
@@ -65,6 +66,15 @@ export async function projectExplicitUserImageContentV1(input: {
 }): Promise<ModelUserContentProjection> {
   if (input.occurrences === undefined || input.occurrences.length === 0) {
     return { status: "projected", content: input.text };
+  }
+  if (
+    input.modalityProfile?.explicitUserImages !== "supported" &&
+    input.modalityProfile?.imageToolResults === "supported"
+  ) {
+    return {
+      status: "projected",
+      content: projectInputResourcesV1(input.text, input.occurrences),
+    };
   }
   const images: Array<{
     readonly occurrenceId: string;
@@ -198,12 +208,6 @@ export async function projectExplicitUserImageContentV1(input: {
     };
   }
   if (input.modalityProfile?.explicitUserImages !== "supported") {
-    if (input.modalityProfile?.imageToolResults === "supported") {
-      return {
-        status: "projected",
-        content: projectInputResourcesV1(input.text, input.occurrences),
-      };
-    }
     return {
       status: "failed",
       error: {
@@ -386,28 +390,43 @@ export function projectedContentUsageV1(
   messages: readonly ModelMessage[],
   imageUsageByProjection: ReadonlyMap<ModelMessage, ProjectedExplicitUserImageUsageV1>,
 ): ProjectedContentUsageV1 | undefined {
-  let count = 0;
-  let byteCount = 0;
-  let pixelCount = 0;
-  let maximumWidth = 0;
-  let maximumHeight = 0;
+  const user = emptyProjectedImageUsage();
+  const tool = emptyProjectedImageUsage();
   for (const message of messages) {
     const usage = imageUsageByProjection.get(message);
     if (usage === undefined) {
       continue;
     }
-    count += usage.count;
-    byteCount += usage.byteCount;
-    pixelCount += usage.pixelCount;
-    maximumWidth = Math.max(maximumWidth, usage.maximumWidth);
-    maximumHeight = Math.max(maximumHeight, usage.maximumHeight);
+    addProjectedImageUsage(message.role === "tool" ? tool : user, usage);
   }
-  return count === 0
+  return user.count === 0 && tool.count === 0
     ? undefined
     : {
         version: 1,
-        explicitUserImages: { count, byteCount, pixelCount, maximumWidth, maximumHeight },
+        ...(user.count === 0 ? {} : { explicitUserImages: user }),
+        ...(tool.count === 0 ? {} : { imageToolResults: tool }),
       };
+}
+
+function emptyProjectedImageUsage(): {
+  count: number;
+  byteCount: number;
+  pixelCount: number;
+  maximumWidth: number;
+  maximumHeight: number;
+} {
+  return { count: 0, byteCount: 0, pixelCount: 0, maximumWidth: 0, maximumHeight: 0 };
+}
+
+function addProjectedImageUsage(
+  target: ReturnType<typeof emptyProjectedImageUsage>,
+  usage: ProjectedExplicitUserImageUsageV1,
+): void {
+  target.count += usage.count;
+  target.byteCount += usage.byteCount;
+  target.pixelCount += usage.pixelCount;
+  target.maximumWidth = Math.max(target.maximumWidth, usage.maximumWidth);
+  target.maximumHeight = Math.max(target.maximumHeight, usage.maximumHeight);
 }
 
 export function applyPreparedExplicitUserImageMessagesV1(

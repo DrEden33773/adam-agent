@@ -1385,11 +1385,11 @@ const sessionRunLimitsSchema = z.strictObject({
 });
 const thinkingPolicyMappingV1Schema = z.union([
   z.strictObject({
-    requestPath: z.literal("provider_options.deepseek"),
+    requestPath: z.enum(["provider_options.deepseek", "reasoning.effort"]),
     thinkingType: z.literal("disabled"),
   }),
   z.strictObject({
-    requestPath: z.literal("provider_options.deepseek"),
+    requestPath: z.enum(["provider_options.deepseek", "reasoning.effort"]),
     thinkingType: z.literal("enabled"),
     reasoningEffort: z.enum(["low", "high", "max"]),
   }),
@@ -1429,24 +1429,26 @@ const responseUsageSchema = z.strictObject({
   cachedInputTokens: z.number().int().nonnegative().optional(),
   cacheMissInputTokens: z.number().int().nonnegative().optional(),
 });
-const projectedContentUsageV1Schema: z.ZodType<ProjectedContentUsageV1> = z.strictObject({
-  version: z.literal(1),
-  explicitUserImages: z.strictObject({
-    count: z.number().int().positive().max(inputResourceLimitsV1.maximumOccurrencesPerLineage),
-    byteCount: z
-      .number()
-      .int()
-      .positive()
-      .max(inputResourceLimitsV1.maximumAggregateBytesPerLineage),
-    pixelCount: z
-      .number()
-      .int()
-      .positive()
-      .max(imageInputLimitsV1.maximumPixels * inputResourceLimitsV1.maximumOccurrencesPerLineage),
-    maximumWidth: z.number().int().positive().max(imageInputLimitsV1.maximumWidth),
-    maximumHeight: z.number().int().positive().max(imageInputLimitsV1.maximumHeight),
-  }),
+const projectedImageUsageV1Schema = z.strictObject({
+  count: z.number().int().positive().max(inputResourceLimitsV1.maximumOccurrencesPerLineage),
+  byteCount: z.number().int().positive().max(inputResourceLimitsV1.maximumAggregateBytesPerLineage),
+  pixelCount: z
+    .number()
+    .int()
+    .positive()
+    .max(imageInputLimitsV1.maximumPixels * inputResourceLimitsV1.maximumOccurrencesPerLineage),
+  maximumWidth: z.number().int().positive().max(imageInputLimitsV1.maximumWidth),
+  maximumHeight: z.number().int().positive().max(imageInputLimitsV1.maximumHeight),
 });
+const projectedContentUsageV1Schema: z.ZodType<ProjectedContentUsageV1> = z
+  .strictObject({
+    version: z.literal(1),
+    explicitUserImages: projectedImageUsageV1Schema.optional(),
+    imageToolResults: projectedImageUsageV1Schema.optional(),
+  })
+  .refine(
+    (value) => value.explicitUserImages !== undefined || value.imageToolResults !== undefined,
+  );
 const contextProfileSchema: z.ZodType<ContextProfile> = z.strictObject({
   version: z.number().int().positive(),
   contextWindowTokens: z.number().int().positive(),

@@ -2080,6 +2080,45 @@ function visionChatV1Identity(): ModelTargetIdentity {
 }
 
 function expectedDirectDeepSeekThinkingCapability(targetIdentity: ModelTargetIdentity) {
+  if (
+    targetIdentity.modelId === "deepseek-v4-flash-vision-exp" &&
+    targetIdentity.profileVersion === 2
+  ) {
+    return {
+      schemaVersion: 1,
+      capabilityId: `deepseek-responses-thinking:${targetIdentity.targetId}:target-profile-2`,
+      capabilityVersion: 1,
+      capabilityDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      targetIdentity,
+      providerProfile: {
+        id: "deepseek/responses",
+        version: "v1",
+        requestPath: "reasoning.effort",
+      },
+      supportsOff: true,
+      defaultLevelId: "high",
+      providerDefault: { effectiveLevelId: "high", mutable: true },
+      levels: [
+        {
+          id: "off",
+          label: "Off",
+          effectiveLevelId: "off",
+          mapping: { requestPath: "reasoning.effort", thinkingType: "disabled" },
+        },
+        ...(["low", "high", "max"] as const).map((reasoningEffort) => ({
+          id: reasoningEffort,
+          label: `${reasoningEffort[0]?.toUpperCase()}${reasoningEffort.slice(1)}`,
+          effectiveLevelId: reasoningEffort,
+          mapping: {
+            requestPath: "reasoning.effort",
+            thinkingType: "enabled",
+            reasoningEffort,
+          },
+        })),
+      ],
+      reasoningArtifact: "provider_reasoning",
+    };
+  }
   return {
     schemaVersion: 1,
     capabilityId: `deepseek-chat-thinking:${targetIdentity.targetId}:target-profile-${targetIdentity.profileVersion}`,
