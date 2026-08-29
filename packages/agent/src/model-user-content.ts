@@ -8,6 +8,8 @@ import { imageInputLimitsV1, inspectExplicitUserImageV1 } from "./image-input.js
 import {
   authorizedInputResourceOccurrencesV1,
   type InputResourceOccurrenceV1,
+  inputResourceImageV1Schema,
+  materializeInputResourceImageV1,
   parseInputResourceProjectionV1,
   projectInputResourcesV1,
 } from "./input-resources.js";
@@ -36,7 +38,8 @@ export { imageInputLimitsV1 } from "./image-input.js";
 
 export type ProjectedContentUsageV1 = {
   readonly version: 1;
-  readonly explicitUserImages: ProjectedExplicitUserImageUsageV1;
+  readonly explicitUserImages?: ProjectedExplicitUserImageUsageV1 | undefined;
+  readonly imageToolResults?: ProjectedExplicitUserImageUsageV1 | undefined;
 };
 
 type ProjectedExplicitUserImageUsageV1 = {
@@ -63,6 +66,15 @@ export async function projectExplicitUserImageContentV1(input: {
 }): Promise<ModelUserContentProjection> {
   if (input.occurrences === undefined || input.occurrences.length === 0) {
     return { status: "projected", content: input.text };
+  }
+  if (
+    input.modalityProfile?.explicitUserImages !== "supported" &&
+    input.modalityProfile?.imageToolResults === "supported"
+  ) {
+    return {
+      status: "projected",
+      content: projectInputResourcesV1(input.text, input.occurrences),
+    };
   }
   const images: Array<{
     readonly occurrenceId: string;
@@ -240,6 +252,7 @@ export async function projectExplicitUserImageContentV1(input: {
 
 export async function prepareExplicitUserImageMessagesV1(input: {
   readonly artifactStore: ArtifactStore | undefined;
+  readonly inputResources?: readonly InputResourceOccurrenceV1[];
   readonly messages: readonly ModelMessage[];
   readonly modalityProfile: ModelModalityProfile | undefined;
   readonly signal: AbortSignal;
@@ -262,6 +275,77 @@ export async function prepareExplicitUserImageMessagesV1(input: {
     ProjectedExplicitUserImageArtifactUsageV1
   >();
   for (const message of input.messages) {
+    if (message.role === "tool") {
+      const output = message.result.status === "completed" ? message.result.output : undefined;
+      const parsedImage = inputResourceImageV1Schema.safeParse(output);
+      if (!parsedImage.success) {
+        continue;
+      }
+      if (
+        input.modalityProfile?.imageToolResults !== "supported" ||
+        input.artifactStore === undefined
+      ) {
+        return {
+          status: "failed",
+          error: {
+            code: "input_resource_unsupported",
+            message: "The selected target does not support image-bearing tool results.",
+          },
+        };
+      }
+      const occurrence = input.inputResources?.find(
+        (candidate) => candidate.occurrenceId === parsedImage.data.occurrenceId,
+      );
+      try {
+        const materialized = await materializeInputResourceImageV1({
+          artifactStore: input.artifactStore,
+          occurrence,
+          occurrenceId: parsedImage.data.occurrenceId,
+          signal: input.signal,
+        });
+        if (JSON.stringify(materialized.descriptor) !== JSON.stringify(parsedImage.data)) {
+          return {
+            status: "failed",
+            error: {
+              code: "input_resource_invalid",
+              message: "The image-bearing tool result does not match canonical resource truth.",
+            },
+          };
+        }
+        projections.set(message, [
+          {
+            type: "file",
+            artifactId: materialized.descriptor.artifactId,
+            mediaType: materialized.descriptor.mediaType,
+            bytes: materialized.bytes,
+          },
+        ]);
+        const usage = {
+          count: 1,
+          byteCount: materialized.bytes.byteLength,
+          pixelCount: materialized.descriptor.width * materialized.descriptor.height,
+          maximumWidth: materialized.descriptor.width,
+          maximumHeight: materialized.descriptor.height,
+        };
+        imageUsageByProjection.set(message, usage);
+        imageUsageByArtifactId.set(materialized.descriptor.artifactId, {
+          byteCount: usage.byteCount,
+          pixelCount: usage.pixelCount,
+          width: usage.maximumWidth,
+          height: usage.maximumHeight,
+        });
+      } catch {
+        input.signal.throwIfAborted();
+        return {
+          status: "failed",
+          error: {
+            code: "input_resource_invalid",
+            message: "The image-bearing tool result is unavailable or corrupt.",
+          },
+        };
+      }
+      continue;
+    }
     if (message.role !== "user" || typeof message.content !== "string") {
       continue;
     }
@@ -307,28 +391,43 @@ export function projectedContentUsageV1(
   messages: readonly ModelMessage[],
   imageUsageByProjection: ReadonlyMap<ModelMessage, ProjectedExplicitUserImageUsageV1>,
 ): ProjectedContentUsageV1 | undefined {
-  let count = 0;
-  let byteCount = 0;
-  let pixelCount = 0;
-  let maximumWidth = 0;
-  let maximumHeight = 0;
+  const user = emptyProjectedImageUsage();
+  const tool = emptyProjectedImageUsage();
   for (const message of messages) {
     const usage = imageUsageByProjection.get(message);
     if (usage === undefined) {
       continue;
     }
-    count += usage.count;
-    byteCount += usage.byteCount;
-    pixelCount += usage.pixelCount;
-    maximumWidth = Math.max(maximumWidth, usage.maximumWidth);
-    maximumHeight = Math.max(maximumHeight, usage.maximumHeight);
+    addProjectedImageUsage(message.role === "tool" ? tool : user, usage);
   }
-  return count === 0
+  return user.count === 0 && tool.count === 0
     ? undefined
     : {
         version: 1,
-        explicitUserImages: { count, byteCount, pixelCount, maximumWidth, maximumHeight },
+        ...(user.count === 0 ? {} : { explicitUserImages: user }),
+        ...(tool.count === 0 ? {} : { imageToolResults: tool }),
       };
+}
+
+function emptyProjectedImageUsage(): {
+  count: number;
+  byteCount: number;
+  pixelCount: number;
+  maximumWidth: number;
+  maximumHeight: number;
+} {
+  return { count: 0, byteCount: 0, pixelCount: 0, maximumWidth: 0, maximumHeight: 0 };
+}
+
+function addProjectedImageUsage(
+  target: ReturnType<typeof emptyProjectedImageUsage>,
+  usage: ProjectedExplicitUserImageUsageV1,
+): void {
+  target.count += usage.count;
+  target.byteCount += usage.byteCount;
+  target.pixelCount += usage.pixelCount;
+  target.maximumWidth = Math.max(target.maximumWidth, usage.maximumWidth);
+  target.maximumHeight = Math.max(target.maximumHeight, usage.maximumHeight);
 }
 
 export function applyPreparedExplicitUserImageMessagesV1(
@@ -340,6 +439,11 @@ export function applyPreparedExplicitUserImageMessagesV1(
   }
   return messages.map((message) => {
     const projected = projections.get(message);
-    return projected === undefined ? message : { role: "user", content: projected };
+    if (projected === undefined) {
+      return message;
+    }
+    return message.role === "tool"
+      ? { ...message, content: typeof projected === "string" ? [] : projected }
+      : { role: "user", content: projected };
   });
 }

@@ -34,7 +34,12 @@ import {
   type SessionEventRecord,
   type SessionStore,
 } from "@adam-agent/agent";
-import { createCodingToolRegistryForTesting } from "@adam-agent/agent/internal-testing";
+import {
+  createCodingToolRegistryForTesting,
+  createPromptContextV1,
+  type SessionRecord,
+  sessionDurableContext,
+} from "@adam-agent/agent/internal-testing";
 import { describe, expect, expectTypeOf, test } from "vitest";
 
 import { FakeModelDriver } from "./index.js";
@@ -218,12 +223,13 @@ describe("AgentSession", () => {
         { type: "finish", reason: "stop" },
       ];
     });
-    const session = new AgentSession({
+    const dependencies = {
       artifactStore,
       maximumOutputTokens: 4_096,
       model,
       store: createInMemorySessionStore(),
-    });
+    } as const;
+    const session = new AgentSession(dependencies);
 
     await expect(
       session.run({
@@ -299,6 +305,241 @@ describe("AgentSession", () => {
       },
     });
     expect({ artifactReads, modelCalls }).toEqual({ artifactReads: 0, modelCalls: 0 });
+  });
+
+  test("a Vision Responses run returns one linked image through the real resource tool without a synthetic user", async () => {
+    const bytes = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    );
+    const artifactId = `sha256:${createHash("sha256").update(bytes).digest("hex")}` as const;
+    const occurrence = imageOccurrence(artifactId, bytes.byteLength, "lazy-image");
+    const underlyingArtifactStore = inMemoryImageArtifactStore(artifactId, bytes);
+    let artifactReads = 0;
+    const artifactStore: ArtifactStore = {
+      write: (input) => underlyingArtifactStore.write(input),
+      async read(id, options) {
+        artifactReads += 1;
+        return underlyingArtifactStore.read(id, options);
+      },
+    };
+    let call = 0;
+    const model = new FakeModelDriver((request) => {
+      call += 1;
+      if (call === 1) {
+        expect(request.messages.at(-1)).toMatchObject({
+          role: "user",
+          content: expect.stringContaining('"occurrenceId":"lazy-image"'),
+        });
+        expect(
+          request.messages.flatMap((message) =>
+            "content" in message && Array.isArray(message.content)
+              ? message.content.filter((part) => part.type === "file")
+              : [],
+          ),
+        ).toEqual([]);
+        return [
+          { type: "tool_call_start", id: "read-lazy-image", name: "read_input_resource" },
+          {
+            type: "tool_call_delta",
+            id: "read-lazy-image",
+            json: JSON.stringify({ occurrenceId: occurrence.occurrenceId, maxByteCount: 64 }),
+          },
+          { type: "tool_call_end", id: "read-lazy-image" },
+          { type: "finish", reason: "tool_calls" },
+        ];
+      }
+      expect(request.messages.filter((message) => message.role === "user")).toHaveLength(1);
+      expect(request.messages.at(-1)).toEqual({
+        role: "tool",
+        callId: "read-lazy-image",
+        name: "read_input_resource",
+        result: {
+          status: "completed",
+          output: {
+            schemaVersion: 1,
+            type: "image",
+            occurrenceId: occurrence.occurrenceId,
+            displayName: occurrence.displayName,
+            artifactId,
+            byteCount: bytes.byteLength,
+            digest: artifactId,
+            mediaType: "image/png",
+            width: 1,
+            height: 1,
+          },
+        },
+        content: [
+          {
+            type: "file",
+            artifactId,
+            mediaType: "image/png",
+            bytes: new Uint8Array(bytes),
+          },
+        ],
+      });
+      return [
+        { type: "text_delta", text: "The lazy image arrived as the real tool result." },
+        { type: "finish", reason: "stop" },
+      ];
+    });
+    const tools = createCodingToolRegistry({ artifactStore, workspaceRoot: "/workspace" });
+    const store = createInMemorySessionStore<SessionRecord>();
+    const dependencies = {
+      artifactStore,
+      maximumOutputTokens: 4_096,
+      modalityProfile: {
+        profileVersion: 1,
+        explicitUserImages: "unsupported",
+        imageToolResults: "supported",
+      },
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      store: store as unknown as AgentSessionDependencies["store"],
+      tools,
+      [sessionDurableContext]: {
+        inputResources: [occurrence],
+        nextSequence: 1,
+        promptContext: createPromptContextV1(tools),
+        targetIdentity: {
+          targetId: "deepseek-v4-flash-vision-exp.direct",
+          vendor: "deepseek",
+          modelId: "deepseek-v4-flash-vision-exp",
+          route: "direct",
+          profileVersion: 2,
+          certification: "certified",
+        },
+      },
+    } as const;
+    const session = new AgentSession(dependencies);
+
+    await expect(
+      session.run({
+        text: "Use the resource tool to inspect this linked image.",
+        inputResources: [occurrence],
+      }),
+    ).resolves.toEqual({
+      status: "completed",
+      answer: "The lazy image arrived as the real tool result.",
+    });
+    expect({ call, artifactReads }).toEqual({ call: 2, artifactReads: 2 });
+    expect(
+      (await store.read())
+        .filter(
+          (record) =>
+            record.schemaVersion === 3 && record.record.type === "provider_attempt_started",
+        )
+        .map((record) =>
+          record.schemaVersion === 3 && record.record.type === "provider_attempt_started"
+            ? record.record.projectedContent
+            : undefined,
+        ),
+    ).toEqual([
+      undefined,
+      {
+        version: 1,
+        imageToolResults: {
+          count: 1,
+          byteCount: bytes.byteLength,
+          pixelCount: 1,
+          maximumWidth: 1,
+          maximumHeight: 1,
+        },
+      },
+    ]);
+  });
+
+  test("Vision Responses cancellation during image tool-result projection remains caller cancellation", async () => {
+    const bytes = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    );
+    const artifactId = `sha256:${createHash("sha256").update(bytes).digest("hex")}` as const;
+    const occurrence = imageOccurrence(artifactId, bytes.byteLength, "cancel-image-projection");
+    const readStarted = Promise.withResolvers<void>();
+    const releaseRead = Promise.withResolvers<void>();
+    let call = 0;
+    const model = new FakeModelDriver(() => {
+      call += 1;
+      return call === 1
+        ? [
+            {
+              type: "tool_call_start",
+              id: "cancel-image-read",
+              name: "read_input_resource",
+            },
+            {
+              type: "tool_call_delta",
+              id: "cancel-image-read",
+              json: JSON.stringify({ occurrenceId: occurrence.occurrenceId }),
+            },
+            { type: "tool_call_end", id: "cancel-image-read" },
+            { type: "finish", reason: "tool_calls" },
+          ]
+        : [{ type: "finish", reason: "stop" }];
+    });
+    let artifactReads = 0;
+    const artifactStore: ArtifactStore = {
+      async write(input) {
+        return {
+          id: artifactId,
+          mediaType: input.mediaType,
+          byteCount: input.bytes.byteLength,
+          source: input.source,
+        };
+      },
+      async read(id) {
+        artifactReads += 1;
+        if (artifactReads === 2) {
+          readStarted.resolve();
+          await releaseRead.promise;
+        }
+        return id === artifactId ? new Uint8Array(bytes) : undefined;
+      },
+    };
+    const tools = createCodingToolRegistry({ artifactStore, workspaceRoot: "/workspace" });
+    const session = new AgentSession({
+      artifactStore,
+      maximumOutputTokens: 4_096,
+      modalityProfile: {
+        profileVersion: 1,
+        explicitUserImages: "unsupported",
+        imageToolResults: "supported",
+      },
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      store: createInMemorySessionStore(),
+      tools,
+      [sessionDurableContext]: {
+        inputResources: [occurrence],
+        nextSequence: 1,
+        promptContext: createPromptContextV1(tools),
+        targetIdentity: {
+          targetId: "deepseek-v4-flash-vision-exp.direct",
+          vendor: "deepseek",
+          modelId: "deepseek-v4-flash-vision-exp",
+          route: "direct",
+          profileVersion: 2,
+          certification: "certified",
+        },
+      },
+    } as ConstructorParameters<typeof AgentSession>[0] & {
+      readonly [sessionDurableContext]: unknown;
+    });
+    const controller = new AbortController();
+    const result = session.run(
+      {
+        text: "Read the linked image, then inspect it.",
+        inputResources: [occurrence],
+      },
+      { signal: controller.signal },
+    );
+    await readStarted.promise;
+    controller.abort(new DOMException("cancelled", "AbortError"));
+    releaseRead.resolve();
+
+    await expect(result).resolves.toEqual(cancelledResult);
+    expect({ artifactReads, call }).toEqual({ artifactReads: 2, call: 1 });
   });
 
   test("a provider reasoning block streams as structural runtime facts before the answer", async () => {

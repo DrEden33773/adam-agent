@@ -95,6 +95,7 @@ test("the exact Vision Chat target projects immutable PNG bytes through Direct C
   });
   const resolved = await targets.resolve({
     targetId: "deepseek-v4-flash-vision-exp.direct",
+    targetIdentity: visionChatV1Identity(),
     allowExperimental: false,
     signal: new AbortController().signal,
   });
@@ -188,6 +189,7 @@ test("the exact Vision Chat target classifies a provider error for structured im
   });
   const { driver } = await targets.resolve({
     targetId: "deepseek-v4-flash-vision-exp.direct",
+    targetIdentity: visionChatV1Identity(),
     allowExperimental: false,
     signal: new AbortController().signal,
   });
@@ -226,6 +228,7 @@ test("the exact Vision Chat target preserves cancellation during structured imag
   });
   const { driver } = await targets.resolve({
     targetId: "deepseek-v4-flash-vision-exp.direct",
+    targetIdentity: visionChatV1Identity(),
     allowExperimental: false,
     signal: new AbortController().signal,
   });
@@ -2004,7 +2007,7 @@ test("the target snapshot reports exact Certified identities and safe credential
           vendor: "deepseek",
           modelId: "deepseek-v4-flash-vision-exp",
           route: "direct",
-          profileVersion: 1,
+          profileVersion: 2,
           certification: "certified",
         },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
@@ -2021,8 +2024,8 @@ test("the target snapshot reports exact Certified identities and safe credential
         },
         modalityProfile: {
           profileVersion: 1,
-          explicitUserImages: "supported",
-          imageToolResults: "unsupported",
+          explicitUserImages: "unsupported",
+          imageToolResults: "supported",
         },
         upstreamLifecycle: "experimental",
         connectionTest: "supported",
@@ -2031,7 +2034,7 @@ test("the target snapshot reports exact Certified identities and safe credential
           vendor: "deepseek",
           modelId: "deepseek-v4-flash-vision-exp",
           route: "direct",
-          profileVersion: 1,
+          profileVersion: 2,
           certification: "certified",
         }),
       },
@@ -2062,7 +2065,57 @@ test("the target snapshot reports exact Certified identities and safe credential
   expect(snapshot.targets.every(({ identity }) => Object.isFrozen(identity))).toBe(true);
 });
 
+function visionChatV1Identity(): ModelTargetIdentity {
+  return {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  };
+}
+
 function expectedDirectDeepSeekThinkingCapability(targetIdentity: ModelTargetIdentity) {
+  if (
+    targetIdentity.modelId === "deepseek-v4-flash-vision-exp" &&
+    targetIdentity.profileVersion === 2
+  ) {
+    return {
+      schemaVersion: 1,
+      capabilityId: `deepseek-responses-thinking:${targetIdentity.targetId}:target-profile-2`,
+      capabilityVersion: 1,
+      capabilityDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      targetIdentity,
+      providerProfile: {
+        id: "deepseek/responses",
+        version: "v1",
+        requestPath: "reasoning.effort",
+      },
+      supportsOff: true,
+      defaultLevelId: "high",
+      providerDefault: { effectiveLevelId: "high", mutable: true },
+      levels: [
+        {
+          id: "off",
+          label: "Off",
+          effectiveLevelId: "off",
+          mapping: { requestPath: "reasoning.effort", thinkingType: "disabled" },
+        },
+        ...(["low", "high", "max"] as const).map((reasoningEffort) => ({
+          id: reasoningEffort,
+          label: `${reasoningEffort[0]?.toUpperCase()}${reasoningEffort.slice(1)}`,
+          effectiveLevelId: reasoningEffort,
+          mapping: {
+            requestPath: "reasoning.effort",
+            thinkingType: "enabled",
+            reasoningEffort,
+          },
+        })),
+      ],
+      reasoningArtifact: "provider_reasoning",
+    };
+  }
   return {
     schemaVersion: 1,
     capabilityId: `deepseek-chat-thinking:${targetIdentity.targetId}:target-profile-${targetIdentity.profileVersion}`,
@@ -2177,11 +2230,91 @@ test("current Direct DeepSeek v3 selection retains exact historical v2 and v1 re
       { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 1 } },
       { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 1 } },
       {
+        identity: { targetId: "deepseek-v4-flash-vision-exp.direct", profileVersion: 2 },
+      },
+      {
         identity: { targetId: "deepseek-v4-flash-vision-exp.direct", profileVersion: 1 },
       },
       { identity: { targetId: "poolside-laguna-s-2.1-free.gateway", profileVersion: 1 } },
     ],
   });
+});
+
+test("current Vision resolves all-Responses v2 while historical Vision remains Chat v1", async () => {
+  const requests: Array<{ readonly url: string; readonly body: unknown }> = [];
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      requests.push({ url, body: JSON.parse(String(init?.body)) });
+      return new Response(
+        url.endsWith("/responses")
+          ? 'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+          : answerOnlyDeepSeekStream,
+        { headers: { "content-type": "text/event-stream" }, status: 200 },
+      );
+    },
+  });
+  const current = await targets.resolve({
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+  const historical = await targets.resolve({
+    targetId: current.identity.targetId,
+    targetIdentity: { ...current.identity, profileVersion: 1 },
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+
+  expect(current).toMatchObject({
+    identity: { profileVersion: 2 },
+    modalityProfile: {
+      profileVersion: 1,
+      explicitUserImages: "unsupported",
+      imageToolResults: "supported",
+    },
+  });
+  expect(historical).toMatchObject({
+    identity: { profileVersion: 1 },
+    modalityProfile: {
+      profileVersion: 1,
+      explicitUserImages: "supported",
+      imageToolResults: "unsupported",
+    },
+  });
+  await collect(
+    current.driver.stream({
+      messages: [{ role: "user", content: "Use current Vision." }],
+      tools: [],
+      maximumOutputTokens: 2_048,
+      signal: new AbortController().signal,
+    }),
+  );
+  await collect(
+    historical.driver.stream({
+      messages: [{ role: "user", content: "Use historical Vision." }],
+      tools: [],
+      maximumOutputTokens: 2_048,
+      signal: new AbortController().signal,
+    }),
+  );
+  expect(requests).toEqual([
+    {
+      url: "https://api.deepseek.com/responses",
+      body: expect.objectContaining({
+        model: "deepseek-v4-flash-vision-exp",
+        input: [{ role: "user", content: "Use current Vision." }],
+      }),
+    },
+    {
+      url: "https://api.deepseek.com/chat/completions",
+      body: expect.objectContaining({
+        model: "deepseek-v4-flash-vision-exp",
+        messages: [{ role: "user", content: "Use historical Vision." }],
+      }),
+    },
+  ]);
 });
 
 test("historical target resolution rejects a conflicting target ID and exact identity", async () => {

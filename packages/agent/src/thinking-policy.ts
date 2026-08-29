@@ -5,11 +5,11 @@ import type { ModelTargetIdentity } from "./model-targets.js";
 
 export type ThinkingPolicyMappingV1 =
   | {
-      readonly requestPath: "provider_options.deepseek";
+      readonly requestPath: "provider_options.deepseek" | "reasoning.effort";
       readonly thinkingType: "disabled";
     }
   | {
-      readonly requestPath: "provider_options.deepseek";
+      readonly requestPath: "provider_options.deepseek" | "reasoning.effort";
       readonly thinkingType: "enabled";
       readonly reasoningEffort: "low" | "high" | "max";
     };
@@ -20,11 +20,17 @@ export type ThinkingCapabilityV1 = {
   readonly capabilityVersion: 1;
   readonly capabilityDigest: `sha256:${string}`;
   readonly targetIdentity: ModelTargetIdentity;
-  readonly providerProfile: {
-    readonly id: "@ai-sdk/deepseek/chat";
-    readonly version: "3.0.28" | "3.0.30";
-    readonly requestPath: "provider_options.deepseek";
-  };
+  readonly providerProfile:
+    | {
+        readonly id: "@ai-sdk/deepseek/chat";
+        readonly version: "3.0.28" | "3.0.30";
+        readonly requestPath: "provider_options.deepseek";
+      }
+    | {
+        readonly id: "deepseek/responses";
+        readonly version: "v1";
+        readonly requestPath: "reasoning.effort";
+      };
   readonly supportsOff: true;
   readonly defaultLevelId: string;
   readonly providerDefault: {
@@ -148,6 +154,41 @@ export function createDirectDeepSeekThinkingCapability(
     ...capability,
     capabilityDigest: digestCapability(capability),
   });
+}
+
+export function createDirectDeepSeekResponsesThinkingCapability(
+  targetIdentity: ModelTargetIdentity,
+): ThinkingCapabilityV1 {
+  if (targetIdentity.vendor !== "deepseek" || targetIdentity.route !== "direct") {
+    throw new TypeError("A Direct DeepSeek Responses capability requires a Direct target.");
+  }
+  const requestPath = "reasoning.effort" as const;
+  const capability = {
+    schemaVersion: 1 as const,
+    capabilityId: `deepseek-responses-thinking:${targetIdentity.targetId}:target-profile-${targetIdentity.profileVersion}`,
+    capabilityVersion: 1 as const,
+    targetIdentity,
+    providerProfile: { id: "deepseek/responses" as const, version: "v1" as const, requestPath },
+    supportsOff: true as const,
+    defaultLevelId: "high",
+    providerDefault: { effectiveLevelId: "high", mutable: true as const },
+    levels: [
+      {
+        id: "off",
+        label: "Off",
+        effectiveLevelId: "off",
+        mapping: { requestPath, thinkingType: "disabled" as const },
+      },
+      ...(["low", "high", "max"] as const).map((reasoningEffort) => ({
+        id: reasoningEffort,
+        label: `${reasoningEffort[0]?.toUpperCase()}${reasoningEffort.slice(1)}`,
+        effectiveLevelId: reasoningEffort,
+        mapping: { requestPath, thinkingType: "enabled" as const, reasoningEffort },
+      })),
+    ],
+    reasoningArtifact: "provider_reasoning" as const,
+  };
+  return Object.freeze({ ...capability, capabilityDigest: digestCapability(capability) });
 }
 
 export function resolveThinkingPolicy(

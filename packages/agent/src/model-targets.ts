@@ -3,7 +3,9 @@ import { createGateway } from "@ai-sdk/gateway";
 import type { ModelDriver, ModelModalityProfile } from "./agent-session-contracts.js";
 import { AiSdkModelDriver } from "./ai-sdk-model-driver.js";
 import type { ContextProfile } from "./context-profile.js";
+import { DirectDeepSeekResponsesModelDriver } from "./deepseek-responses-model-driver.js";
 import {
+  createDirectDeepSeekResponsesThinkingCapability,
   createDirectDeepSeekThinkingCapability,
   type ThinkingCapabilityV1,
 } from "./thinking-policy.js";
@@ -201,19 +203,29 @@ const directDeepSeekVisionChatV1Target: ModelTargetIdentity = Object.freeze({
   profileVersion: 1,
   certification: "certified",
 });
+const directDeepSeekVisionResponsesV2Target: ModelTargetIdentity = Object.freeze({
+  ...directDeepSeekVisionChatV1Target,
+  profileVersion: 2,
+});
 const directDeepSeekVisionChatV1ModalityProfile: ModelModalityProfile = Object.freeze({
   profileVersion: 1,
   explicitUserImages: "supported",
   imageToolResults: "unsupported",
 });
+const directDeepSeekVisionResponsesV2ModalityProfile: ModelModalityProfile = Object.freeze({
+  profileVersion: 1,
+  explicitUserImages: "unsupported",
+  imageToolResults: "supported",
+});
 const currentDirectDeepSeekTargets = Object.freeze([
   ...directDeepSeekV3Targets,
-  directDeepSeekVisionChatV1Target,
+  directDeepSeekVisionResponsesV2Target,
 ]);
 const supportedDirectDeepSeekTargets = Object.freeze([
   ...directDeepSeekV3Targets,
   ...directDeepSeekV2Targets,
   ...directDeepSeekV1Targets,
+  directDeepSeekVisionResponsesV2Target,
   directDeepSeekVisionChatV1Target,
 ]);
 
@@ -415,6 +427,24 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
         ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
       });
       const contextProfile = directDeepSeekContextProfileFor(identity);
+      if (sameModelTargetIdentity(identity, directDeepSeekVisionResponsesV2Target)) {
+        return {
+          identity,
+          contextProfile,
+          connectionTest: "supported" as const,
+          modalityProfile: directDeepSeekVisionResponsesV2ModalityProfile,
+          upstreamLifecycle: "experimental" as const,
+          thinkingCapability: createDirectDeepSeekResponsesThinkingCapability(identity),
+          driver: new DirectDeepSeekResponsesModelDriver({
+            apiKey: options.environment.DEEPSEEK_API_KEY as string,
+            baseURL: "https://api.deepseek.com",
+            model: identity.modelId,
+            maximumOutputTokens: contextProfile.maximumOutputTokens,
+            deadlineMs,
+            ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+          }),
+        };
+      }
       return {
         identity,
         contextProfile,
@@ -469,13 +499,23 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
             readiness: { status, credentialSource: "DEEPSEEK_API_KEY" },
             contextProfile: directDeepSeekContextProfileFor(identity),
             connectionTest: "supported" as const,
-            ...(identity.targetId === directDeepSeekVisionChatV1Target.targetId
+            ...(sameModelTargetIdentity(identity, directDeepSeekVisionResponsesV2Target)
               ? {
-                  modalityProfile: directDeepSeekVisionChatV1ModalityProfile,
+                  modalityProfile: directDeepSeekVisionResponsesV2ModalityProfile,
                   upstreamLifecycle: "experimental" as const,
                 }
-              : {}),
-            thinkingCapability: createDirectDeepSeekThinkingCapability(identity),
+              : identity.targetId === directDeepSeekVisionChatV1Target.targetId
+                ? {
+                    modalityProfile: directDeepSeekVisionChatV1ModalityProfile,
+                    upstreamLifecycle: "experimental" as const,
+                  }
+                : {}),
+            thinkingCapability: sameModelTargetIdentity(
+              identity,
+              directDeepSeekVisionResponsesV2Target,
+            )
+              ? createDirectDeepSeekResponsesThinkingCapability(identity)
+              : createDirectDeepSeekThinkingCapability(identity),
           })),
           {
             identity: experimentalGatewayTarget,
@@ -571,7 +611,10 @@ function hasCredential(value: string | undefined): boolean {
 }
 
 function directDeepSeekContextProfileFor(identity: ModelTargetIdentity): ContextProfile {
-  if (identity.targetId === directDeepSeekVisionChatV1Target.targetId) {
+  if (
+    identity.targetId === directDeepSeekVisionChatV1Target.targetId ||
+    identity.targetId === directDeepSeekVisionResponsesV2Target.targetId
+  ) {
     return preparedDirectDeepSeekV2ContextProfile;
   }
   if (identity.profileVersion === 1) {

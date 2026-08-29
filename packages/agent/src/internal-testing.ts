@@ -6,7 +6,9 @@ export {
   type ObservedBiomeProcess,
 } from "./biome-execution.js";
 export type { ContextProfile } from "./context-profile.js";
+export { DirectDeepSeekResponsesModelDriver as DirectDeepSeekResponsesModelDriverForTesting } from "./deepseek-responses-model-driver.js";
 export { digestContextRecordPrefix } from "./durable-context.js";
+export { createInputResourceUserMessageV1 } from "./input-resources.js";
 export type {
   McpBeforeToolDispatchBarrier,
   McpBootstrapScheduler,
@@ -52,7 +54,11 @@ export {
   createProjectLifecycleOwner,
   ProjectLifecycleOwnerError,
 } from "./project-lifecycle-owner.js";
-export { assemblePromptMessagesV1, digestPromptRequestV1 } from "./prompt-assembly.js";
+export {
+  assemblePromptMessagesV1,
+  createPromptContextV1,
+  digestPromptRequestV1,
+} from "./prompt-assembly.js";
 export {
   createPresentationPreferencesWithStorageForTesting,
   createTrustedWorkspaceTrustForTesting,

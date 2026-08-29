@@ -50,6 +50,15 @@ type ChildObservation = {
 
 const childObservations = new WeakMap<ChildProcess, ChildObservation>();
 
+const visionResponsesIdentity = {
+  targetId: "deepseek-v4-flash-vision-exp.direct",
+  vendor: "deepseek",
+  modelId: "deepseek-v4-flash-vision-exp",
+  route: "direct",
+  profileVersion: 2,
+  certification: "certified",
+} as const;
+
 test("SessionLifecycle cold resume reads an immutable input resource after its source is deleted", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-cold-resume-"));
   const stateRoot = join(testRoot, "state");
@@ -158,6 +167,14 @@ test("SessionLifecycle cold resume reads an immutable input resource after its s
     await first.close();
     await rm(testRoot, { recursive: true, force: true });
   }
+});
+
+test("SessionLifecycle blocks a cold Vision Responses continuation when its JSONL image artifact is missing", async () => {
+  await exerciseColdVisionResponsesArtifactFailure("missing");
+});
+
+test("SessionLifecycle blocks a cold Vision Responses continuation when its JSONL image artifact is corrupt", async () => {
+  await exerciseColdVisionResponsesArtifactFailure("corrupt");
 });
 
 test("SessionLifecycle cold resume reconstructs the exact historical Vision Chat image bytes", async () => {
@@ -1293,6 +1310,162 @@ type CurrentSessionSnapshotForFixture = {
     readonly parentEventPosition: number;
   };
 };
+
+async function exerciseColdVisionResponsesArtifactFailure(
+  mutation: "corrupt" | "missing",
+): Promise<void> {
+  const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-vision-responses-${mutation}-`));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "durable-image.png");
+  const pngBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const artifactId = `sha256:${createHash("sha256").update(pngBytes).digest("hex")}` as const;
+  const runId =
+    mutation === "missing"
+      ? "81000000-0000-4000-8000-000000000001"
+      : "81000000-0000-4000-8000-000000000002";
+  const occurrenceId = `${runId}:input:1`;
+  const contextProfile = {
+    version: 2 as const,
+    contextWindowTokens: 1_000_000,
+    maximumOutputTokens: 384_000,
+    ordinaryOutputReserveTokens: 4_096,
+    compactionSummaryMaximumOutputTokens: 32_768,
+    compactAtTokens: 900_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+    estimatorVersion: 1 as const,
+  };
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, pngBytes);
+  let providerCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    providerCalls += 1;
+    if (providerCalls === 1) {
+      return [
+        { type: "tool_call_start", id: "durable-image-read", name: "read_input_resource" },
+        {
+          type: "tool_call_delta",
+          id: "durable-image-read",
+          json: JSON.stringify({ occurrenceId }),
+        },
+        { type: "tool_call_end", id: "durable-image-read" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.find((message) => message.role === "tool")).toMatchObject({
+      role: "tool",
+      callId: "durable-image-read",
+      result: {
+        status: "completed",
+        output: { type: "image", occurrenceId, artifactId },
+      },
+      content: [
+        {
+          type: "file",
+          artifactId,
+          mediaType: "image/png",
+          bytes: new Uint8Array(pngBytes),
+        },
+      ],
+    });
+    return [
+      { type: "text_delta", text: "The image is durably materialized." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: visionResponsesIdentity,
+        driver,
+        contextProfile,
+        modalityProfile: {
+          profileVersion: 1,
+          explicitUserImages: "unsupported",
+          imageToolResults: "supported",
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionResponsesIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const warm = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+  });
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const created = await warm.create({ targetIdentity: visionResponsesIdentity });
+    await expect(
+      warm.continue({
+        sessionId: created.sessionId,
+        input: { text: "Materialize this image through the resource tool." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+        runId,
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The image is durably materialized." },
+    });
+    const store = await openJsonlSessionStore<SessionRecord>({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    expect(
+      (await store.read()).filter(
+        (record) =>
+          record.schemaVersion === 3 &&
+          record.record.type === "input_resource_image_read_committed",
+      ),
+    ).toHaveLength(1);
+    await warm.close();
+    await unlink(selectedPath);
+    const artifactPath = join(stateRoot, "artifacts", artifactId.replace(/^sha256:/u, ""));
+    if (mutation === "missing") {
+      await unlink(artifactPath);
+    } else {
+      await chmod(artifactPath, 0o600);
+      await writeFile(artifactPath, Buffer.alloc(pngBytes.byteLength));
+    }
+
+    cold = createSessionLifecycle({
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      workspaceRoot,
+    });
+    await expect(
+      cold.continue({
+        sessionId: created.sessionId,
+        input: { text: "Continue from the canonical image history." },
+      }),
+    ).rejects.toMatchObject({
+      code: "input_resource_corrupt",
+      message: expect.stringContaining("immutable input-resource"),
+    });
+    expect(providerCalls).toBe(2);
+  } finally {
+    await cold?.close();
+    await warm.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+}
 
 function observeChild(child: ChildProcess): void {
   const observation: ChildObservation = { messages: [], stderr: "" };

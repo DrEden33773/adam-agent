@@ -454,37 +454,67 @@ function buildContextSummaryRequestMessages(
   messages: readonly unknown[],
 ): readonly ModelMessage[] {
   const imageParts: Array<Extract<ModelUserContentPart, { readonly type: "file" }>> = [];
-  const projectedMessages = messages.map((message) => {
+  const imageToolCallIdsByAssistantIndex = new Map<number, Set<string>>();
+  const imageToolMessageIndexes = new Set<number>();
+  const projectedMessages = messages.map((message, messageIndex) => {
     if (
       typeof message !== "object" ||
       message === null ||
       !("role" in message) ||
-      message.role !== "user" ||
+      (message.role !== "user" && message.role !== "tool") ||
       !("content" in message) ||
       !Array.isArray(message.content)
     ) {
       return message;
     }
+    const toolMessage = message.role === "tool" ? message : undefined;
+    if (
+      toolMessage !== undefined &&
+      "callId" in toolMessage &&
+      typeof toolMessage.callId === "string" &&
+      "name" in toolMessage &&
+      typeof toolMessage.name === "string" &&
+      "result" in toolMessage
+    ) {
+      const hasImageContent = message.content.some(isProjectableImagePart);
+      if (!hasImageContent) {
+        return message;
+      }
+      const assistantIndex = messages.findLastIndex(
+        (candidate, index) =>
+          index < messageIndex &&
+          typeof candidate === "object" &&
+          candidate !== null &&
+          "role" in candidate &&
+          candidate.role === "assistant" &&
+          "toolCalls" in candidate &&
+          Array.isArray(candidate.toolCalls) &&
+          candidate.toolCalls.some(
+            (call) =>
+              typeof call === "object" &&
+              call !== null &&
+              "id" in call &&
+              call.id === toolMessage.callId,
+          ),
+      );
+      if (assistantIndex < 0) {
+        throw new TypeError("Prepared compaction image tool call is unavailable.");
+      }
+      const imageToolCallIds = imageToolCallIdsByAssistantIndex.get(assistantIndex) ?? new Set();
+      imageToolCallIds.add(toolMessage.callId);
+      imageToolCallIdsByAssistantIndex.set(assistantIndex, imageToolCallIds);
+      imageToolMessageIndexes.add(messageIndex);
+    }
     return {
       ...message,
       content: message.content.map((part) => {
-        if (
-          typeof part !== "object" ||
-          part === null ||
-          !("type" in part) ||
-          part.type !== "file" ||
-          !("artifactId" in part) ||
-          !("mediaType" in part) ||
-          !("bytes" in part) ||
-          !(part.bytes instanceof Uint8Array) ||
-          (part.mediaType !== "image/jpeg" && part.mediaType !== "image/png")
-        ) {
+        if (!isProjectableImagePart(part)) {
           return part;
         }
-        const attachmentIndex = imageParts.length;
-        imageParts.push(part as (typeof imageParts)[number]);
+        const attachmentIndex =
+          message.role === "user" ? imageParts.push(part as (typeof imageParts)[number]) - 1 : 0;
         return {
-          type: "image_attachment",
+          type: message.role === "user" ? "image_attachment" : "tool_image_output",
           attachmentIndex,
           artifactId: part.artifactId,
           mediaType: part.mediaType,
@@ -492,6 +522,34 @@ function buildContextSummaryRequestMessages(
         };
       }),
     };
+  });
+  const imageToolMessages = messages.flatMap((message, messageIndex) => {
+    if (imageToolMessageIndexes.has(messageIndex)) {
+      return [message as ModelMessage];
+    }
+    if (
+      typeof message !== "object" ||
+      message === null ||
+      !("role" in message) ||
+      message.role !== "assistant" ||
+      !("toolCalls" in message) ||
+      !Array.isArray(message.toolCalls)
+    ) {
+      return [];
+    }
+    const imageToolCallIds = imageToolCallIdsByAssistantIndex.get(messageIndex);
+    if (imageToolCallIds === undefined) {
+      return [];
+    }
+    const toolCalls = message.toolCalls.filter(
+      (call) =>
+        typeof call === "object" &&
+        call !== null &&
+        "id" in call &&
+        typeof call.id === "string" &&
+        imageToolCallIds.has(call.id),
+    );
+    return toolCalls.length === 0 ? [] : [{ ...(message as ModelMessage), toolCalls }];
   });
   const instruction = JSON.stringify({
     schema: {
@@ -520,7 +578,25 @@ function buildContextSummaryRequestMessages(
           ? instruction
           : [{ type: "text", text: instruction }, ...imageParts],
     },
+    ...imageToolMessages,
   ];
+}
+
+function isProjectableImagePart(
+  part: unknown,
+): part is Extract<ModelUserContentPart, { readonly type: "file" }> {
+  return (
+    typeof part === "object" &&
+    part !== null &&
+    "type" in part &&
+    part.type === "file" &&
+    "artifactId" in part &&
+    typeof part.artifactId === "string" &&
+    "mediaType" in part &&
+    (part.mediaType === "image/jpeg" || part.mediaType === "image/png") &&
+    "bytes" in part &&
+    part.bytes instanceof Uint8Array
+  );
 }
 
 function estimatePreparedContextSummaryRequestTokens(
@@ -529,7 +605,11 @@ function estimatePreparedContextSummaryRequestTokens(
 ): number {
   return estimateActiveContextTokens(
     messages.map((message) => {
-      if (message.role !== "user" || typeof message.content === "string") {
+      if (
+        (message.role !== "user" && message.role !== "tool") ||
+        message.content === undefined ||
+        typeof message.content === "string"
+      ) {
         return message;
       }
       return {
@@ -549,32 +629,46 @@ function projectedContentUsageFromSummaryRequest(
     | ReadonlyMap<`sha256:${string}`, ProjectedExplicitUserImageArtifactUsageV1>
     | undefined,
 ): ProjectedContentUsageV1 | undefined {
-  const usages = messages.flatMap((message) =>
-    message.role === "user" && typeof message.content !== "string"
-      ? message.content.flatMap((part) => {
-          if (part.type !== "file") {
-            return [];
-          }
-          const usage = imageUsageByArtifactId?.get(part.artifactId);
-          if (usage === undefined) {
-            throw new TypeError("Prepared compaction image usage is unavailable.");
-          }
-          return [usage];
-        })
-      : [],
-  );
-  if (usages.length === 0) {
+  const userUsages: ProjectedExplicitUserImageArtifactUsageV1[] = [];
+  const toolUsages: ProjectedExplicitUserImageArtifactUsageV1[] = [];
+  for (const message of messages) {
+    if (
+      (message.role !== "user" && message.role !== "tool") ||
+      message.content === undefined ||
+      typeof message.content === "string"
+    ) {
+      continue;
+    }
+    for (const part of message.content) {
+      if (part.type !== "file") {
+        continue;
+      }
+      const usage = imageUsageByArtifactId?.get(part.artifactId);
+      if (usage === undefined) {
+        throw new TypeError("Prepared compaction image usage is unavailable.");
+      }
+      (message.role === "tool" ? toolUsages : userUsages).push(usage);
+    }
+  }
+  if (userUsages.length === 0 && toolUsages.length === 0) {
     return undefined;
   }
   return {
     version: 1,
-    explicitUserImages: {
-      count: usages.length,
-      byteCount: usages.reduce((total, usage) => total + usage.byteCount, 0),
-      pixelCount: usages.reduce((total, usage) => total + usage.pixelCount, 0),
-      maximumWidth: Math.max(...usages.map((usage) => usage.width)),
-      maximumHeight: Math.max(...usages.map((usage) => usage.height)),
-    },
+    ...(userUsages.length === 0 ? {} : { explicitUserImages: summarizeImageUsages(userUsages) }),
+    ...(toolUsages.length === 0 ? {} : { imageToolResults: summarizeImageUsages(toolUsages) }),
+  };
+}
+
+function summarizeImageUsages(
+  usages: readonly ProjectedExplicitUserImageArtifactUsageV1[],
+): NonNullable<ProjectedContentUsageV1["explicitUserImages"]> {
+  return {
+    count: usages.length,
+    byteCount: usages.reduce((total, usage) => total + usage.byteCount, 0),
+    pixelCount: usages.reduce((total, usage) => total + usage.pixelCount, 0),
+    maximumWidth: Math.max(...usages.map((usage) => usage.width)),
+    maximumHeight: Math.max(...usages.map((usage) => usage.height)),
   };
 }
 

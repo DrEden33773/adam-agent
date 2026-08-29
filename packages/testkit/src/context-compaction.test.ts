@@ -23,6 +23,7 @@ import {
 } from "@adam-agent/agent";
 import {
   type ContextProfile,
+  createPromptContextV1,
   digestContextRecordPrefix,
   openJsonlSessionStore,
   preparedDirectDeepSeekV2ContextProfile,
@@ -3766,6 +3767,313 @@ test("AgentSession projects an eager Vision Chat image into compaction without s
       projectedContent: {
         version: 1,
         explicitUserImages: {
+          count: 1,
+          byteCount: imageBytes.byteLength,
+          pixelCount: 1,
+          maximumWidth: 1,
+          maximumHeight: 1,
+        },
+      },
+    },
+  });
+});
+
+test("AgentSession keeps a lazy Vision Responses image as the real compaction function output", async () => {
+  const imageBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const artifactId = `sha256:${createHash("sha256").update(imageBytes).digest("hex")}` as const;
+  const occurrence = {
+    occurrenceId: "lazy-image-compaction-run:input:1",
+    displayName: "lazy-compacted-image.png",
+    artifact: { id: artifactId, mediaType: "image/png" as const, byteCount: imageBytes.byteLength },
+    digest: artifactId,
+    mediaHint: "image" as const,
+    provenance: "user_local_file" as const,
+    support: "image" as const,
+    mode: "link" as const,
+  };
+  const descriptor = {
+    schemaVersion: 1 as const,
+    type: "image" as const,
+    occurrenceId: occurrence.occurrenceId,
+    displayName: occurrence.displayName,
+    artifactId,
+    byteCount: imageBytes.byteLength,
+    digest: artifactId,
+    mediaType: "image/png" as const,
+    width: 1,
+    height: 1,
+  };
+  const userText = "Inspect the linked image through its resource tool.";
+  const reasoning = "Inspect the image only after the tool returns it. ".repeat(5_000);
+  const compactionProfile: ContextProfile = {
+    ...preparedDirectDeepSeekV2ContextProfile,
+    contextWindowTokens: 400_000,
+    maximumOutputTokens: 1_000,
+    ordinaryOutputReserveTokens: 1_000,
+    compactionSummaryMaximumOutputTokens: 1_000,
+    compactAtTokens: 50_000,
+    postCompactTargetTokens: 40_000,
+    retainedTargetTokens: 0,
+  };
+  let artifactReads = 0;
+  const artifactStore: ArtifactStore = {
+    async write(input) {
+      return {
+        id: artifactId,
+        mediaType: input.mediaType,
+        byteCount: input.bytes.byteLength,
+        source: input.source,
+      };
+    },
+    async read(id) {
+      artifactReads += 1;
+      return id === artifactId ? new Uint8Array(imageBytes) : undefined;
+    },
+  };
+  let compactionCalls = 0;
+  let ordinaryCalls = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      if (request.purpose === "compaction") {
+        compactionCalls += 1;
+        const assistantIndex = request.messages.findIndex(
+          (message) => message.role === "assistant" && message.toolCalls.length === 1,
+        );
+        const wrapper = request.messages.find((message) => message.role === "user");
+        const wrapperText =
+          wrapper?.role === "user"
+            ? typeof wrapper.content === "string"
+              ? wrapper.content
+              : wrapper.content.find((part) => part.type === "text")?.text
+            : undefined;
+        const wrappedMessages =
+          wrapperText === undefined
+            ? undefined
+            : (
+                JSON.parse(wrapperText) as {
+                  readonly messages?: readonly {
+                    readonly role?: unknown;
+                    readonly callId?: unknown;
+                    readonly content?: unknown;
+                  }[];
+                }
+              ).messages;
+        expect(
+          assistantIndex,
+          JSON.stringify({
+            ordinaryCalls,
+            projectedRoles:
+              wrappedMessages === undefined
+                ? undefined
+                : wrappedMessages.map((message) => ({
+                    role: message.role,
+                    hasContent: message.content !== undefined,
+                    ...(message.role === "tool" ? { message } : {}),
+                  })),
+            messages: request.messages.map((message) => ({
+              role: message.role,
+              ...(message.role === "assistant"
+                ? { callIds: message.toolCalls.map((call) => call.id) }
+                : {}),
+              ...(message.role === "tool" ? { callId: message.callId } : {}),
+            })),
+          }),
+        ).toBeGreaterThan(0);
+        expect(
+          wrappedMessages?.some(
+            (message) => message.role === "tool" && message.callId === "sibling-read-before-image",
+          ),
+        ).toBe(true);
+        expect(
+          wrappedMessages?.some(
+            (message) =>
+              message.role === "tool" && message.callId === "lazy-image-before-compaction",
+          ),
+        ).toBe(true);
+        expect(request.messages[assistantIndex]).toEqual({
+          role: "assistant",
+          content: "",
+          reasoning,
+          toolCalls: [
+            {
+              id: "lazy-image-before-compaction",
+              name: "read_input_resource",
+              argumentsJson: JSON.stringify({ occurrenceId: occurrence.occurrenceId }),
+            },
+          ],
+        });
+        expect(request.messages[assistantIndex + 1]).toEqual({
+          role: "tool",
+          callId: "lazy-image-before-compaction",
+          name: "read_input_resource",
+          result: { status: "completed", output: descriptor },
+          content: [
+            {
+              type: "file",
+              artifactId,
+              mediaType: "image/png",
+              bytes: new Uint8Array(imageBytes),
+            },
+          ],
+        });
+        expect(
+          request.messages.flatMap((message) =>
+            message.role === "user" && typeof message.content !== "string"
+              ? message.content.filter((part) => part.type === "file")
+              : [],
+          ),
+        ).toEqual([]);
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Describe the tool-returned image.",
+            constraints: ["Preserve the real function output identity."],
+            progress: ["The image tool result was observed."],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: ["Answer from the observed image."],
+            nextSafeAction: "Answer from the compacted image evidence.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 3_200, outputTokens: 40 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCalls += 1;
+      if (ordinaryCalls === 1) {
+        expect(
+          request.messages.flatMap((message) =>
+            message.role === "user" && typeof message.content !== "string"
+              ? message.content.filter((part) => part.type === "file")
+              : [],
+          ),
+        ).toEqual([]);
+        yield {
+          type: "reasoning_start",
+          id: "lazy-image-reasoning",
+          artifactType: "provider_reasoning",
+        };
+        yield { type: "reasoning_delta", id: "lazy-image-reasoning", text: reasoning };
+        yield { type: "reasoning_end", id: "lazy-image-reasoning" };
+        yield {
+          type: "tool_call_start",
+          id: "sibling-read-before-image",
+          name: "read_file",
+        };
+        yield {
+          type: "tool_call_delta",
+          id: "sibling-read-before-image",
+          json: JSON.stringify({ path: "missing-sibling.txt" }),
+        };
+        yield { type: "tool_call_end", id: "sibling-read-before-image" };
+        yield {
+          type: "tool_call_start",
+          id: "lazy-image-before-compaction",
+          name: "read_input_resource",
+        };
+        yield {
+          type: "tool_call_delta",
+          id: "lazy-image-before-compaction",
+          json: JSON.stringify({ occurrenceId: occurrence.occurrenceId }),
+        };
+        yield { type: "tool_call_end", id: "lazy-image-before-compaction" };
+        yield { type: "usage", inputTokens: 500, outputTokens: 3_000 };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "The image remained visible through compaction." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const currentTools = createCodingToolRegistry({ artifactStore, workspaceRoot: "/workspace" });
+  const tools: ToolRegistry = {
+    definitions: () =>
+      currentTools
+        .definitions()
+        .filter(
+          (definition) =>
+            definition.name === "read_file" || definition.name === "read_input_resource",
+        ),
+    resolve: (name) =>
+      name === "read_file" || name === "read_input_resource"
+        ? currentTools.resolve(name)
+        : undefined,
+  };
+  const store = createInMemorySessionStore<SessionRecord>();
+  const session = new AgentSession({
+    artifactStore,
+    contextProfile: compactionProfile,
+    modalityProfile: {
+      profileVersion: 1,
+      explicitUserImages: "unsupported",
+      imageToolResults: "supported",
+    },
+    model,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools,
+    [sessionDurableContext]: {
+      initialMessages: [
+        { role: "user", content: "Record one ordinary failed read first." },
+        {
+          role: "assistant",
+          content: "",
+          toolCalls: [
+            {
+              id: "lazy-image-before-compaction",
+              name: "read_file",
+              argumentsJson: JSON.stringify({ path: "prior-missing.txt" }),
+            },
+          ],
+        },
+        {
+          role: "tool",
+          callId: "lazy-image-before-compaction",
+          name: "read_file",
+          result: {
+            status: "failed",
+            error: { code: "not_found", message: "The requested path does not exist." },
+          },
+        },
+      ],
+      inputResources: [occurrence],
+      nextSequence: 1,
+      promptContext: createPromptContextV1(tools),
+      targetIdentity: {
+        targetId: "deepseek-v4-flash-vision-exp.direct",
+        vendor: "deepseek",
+        modelId: "deepseek-v4-flash-vision-exp",
+        route: "direct",
+        profileVersion: 2,
+        certification: "certified",
+      },
+    },
+  } as ConstructorParameters<typeof AgentSession>[0] & {
+    readonly [sessionDurableContext]: unknown;
+  });
+
+  await expect(session.run({ text: userText, inputResources: [occurrence] })).resolves.toEqual({
+    status: "completed",
+    answer: "The image remained visible through compaction.",
+  });
+  expect({ artifactReads, compactionCalls, ordinaryCalls }).toEqual({
+    artifactReads: 2,
+    compactionCalls: 1,
+    ordinaryCalls: 2,
+  });
+  expect(
+    (await store.read()).find(
+      (record) => record.schemaVersion === 3 && record.record.type === "context_compaction_started",
+    ),
+  ).toMatchObject({
+    record: {
+      projectedContent: {
+        version: 1,
+        imageToolResults: {
           count: 1,
           byteCount: imageBytes.byteLength,
           pixelCount: 1,

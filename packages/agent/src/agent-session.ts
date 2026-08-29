@@ -48,9 +48,11 @@ import {
 import {
   createInputResourceProjectionMessageV1,
   createInputResourceUserMessageV1,
+  inputResourceImageV1Schema,
   inputResourceLimitsV1,
   inputResourceOccurrenceV1Schema,
   inputResourcePageV1Schema,
+  materializeInputResourceImageV1,
 } from "./input-resources.js";
 import { ModelDriverError } from "./model-driver-error.js";
 import {
@@ -628,6 +630,9 @@ export class AgentSession {
       const attemptNumber = nextAttemptNumber;
       const preparedUserImages = await prepareExplicitUserImageMessagesV1({
         artifactStore: this.#artifactStore,
+        ...(this.#durableContext?.inputResources === undefined
+          ? {}
+          : { inputResources: this.#durableContext.inputResources }),
         messages: requestMessages,
         modalityProfile: this.#modalityProfile,
         signal,
@@ -1280,6 +1285,9 @@ export class AgentSession {
           : { summaryMessages: retryMessages, retainedMessages: [] };
       const preparedSummaryImages = await prepareExplicitUserImageMessagesV1({
         artifactStore: this.#artifactStore,
+        ...(this.#durableContext?.inputResources === undefined
+          ? {}
+          : { inputResources: this.#durableContext.inputResources }),
         messages: summaryMessages,
         modalityProfile: this.#modalityProfile,
         signal,
@@ -2473,6 +2481,74 @@ export class AgentSession {
     execute: () => Promise<ToolResult>,
   ): Promise<ToolResult> {
     const runId = this.#activeRunId;
+    const parsedArguments = parseImageInputResourceCall(call.argumentsJson);
+    const imageOccurrence = this.#durableContext?.inputResources?.find(
+      (candidate) => candidate.occurrenceId === parsedArguments?.occurrenceId,
+    );
+    if (
+      this.#modalityProfile?.imageToolResults === "supported" &&
+      imageOccurrence?.support === "image"
+    ) {
+      if (
+        runId === undefined ||
+        this.#artifactStore === undefined ||
+        this.#activeAbortController === undefined
+      ) {
+        return inputResourceReadFailure(
+          "input_resource_corrupt",
+          "The immutable input-resource image is unavailable in this run.",
+        );
+      }
+      let materialized: Awaited<ReturnType<typeof materializeInputResourceImageV1>>;
+      try {
+        materialized = await materializeInputResourceImageV1({
+          artifactStore: this.#artifactStore,
+          occurrence: imageOccurrence,
+          occurrenceId: imageOccurrence.occurrenceId,
+          signal: this.#activeAbortController.signal,
+        });
+      } catch (error) {
+        if (this.#activeAbortController.signal.aborted) {
+          throw error;
+        }
+        return inputResourceReadFailure(
+          "input_resource_corrupt",
+          "The immutable input-resource image did not match canonical resource truth.",
+        );
+      }
+      const { descriptor } = materialized;
+      if (!inputResourceImageV1Schema.safeParse(descriptor).success) {
+        return inputResourceReadFailure(
+          "input_resource_corrupt",
+          "The immutable input-resource image descriptor is invalid.",
+        );
+      }
+      if (
+        this.#inputResourceRunBytes + descriptor.byteCount >
+          inputResourceLimitsV1.maximumMaterializedBytesPerRun ||
+        this.#inputResourceLineageBytes + descriptor.byteCount >
+          inputResourceLimitsV1.maximumMaterializedBytesPerLineage
+      ) {
+        return inputResourceReadFailure(
+          "input_resource_quota_exceeded",
+          "The input-resource materialization quota for this run or session lineage would be exceeded.",
+        );
+      }
+      await this.#appendRecord({
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "input_resource_image_read_committed",
+          recordVersion: 1,
+          runId,
+          callId: call.id,
+          image: descriptor,
+        },
+      });
+      this.#inputResourceRunBytes += descriptor.byteCount;
+      this.#inputResourceLineageBytes += descriptor.byteCount;
+      return { status: "completed", output: descriptor };
+    }
     const result = await execute();
     if (result.status === "failed") {
       return result;
@@ -3711,6 +3787,30 @@ function inputResourceReadFailure(
   message: string,
 ): Extract<ToolResult, { readonly status: "failed" }> {
   return { status: "failed", error: { code, message } };
+}
+
+function parseImageInputResourceCall(
+  argumentsJson: string,
+): { readonly occurrenceId: string } | undefined {
+  try {
+    const decoded = JSON.parse(argumentsJson) as unknown;
+    if (
+      typeof decoded !== "object" ||
+      decoded === null ||
+      Array.isArray(decoded) ||
+      !Object.keys(decoded).every((key) => key === "occurrenceId" || key === "maxByteCount") ||
+      typeof (decoded as { readonly occurrenceId?: unknown }).occurrenceId !== "string" ||
+      ("maxByteCount" in decoded &&
+        (!Number.isSafeInteger(decoded.maxByteCount) ||
+          (decoded.maxByteCount as number) < 1 ||
+          (decoded.maxByteCount as number) > inputResourceLimitsV1.maximumReadPageBytes))
+    ) {
+      return undefined;
+    }
+    return { occurrenceId: (decoded as { readonly occurrenceId: string }).occurrenceId };
+  } catch {
+    return undefined;
+  }
 }
 
 function isPositiveSafeInteger(value: number): boolean {

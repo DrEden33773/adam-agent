@@ -65,6 +65,15 @@ const testContextProfile: ContextProfile = {
   estimatorVersion: 1,
 };
 
+const visionResponsesIdentity: ModelTargetIdentity = {
+  targetId: "deepseek-v4-flash-vision-exp.direct",
+  vendor: "deepseek",
+  modelId: "deepseek-v4-flash-vision-exp",
+  route: "direct",
+  profileVersion: 2,
+  certification: "certified",
+};
+
 function thinkingSelection(
   capability: {
     readonly capabilityId: string;
@@ -2362,6 +2371,280 @@ test("SessionLifecycle prefix branch exposes only input-resource occurrences ins
   }
 });
 
+test("SessionLifecycle re-materializes one lazy Vision Responses image after a pre-commit restart", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-vision-responses-pre-commit-restart-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "pre-commit.png");
+  const pngBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const artifactId = `sha256:${createHash("sha256").update(pngBytes).digest("hex")}` as const;
+  const runId = "80000000-0000-4000-8000-000000000001";
+  const occurrenceId = `${runId}:input:1`;
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, pngBytes);
+  let providerCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    providerCalls += 1;
+    if (providerCalls === 1) {
+      expect(
+        request.messages.flatMap((message) =>
+          message.role === "user" && typeof message.content !== "string"
+            ? message.content.filter((part) => part.type === "file")
+            : [],
+        ),
+      ).toEqual([]);
+      return [
+        { type: "tool_call_start", id: "pre-commit-image", name: "read_input_resource" },
+        {
+          type: "tool_call_delta",
+          id: "pre-commit-image",
+          json: JSON.stringify({ occurrenceId }),
+        },
+        { type: "tool_call_end", id: "pre-commit-image" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.find((message) => message.role === "tool")).toEqual({
+      role: "tool",
+      callId: "pre-commit-image",
+      name: "read_input_resource",
+      result: {
+        status: "completed",
+        output: {
+          schemaVersion: 1,
+          type: "image",
+          occurrenceId,
+          displayName: "pre-commit.png",
+          artifactId,
+          byteCount: pngBytes.byteLength,
+          digest: artifactId,
+          mediaType: "image/png",
+          width: 1,
+          height: 1,
+        },
+      },
+      content: [
+        {
+          type: "file",
+          artifactId,
+          mediaType: "image/png",
+          bytes: new Uint8Array(pngBytes),
+        },
+      ],
+    });
+    return [
+      { type: "text_delta", text: "The immutable image survived pre-commit restart." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const backing = createInMemorySessionStoreDirectory<SessionRecord>();
+  const crash = createAppendCrashDirectory(
+    backing,
+    (record) =>
+      record.schemaVersion === 3 && record.record.type === "input_resource_image_read_committed",
+  );
+  const lifecycleOptions = {
+    modelTargets: createVisionResponsesTargets(driver),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+    [sessionStoreDirectory]: crash.directory,
+  };
+  const warm = createSessionLifecycle(lifecycleOptions);
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const created = await warm.create({ targetIdentity: visionResponsesIdentity });
+    await expect(
+      warm.continue({
+        sessionId: created.sessionId,
+        input: { text: "Read this image through its resource tool." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+        runId,
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "failed", error: { code: "session_persistence_failed" } },
+    });
+    expect(crash.didTrip()).toBe(true);
+    crash.disable();
+    await warm.close();
+    await rm(selectedPath);
+
+    cold = createSessionLifecycle(lifecycleOptions);
+    await expect(cold.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "ready",
+      snapshot: { status: "interrupted", run: { runId, status: "interrupted" } },
+    });
+    await expect(cold.continue({ sessionId: created.sessionId })).resolves.toMatchObject({
+      result: {
+        status: "completed",
+        answer: "The immutable image survived pre-commit restart.",
+      },
+      snapshot: { status: "settled", run: { runId, status: "settled" } },
+    });
+    const store = await backing.open(created.sessionId);
+    const records = (await store?.read()) ?? [];
+    expect(
+      records.filter(
+        (record) =>
+          record.schemaVersion === 3 &&
+          record.record.type === "input_resource_image_read_committed",
+      ),
+    ).toHaveLength(1);
+    expect(providerCalls).toBe(2);
+  } finally {
+    crash.disable();
+    await cold?.close();
+    await warm.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle replays one committed Vision Responses image without duplicating its effect", async () => {
+  const testRoot = await mkdtemp(
+    join(tmpdir(), "adam-agent-vision-responses-post-commit-restart-"),
+  );
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "post-commit.png");
+  const pngBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const artifactId = `sha256:${createHash("sha256").update(pngBytes).digest("hex")}` as const;
+  const runId = "80000000-0000-4000-8000-000000000002";
+  const occurrenceId = `${runId}:input:1`;
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, pngBytes);
+  let providerCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    providerCalls += 1;
+    if (providerCalls === 1) {
+      return [
+        { type: "tool_call_start", id: "post-commit-image", name: "read_input_resource" },
+        {
+          type: "tool_call_delta",
+          id: "post-commit-image",
+          json: JSON.stringify({ occurrenceId }),
+        },
+        { type: "tool_call_end", id: "post-commit-image" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    const imageTool = request.messages.find(
+      (message) => message.role === "tool" && message.callId === "post-commit-image",
+    );
+    expect(imageTool).toMatchObject({
+      role: "tool",
+      callId: "post-commit-image",
+      result: {
+        status: "completed",
+        output: { type: "image", occurrenceId, artifactId },
+      },
+      content: [
+        {
+          type: "file",
+          artifactId,
+          mediaType: "image/png",
+          bytes: new Uint8Array(pngBytes),
+        },
+      ],
+    });
+    return [
+      {
+        type: "text_delta",
+        text:
+          providerCalls === 2
+            ? "The committed image effect replayed once."
+            : "The child retained the inherited image.",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const backing = createInMemorySessionStoreDirectory<SessionRecord>();
+  const crash = createAppendCrashDirectory(
+    backing,
+    (record) =>
+      record.schemaVersion === 3 &&
+      record.record.type === "runtime_event" &&
+      record.record.event.type === "tool_completed" &&
+      record.record.event.callId === "post-commit-image",
+  );
+  const lifecycleOptions = {
+    modelTargets: createVisionResponsesTargets(driver),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+    [sessionStoreDirectory]: crash.directory,
+  };
+  const warm = createSessionLifecycle(lifecycleOptions);
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const created = await warm.create({ targetIdentity: visionResponsesIdentity });
+    await expect(
+      warm.continue({
+        sessionId: created.sessionId,
+        input: { text: "Read and retain this image." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+        runId,
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "failed", error: { code: "session_persistence_failed" } },
+    });
+    expect(crash.didTrip()).toBe(true);
+    crash.disable();
+    await warm.close();
+    await rm(selectedPath);
+
+    cold = createSessionLifecycle(lifecycleOptions);
+    await expect(cold.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "ready",
+      snapshot: { status: "interrupted", run: { runId, status: "interrupted" } },
+    });
+    const continued = await cold.continue({ sessionId: created.sessionId });
+    expect(continued).toMatchObject({
+      result: { status: "completed", answer: "The committed image effect replayed once." },
+      snapshot: { status: "settled", run: { runId, status: "settled" } },
+    });
+    const parentStore = await backing.open(created.sessionId);
+    expect(
+      ((await parentStore?.read()) ?? []).filter(
+        (record) =>
+          record.schemaVersion === 3 &&
+          record.record.type === "input_resource_image_read_committed",
+      ),
+    ).toHaveLength(1);
+
+    const child = await cold.branch({
+      parentSessionId: created.sessionId,
+      atSequence: continued.snapshot.lastSequence,
+    });
+    await expect(
+      cold.continue({ sessionId: child.sessionId, input: { text: "Use the inherited image." } }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The child retained the inherited image." },
+    });
+    const childStore = await backing.open(child.sessionId);
+    expect(
+      ((await childStore?.read()) ?? []).filter(
+        (record) =>
+          record.schemaVersion === 3 &&
+          record.record.type === "input_resource_image_read_committed",
+      ),
+    ).toHaveLength(0);
+    expect(providerCalls).toBe(3);
+  } finally {
+    crash.disable();
+    await cold?.close();
+    await warm.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle projects one validated PNG only for the exact Vision Chat profile", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-vision-chat-png-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -2849,9 +3132,11 @@ test("SessionLifecycle preserves a Vision Chat image through reasoning and a too
   await writeFile(selectedPath, pngBytes);
   const productionSnapshot = await createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
-  }).snapshot({ signal: new AbortController().signal });
-  const thinkingCapability = productionSnapshot.targets.find((target) =>
-    Object.is(target.identity.targetId, visionIdentity.targetId),
+  }).snapshot({ includeHistoricalProfiles: true, signal: new AbortController().signal });
+  const thinkingCapability = productionSnapshot.targets.find(
+    (target) =>
+      target.identity.targetId === visionIdentity.targetId &&
+      target.identity.profileVersion === visionIdentity.profileVersion,
   )?.thinkingCapability;
   if (thinkingCapability === undefined) {
     throw new Error("Expected the exact Vision Chat thinking capability.");
@@ -6997,6 +7282,78 @@ test("SessionLifecycle rejects a title terminal record without its matching dura
     await rm(testRoot, { recursive: true, force: true });
   }
 });
+
+function createVisionResponsesTargets(driver: ModelDriver): ModelTargets {
+  return {
+    async resolve() {
+      return {
+        identity: visionResponsesIdentity,
+        driver,
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+        modalityProfile: {
+          profileVersion: 1,
+          explicitUserImages: "unsupported",
+          imageToolResults: "supported",
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionResponsesIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: preparedDirectDeepSeekV2ContextProfile,
+          },
+        ],
+      };
+    },
+  };
+}
+
+function createAppendCrashDirectory(
+  backing: SessionStoreDirectory<SessionRecord>,
+  shouldCrash: (record: SessionRecord) => boolean,
+): {
+  readonly directory: SessionStoreDirectory<SessionRecord>;
+  readonly didTrip: () => boolean;
+  readonly disable: () => void;
+} {
+  let enabled = true;
+  let tripped = false;
+  let blocking = false;
+  const wrapStore = (
+    store: Awaited<ReturnType<SessionStoreDirectory<SessionRecord>["create"]>>,
+  ) => ({
+    async append(record: SessionRecord) {
+      if (enabled && (blocking || shouldCrash(record))) {
+        blocking = true;
+        tripped = true;
+        throw new Error("simulated process loss after the selected durable prefix");
+      }
+      await store.append(record);
+    },
+    read: () => store.read(),
+  });
+  return {
+    directory: {
+      async create(sessionId) {
+        return wrapStore(await backing.create(sessionId));
+      },
+      listSessionEntries: () => backing.listSessionEntries(),
+      listSessionIds: () => backing.listSessionIds(),
+      async open(sessionId) {
+        const store = await backing.open(sessionId);
+        return store === undefined ? undefined : wrapStore(store);
+      },
+    },
+    didTrip: () => tripped,
+    disable() {
+      enabled = false;
+      blocking = false;
+    },
+  };
+}
 
 function isToolEvent(event: RuntimeEvent): boolean {
   return event.type.startsWith("tool_");
