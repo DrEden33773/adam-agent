@@ -2849,9 +2849,11 @@ test("SessionLifecycle preserves a Vision Chat image through reasoning and a too
   await writeFile(selectedPath, pngBytes);
   const productionSnapshot = await createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
-  }).snapshot({ signal: new AbortController().signal });
-  const thinkingCapability = productionSnapshot.targets.find((target) =>
-    Object.is(target.identity.targetId, visionIdentity.targetId),
+  }).snapshot({ includeHistoricalProfiles: true, signal: new AbortController().signal });
+  const thinkingCapability = productionSnapshot.targets.find(
+    (target) =>
+      target.identity.targetId === visionIdentity.targetId &&
+      target.identity.profileVersion === visionIdentity.profileVersion,
   )?.thinkingCapability;
   if (thinkingCapability === undefined) {
     throw new Error("Expected the exact Vision Chat thinking capability.");

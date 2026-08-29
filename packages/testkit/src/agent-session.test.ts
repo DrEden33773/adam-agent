@@ -36,6 +36,7 @@ import {
 } from "@adam-agent/agent";
 import {
   createCodingToolRegistryForTesting,
+  createInputResourceUserMessageV1,
   createPromptContextV1,
   type SessionRecord,
   sessionDurableContext,
@@ -343,7 +344,7 @@ describe("AgentSession", () => {
           {
             type: "tool_call_delta",
             id: "read-lazy-image",
-            json: JSON.stringify({ occurrenceId: occurrence.occurrenceId }),
+            json: JSON.stringify({ occurrenceId: occurrence.occurrenceId, maxByteCount: 64 }),
           },
           { type: "tool_call_end", id: "read-lazy-image" },
           { type: "finish", reason: "tool_calls" },
@@ -447,6 +448,112 @@ describe("AgentSession", () => {
         },
       },
     ]);
+  });
+
+  test("a cold Vision Responses continuation reconstructs the image tool output without replaying its effect", async () => {
+    const bytes = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    );
+    const artifactId = `sha256:${createHash("sha256").update(bytes).digest("hex")}` as const;
+    const occurrence = imageOccurrence(artifactId, bytes.byteLength, "restart-image");
+    let artifactReads = 0;
+    const artifactStore: ArtifactStore = {
+      async write(input) {
+        return {
+          id: artifactId,
+          mediaType: input.mediaType,
+          byteCount: input.bytes.byteLength,
+          source: input.source,
+        };
+      },
+      async read(id) {
+        artifactReads += 1;
+        return id === artifactId ? new Uint8Array(bytes) : undefined;
+      },
+    };
+    const descriptor = {
+      schemaVersion: 1 as const,
+      type: "image" as const,
+      occurrenceId: occurrence.occurrenceId,
+      displayName: occurrence.displayName,
+      artifactId,
+      byteCount: bytes.byteLength,
+      digest: artifactId,
+      mediaType: "image/png" as const,
+      width: 1,
+      height: 1,
+    };
+    const initialMessages = [
+      createInputResourceUserMessageV1("Inspect the linked image.", [occurrence]),
+      {
+        role: "assistant" as const,
+        content: "",
+        toolCalls: [
+          {
+            id: "read-before-restart",
+            name: "read_input_resource",
+            argumentsJson: JSON.stringify({ occurrenceId: occurrence.occurrenceId }),
+          },
+        ],
+      },
+      {
+        role: "tool" as const,
+        callId: "read-before-restart",
+        name: "read_input_resource",
+        result: { status: "completed" as const, output: descriptor },
+      },
+    ];
+    const model = new FakeModelDriver((request) => {
+      expect(request.messages.find((message) => message.role === "tool")).toEqual({
+        ...initialMessages[2],
+        content: [
+          {
+            type: "file",
+            artifactId,
+            mediaType: "image/png",
+            bytes: new Uint8Array(bytes),
+          },
+        ],
+      });
+      return [
+        { type: "text_delta", text: "The durable image was reconstructed." },
+        { type: "finish", reason: "stop" },
+      ];
+    });
+    const session = new AgentSession({
+      artifactStore,
+      maximumOutputTokens: 4_096,
+      modalityProfile: {
+        profileVersion: 1,
+        explicitUserImages: "unsupported",
+        imageToolResults: "supported",
+      },
+      model,
+      store: createInMemorySessionStore(),
+      [sessionDurableContext]: {
+        hasInheritedMessages: true,
+        initialMessages,
+        inputResources: [occurrence],
+        nextSequence: 1,
+        targetIdentity: {
+          targetId: "deepseek-v4-flash-vision-exp.direct",
+          vendor: "deepseek",
+          modelId: "deepseek-v4-flash-vision-exp",
+          route: "direct",
+          profileVersion: 2,
+          certification: "certified",
+        },
+      },
+    } as ConstructorParameters<typeof AgentSession>[0] & {
+      readonly [sessionDurableContext]: unknown;
+    });
+
+    await expect(session.run({ text: "Continue from canonical history." })).resolves.toEqual({
+      status: "completed",
+      answer: "The durable image was reconstructed.",
+    });
+    expect(artifactReads).toBe(1);
   });
 
   test("a provider reasoning block streams as structural runtime facts before the answer", async () => {

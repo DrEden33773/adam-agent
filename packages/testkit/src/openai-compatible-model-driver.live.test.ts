@@ -210,8 +210,15 @@ liveTest(
       deadlineMs: 90_000,
     });
     const target = (
-      await modelTargets.snapshot({ signal: new AbortController().signal })
-    ).targets.find(({ identity }) => identity.targetId === "deepseek-v4-flash-vision-exp.direct");
+      await modelTargets.snapshot({
+        includeHistoricalProfiles: true,
+        signal: new AbortController().signal,
+      })
+    ).targets.find(
+      ({ identity }) =>
+        identity.targetId === "deepseek-v4-flash-vision-exp.direct" &&
+        identity.profileVersion === 1,
+    );
     if (target === undefined || modelTargets.testConnection === undefined) {
       throw new Error("Expected the exact Vision Chat target and connection test.");
     }
@@ -272,6 +279,72 @@ liveTest(
         projectedContent: {
           version: 1,
           explicitUserImages: {
+            count: 1,
+            byteCount: imageBytes.byteLength,
+            pixelCount: 128 * 128,
+            maximumWidth: 128,
+            maximumHeight: 128,
+          },
+        },
+      });
+    } finally {
+      await lifecycle.close();
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+  180_000,
+);
+
+liveTest(
+  "Vision Responses lazy image observes one exact quadrant order through the real resource tool",
+  async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-live-vision-responses-"));
+    const stateRoot = join(testRoot, "state");
+    const workspaceRoot = join(testRoot, "workspace");
+    const imagePath = join(testRoot, "quadrants.png");
+    const imageBytes = createQuadrantPng(128, 128);
+    await mkdir(workspaceRoot);
+    await writeFile(imagePath, imageBytes);
+    const modelTargets = createModelTargets({
+      environment: { DEEPSEEK_API_KEY: liveApiKey },
+      connectionDeadlineMs: 15_000,
+      deadlineMs: 90_000,
+    });
+    const target = (
+      await modelTargets.snapshot({ signal: new AbortController().signal })
+    ).targets.find(({ identity }) => identity.targetId === "deepseek-v4-flash-vision-exp.direct");
+    if (target === undefined || target.identity.profileVersion !== 2) {
+      throw new Error("Expected the current exact Vision Responses profile.");
+    }
+    const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+    try {
+      const created = await lifecycle.create({ targetIdentity: target.identity });
+      const continued = await lifecycle.continue({
+        sessionId: created.sessionId,
+        input: {
+          text: "You must call read_input_resource for the linked image. Inspect its four equal color quadrants, then reply with only the top-left, top-right, bottom-left, and bottom-right colors in that order.",
+        },
+        resourceSelections: [{ type: "local_file", path: imagePath }],
+      });
+      expect(continued.result).toMatchObject({ status: "completed" });
+      if (continued.result.status !== "completed") {
+        throw new Error("Expected the Vision Responses image turn to complete.");
+      }
+      expect(continued.result.answer).toMatch(/red.*green.*blue.*white/isu);
+      const records = await readJsonlRecords(stateRoot);
+      expect(
+        records.find((record) => isRecordType(record, "input_resource_image_read_committed")),
+      ).toMatchObject({
+        image: { type: "image", mediaType: "image/png", width: 128, height: 128 },
+      });
+      expect(
+        records.filter((record) => isRecordType(record, "provider_attempt_started")).at(-1),
+      ).toMatchObject({
+        targetIdentity: { profileVersion: 2 },
+        projectedContent: {
+          version: 1,
+          imageToolResults: {
             count: 1,
             byteCount: imageBytes.byteLength,
             pixelCount: 128 * 128,

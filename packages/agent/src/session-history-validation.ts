@@ -869,7 +869,7 @@ export function validateCurrentSessionHistory(
     if (record.type === "input_resource_image_read_committed") {
       const toolState = toolStates.get(record.callId);
       const occurrence = visibleInputResources.get(record.image.occurrenceId);
-      let argumentsValue: { occurrenceId?: unknown } | undefined;
+      let argumentsValue: { occurrenceId?: unknown; maxByteCount?: unknown } | undefined;
       try {
         const decoded = JSON.parse(toolState?.call.argumentsJson ?? "") as unknown;
         argumentsValue =
@@ -890,7 +890,14 @@ export function validateCurrentSessionHistory(
         toolState.terminal ||
         toolState.decision !== "allow" ||
         committedInputResourceReads.has(record.callId) ||
-        Object.keys(argumentsValue ?? {}).length !== 1 ||
+        !Object.keys(argumentsValue ?? {}).every(
+          (key) => key === "occurrenceId" || key === "maxByteCount",
+        ) ||
+        (argumentsValue?.maxByteCount !== undefined &&
+          (!Number.isSafeInteger(argumentsValue.maxByteCount) ||
+            (argumentsValue.maxByteCount as number) < 1 ||
+            (argumentsValue.maxByteCount as number) >
+              inputResourceLimitsV1.maximumReadPageBytes)) ||
         argumentsValue?.occurrenceId !== record.image.occurrenceId ||
         occurrence === undefined ||
         occurrence.support !== "image" ||

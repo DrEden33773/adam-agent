@@ -3798,8 +3798,12 @@ function parseImageInputResourceCall(
       typeof decoded !== "object" ||
       decoded === null ||
       Array.isArray(decoded) ||
-      Object.keys(decoded).length !== 1 ||
-      typeof (decoded as { readonly occurrenceId?: unknown }).occurrenceId !== "string"
+      !Object.keys(decoded).every((key) => key === "occurrenceId" || key === "maxByteCount") ||
+      typeof (decoded as { readonly occurrenceId?: unknown }).occurrenceId !== "string" ||
+      ("maxByteCount" in decoded &&
+        (!Number.isSafeInteger(decoded.maxByteCount) ||
+          (decoded.maxByteCount as number) < 1 ||
+          (decoded.maxByteCount as number) > inputResourceLimitsV1.maximumReadPageBytes))
     ) {
       return undefined;
     }
