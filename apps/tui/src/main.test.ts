@@ -4242,6 +4242,7 @@ test("continued scrolling loads only the adjacent oversized reasoning range", as
     terminal.input("Traverse provider reasoning ranges\r");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
     await waitForPhysicalText(terminal, "Thinking done · adam");
+    await waitForPhysicalText(terminal, "Adam · Streaming session");
     const durableStateBeforeNavigation = await readFilesRecursively(stateRoot);
     await inputAndWaitForPhysicalFrame(terminal, "\u0014");
     await waitForPath(join(controlRoot, "artifact-read-1-settled"));
