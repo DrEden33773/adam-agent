@@ -335,6 +335,7 @@ export async function prepareExplicitUserImageMessagesV1(input: {
           height: usage.maximumHeight,
         });
       } catch {
+        input.signal.throwIfAborted();
         return {
           status: "failed",
           error: {

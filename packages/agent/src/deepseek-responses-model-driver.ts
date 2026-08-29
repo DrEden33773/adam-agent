@@ -5,7 +5,15 @@ import type {
   ModelRequest,
   ModelUserContentPart,
 } from "./agent-session-contracts.js";
+import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
 import { ModelDriverError } from "./model-driver-error.js";
+
+const maximumSseFrameBytes = 2 * 1024 * 1024;
+const maximumToolArgumentBytes = 2 * 1024 * 1024;
+const maximumToolCallCount = 128;
+const maximumToolItemIdBytes = 1_024;
+const maximumToolCallIdBytes = 1_024;
+const maximumToolNameBytes = 256;
 
 export type DirectDeepSeekResponsesModelDriverOptions = {
   readonly apiKey: string;
@@ -40,16 +48,23 @@ export class DirectDeepSeekResponsesModelDriver implements ModelDriver {
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
     const controller = new AbortController();
     let deadlineExpired = false;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     const abort = () => controller.abort(request.signal.reason);
     if (request.signal.aborted) {
       abort();
     } else {
       request.signal.addEventListener("abort", abort, { once: true });
     }
-    const timer = setTimeout(() => {
-      deadlineExpired = true;
-      controller.abort(new Error("The model provider request reached its deadline."));
-    }, this.#deadlineMs);
+    const armDeadline = () => {
+      if (deadlineTimer !== undefined) {
+        clearTimeout(deadlineTimer);
+      }
+      deadlineTimer = setTimeout(() => {
+        deadlineExpired = true;
+        controller.abort(new Error("The model provider request reached its deadline."));
+      }, this.#deadlineMs);
+    };
+    armDeadline();
     try {
       const response = await this.#fetch(`${this.#baseURL}/responses`, {
         method: "POST",
@@ -66,7 +81,20 @@ export class DirectDeepSeekResponsesModelDriver implements ModelDriver {
       if (response.body === null) {
         throw protocolError("The model provider returned an empty streaming response.");
       }
-      yield* normalizeResponsesEvents(readServerSentEvents(response.body));
+      for await (const event of normalizeResponsesEvents(
+        readServerSentEvents(response.body, controller.signal),
+        this.#apiKey,
+      )) {
+        if (event.type === "finish") {
+          if (deadlineTimer !== undefined) {
+            clearTimeout(deadlineTimer);
+            deadlineTimer = undefined;
+          }
+        } else if (isAcceptedProgressEvent(event)) {
+          armDeadline();
+        }
+        yield event;
+      }
       if (deadlineExpired) {
         throw new ModelDriverError("timeout", "The model provider request reached its deadline.", {
           cause: undefined,
@@ -96,7 +124,9 @@ export class DirectDeepSeekResponsesModelDriver implements ModelDriver {
         cause: error,
       });
     } finally {
-      clearTimeout(timer);
+      if (deadlineTimer !== undefined) {
+        clearTimeout(deadlineTimer);
+      }
       request.signal.removeEventListener("abort", abort);
     }
   }
@@ -142,6 +172,14 @@ function mapMessage(message: ModelMessage): readonly unknown[] {
       ];
     case "assistant":
       return [
+        ...(message.reasoning === undefined || message.reasoning.length === 0
+          ? []
+          : [
+              {
+                type: "reasoning",
+                content: [{ type: "reasoning_text", text: message.reasoning }],
+              },
+            ]),
         ...(message.content.length === 0
           ? []
           : [
@@ -185,14 +223,28 @@ function mapReasoningEffort(policy: NonNullable<ModelRequest["thinkingPolicy"]>)
   return policy.mapping.thinkingType === "disabled" ? "none" : policy.mapping.reasoningEffort;
 }
 
-async function* readServerSentEvents(body: ReadableStream<Uint8Array>): AsyncIterable<unknown> {
+async function* readServerSentEvents(
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+): AsyncIterable<unknown> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffered = "";
   let eventCount = 0;
+  let completed = false;
+  let rejectAborted: (reason: unknown) => void = () => undefined;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    rejectAborted = reject;
+  });
+  const abort = () => rejectAborted(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  if (signal.aborted) {
+    abort();
+  } else {
+    signal.addEventListener("abort", abort, { once: true });
+  }
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await Promise.race([reader.read(), aborted]);
       buffered += decoder.decode(value, { stream: !done });
       let boundary = buffered.indexOf("\n\n");
       while (boundary >= 0) {
@@ -205,7 +257,7 @@ async function* readServerSentEvents(body: ReadableStream<Uint8Array>): AsyncIte
           .join("\n");
         if (data.length > 0) {
           eventCount += 1;
-          if (eventCount > 100_000 || Buffer.byteLength(data, "utf8") > 2 * 1024 * 1024) {
+          if (eventCount > 100_000 || Buffer.byteLength(data, "utf8") > maximumSseFrameBytes) {
             throw protocolError("The model provider response exceeded Adam's stream limit.");
           }
           try {
@@ -216,7 +268,11 @@ async function* readServerSentEvents(body: ReadableStream<Uint8Array>): AsyncIte
         }
         boundary = buffered.indexOf("\n\n");
       }
+      if (Buffer.byteLength(buffered, "utf8") > maximumSseFrameBytes) {
+        throw protocolError("The model provider response exceeded Adam's stream limit.");
+      }
       if (done) {
+        completed = true;
         break;
       }
     }
@@ -224,16 +280,25 @@ async function* readServerSentEvents(body: ReadableStream<Uint8Array>): AsyncIte
       throw protocolError("The model provider ended with an incomplete SSE frame.");
     }
   } finally {
+    signal.removeEventListener("abort", abort);
+    if (!completed) {
+      await reader.cancel(signal.reason).catch(() => undefined);
+    }
     reader.releaseLock();
   }
 }
 
 async function* normalizeResponsesEvents(
   events: AsyncIterable<unknown>,
+  sensitiveValue: string,
 ): AsyncIterable<ModelEvent> {
   let reasoningStarted = false;
   let terminal = false;
   const calls = new Map<string, { readonly callId: string; readonly name: string }>();
+  const callIds = new Set<string>();
+  let contentBytes = 0;
+  let toolArgumentBytes = 0;
+  let toolCallCount = 0;
   for await (const value of events) {
     if (typeof value !== "object" || value === null || !("type" in value)) {
       throw protocolError("The model provider returned an invalid semantic event.");
@@ -250,6 +315,7 @@ async function* normalizeResponsesEvents(
         if (typeof event.delta !== "string") {
           throw protocolError("The model provider returned invalid reasoning text.");
         }
+        contentBytes = addBoundedBytes(contentBytes, event.delta, maximumModelResponseContentBytes);
         if (!reasoningStarted) {
           reasoningStarted = true;
           yield {
@@ -264,6 +330,7 @@ async function* normalizeResponsesEvents(
         if (typeof event.delta !== "string") {
           throw protocolError("The model provider returned invalid output text.");
         }
+        contentBytes = addBoundedBytes(contentBytes, event.delta, maximumModelResponseContentBytes);
         yield { type: "text_delta", text: event.delta };
         break;
       case "response.output_item.added": {
@@ -281,8 +348,27 @@ async function* normalizeResponsesEvents(
           typeof item.call_id === "string" &&
           typeof item.name === "string"
         ) {
+          if (
+            item.id.length === 0 ||
+            item.call_id.length === 0 ||
+            item.name.length === 0 ||
+            Buffer.byteLength(item.id, "utf8") > maximumToolItemIdBytes ||
+            Buffer.byteLength(item.call_id, "utf8") > maximumToolCallIdBytes ||
+            Buffer.byteLength(item.name, "utf8") > maximumToolNameBytes ||
+            calls.has(item.id) ||
+            callIds.has(item.call_id)
+          ) {
+            throw protocolError("The model provider returned invalid function-call identity.");
+          }
+          toolCallCount += 1;
+          if (toolCallCount > maximumToolCallCount) {
+            throw protocolError("The model provider response exceeded Adam's tool-call limit.");
+          }
           calls.set(item.id, { callId: item.call_id, name: item.name });
+          callIds.add(item.call_id);
           yield { type: "tool_call_start", id: item.call_id, name: item.name };
+        } else if (item?.type === "function_call") {
+          throw protocolError("The model provider returned invalid function-call identity.");
         }
         break;
       }
@@ -291,14 +377,22 @@ async function* normalizeResponsesEvents(
         if (call === undefined || typeof event.delta !== "string") {
           throw protocolError("The model provider returned invalid function arguments.");
         }
+        toolArgumentBytes = addBoundedBytes(
+          toolArgumentBytes,
+          event.delta,
+          maximumToolArgumentBytes,
+        );
         yield { type: "tool_call_delta", id: call.callId, json: event.delta };
         break;
       }
       case "response.output_item.done": {
-        const item = event.item as { readonly id?: unknown } | undefined;
+        const item = event.item as { readonly id?: unknown; readonly type?: unknown } | undefined;
         const call = typeof item?.id === "string" ? calls.get(item.id) : undefined;
         if (call !== undefined) {
           yield { type: "tool_call_end", id: call.callId };
+          calls.delete(item?.id as string);
+        } else if (item?.type === "function_call") {
+          throw protocolError("The model provider ended an unknown function call.");
         }
         break;
       }
@@ -309,12 +403,41 @@ async function* normalizeResponsesEvents(
           throw protocolError("The model provider returned more than one terminal response event.");
         }
         terminal = true;
+        if (calls.size > 0) {
+          throw protocolError("The model provider ended with an incomplete function call.");
+        }
         if (reasoningStarted) {
           yield { type: "reasoning_end", id: "provider-reasoning-0" };
         }
         const response = event.response as
-          | { readonly usage?: unknown; readonly status?: unknown }
+          | {
+              readonly usage?: unknown;
+              readonly status?: unknown;
+              readonly error?: unknown;
+              readonly incomplete_details?: unknown;
+            }
           | undefined;
+        if (event.type === "response.failed") {
+          const error = response?.error as
+            | { readonly code?: unknown; readonly message?: unknown }
+            | undefined;
+          throw new ModelDriverError("provider", "The model provider failed the response.", {
+            cause: undefined,
+            ...(typeof error?.code === "string"
+              ? {
+                  providerCode: error.code.split(sensitiveValue).join("[REDACTED]").slice(0, 128),
+                }
+              : {}),
+            ...(typeof error?.message === "string"
+              ? {
+                  responseSummary: error.message
+                    .split(sensitiveValue)
+                    .join("[REDACTED]")
+                    .slice(0, 512),
+                }
+              : {}),
+          });
+        }
         const usage = response?.usage as
           | {
               readonly input_tokens?: unknown;
@@ -353,18 +476,24 @@ async function* normalizeResponsesEvents(
         }
         const reason =
           event.type === "response.completed"
-            ? calls.size > 0
+            ? toolCallCount > 0
               ? "tool_calls"
               : "stop"
             : event.type === "response.incomplete"
-              ? "length"
+              ? (response?.incomplete_details as { readonly reason?: unknown } | undefined)
+                  ?.reason === "content_filter"
+                ? "content_filter"
+                : "length"
               : "unknown";
+        const incompleteReason = (
+          response?.incomplete_details as { readonly reason?: unknown } | undefined
+        )?.reason;
         yield {
           type: "finish",
           reason,
-          rawReason: String(response?.status ?? event.type).slice(0, 128),
+          rawReason: String(incompleteReason ?? response?.status ?? event.type).slice(0, 128),
         };
-        break;
+        return;
       }
       default:
         break;
@@ -372,6 +501,29 @@ async function* normalizeResponsesEvents(
   }
   if (!terminal) {
     throw protocolError("The model provider stream ended without a terminal response event.");
+  }
+}
+
+function addBoundedBytes(total: number, value: string, maximum: number): number {
+  const next = total + Buffer.byteLength(value, "utf8");
+  if (!Number.isSafeInteger(next) || next > maximum) {
+    throw protocolError("The model provider response exceeded Adam's semantic content limit.");
+  }
+  return next;
+}
+
+function isAcceptedProgressEvent(event: ModelEvent): boolean {
+  switch (event.type) {
+    case "text_delta":
+    case "reasoning_delta":
+      return Buffer.byteLength(event.text, "utf8") > 0;
+    case "tool_call_delta":
+      return Buffer.byteLength(event.json, "utf8") > 0;
+    case "tool_call_start":
+    case "tool_call_end":
+      return true;
+    default:
+      return false;
   }
 }
 
@@ -425,10 +577,12 @@ async function readBoundedErrorBody(response: Response): Promise<string> {
   const reader = response.body.getReader();
   const chunks: Uint8Array[] = [];
   let bytes = 0;
+  let completed = false;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) {
+        completed = true;
         break;
       }
       bytes += value.byteLength;
@@ -438,6 +592,9 @@ async function readBoundedErrorBody(response: Response): Promise<string> {
       chunks.push(value);
     }
   } finally {
+    if (!completed) {
+      await reader.cancel().catch(() => undefined);
+    }
     reader.releaseLock();
   }
   const combined = new Uint8Array(bytes);

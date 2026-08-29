@@ -13,6 +13,8 @@ const topologySuitePath = fileURLToPath(import.meta.url);
 const testkitSourcePath = fileURLToPath(new URL(".", import.meta.url));
 
 const operatingSystemTestNames = [
+  "SessionLifecycle blocks a cold Vision Responses continuation when its JSONL image artifact is corrupt",
+  "SessionLifecycle blocks a cold Vision Responses continuation when its JSONL image artifact is missing",
   "SessionLifecycle cold resume keeps a Direct DeepSeek v2 session on its historical profile",
   "SessionLifecycle cold resume reconstructs the exact historical Vision Chat image bytes",
   "SessionLifecycle cold resume reads an immutable input resource after its source is deleted",
@@ -97,6 +99,8 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
     .toEqual([
       "const:lifecycleOwnerFixturePath=CallExpression",
       "const:childObservations=NewExpression",
+      "const:visionResponsesIdentity=ObjectLiteralExpression",
+      "function:exerciseColdVisionResponsesArtifactFailure",
       "function:observeChild",
       "function:waitForChildMessage",
       "function:waitForFixtureRecord",
@@ -147,9 +151,9 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
 
   const behaviorNames = declaredTestNames(behaviorSource);
   const operatingSystemNames = declaredTestNames(operatingSystemSource);
-  expect.soft(behaviorNames).toHaveLength(75);
+  expect.soft(behaviorNames).toHaveLength(77);
   expect.soft(operatingSystemNames).toEqual([...operatingSystemTestNames].sort());
-  expect.soft(operatingSystemNames).toHaveLength(17);
+  expect.soft(operatingSystemNames).toHaveLength(19);
   expect.soft(operatingSystemTestNames.filter((name) => behaviorNames.includes(name))).toEqual([]);
   const combinedNames = [...behaviorNames, ...operatingSystemNames];
   expect.soft(new Set(combinedNames).size).toBe(combinedNames.length);

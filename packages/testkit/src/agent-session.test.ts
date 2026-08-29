@@ -36,7 +36,6 @@ import {
 } from "@adam-agent/agent";
 import {
   createCodingToolRegistryForTesting,
-  createInputResourceUserMessageV1,
   createPromptContextV1,
   type SessionRecord,
   sessionDurableContext,
@@ -450,13 +449,35 @@ describe("AgentSession", () => {
     ]);
   });
 
-  test("a cold Vision Responses continuation reconstructs the image tool output without replaying its effect", async () => {
+  test("Vision Responses cancellation during image tool-result projection remains caller cancellation", async () => {
     const bytes = Buffer.from(
       "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
       "base64",
     );
     const artifactId = `sha256:${createHash("sha256").update(bytes).digest("hex")}` as const;
-    const occurrence = imageOccurrence(artifactId, bytes.byteLength, "restart-image");
+    const occurrence = imageOccurrence(artifactId, bytes.byteLength, "cancel-image-projection");
+    const readStarted = Promise.withResolvers<void>();
+    const releaseRead = Promise.withResolvers<void>();
+    let call = 0;
+    const model = new FakeModelDriver(() => {
+      call += 1;
+      return call === 1
+        ? [
+            {
+              type: "tool_call_start",
+              id: "cancel-image-read",
+              name: "read_input_resource",
+            },
+            {
+              type: "tool_call_delta",
+              id: "cancel-image-read",
+              json: JSON.stringify({ occurrenceId: occurrence.occurrenceId }),
+            },
+            { type: "tool_call_end", id: "cancel-image-read" },
+            { type: "finish", reason: "tool_calls" },
+          ]
+        : [{ type: "finish", reason: "stop" }];
+    });
     let artifactReads = 0;
     const artifactStore: ArtifactStore = {
       async write(input) {
@@ -469,58 +490,14 @@ describe("AgentSession", () => {
       },
       async read(id) {
         artifactReads += 1;
+        if (artifactReads === 2) {
+          readStarted.resolve();
+          await releaseRead.promise;
+        }
         return id === artifactId ? new Uint8Array(bytes) : undefined;
       },
     };
-    const descriptor = {
-      schemaVersion: 1 as const,
-      type: "image" as const,
-      occurrenceId: occurrence.occurrenceId,
-      displayName: occurrence.displayName,
-      artifactId,
-      byteCount: bytes.byteLength,
-      digest: artifactId,
-      mediaType: "image/png" as const,
-      width: 1,
-      height: 1,
-    };
-    const initialMessages = [
-      createInputResourceUserMessageV1("Inspect the linked image.", [occurrence]),
-      {
-        role: "assistant" as const,
-        content: "",
-        toolCalls: [
-          {
-            id: "read-before-restart",
-            name: "read_input_resource",
-            argumentsJson: JSON.stringify({ occurrenceId: occurrence.occurrenceId }),
-          },
-        ],
-      },
-      {
-        role: "tool" as const,
-        callId: "read-before-restart",
-        name: "read_input_resource",
-        result: { status: "completed" as const, output: descriptor },
-      },
-    ];
-    const model = new FakeModelDriver((request) => {
-      expect(request.messages.find((message) => message.role === "tool")).toEqual({
-        ...initialMessages[2],
-        content: [
-          {
-            type: "file",
-            artifactId,
-            mediaType: "image/png",
-            bytes: new Uint8Array(bytes),
-          },
-        ],
-      });
-      return [
-        { type: "text_delta", text: "The durable image was reconstructed." },
-        { type: "finish", reason: "stop" },
-      ];
-    });
+    const tools = createCodingToolRegistry({ artifactStore, workspaceRoot: "/workspace" });
     const session = new AgentSession({
       artifactStore,
       maximumOutputTokens: 4_096,
@@ -530,12 +507,13 @@ describe("AgentSession", () => {
         imageToolResults: "supported",
       },
       model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
       store: createInMemorySessionStore(),
+      tools,
       [sessionDurableContext]: {
-        hasInheritedMessages: true,
-        initialMessages,
         inputResources: [occurrence],
         nextSequence: 1,
+        promptContext: createPromptContextV1(tools),
         targetIdentity: {
           targetId: "deepseek-v4-flash-vision-exp.direct",
           vendor: "deepseek",
@@ -548,12 +526,20 @@ describe("AgentSession", () => {
     } as ConstructorParameters<typeof AgentSession>[0] & {
       readonly [sessionDurableContext]: unknown;
     });
+    const controller = new AbortController();
+    const result = session.run(
+      {
+        text: "Read the linked image, then inspect it.",
+        inputResources: [occurrence],
+      },
+      { signal: controller.signal },
+    );
+    await readStarted.promise;
+    controller.abort(new DOMException("cancelled", "AbortError"));
+    releaseRead.resolve();
 
-    await expect(session.run({ text: "Continue from canonical history." })).resolves.toEqual({
-      status: "completed",
-      answer: "The durable image was reconstructed.",
-    });
-    expect(artifactReads).toBe(1);
+    await expect(result).resolves.toEqual(cancelledResult);
+    expect({ artifactReads, call }).toEqual({ artifactReads: 2, call: 1 });
   });
 
   test("a provider reasoning block streams as structural runtime facts before the answer", async () => {

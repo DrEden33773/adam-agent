@@ -17,10 +17,7 @@ import {
   resolveThinkingPolicy,
   selectModelTargetId,
 } from "@adam-agent/agent";
-import {
-  AiSdkModelDriverForTesting,
-  DirectDeepSeekResponsesModelDriverForTesting,
-} from "@adam-agent/agent/internal-testing";
+import { AiSdkModelDriverForTesting } from "@adam-agent/agent/internal-testing";
 import { expect, test, vi } from "vitest";
 
 test("an exact Direct DeepSeek target returns a public answer-only model driver", async () => {
@@ -2244,8 +2241,19 @@ test("current Direct DeepSeek v3 selection retains exact historical v2 and v1 re
 });
 
 test("current Vision resolves all-Responses v2 while historical Vision remains Chat v1", async () => {
+  const requests: Array<{ readonly url: string; readonly body: unknown }> = [];
   const targets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      requests.push({ url, body: JSON.parse(String(init?.body)) });
+      return new Response(
+        url.endsWith("/responses")
+          ? 'data: {"type":"response.completed","response":{"status":"completed"}}\n\n'
+          : answerOnlyDeepSeekStream,
+        { headers: { "content-type": "text/event-stream" }, status: 200 },
+      );
+    },
   });
   const current = await targets.resolve({
     targetId: "deepseek-v4-flash-vision-exp.direct",
@@ -2267,7 +2275,6 @@ test("current Vision resolves all-Responses v2 while historical Vision remains C
       imageToolResults: "supported",
     },
   });
-  expect(current.driver).toBeInstanceOf(DirectDeepSeekResponsesModelDriverForTesting);
   expect(historical).toMatchObject({
     identity: { profileVersion: 1 },
     modalityProfile: {
@@ -2276,7 +2283,38 @@ test("current Vision resolves all-Responses v2 while historical Vision remains C
       imageToolResults: "unsupported",
     },
   });
-  expect(historical.driver).toBeInstanceOf(AiSdkModelDriverForTesting);
+  await collect(
+    current.driver.stream({
+      messages: [{ role: "user", content: "Use current Vision." }],
+      tools: [],
+      maximumOutputTokens: 2_048,
+      signal: new AbortController().signal,
+    }),
+  );
+  await collect(
+    historical.driver.stream({
+      messages: [{ role: "user", content: "Use historical Vision." }],
+      tools: [],
+      maximumOutputTokens: 2_048,
+      signal: new AbortController().signal,
+    }),
+  );
+  expect(requests).toEqual([
+    {
+      url: "https://api.deepseek.com/responses",
+      body: expect.objectContaining({
+        model: "deepseek-v4-flash-vision-exp",
+        input: [{ role: "user", content: "Use current Vision." }],
+      }),
+    },
+    {
+      url: "https://api.deepseek.com/chat/completions",
+      body: expect.objectContaining({
+        model: "deepseek-v4-flash-vision-exp",
+        messages: [{ role: "user", content: "Use historical Vision." }],
+      }),
+    },
+  ]);
 });
 
 test("historical target resolution rejects a conflicting target ID and exact identity", async () => {
