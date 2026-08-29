@@ -4961,8 +4961,12 @@ test("the production editor clears a manual session name through canonical Prese
   try {
     const fixture = startFixture({ controlRoot, stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
+    const beforeRename = fixture.output().length;
     fixture.write("/name Temporary name\r");
-    await fixture.waitFor("Adam · Temporary name");
+    await expect(
+      waitForFileContents(join(controlRoot, "session-name-dispatch-settled"), "admitted\n"),
+    ).resolves.toBe("admitted\n");
+    await fixture.waitForCompleteFrameAfter("Adam · Temporary name", beforeRename);
     const beforeClear = fixture.output().length;
     fixture.write("/name --");
     await fixture.waitForCompleteFrameAfter("--generate", beforeClear);
