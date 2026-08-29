@@ -31,6 +31,7 @@ import {
   withInternalExtensionSkillSourcesCurrent,
 } from "./extension-host.js";
 import {
+  createInputResourceUserMessageV1,
   InputResourceError,
   type InputResourceOccurrenceV1,
   type InputResourceSelectionV1,
@@ -2903,6 +2904,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             ...(durableResumeState === undefined ? {} : { resume: durableResumeState }),
           },
           contextProfile: resolved.contextProfile,
+          ...(resolved.modalityProfile === undefined
+            ? {}
+            : { modalityProfile: resolved.modalityProfile }),
           ...(durableOutputLimits === undefined
             ? {}
             : { [sessionDurableOutputLimits]: durableOutputLimits }),
@@ -5496,7 +5500,7 @@ function createAgentResumeState(
       ? modelMessagesFromCompleteRecords(
           currentRecords.filter((record) => record.sequence <= (contextCheckpoint?.sequence ?? 0)),
         )
-      : [{ role: "user", content: run.record.userMessage }];
+      : [createInputResourceUserMessageV1(run.record.userMessage, run.record.inputResources)];
   const toolResults: Array<
     NonNullable<AgentSessionDurableContext["resume"]>["toolResults"][number]
   > = [];

@@ -1819,6 +1819,9 @@ test("SessionLifecycle preserves duplicate selections as ordered occurrences ove
     if (user?.role !== "user") {
       throw new Error("Expected the duplicate resource descriptor request.");
     }
+    if (typeof user.content !== "string") {
+      throw new Error("Expected descriptor-only text for duplicate resources.");
+    }
     projectedOccurrences = JSON.parse(user.content.split("\n").at(-1) ?? "[]") as readonly {
       readonly occurrenceId: string;
       readonly artifact: { readonly id: string };
@@ -2353,6 +2356,619 @@ test("SessionLifecycle prefix branch exposes only input-resource occurrences ins
     ).resolves.toMatchObject({
       result: { status: "completed", answer: "Only the prefix resource is available." },
     });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle projects one validated PNG only for the exact Vision Chat profile", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-vision-chat-png-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "one-pixel.png");
+  const pngBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const digest = `sha256:${createHash("sha256").update(pngBytes).digest("hex")}` as const;
+  const visionIdentity: ModelTargetIdentity = {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  };
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, pngBytes);
+
+  const visionDriver = new FakeModelDriver((request) => {
+    expect(request.messages.at(-1)).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "Describe the exact image." },
+        {
+          type: "file",
+          artifactId: digest,
+          mediaType: "image/png",
+          bytes: new Uint8Array(pngBytes),
+        },
+      ],
+    });
+    return [
+      { type: "text_delta", text: "The image contains one exact pixel." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const visionTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: visionIdentity,
+        driver: visionDriver,
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+        modalityProfile: {
+          profileVersion: 1 as const,
+          explicitUserImages: "supported" as const,
+          imageToolResults: "unsupported" as const,
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: preparedDirectDeepSeekV2ContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const visionHarness = createInMemorySessionLifecycleHarness();
+  const visionLifecycle = visionHarness.createLifecycle({
+    modelTargets: visionTargets,
+    stateRoot: join(testRoot, "vision-state"),
+    workspaceRoot,
+  });
+  let flashDriverCalls = 0;
+  const flashDriver = new FakeModelDriver(() => {
+    flashDriverCalls += 1;
+    return [
+      { type: "text_delta", text: "This target must not receive an image." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const flashTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: flashDriver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const flashLifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets: flashTargets,
+    stateRoot: join(testRoot, "flash-state"),
+    workspaceRoot,
+  });
+
+  try {
+    const admitted = await visionLifecycle.admit({
+      targetIdentity: visionIdentity,
+      input: { text: "Describe the exact image." },
+      resourceSelections: [{ type: "local_file", path: selectedPath }],
+    });
+    expect(admitted).toMatchObject({
+      result: { status: "completed", answer: "The image contains one exact pixel." },
+    });
+    const visionStore = await visionHarness.sessions.open(admitted.snapshot.sessionId);
+    if (visionStore === undefined) {
+      throw new Error("Expected the Vision Chat session store.");
+    }
+    expect(
+      (await visionStore.read()).find(
+        (record) => record.schemaVersion === 3 && record.record.type === "provider_attempt_started",
+      ),
+    ).toMatchObject({
+      record: {
+        projectedContent: {
+          version: 1,
+          explicitUserImages: {
+            count: 1,
+            byteCount: pngBytes.byteLength,
+            pixelCount: 1,
+            maximumWidth: 1,
+            maximumHeight: 1,
+          },
+        },
+      },
+    });
+    await expect(
+      flashLifecycle.admit({
+        targetIdentity,
+        input: { text: "Describe the exact image." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+      }),
+    ).resolves.toMatchObject({
+      result: {
+        status: "failed",
+        error: {
+          code: "input_resource_unsupported",
+          message: "The selected target does not support explicit user images.",
+        },
+      },
+    });
+    expect(flashDriverCalls).toBe(0);
+  } finally {
+    await Promise.all([visionLifecycle.close(), flashLifecycle.close()]);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle projects one validated JPEG through the exact Vision Chat profile", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-vision-chat-jpeg-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "one-pixel.jpg");
+  const jpegBytes = Buffer.from(
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRQBAwQEBQQFCQUFCRQNCw0UFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFP/AABEIAAEAAQMBEQACEQEDEQH/xAGiAAABBQEBAQEBAQAAAAAAAAAAAQIDBAUGBwgJCgsQAAIBAwMCBAMFBQQEAAABfQECAwAEEQUSITFBBhNRYQcicRQygZGhCCNCscEVUtHwJDNicoIJChYXGBkaJSYnKCkqNDU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6g4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2drh4uPk5ebn6Onq8fLz9PX29/j5+gEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoLEQACAQIEBAMEBwUEBAABAncAAQIDEQQFITEGEkFRB2FxEyIygQgUQpGhscEJIzNS8BVictEKFiQ04SXxFxgZGiYnKCkqNTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqCg4SFhoeIiYqSk5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2dri4+Tl5ufo6ery8/T19vf4+fr/2gAMAwEAAhEDEQA/APnSvww/1TP/2Q==",
+    "base64",
+  );
+  const digest = `sha256:${createHash("sha256").update(jpegBytes).digest("hex")}` as const;
+  const visionIdentity: ModelTargetIdentity = {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  };
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, jpegBytes);
+  const driver = new FakeModelDriver((request) => {
+    expect(request.messages.at(-1)).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "Describe the JPEG." },
+        {
+          type: "file",
+          artifactId: digest,
+          mediaType: "image/jpeg",
+          bytes: new Uint8Array(jpegBytes),
+        },
+      ],
+    });
+    return [
+      { type: "text_delta", text: "The JPEG contains one exact pixel." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: visionIdentity,
+        driver,
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+        modalityProfile: {
+          profileVersion: 1,
+          explicitUserImages: "supported",
+          imageToolResults: "unsupported",
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: preparedDirectDeepSeekV2ContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    stateRoot: join(testRoot, "state"),
+    workspaceRoot,
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity: visionIdentity,
+        input: { text: "Describe the JPEG." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The JPEG contains one exact pixel." },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle trusts validated image bytes over names and rejects images that fail complete decoding", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-vision-chat-magic-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const misleadingPath = join(testRoot, "actually-png.jpg");
+  const truncatedPath = join(testRoot, "truncated.png");
+  const corruptImageDataPath = join(testRoot, "corrupt-image-data.png");
+  const pngBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const digest = `sha256:${createHash("sha256").update(pngBytes).digest("hex")}` as const;
+  const visionIdentity: ModelTargetIdentity = {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  };
+  await mkdir(workspaceRoot);
+  await writeFile(misleadingPath, pngBytes);
+  await writeFile(truncatedPath, pngBytes.subarray(0, 12));
+  await writeFile(
+    corruptImageDataPath,
+    Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVSH2mNk+A8AAQUBAT0jcMwAAAAASUVORK5CYII=",
+      "base64",
+    ),
+  );
+  let driverCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    driverCalls += 1;
+    expect(request.messages.at(-1)).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "Use byte truth." },
+        {
+          type: "file",
+          artifactId: digest,
+          mediaType: "image/png",
+          bytes: new Uint8Array(pngBytes),
+        },
+      ],
+    });
+    return [
+      { type: "text_delta", text: "Byte truth wins." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: visionIdentity,
+        driver,
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+        modalityProfile: {
+          profileVersion: 1,
+          explicitUserImages: "supported",
+          imageToolResults: "unsupported",
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: preparedDirectDeepSeekV2ContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    stateRoot: join(testRoot, "state"),
+    workspaceRoot,
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity: visionIdentity,
+        input: { text: "Use byte truth." },
+        resourceSelections: [{ type: "local_file", path: misleadingPath }],
+      }),
+    ).resolves.toMatchObject({ result: { status: "completed", answer: "Byte truth wins." } });
+    await expect(
+      lifecycle.admit({
+        targetIdentity: visionIdentity,
+        input: { text: "Reject truncated magic." },
+        resourceSelections: [{ type: "local_file", path: truncatedPath }],
+      }),
+    ).resolves.toMatchObject({
+      result: {
+        status: "failed",
+        error: {
+          code: "input_resource_invalid",
+          message: "The selected image is corrupt or has an unsupported image format.",
+        },
+      },
+    });
+    await expect(
+      lifecycle.admit({
+        targetIdentity: visionIdentity,
+        input: { text: "Reject corrupt decoded pixels." },
+        resourceSelections: [{ type: "local_file", path: corruptImageDataPath }],
+      }),
+    ).resolves.toMatchObject({
+      result: {
+        status: "failed",
+        error: {
+          code: "input_resource_invalid",
+          message: "The selected image is corrupt or has an unsupported image format.",
+        },
+      },
+    });
+    expect(driverCalls).toBe(1);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle enforces the exact v1 image count and dimension budgets before the driver", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-vision-chat-bounds-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const oversizedDimensionPath = join(testRoot, "too-wide.png");
+  const firstPath = join(testRoot, "first.png");
+  const secondPath = join(testRoot, "second.png");
+  const onePixelPng = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const tooWidePng = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAEAEAAAABCAQAAAAb6sjJAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const visionIdentity: ModelTargetIdentity = {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  };
+  await mkdir(workspaceRoot);
+  await writeFile(oversizedDimensionPath, tooWidePng);
+  await writeFile(firstPath, onePixelPng);
+  await writeFile(secondPath, onePixelPng);
+  let driverCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    driverCalls += 1;
+    return [{ type: "finish", reason: "stop" }];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: visionIdentity,
+        driver,
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+        modalityProfile: {
+          profileVersion: 1,
+          explicitUserImages: "supported",
+          imageToolResults: "unsupported",
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: preparedDirectDeepSeekV2ContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    stateRoot: join(testRoot, "state"),
+    workspaceRoot,
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity: visionIdentity,
+        input: { text: "Reject oversized dimensions." },
+        resourceSelections: [{ type: "local_file", path: oversizedDimensionPath }],
+      }),
+    ).resolves.toMatchObject({
+      result: {
+        status: "failed",
+        error: {
+          code: "input_resource_limit_exceeded",
+          message: "The selected image dimensions exceed the v1 limit.",
+        },
+      },
+    });
+    await expect(
+      lifecycle.admit({
+        targetIdentity: visionIdentity,
+        input: { text: "Reject a second explicit image." },
+        resourceSelections: [
+          { type: "local_file", path: firstPath },
+          { type: "local_file", path: secondPath },
+        ],
+      }),
+    ).resolves.toMatchObject({
+      result: {
+        status: "failed",
+        error: {
+          code: "input_resource_limit_exceeded",
+          message: "At most one explicit user image is supported per run.",
+        },
+      },
+    });
+    expect(driverCalls).toBe(0);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle preserves a Vision Chat image through reasoning and a tool continuation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-vision-chat-tool-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "tool-image.png");
+  const pngBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const artifactId = `sha256:${createHash("sha256").update(pngBytes).digest("hex")}` as const;
+  const visionIdentity: ModelTargetIdentity = {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  };
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "README.md"), "# Adam\n", "utf8");
+  await writeFile(selectedPath, pngBytes);
+  const productionSnapshot = await createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+  }).snapshot({ signal: new AbortController().signal });
+  const thinkingCapability = productionSnapshot.targets.find((target) =>
+    Object.is(target.identity.targetId, visionIdentity.targetId),
+  )?.thinkingCapability;
+  if (thinkingCapability === undefined) {
+    throw new Error("Expected the exact Vision Chat thinking capability.");
+  }
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    expect(request.messages.find((message) => message.role === "user")).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "Use the image and inspect the project." },
+        {
+          type: "file",
+          artifactId,
+          mediaType: "image/png",
+          bytes: new Uint8Array(pngBytes),
+        },
+      ],
+    });
+    expect(request.thinkingPolicy).toMatchObject({
+      requestedLevelId: "high",
+      mapping: {
+        requestPath: "provider_options.deepseek",
+        thinkingType: "enabled",
+        reasoningEffort: "high",
+      },
+    });
+    if (requestCount === 1) {
+      return [
+        {
+          type: "reasoning_start",
+          id: "provider-reasoning-0",
+          artifactType: "provider_reasoning",
+        },
+        {
+          type: "reasoning_delta",
+          id: "provider-reasoning-0",
+          text: "I should inspect the project before answering.",
+        },
+        { type: "reasoning_end", id: "provider-reasoning-0" },
+        { type: "tool_call_start", id: "vision-read", name: "read_file" },
+        { type: "tool_call_delta", id: "vision-read", json: '{"path":"README.md"}' },
+        { type: "tool_call_end", id: "vision-read" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.at(-1)).toMatchObject({
+      role: "tool",
+      callId: "vision-read",
+      name: "read_file",
+      result: { status: "completed" },
+    });
+    return [
+      { type: "text_delta", text: "The image and Adam project are both available." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: visionIdentity,
+        driver,
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+        modalityProfile: {
+          profileVersion: 1,
+          explicitUserImages: "supported",
+          imageToolResults: "unsupported",
+        },
+        thinkingCapability,
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: preparedDirectDeepSeekV2ContextProfile,
+            thinkingCapability,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const admitted = await lifecycle.admit({
+      targetIdentity: visionIdentity,
+      input: { text: "Use the image and inspect the project." },
+      resourceSelections: [{ type: "local_file", path: selectedPath }],
+      thinkingSelection: thinkingSelection(thinkingCapability, "high"),
+    });
+    expect(admitted.result).toEqual({
+      status: "completed",
+      answer: "The image and Adam project are both available.",
+    });
+    const store = await harness.sessions.open(admitted.snapshot.sessionId);
+    const responses = (await store?.read())?.filter(
+      (record) => record.schemaVersion === 3 && record.record.type === "model_response_completed",
+    );
+    expect(responses?.[0]).toMatchObject({
+      record: {
+        response: {
+          reasoning: "I should inspect the project before answering.",
+          toolCalls: [{ id: "vision-read", name: "read_file" }],
+        },
+      },
+    });
+    expect(requestCount).toBe(2);
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });

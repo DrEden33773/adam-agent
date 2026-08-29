@@ -1275,6 +1275,9 @@ export function validateCurrentSessionHistory(
         (event.result.status === "failed" &&
           ((attemptState === undefined &&
             event.result.error.code !== "skill_activation_failed" &&
+            event.result.error.code !== "input_resource_invalid" &&
+            event.result.error.code !== "input_resource_limit_exceeded" &&
+            event.result.error.code !== "input_resource_unsupported" &&
             !isContextTerminalFailure(event.result, lastContextTerminal)) ||
             event.result.error.code === "invalid_run_limits" ||
             event.result.error.code === "run_already_active" ||
@@ -1540,12 +1543,13 @@ function validateContextCompactionHistory(
       (candidate) =>
         candidate.sequence >= record.retainedFrom && candidate.sequence <= record.sourceThrough,
     );
+    const retainedMessages = modelMessagesFromCanonicalRecords(retainedRecords);
     const replacement = [
       createContextProjectionMessage(record.summary, record.evidence),
       ...(record.inputResources === undefined || record.inputResources.length === 0
         ? []
         : [createInputResourceProjectionMessageV1(record.inputResources)]),
-      ...modelMessagesFromCanonicalRecords(retainedRecords),
+      ...retainedMessages,
     ];
     if (
       !isContextEvidenceValid(record.evidence, records, record.runId, record.sourceThrough) ||
@@ -1674,7 +1678,11 @@ function areLogicalInputResourcesValid(
           resource.artifact.mediaType === "text/plain; charset=utf-8") ||
           (resource.support === "unsupported_binary" &&
             resource.mediaHint === "binary" &&
-            resource.artifact.mediaType === "application/octet-stream")),
+            resource.artifact.mediaType === "application/octet-stream") ||
+          (resource.support === "image" &&
+            resource.mediaHint === "image" &&
+            (resource.artifact.mediaType === "image/jpeg" ||
+              resource.artifact.mediaType === "image/png"))),
     )
   );
 }

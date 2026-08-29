@@ -744,12 +744,55 @@ test("the production TUI selects an exact available target before creating an em
     expectFramedOverlay(fixture.output(), "Select an exact model target");
     await fixture.waitFor("deepseek-v4-flash.direct");
     await fixture.waitFor("deepseek-v4-pro.direct");
+    const targetFrame = latestSynchronizedFrame(fixture.output()).join("\n");
+    expect(targetFrame).toContain("deepseek-v4-flash-vision-exp.d");
+    expect(targetFrame).toContain("Upstream Experimental");
     fixture.write("\r");
     await fixture.waitFor("Adam · New session");
     await fixture.waitFor("deepseek-v4-flash.direct · Certified");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI tests a configured exact target without conflating reachability and certification in process", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-target-connection-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal({ columns: 120, rows: 24 });
+  const execution = runTuiFixture({
+    launch: { startupTargetId: "deepseek-v4-flash-vision-exp.direct" },
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    await terminal.nextSynchronizedFrameContaining("Adam · New session");
+    await terminal.nextSynchronizedFrameContaining(
+      "deepseek-v4-flash-vision-exp.direct · Certified",
+    );
+    await terminal.nextSynchronizedFrameContaining("Configured · Not tested");
+    const beforeTest = terminal.output().length;
+
+    terminal.input("/connection\r");
+
+    await terminal.nextSynchronizedFrameContaining(
+      "Connection test: Configured · Reachable · Certified.",
+      beforeTest,
+    );
+    terminal.input("\u0011");
+    await expect(execution).resolves.toBeUndefined();
+    expect(terminal.lifecycle()).toEqual(["started", "stopped"]);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -1012,6 +1055,50 @@ test("the production TUI stages and sends one linked input resource", async () =
     expect(durable).toContain('"displayName":"outside-notes.txt"');
     expect(durable).not.toContain(selectedPath);
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI stages and sends one validated image to the exact Vision Chat target in process", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-vision-image-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const selectedPath = join(testRoot, "one-pixel.png");
+  const imageBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, imageBytes);
+  const terminal = new VirtualTerminal({ columns: 120, rows: 24 });
+  const execution = runTuiFixture({
+    launch: { startupTargetId: "deepseek-v4-flash-vision-exp.direct" },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    await terminal.nextSynchronizedFrameContaining("Adam · New session");
+    const beforeAttach = terminal.output().length;
+    terminal.input(`/attach ${selectedPath}\r`);
+    await terminal.nextSynchronizedFrameContaining(
+      `ready · one-pixel.png · ${imageBytes.byteLength} bytes`,
+      beforeAttach,
+    );
+
+    const beforePrompt = terminal.output().length;
+    terminal.input("Describe the attached image.\r");
+    await terminal.nextSynchronizedFrameContaining("Provider usage unavailable.", beforePrompt);
+    terminal.input("\u0011");
+    await expect(execution).resolves.toBeUndefined();
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
     await rm(testRoot, { recursive: true, force: true });
   }
 });

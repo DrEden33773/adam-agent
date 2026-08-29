@@ -219,7 +219,21 @@ function mapMessage(message: ModelRequest["messages"][number]): LanguageModelV4M
     case "developer":
       return { role: "system", content: `Developer instruction:\n${message.content}` };
     case "user":
-      return { role: "user", content: [{ type: "text", text: message.content }] };
+      return {
+        role: "user",
+        content:
+          typeof message.content === "string"
+            ? [{ type: "text", text: message.content }]
+            : message.content.map((part) =>
+                part.type === "text"
+                  ? { type: "text" as const, text: part.text }
+                  : {
+                      type: "file" as const,
+                      data: { type: "data" as const, data: part.bytes },
+                      mediaType: part.mediaType,
+                    },
+              ),
+      };
     case "assistant":
       return {
         role: "assistant",

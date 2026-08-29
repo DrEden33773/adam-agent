@@ -90,6 +90,7 @@ export type { ClipboardAdapter, DeadlineScheduler } from "./exit-policy.js";
 export type TuiTargetStatus = {
   readonly certification: "Certified" | "Experimental";
   readonly targetId: string;
+  readonly upstreamLifecycle?: "Experimental" | "Stable";
 };
 
 export type RunTuiOptions = {
@@ -1421,6 +1422,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         (candidate) => candidate.targetId === draft.targetId,
       );
       const thinkingLevel = selectedThinkingLevel(target);
+      const upstreamSummary =
+        target?.upstreamLifecycle === undefined
+          ? ""
+          : ` · Upstream ${safeTerminalText(target.upstreamLifecycle)}`;
+      const connectionSummary =
+        target?.connection === undefined
+          ? ""
+          : ` · ${safeTerminalText(target.connection.configured)} · ${safeTerminalText(target.connection.reachability)}`;
       const thinkingSummary =
         thinkingLevel === undefined
           ? ""
@@ -1431,10 +1440,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`;
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
+          `${safeTerminalText(state.authoritative.project.label)} · New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
         ),
         standard: theme.muted(
-          `New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
+          `New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
         ),
         narrow: theme.muted(
           `draft · idle\n${safeTerminalText(draft.targetId)}\n/help · Tab complete`,
@@ -1447,6 +1456,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       );
       const targetCertification =
         activeTarget?.certification ?? options.targetStatus?.certification ?? "Experimental";
+      const targetUpstreamLifecycle =
+        activeTarget?.upstreamLifecycle ?? options.targetStatus?.upstreamLifecycle;
+      const upstreamSummary =
+        targetUpstreamLifecycle === undefined
+          ? ""
+          : ` · Upstream ${safeTerminalText(targetUpstreamLifecycle)}`;
+      const connectionSummary =
+        activeTarget?.connection === undefined
+          ? ""
+          : ` · ${safeTerminalText(activeTarget.connection.configured)} · ${safeTerminalText(activeTarget.connection.reachability)}`;
       const thinkingLevel = selectedThinkingLevel(activeTarget);
       const thinkingSummary =
         thinkingLevel === undefined
@@ -1460,13 +1479,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         active.transcript.olderCursor === null ? "" : " · older history available";
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
         ),
         standard: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
         ),
         narrow: theme.muted(
-          `${runStatus} · ${footerContextCompactText(active)}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}\n/help · Tab complete`,
+          `${runStatus} · ${footerContextCompactText(active)}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}\n/help · Tab complete`,
         ),
       });
     }
@@ -2146,6 +2165,110 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     editor.setText("");
     stopFromCommand?.();
   };
+  const handleConnectionCommand = (
+    argumentsText: string,
+    targetId: string,
+    sessionId?: string,
+  ): void => {
+    if (argumentsText.length > 0) {
+      showNotice("warning", "Usage: /connection", "until_edit", sessionId);
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    const target = options.presentation
+      .getState()
+      .authoritative.targets.items.find((candidate) => candidate.targetId === targetId);
+    if (target?.connection === undefined || target.connection.configured !== "Configured") {
+      showNotice(
+        "warning",
+        "This exact target has no configured explicit connection test.",
+        "until_edit",
+        sessionId,
+      );
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    const cancelling = target.connection.reachability === "Testing";
+    editor.setText("");
+    editor.disableSubmit = false;
+    const actionId = showNotice(
+      "progress",
+      cancelling ? "Cancelling target connection test…" : "Testing target connection…",
+      "until_replaced",
+      sessionId,
+    );
+    const command = {
+      type: cancelling
+        ? ("cancel_target_connection_test" as const)
+        : ("test_target_connection" as const),
+      targetId,
+    };
+    void options.presentation
+      .dispatch(command)
+      .then((receipt) => {
+        if (receipt.status !== "admitted") {
+          settleNotice(
+            actionId,
+            receipt.code === "authority_rejected" ? "info" : "error",
+            receipt.message,
+            receipt.code === "authority_rejected" ? "until_next_action" : "until_edit",
+            sessionId,
+          );
+          return;
+        }
+        if (cancelling) {
+          settleNotice(
+            actionId,
+            "success",
+            "Target connection test cancelled.",
+            "until_next_action",
+            sessionId,
+          );
+          return;
+        }
+        const settled = options.presentation
+          .getState()
+          .authoritative.targets.items.find(
+            (candidate) => candidate.targetId === targetId,
+          )?.connection;
+        if (settled === undefined) {
+          settleNotice(
+            actionId,
+            "error",
+            "The exact target connection state became unavailable.",
+            "until_edit",
+            sessionId,
+          );
+          return;
+        }
+        const message = `Connection test: ${settled.configured} · ${settled.reachability} · ${target.certification}.${
+          settled.diagnostic === null ? "" : ` ${settled.diagnostic.message}`
+        }`;
+        settleNotice(
+          actionId,
+          settled.reachability === "Reachable" ? "success" : "warning",
+          message,
+          settled.reachability === "Reachable" ? "until_next_action" : "until_edit",
+          sessionId,
+        );
+      })
+      .catch(() => {
+        settleNotice(
+          actionId,
+          "error",
+          "The exact target connection test could not be dispatched safely.",
+          "until_edit",
+          sessionId,
+        );
+      })
+      .finally(() => {
+        editor.disableSubmit = false;
+        renderState();
+      });
+    renderState();
+  };
   const handleAttachCommand = (path: string, sessionId?: string): void => {
     const composer = options.presentation.getState().composer;
     if (path.length === 0) {
@@ -2305,6 +2428,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       if (parsedDraft.kind === "known" && parsedDraft.command.id === "trust") {
         handleWorkspaceTrustCommand(parsedDraft.argumentsText);
+        return;
+      }
+      if (parsedDraft.kind === "known" && parsedDraft.command.id === "connection") {
+        handleConnectionCommand(parsedDraft.argumentsText, state.draft.targetId);
         return;
       }
       if (handleAttachmentCommand(parsedDraft)) {
@@ -2496,6 +2623,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     if (parsedCommand.kind === "known" && parsedCommand.command.id === "exit") {
       handleExitCommand(parsedCommand.argumentsText);
+      return;
+    }
+    if (parsedCommand.kind === "known" && parsedCommand.command.id === "connection") {
+      handleConnectionCommand(
+        parsedCommand.argumentsText,
+        active.session.targetId,
+        active.session.id,
+      );
       return;
     }
     if (parsedCommand.kind === "not_command" && runActive) {

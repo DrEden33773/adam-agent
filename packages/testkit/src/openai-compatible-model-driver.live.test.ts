@@ -1,6 +1,8 @@
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 
 import {
   AgentSession,
@@ -192,6 +194,101 @@ liveTest(
 );
 
 liveTest(
+  "Vision Chat eager image observes one exact quadrant order and durable resource truth",
+  async () => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-live-vision-chat-"));
+    const stateRoot = join(testRoot, "state");
+    const workspaceRoot = join(testRoot, "workspace");
+    const imagePath = join(testRoot, "quadrants.png");
+    const imageBytes = createQuadrantPng(128, 128);
+    const imageDigest = `sha256:${createHash("sha256").update(imageBytes).digest("hex")}`;
+    await mkdir(workspaceRoot);
+    await writeFile(imagePath, imageBytes);
+    const modelTargets = createModelTargets({
+      environment: { DEEPSEEK_API_KEY: liveApiKey },
+      connectionDeadlineMs: 15_000,
+      deadlineMs: 90_000,
+    });
+    const target = (
+      await modelTargets.snapshot({ signal: new AbortController().signal })
+    ).targets.find(({ identity }) => identity.targetId === "deepseek-v4-flash-vision-exp.direct");
+    if (target === undefined || modelTargets.testConnection === undefined) {
+      throw new Error("Expected the exact Vision Chat target and connection test.");
+    }
+    const connection = await modelTargets.testConnection({
+      targetId: target.identity.targetId,
+      signal: new AbortController().signal,
+    });
+    expect(connection).toEqual({ status: "reachable", diagnostic: null });
+    const lifecycle = createSessionLifecycle({
+      modelTargets,
+      stateRoot,
+      workspaceRoot,
+    });
+
+    try {
+      const created = await lifecycle.create({ targetIdentity: target.identity });
+      const continued = await lifecycle.continue({
+        sessionId: created.sessionId,
+        input: {
+          text: "Inspect the attached four equal color quadrants. Reply with only the top-left, top-right, bottom-left, and bottom-right colors in that order.",
+        },
+        resourceSelections: [{ type: "local_file", path: imagePath }],
+      });
+      expect(continued.result).toMatchObject({ status: "completed" });
+      if (continued.result.status !== "completed") {
+        throw new Error("Expected the Vision Chat image turn to complete.");
+      }
+      expect(continued.result.answer).toMatch(/red.*green.*blue.*white/isu);
+      expect(continued.snapshot.targetIdentity).toMatchObject({
+        targetId: "deepseek-v4-flash-vision-exp.direct",
+        profileVersion: 1,
+      });
+      const records = await readJsonlRecords(stateRoot);
+      expect(
+        records.find(
+          (record) =>
+            isRecordType(record, "logical_run_started") && Array.isArray(record.inputResources),
+        ),
+      ).toMatchObject({
+        inputResources: [
+          {
+            artifact: {
+              id: imageDigest,
+              byteCount: imageBytes.byteLength,
+            },
+            support: "image",
+            mode: "link",
+          },
+        ],
+      });
+      expect(
+        records.find((record) => isRecordType(record, "provider_attempt_started")),
+      ).toMatchObject({
+        targetIdentity: {
+          targetId: "deepseek-v4-flash-vision-exp.direct",
+          profileVersion: 1,
+        },
+        projectedContent: {
+          version: 1,
+          explicitUserImages: {
+            count: 1,
+            byteCount: imageBytes.byteLength,
+            pixelCount: 128 * 128,
+            maximumWidth: 128,
+            maximumHeight: 128,
+          },
+        },
+      });
+    } finally {
+      await lifecycle.close();
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+  180_000,
+);
+
+liveTest(
   "applies one approved structured repository lifecycle patch",
   async () => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-live-patch-lifecycle-"));
@@ -323,6 +420,91 @@ After the tool settles, reply briefly.`,
   },
   180_000,
 );
+
+function createQuadrantPng(width: number, height: number): Buffer {
+  const stride = width * 3 + 1;
+  const pixels = Buffer.alloc(stride * height);
+  for (let y = 0; y < height; y += 1) {
+    const row = y * stride;
+    pixels[row] = 0;
+    for (let x = 0; x < width; x += 1) {
+      const offset = row + 1 + x * 3;
+      const color =
+        y < height / 2
+          ? x < width / 2
+            ? [255, 0, 0]
+            : [0, 255, 0]
+          : x < width / 2
+            ? [0, 0, 255]
+            : [255, 255, 255];
+      pixels[offset] = color[0] as number;
+      pixels[offset + 1] = color[1] as number;
+      pixels[offset + 2] = color[2] as number;
+    }
+  }
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header.set([8, 2, 0, 0, 0], 8);
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk("IHDR", header),
+    pngChunk("IDAT", deflateSync(pixels)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function pngChunk(type: "IDAT" | "IEND" | "IHDR", data: Buffer): Buffer {
+  const typeBytes = Buffer.from(type, "ascii");
+  const chunk = Buffer.alloc(12 + data.byteLength);
+  chunk.writeUInt32BE(data.byteLength, 0);
+  typeBytes.copy(chunk, 4);
+  data.copy(chunk, 8);
+  chunk.writeUInt32BE(pngCrc32(Buffer.concat([typeBytes, data])), 8 + data.byteLength);
+  return chunk;
+}
+
+function pngCrc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+type JsonlRecord = Readonly<Record<string, unknown>> & {
+  readonly type?: unknown;
+  readonly inputResources?: unknown;
+};
+
+async function readJsonlRecords(root: string): Promise<JsonlRecord[]> {
+  const records: JsonlRecord[] = [];
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        await visit(path);
+      } else if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+        const lines = (await readFile(path, "utf8")).split("\n").filter(Boolean);
+        for (const line of lines) {
+          const decoded = JSON.parse(line) as { readonly record?: unknown };
+          if (typeof decoded.record === "object" && decoded.record !== null) {
+            records.push(decoded.record as JsonlRecord);
+          }
+        }
+      }
+    }
+  };
+  await visit(root);
+  return records;
+}
+
+function isRecordType(record: JsonlRecord, type: string): boolean {
+  return record.type === type;
+}
 
 function createLivePatchSession(options: {
   readonly liveApiKey: string;

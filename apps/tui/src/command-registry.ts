@@ -11,6 +11,7 @@ export type AdamCommandDefinition = {
     | "attach"
     | "cancelattach"
     | "clone"
+    | "connection"
     | "config"
     | "copy"
     | "detach"
@@ -302,6 +303,14 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     name: "thinking",
     summary: "Choose the exact thinking level for the next prompt.",
     usage: "/thinking [level]",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "connection",
+    name: "connection",
+    summary: "Test or cancel the explicit authenticated connection for this exact target.",
+    usage: "/connection",
   },
   {
     aliases: [],

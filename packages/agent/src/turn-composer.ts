@@ -230,7 +230,11 @@ export async function createTurnComposer(options: {
           "The retained input resources exceed the v1 aggregate run limit.",
         );
       }
-      if (retained.some((resource) => resource.support !== "utf8_text")) {
+      if (
+        retained.some(
+          (resource) => resource.support !== "utf8_text" && resource.support !== "image",
+        )
+      ) {
         sealed = false;
         publish();
         throw new TurnComposerError(

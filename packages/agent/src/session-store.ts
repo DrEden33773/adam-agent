@@ -18,6 +18,7 @@ import {
 import type { McpToolProfileV1 } from "./mcp-profile-contracts.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
+import { imageInputLimitsV1, type ProjectedContentUsageV1 } from "./model-user-content.js";
 import {
   type PromptContextRecord,
   type PromptContextRecordV1,
@@ -530,6 +531,7 @@ export type SessionProviderAttemptStartedRecord = {
       readonly assemblyIdentityDigest: Sha256Digest;
       readonly requestProjectionDigest: Sha256Digest;
     };
+    readonly projectedContent?: ProjectedContentUsageV1;
   };
 };
 
@@ -657,6 +659,7 @@ export type SessionContextCompactionStartedRecord = {
     readonly contextProfile: ContextProfile;
     readonly projectionVersion: 1;
     readonly sourceDigest: `sha256:${string}`;
+    readonly projectedContent?: ProjectedContentUsageV1;
   };
 };
 
@@ -853,6 +856,8 @@ const ordinaryRunErrorCodeSchema = z.enum([
   "replay_envelope_too_large",
   "invalid_run_limits",
   "input_resource_invalid",
+  "input_resource_limit_exceeded",
+  "input_resource_unsupported",
   "run_already_active",
   "session_persistence_failed",
   "turn_limit_exceeded",
@@ -1399,6 +1404,24 @@ const responseUsageSchema = z.strictObject({
   reasoningTokens: z.number().int().nonnegative().optional(),
   cachedInputTokens: z.number().int().nonnegative().optional(),
   cacheMissInputTokens: z.number().int().nonnegative().optional(),
+});
+const projectedContentUsageV1Schema: z.ZodType<ProjectedContentUsageV1> = z.strictObject({
+  version: z.literal(1),
+  explicitUserImages: z.strictObject({
+    count: z.number().int().positive().max(inputResourceLimitsV1.maximumOccurrencesPerLineage),
+    byteCount: z
+      .number()
+      .int()
+      .positive()
+      .max(inputResourceLimitsV1.maximumAggregateBytesPerLineage),
+    pixelCount: z
+      .number()
+      .int()
+      .positive()
+      .max(imageInputLimitsV1.maximumPixels * inputResourceLimitsV1.maximumOccurrencesPerLineage),
+    maximumWidth: z.number().int().positive().max(imageInputLimitsV1.maximumWidth),
+    maximumHeight: z.number().int().positive().max(imageInputLimitsV1.maximumHeight),
+  }),
 });
 const contextProfileSchema: z.ZodType<ContextProfile> = z.strictObject({
   version: z.number().int().positive(),
@@ -1955,6 +1978,7 @@ const sessionV3RecordSchema = z.union([
         requestProjectionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
       })
       .optional(),
+    projectedContent: projectedContentUsageV1Schema.optional(),
   }),
   z.strictObject({
     type: z.literal("repository_instructions_committed"),
@@ -2068,6 +2092,7 @@ const sessionV3RecordSchema = z.union([
     contextProfile: contextProfileSchema,
     projectionVersion: z.literal(1),
     sourceDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    projectedContent: projectedContentUsageV1Schema.optional(),
   }),
   z.strictObject({
     type: z.literal("context_compaction_committed"),

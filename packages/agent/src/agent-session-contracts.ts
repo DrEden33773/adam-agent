@@ -25,10 +25,27 @@ export type RunOptions = {
   };
 };
 
+export type ModelModalityProfile = {
+  readonly profileVersion: 1;
+  readonly explicitUserImages: "supported" | "unsupported";
+  readonly imageToolResults: "supported" | "unsupported";
+};
+
+export type ModelUserContentPart =
+  | { readonly type: "text"; readonly text: string }
+  | {
+      readonly type: "file";
+      readonly artifactId: `sha256:${string}`;
+      readonly mediaType: "image/jpeg" | "image/png";
+      readonly bytes: Uint8Array;
+    };
+
+export type ModelUserContent = string | readonly ModelUserContentPart[];
+
 export type ModelMessage =
   | { readonly role: "system"; readonly content: string }
   | { readonly role: "developer"; readonly content: string }
-  | { readonly role: "user"; readonly content: string }
+  | { readonly role: "user"; readonly content: ModelUserContent }
   | {
       readonly role: "assistant";
       readonly content: string;
@@ -118,6 +135,8 @@ export type RunResult =
               | "replay_envelope_too_large"
               | "invalid_run_limits"
               | "input_resource_invalid"
+              | "input_resource_limit_exceeded"
+              | "input_resource_unsupported"
               | "run_already_active"
               | "session_persistence_failed"
               | "turn_limit_exceeded"

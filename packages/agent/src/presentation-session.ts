@@ -442,6 +442,25 @@ export async function createPresentationSession(
             route: target.identity.route,
             certification:
               target.identity.certification === "certified" ? "Certified" : "Experimental",
+            ...(target.upstreamLifecycle === undefined
+              ? {}
+              : {
+                  upstreamLifecycle:
+                    target.upstreamLifecycle === "experimental" ? "Experimental" : "Stable",
+                }),
+            ...(target.connectionTest === undefined
+              ? {}
+              : {
+                  connection: {
+                    configured:
+                      target.readiness.status === "available"
+                        ? ("Configured" as const)
+                        : ("Not configured" as const),
+                    reachability: "Not tested" as const,
+                    checkedAt: null,
+                    diagnostic: null,
+                  },
+                }),
             readiness: target.readiness,
             thinking:
               target.thinkingCapability === undefined
@@ -522,6 +541,45 @@ export async function createPresentationSession(
           // Presentation observers cannot change authoritative command or refresh outcomes.
         }
       }
+    };
+    type TargetConnection = NonNullable<
+      AuthoritativePresentationSnapshot["targets"]["items"][number]["connection"]
+    >;
+    const activeConnectionTests = new Map<
+      string,
+      {
+        readonly controller: AbortController;
+        readonly previous: TargetConnection;
+        settlement?: Promise<CommandReceipt>;
+      }
+    >();
+    const publishTargetConnection = (targetId: string, connection: TargetConnection): boolean => {
+      if (closed) {
+        return false;
+      }
+      const target = state.authoritative.targets.items.find(
+        (candidate) => candidate.targetId === targetId,
+      );
+      if (target?.connection === undefined) {
+        return false;
+      }
+      state = {
+        revision: state.revision + 1,
+        authoritative: {
+          ...state.authoritative,
+          targets: {
+            ...state.authoritative.targets,
+            items: state.authoritative.targets.items.map((candidate) =>
+              candidate.targetId === targetId ? { ...candidate, connection } : candidate,
+            ),
+          },
+        },
+        draft: state.draft,
+        composer: state.composer,
+        transient: state.transient,
+      };
+      publishStateChange();
+      return true;
     };
     let turnComposer: TurnComposer;
     const projectTurnComposer = (): PresentationDisplayState["composer"] => {
@@ -1575,6 +1633,98 @@ export async function createPresentationSession(
           code: "presentation_closed",
           message: "The presentation session is closed.",
         };
+      }
+      if (command.type === "cancel_target_connection_test") {
+        const active = activeConnectionTests.get(command.targetId);
+        if (active === undefined) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected target has no active connection test.",
+          };
+        }
+        active.controller.abort(new DOMException("Connection test cancelled.", "AbortError"));
+        await active.settlement;
+        return { status: "admitted", commandId: randomUUID(), resource: null };
+      }
+      if (command.type === "test_target_connection") {
+        const target = state.authoritative.targets.items.find(
+          (candidate) => candidate.targetId === command.targetId,
+        );
+        const testConnection = options.modelTargets?.testConnection;
+        if (
+          target?.connection === undefined ||
+          target.connection.configured !== "Configured" ||
+          testConnection === undefined
+        ) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "The selected target connection test is not available.",
+          };
+        }
+        if (activeConnectionTests.has(command.targetId)) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "The selected target already has an active connection test.",
+          };
+        }
+        const entry = {
+          controller: new AbortController(),
+          previous: target.connection,
+        } as {
+          readonly controller: AbortController;
+          readonly previous: TargetConnection;
+          settlement?: Promise<CommandReceipt>;
+        };
+        activeConnectionTests.set(command.targetId, entry);
+        publishTargetConnection(command.targetId, {
+          ...target.connection,
+          reachability: "Testing",
+          diagnostic: null,
+        });
+        const settlement: Promise<CommandReceipt> = (async () => {
+          try {
+            const result = await testConnection({
+              targetId: command.targetId,
+              signal: entry.controller.signal,
+            });
+            entry.controller.signal.throwIfAborted();
+            publishTargetConnection(command.targetId, {
+              configured: "Configured",
+              reachability: result.status === "reachable" ? "Reachable" : "Unreachable",
+              checkedAt: new Date().toISOString(),
+              diagnostic: result.diagnostic,
+            });
+            return { status: "admitted", commandId: randomUUID(), resource: null };
+          } catch {
+            if (entry.controller.signal.aborted) {
+              publishTargetConnection(command.targetId, entry.previous);
+              return {
+                status: "rejected",
+                code: "authority_rejected",
+                message: "The selected target connection test was cancelled.",
+              };
+            }
+            publishTargetConnection(command.targetId, {
+              configured: "Configured",
+              reachability: "Unreachable",
+              checkedAt: new Date().toISOString(),
+              diagnostic: {
+                code: "connection_request_failed",
+                message: "The selected target connection test failed.",
+              },
+            });
+            return { status: "admitted", commandId: randomUUID(), resource: null };
+          } finally {
+            if (activeConnectionTests.get(command.targetId) === entry) {
+              activeConnectionTests.delete(command.targetId);
+            }
+          }
+        })();
+        entry.settlement = settlement;
+        return settlement;
       }
       if (command.type === "set_workspace_trust") {
         const conflict = configurationMutationConflict();
@@ -2962,6 +3112,12 @@ export async function createPresentationSession(
         }
         closed = true;
         activeRun?.controller.abort();
+        const connectionSettlements = [...activeConnectionTests.values()].flatMap((active) =>
+          active.settlement === undefined ? [] : [active.settlement],
+        );
+        for (const active of activeConnectionTests.values()) {
+          active.controller.abort(new DOMException("Presentation session closed.", "AbortError"));
+        }
         await turnComposer.close();
         for (const observer of operationObservers.values()) {
           observer.abort();
@@ -2977,6 +3133,7 @@ export async function createPresentationSession(
         unsubscribeLifecycle();
         unsubscribeMetadata();
         await activeRun?.settlement;
+        await Promise.all(connectionSettlements);
         await runtimeRefresh;
         await metadataRefresh;
         await Promise.all(operationRefreshes);

@@ -1,12 +1,16 @@
 import { createHash } from "node:crypto";
 
 import { z } from "zod";
-import type { ModelDriver, ModelMessage } from "./agent-session-contracts.js";
+import type { ModelDriver, ModelMessage, ModelUserContentPart } from "./agent-session-contracts.js";
 import {
   type ContextProfile,
   resolveCompactionSummaryMaximumOutputTokens,
 } from "./context-profile.js";
 import { ModelDriverError } from "./model-driver-error.js";
+import type {
+  ProjectedContentUsageV1,
+  ProjectedExplicitUserImageArtifactUsageV1,
+} from "./model-user-content.js";
 import type { SessionRecord } from "./session-store.js";
 import type { PermissionSubject } from "./tool-runtime.js";
 
@@ -250,6 +254,7 @@ export async function generateContextSummary(input: {
   readonly messages: readonly ModelMessage[];
   readonly model: ModelDriver;
   readonly profile: ContextProfile;
+  readonly preparedRequest?: PreparedContextSummaryRequestV1;
   readonly signal: AbortSignal;
 }): Promise<{
   readonly summary: ContextSummaryV1;
@@ -268,10 +273,12 @@ export async function generateContextSummary(input: {
   let usage: ContextCallUsage | undefined;
   let usageInvalid = false;
   let invalid = false;
-  const requestMessages = createContextSummaryRequestMessages(input);
+  const requestMessages =
+    input.preparedRequest?.messages ?? createContextSummaryRequestMessages(input);
   const maximumOutputTokens = resolveCompactionSummaryMaximumOutputTokens(input.profile);
   if (
-    estimateActiveContextTokens(requestMessages, input.profile) + maximumOutputTokens >
+    estimatePreparedContextSummaryRequestTokens(requestMessages, input.profile) +
+      maximumOutputTokens >
     input.profile.contextWindowTokens
   ) {
     throw new ContextCompactionError(
@@ -378,7 +385,35 @@ export function estimateContextSummaryRequestTokens(input: {
   readonly messages: readonly ModelMessage[];
   readonly profile: ContextProfile;
 }): number {
-  return estimateActiveContextTokens(createContextSummaryRequestMessages(input), input.profile);
+  return estimatePreparedContextSummaryRequestTokens(
+    createContextSummaryRequestMessages(input),
+    input.profile,
+  );
+}
+
+export type PreparedContextSummaryRequestV1 = {
+  readonly messages: readonly ModelMessage[];
+  readonly projectedContent?: ProjectedContentUsageV1;
+};
+
+export function prepareContextSummaryRequestV1(input: {
+  readonly evidence: ContextEvidenceV1;
+  readonly messages: readonly ModelMessage[];
+  readonly profile: ContextProfile;
+  readonly imageUsageByArtifactId?: ReadonlyMap<
+    `sha256:${string}`,
+    ProjectedExplicitUserImageArtifactUsageV1
+  >;
+}): PreparedContextSummaryRequestV1 {
+  const messages = createContextSummaryRequestMessages(input);
+  const projectedContent = projectedContentUsageFromSummaryRequest(
+    messages,
+    input.imageUsageByArtifactId,
+  );
+  return {
+    messages,
+    ...(projectedContent === undefined ? {} : { projectedContent }),
+  };
 }
 
 function createContextSummaryRequestMessages(input: {
@@ -393,7 +428,7 @@ function createContextSummaryRequestMessages(input: {
       fitContextMessages(sourceMessages, maximumFittedToolResultBytes),
     );
     if (
-      estimateActiveContextTokens(request, input.profile) +
+      estimatePreparedContextSummaryRequestTokens(request, input.profile) +
         resolveCompactionSummaryMaximumOutputTokens(input.profile) <=
       input.profile.contextWindowTokens
     ) {
@@ -418,6 +453,60 @@ function buildContextSummaryRequestMessages(
   evidence: ContextEvidenceV1,
   messages: readonly unknown[],
 ): readonly ModelMessage[] {
+  const imageParts: Array<Extract<ModelUserContentPart, { readonly type: "file" }>> = [];
+  const projectedMessages = messages.map((message) => {
+    if (
+      typeof message !== "object" ||
+      message === null ||
+      !("role" in message) ||
+      message.role !== "user" ||
+      !("content" in message) ||
+      !Array.isArray(message.content)
+    ) {
+      return message;
+    }
+    return {
+      ...message,
+      content: message.content.map((part) => {
+        if (
+          typeof part !== "object" ||
+          part === null ||
+          !("type" in part) ||
+          part.type !== "file" ||
+          !("artifactId" in part) ||
+          !("mediaType" in part) ||
+          !("bytes" in part) ||
+          !(part.bytes instanceof Uint8Array) ||
+          (part.mediaType !== "image/jpeg" && part.mediaType !== "image/png")
+        ) {
+          return part;
+        }
+        const attachmentIndex = imageParts.length;
+        imageParts.push(part as (typeof imageParts)[number]);
+        return {
+          type: "image_attachment",
+          attachmentIndex,
+          artifactId: part.artifactId,
+          mediaType: part.mediaType,
+          byteCount: part.bytes.byteLength,
+        };
+      }),
+    };
+  });
+  const instruction = JSON.stringify({
+    schema: {
+      schemaVersion: 1,
+      objective: "string",
+      constraints: ["string"],
+      progress: ["string"],
+      unresolvedQuestions: ["string"],
+      failures: ["string"],
+      remainingVerification: ["string"],
+      nextSafeAction: "string",
+    },
+    evidence,
+    messages: projectedMessages,
+  });
   return [
     {
       role: "system",
@@ -426,22 +515,67 @@ function buildContextSummaryRequestMessages(
     },
     {
       role: "user",
-      content: JSON.stringify({
-        schema: {
-          schemaVersion: 1,
-          objective: "string",
-          constraints: ["string"],
-          progress: ["string"],
-          unresolvedQuestions: ["string"],
-          failures: ["string"],
-          remainingVerification: ["string"],
-          nextSafeAction: "string",
-        },
-        evidence,
-        messages,
-      }),
+      content:
+        imageParts.length === 0
+          ? instruction
+          : [{ type: "text", text: instruction }, ...imageParts],
     },
   ];
+}
+
+function estimatePreparedContextSummaryRequestTokens(
+  messages: readonly ModelMessage[],
+  profile: ContextProfile,
+): number {
+  return estimateActiveContextTokens(
+    messages.map((message) => {
+      if (message.role !== "user" || typeof message.content === "string") {
+        return message;
+      }
+      return {
+        ...message,
+        content: message.content.map((part) =>
+          part.type === "file" ? { ...part, bytes: new Uint8Array() } : part,
+        ),
+      };
+    }),
+    profile,
+  );
+}
+
+function projectedContentUsageFromSummaryRequest(
+  messages: readonly ModelMessage[],
+  imageUsageByArtifactId:
+    | ReadonlyMap<`sha256:${string}`, ProjectedExplicitUserImageArtifactUsageV1>
+    | undefined,
+): ProjectedContentUsageV1 | undefined {
+  const usages = messages.flatMap((message) =>
+    message.role === "user" && typeof message.content !== "string"
+      ? message.content.flatMap((part) => {
+          if (part.type !== "file") {
+            return [];
+          }
+          const usage = imageUsageByArtifactId?.get(part.artifactId);
+          if (usage === undefined) {
+            throw new TypeError("Prepared compaction image usage is unavailable.");
+          }
+          return [usage];
+        })
+      : [],
+  );
+  if (usages.length === 0) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    explicitUserImages: {
+      count: usages.length,
+      byteCount: usages.reduce((total, usage) => total + usage.byteCount, 0),
+      pixelCount: usages.reduce((total, usage) => total + usage.pixelCount, 0),
+      maximumWidth: Math.max(...usages.map((usage) => usage.width)),
+      maximumHeight: Math.max(...usages.map((usage) => usage.height)),
+    },
+  };
 }
 
 function contextMessageGroups(
