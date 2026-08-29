@@ -130,11 +130,17 @@ export class TargetPicker implements Component {
     readonly alwaysVisible?: boolean;
   }> {
     const targets = [...this.#targets.values()].map((target) => {
+      const connectionSummary =
+        target.connection === undefined
+          ? ""
+          : ` · ${target.connection.configured} · ${target.connection.reachability}`;
       const item: SelectItem = {
         value: target.targetId,
         label: safeTerminalText(target.targetId),
         description: safeTerminalText(
-          `${target.label} · ${target.route} · ${target.certification} · ${target.readiness.status} (${target.readiness.credentialSource})`,
+          target.upstreamLifecycle === undefined
+            ? `${target.label} · ${target.route} · ${target.certification}${connectionSummary} · ${target.readiness.status} (${target.readiness.credentialSource})`
+            : `Upstream ${target.upstreamLifecycle}${connectionSummary} · ${target.certification} · ${target.label} · ${target.route} · ${target.readiness.status} (${target.readiness.credentialSource})`,
         ),
       };
       return {

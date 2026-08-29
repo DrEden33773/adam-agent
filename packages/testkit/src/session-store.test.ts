@@ -189,6 +189,16 @@ test("SessionStore adapters preserve additive v3 compaction records", async () =
         contextProfile,
         projectionVersion: 1,
         sourceDigest: `sha256:${"b".repeat(64)}`,
+        projectedContent: {
+          version: 1,
+          explicitUserImages: {
+            count: 1,
+            byteCount: 68,
+            pixelCount: 1,
+            maximumWidth: 1,
+            maximumHeight: 1,
+          },
+        },
       },
     },
     {

@@ -508,6 +508,13 @@ function mapMessage(message: ModelMessage, isDeepSeekV4: boolean): ChatCompletio
         content: `Developer instruction:\n${message.content}`,
       };
     case "user":
+      if (typeof message.content !== "string") {
+        throw new ModelDriverError(
+          "protocol_incompatibility",
+          "The selected OpenAI-compatible transport does not accept explicit user images.",
+          { cause: undefined },
+        );
+      }
       return { role: "user", content: message.content };
     case "assistant":
       return {

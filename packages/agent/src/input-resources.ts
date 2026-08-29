@@ -11,6 +11,7 @@ import {
   publishFileArtifactStage,
   type StagedArtifactReference,
 } from "./artifact-store.js";
+import { sniffExplicitUserImageMediaTypeV1 } from "./image-input.js";
 
 export const inputResourceLimitsV1 = {
   maximumOccurrencesPerRun: 8,
@@ -36,8 +37,8 @@ export type StagedInputResourceSelectionV1 = {
   readonly staged: StagedArtifactReference;
   readonly displayName: string;
   readonly digest: `sha256:${string}`;
-  readonly mediaHint: "binary" | "text";
-  readonly support: "unsupported_binary" | "utf8_text";
+  readonly mediaHint: "binary" | "image" | "text";
+  readonly support: "image" | "unsupported_binary" | "utf8_text";
 };
 
 export type InputResourceSelectionV1 =
@@ -49,13 +50,17 @@ export type InputResourceOccurrenceV1 = {
   readonly displayName: string;
   readonly artifact: {
     readonly id: `sha256:${string}`;
-    readonly mediaType: "application/octet-stream" | "text/plain; charset=utf-8";
+    readonly mediaType:
+      | "application/octet-stream"
+      | "image/jpeg"
+      | "image/png"
+      | "text/plain; charset=utf-8";
     readonly byteCount: number;
   };
   readonly digest: `sha256:${string}`;
-  readonly mediaHint: "binary" | "text";
+  readonly mediaHint: "binary" | "image" | "text";
   readonly provenance: "user_local_file";
-  readonly support: "unsupported_binary" | "utf8_text";
+  readonly support: "image" | "unsupported_binary" | "utf8_text";
   readonly mode: "link";
 };
 
@@ -74,13 +79,18 @@ export const inputResourceOccurrenceV1Schema: z.ZodType<InputResourceOccurrenceV
       ),
     artifact: z.strictObject({
       id: digestSchema,
-      mediaType: z.enum(["application/octet-stream", "text/plain; charset=utf-8"]),
+      mediaType: z.enum([
+        "application/octet-stream",
+        "image/jpeg",
+        "image/png",
+        "text/plain; charset=utf-8",
+      ]),
       byteCount: z.number().int().nonnegative().max(inputResourceLimitsV1.maximumFileBytes),
     }),
     digest: digestSchema,
-    mediaHint: z.enum(["binary", "text"]),
+    mediaHint: z.enum(["binary", "image", "text"]),
     provenance: z.literal("user_local_file"),
-    support: z.enum(["unsupported_binary", "utf8_text"]),
+    support: z.enum(["image", "unsupported_binary", "utf8_text"]),
     mode: z.literal("link"),
   },
 );
@@ -202,7 +212,10 @@ async function promoteStagedInputResource(input: {
       selection.staged.mediaType === "text/plain; charset=utf-8") ||
     (selection.support === "unsupported_binary" &&
       selection.mediaHint === "binary" &&
-      selection.staged.mediaType === "application/octet-stream");
+      selection.staged.mediaType === "application/octet-stream") ||
+    (selection.support === "image" &&
+      selection.mediaHint === "image" &&
+      (selection.staged.mediaType === "image/jpeg" || selection.staged.mediaType === "image/png"));
   if (
     input.artifactRoot === undefined ||
     selection.displayName.length === 0 ||
@@ -370,9 +383,10 @@ async function ingestOneLocalFile(input: {
       runId: input.runId,
       provenance: "user_local_file",
     };
+    const imageMediaType = strictUtf8 ? undefined : sniffExplicitUserImageMediaTypeV1(bytes);
     const mediaType = strictUtf8
       ? ("text/plain; charset=utf-8" as const)
-      : ("application/octet-stream" as const);
+      : (imageMediaType ?? ("application/octet-stream" as const));
     let artifact: ArtifactReference<InputResourceArtifactSourceV1>;
     try {
       artifact = await input.artifactStore.write({ bytes, mediaType, source });
@@ -395,9 +409,13 @@ async function ingestOneLocalFile(input: {
       displayName: safeInputResourceDisplayNameV1(input.path),
       artifact: { id: digest, mediaType, byteCount: identity.size },
       digest,
-      mediaHint: strictUtf8 ? "text" : "binary",
+      mediaHint: strictUtf8 ? "text" : imageMediaType === undefined ? "binary" : "image",
       provenance: "user_local_file",
-      support: strictUtf8 ? "utf8_text" : "unsupported_binary",
+      support: strictUtf8
+        ? "utf8_text"
+        : imageMediaType === undefined
+          ? "unsupported_binary"
+          : "image",
       mode: "link",
     };
   } finally {
@@ -430,6 +448,63 @@ export function projectInputResourcesV1(
     return text;
   }
   return `${text}\n\nLinked input resources (descriptor-only; use read_input_resource to read supported immutable content):\n${JSON.stringify(occurrences)}`;
+}
+
+export const inputResourceProjectionOccurrencesV1 = Symbol(
+  "adam-agent.input-resource-projection-occurrences-v1",
+);
+
+export function createInputResourceUserMessageV1(
+  text: string,
+  occurrences: readonly InputResourceOccurrenceV1[] | undefined,
+) {
+  return {
+    role: "user" as const,
+    content: projectInputResourcesV1(text, occurrences),
+    ...(occurrences === undefined || occurrences.length === 0
+      ? {}
+      : { [inputResourceProjectionOccurrencesV1]: occurrences }),
+  };
+}
+
+export function authorizedInputResourceOccurrencesV1(
+  message: object,
+): readonly InputResourceOccurrenceV1[] | undefined {
+  return (
+    message as {
+      readonly [inputResourceProjectionOccurrencesV1]?: readonly InputResourceOccurrenceV1[];
+    }
+  )[inputResourceProjectionOccurrencesV1];
+}
+
+export function parseInputResourceProjectionV1(content: string):
+  | {
+      readonly text: string;
+      readonly occurrences: readonly InputResourceOccurrenceV1[];
+    }
+  | undefined {
+  const separator =
+    "\n\nLinked input resources (descriptor-only; use read_input_resource to read supported immutable content):\n";
+  const separatorIndex = content.lastIndexOf(separator);
+  if (separatorIndex < 0) {
+    return undefined;
+  }
+  const text = content.slice(0, separatorIndex);
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(content.slice(separatorIndex + separator.length));
+  } catch {
+    return undefined;
+  }
+  const occurrences = inputResourceOccurrenceV1Schema
+    .array()
+    .min(1)
+    .max(inputResourceLimitsV1.maximumOccurrencesPerRun)
+    .safeParse(decoded);
+  if (!occurrences.success || projectInputResourcesV1(text, occurrences.data) !== content) {
+    return undefined;
+  }
+  return { text, occurrences: occurrences.data };
 }
 
 export function createInputResourceProjectionMessageV1(

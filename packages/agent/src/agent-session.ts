@@ -7,6 +7,7 @@ import type {
   ModelDriver,
   ModelEvent,
   ModelMessage,
+  ModelModalityProfile,
   PermissionDecisionCommand,
   PermissionDecisionCommandResult,
   RunOptions,
@@ -34,6 +35,7 @@ import {
   estimateContextSummaryRequestTokens,
   generateContextSummary,
   mergeContextEvidence,
+  prepareContextSummaryRequestV1,
   reduceContextEvidence,
   shrinkContextMessagesForRetry,
   splitContextForCompaction,
@@ -45,12 +47,17 @@ import {
 } from "./durable-model-response-policy.js";
 import {
   createInputResourceProjectionMessageV1,
+  createInputResourceUserMessageV1,
   inputResourceLimitsV1,
   inputResourceOccurrenceV1Schema,
   inputResourcePageV1Schema,
-  projectInputResourcesV1,
 } from "./input-resources.js";
 import { ModelDriverError } from "./model-driver-error.js";
+import {
+  applyPreparedExplicitUserImageMessagesV1,
+  prepareExplicitUserImageMessagesV1,
+  projectedContentUsageV1,
+} from "./model-user-content.js";
 import {
   assemblePromptMessagesV1,
   createPromptContextV1,
@@ -108,9 +115,16 @@ import type {
 
 class SessionPersistenceError extends Error {}
 
+class InputResourceProjectionError extends Error {
+  constructor(readonly details: Extract<RunResult, { readonly status: "failed" }>["error"]) {
+    super(details.message);
+  }
+}
+
 type AgentSessionBaseDependencies = {
   readonly artifactStore?: ArtifactStore;
   readonly model: ModelDriver;
+  readonly modalityProfile?: ModelModalityProfile;
   readonly tools?: ToolRegistry;
   readonly permissions?: PermissionPolicy;
   readonly store: SessionStore;
@@ -134,6 +148,7 @@ export class AgentSession {
   #nextNotification = 1;
   readonly #artifactStore: ArtifactStore | undefined;
   readonly #model: ModelDriver;
+  readonly #modalityProfile: ModelModalityProfile | undefined;
   readonly #tools: ToolRegistry | undefined;
   readonly #permissions: PermissionPolicy | undefined;
   #promptContext: PromptContextRecord | undefined;
@@ -211,6 +226,7 @@ export class AgentSession {
     }
     this.#maximumOutputTokens = maximumOutputTokens;
     this.#model = dependencies.model;
+    this.#modalityProfile = dependencies.modalityProfile;
     const durablePromptContext = this.#durableContext?.promptContext;
     const selectedToolNames =
       durablePromptContext === undefined
@@ -401,6 +417,9 @@ export class AgentSession {
         if (error instanceof ContextCompactionError) {
           return await this.#settleContextCompactionFailed(error);
         }
+        if (error instanceof InputResourceProjectionError) {
+          return await this.#settle({ status: "failed", error: error.details });
+        }
         throw error;
       }
     } catch (error) {
@@ -430,7 +449,7 @@ export class AgentSession {
     explicitSkills: readonly { readonly selection: string; readonly requestId: string }[],
   ): Promise<RunResult> {
     const resume = this.#durableContext?.resume;
-    const projectedUserMessage = projectInputResourcesV1(input.text, input.inputResources);
+    const projectedUserMessage = createInputResourceUserMessageV1(input.text, input.inputResources);
     if (resume === undefined) {
       await this.#emit({ type: "user_message", text: input.text });
       if (signal.aborted) {
@@ -457,10 +476,7 @@ export class AgentSession {
     }
     const messages: ModelMessage[] =
       resume === undefined
-        ? [
-            ...(this.#durableContext?.initialMessages ?? []),
-            { role: "user", content: projectedUserMessage },
-          ]
+        ? [...(this.#durableContext?.initialMessages ?? []), projectedUserMessage]
         : resume.messages.map((message) => ({ ...message }));
     const toolResultsById = new Map<
       string,
@@ -610,6 +626,19 @@ export class AgentSession {
           resume !== undefined && modelTurns === resume.nextTurn ? resume.nextAttempt : 1;
       }
       const attemptNumber = nextAttemptNumber;
+      const preparedUserImages = await prepareExplicitUserImageMessagesV1({
+        artifactStore: this.#artifactStore,
+        messages: requestMessages,
+        modalityProfile: this.#modalityProfile,
+        signal,
+      });
+      if (preparedUserImages.status === "failed") {
+        return this.#settle({ status: "failed", error: preparedUserImages.error });
+      }
+      const projectedContent = projectedContentUsageV1(
+        requestMessages,
+        preparedUserImages.imageUsageByProjection,
+      );
       if (this.#durableContext !== undefined) {
         const targetIdentity = this.#durableContext.targetIdentity;
         const appendAttempt = async () => {
@@ -622,6 +651,7 @@ export class AgentSession {
               turn: modelTurns,
               attempt: attemptNumber,
               targetIdentity,
+              ...(projectedContent === undefined ? {} : { projectedContent }),
               ...(this.#promptContext === undefined
                 ? {}
                 : {
@@ -692,7 +722,10 @@ export class AgentSession {
 
       try {
         for await (const event of this.#model.stream({
-          messages: requestMessages,
+          messages: applyPreparedExplicitUserImageMessagesV1(
+            requestMessages,
+            preparedUserImages.projections,
+          ),
           tools: requestTools,
           maximumOutputTokens,
           purpose: "ordinary",
@@ -1236,6 +1269,39 @@ export class AgentSession {
       attemptNumber <= lastAttemptNumber;
       attemptNumber += 1
     ) {
+      const { summaryMessages, retainedMessages } =
+        retryMessages === undefined
+          ? splitContextForCompaction(
+              messages,
+              attemptNumber === 1 && !this.#hasUncheckpointedInheritedMessages
+                ? contextProfile.retainedTargetTokens
+                : 0,
+            )
+          : { summaryMessages: retryMessages, retainedMessages: [] };
+      const preparedSummaryImages = await prepareExplicitUserImageMessagesV1({
+        artifactStore: this.#artifactStore,
+        messages: summaryMessages,
+        modalityProfile: this.#modalityProfile,
+        signal,
+      });
+      if (preparedSummaryImages.status === "failed") {
+        throw new InputResourceProjectionError(preparedSummaryImages.error);
+      }
+      const projectedSummaryMessages = applyPreparedExplicitUserImageMessagesV1(
+        summaryMessages,
+        preparedSummaryImages.projections,
+      );
+      const records = await this.#store.read();
+      const evidence = mergeContextEvidence(
+        durableContext.inheritedEvidence,
+        reduceContextEvidence(records, runId, sourceThrough),
+      );
+      const preparedRequest = prepareContextSummaryRequestV1({
+        evidence,
+        messages: projectedSummaryMessages,
+        profile: contextProfile,
+        imageUsageByArtifactId: preparedSummaryImages.imageUsageByArtifactId,
+      });
       const attemptId = randomUUID();
       await this.#appendRecord({
         schemaVersion: 3,
@@ -1254,6 +1320,9 @@ export class AgentSession {
           contextProfile,
           projectionVersion: 1,
           sourceDigest,
+          ...(preparedRequest.projectedContent === undefined
+            ? {}
+            : { projectedContent: preparedRequest.projectedContent }),
         },
       });
       this.#publish({
@@ -1263,26 +1332,13 @@ export class AgentSession {
         windowNumber,
         trigger: options.trigger,
       });
-      const records = await this.#store.read();
-      const evidence = mergeContextEvidence(
-        durableContext.inheritedEvidence,
-        reduceContextEvidence(records, runId, sourceThrough),
-      );
-      const { summaryMessages, retainedMessages } =
-        retryMessages === undefined
-          ? splitContextForCompaction(
-              messages,
-              attemptNumber === 1 && !this.#hasUncheckpointedInheritedMessages
-                ? contextProfile.retainedTargetTokens
-                : 0,
-            )
-          : { summaryMessages: retryMessages, retainedMessages: [] };
       let compacted: Awaited<ReturnType<typeof generateContextSummary>>;
       try {
         compacted = await generateContextSummary({
           evidence,
-          messages: summaryMessages,
+          messages: projectedSummaryMessages,
           model: this.#model,
+          preparedRequest,
           profile: contextProfile,
           signal,
         });

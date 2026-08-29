@@ -70,6 +70,14 @@ const launchTargetIdentities: readonly ModelTargetIdentity[] = [
     profileVersion: 3,
     certification: "certified",
   },
+  {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  },
 ];
 const fixtureThinkingCapabilities = new Map(
   [...launchTargetIdentities, targetIdentity].map((identity) => {
@@ -80,7 +88,10 @@ const fixtureThinkingCapabilities = new Map(
       targetIdentity: identity,
       providerProfile: {
         id: "@ai-sdk/deepseek/chat" as const,
-        version: identity.profileVersion >= 3 ? ("3.0.30" as const) : ("3.0.28" as const),
+        version:
+          identity.profileVersion >= 3 || identity.modelId === "deepseek-v4-flash-vision-exp"
+            ? ("3.0.30" as const)
+            : ("3.0.28" as const),
         requestPath: "provider_options.deepseek" as const,
       },
       supportsOff: true as const,
@@ -1013,6 +1024,7 @@ function createFixtureModelTargets(options: {
       const latestUser = [...request.messages].reverse().find((message) => message.role === "user");
       if (
         latestUser?.role === "user" &&
+        typeof latestUser.content === "string" &&
         latestUser.content.startsWith("Seeded project session for ")
       ) {
         yield { type: "text_delta", text: "Seeded project session ready." };
@@ -1512,7 +1524,19 @@ function createFixtureModelTargets(options: {
         identity,
         driver: model,
         contextProfile:
-          identity.profileVersion >= 2 ? preparedDirectDeepSeekV2ContextProfile : contextProfile,
+          identity.profileVersion >= 2 || identity.modelId === "deepseek-v4-flash-vision-exp"
+            ? preparedDirectDeepSeekV2ContextProfile
+            : contextProfile,
+        ...(identity.modelId === "deepseek-v4-flash-vision-exp"
+          ? {
+              modalityProfile: {
+                profileVersion: 1 as const,
+                explicitUserImages: "supported" as const,
+                imageToolResults: "unsupported" as const,
+              },
+              upstreamLifecycle: "experimental" as const,
+            }
+          : {}),
         ...(thinkingCapability === undefined ? {} : { thinkingCapability }),
       };
     },
@@ -1527,6 +1551,17 @@ function createFixtureModelTargets(options: {
             },
             contextProfile: preparedDirectDeepSeekV2ContextProfile,
             thinkingCapability: requireFixtureThinkingCapability(identity.targetId),
+            ...(identity.modelId === "deepseek-v4-flash-vision-exp"
+              ? {
+                  modalityProfile: {
+                    profileVersion: 1 as const,
+                    explicitUserImages: "supported" as const,
+                    imageToolResults: "unsupported" as const,
+                  },
+                  connectionTest: "supported" as const,
+                  upstreamLifecycle: "experimental" as const,
+                }
+              : {}),
           })),
         };
       }
@@ -1554,6 +1589,18 @@ function createFixtureModelTargets(options: {
             : []),
         ],
       };
+    },
+    async testConnection(input) {
+      input.signal.throwIfAborted();
+      return input.targetId === "deepseek-v4-flash-vision-exp.direct"
+        ? { status: "reachable", diagnostic: null }
+        : {
+            status: "unreachable",
+            diagnostic: {
+              code: "connection_unsupported",
+              message: "The deterministic fixture target has no connection test.",
+            },
+          };
     },
   };
 }

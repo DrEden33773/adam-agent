@@ -78,6 +78,346 @@ test("an exact Direct DeepSeek target returns a public answer-only model driver"
   });
 });
 
+test("the exact Vision Chat target projects immutable PNG bytes through Direct Chat", async () => {
+  const requests: Array<{ readonly url: string; readonly body: unknown }> = [];
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async (input, init) => {
+      requests.push({
+        url: input instanceof Request ? input.url : String(input),
+        body: JSON.parse(String(init?.body)),
+      });
+      return new Response(answerOnlyDeepSeekStream, {
+        headers: { "content-type": "text/event-stream" },
+        status: 200,
+      });
+    },
+  });
+  const resolved = await targets.resolve({
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+  const imageBytes = Uint8Array.from([0x89, 0x50, 0x4e, 0x47]);
+
+  const events = await collect(
+    resolved.driver.stream({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Describe this image." },
+            {
+              type: "file",
+              artifactId: `sha256:${"a".repeat(64)}`,
+              mediaType: "image/png",
+              bytes: imageBytes,
+            },
+          ],
+        },
+      ],
+      tools: [],
+      maximumOutputTokens: resolved.contextProfile.maximumOutputTokens,
+      signal: new AbortController().signal,
+    }),
+  );
+
+  expect({
+    identity: resolved.identity,
+    modalityProfile: resolved.modalityProfile,
+    requests,
+    events,
+  }).toEqual({
+    identity: {
+      targetId: "deepseek-v4-flash-vision-exp.direct",
+      vendor: "deepseek",
+      modelId: "deepseek-v4-flash-vision-exp",
+      route: "direct",
+      profileVersion: 1,
+      certification: "certified",
+    },
+    modalityProfile: {
+      profileVersion: 1,
+      explicitUserImages: "supported",
+      imageToolResults: "unsupported",
+    },
+    requests: [
+      {
+        url: "https://api.deepseek.com/chat/completions",
+        body: expect.objectContaining({
+          model: "deepseek-v4-flash-vision-exp",
+          messages: [
+            {
+              role: "user",
+              content: [
+                { type: "text", text: "Describe this image." },
+                {
+                  type: "image_url",
+                  image_url: { url: "data:image/png;base64,iVBORw==" },
+                },
+              ],
+            },
+          ],
+          max_tokens: 384_000,
+          stream: true,
+        }),
+      },
+    ],
+    events: [
+      { type: "text_delta", text: "Hello, Adam." },
+      { type: "usage", inputTokens: 7, outputTokens: 3 },
+      { type: "finish", reason: "stop", rawReason: "stop" },
+    ],
+  });
+});
+
+test("the exact Vision Chat target classifies a provider error for structured image input", async () => {
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-secret-key" },
+    fetch: async () =>
+      Response.json(
+        {
+          error: {
+            message: "Insufficient balance for test-secret-key",
+            type: "insufficient_balance",
+            code: "billing_error",
+          },
+        },
+        { status: 402 },
+      ),
+  });
+  const { driver } = await targets.resolve({
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+
+  const error = await collectError(
+    driver.stream({
+      maximumOutputTokens: 4_096,
+      messages: [visionImageMessage()],
+      tools: [],
+      signal: new AbortController().signal,
+    }),
+  );
+
+  expect(error).toMatchObject({
+    category: "billing",
+    status: 402,
+    providerCode: "billing_error",
+    responseSummary: "Insufficient balance for [REDACTED]",
+  });
+});
+
+test("the exact Vision Chat target preserves cancellation during structured image input", async () => {
+  const requestStarted = Promise.withResolvers<AbortSignal>();
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async (_input, init) => {
+      const signal = init?.signal;
+      if (signal === null || signal === undefined) {
+        throw new Error("Expected the Vision Chat request signal.");
+      }
+      requestStarted.resolve(signal);
+      return await new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    },
+  });
+  const { driver } = await targets.resolve({
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+  const controller = new AbortController();
+  const error = collectError(
+    driver.stream({
+      maximumOutputTokens: 4_096,
+      messages: [visionImageMessage()],
+      tools: [],
+      signal: controller.signal,
+    }),
+  );
+  const requestSignal = await requestStarted.promise;
+
+  controller.abort(new DOMException("Vision request cancelled.", "AbortError"));
+
+  await expect(error).resolves.toMatchObject({
+    category: "aborted",
+    message: "The model provider request was aborted.",
+  });
+  expect(requestSignal.aborted).toBe(true);
+});
+
+test("the explicit Direct connection test authenticates one bounded models handshake", async () => {
+  const requests: Array<{
+    readonly url: string;
+    readonly method: string | undefined;
+    readonly authorization: string | null;
+  }> = [];
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async (input, init) => {
+      requests.push({
+        url: input instanceof Request ? input.url : String(input),
+        method: init?.method,
+        authorization: new Headers(init?.headers).get("authorization"),
+      });
+      return Response.json({
+        object: "list",
+        data: [{ id: "deepseek-v4-flash-vision-exp", object: "model", owned_by: "deepseek" }],
+      });
+    },
+  });
+  if (targets.testConnection === undefined) {
+    throw new Error("Expected the production model-target connection test.");
+  }
+
+  await expect(
+    targets.testConnection({
+      targetId: "deepseek-v4-flash-vision-exp.direct",
+      signal: new AbortController().signal,
+    }),
+  ).resolves.toEqual({ status: "reachable", diagnostic: null });
+  expect(requests).toEqual([
+    {
+      url: "https://api.deepseek.com/models",
+      method: "GET",
+      authorization: "Bearer test-deepseek-key",
+    },
+  ]);
+});
+
+test("the explicit Direct connection test propagates caller cancellation to its one request", async () => {
+  const requestStarted = Promise.withResolvers<AbortSignal>();
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async (_input, init) => {
+      const signal = init?.signal;
+      if (signal === null || signal === undefined) {
+        throw new Error("Expected the connection request signal.");
+      }
+      requestStarted.resolve(signal);
+      return await new Promise<Response>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+    },
+  });
+  if (targets.testConnection === undefined) {
+    throw new Error("Expected the production model-target connection test.");
+  }
+  const controller = new AbortController();
+  const cancellation = new DOMException("Caller cancelled the connection test.", "AbortError");
+  const result = targets.testConnection({
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    signal: controller.signal,
+  });
+  const requestSignal = await requestStarted.promise;
+
+  controller.abort(cancellation);
+
+  await expect(result).rejects.toBe(cancellation);
+  expect(requestSignal.aborted).toBe(true);
+  expect(requestSignal.reason).toBe(cancellation);
+});
+
+test("the explicit Direct connection test settles a causally expired request as unreachable", async () => {
+  vi.useFakeTimers();
+  try {
+    const requestStarted = Promise.withResolvers<AbortSignal>();
+    const targets = createModelTargets({
+      environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+      connectionDeadlineMs: 25,
+      fetch: async (_input, init) => {
+        const signal = init?.signal;
+        if (signal === null || signal === undefined) {
+          throw new Error("Expected the connection request signal.");
+        }
+        requestStarted.resolve(signal);
+        return await new Promise<Response>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+      },
+    });
+    if (targets.testConnection === undefined) {
+      throw new Error("Expected the production model-target connection test.");
+    }
+    const result = targets.testConnection({
+      targetId: "deepseek-v4-flash-vision-exp.direct",
+      signal: new AbortController().signal,
+    });
+    const requestSignal = await requestStarted.promise;
+
+    await vi.advanceTimersByTimeAsync(25);
+
+    await expect(result).resolves.toEqual({
+      status: "unreachable",
+      diagnostic: {
+        code: "connection_timeout",
+        message: "The authenticated model catalog request reached its deadline.",
+      },
+    });
+    expect(requestSignal.aborted).toBe(true);
+    expect(requestSignal.reason).toMatchObject({ name: "TimeoutError" });
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+test.each([
+  {
+    name: "an HTTP rejection",
+    response: () => Response.json({ error: "unauthorized" }, { status: 401 }),
+    diagnostic: {
+      code: "connection_http_error",
+      message: "The authenticated model catalog returned HTTP 401.",
+    },
+  },
+  {
+    name: "a missing exact model",
+    response: () => Response.json({ object: "list", data: [{ id: "another-model" }] }),
+    diagnostic: {
+      code: "connection_model_not_advertised",
+      message: "The authenticated model catalog did not advertise the expected exact model.",
+    },
+  },
+  {
+    name: "an oversized response",
+    response: () => new Response("x".repeat(256 * 1024 + 1)),
+    diagnostic: {
+      code: "connection_response_too_large",
+      message: "The authenticated model catalog exceeded Adam's response limit.",
+    },
+  },
+  {
+    name: "too many advertised models",
+    response: () =>
+      Response.json({
+        object: "list",
+        data: Array.from({ length: 4_097 }, (_, index) => ({ id: `model-${index}` })),
+      }),
+    diagnostic: {
+      code: "connection_response_invalid",
+      message: "The authenticated model catalog response is invalid.",
+    },
+  },
+])("the explicit Direct connection test bounds $name", async ({ response, diagnostic }) => {
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async () => response(),
+  });
+  if (targets.testConnection === undefined) {
+    throw new Error("Expected the production model-target connection test.");
+  }
+
+  await expect(
+    targets.testConnection({
+      targetId: "deepseek-v4-flash-vision-exp.direct",
+      signal: new AbortController().signal,
+    }),
+  ).resolves.toEqual({ status: "unreachable", diagnostic });
+});
+
 test("an exact Direct DeepSeek target exposes only its real thinking policy choices", async () => {
   const targets = createModelTargets({
     environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
@@ -1617,6 +1957,7 @@ test("the target snapshot reports exact Certified identities and safe credential
           retainedTargetTokens: 20_000,
           estimatorVersion: 1,
         },
+        connectionTest: "supported",
         thinkingCapability: expectedDirectDeepSeekThinkingCapability({
           targetId: "deepseek-v4-flash.direct",
           vendor: "deepseek",
@@ -1647,12 +1988,50 @@ test("the target snapshot reports exact Certified identities and safe credential
           retainedTargetTokens: 20_000,
           estimatorVersion: 1,
         },
+        connectionTest: "supported",
         thinkingCapability: expectedDirectDeepSeekThinkingCapability({
           targetId: "deepseek-v4-pro.direct",
           vendor: "deepseek",
           modelId: "deepseek-v4-pro",
           route: "direct",
           profileVersion: 3,
+          certification: "certified",
+        }),
+      },
+      {
+        identity: {
+          targetId: "deepseek-v4-flash-vision-exp.direct",
+          vendor: "deepseek",
+          modelId: "deepseek-v4-flash-vision-exp",
+          route: "direct",
+          profileVersion: 1,
+          certification: "certified",
+        },
+        readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+        contextProfile: {
+          version: 2,
+          contextWindowTokens: 1_000_000,
+          maximumOutputTokens: 384_000,
+          ordinaryOutputReserveTokens: 4_096,
+          compactionSummaryMaximumOutputTokens: 32_768,
+          compactAtTokens: 900_000,
+          postCompactTargetTokens: 200_000,
+          retainedTargetTokens: 20_000,
+          estimatorVersion: 1,
+        },
+        modalityProfile: {
+          profileVersion: 1,
+          explicitUserImages: "supported",
+          imageToolResults: "unsupported",
+        },
+        upstreamLifecycle: "experimental",
+        connectionTest: "supported",
+        thinkingCapability: expectedDirectDeepSeekThinkingCapability({
+          targetId: "deepseek-v4-flash-vision-exp.direct",
+          vendor: "deepseek",
+          modelId: "deepseek-v4-flash-vision-exp",
+          route: "direct",
+          profileVersion: 1,
           certification: "certified",
         }),
       },
@@ -1692,7 +2071,11 @@ function expectedDirectDeepSeekThinkingCapability(targetIdentity: ModelTargetIde
     targetIdentity,
     providerProfile: {
       id: "@ai-sdk/deepseek/chat",
-      version: targetIdentity.profileVersion >= 3 ? "3.0.30" : "3.0.28",
+      version:
+        targetIdentity.profileVersion >= 3 ||
+        targetIdentity.modelId === "deepseek-v4-flash-vision-exp"
+          ? "3.0.30"
+          : "3.0.28",
       requestPath: "provider_options.deepseek",
     },
     supportsOff: true,
@@ -1793,6 +2176,9 @@ test("current Direct DeepSeek v3 selection retains exact historical v2 and v1 re
       { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 2 } },
       { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 1 } },
       { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 1 } },
+      {
+        identity: { targetId: "deepseek-v4-flash-vision-exp.direct", profileVersion: 1 },
+      },
       { identity: { targetId: "poolside-laguna-s-2.1-free.gateway", profileVersion: 1 } },
     ],
   });
@@ -1983,7 +2369,7 @@ test("the target resolver rejects every model identity outside the exact built-i
   expect(error).toMatchObject({
     code: "target_not_found",
     message:
-      "Unknown model target. Choose deepseek-v4-flash.direct, deepseek-v4-pro.direct, or the documented Experimental Gateway target.",
+      "Unknown model target. Choose deepseek-v4-flash.direct, deepseek-v4-pro.direct, deepseek-v4-flash-vision-exp.direct, or the documented Experimental Gateway target.",
   });
 });
 
@@ -1998,7 +2384,7 @@ test("credentials never imply a target when no explicit or legacy selector exist
   );
 });
 
-test("the temporary DeepSeek selectors map only their two exact legacy models", () => {
+test("the temporary DeepSeek selectors map only their three exact compatibility models", () => {
   expect([
     selectModelTargetId({ ADAM_AGENT_PROVIDER: "deepseek" }),
     selectModelTargetId({
@@ -2009,7 +2395,16 @@ test("the temporary DeepSeek selectors map only their two exact legacy models", 
       ADAM_AGENT_PROVIDER: "deepseek",
       ADAM_AGENT_MODEL: "deepseek-v4-pro",
     }),
-  ]).toEqual(["deepseek-v4-pro.direct", "deepseek-v4-flash.direct", "deepseek-v4-pro.direct"]);
+    selectModelTargetId({
+      ADAM_AGENT_PROVIDER: "deepseek",
+      ADAM_AGENT_MODEL: "deepseek-v4-flash-vision-exp",
+    }),
+  ]).toEqual([
+    "deepseek-v4-pro.direct",
+    "deepseek-v4-flash.direct",
+    "deepseek-v4-pro.direct",
+    "deepseek-v4-flash-vision-exp.direct",
+  ]);
 });
 
 test("the legacy DeepSeek selector rejects a configured model outside the exact V4 allowlist", () => {
@@ -2022,7 +2417,7 @@ test("the legacy DeepSeek selector rejects a configured model outside the exact 
     expect.objectContaining({
       code: "invalid_selector",
       message:
-        "ADAM_AGENT_MODEL must be deepseek-v4-flash or deepseek-v4-pro when ADAM_AGENT_PROVIDER=deepseek.",
+        "ADAM_AGENT_MODEL must be deepseek-v4-flash, deepseek-v4-pro, or deepseek-v4-flash-vision-exp when ADAM_AGENT_PROVIDER=deepseek.",
     }),
   );
 });
@@ -2060,6 +2455,21 @@ async function collectError(stream: AsyncIterable<ModelEvent>): Promise<ModelDri
     throw error;
   }
   throw new Error("Expected the model driver to fail.");
+}
+
+function visionImageMessage() {
+  return {
+    role: "user" as const,
+    content: [
+      { type: "text" as const, text: "Describe this image." },
+      {
+        type: "file" as const,
+        artifactId: `sha256:${"a".repeat(64)}` as const,
+        mediaType: "image/png" as const,
+        bytes: Uint8Array.from([0x89, 0x50, 0x4e, 0x47]),
+      },
+    ],
+  };
 }
 
 const readFileDefinition = {

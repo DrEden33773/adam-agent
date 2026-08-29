@@ -5,7 +5,10 @@ export type {
   ModelDriver,
   ModelEvent,
   ModelMessage,
+  ModelModalityProfile,
   ModelRequest,
+  ModelUserContent,
+  ModelUserContentPart,
   PermissionDecisionCommand,
   PermissionDecisionCommandResult,
   RunOptions,
@@ -60,6 +63,7 @@ export {
 export { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
 export {
   createModelTargets,
+  type ModelTargetConnectionTestResult,
   ModelTargetError,
   type ModelTargetIdentity,
   type ModelTargetReadiness,
@@ -68,6 +72,7 @@ export {
   type ModelTargetsOptions,
   selectModelTargetId,
 } from "./model-targets.js";
+export { imageInputLimitsV1 } from "./model-user-content.js";
 export {
   OpenAICompatibleModelDriver,
   type OpenAICompatibleModelDriverOptions,

@@ -33,6 +33,13 @@ export type TargetDisplay = {
   readonly label: string;
   readonly route: "direct" | "vercel-ai-gateway";
   readonly certification: "Certified" | "Experimental";
+  readonly upstreamLifecycle?: "Experimental" | "Stable";
+  readonly connection?: {
+    readonly configured: "Configured" | "Not configured";
+    readonly reachability: "Not tested" | "Testing" | "Reachable" | "Unreachable";
+    readonly checkedAt: string | null;
+    readonly diagnostic: { readonly code: string; readonly message: string } | null;
+  };
   readonly readiness: {
     readonly status: "available" | "missing";
     readonly credentialSource: string;
@@ -663,7 +670,7 @@ export type TurnComposerDisplay = {
     readonly displayName: string;
     readonly state: "queued" | "copying" | "ready" | "failed" | "cancelled" | "removed";
     readonly byteCount: number | null;
-    readonly support: "unsupported_binary" | "utf8_text" | null;
+    readonly support: "image" | "unsupported_binary" | "utf8_text" | null;
     readonly diagnostic: string | null;
   }[];
 };
@@ -772,6 +779,10 @@ export type PresentationCommand =
         | "maximumOutputTokens"
         | "automaticCompactionWindowTokens";
       readonly value: number | null;
+    }
+  | {
+      readonly type: "test_target_connection" | "cancel_target_connection_test";
+      readonly targetId: string;
     }
   | {
       readonly type: "set_workspace_trust";

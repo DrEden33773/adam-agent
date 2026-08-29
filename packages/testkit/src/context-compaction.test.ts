@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2278,7 +2279,10 @@ test("AgentSession fits bulky tool output while preserving canonical write evide
     async *stream(request) {
       if (request.tools.length === 0) {
         const summaryInput = request.messages.at(-1);
-        fittedSummaryInput = summaryInput?.role === "user" ? summaryInput.content : "";
+        fittedSummaryInput =
+          summaryInput?.role === "user" && typeof summaryInput.content === "string"
+            ? summaryInput.content
+            : "";
         yield {
           type: "text_delta",
           text: JSON.stringify({
@@ -2391,7 +2395,11 @@ test("AgentSession reconsiders a complete retained tool turn during repeated com
       if (request.tools.length === 0) {
         compactionCall += 1;
         const inputMessage = request.messages.at(-1);
-        if (compactionCall === 2 && inputMessage?.role === "user") {
+        if (
+          compactionCall === 2 &&
+          inputMessage?.role === "user" &&
+          typeof inputMessage.content === "string"
+        ) {
           secondCompactionInput = inputMessage.content;
         }
         yield {
@@ -3602,6 +3610,171 @@ test("SessionLifecycle retains canonical input-resource identity for reread afte
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }
+});
+
+test("AgentSession projects an eager Vision Chat image into compaction without synthesizing a replacement user turn", async () => {
+  const imageBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const artifactId = `sha256:${createHash("sha256").update(imageBytes).digest("hex")}` as const;
+  const visionIdentity = {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+  const occurrence = {
+    occurrenceId: "image-compaction-run:input:1",
+    displayName: "compacted-image.png",
+    artifact: { id: artifactId, mediaType: "image/png" as const, byteCount: imageBytes.byteLength },
+    digest: artifactId,
+    mediaHint: "image" as const,
+    provenance: "user_local_file" as const,
+    support: "image" as const,
+    mode: "link" as const,
+  };
+  const userText = `Retain and describe this image. ${"Summarize this filler. ".repeat(3_000)}`;
+  const compactionProfile: ContextProfile = {
+    ...preparedDirectDeepSeekV2ContextProfile,
+    contextWindowTokens: 20_000,
+    maximumOutputTokens: 1_000,
+    ordinaryOutputReserveTokens: 1_000,
+    compactionSummaryMaximumOutputTokens: 1_000,
+    compactAtTokens: 8_000,
+    postCompactTargetTokens: 6_000,
+    retainedTargetTokens: 0,
+  };
+  let compactionCalls = 0;
+  let ordinaryCalls = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      const imageParts = request.messages.flatMap((message) =>
+        message.role === "user" && typeof message.content !== "string"
+          ? message.content.filter((part) => part.type === "file")
+          : [],
+      );
+      if (request.purpose === "compaction") {
+        compactionCalls += 1;
+        const wrapper = request.messages.at(-1);
+        expect(wrapper?.role).toBe("user");
+        if (wrapper?.role !== "user" || typeof wrapper.content === "string") {
+          throw new Error("Expected one image-bearing compaction request wrapper.");
+        }
+        const instructionPart = wrapper.content[0];
+        if (instructionPart?.type !== "text") {
+          throw new Error("Expected the compaction instruction text before its image.");
+        }
+        const instruction = JSON.parse(instructionPart.text) as { readonly messages?: unknown };
+        expect(instruction.messages).toEqual([
+          {
+            role: "user",
+            content: [
+              { type: "text", text: userText },
+              {
+                type: "image_attachment",
+                attachmentIndex: 0,
+                artifactId,
+                mediaType: "image/png",
+                byteCount: imageBytes.byteLength,
+              },
+            ],
+          },
+        ]);
+        expect(imageParts).toEqual([
+          expect.objectContaining({
+            type: "file",
+            mediaType: "image/png",
+            bytes: new Uint8Array(imageBytes),
+          }),
+        ]);
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Describe the retained image after compaction.",
+            constraints: [],
+            progress: [],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: ["Inspect the retained image."],
+            nextSafeAction: "Answer from the retained image.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 600, outputTokens: 30 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCalls += 1;
+      expect(imageParts).toEqual([]);
+      yield { type: "text_delta", text: "The compacted image summary remained visible." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const artifactStore: ArtifactStore = {
+    async write(input) {
+      return {
+        id: artifactId,
+        mediaType: input.mediaType,
+        byteCount: input.bytes.byteLength,
+        source: input.source,
+      };
+    },
+    async read(id) {
+      return id === artifactId ? new Uint8Array(imageBytes) : undefined;
+    },
+  };
+  const store = createInMemorySessionStore<SessionRecord>();
+  const dependencies = {
+    artifactStore,
+    contextProfile: compactionProfile,
+    modalityProfile: {
+      profileVersion: 1 as const,
+      explicitUserImages: "supported" as const,
+      imageToolResults: "unsupported" as const,
+    },
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    [sessionDurableContext]: {
+      inputResources: [occurrence],
+      nextSequence: 1,
+      projectId: `sha256:${"e".repeat(64)}`,
+      sessionId: "image-compaction-session",
+      targetIdentity: visionIdentity,
+    },
+  };
+  const session = new AgentSession(dependencies);
+
+  await expect(
+    session.run({
+      text: userText,
+      inputResources: [occurrence],
+    }),
+  ).resolves.toEqual({
+    status: "completed",
+    answer: "The compacted image summary remained visible.",
+  });
+  expect({ compactionCalls, ordinaryCalls }).toEqual({ compactionCalls: 1, ordinaryCalls: 1 });
+  expect(
+    (await store.read()).find(
+      (record) => record.schemaVersion === 3 && record.record.type === "context_compaction_started",
+    ),
+  ).toMatchObject({
+    record: {
+      projectedContent: {
+        version: 1,
+        explicitUserImages: {
+          count: 1,
+          byteCount: imageBytes.byteLength,
+          pixelCount: 1,
+          maximumWidth: 1,
+          maximumHeight: 1,
+        },
+      },
+    },
+  });
 });
 
 test("SessionLifecycle restarts and branches from one committed context checkpoint", async () => {

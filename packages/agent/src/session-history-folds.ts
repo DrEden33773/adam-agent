@@ -1,5 +1,6 @@
 import type { ContextUsageTotals } from "./agent-session-contracts.js";
 import { createContextProjectionMessage, estimateActiveContextTokens } from "./durable-context.js";
+import { createInputResourceProjectionMessageV1 } from "./input-resources.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import {
   commitMcpToolProfileV3,
@@ -687,6 +688,10 @@ export function contextSnapshotFromRecords(
             tokens: estimateActiveContextTokens(
               [
                 createContextProjectionMessage(checkpointRecord.summary, checkpointRecord.evidence),
+                ...(checkpointRecord.inputResources === undefined ||
+                checkpointRecord.inputResources.length === 0
+                  ? []
+                  : [createInputResourceProjectionMessageV1(checkpointRecord.inputResources)]),
                 ...modelMessagesFromCanonicalRecords(
                   currentRecords.filter(
                     (record) =>

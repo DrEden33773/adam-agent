@@ -160,6 +160,116 @@ test("SessionLifecycle cold resume reads an immutable input resource after its s
   }
 });
 
+test("SessionLifecycle cold resume reconstructs the exact historical Vision Chat image bytes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-vision-chat-cold-resume-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "cold-image.png");
+  const pngBytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const artifactId = `sha256:${createHash("sha256").update(pngBytes).digest("hex")}` as const;
+  const visionIdentity = {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+  const contextProfile = {
+    version: 2,
+    contextWindowTokens: 1_000_000,
+    maximumOutputTokens: 384_000,
+    ordinaryOutputReserveTokens: 4_096,
+    compactionSummaryMaximumOutputTokens: 32_768,
+    compactAtTokens: 900_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+    estimatorVersion: 1,
+  } as const;
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, pngBytes);
+  let providerCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    providerCalls += 1;
+    const firstUser = request.messages.find((message) => message.role === "user");
+    expect(firstUser).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "Remember this image." },
+        {
+          type: "file",
+          artifactId,
+          mediaType: "image/png",
+          bytes: new Uint8Array(pngBytes),
+        },
+      ],
+    });
+    return providerCalls === 1
+      ? [
+          { type: "text_delta" as const, text: "The image is remembered." },
+          { type: "finish" as const, reason: "stop" as const },
+        ]
+      : [
+          { type: "text_delta" as const, text: "The same image survived restart." },
+          { type: "finish" as const, reason: "stop" as const },
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: visionIdentity,
+        driver,
+        contextProfile,
+        modalityProfile: {
+          profileVersion: 1,
+          explicitUserImages: "supported",
+          imageToolResults: "unsupported",
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const warm = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const admitted = await warm.admit({
+      targetIdentity: visionIdentity,
+      input: { text: "Remember this image." },
+      resourceSelections: [{ type: "local_file", path: selectedPath }],
+    });
+    await warm.close();
+    await unlink(selectedPath);
+    cold = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    await expect(
+      cold.continue({
+        sessionId: admitted.snapshot.sessionId,
+        input: { text: "What image survived restart?" },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The same image survived restart." },
+    });
+    expect(providerCalls).toBe(2);
+  } finally {
+    await cold?.close();
+    await warm.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle rejects a corrupt immutable input resource before cold provider projection", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-corrupt-resume-"));
   const stateRoot = join(testRoot, "state");

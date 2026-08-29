@@ -91,7 +91,11 @@ export function createDirectDeepSeekThinkingCapability(
     targetIdentity,
     providerProfile: {
       id: "@ai-sdk/deepseek/chat" as const,
-      version: targetIdentity.profileVersion >= 3 ? ("3.0.30" as const) : ("3.0.28" as const),
+      version:
+        targetIdentity.profileVersion >= 3 ||
+        targetIdentity.modelId === "deepseek-v4-flash-vision-exp"
+          ? ("3.0.30" as const)
+          : ("3.0.28" as const),
       requestPath: "provider_options.deepseek" as const,
     },
     supportsOff: true as const,

@@ -885,6 +885,20 @@ test("PresentationSession projects exact target identity and readiness for proje
           },
           {
             identity: {
+              targetId: "deepseek-v4-flash-vision-exp.direct",
+              vendor: "deepseek",
+              modelId: "deepseek-v4-flash-vision-exp",
+              route: "direct",
+              profileVersion: 1,
+              certification: "certified",
+            },
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+            connectionTest: "supported",
+            upstreamLifecycle: "experimental",
+          },
+          {
+            identity: {
               targetId: "poolside-laguna-s-2.1-free.gateway",
               vendor: "poolside",
               modelId: "poolside/laguna-s-2.1-free",
@@ -898,6 +912,11 @@ test("PresentationSession projects exact target identity and readiness for proje
           },
         ],
       };
+    },
+    async testConnection(input) {
+      expect(input.targetId).toBe("deepseek-v4-flash-vision-exp.direct");
+      expect(input.signal.aborted).toBe(false);
+      return { status: "reachable", diagnostic: null };
     },
   };
 
@@ -940,6 +959,21 @@ test("PresentationSession projects exact target identity and readiness for proje
           },
         },
         {
+          targetId: "deepseek-v4-flash-vision-exp.direct",
+          label: "deepseek-v4-flash-vision-exp",
+          route: "direct",
+          certification: "Certified",
+          upstreamLifecycle: "Experimental",
+          readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+          connection: {
+            configured: "Configured",
+            reachability: "Not tested",
+            checkedAt: null,
+            diagnostic: null,
+          },
+          thinking: null,
+        },
+        {
           targetId: "poolside-laguna-s-2.1-free.gateway",
           label: "poolside/laguna-s-2.1-free",
           route: "vercel-ai-gateway",
@@ -952,8 +986,235 @@ test("PresentationSession projects exact target identity and readiness for proje
       diagnostic: null,
     });
     expect(presentation.getState().authoritative.active).toBeNull();
-
     await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession publishes Reachable after one successful target connection test", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-connection-reachable-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const visionIdentity = {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Connection projection does not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+            connectionTest: "supported",
+            upstreamLifecycle: "experimental",
+          },
+        ],
+      };
+    },
+    async testConnection(input) {
+      expect(input).toMatchObject({ targetId: visionIdentity.targetId });
+      expect(input.signal.aborted).toBe(false);
+      return { status: "reachable", diagnostic: null };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await expect(
+      presentation.dispatch({
+        type: "test_target_connection",
+        targetId: visionIdentity.targetId,
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    expect(presentation.getState().authoritative.targets.items[0]?.connection).toEqual({
+      configured: "Configured",
+      reachability: "Reachable",
+      checkedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u),
+      diagnostic: null,
+    });
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession cancellation restores the last settled target connection state", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-connection-cancel-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const visionIdentity = {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+  let connectionTests = 0;
+  const pendingStarted = Promise.withResolvers<void>();
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Connection projection does not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+            connectionTest: "supported",
+            upstreamLifecycle: "experimental",
+          },
+        ],
+      };
+    },
+    async testConnection(input) {
+      connectionTests += 1;
+      if (connectionTests === 1) {
+        return { status: "reachable", diagnostic: null };
+      }
+      pendingStarted.resolve();
+      return await new Promise((_resolve, reject) => {
+        input.signal.addEventListener("abort", () => reject(input.signal.reason), { once: true });
+      });
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+
+  try {
+    presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({
+      type: "test_target_connection",
+      targetId: visionIdentity.targetId,
+    });
+    const settled = presentation.getState().authoritative.targets.items[0]?.connection;
+    const pending = presentation.dispatch({
+      type: "test_target_connection",
+      targetId: visionIdentity.targetId,
+    });
+    await pendingStarted.promise;
+    expect(presentation.getState().authoritative.targets.items[0]?.connection).toEqual({
+      ...settled,
+      reachability: "Testing",
+      diagnostic: null,
+    });
+
+    await expect(
+      presentation.dispatch({
+        type: "cancel_target_connection_test",
+        targetId: visionIdentity.targetId,
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+    await expect(pending).resolves.toMatchObject({
+      status: "rejected",
+      code: "authority_rejected",
+    });
+    expect(presentation.getState().authoritative.targets.items[0]?.connection).toEqual(settled);
+    await presentation.close();
+    presentation = undefined;
+  } finally {
+    await presentation?.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession close settles an active target connection test", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-connection-close-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const visionIdentity = {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+  const pendingStarted = Promise.withResolvers<void>();
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Connection projection does not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionIdentity,
+            readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
+            contextProfile,
+            connectionTest: "supported",
+            upstreamLifecycle: "experimental",
+          },
+        ],
+      };
+    },
+    async testConnection(input) {
+      pendingStarted.resolve();
+      return await new Promise((_resolve, reject) => {
+        input.signal.addEventListener("abort", () => reject(input.signal.reason), { once: true });
+      });
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const pending = presentation.dispatch({
+      type: "test_target_connection",
+      targetId: visionIdentity.targetId,
+    });
+    await pendingStarted.promise;
+    await presentation.close();
+    await expect(pending).resolves.toMatchObject({
+      status: "rejected",
+      code: "authority_rejected",
+    });
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -11304,7 +11565,8 @@ test("PresentationSession branches a branch at one inherited source-aware bounda
   await mkdir(workspaceRoot);
   const driver = new FakeModelDriver((request) => {
     const message = request.messages.findLast((candidate) => candidate.role === "user");
-    const prompt = message?.content ?? "";
+    const prompt =
+      message?.role === "user" && typeof message.content === "string" ? message.content : "";
     return [
       {
         type: "text_delta",

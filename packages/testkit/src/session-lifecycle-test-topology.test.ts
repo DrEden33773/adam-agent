@@ -14,6 +14,7 @@ const testkitSourcePath = fileURLToPath(new URL(".", import.meta.url));
 
 const operatingSystemTestNames = [
   "SessionLifecycle cold resume keeps a Direct DeepSeek v2 session on its historical profile",
+  "SessionLifecycle cold resume reconstructs the exact historical Vision Chat image bytes",
   "SessionLifecycle cold resume reads an immutable input resource after its source is deleted",
   "SessionLifecycle follows one selected symlink without persisting its source path",
   "SessionLifecycle rejects a competing project writer before model dispatch and takes over after owner death",
@@ -146,9 +147,9 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
 
   const behaviorNames = declaredTestNames(behaviorSource);
   const operatingSystemNames = declaredTestNames(operatingSystemSource);
-  expect.soft(behaviorNames).toHaveLength(70);
+  expect.soft(behaviorNames).toHaveLength(75);
   expect.soft(operatingSystemNames).toEqual([...operatingSystemTestNames].sort());
-  expect.soft(operatingSystemNames).toHaveLength(16);
+  expect.soft(operatingSystemNames).toHaveLength(17);
   expect.soft(operatingSystemTestNames.filter((name) => behaviorNames.includes(name))).toEqual([]);
   const combinedNames = [...behaviorNames, ...operatingSystemNames];
   expect.soft(new Set(combinedNames).size).toBe(combinedNames.length);

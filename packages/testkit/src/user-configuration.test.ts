@@ -2290,7 +2290,11 @@ test("revoked historical sessions cannot read a live resource from an active pro
   const configuration = createInMemoryWorkspaceTrustConfiguration(workspaceRoot);
   const model = new FakeModelDriver((request) => {
     const latest = request.messages.at(-1);
-    if (latest?.role === "user" && latest.content.includes("Read the active")) {
+    if (
+      latest?.role === "user" &&
+      typeof latest.content === "string" &&
+      latest.content.includes("Read the active")
+    ) {
       return [
         { type: "tool_call_start", id: "read-revoked-resource", name: "read_skill_resource" },
         {

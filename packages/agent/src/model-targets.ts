@@ -1,6 +1,6 @@
 import { createDeepSeek } from "@ai-sdk/deepseek";
 import { createGateway } from "@ai-sdk/gateway";
-import type { ModelDriver } from "./agent-session-contracts.js";
+import type { ModelDriver, ModelModalityProfile } from "./agent-session-contracts.js";
 import { AiSdkModelDriver } from "./ai-sdk-model-driver.js";
 import type { ContextProfile } from "./context-profile.js";
 import {
@@ -28,6 +28,9 @@ export type ModelTargetSnapshot = {
     readonly identity: ModelTargetIdentity;
     readonly readiness: ModelTargetReadiness;
     readonly contextProfile: ContextProfile;
+    readonly modalityProfile?: ModelModalityProfile;
+    readonly connectionTest?: "supported";
+    readonly upstreamLifecycle?: "experimental" | "stable";
     readonly thinkingCapability?: ThinkingCapabilityV1;
   }[];
 };
@@ -88,12 +91,16 @@ export function selectModelTargetId(
   }
   if (environment.ADAM_AGENT_PROVIDER === "deepseek") {
     const modelId = environment.ADAM_AGENT_MODEL ?? "deepseek-v4-pro";
-    if (modelId === "deepseek-v4-flash" || modelId === "deepseek-v4-pro") {
+    if (
+      modelId === "deepseek-v4-flash" ||
+      modelId === "deepseek-v4-pro" ||
+      modelId === "deepseek-v4-flash-vision-exp"
+    ) {
       return `${modelId}.direct`;
     }
     throw new ModelTargetError(
       "invalid_selector",
-      "ADAM_AGENT_MODEL must be deepseek-v4-flash or deepseek-v4-pro when ADAM_AGENT_PROVIDER=deepseek.",
+      "ADAM_AGENT_MODEL must be deepseek-v4-flash, deepseek-v4-pro, or deepseek-v4-flash-vision-exp when ADAM_AGENT_PROVIDER=deepseek.",
     );
   }
   if (environment.ADAM_AGENT_MODEL !== undefined) {
@@ -118,6 +125,8 @@ export interface ModelTargets {
     readonly identity: ModelTargetIdentity;
     readonly driver: ModelDriver;
     readonly contextProfile: ContextProfile;
+    readonly modalityProfile?: ModelModalityProfile;
+    readonly upstreamLifecycle?: "experimental" | "stable";
     readonly thinkingCapability?: ThinkingCapabilityV1;
   }>;
   snapshot(input: {
@@ -125,7 +134,26 @@ export interface ModelTargets {
     readonly includeHistoricalProfiles?: boolean | undefined;
     readonly signal: AbortSignal;
   }): Promise<ModelTargetSnapshot>;
+  readonly testConnection?: (input: {
+    readonly targetId: string;
+    readonly signal: AbortSignal;
+  }) => Promise<ModelTargetConnectionTestResult>;
 }
+
+export type ModelTargetConnectionTestResult = {
+  readonly status: "reachable" | "unreachable";
+  readonly diagnostic: {
+    readonly code:
+      | "connection_http_error"
+      | "connection_model_not_advertised"
+      | "connection_request_failed"
+      | "connection_response_invalid"
+      | "connection_response_too_large"
+      | "connection_timeout"
+      | "connection_unsupported";
+    readonly message: string;
+  } | null;
+};
 
 export type ModelTargetsOptions = {
   readonly environment: Readonly<{
@@ -133,8 +161,13 @@ export type ModelTargetsOptions = {
     DEEPSEEK_API_KEY?: string | undefined;
   }>;
   readonly deadlineMs?: number | undefined;
+  readonly connectionDeadlineMs?: number | undefined;
   readonly fetch?: (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 };
+
+const maximumConnectionResponseBytes = 256 * 1024;
+const maximumAdvertisedModels = 4_096;
+const maximumAdvertisedModelIdBytes = 512;
 
 const directDeepSeekV1Targets: readonly ModelTargetIdentity[] = Object.freeze([
   Object.freeze({
@@ -160,11 +193,28 @@ const directDeepSeekV2Targets: readonly ModelTargetIdentity[] = Object.freeze(
 const directDeepSeekV3Targets: readonly ModelTargetIdentity[] = Object.freeze(
   directDeepSeekV2Targets.map((identity) => Object.freeze({ ...identity, profileVersion: 3 })),
 );
-const currentDirectDeepSeekTargets = directDeepSeekV3Targets;
+const directDeepSeekVisionChatV1Target: ModelTargetIdentity = Object.freeze({
+  targetId: "deepseek-v4-flash-vision-exp.direct",
+  vendor: "deepseek",
+  modelId: "deepseek-v4-flash-vision-exp",
+  route: "direct",
+  profileVersion: 1,
+  certification: "certified",
+});
+const directDeepSeekVisionChatV1ModalityProfile: ModelModalityProfile = Object.freeze({
+  profileVersion: 1,
+  explicitUserImages: "supported",
+  imageToolResults: "unsupported",
+});
+const currentDirectDeepSeekTargets = Object.freeze([
+  ...directDeepSeekV3Targets,
+  directDeepSeekVisionChatV1Target,
+]);
 const supportedDirectDeepSeekTargets = Object.freeze([
   ...directDeepSeekV3Targets,
   ...directDeepSeekV2Targets,
   ...directDeepSeekV1Targets,
+  directDeepSeekVisionChatV1Target,
 ]);
 
 const experimentalGatewayProviderId = "poolside";
@@ -210,10 +260,91 @@ const experimentalGatewayTarget: ModelTargetIdentity = Object.freeze({
 
 export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
   const deadlineMs = options.deadlineMs ?? 120_000;
+  const connectionDeadlineMs = options.connectionDeadlineMs ?? 10_000;
   if (!Number.isSafeInteger(deadlineMs) || deadlineMs <= 0) {
     throw new RangeError("The model request deadline must be a positive safe integer.");
   }
+  if (!Number.isSafeInteger(connectionDeadlineMs) || connectionDeadlineMs <= 0) {
+    throw new RangeError("The model connection-test deadline must be a positive safe integer.");
+  }
   return {
+    async testConnection(input) {
+      const identity = currentDirectDeepSeekTargets.find(
+        (candidate) => candidate.targetId === input.targetId,
+      );
+      if (identity === undefined) {
+        return connectionFailure(
+          "connection_unsupported",
+          "The selected target does not support this connection test.",
+        );
+      }
+      if (!hasCredential(options.environment.DEEPSEEK_API_KEY)) {
+        return connectionFailure(
+          "connection_request_failed",
+          "The selected target is not configured with its required credential.",
+        );
+      }
+      input.signal.throwIfAborted();
+      const deadline = new AbortController();
+      const abortFromCaller = () => deadline.abort(input.signal.reason);
+      input.signal.addEventListener("abort", abortFromCaller, { once: true });
+      const timer = setTimeout(
+        () => deadline.abort(new DOMException("Connection test deadline reached.", "TimeoutError")),
+        connectionDeadlineMs,
+      );
+      try {
+        const fetcher = options.fetch ?? globalThis.fetch;
+        const response = await fetcher("https://api.deepseek.com/models", {
+          method: "GET",
+          headers: { authorization: `Bearer ${options.environment.DEEPSEEK_API_KEY}` },
+          signal: deadline.signal,
+        });
+        if (!response.ok) {
+          return connectionFailure(
+            "connection_http_error",
+            `The authenticated model catalog returned HTTP ${response.status}.`,
+          );
+        }
+        const body = await readBoundedConnectionBody(response, maximumConnectionResponseBytes);
+        if (body === undefined) {
+          return connectionFailure(
+            "connection_response_too_large",
+            "The authenticated model catalog exceeded Adam's response limit.",
+          );
+        }
+        const advertised = advertisedModelIds(body);
+        if (advertised === undefined) {
+          return connectionFailure(
+            "connection_response_invalid",
+            "The authenticated model catalog response is invalid.",
+          );
+        }
+        if (!advertised.has(identity.modelId)) {
+          return connectionFailure(
+            "connection_model_not_advertised",
+            "The authenticated model catalog did not advertise the expected exact model.",
+          );
+        }
+        return { status: "reachable", diagnostic: null };
+      } catch {
+        if (input.signal.aborted) {
+          input.signal.throwIfAborted();
+        }
+        if (deadline.signal.aborted) {
+          return connectionFailure(
+            "connection_timeout",
+            "The authenticated model catalog request reached its deadline.",
+          );
+        }
+        return connectionFailure(
+          "connection_request_failed",
+          "The authenticated model catalog request failed.",
+        );
+      } finally {
+        clearTimeout(timer);
+        input.signal.removeEventListener("abort", abortFromCaller);
+      }
+    },
     async resolve(input) {
       const requestedIdentity = input.targetIdentity;
       const identity =
@@ -232,7 +363,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
       if (identity === undefined) {
         throw new ModelTargetError(
           "target_not_found",
-          "Unknown model target. Choose deepseek-v4-flash.direct, deepseek-v4-pro.direct, or the documented Experimental Gateway target.",
+          "Unknown model target. Choose deepseek-v4-flash.direct, deepseek-v4-pro.direct, deepseek-v4-flash-vision-exp.direct, or the documented Experimental Gateway target.",
         );
       }
       if (identity.certification === "experimental" && !input.allowExperimental) {
@@ -287,6 +418,13 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
       return {
         identity,
         contextProfile,
+        connectionTest: "supported" as const,
+        ...(identity.targetId === directDeepSeekVisionChatV1Target.targetId
+          ? {
+              modalityProfile: directDeepSeekVisionChatV1ModalityProfile,
+              upstreamLifecycle: "experimental" as const,
+            }
+          : {}),
         thinkingCapability: createDirectDeepSeekThinkingCapability(identity),
         driver: new AiSdkModelDriver({
           model: provider(identity.modelId),
@@ -330,6 +468,13 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
             identity,
             readiness: { status, credentialSource: "DEEPSEEK_API_KEY" },
             contextProfile: directDeepSeekContextProfileFor(identity),
+            connectionTest: "supported" as const,
+            ...(identity.targetId === directDeepSeekVisionChatV1Target.targetId
+              ? {
+                  modalityProfile: directDeepSeekVisionChatV1ModalityProfile,
+                  upstreamLifecycle: "experimental" as const,
+                }
+              : {}),
             thinkingCapability: createDirectDeepSeekThinkingCapability(identity),
           })),
           {
@@ -346,11 +491,89 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
   };
 }
 
+function connectionFailure(
+  code: NonNullable<ModelTargetConnectionTestResult["diagnostic"]>["code"],
+  message: string,
+): ModelTargetConnectionTestResult {
+  return { status: "unreachable", diagnostic: { code, message } };
+}
+
+async function readBoundedConnectionBody(
+  response: Response,
+  maximumBytes: number,
+): Promise<Uint8Array | undefined> {
+  if (response.body === null) {
+    return new Uint8Array();
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let byteCount = 0;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) {
+        break;
+      }
+      byteCount += part.value.byteLength;
+      if (byteCount > maximumBytes) {
+        await reader.cancel();
+        return undefined;
+      }
+      chunks.push(part.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(byteCount);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+function advertisedModelIds(body: Uint8Array): ReadonlySet<string> | undefined {
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(body));
+  } catch {
+    return undefined;
+  }
+  if (
+    typeof decoded !== "object" ||
+    decoded === null ||
+    !("data" in decoded) ||
+    !Array.isArray(decoded.data) ||
+    decoded.data.length > maximumAdvertisedModels
+  ) {
+    return undefined;
+  }
+  const ids = new Set<string>();
+  for (const entry of decoded.data) {
+    if (
+      typeof entry !== "object" ||
+      entry === null ||
+      !("id" in entry) ||
+      typeof entry.id !== "string" ||
+      entry.id.length === 0 ||
+      Buffer.byteLength(entry.id, "utf8") > maximumAdvertisedModelIdBytes
+    ) {
+      return undefined;
+    }
+    ids.add(entry.id);
+  }
+  return ids;
+}
+
 function hasCredential(value: string | undefined): boolean {
   return value !== undefined && value.trim().length > 0;
 }
 
 function directDeepSeekContextProfileFor(identity: ModelTargetIdentity): ContextProfile {
+  if (identity.targetId === directDeepSeekVisionChatV1Target.targetId) {
+    return preparedDirectDeepSeekV2ContextProfile;
+  }
   if (identity.profileVersion === 1) {
     return directDeepSeekContextProfileV1;
   }
@@ -382,8 +605,10 @@ export function modelTargetUsesContextProfile(
   const expectedContextProfileVersion =
     identity.vendor === "deepseek" &&
     identity.route === "direct" &&
-    (identity.modelId === "deepseek-v4-flash" || identity.modelId === "deepseek-v4-pro") &&
+    ((identity.modelId === "deepseek-v4-flash" || identity.modelId === "deepseek-v4-pro") &&
     identity.profileVersion === 3
+      ? true
+      : identity.modelId === "deepseek-v4-flash-vision-exp")
       ? 2
       : identity.profileVersion;
   return contextProfile.version === expectedContextProfileVersion;

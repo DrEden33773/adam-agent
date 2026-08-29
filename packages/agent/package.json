@@ -21,10 +21,15 @@
     "@ai-sdk/provider": "4.0.7",
     "@biomejs/biome": "2.5.8",
     "@modelcontextprotocol/client": "2.0.0",
+    "jpeg-js": "0.4.4",
     "npm": "11.6.2",
     "openai": "7.4.0",
+    "pngjs": "7.0.0",
     "semver": "7.8.5",
     "yaml": "2.9.0",
     "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@types/pngjs": "6.0.5"
   }
 }
