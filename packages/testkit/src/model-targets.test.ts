@@ -17,7 +17,10 @@ import {
   resolveThinkingPolicy,
   selectModelTargetId,
 } from "@adam-agent/agent";
-import { AiSdkModelDriverForTesting } from "@adam-agent/agent/internal-testing";
+import {
+  AiSdkModelDriverForTesting,
+  DirectDeepSeekResponsesModelDriverForTesting,
+} from "@adam-agent/agent/internal-testing";
 import { expect, test, vi } from "vitest";
 
 test("an exact Direct DeepSeek target returns a public answer-only model driver", async () => {
@@ -95,6 +98,7 @@ test("the exact Vision Chat target projects immutable PNG bytes through Direct C
   });
   const resolved = await targets.resolve({
     targetId: "deepseek-v4-flash-vision-exp.direct",
+    targetIdentity: visionChatV1Identity(),
     allowExperimental: false,
     signal: new AbortController().signal,
   });
@@ -188,6 +192,7 @@ test("the exact Vision Chat target classifies a provider error for structured im
   });
   const { driver } = await targets.resolve({
     targetId: "deepseek-v4-flash-vision-exp.direct",
+    targetIdentity: visionChatV1Identity(),
     allowExperimental: false,
     signal: new AbortController().signal,
   });
@@ -226,6 +231,7 @@ test("the exact Vision Chat target preserves cancellation during structured imag
   });
   const { driver } = await targets.resolve({
     targetId: "deepseek-v4-flash-vision-exp.direct",
+    targetIdentity: visionChatV1Identity(),
     allowExperimental: false,
     signal: new AbortController().signal,
   });
@@ -2004,7 +2010,7 @@ test("the target snapshot reports exact Certified identities and safe credential
           vendor: "deepseek",
           modelId: "deepseek-v4-flash-vision-exp",
           route: "direct",
-          profileVersion: 1,
+          profileVersion: 2,
           certification: "certified",
         },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
@@ -2021,8 +2027,8 @@ test("the target snapshot reports exact Certified identities and safe credential
         },
         modalityProfile: {
           profileVersion: 1,
-          explicitUserImages: "supported",
-          imageToolResults: "unsupported",
+          explicitUserImages: "unsupported",
+          imageToolResults: "supported",
         },
         upstreamLifecycle: "experimental",
         connectionTest: "supported",
@@ -2031,7 +2037,7 @@ test("the target snapshot reports exact Certified identities and safe credential
           vendor: "deepseek",
           modelId: "deepseek-v4-flash-vision-exp",
           route: "direct",
-          profileVersion: 1,
+          profileVersion: 2,
           certification: "certified",
         }),
       },
@@ -2061,6 +2067,17 @@ test("the target snapshot reports exact Certified identities and safe credential
   expect(JSON.stringify(snapshot)).not.toContain("test-secret-key");
   expect(snapshot.targets.every(({ identity }) => Object.isFrozen(identity))).toBe(true);
 });
+
+function visionChatV1Identity(): ModelTargetIdentity {
+  return {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  };
+}
 
 function expectedDirectDeepSeekThinkingCapability(targetIdentity: ModelTargetIdentity) {
   return {
@@ -2177,11 +2194,50 @@ test("current Direct DeepSeek v3 selection retains exact historical v2 and v1 re
       { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 1 } },
       { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 1 } },
       {
+        identity: { targetId: "deepseek-v4-flash-vision-exp.direct", profileVersion: 2 },
+      },
+      {
         identity: { targetId: "deepseek-v4-flash-vision-exp.direct", profileVersion: 1 },
       },
       { identity: { targetId: "poolside-laguna-s-2.1-free.gateway", profileVersion: 1 } },
     ],
   });
+});
+
+test("current Vision resolves all-Responses v2 while historical Vision remains Chat v1", async () => {
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+  });
+  const current = await targets.resolve({
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+  const historical = await targets.resolve({
+    targetId: current.identity.targetId,
+    targetIdentity: { ...current.identity, profileVersion: 1 },
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+
+  expect(current).toMatchObject({
+    identity: { profileVersion: 2 },
+    modalityProfile: {
+      profileVersion: 1,
+      explicitUserImages: "unsupported",
+      imageToolResults: "supported",
+    },
+  });
+  expect(current.driver).toBeInstanceOf(DirectDeepSeekResponsesModelDriverForTesting);
+  expect(historical).toMatchObject({
+    identity: { profileVersion: 1 },
+    modalityProfile: {
+      profileVersion: 1,
+      explicitUserImages: "supported",
+      imageToolResults: "unsupported",
+    },
+  });
+  expect(historical.driver).toBeInstanceOf(AiSdkModelDriverForTesting);
 });
 
 test("historical target resolution rejects a conflicting target ID and exact identity", async () => {

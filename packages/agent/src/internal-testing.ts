@@ -6,6 +6,7 @@ export {
   type ObservedBiomeProcess,
 } from "./biome-execution.js";
 export type { ContextProfile } from "./context-profile.js";
+export { DirectDeepSeekResponsesModelDriver as DirectDeepSeekResponsesModelDriverForTesting } from "./deepseek-responses-model-driver.js";
 export { digestContextRecordPrefix } from "./durable-context.js";
 export type {
   McpBeforeToolDispatchBarrier,
