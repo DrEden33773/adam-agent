@@ -4587,6 +4587,7 @@ test.each(["missing", "truncated", "same-size corrupt"] as const)(
       fixture.write("Recover one unavailable reasoning range\r");
       await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforePrompt);
       await waitForPath(join(controlRoot, "reasoning-session-settled"));
+      await fixture.waitFor("Adam · Streaming session");
       const artifactRoot = join(stateRoot, "artifacts");
       const artifactRelativePaths = (await readdir(artifactRoot, { recursive: true })).filter(
         (path): path is string => typeof path === "string" && !path.endsWith(".tmp"),
