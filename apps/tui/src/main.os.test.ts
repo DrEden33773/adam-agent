@@ -21,6 +21,7 @@ import {
 } from "./tui-filesystem.test-support.js";
 import {
   cleanupActiveTuiFixtures,
+  outputAfterFinalAltScreenExit,
   startTuiFixture as startFixture,
 } from "./tui-fixture.test-support.js";
 
@@ -370,6 +371,9 @@ test.each([
         workspaceRoot,
       });
       await fixture.waitFor("Adam · New session");
+      const privateDraftSentinel = `PRIVATE_${signal}_DRAFT_SENTINEL`;
+      fixture.write(privateDraftSentinel);
+      await fixture.waitFor(privateDraftSentinel);
       await fixture.terminate(signal);
       const result = await fixture.closed;
       expect(result).toMatchObject({ code, signal: null, stderr: "" });
@@ -378,6 +382,9 @@ test.each([
       );
       expect(result.stdout).toContain("\u001b[?2004l");
       expect(result.stdout).toContain("\u001b[?25h");
+      const afterExit = outputAfterFinalAltScreenExit(result.stdout);
+      expect(afterExit).toBe("\u001b[?25h\u001b[?2026l");
+      expect(afterExit).not.toContain(privateDraftSentinel);
     } finally {
       await rm(testRoot, { recursive: true, force: true });
     }
@@ -1362,8 +1369,12 @@ test("idle Ctrl+C preserves a CJK draft and copies it only on the confirming pre
     await fixture.waitFor("Press Ctrl+C again within two seconds to exit · draft will be copied");
     expect(fixture.output()).not.toContain("clipboard copied");
     fixture.write("\u0003");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(draft);
+    const afterExit = outputAfterFinalAltScreenExit(result.stdout);
+    expect(afterExit).toBe("\u001b[?25h\u001b[?2026l");
+    expect(afterExit).not.toContain(draft);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

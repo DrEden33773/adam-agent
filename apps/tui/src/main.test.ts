@@ -23,6 +23,7 @@ import {
 } from "./tui-filesystem.test-support.js";
 import {
   cleanupActiveTuiFixtures,
+  outputAfterFinalAltScreenExit,
   startTuiFixture as startFixture,
 } from "./tui-fixture.test-support.js";
 import { VirtualTerminal } from "./virtual-terminal.test-support.js";
@@ -108,6 +109,49 @@ test("minimum-size mode consumes ordinary editor input while preserving safe exi
   }
 });
 
+test("Ctrl+Q explicitly preserves the pre-Adam screen without printing the transcript or draft", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-preserve-screen-ctrl-q-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const terminal = new VirtualTerminal();
+  const previousScreenSentinel = "PRE_ADAM_SCREEN_SENTINEL";
+  const privateDraftSentinel = "PRIVATE_DRAFT_SENTINEL";
+  await mkdir(workspaceRoot);
+  terminal.write(previousScreenSentinel);
+
+  const execution = runTuiFixture({
+    clipboard: {
+      async writeText() {
+        return "copied";
+      },
+    },
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    terminal.input(privateDraftSentinel);
+    await terminal.nextSynchronizedFrameContaining(privateDraftSentinel);
+    terminal.input("\u0011");
+    await expect(execution).resolves.toBeUndefined();
+
+    const output = terminal.output();
+    expect(output.startsWith(previousScreenSentinel)).toBe(true);
+    const afterExit = outputAfterFinalAltScreenExit(output);
+    expect(afterExit).toBe("\u001b[?25h\u001b[?2026l");
+    expect(afterExit).not.toContain("Adam ·");
+    expect(afterExit).not.toContain(privateDraftSentinel);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("/exit clears its literal input and reaches the existing TUI cleanup without submission", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-slash-exit-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -127,12 +171,16 @@ test("/exit clears its literal input and reaches the existing TUI cleanup withou
     },
     controlRoot,
     presentationCloseMarker,
+    scenario: "provider-no-usage",
     stateRoot,
     terminal,
     workspaceRoot,
   });
   try {
     await terminal.whenStarted();
+    const privateTranscriptSentinel = "PRIVATE_TRANSCRIPT_SENTINEL";
+    terminal.input(`${privateTranscriptSentinel}\r`);
+    await terminal.nextSynchronizedFrameContaining("Provider usage unavailable.");
     terminal.input("/exit extra\r");
     await terminal.nextOutputContaining("Usage: /exit");
     expect(terminal.running()).toBe(true);
@@ -152,6 +200,9 @@ test("/exit clears its literal input and reaches the existing TUI cleanup withou
     });
     expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/exit');
     expect(terminal.lifecycle()).toEqual(["started", "stopped"]);
+    const afterExit = outputAfterFinalAltScreenExit(terminal.output());
+    expect(afterExit).toBe("\u001b[?25h\u001b[?2026l");
+    expect(afterExit).not.toContain(privateTranscriptSentinel);
   } finally {
     if (terminal.running()) {
       terminal.input("\u0011");
@@ -6281,6 +6332,50 @@ test("a mutation permission shows its canonical diff and Enter allows the exact 
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a mandatory permission keeps input ownership when the inherited transcript-search chord is pressed", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-permission-search-chord-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "edit.txt"), "before\n", "utf8");
+  const terminal = new AppliedViewportTerminal({ columns: 80, rows: 24 });
+  const execution = runTuiFixture({
+    scenario: "mutation",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.nextFrame(0);
+    terminal.input("Edit the file\r");
+    await waitForPhysicalText(terminal, "Permission required");
+    const transcriptHeaderRow = terminal
+      .lines()
+      .findIndex((line) => line.includes("Adam · New session"));
+    expect(transcriptHeaderRow).toBeGreaterThanOrEqual(0);
+
+    await inputAndWaitForPhysicalFrame(terminal, "\u001b[102;6u");
+
+    const frame = terminal.lines().join("\n");
+    expect(frame).toContain("Permission required");
+    expect(frame).not.toContain("Find transcript");
+    expect(terminal.lines().findIndex((line) => line.includes("Adam · New session"))).toBe(
+      transcriptHeaderRow,
+    );
+
+    terminal.input("\u001b");
+    await waitForPhysicalText(terminal, "denied");
+    await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("before\n");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
     await rm(testRoot, { recursive: true, force: true });
   }
 });
