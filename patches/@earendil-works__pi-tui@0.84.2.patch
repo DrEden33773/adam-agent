@@ -1,5 +1,5 @@
 diff --git a/dist/components/select-list.js b/dist/components/select-list.js
-index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..a3e433040844ff81205ed55edb7713241410bcc3 100644
+index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..0b8964d09635714a7e5872c653883e064f59df14 100644
 --- a/dist/components/select-list.js
 +++ b/dist/components/select-list.js
 @@ -88,7 +88,7 @@ export class SelectList {
@@ -11,3 +11,53 @@ index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..a3e433040844ff81205ed55edb771324
          const prefixWidth = visibleWidth(prefix);
          if (descriptionSingleLine && width > 40) {
              const effectivePrimaryColumnWidth = Math.max(1, Math.min(primaryColumnWidth, width - prefixWidth - 4));
+diff --git a/dist/tui-alt-screen.d.ts b/dist/tui-alt-screen.d.ts
+index 848119411c1ff2885b8d1efe97f2f297bd4cd470..9acf1cd67d25554e9e4986f5ac738f2dac1b10ea 100644
+--- a/dist/tui-alt-screen.d.ts
++++ b/dist/tui-alt-screen.d.ts
+@@ -5,6 +5,8 @@ export interface TuiAltScreenOptions {
+     wheelScrollLines?: number;
+     /** Capture mouse events for viewport scrolling and application-owned text selection. */
+     mouse?: boolean;
++    /** Enable the built-in transcript-search keybindings. Defaults to true. */
++    transcriptSearch?: boolean;
+     /** Style a non-current transcript search match. */
+     searchMatchStyle?: (text: string) => string;
+     /** Style the current transcript search match. */
+@@ -52,6 +54,7 @@ export declare class TuiAltScreen extends TuiBase implements ViewportTUI {
+     private selectionDragged;
+     private readonly wheelScrollLines;
+     private readonly mouseEnabled;
++    private readonly transcriptSearchEnabled;
+     private readonly searchMatchStyle;
+     private readonly searchCurrentMatchStyle;
+     private readonly openUrl?;
+diff --git a/dist/tui-alt-screen.js b/dist/tui-alt-screen.js
+index 4edcf845ba7866782a8ec7219508a2dce0073a91..3aecee4ed79adc5a0586fb6d8a95364e31966f09 100644
+--- a/dist/tui-alt-screen.js
++++ b/dist/tui-alt-screen.js
+@@ -59,6 +59,7 @@ export class TuiAltScreen extends TuiBase {
+     selectionDragged = false;
+     wheelScrollLines;
+     mouseEnabled;
++    transcriptSearchEnabled;
+     searchMatchStyle;
+     searchCurrentMatchStyle;
+     openUrl;
+@@ -77,6 +78,7 @@ export class TuiAltScreen extends TuiBase {
+         this.flashes = new AltScreenFlashContainer(() => this.requestRender());
+         this.wheelScrollLines = Math.max(1, Math.floor(options.wheelScrollLines ?? 1));
+         this.mouseEnabled = options.mouse ?? true;
++        this.transcriptSearchEnabled = options.transcriptSearch ?? true;
+         this.searchMatchStyle = options.searchMatchStyle ?? ((text) => `\x1b[4m${text}\x1b[24m`);
+         this.searchCurrentMatchStyle = options.searchCurrentMatchStyle ?? ((text) => `\x1b[1;7m${text}\x1b[22;27m`);
+         this.openUrl = options.openUrl;
+@@ -423,7 +425,7 @@ export class TuiAltScreen extends TuiBase {
+             return { consume: true };
+         const keybindings = getKeybindings();
+         const isRelease = isKeyRelease(data);
+-        if (keybindings.matches(data, "tui.altScreen.search")) {
++        if (this.transcriptSearchEnabled && keybindings.matches(data, "tui.altScreen.search")) {
+             if (!isRelease)
+                 this.openSearch();
+             return { consume: true };

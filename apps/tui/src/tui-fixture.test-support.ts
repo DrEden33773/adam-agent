@@ -70,6 +70,17 @@ export async function cleanupActiveTuiFixtures(): Promise<void> {
   activeFixtures.clear();
 }
 
+export function outputAfterFinalAltScreenExit(output: string): string {
+  const enterAltScreen = "\u001b[?1049h";
+  const exitAltScreen = "\u001b[?1049l";
+  const enterOffset = output.indexOf(enterAltScreen);
+  const exitOffset = output.lastIndexOf(exitAltScreen);
+  if (enterOffset < 0 || exitOffset <= enterOffset) {
+    throw new Error("The TUI output did not contain one ordered alternate-screen lifecycle.");
+  }
+  return output.slice(exitOffset + exitAltScreen.length);
+}
+
 function startInProcessTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
   const terminal = new VirtualTerminal();
   const execution = withTuiColorEnvironment(input.noColor === true, () =>

@@ -186,6 +186,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let requestPolicyRender: () => void = () => undefined;
   const tui = new TuiAltScreen(terminal, true, undefined, {
     mouse: options.mouse ?? true,
+    transcriptSearch: false,
     async copySelection(text) {
       const actionId = beginNoticeAction();
       const result = await copySelectionToClipboard(text, options.clipboard, deadlineScheduler);
@@ -3581,7 +3582,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       attempt(() => loader.stop());
     }
     operationLoaders.clear();
-    attempt(() => tui.stop());
+    attempt(() => tui.stop({ preserveScreen: true }));
     try {
       if (copyDraft) {
         const clipboardResult = await copyDraftToClipboard(
