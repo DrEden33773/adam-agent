@@ -57,6 +57,7 @@ export type ModelMessage =
       readonly callId: string;
       readonly name: string;
       readonly result: ToolResult;
+      readonly content?: readonly ModelUserContentPart[];
     };
 
 export type ModelRequest = {

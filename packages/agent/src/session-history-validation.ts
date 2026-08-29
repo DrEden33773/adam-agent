@@ -866,6 +866,52 @@ export function validateCurrentSessionHistory(
       committedInputResourceReads.add(record.callId);
       continue;
     }
+    if (record.type === "input_resource_image_read_committed") {
+      const toolState = toolStates.get(record.callId);
+      const occurrence = visibleInputResources.get(record.image.occurrenceId);
+      let argumentsValue: { occurrenceId?: unknown } | undefined;
+      try {
+        const decoded = JSON.parse(toolState?.call.argumentsJson ?? "") as unknown;
+        argumentsValue =
+          typeof decoded === "object" && decoded !== null && !Array.isArray(decoded)
+            ? (decoded as { occurrenceId?: unknown })
+            : undefined;
+      } catch {
+        argumentsValue = undefined;
+      }
+      if (
+        run === undefined ||
+        record.runId !== run.runId ||
+        attemptState?.status !== "completed" ||
+        attemptState.response?.response.finishReason !== "tool_calls" ||
+        toolState?.call.name !== "read_input_resource" ||
+        !toolState.requested ||
+        !toolState.started ||
+        toolState.terminal ||
+        toolState.decision !== "allow" ||
+        committedInputResourceReads.has(record.callId) ||
+        Object.keys(argumentsValue ?? {}).length !== 1 ||
+        argumentsValue?.occurrenceId !== record.image.occurrenceId ||
+        occurrence === undefined ||
+        occurrence.support !== "image" ||
+        record.image.displayName !== occurrence.displayName ||
+        record.image.artifactId !== occurrence.artifact.id ||
+        record.image.byteCount !== occurrence.artifact.byteCount ||
+        record.image.digest !== occurrence.digest ||
+        record.image.mediaType !== occurrence.artifact.mediaType
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      inputResourceRunBytes += record.image.byteCount;
+      if (
+        !Number.isSafeInteger(inputResourceRunBytes) ||
+        inputResourceRunBytes > inputResourceLimitsV1.maximumMaterializedBytesPerRun
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      committedInputResourceReads.add(record.callId);
+      continue;
+    }
     if (record.type === "session_manual_name_set") {
       if (run !== undefined) {
         throw new SessionLifecycleError("session_invalid");

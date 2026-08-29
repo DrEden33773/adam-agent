@@ -517,6 +517,29 @@ export type SessionInputResourceReadCommittedRecord = {
   };
 };
 
+export type SessionInputResourceImageReadCommittedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "input_resource_image_read_committed";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly callId: string;
+    readonly image: {
+      readonly schemaVersion: 1;
+      readonly type: "image";
+      readonly occurrenceId: string;
+      readonly displayName: string;
+      readonly artifactId: Sha256Digest;
+      readonly byteCount: number;
+      readonly digest: Sha256Digest;
+      readonly mediaType: "image/jpeg" | "image/png";
+      readonly width: number;
+      readonly height: number;
+    };
+  };
+};
+
 export type SessionProviderAttemptStartedRecord = {
   readonly schemaVersion: 3;
   readonly sequence: number;
@@ -793,6 +816,7 @@ export type SessionV3Record =
   | SessionPathContextFailedRecord
   | SessionSkillResourceReadCommittedRecord
   | SessionInputResourceReadCommittedRecord
+  | SessionInputResourceImageReadCommittedRecord
   | SessionProviderAttemptStartedRecord
   | SessionProviderAttemptInterruptedRecord
   | SessionModelResponseCompletedRecord
@@ -1964,6 +1988,24 @@ const sessionV3RecordSchema = z.union([
     digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
     pageDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
     content: z.string().max(inputResourceLimitsV1.maximumReadPageBytes),
+  }),
+  z.strictObject({
+    type: z.literal("input_resource_image_read_committed"),
+    recordVersion: z.literal(1),
+    runId: z.uuid(),
+    callId: z.string().min(1).max(256),
+    image: z.strictObject({
+      schemaVersion: z.literal(1),
+      type: z.literal("image"),
+      occurrenceId: z.string().min(1).max(256),
+      displayName: z.string().min(1).max(inputResourceLimitsV1.maximumDisplayNameBytes),
+      artifactId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+      byteCount: z.number().int().nonnegative().max(inputResourceLimitsV1.maximumFileBytes),
+      digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+      mediaType: z.enum(["image/jpeg", "image/png"]),
+      width: z.number().int().positive().max(4_096),
+      height: z.number().int().positive().max(4_096),
+    }),
   }),
   z.strictObject({
     type: z.literal("provider_attempt_started"),

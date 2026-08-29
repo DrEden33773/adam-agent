@@ -34,7 +34,11 @@ import {
   type SessionEventRecord,
   type SessionStore,
 } from "@adam-agent/agent";
-import { createCodingToolRegistryForTesting } from "@adam-agent/agent/internal-testing";
+import {
+  createCodingToolRegistryForTesting,
+  createPromptContextV1,
+  sessionDurableContext,
+} from "@adam-agent/agent/internal-testing";
 import { describe, expect, expectTypeOf, test } from "vitest";
 
 import { FakeModelDriver } from "./index.js";
@@ -218,12 +222,13 @@ describe("AgentSession", () => {
         { type: "finish", reason: "stop" },
       ];
     });
-    const session = new AgentSession({
+    const dependencies = {
       artifactStore,
       maximumOutputTokens: 4_096,
       model,
       store: createInMemorySessionStore(),
-    });
+    } as const;
+    const session = new AgentSession(dependencies);
 
     await expect(
       session.run({
@@ -299,6 +304,115 @@ describe("AgentSession", () => {
       },
     });
     expect({ artifactReads, modelCalls }).toEqual({ artifactReads: 0, modelCalls: 0 });
+  });
+
+  test("a Vision Responses run returns one linked image through the real resource tool without a synthetic user", async () => {
+    const bytes = Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    );
+    const artifactId = `sha256:${createHash("sha256").update(bytes).digest("hex")}` as const;
+    const occurrence = imageOccurrence(artifactId, bytes.byteLength, "lazy-image");
+    const artifactStore = inMemoryImageArtifactStore(artifactId, bytes);
+    let call = 0;
+    const model = new FakeModelDriver((request) => {
+      call += 1;
+      if (call === 1) {
+        expect(request.messages.at(-1)).toMatchObject({
+          role: "user",
+          content: expect.stringContaining('"occurrenceId":"lazy-image"'),
+        });
+        expect(
+          request.messages.flatMap((message) =>
+            "content" in message && Array.isArray(message.content)
+              ? message.content.filter((part) => part.type === "file")
+              : [],
+          ),
+        ).toEqual([]);
+        return [
+          { type: "tool_call_start", id: "read-lazy-image", name: "read_input_resource" },
+          {
+            type: "tool_call_delta",
+            id: "read-lazy-image",
+            json: JSON.stringify({ occurrenceId: occurrence.occurrenceId }),
+          },
+          { type: "tool_call_end", id: "read-lazy-image" },
+          { type: "finish", reason: "tool_calls" },
+        ];
+      }
+      expect(request.messages.filter((message) => message.role === "user")).toHaveLength(1);
+      expect(request.messages.at(-1)).toEqual({
+        role: "tool",
+        callId: "read-lazy-image",
+        name: "read_input_resource",
+        result: {
+          status: "completed",
+          output: {
+            schemaVersion: 1,
+            type: "image",
+            occurrenceId: occurrence.occurrenceId,
+            displayName: occurrence.displayName,
+            artifactId,
+            byteCount: bytes.byteLength,
+            digest: artifactId,
+            mediaType: "image/png",
+            width: 1,
+            height: 1,
+          },
+        },
+        content: [
+          {
+            type: "file",
+            artifactId,
+            mediaType: "image/png",
+            bytes: new Uint8Array(bytes),
+          },
+        ],
+      });
+      return [
+        { type: "text_delta", text: "The lazy image arrived as the real tool result." },
+        { type: "finish", reason: "stop" },
+      ];
+    });
+    const tools = createCodingToolRegistry({ artifactStore, workspaceRoot: "/workspace" });
+    const dependencies = {
+      artifactStore,
+      maximumOutputTokens: 4_096,
+      modalityProfile: {
+        profileVersion: 1,
+        explicitUserImages: "unsupported",
+        imageToolResults: "supported",
+      },
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      store: createInMemorySessionStore(),
+      tools,
+      [sessionDurableContext]: {
+        inputResources: [occurrence],
+        nextSequence: 1,
+        promptContext: createPromptContextV1(tools),
+        targetIdentity: {
+          targetId: "deepseek-v4-flash-vision-exp.direct",
+          vendor: "deepseek",
+          modelId: "deepseek-v4-flash-vision-exp",
+          route: "direct",
+          profileVersion: 2,
+          certification: "certified",
+        },
+      },
+    } as const;
+    const session = new AgentSession(dependencies);
+
+    await expect(
+      session.run({
+        text: "Use the resource tool to inspect this linked image.",
+        inputResources: [occurrence],
+      }),
+    ).resolves.toEqual({
+      status: "completed",
+      answer: "The lazy image arrived as the real tool result.",
+    });
+    expect(call).toBe(2);
   });
 
   test("a provider reasoning block streams as structural runtime facts before the answer", async () => {

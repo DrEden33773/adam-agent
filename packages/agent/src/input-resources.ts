@@ -11,7 +11,11 @@ import {
   publishFileArtifactStage,
   type StagedArtifactReference,
 } from "./artifact-store.js";
-import { sniffExplicitUserImageMediaTypeV1 } from "./image-input.js";
+import {
+  imageInputLimitsV1,
+  inspectExplicitUserImageV1,
+  sniffExplicitUserImageMediaTypeV1,
+} from "./image-input.js";
 
 export const inputResourceLimitsV1 = {
   maximumOccurrencesPerRun: 8,
@@ -64,6 +68,19 @@ export type InputResourceOccurrenceV1 = {
   readonly mode: "link";
 };
 
+export type InputResourceImageV1 = {
+  readonly schemaVersion: 1;
+  readonly type: "image";
+  readonly occurrenceId: string;
+  readonly displayName: string;
+  readonly artifactId: `sha256:${string}`;
+  readonly byteCount: number;
+  readonly digest: `sha256:${string}`;
+  readonly mediaType: "image/jpeg" | "image/png";
+  readonly width: number;
+  readonly height: number;
+};
+
 const digestSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/u) as z.ZodType<`sha256:${string}`>;
 
 export const inputResourceOccurrenceV1Schema: z.ZodType<InputResourceOccurrenceV1> = z.strictObject(
@@ -94,6 +111,19 @@ export const inputResourceOccurrenceV1Schema: z.ZodType<InputResourceOccurrenceV
     mode: z.literal("link"),
   },
 );
+
+export const inputResourceImageV1Schema: z.ZodType<InputResourceImageV1> = z.strictObject({
+  schemaVersion: z.literal(1),
+  type: z.literal("image"),
+  occurrenceId: z.string().min(1).max(256),
+  displayName: z.string().min(1).max(inputResourceLimitsV1.maximumDisplayNameBytes),
+  artifactId: digestSchema,
+  byteCount: z.number().int().nonnegative().max(imageInputLimitsV1.maximumBytesPerImage),
+  digest: digestSchema,
+  mediaType: z.enum(["image/jpeg", "image/png"]),
+  width: z.number().int().positive().max(imageInputLimitsV1.maximumWidth),
+  height: z.number().int().positive().max(imageInputLimitsV1.maximumHeight),
+});
 
 export class InputResourceError extends Error {
   readonly code:
@@ -541,6 +571,80 @@ export const inputResourcePageV1Schema: z.ZodType<InputResourcePageV1> = z.stric
   pageDigest: digestSchema,
   content: z.string().max(inputResourceLimitsV1.maximumReadPageBytes),
 });
+
+export async function materializeInputResourceImageV1(input: {
+  readonly artifactStore: ArtifactStore;
+  readonly occurrence: InputResourceOccurrenceV1 | undefined;
+  readonly occurrenceId: string;
+  readonly signal: AbortSignal;
+}): Promise<{ readonly descriptor: InputResourceImageV1; readonly bytes: Uint8Array }> {
+  const occurrence = input.occurrence;
+  if (occurrence === undefined || occurrence.occurrenceId !== input.occurrenceId) {
+    throw new InputResourceError(
+      "input_resource_not_visible",
+      "The requested input-resource occurrence is not visible in this session history.",
+    );
+  }
+  if (
+    occurrence.support !== "image" ||
+    (occurrence.artifact.mediaType !== "image/jpeg" &&
+      occurrence.artifact.mediaType !== "image/png")
+  ) {
+    throw new InputResourceError(
+      "input_resource_unsupported",
+      "The requested input resource is not a supported immutable image.",
+    );
+  }
+  input.signal.throwIfAborted();
+  let stored: Uint8Array | undefined;
+  try {
+    stored = await input.artifactStore.read(occurrence.artifact.id, {
+      maximumBytes: imageInputLimitsV1.maximumBytesPerImage,
+    });
+  } catch {
+    throw new InputResourceError(
+      "input_resource_corrupt",
+      "The immutable input-resource image failed integrity validation.",
+    );
+  }
+  input.signal.throwIfAborted();
+  if (stored === undefined) {
+    throw new InputResourceError(
+      "input_resource_corrupt",
+      "The immutable input-resource image is unavailable.",
+    );
+  }
+  const bytes = new Uint8Array(stored);
+  const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}` as const;
+  const inspected = inspectExplicitUserImageV1(bytes);
+  if (
+    bytes.byteLength !== occurrence.artifact.byteCount ||
+    digest !== occurrence.digest ||
+    occurrence.artifact.id !== occurrence.digest ||
+    inspected.status !== "valid" ||
+    inspected.mediaType !== occurrence.artifact.mediaType
+  ) {
+    throw new InputResourceError(
+      "input_resource_corrupt",
+      "The immutable input-resource image does not match its descriptor.",
+    );
+  }
+  return {
+    descriptor: {
+      schemaVersion: 1,
+      type: "image",
+      occurrenceId: occurrence.occurrenceId,
+      displayName: occurrence.displayName,
+      artifactId: occurrence.artifact.id,
+      byteCount: bytes.byteLength,
+      digest: occurrence.digest,
+      mediaType: inspected.mediaType,
+      width: inspected.width,
+      height: inspected.height,
+    },
+    bytes,
+  };
+}
 
 export async function readInputResourcePageV1(input: {
   readonly artifactStore: ArtifactStore;

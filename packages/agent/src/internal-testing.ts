@@ -52,7 +52,11 @@ export {
   createProjectLifecycleOwner,
   ProjectLifecycleOwnerError,
 } from "./project-lifecycle-owner.js";
-export { assemblePromptMessagesV1, digestPromptRequestV1 } from "./prompt-assembly.js";
+export {
+  assemblePromptMessagesV1,
+  createPromptContextV1,
+  digestPromptRequestV1,
+} from "./prompt-assembly.js";
 export {
   createPresentationPreferencesWithStorageForTesting,
   createTrustedWorkspaceTrustForTesting,
