@@ -618,6 +618,7 @@ test("SessionLifecycle bounds unknown frontmatter fields and reports allowed-too
       created.promptContext?.toolProfile.definitions.map((definition) => definition.name),
     ).toEqual([
       "read_file",
+      "search_repository",
       "write_file",
       "edit_file",
       "run_shell",
@@ -676,6 +677,7 @@ test("SessionLifecycle admits audited Skill metadata arrays without granting lis
       created.promptContext?.toolProfile.definitions.map((definition) => definition.name),
     ).toEqual([
       "read_file",
+      "search_repository",
       "write_file",
       "edit_file",
       "run_shell",

@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -29,18 +30,22 @@ import {
   createReadToolRegistry,
   type ModelDriver,
   ModelDriverError,
+  type ModelEvent,
   type ModelRequest,
   type RuntimeEvent,
   type SessionEventRecord,
   type SessionStore,
+  type ToolRegistry,
+  type ToolResult,
 } from "@adam-agent/agent";
 import {
   createCodingToolRegistryForTesting,
   createPromptContextV1,
+  type RepositorySearchBackend,
   type SessionRecord,
   sessionDurableContext,
 } from "@adam-agent/agent/internal-testing";
-import { describe, expect, expectTypeOf, test } from "vitest";
+import { describe, expect, expectTypeOf, test, vi } from "vitest";
 
 import { FakeModelDriver } from "./index.js";
 
@@ -1449,6 +1454,822 @@ describe("AgentSession", () => {
       },
     });
     expect(events.at(-1)).toEqual({ type: "session_settled", result });
+  });
+
+  test("repository search cursor pages one immutable session and policy-bound snapshot", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-cursor-"));
+    const sourceRoot = join(workspaceRoot, "src");
+
+    try {
+      await mkdir(sourceRoot);
+      for (const name of ["10-first.ts", "20-second.ts", "30-third.ts", "40-fourth.ts"]) {
+        await writeFile(
+          join(sourceRoot, name),
+          `export const marker = "snapshot needle";\n`,
+          "utf8",
+        );
+      }
+      const pages: unknown[] = [];
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return searchRepositoryEvents({ query: "snapshot needle", limit: 2 });
+        }
+        if (
+          latestMessage?.role === "tool" &&
+          latestMessage.name === "search_repository" &&
+          latestMessage.result.status === "completed"
+        ) {
+          const page = latestMessage.result.output as {
+            readonly nextCursor?: string;
+          };
+          pages.push(page);
+          if (pages.length === 1) {
+            expect(page.nextCursor).toEqual(expect.any(String));
+            if (page.nextCursor === undefined) {
+              throw new Error("Expected the first immutable search page to have a cursor.");
+            }
+            writeFileSync(
+              join(sourceRoot, "00-new.ts"),
+              'export const marker = "snapshot needle";\n',
+            );
+            writeFileSync(join(sourceRoot, "30-third.ts"), "export const marker = 'changed';\n");
+            return searchRepositoryEvents({
+              query: "snapshot needle",
+              limit: 2,
+              cursor: page.nextCursor,
+            });
+          }
+        }
+        return [
+          { type: "text_delta", text: "The cursor retained one immutable snapshot." },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          repositorySearchBackend: createScriptedRepositorySearchBackend([
+            {
+              records: scriptedContentRecords([
+                { path: "src/10-first.ts" },
+                { path: "src/20-second.ts" },
+                { path: "src/30-third.ts" },
+                { path: "src/40-fourth.ts" },
+              ]),
+            },
+          ]),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      });
+
+      await expect(session.run({ text: "Page the repository snapshot." })).resolves.toEqual({
+        status: "completed",
+        answer: "The cursor retained one immutable snapshot.",
+      });
+      expect(pages).toHaveLength(2);
+      expect(pages[0]).toMatchObject({
+        snapshotResultCount: 4,
+        pageIndex: 0,
+        resultCount: 2,
+        remainingResultCount: 2,
+        groups: [{ path: "src/10-first.ts" }, { path: "src/20-second.ts" }],
+      });
+      expect(pages[1]).toMatchObject({
+        snapshotResultCount: 4,
+        pageIndex: 1,
+        resultCount: 2,
+        remainingResultCount: 0,
+        currentContentMustBeReread: true,
+        groups: [{ path: "src/30-third.ts" }, { path: "src/40-fourth.ts" }],
+      });
+      expect(pages[1]).not.toEqual(
+        expect.objectContaining({ groups: expect.arrayContaining([{ path: "src/00-new.ts" }]) }),
+      );
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("content search applies explicit regex, case, and include-exclude glob semantics", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-regex-"));
+    const sourceRoot = join(workspaceRoot, "src");
+    const testSourceRoot = join(workspaceRoot, "tests");
+
+    try {
+      await mkdir(sourceRoot);
+      await mkdir(testSourceRoot);
+      await writeFile(join(sourceRoot, "selected.ts"), "const value = NeedleAlpha;\n", "utf8");
+      await writeFile(join(sourceRoot, "wrong-case.ts"), "const value = needleAlpha;\n", "utf8");
+      await writeFile(
+        join(testSourceRoot, "excluded.test.ts"),
+        "const value = NeedleBeta;\n",
+        "utf8",
+      );
+      let searchOutput: unknown;
+      let searchResult: ToolResult | undefined;
+      let observedArguments: readonly string[] | undefined;
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return toolCallEvents("search-regex", "search_repository", {
+            kind: "content",
+            query: "Needle[A-Z][a-z]+",
+            mode: "regex",
+            case: "sensitive",
+            include: ["**/*.ts"],
+            exclude: ["tests/**"],
+          });
+        }
+        if (latestMessage?.role === "tool" && latestMessage.name === "search_repository") {
+          searchResult = latestMessage.result;
+          if (latestMessage.result.status === "completed") {
+            searchOutput = latestMessage.result.output;
+          }
+        }
+        return [
+          { type: "text_delta", text: "The exact regex result was selected." },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          repositorySearchBackend: createScriptedRepositorySearchBackend([
+            {
+              records: scriptedContentRecords([
+                {
+                  path: "src/selected.ts",
+                  text: "const value = NeedleAlpha;\n",
+                  submatches: [{ text: "NeedleAlpha", start: 14, end: 25 }],
+                },
+              ]),
+              assertArguments(arguments_) {
+                observedArguments = arguments_;
+              },
+            },
+          ]),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      });
+
+      await expect(session.run({ text: "Find the selected symbol." })).resolves.toEqual({
+        status: "completed",
+        answer: "The exact regex result was selected.",
+      });
+      expect(searchResult).toEqual({ status: "completed", output: expect.anything() });
+      expect(observedArguments).toEqual([
+        "--json",
+        "--case-sensitive",
+        "--color",
+        "never",
+        "--glob",
+        "**/*.ts",
+        "--glob",
+        "!tests/**",
+        "--",
+        "Needle[A-Z][a-z]+",
+        ".",
+      ]);
+      expect(searchOutput).toMatchObject({
+        kind: "content",
+        mode: "regex",
+        case: "sensitive",
+        groups: [{ path: "src/selected.ts", matches: [{ line: 1, rankReason: "regex" }] }],
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("path search ranks an all-token typo-tolerant repository filename first", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-path-"));
+    const sourceRoot = join(workspaceRoot, "src");
+
+    try {
+      await mkdir(sourceRoot);
+      await writeFile(join(sourceRoot, "search_repository_adapter.ts"), "export {};\n", "utf8");
+      await writeFile(join(sourceRoot, "repository_search_notes.ts"), "export {};\n", "utf8");
+      await writeFile(join(sourceRoot, "unrelated.ts"), "export {};\n", "utf8");
+      let searchOutput: unknown;
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return toolCallEvents("search-path", "search_repository", {
+            kind: "path",
+            query: "serch repos adapter",
+          });
+        }
+        if (
+          latestMessage?.role === "tool" &&
+          latestMessage.name === "search_repository" &&
+          latestMessage.result.status === "completed"
+        ) {
+          searchOutput = latestMessage.result.output;
+        }
+        return [
+          { type: "text_delta", text: "The intended repository path ranked first." },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          repositorySearchBackend: createScriptedRepositorySearchBackend([
+            {
+              records: [
+                "src/search_repository_adapter.ts",
+                "src/repository_search_notes.ts",
+                "src/unrelated.ts",
+              ],
+            },
+          ]),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      });
+
+      await expect(
+        session.run({ text: "Find the repository search adapter path." }),
+      ).resolves.toEqual({
+        status: "completed",
+        answer: "The intended repository path ranked first.",
+      });
+      expect(searchOutput).toMatchObject({
+        kind: "path",
+        mode: "fuzzy",
+        resultCount: 1,
+        entries: [
+          {
+            path: "src/search_repository_adapter.ts",
+            rankReason: "fuzzy_subsequence",
+          },
+        ],
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("path search cursor pages one immutable result snapshot after filesystem mutation", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-path-cursor-"));
+
+    try {
+      for (const path of ["10-needle.ts", "20-needle.ts", "30-needle.ts", "40-needle.ts"]) {
+        await writeFile(join(workspaceRoot, path), "export {};\n", "utf8");
+      }
+      const pages: Array<{
+        entries: Array<{ path: string }>;
+        nextCursor?: string;
+      }> = [];
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return toolCallEvents("search-path-cursor-1", "search_repository", {
+            kind: "path",
+            query: "needle",
+            limit: 2,
+          });
+        }
+        if (
+          latestMessage?.role === "tool" &&
+          latestMessage.name === "search_repository" &&
+          latestMessage.result.status === "completed"
+        ) {
+          const page = latestMessage.result.output as (typeof pages)[number];
+          pages.push(page);
+          if (pages.length === 1 && page.nextCursor !== undefined) {
+            writeFileSync(join(workspaceRoot, "00-needle-new.ts"), "export {};\n");
+            writeFileSync(join(workspaceRoot, "30-needle.ts"), "renamed content\n");
+            return toolCallEvents("search-path-cursor-2", "search_repository", {
+              kind: "path",
+              query: "needle",
+              limit: 2,
+              cursor: page.nextCursor,
+            });
+          }
+        }
+        return [
+          { type: "text_delta", text: "The path cursor retained one immutable snapshot." },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          repositorySearchBackend: createScriptedRepositorySearchBackend([
+            {
+              records: ["10-needle.ts", "20-needle.ts", "30-needle.ts", "40-needle.ts"],
+            },
+          ]),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      });
+
+      await expect(session.run({ text: "Page the repository paths." })).resolves.toEqual({
+        status: "completed",
+        answer: "The path cursor retained one immutable snapshot.",
+      });
+      expect(pages).toHaveLength(2);
+      expect(pages[0]).toMatchObject({
+        pageIndex: 0,
+        remainingResultCount: 2,
+        entries: [{ path: "10-needle.ts" }, { path: "20-needle.ts" }],
+      });
+      expect(pages[1]).toMatchObject({
+        pageIndex: 1,
+        remainingResultCount: 0,
+        entries: [{ path: "30-needle.ts" }, { path: "40-needle.ts" }],
+      });
+      expect(JSON.stringify(pages[1])).not.toContain("00-needle-new.ts");
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("repository search rejects a cursor whose normalized request changed", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-cursor-request-"));
+
+    try {
+      await writeFile(join(workspaceRoot, "one.ts"), "first needle\nsecond needle\n");
+      const registry = createCodingToolRegistryForTesting({
+        workspaceRoot,
+        repositorySearchBackend: createScriptedRepositorySearchBackend([
+          {
+            records: scriptedContentRecords([
+              { path: "one.ts", line: 1 },
+              { path: "one.ts", line: 2 },
+            ]),
+          },
+        ]),
+      });
+      const first = await executeRepositorySearchForTesting(registry, {
+        kind: "content",
+        query: "needle",
+        limit: 1,
+      });
+      expect(first).toMatchObject({ status: "completed" });
+      const cursor = repositorySearchCursor(first);
+
+      await expect(
+        executeRepositorySearchForTesting(registry, {
+          kind: "content",
+          query: "different",
+          limit: 1,
+          cursor,
+        }),
+      ).resolves.toMatchObject({
+        status: "failed",
+        error: { code: "search_cursor_invalid" },
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("repository search reports a runtime-restart cursor as stale", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-cursor-restart-"));
+
+    try {
+      await writeFile(join(workspaceRoot, "one.ts"), "first needle\nsecond needle\n");
+      const first = await executeRepositorySearchForTesting(
+        createCodingToolRegistryForTesting({
+          workspaceRoot,
+          repositorySearchBackend: createScriptedRepositorySearchBackend([
+            {
+              records: scriptedContentRecords([
+                { path: "one.ts", line: 1 },
+                { path: "one.ts", line: 2 },
+              ]),
+            },
+          ]),
+        }),
+        { kind: "content", query: "needle", limit: 1 },
+      );
+      const cursor = repositorySearchCursor(first);
+
+      await expect(
+        executeRepositorySearchForTesting(
+          createCodingToolRegistryForTesting({
+            workspaceRoot,
+            repositorySearchBackend: createScriptedRepositorySearchBackend([]),
+          }),
+          {
+            kind: "content",
+            query: "needle",
+            limit: 1,
+            cursor,
+          },
+        ),
+      ).resolves.toMatchObject({
+        status: "failed",
+        error: { code: "search_cursor_stale" },
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("repository search evicts the least-recently-used snapshot after eight live snapshots", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-cursor-lru-"));
+
+    try {
+      await writeFile(join(workspaceRoot, "one.ts"), "first needle\nsecond needle\n");
+      const registry = createCodingToolRegistryForTesting({
+        workspaceRoot,
+        repositorySearchBackend: createScriptedRepositorySearchBackend(
+          Array.from({ length: 9 }, () => ({
+            records: scriptedContentRecords([
+              { path: "one.ts", line: 1 },
+              { path: "one.ts", line: 2 },
+            ]),
+          })),
+        ),
+      });
+      let firstCursor = "";
+      for (let index = 0; index < 9; index += 1) {
+        const result = await executeRepositorySearchForTesting(registry, {
+          kind: "content",
+          query: "needle",
+          limit: 1,
+        });
+        expect(result).toMatchObject({ status: "completed" });
+        if (index === 0) {
+          firstCursor = repositorySearchCursor(result);
+        }
+      }
+
+      await expect(
+        executeRepositorySearchForTesting(registry, {
+          kind: "content",
+          query: "needle",
+          limit: 1,
+          cursor: firstCursor,
+        }),
+      ).resolves.toMatchObject({
+        status: "failed",
+        error: { code: "search_cursor_stale" },
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("repository search expires one cursor after exactly ten idle minutes without polling", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-cursor-expiry-"));
+    const actualNow = Date.now();
+    let now = actualNow;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => now);
+
+    try {
+      await writeFile(join(workspaceRoot, "one.ts"), "first needle\nsecond needle\n");
+      const registry = createCodingToolRegistryForTesting({
+        workspaceRoot,
+        repositorySearchBackend: createScriptedRepositorySearchBackend([
+          {
+            records: scriptedContentRecords([
+              { path: "one.ts", line: 1 },
+              { path: "one.ts", line: 2 },
+            ]),
+          },
+        ]),
+      });
+      const first = await executeRepositorySearchForTesting(registry, {
+        kind: "content",
+        query: "needle",
+        limit: 1,
+      });
+      const cursor = repositorySearchCursor(first);
+      now += 10 * 60 * 1_000;
+
+      await expect(
+        executeRepositorySearchForTesting(registry, {
+          kind: "content",
+          query: "needle",
+          limit: 1,
+          cursor,
+        }),
+      ).resolves.toMatchObject({
+        status: "failed",
+        error: { code: "search_cursor_stale" },
+      });
+    } finally {
+      nowSpy.mockRestore();
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("path search boosts current Git changes only within one equal match-quality tier", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-git-rank-"));
+
+    try {
+      await mkdir(join(workspaceRoot, "src"));
+      await writeFile(join(workspaceRoot, "src", "a-needle-clean.ts"), "export const a = 1;\n");
+      await writeFile(join(workspaceRoot, "src", "z-needle-modified.ts"), "export const z = 2;\n");
+      let searchOutput: unknown;
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return toolCallEvents("search-git-rank", "search_repository", {
+            kind: "path",
+            query: "needle",
+          });
+        }
+        if (
+          latestMessage?.role === "tool" &&
+          latestMessage.name === "search_repository" &&
+          latestMessage.result.status === "completed"
+        ) {
+          searchOutput = latestMessage.result.output;
+        }
+        return [
+          { type: "text_delta", text: "The current Git change ranked first." },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          repositorySearchBackend: createScriptedRepositorySearchBackend([
+            {
+              records: ["src/a-needle-clean.ts", "src/z-needle-modified.ts"],
+              changedPaths: ["src/z-needle-modified.ts"],
+            },
+          ]),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      });
+
+      await expect(session.run({ text: "Rank the matching repository paths." })).resolves.toEqual({
+        status: "completed",
+        answer: "The current Git change ranked first.",
+      });
+      expect(searchOutput).toMatchObject({
+        entries: [
+          { path: "src/z-needle-modified.ts", rankReason: "literal_substring" },
+          { path: "src/a-needle-clean.ts", rankReason: "literal_substring" },
+        ],
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("path search applies one explicit ripgrep glob without fuzzy fallback", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-path-glob-"));
+
+    try {
+      await mkdir(join(workspaceRoot, "src"), { recursive: true });
+      await mkdir(join(workspaceRoot, "tests"), { recursive: true });
+      await writeFile(join(workspaceRoot, "src", "alpha.test.ts"), "export {};\n", "utf8");
+      await writeFile(join(workspaceRoot, "tests", "beta.test.ts"), "export {};\n", "utf8");
+      await writeFile(join(workspaceRoot, "src", "alpha.ts"), "export {};\n", "utf8");
+      let searchOutput: unknown;
+      let observedArguments: readonly string[] | undefined;
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return toolCallEvents("search-path-glob", "search_repository", {
+            kind: "path",
+            query: "{src,tests}/**/*.test.ts",
+            mode: "glob",
+          });
+        }
+        if (
+          latestMessage?.role === "tool" &&
+          latestMessage.name === "search_repository" &&
+          latestMessage.result.status === "completed"
+        ) {
+          searchOutput = latestMessage.result.output;
+        }
+        return [
+          { type: "text_delta", text: "Only the explicit glob paths were returned." },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          repositorySearchBackend: createScriptedRepositorySearchBackend([
+            {
+              records: ["src/alpha.test.ts", "tests/beta.test.ts"],
+              assertArguments(arguments_) {
+                observedArguments = arguments_;
+              },
+            },
+          ]),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      });
+
+      await expect(session.run({ text: "Find the exact test-file glob." })).resolves.toEqual({
+        status: "completed",
+        answer: "Only the explicit glob paths were returned.",
+      });
+      expect(searchOutput).toMatchObject({
+        kind: "path",
+        mode: "glob",
+        entries: [
+          { path: "src/alpha.test.ts", rankReason: "glob" },
+          { path: "tests/beta.test.ts", rankReason: "glob" },
+        ],
+      });
+      expect(observedArguments).toEqual([
+        "--files",
+        "--null",
+        "--glob",
+        "{src,tests}/**/*.test.ts",
+        "--",
+        ".",
+      ]);
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("content search returns the requested bounded context around one match", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-context-"));
+
+    try {
+      await writeFile(
+        join(workspaceRoot, "context.ts"),
+        ["line one", "line two", "needle line", "line four", "line five", ""].join("\n"),
+        "utf8",
+      );
+      let searchOutput: unknown;
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return toolCallEvents("search-context", "search_repository", {
+            kind: "content",
+            query: "needle",
+            context: 1,
+          });
+        }
+        if (
+          latestMessage?.role === "tool" &&
+          latestMessage.name === "search_repository" &&
+          latestMessage.result.status === "completed"
+        ) {
+          searchOutput = latestMessage.result.output;
+        }
+        return [
+          { type: "text_delta", text: "The bounded surrounding lines were returned." },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          repositorySearchBackend: createScriptedRepositorySearchBackend([
+            {
+              records: [
+                JSON.stringify({
+                  type: "begin",
+                  data: { path: { text: "context.ts" } },
+                }),
+                scriptedRipgrepLine("context", "context.ts", 2, "line two\n", []),
+                scriptedRipgrepLine("match", "context.ts", 3, "needle line\n", [
+                  { text: "needle", start: 0, end: 6 },
+                ]),
+                scriptedRipgrepLine("context", "context.ts", 4, "line four\n", []),
+              ],
+            },
+          ]),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      });
+
+      await expect(session.run({ text: "Inspect one line of context." })).resolves.toEqual({
+        status: "completed",
+        answer: "The bounded surrounding lines were returned.",
+      });
+      expect(searchOutput).toMatchObject({
+        kind: "content",
+        context: 1,
+        groups: [
+          {
+            path: "context.ts",
+            matches: [
+              {
+                line: 3,
+                snippet: "needle line",
+                contextBefore: [{ line: 2, snippet: "line two" }],
+                contextAfter: [{ line: 4, snippet: "line four" }],
+              },
+            ],
+          },
+        ],
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("content search shapes complete normalized results into a 16 KiB UTF-8 page", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-page-bytes-"));
+
+    try {
+      for (let index = 0; index < 20; index += 1) {
+        await writeFile(
+          join(workspaceRoot, `${String(index).padStart(2, "0")}.ts`),
+          `needle ${"界".repeat(500)}\n`,
+          "utf8",
+        );
+      }
+      let searchOutput: unknown;
+      const model = new FakeModelDriver((request) => {
+        const latestMessage = request.messages.at(-1);
+        if (latestMessage?.role === "user") {
+          return toolCallEvents("search-page-bytes", "search_repository", {
+            kind: "content",
+            query: "needle",
+          });
+        }
+        if (
+          latestMessage?.role === "tool" &&
+          latestMessage.name === "search_repository" &&
+          latestMessage.result.status === "completed"
+        ) {
+          searchOutput = latestMessage.result.output;
+        }
+        return [
+          { type: "text_delta", text: "The first UTF-8 page remained bounded." },
+          { type: "finish", reason: "stop" },
+        ];
+      });
+      const session = createTestSession({
+        model,
+        tools: createCodingToolRegistryForTesting({
+          workspaceRoot,
+          repositorySearchBackend: createScriptedRepositorySearchBackend([
+            {
+              records: scriptedContentRecords(
+                Array.from({ length: 20 }, (_unused, index) => ({
+                  path: `${String(index).padStart(2, "0")}.ts`,
+                  text: `needle ${"界".repeat(500)}\n`,
+                })),
+              ),
+            },
+          ]),
+        }),
+        permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      });
+
+      await expect(session.run({ text: "Return one bounded search page." })).resolves.toEqual({
+        status: "completed",
+        answer: "The first UTF-8 page remained bounded.",
+      });
+      expect(searchOutput).toMatchObject({
+        resultCount: expect.any(Number),
+        nextCursor: expect.any(String),
+        omissions: expect.arrayContaining([expect.objectContaining({ reason: "page_byte_limit" })]),
+      });
+      expect(Buffer.byteLength(JSON.stringify(searchOutput), "utf8")).toBeLessThanOrEqual(
+        16 * 1_024,
+      );
+      expect((searchOutput as { resultCount: number }).resultCount).toBeLessThan(20);
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("repository search rejects more than 100000 raw content matches without a partial snapshot", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-search-raw-cap-"));
+
+    try {
+      await writeFile(join(workspaceRoot, "overflow.txt"), "needle\n", "utf8");
+      const records = scriptedContentRecords(
+        Array.from({ length: 100_001 }, (_unused, index) => ({
+          path: "overflow.txt",
+          line: index + 1,
+        })),
+      );
+
+      await expect(
+        executeRepositorySearchForTesting(
+          createCodingToolRegistryForTesting({
+            workspaceRoot,
+            repositorySearchBackend: createScriptedRepositorySearchBackend([{ records }]),
+          }),
+          {
+            kind: "content",
+            query: "needle",
+          },
+        ),
+      ).resolves.toMatchObject({
+        status: "failed",
+        error: { code: "search_quota_exceeded" },
+      });
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
   });
 
   test("answers from one read_file result without changing the repository", async () => {
@@ -3732,6 +4553,7 @@ describe("AgentSession", () => {
       }).toEqual({
         definitions: [
           "read_file",
+          "search_repository",
           "write_file",
           "edit_file",
           "run_shell",
@@ -4789,6 +5611,51 @@ describe("AgentSession", () => {
     }
   });
 
+  test("an unavailable historical repository search gives actionable new-session guidance", async () => {
+    let observedMessage: string | undefined;
+    const model = new FakeModelDriver((request) => {
+      const latestMessage = request.messages.at(-1);
+      if (latestMessage?.role === "user") {
+        return toolCallEvents("historical-search", "search_repository", {
+          kind: "content",
+          query: "needle",
+        });
+      }
+      if (
+        latestMessage?.role === "tool" &&
+        latestMessage.name === "search_repository" &&
+        latestMessage.result.status === "failed"
+      ) {
+        observedMessage = latestMessage.result.error.message;
+      }
+      return [
+        { type: "text_delta", text: "The historical profile remained unchanged." },
+        { type: "finish", reason: "stop" },
+      ];
+    });
+    const historicalTools: ToolRegistry = {
+      definitions() {
+        return [];
+      },
+      resolve() {
+        return undefined;
+      },
+    };
+    const session = createTestSession({
+      model,
+      tools: historicalTools,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    });
+
+    await expect(session.run({ text: "Search from the historical session." })).resolves.toEqual({
+      status: "completed",
+      answer: "The historical profile remained unchanged.",
+    });
+    expect(observedMessage).toBe(
+      "Repository search is unavailable in this historical Tool Profile. Start a new session to use search_repository.",
+    );
+  });
+
   test("feeds one permission denial back without executing the tool", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-denied-"));
 
@@ -5482,6 +6349,159 @@ function createTestSession(
     maximumOutputTokens: 4_096,
     store: dependencies.store ?? createInMemorySessionStore(),
   });
+}
+
+function searchRepositoryEvents(input: {
+  readonly query: string;
+  readonly limit: number;
+  readonly cursor?: string;
+}): readonly ModelEvent[] {
+  return toolCallEvents(`search-page-${input.cursor === undefined ? 1 : 2}`, "search_repository", {
+    kind: "content",
+    ...input,
+  });
+}
+
+async function executeRepositorySearchForTesting(
+  registry: ToolRegistry,
+  input: Record<string, unknown>,
+) {
+  const adapter = registry.resolve("search_repository");
+  if (adapter === undefined) {
+    throw new TypeError("The repository search tool is unavailable.");
+  }
+  const prepared = adapter.prepare(JSON.stringify(input));
+  if (prepared.status !== "ready") {
+    return prepared;
+  }
+  return prepared.execute({
+    signal: new AbortController().signal,
+    callId: "search-contract",
+    toolName: "search_repository",
+    sessionId: "search-contract-session",
+    toolProfileDigest: "sha256:search-contract-profile",
+  });
+}
+
+type ScriptedRepositorySearch = {
+  readonly records: readonly string[];
+  readonly changedPaths?: readonly string[];
+  readonly assertArguments?: (arguments_: readonly string[]) => void;
+};
+
+function createScriptedRepositorySearchBackend(
+  scripts: readonly ScriptedRepositorySearch[],
+): RepositorySearchBackend {
+  let nextScript = 0;
+  return {
+    async readChangedPaths() {
+      return new Set(scripts[nextScript]?.changedPaths ?? []);
+    },
+    async runRecords(input) {
+      const script = scripts[nextScript];
+      nextScript += 1;
+      if (script === undefined) {
+        throw new TypeError("The deterministic repository search script was exhausted.");
+      }
+      script.assertArguments?.(input.args);
+      for (const record of script.records) {
+        input.signal.throwIfAborted();
+        input.budget.consumeRawBytes(Buffer.byteLength(record, "utf8") + 1);
+        input.accept(record);
+      }
+    },
+  };
+}
+
+function scriptedContentRecords(
+  matches: readonly {
+    readonly path: string;
+    readonly line?: number;
+    readonly text?: string;
+    readonly submatches?: readonly {
+      readonly text: string;
+      readonly start: number;
+      readonly end: number;
+    }[];
+  }[],
+): readonly string[] {
+  const records: string[] = [];
+  for (const path of new Set(matches.map((match) => match.path))) {
+    records.push(JSON.stringify({ type: "begin", data: { path: { text: path } } }));
+  }
+  for (const match of matches) {
+    const text = match.text ?? "needle\n";
+    records.push(
+      JSON.stringify({
+        type: "match",
+        data: {
+          path: { text: match.path },
+          lines: { text },
+          line_number: match.line ?? 1,
+          absolute_offset: 0,
+          submatches: match.submatches?.map((submatch) => ({
+            match: { text: submatch.text },
+            start: submatch.start,
+            end: submatch.end,
+          })) ?? [{ match: { text: "needle" }, start: 0, end: 6 }],
+        },
+      }),
+    );
+  }
+  return records;
+}
+
+function scriptedRipgrepLine(
+  type: "match" | "context",
+  path: string,
+  line: number,
+  text: string,
+  submatches: readonly { readonly text: string; readonly start: number; readonly end: number }[],
+): string {
+  return JSON.stringify({
+    type,
+    data: {
+      path: { text: path },
+      lines: { text },
+      line_number: line,
+      absolute_offset: 0,
+      submatches: submatches.map((submatch) => ({
+        match: { text: submatch.text },
+        start: submatch.start,
+        end: submatch.end,
+      })),
+    },
+  });
+}
+
+function repositorySearchCursor(result: ToolResult): string {
+  const output = result.status === "completed" ? result.output : undefined;
+  if (
+    typeof output !== "object" ||
+    output === null ||
+    !("nextCursor" in output) ||
+    typeof (output as { readonly nextCursor?: unknown }).nextCursor !== "string"
+  ) {
+    throw new TypeError("The repository search result has no next cursor.");
+  }
+  return (output as { readonly nextCursor: string }).nextCursor;
+}
+
+function toolCallEvents(
+  id: string,
+  name: string,
+  input: Readonly<Record<string, unknown>>,
+): readonly ModelEvent[] {
+  return [
+    { type: "tool_call_start", id, name },
+    {
+      type: "tool_call_delta",
+      id,
+      json: JSON.stringify(input),
+    },
+    { type: "tool_call_end", id },
+    { type: "finish", reason: "tool_calls" },
+  ];
 }
 
 function imageOccurrence(artifactId: `sha256:${string}`, byteCount: number, occurrenceId: string) {

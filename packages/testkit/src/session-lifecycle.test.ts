@@ -448,9 +448,9 @@ function snapshotWithLastPromptProjection<Snapshot extends { readonly promptCont
 }
 
 const introductionRequestDigest =
-  "sha256:0782707796dafcb2988d1eadadddc3de09e48ef4a1760ab57a4be9a983b9a181" as const;
+  "sha256:261865cb0025860d34717e6bc56716925fbdaf70a4757f6b4826af1417305fc7" as const;
 const permissionRequestDigest =
-  "sha256:341baabb2a66d516430fc49f39c3c408a15dae8a47608ad543a3bb888431b01c" as const;
+  "sha256:c82b39aa784fec5a2d91bfc5f2471cde20a55ff8f618747023c3efc21ee16f8f" as const;
 
 test("SessionLifecycle rejects a deterministic competing owner and proceeds after release", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-memory-owner-"));
@@ -3485,6 +3485,7 @@ test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill s
           toolProfile: {
             definitions: [
               { name: "read_file" },
+              { name: "search_repository" },
               { name: "write_file" },
               { name: "edit_file" },
               { name: "run_shell" },

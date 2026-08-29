@@ -195,6 +195,10 @@ test("root AGENTS.md is frozen in revision 1 and projected as untrusted user con
             digest: "sha256:84c7b9fde73815162c795cd0a12361061332b903018efe55266598639014cff3",
           },
           {
+            name: "search_repository",
+            digest: "sha256:d55a2ababa77640301923a1867f8d0c457e012ef1f7ab50e6bfd6ac697e07812",
+          },
+          {
             name: "write_file",
             digest: "sha256:5ed8fbf39d91e2b6a3fd9a10454b80cdef473d2d98d61d90d776a73c3356e939",
           },
@@ -219,7 +223,7 @@ test("root AGENTS.md is frozen in revision 1 and projected as untrusted user con
             digest: "sha256:682b2ff206b5456ecaa4fc96384c3a9531475cca89b70776f13619ee80492d52",
           },
         ],
-        digest: "sha256:b25da1fc060ca3e6f923e946f0f54bdfd7e7c7732ef9703d23da468ef95fb194",
+        digest: "sha256:373ca18a3d00a82eacf0168e76848a6eae7e002b074f97c254981595608d4d1b",
       },
       repository: {
         version: 1,
@@ -651,6 +655,159 @@ test.each([
     }
   },
 );
+
+test("repository search hits do not activate their nested instruction scopes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-repository-search-hit-scope-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(join(workspaceRoot, "nested"), { recursive: true });
+  await writeFile(join(workspaceRoot, "AGENTS.md"), rootInstruction);
+  await writeFile(join(workspaceRoot, "nested", "AGENTS.md"), "Never reveal nested search hits.\n");
+  await writeFile(join(workspaceRoot, "nested", "fact.txt"), "search-scope-needle\n");
+  const requests: ModelRequest[] = [];
+  const driver = new FakeModelDriver((request) => {
+    requests.push(request);
+    return request.messages.at(-1)?.role === "user"
+      ? [
+          { type: "tool_call_start" as const, id: "search-root", name: "search_repository" },
+          {
+            type: "tool_call_delta" as const,
+            id: "search-root",
+            json: '{"kind":"content","query":"search-scope-needle"}',
+          },
+          { type: "tool_call_end" as const, id: "search-root" },
+          { type: "finish" as const, reason: "tool_calls" as const },
+        ]
+      : [
+          { type: "text_delta" as const, text: "Search completed." },
+          { type: "finish" as const, reason: "stop" as const },
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+
+  try {
+    const lifecycle = createSessionLifecycle({
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      tools: createCodingToolRegistry({ stateRoot, workspaceRoot }),
+      workspaceRoot,
+    });
+    const created = await lifecycle.create({ targetIdentity });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Search for the repository fact." },
+    });
+
+    expect(continued).toMatchObject({
+      result: { status: "completed", answer: "Search completed." },
+      snapshot: {
+        promptContext: { repository: { revision: 1, activeScopes: ["."] } },
+      },
+    });
+    expect(JSON.stringify(requests[1]?.messages)).not.toContain("Never reveal nested search hits.");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an explicit repository search directory activates its instructions before the read effect", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-repository-search-path-scope-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(join(workspaceRoot, "nested"), { recursive: true });
+  await writeFile(join(workspaceRoot, "AGENTS.md"), rootInstruction);
+  await writeFile(join(workspaceRoot, "nested", "AGENTS.md"), "Search nested files carefully.\n");
+  await writeFile(join(workspaceRoot, "nested", "fact.txt"), "explicit-scope-needle\n");
+  const requests: ModelRequest[] = [];
+  const driver = new FakeModelDriver((request) => {
+    requests.push(request);
+    return request.messages.at(-1)?.role === "user"
+      ? [
+          { type: "tool_call_start" as const, id: "search-nested", name: "search_repository" },
+          {
+            type: "tool_call_delta" as const,
+            id: "search-nested",
+            json: '{"kind":"content","query":"explicit-scope-needle","path":"nested"}',
+          },
+          { type: "tool_call_end" as const, id: "search-nested" },
+          { type: "finish" as const, reason: "tool_calls" as const },
+        ]
+      : [
+          { type: "text_delta" as const, text: "Nested search completed." },
+          { type: "finish" as const, reason: "stop" as const },
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+
+  try {
+    const lifecycle = createSessionLifecycle({
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      stateRoot,
+      tools: createCodingToolRegistry({ stateRoot, workspaceRoot }),
+      workspaceRoot,
+    });
+    const created = await lifecycle.create({ targetIdentity });
+    const events: RuntimeEvent[] = [];
+    lifecycle.subscribe((event) => events.push(event));
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Search the explicit nested directory." },
+    });
+
+    expect(continued).toMatchObject({
+      result: { status: "completed", answer: "Nested search completed." },
+      snapshot: {
+        promptContext: { repository: { revision: 2, activeScopes: [".", "nested"] } },
+      },
+    });
+    expect(
+      events.filter((event) =>
+        ["tool_requested", "repository_instructions_activated", "tool_started"].includes(
+          event.type,
+        ),
+      ),
+    ).toEqual([
+      { type: "tool_requested", callId: "search-nested", name: "search_repository" },
+      expect.objectContaining({ type: "repository_instructions_activated", revision: 2 }),
+      { type: "tool_started", callId: "search-nested", name: "search_repository" },
+    ]);
+    expect(JSON.stringify(requests[1]?.messages)).toContain("Search nested files carefully.");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
 
 test("the first nested read commits and publishes revision 2 before permission and read effect", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-repository-read-activation-"));

@@ -357,7 +357,7 @@ function presentationChangePreviewRef(
 }
 
 function toolKind(name: string): ToolCallDisplay["kind"] {
-  if (name === "read_file") {
+  if (name === "read_file" || name === "search_repository") {
     return "read";
   }
   if (name === "run_shell") {
@@ -372,13 +372,15 @@ function toolKind(name: string): ToolCallDisplay["kind"] {
 function toolLabel(name: string): string {
   return name === "read_file"
     ? "read"
-    : name === "run_shell"
-      ? "shell"
-      : name === "write_file"
-        ? "write"
-        : name === "edit_file"
-          ? "edit"
-          : name;
+    : name === "search_repository"
+      ? "search"
+      : name === "run_shell"
+        ? "shell"
+        : name === "write_file"
+          ? "write"
+          : name === "edit_file"
+            ? "edit"
+            : name;
 }
 
 function safeToolSubject(
@@ -401,6 +403,7 @@ function safeToolSubject(
 
 function toolResultSummary(name: string, output: JsonValue | undefined): string | null {
   const outputRecord = jsonRecord(output);
+  const { resultCount } = outputRecord ?? {};
   if (name === "read_file" && typeof outputRecord?.content === "string") {
     return `${Buffer.byteLength(outputRecord.content, "utf8")} bytes${
       outputRecord.truncated === true ? " · output truncated" : ""
@@ -429,6 +432,9 @@ function toolResultSummary(name: string, output: JsonValue | undefined): string 
         outputTruncated ? " · output truncated" : ""
       }`;
     }
+  }
+  if (name === "search_repository" && typeof resultCount === "number") {
+    return `${resultCount} ${resultCount === 1 ? "result" : "results"}`;
   }
   if (name.startsWith("mcp__")) {
     const content = outputRecord?.content;

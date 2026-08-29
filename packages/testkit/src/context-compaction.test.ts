@@ -4090,11 +4090,11 @@ test("SessionLifecycle restarts and branches from one committed context checkpoi
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
-  await writeFile(join(workspaceRoot, "context.txt"), "lifecycle context ".repeat(220), "utf8");
+  await writeFile(join(workspaceRoot, "context.txt"), "lifecycle context ".repeat(600), "utf8");
   const lifecycleContextProfile: ContextProfile = {
     ...contextProfile,
-    compactAtTokens: 900,
-    postCompactTargetTokens: 700,
+    compactAtTokens: 1_500,
+    postCompactTargetTokens: 1_200,
   };
 
   let ordinaryCall = 0;
@@ -4373,14 +4373,14 @@ test("SessionLifecycle reports then normalizes a dangling compaction attempt aft
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
-  await writeFile(join(workspaceRoot, "context.txt"), "dangling context ".repeat(220), "utf8");
+  await writeFile(join(workspaceRoot, "context.txt"), "dangling context ".repeat(600), "utf8");
 
   let ordinaryCall = 0;
   let compactionCall = 0;
   const danglingContextProfile = {
     ...contextProfile,
-    compactAtTokens: 900,
-    postCompactTargetTokens: 700,
+    compactAtTokens: 1_500,
+    postCompactTargetTokens: 1_200,
   };
   const model: ModelDriver = {
     async *stream(request) {

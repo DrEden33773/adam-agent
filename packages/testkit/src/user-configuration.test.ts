@@ -1145,7 +1145,7 @@ test("a legacy compacted session reuses the selected-prefix profile instead of c
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-legacy-compacted-profile-"));
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot, { mode: 0o700 });
-  await writeFile(join(workspaceRoot, "context.txt"), "legacy context ".repeat(220), "utf8");
+  await writeFile(join(workspaceRoot, "context.txt"), "legacy context ".repeat(600), "utf8");
   const configuration = createInMemoryUserConfiguration(
     `${JSON.stringify({
       schemaVersion: 2,
@@ -1162,8 +1162,8 @@ test("a legacy compacted session reuses the selected-prefix profile instead of c
     version: 1,
     contextWindowTokens: 20_000,
     maximumOutputTokens: 100,
-    compactAtTokens: 900,
-    postCompactTargetTokens: 700,
+    compactAtTokens: 1_500,
+    postCompactTargetTokens: 1_200,
     retainedTargetTokens: 100,
     estimatorVersion: 1,
   };
@@ -1171,7 +1171,7 @@ test("a legacy compacted session reuses the selected-prefix profile instead of c
     ...historicalOfficialProfile,
     contextWindowTokens: 30_000,
     maximumOutputTokens: 200,
-    compactAtTokens: 1_500,
+    compactAtTokens: 2_200,
   };
   const summary = JSON.stringify({
     schemaVersion: 1,

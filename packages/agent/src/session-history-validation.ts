@@ -491,7 +491,8 @@ export function validateCurrentSessionHistory(
           toolState.decision !== undefined ||
           toolState.permissionRequestId !== undefined ||
           toolState.repositoryDisposition !== undefined ||
-          (record.trigger.name === "read_file") !== (record.trigger.disposition === "read_continue")
+          (record.trigger.name === "read_file" || record.trigger.name === "search_repository") !==
+            (record.trigger.disposition === "read_continue")
         ) {
           throw new SessionLifecycleError("session_invalid");
         }

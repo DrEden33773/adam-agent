@@ -60,6 +60,13 @@ export {
   digestPromptRequestV1,
 } from "./prompt-assembly.js";
 export {
+  createRepositorySearchToolAdapter as createRepositorySearchToolAdapterForTesting,
+  type RepositorySearchBackend,
+  type RepositorySearchBackendBudget,
+  type RepositorySearchProcessObserver,
+  repositorySearchBackendForTesting,
+} from "./repository-search.js";
+export {
   createPresentationPreferencesWithStorageForTesting,
   createTrustedWorkspaceTrustForTesting,
   createWorkspaceTrustWithStorageForTesting,

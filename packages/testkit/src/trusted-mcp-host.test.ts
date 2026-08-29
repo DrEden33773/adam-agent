@@ -5002,6 +5002,7 @@ test("SessionLifecycle keeps user-assigned MCP effect authority over server anno
     });
     expect(requests[0]?.tools.map((tool) => tool.name)).toEqual([
       "read_file",
+      "search_repository",
       "write_file",
       "edit_file",
       "run_shell",
