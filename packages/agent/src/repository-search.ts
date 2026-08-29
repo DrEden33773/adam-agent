@@ -852,6 +852,8 @@ async function runContentSearch(options: {
   readonly omissions: readonly z.infer<typeof omissionSchema>[];
 }> {
   const args = [
+    "--no-config",
+    "--no-require-git",
     "--json",
     ...(options.mode === "literal" ? ["--fixed-strings"] : []),
     ...(options.case === "smart"
@@ -951,6 +953,8 @@ async function runPathSearch(options: {
   });
   await options.backend.runRecords({
     args: [
+      "--no-config",
+      "--no-require-git",
       "--files",
       "--null",
       ...(options.mode === "glob" ? ["--glob", options.query] : []),

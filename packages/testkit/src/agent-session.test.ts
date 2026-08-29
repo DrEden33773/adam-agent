@@ -1621,6 +1621,8 @@ describe("AgentSession", () => {
       });
       expect(searchResult).toEqual({ status: "completed", output: expect.anything() });
       expect(observedArguments).toEqual([
+        "--no-config",
+        "--no-require-git",
         "--json",
         "--case-sensitive",
         "--color",
@@ -2080,6 +2082,8 @@ describe("AgentSession", () => {
         ],
       });
       expect(observedArguments).toEqual([
+        "--no-config",
+        "--no-require-git",
         "--files",
         "--null",
         "--glob",

@@ -313,22 +313,32 @@ test("real PTY streams Ctrl+T reasoning and restores application mouse modes on 
       stateRoot,
       workspaceRoot,
     });
+    console.error("[DEBUG-s3r0-pty] fixture-started");
     await fixture.waitFor("Adam · New session");
+    console.error("[DEBUG-s3r0-pty] initial-frame");
     fixture.write("Exercise PTY reasoning\r");
     await waitForPath(join(controlRoot, "model-started"));
+    console.error("[DEBUG-s3r0-pty] model-started");
     await fixture.waitFor("Thinking · provider reasoning · adam");
+    console.error("[DEBUG-s3r0-pty] reasoning-card");
     fixture.write("\u0014");
     await fixture.waitFor("Inspect ");
+    console.error("[DEBUG-s3r0-pty] first-reasoning-delta");
     await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
     await fixture.waitFor("Inspect the evidence.");
+    console.error("[DEBUG-s3r0-pty] full-reasoning-delta");
     const beforeAnswer = fixture.output().length;
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
+    console.error("[DEBUG-s3r0-pty] session-settled");
     await fixture.waitForCompleteFrameAfter(" · idle", beforeAnswer);
+    console.error("[DEBUG-s3r0-pty] idle-frame");
     fixture.write("\u001b[F");
     await fixture.waitForCompleteFrameAfter("Reasoning answer.", beforeAnswer);
+    console.error("[DEBUG-s3r0-pty] answer-frame");
     fixture.write("\u0011");
     const result = await fixture.closed;
+    console.error("[DEBUG-s3r0-pty] child-closed");
 
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).toContain("\u001b[?2004h");
