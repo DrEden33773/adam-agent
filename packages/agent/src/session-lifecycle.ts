@@ -5675,7 +5675,8 @@ function createAgentResumeState(
         const committedInputResource = currentRecords.find(
           (candidate) =>
             candidate.sequence > responseRecord.sequence &&
-            candidate.record.type === "input_resource_read_committed" &&
+            (candidate.record.type === "input_resource_read_committed" ||
+              candidate.record.type === "input_resource_image_read_committed") &&
             candidate.record.runId === runId &&
             candidate.record.callId === call.id,
         );
@@ -5717,7 +5718,9 @@ function createAgentResumeState(
                     content: committedInputResource.record.content,
                   },
                 }
-              : undefined;
+              : committedInputResource?.record.type === "input_resource_image_read_committed"
+                ? { status: "completed" as const, output: committedInputResource.record.image }
+                : undefined;
         pendingToolCalls.push({
           call,
           requested,
@@ -5856,9 +5859,13 @@ function inputResourceBytesForRun(records: readonly SessionRecord[], runId: stri
   const total = records.reduce(
     (sum, record) =>
       record.schemaVersion === 3 &&
-      record.record.type === "input_resource_read_committed" &&
+      (record.record.type === "input_resource_read_committed" ||
+        record.record.type === "input_resource_image_read_committed") &&
       record.record.runId === runId
-        ? sum + record.record.byteCount
+        ? sum +
+          (record.record.type === "input_resource_read_committed"
+            ? record.record.byteCount
+            : record.record.image.byteCount)
         : sum,
     0,
   );
@@ -5879,8 +5886,13 @@ async function inputResourceBytesFromLineage(
 ): Promise<number> {
   const ownBytes = records.reduce(
     (sum, record) =>
-      record.schemaVersion === 3 && record.record.type === "input_resource_read_committed"
-        ? sum + record.record.byteCount
+      record.schemaVersion === 3 &&
+      (record.record.type === "input_resource_read_committed" ||
+        record.record.type === "input_resource_image_read_committed")
+        ? sum +
+          (record.record.type === "input_resource_read_committed"
+            ? record.record.byteCount
+            : record.record.image.byteCount)
         : sum,
     0,
   );
@@ -5968,15 +5980,37 @@ function validateInputResourceReadLineage(
 ): void {
   const occurrences = new Map(visible.map((occurrence) => [occurrence.occurrenceId, occurrence]));
   for (const record of records) {
-    if (record.schemaVersion !== 3 || record.record.type !== "input_resource_read_committed") {
+    if (
+      record.schemaVersion !== 3 ||
+      (record.record.type !== "input_resource_read_committed" &&
+        record.record.type !== "input_resource_image_read_committed")
+    ) {
       continue;
     }
-    const occurrence = occurrences.get(record.record.occurrenceId);
+    const descriptor =
+      record.record.type === "input_resource_read_committed"
+        ? {
+            occurrenceId: record.record.occurrenceId,
+            displayName: record.record.displayName,
+            digest: record.record.digest,
+            byteCount: record.record.totalByteCount,
+          }
+        : {
+            occurrenceId: record.record.image.occurrenceId,
+            displayName: record.record.image.displayName,
+            digest: record.record.image.digest,
+            byteCount: record.record.image.byteCount,
+          };
+    const occurrence = occurrences.get(descriptor.occurrenceId);
     if (
       occurrence === undefined ||
-      record.record.displayName !== occurrence.displayName ||
-      record.record.digest !== occurrence.digest ||
-      record.record.totalByteCount !== occurrence.artifact.byteCount
+      descriptor.displayName !== occurrence.displayName ||
+      descriptor.digest !== occurrence.digest ||
+      descriptor.byteCount !== occurrence.artifact.byteCount ||
+      (record.record.type === "input_resource_image_read_committed" &&
+        (occurrence.support !== "image" ||
+          record.record.image.artifactId !== occurrence.artifact.id ||
+          record.record.image.mediaType !== occurrence.artifact.mediaType))
     ) {
       throw new SessionLifecycleError("session_invalid");
     }
