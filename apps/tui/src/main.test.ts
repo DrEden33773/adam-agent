@@ -4960,23 +4960,32 @@ test("the production editor clears a manual session name through canonical Prese
 
   try {
     const fixture = startFixture({ controlRoot, stateRoot, workspaceRoot });
+    console.error("[DEBUG-s3r0-clear-name] fixture-started");
     await fixture.waitFor("Adam · New session");
+    console.error("[DEBUG-s3r0-clear-name] initial-frame");
     fixture.write("/name Temporary name\r");
     await fixture.waitFor("Adam · Temporary name");
+    console.error("[DEBUG-s3r0-clear-name] temporary-name-frame");
     const beforeClear = fixture.output().length;
     fixture.write("/name --");
     await fixture.waitForCompleteFrameAfter("--generate", beforeClear);
+    console.error("[DEBUG-s3r0-clear-name] completion-frame");
     fixture.write("\t");
     await fixture.resize(81, 24);
+    console.error("[DEBUG-s3r0-clear-name] resized-frame");
     await fixture.waitForCompleteFrameAfter("/name --clear", beforeClear);
+    console.error("[DEBUG-s3r0-clear-name] clear-draft-frame");
     const beforeSubmit = fixture.output().length;
     fixture.write("\r");
     await expect(
       waitForFileContents(join(controlRoot, "clear-session-name-dispatch-settled"), "admitted\n"),
     ).resolves.toBe("admitted\n");
+    console.error("[DEBUG-s3r0-clear-name] dispatch-settled");
     await fixture.waitForCompleteFrameAfter("Adam · New session", beforeSubmit);
+    console.error("[DEBUG-s3r0-clear-name] cleared-frame");
     fixture.write("\u0011");
     await fixture.closed;
+    console.error("[DEBUG-s3r0-clear-name] fixture-closed");
     expect(fixture.screen()?.join("\n") ?? "").not.toContain("Adam · --clear");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
