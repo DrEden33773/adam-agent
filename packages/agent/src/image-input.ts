@@ -1,3 +1,4 @@
+import { inflateSync } from "node:zlib";
 import { decode as decodeJpeg } from "jpeg-js";
 import { PNG } from "pngjs";
 
@@ -49,14 +50,22 @@ export function sniffExplicitUserImageMediaTypeV1(
 }
 
 function inspectPng(bytes: Uint8Array): ImageInspection {
-  const dimensions = inspectPngContainer(bytes);
-  if (dimensions === undefined) {
+  const container = inspectPngContainer(bytes);
+  if (container === undefined) {
     return { status: "invalid" };
   }
+  const dimensions = { width: container.width, height: container.height };
   if (exceedsDimensionLimits(dimensions)) {
     return { status: "limit_exceeded", mediaType: "image/png", ...dimensions };
   }
   try {
+    const inflatedByteLength = expectedPngInflatedByteLength(container);
+    if (inflatedByteLength === undefined) {
+      return { status: "invalid" };
+    }
+    inflateSync(container.imageData, {
+      maxOutputLength: inflatedByteLength,
+    });
     const decoded = PNG.sync.read(Buffer.from(bytes), { checkCRC: true });
     if (
       decoded.width !== dimensions.width ||
@@ -100,13 +109,24 @@ function inspectJpeg(bytes: Uint8Array): ImageInspection {
   return { status: "valid", mediaType: "image/jpeg", ...dimensions };
 }
 
-function inspectPngContainer(
-  bytes: Uint8Array,
-): { readonly width: number; readonly height: number } | undefined {
+function inspectPngContainer(bytes: Uint8Array):
+  | {
+      readonly width: number;
+      readonly height: number;
+      readonly bitDepth: number;
+      readonly colorType: number;
+      readonly interlace: number;
+      readonly imageData: Buffer;
+    }
+  | undefined {
   let offset = pngSignature.byteLength;
   let width: number | undefined;
   let height: number | undefined;
+  let bitDepth: number | undefined;
+  let colorType: number | undefined;
+  let interlace: number | undefined;
   let sawImageData = false;
+  const imageDataChunks: Buffer[] = [];
   let chunkIndex = 0;
   while (offset < bytes.byteLength) {
     if (bytes.byteLength - offset < 12) {
@@ -134,7 +154,18 @@ function inspectPngContainer(
       }
       width = readUint32(bytes, dataStart);
       height = readUint32(bytes, dataStart + 4);
-      if (width === 0 || height === 0) {
+      bitDepth = bytes[dataStart + 8];
+      colorType = bytes[dataStart + 9];
+      const compression = bytes[dataStart + 10];
+      const filter = bytes[dataStart + 11];
+      interlace = bytes[dataStart + 12];
+      if (
+        width === 0 ||
+        height === 0 ||
+        compression !== 0 ||
+        filter !== 0 ||
+        (interlace !== 0 && interlace !== 1)
+      ) {
         return undefined;
       }
     } else if (type === "IHDR") {
@@ -142,6 +173,7 @@ function inspectPngContainer(
     }
     if (type === "IDAT") {
       sawImageData = true;
+      imageDataChunks.push(Buffer.from(bytes.subarray(dataStart, dataEnd)));
     }
     if (type === "IEND") {
       if (
@@ -149,16 +181,76 @@ function inspectPngContainer(
         !sawImageData ||
         width === undefined ||
         height === undefined ||
+        bitDepth === undefined ||
+        colorType === undefined ||
+        interlace === undefined ||
         chunkEnd !== bytes.byteLength
       ) {
         return undefined;
       }
-      return { width, height };
+      return {
+        width,
+        height,
+        bitDepth,
+        colorType,
+        interlace,
+        imageData: Buffer.concat(imageDataChunks),
+      };
     }
     offset = chunkEnd;
     chunkIndex += 1;
   }
   return undefined;
+}
+
+function expectedPngInflatedByteLength(input: {
+  readonly width: number;
+  readonly height: number;
+  readonly bitDepth: number;
+  readonly colorType: number;
+  readonly interlace: number;
+}): number | undefined {
+  const channels =
+    input.colorType === 0
+      ? 1
+      : input.colorType === 2
+        ? 3
+        : input.colorType === 3
+          ? 1
+          : input.colorType === 4
+            ? 2
+            : input.colorType === 6
+              ? 4
+              : undefined;
+  const validBitDepth =
+    (input.colorType === 0 && [1, 2, 4, 8, 16].includes(input.bitDepth)) ||
+    ((input.colorType === 2 || input.colorType === 4 || input.colorType === 6) &&
+      (input.bitDepth === 8 || input.bitDepth === 16)) ||
+    (input.colorType === 3 && [1, 2, 4, 8].includes(input.bitDepth));
+  if (channels === undefined || !validBitDepth) {
+    return undefined;
+  }
+  const bitsPerPixel = channels * input.bitDepth;
+  const passes =
+    input.interlace === 0
+      ? ([[0, 0, 1, 1]] as const)
+      : ([
+          [0, 0, 8, 8],
+          [4, 0, 8, 8],
+          [0, 4, 4, 8],
+          [2, 0, 4, 4],
+          [0, 2, 2, 4],
+          [1, 0, 2, 2],
+          [0, 1, 1, 2],
+        ] as const);
+  return passes.reduce((total, [xStart, yStart, xStep, yStep]) => {
+    const passWidth = Math.ceil(Math.max(0, input.width - xStart) / xStep);
+    const passHeight = Math.ceil(Math.max(0, input.height - yStart) / yStep);
+    if (passWidth === 0 || passHeight === 0) {
+      return total;
+    }
+    return total + passHeight * (Math.ceil((passWidth * bitsPerPixel) / 8) + 1);
+  }, 0);
 }
 
 function inspectJpegContainer(

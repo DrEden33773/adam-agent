@@ -2,6 +2,7 @@ import type { ContextUsageTotals } from "./agent-session-contracts.js";
 import { createContextProjectionMessage, estimateActiveContextTokens } from "./durable-context.js";
 import { createInputResourceProjectionMessageV1 } from "./input-resources.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
+import type { PlanCycleSnapshot } from "./plan-mode.js";
 import {
   commitMcpToolProfileV3,
   hasSkillPromptContext,
@@ -374,7 +375,10 @@ export function isCompleteBranchBoundary(records: readonly SessionRecord[]): boo
             entry.record.type === "mcp_server_definition_approved" ||
             entry.record.type === "mcp_activation_started" ||
             entry.record.type === "mcp_activation_settled" ||
-            entry.record.type === "mcp_tool_profile_committed",
+            entry.record.type === "mcp_tool_profile_committed" ||
+            entry.record.type === "plan_cycle_entered" ||
+            entry.record.type === "plan_cycle_exited" ||
+            entry.record.type === "plan_cycle_inherited",
         )
     );
   }
@@ -898,6 +902,7 @@ export function snapshotFromRecords(
   }
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
   const context = contextSnapshotFromRecords(records);
+  const plan = planCycleSnapshotFromRecords(records);
   const latestRun = currentRecords.findLast(
     (record) => record.record.type === "logical_run_started",
   );
@@ -909,6 +914,7 @@ export function snapshotFromRecords(
       ...(promptContext === undefined ? {} : { promptContext }),
       ...(skillContext === undefined ? {} : { skillContext: skillContextSnapshot(skillContext) }),
       ...(context === undefined ? {} : { context }),
+      ...(plan === undefined ? {} : { plan }),
       ...(artifactInspection?.degradation === undefined
         ? {}
         : { degradation: artifactInspection.degradation }),
@@ -966,6 +972,7 @@ export function snapshotFromRecords(
     ...(promptContext === undefined ? {} : { promptContext }),
     ...(skillContext === undefined ? {} : { skillContext: skillContextSnapshot(skillContext) }),
     ...(context === undefined ? {} : { context }),
+    ...(plan === undefined ? {} : { plan }),
     ...(artifactInspection?.degradation === undefined
       ? {}
       : { degradation: artifactInspection.degradation }),
@@ -986,4 +993,34 @@ export function snapshotFromRecords(
           }),
     },
   };
+}
+
+export function planCycleSnapshotFromRecords(
+  records: readonly SessionRecord[],
+): PlanCycleSnapshot | undefined {
+  let active: PlanCycleSnapshot | undefined;
+  for (const entry of records) {
+    if (entry.schemaVersion !== 3) {
+      continue;
+    }
+    if (
+      entry.record.type === "plan_cycle_entered" ||
+      entry.record.type === "plan_cycle_inherited"
+    ) {
+      active = {
+        state: "exploring",
+        cycleId: entry.record.cycleId,
+        revision: entry.record.revision,
+        policyVersion: entry.record.policyVersion,
+        eligibleToolProfile: entry.record.eligibleToolProfile,
+      };
+    } else if (
+      entry.record.type === "plan_cycle_exited" &&
+      entry.record.cycleId === active?.cycleId &&
+      entry.record.revision === active.revision + 1
+    ) {
+      active = undefined;
+    }
+  }
+  return active;
 }

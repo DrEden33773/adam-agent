@@ -2,6 +2,7 @@ import type { ContextUsageTotals, RunResult } from "./agent-session-contracts.js
 import type { ContextProfile } from "./context-profile.js";
 import type { McpSessionSnapshot } from "./mcp-host.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
+import type { PlanCycleSnapshot } from "./plan-mode.js";
 import type { PromptContextSnapshot } from "./prompt-assembly.js";
 import type { SessionGenesisRecord } from "./session-store.js";
 import type { SkillContextSnapshot } from "./skills.js";
@@ -13,6 +14,7 @@ export type CurrentSessionSnapshot = {
   readonly targetIdentity: ModelTargetIdentity;
   readonly status: "idle" | "interrupted" | "settled";
   readonly lastSequence: number;
+  readonly plan?: PlanCycleSnapshot;
   readonly mcp?: McpSessionSnapshot;
   readonly promptContext?: PromptContextSnapshot;
   readonly skillContext?: SkillContextSnapshot;

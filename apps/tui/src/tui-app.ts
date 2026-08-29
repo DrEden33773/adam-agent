@@ -1478,15 +1478,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`;
       const olderHistorySummary =
         active.transcript.olderCursor === null ? "" : " · older history available";
+      const planSummary = active.plan === undefined ? "" : " · Plan exploring · read-only";
+      const compactPlanSummary = active.plan === undefined ? "" : " · plan read-only";
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
         ),
         standard: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
         ),
         narrow: theme.muted(
-          `${runStatus} · ${footerContextCompactText(active)}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}\n/help · Tab complete`,
+          `${runStatus}${compactPlanSummary} · ${footerContextCompactText(active)}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}\n/help · Tab complete`,
         ),
       });
     }
@@ -2632,6 +2634,63 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         active.session.targetId,
         active.session.id,
       );
+      return;
+    }
+    if (parsedCommand.kind === "known" && parsedCommand.command.id === "plan") {
+      if (parsedCommand.argumentsText.length > 0) {
+        showNotice("warning", "Usage: /plan", "until_edit", active.session.id);
+        editor.disableSubmit = false;
+        renderState();
+        return;
+      }
+      const plan = active.plan;
+      const entering = plan === undefined;
+      const planActionId = showNotice(
+        "progress",
+        entering ? "Entering read-only Plan…" : "Exiting read-only Plan…",
+        "until_replaced",
+        active.session.id,
+      );
+      void options.presentation
+        .dispatch(
+          entering
+            ? { type: "enter_plan", sessionId: active.session.id }
+            : {
+                type: "exit_plan",
+                sessionId: active.session.id,
+                cycleId: plan.cycleId,
+                revision: plan.revision,
+              },
+        )
+        .then((receipt) => {
+          if (receipt.status === "admitted") {
+            editor.setText("");
+            settleNotice(
+              planActionId,
+              "success",
+              entering ? "Entered read-only Plan." : "Exited read-only Plan.",
+              "until_next_action",
+              active.session.id,
+            );
+          } else {
+            settleNotice(planActionId, "error", receipt.message, "until_edit", active.session.id);
+          }
+        })
+        .catch(() => {
+          settleNotice(
+            planActionId,
+            "error",
+            entering
+              ? "Read-only Plan could not be entered."
+              : "Read-only Plan could not be exited.",
+            "until_edit",
+            active.session.id,
+          );
+        })
+        .finally(() => {
+          editor.disableSubmit = false;
+          renderState();
+        });
       return;
     }
     if (parsedCommand.kind === "not_command" && runActive) {

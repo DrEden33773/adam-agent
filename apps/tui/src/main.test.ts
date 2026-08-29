@@ -2695,6 +2695,35 @@ test("the idle footer exposes Registry-driven interaction hints", async () => {
   }
 });
 
+test("the production TUI toggles and displays authoritative read-only Plan status", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-status-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
+
+    fixture.write("/plan\r");
+    await fixture.waitFor("Plan exploring · read-only");
+    let frame = latestSynchronizedFrame(fixture.output()).join("\n");
+    expect(frame).toContain("Plan exploring · read-only");
+
+    const beforeExit = fixture.output().length;
+    fixture.write("/plan\r");
+    await fixture.waitForAfter("Exited read-only Plan.", beforeExit);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeExit)).join("\n");
+    expect(frame).not.toContain("Plan exploring · read-only");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the footer exposes authoritative project context and run facts", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-footer-facts-"));
   const workspaceRoot = join(testRoot, "workspace");

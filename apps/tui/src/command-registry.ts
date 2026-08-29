@@ -27,6 +27,7 @@ export type AdamCommandDefinition = {
     | "model"
     | "name"
     | "new"
+    | "plan"
     | "reload"
     | "resume"
     | "session"
@@ -335,6 +336,14 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     name: "new",
     summary: "Choose an exact target and create a new session.",
     usage: "/new",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "plan",
+    name: "plan",
+    summary: "Enter or exit the authoritative read-only Plan cycle.",
+    usage: "/plan",
   },
   {
     aliases: [],

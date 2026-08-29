@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 
 import {
   type ContextProfile,
@@ -94,6 +95,777 @@ function thinkingSelection(
 const codingToolDefinitions = createCodingToolRegistry({
   workspaceRoot: "/tmp/adam-agent-session-lifecycle-tool-definitions",
 }).definitions();
+
+test("SessionLifecycle Plan exposes only its exact read profile and denies a forged write call", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-write-deny-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      expect(request.tools.map((tool) => tool.name)).toEqual([
+        "read_file",
+        "search_repository",
+        "activate_skill",
+        "read_skill_resource",
+        "read_input_resource",
+      ]);
+      return [
+        { type: "tool_call_start", id: "plan-write", name: "write_file" },
+        {
+          type: "tool_call_delta",
+          id: "plan-write",
+          json: '{"path":"forbidden.txt","content":"must not exist"}',
+        },
+        { type: "tool_call_end", id: "plan-write" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.at(-1)).toMatchObject({
+      role: "tool",
+      name: "write_file",
+      result: { status: "failed", error: { code: "permission_denied" } },
+    });
+    return [
+      { type: "text_delta", text: "The mutation was denied by Plan." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({
+      allowedEffects: ["read", "write", "execute", "network", "delegate", "administrative"],
+    }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Inspect the change without modifying the repository." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The mutation was denied by Plan." },
+      snapshot: { plan: { state: "exploring", policyVersion: "plan-policy.read-v1" } },
+    });
+    await expect(readFile(join(workspaceRoot, "forbidden.txt"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle Plan fails closed for an unknown MCP tool outside the exact profile", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-unknown-mcp-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return [
+        { type: "tool_call_start", id: "unknown-mcp", name: "mcp__ghost__inspect" },
+        { type: "tool_call_delta", id: "unknown-mcp", json: "{}" },
+        { type: "tool_call_end", id: "unknown-mcp" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.at(-1)).toEqual({
+      role: "tool",
+      callId: "unknown-mcp",
+      name: "mcp__ghost__inspect",
+      result: {
+        status: "failed",
+        error: {
+          code: "unknown_tool",
+          message: "Plan denies tools outside its exact eligible Tool Profile.",
+        },
+      },
+    });
+    return [
+      { type: "text_delta", text: "The unknown MCP tool was denied." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Try an unregistered MCP inspection." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The unknown MCP tool was denied." },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects Plan entry while an ordinary run owns the session", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-running-entry-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const providerStarted = Promise.withResolvers<void>();
+  const releaseProvider = Promise.withResolvers<void>();
+  const driver: ModelDriver = {
+    async *stream() {
+      providerStarted.resolve();
+      await releaseProvider.promise;
+      yield { type: "text_delta", text: "The ordinary run completed." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const running = lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Complete one ordinary run." },
+    });
+    await providerStarted.promise;
+
+    await expect(lifecycle.enterPlan({ sessionId: created.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.not.toHaveProperty(
+      "plan",
+    );
+
+    releaseProvider.resolve();
+    const completed = await running;
+    expect(completed).toMatchObject({
+      result: { status: "completed", answer: "The ordinary run completed." },
+    });
+    expect(completed.snapshot).not.toHaveProperty("plan");
+  } finally {
+    releaseProvider.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects Plan entry from interrupted history without appending", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-interrupted-entry-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "First answer." },
+    { type: "finish", reason: "stop" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const completed = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "First prompt" },
+    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
+    const interruptedRunId = "123e4567-e89b-42d3-a456-426614174011";
+    const interruptedRecords: readonly Omit<
+      Extract<SessionRecord, { readonly schemaVersion: 3 }>,
+      "sequence"
+    >[] = [
+      {
+        schemaVersion: 3,
+        record: {
+          type: "logical_run_started",
+          runId: interruptedRunId,
+          userMessage: "Interrupted prompt",
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId: interruptedRunId,
+          event: { type: "user_message", text: "Interrupted prompt" },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "provider_attempt_started",
+          runId: interruptedRunId,
+          turn: 1,
+          attempt: 1,
+          targetIdentity,
+          promptProjection: promptProjectionFor(created, [
+            { role: "user", content: "First prompt" },
+            { role: "assistant", content: "First answer.", toolCalls: [] },
+            { role: "user", content: "Interrupted prompt" },
+          ]),
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId: interruptedRunId,
+          event: { type: "model_message_started" },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId: interruptedRunId,
+          event: { type: "session_interrupted", reason: "cancelled" },
+        },
+      },
+    ];
+    for (const [index, record] of interruptedRecords.entries()) {
+      await store.append({
+        ...record,
+        sequence: completed.snapshot.lastSequence + index + 1,
+      } as SessionRecord);
+    }
+    const beforeEntry = await store.read();
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "interrupted",
+    });
+
+    await expect(lifecycle.enterPlan({ sessionId: created.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+    await expect(store.read()).resolves.toEqual(beforeEntry);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle never exposes Plan entry as a model tool", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-model-entry-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      expect(request.tools.some((tool) => tool.name === "enter_plan")).toBe(false);
+      return [
+        { type: "tool_call_start", id: "model-enter-plan", name: "enter_plan" },
+        { type: "tool_call_delta", id: "model-enter-plan", json: "{}" },
+        { type: "tool_call_end", id: "model-enter-plan" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.at(-1)).toEqual({
+      role: "tool",
+      callId: "model-enter-plan",
+      name: "enter_plan",
+      result: {
+        status: "failed",
+        error: { code: "unknown_tool", message: "Unknown tool: enter_plan" },
+      },
+    });
+    return [
+      { type: "text_delta", text: "Only an external user command can enter Plan." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Try to enter Plan yourself." },
+      limits: { maxTurns: 2 },
+    });
+
+    expect(continued).toMatchObject({
+      result: { status: "completed", answer: "Only an external user command can enter Plan." },
+    });
+    expect(continued.snapshot).not.toHaveProperty("plan");
+    expect(requestCount).toBe(2);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects an unsupported durable Plan policy before model use", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-policy-history-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const initial = createSessionLifecycle({ stateRoot, workspaceRoot });
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+  let resolveCalls = 0;
+
+  try {
+    const created = await initial.create({ targetIdentity });
+    await initial.enterPlan({ sessionId: created.sessionId });
+    await expect(initial.close()).resolves.toEqual({ status: "closed" });
+    const sessionPath = join(
+      stateRoot,
+      "projects",
+      created.projectId.replace(/^sha256:/u, ""),
+      "sessions",
+      `${created.sessionId}.jsonl`,
+    );
+    const durableHistory = await readFile(sessionPath, "utf8");
+    expect(durableHistory.match(/plan-policy\.read-v1/gu)).toHaveLength(1);
+    await writeFile(
+      sessionPath,
+      durableHistory.replace("plan-policy.read-v1", "plan-policy.future-v99"),
+      "utf8",
+    );
+    const modelTargets: ModelTargets = {
+      async resolve() {
+        resolveCalls += 1;
+        throw new Error("An unsupported durable Plan policy must fail before model resolution.");
+      },
+      async snapshot() {
+        return {
+          targets: [
+            {
+              identity: targetIdentity,
+              readiness: { status: "available", credentialSource: "deterministic test adapter" },
+              contextProfile: testContextProfile,
+            },
+          ],
+        };
+      },
+    };
+    cold = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+    await expect(
+      cold.continue({
+        sessionId: created.sessionId,
+        input: { text: "Do not silently upgrade this Plan cycle." },
+      }),
+    ).rejects.toMatchObject({ code: "session_log_invalid" });
+    expect(resolveCalls).toBe(0);
+  } finally {
+    await initial.close();
+    await cold?.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a self-consistent forged Plan profile before model resolution", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-profile-tamper-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const initial = createSessionLifecycle({ stateRoot, workspaceRoot });
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+  let resolveCalls = 0;
+
+  try {
+    const created = await initial.create({ targetIdentity });
+    await initial.enterPlan({ sessionId: created.sessionId });
+    await expect(initial.close()).resolves.toEqual({ status: "closed" });
+    const sessionPath = join(
+      stateRoot,
+      "projects",
+      created.projectId.replace(/^sha256:/u, ""),
+      "sessions",
+      `${created.sessionId}.jsonl`,
+    );
+    const records = (await readFile(sessionPath, "utf8"))
+      .trimEnd()
+      .split("\n")
+      .map((line) => JSON.parse(line) as SessionRecord);
+    const entered = records.find(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "plan_cycle_entered",
+    );
+    if (entered?.schemaVersion !== 3 || entered.record.type !== "plan_cycle_entered") {
+      throw new Error("Expected the durable Plan entry.");
+    }
+    const forgedWithoutDigest = {
+      version: 1 as const,
+      source: entered.record.eligibleToolProfile.source,
+      definitions: entered.record.eligibleToolProfile.definitions.slice(1),
+    };
+    Object.assign(entered.record, {
+      eligibleToolProfile: {
+        ...forgedWithoutDigest,
+        digest: `sha256:${createHash("sha256")
+          .update(canonicalFixtureJson(forgedWithoutDigest))
+          .digest("hex")}`,
+      },
+    });
+    await writeFile(
+      sessionPath,
+      `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+      "utf8",
+    );
+    const modelTargets: ModelTargets = {
+      async resolve() {
+        resolveCalls += 1;
+        return {
+          identity: targetIdentity,
+          driver: new FakeModelDriver([
+            { type: "text_delta", text: "must not run" },
+            { type: "finish", reason: "stop" },
+          ]),
+          contextProfile: testContextProfile,
+        };
+      },
+      async snapshot() {
+        return {
+          targets: [
+            {
+              identity: targetIdentity,
+              readiness: { status: "available", credentialSource: "deterministic test adapter" },
+              contextProfile: testContextProfile,
+            },
+          ],
+        };
+      },
+    };
+    cold = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+
+    await expect(
+      cold.continue({
+        sessionId: created.sessionId,
+        input: { text: "Do not accept a forged eligible profile." },
+      }),
+    ).rejects.toMatchObject({ code: "session_invalid" });
+    expect(resolveCalls).toBe(0);
+  } finally {
+    await initial.close();
+    await cold?.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle preserves the exact Plan cycle identity through context compaction", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-compaction-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "README.md"), "# Plan compaction\n", "utf8");
+  const compactProfile: ContextProfile = {
+    version: 1,
+    contextWindowTokens: 10_000,
+    maximumOutputTokens: 1_000,
+    compactAtTokens: 5_000,
+    postCompactTargetTokens: 3_000,
+    retainedTargetTokens: 200,
+    estimatorVersion: 1,
+  };
+  let ordinaryCalls = 0;
+  let compactionCalls = 0;
+  const driver = new FakeModelDriver((request) => {
+    if (request.tools.length === 0) {
+      compactionCalls += 1;
+      return [
+        {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Preserve the exact active Plan cycle.",
+            constraints: [],
+            progress: [],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: ["Complete the read-only inspection."],
+            nextSafeAction: "Read the requested file.",
+          }),
+        },
+        { type: "usage", inputTokens: 120, outputTokens: 30 },
+        { type: "finish", reason: "stop" },
+      ];
+    }
+    ordinaryCalls += 1;
+    return ordinaryCalls === 1
+      ? [
+          { type: "tool_call_start", id: "plan-read", name: "read_file" },
+          { type: "tool_call_delta", id: "plan-read", json: '{"path":"README.md"}' },
+          { type: "tool_call_end", id: "plan-read" },
+          { type: "usage", inputTokens: 7_000, outputTokens: 10 },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          { type: "text_delta", text: "The read-only inspection survived compaction." },
+          { type: "usage", inputTokens: 80, outputTokens: 12 },
+          { type: "finish", reason: "stop" },
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: compactProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: compactProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const entered = await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const plan = entered.plan;
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Inspect README without changing the repository." },
+    });
+    expect(continued.result).toEqual({
+      status: "completed",
+      answer: "The read-only inspection survived compaction.",
+    });
+    expect(continued.snapshot).toMatchObject({ plan });
+    expect(compactionCalls).toBe(1);
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      plan,
+      context: { checkpoint: { status: "committed" } },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle prefix branch inherits the exact selected exploring Plan state", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-branch-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const parent = await lifecycle.create({ targetIdentity });
+    const entered = await lifecycle.enterPlan({ sessionId: parent.sessionId });
+    const child = await lifecycle.branch({
+      parentSessionId: parent.sessionId,
+      atSequence: entered.lastSequence,
+    });
+
+    expect(child).toMatchObject({
+      lineage: {
+        parentSessionId: parent.sessionId,
+        parentEventPosition: entered.lastSequence,
+      },
+      plan: entered.plan,
+    });
+    await expect(lifecycle.inspect({ sessionId: child.sessionId })).resolves.toMatchObject({
+      plan: entered.plan,
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a branch whose inherited Plan identity diverges from its source prefix", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-branch-tamper-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const parent = await lifecycle.create({ targetIdentity });
+    const entered = await lifecycle.enterPlan({ sessionId: parent.sessionId });
+    const child = await lifecycle.branch({
+      parentSessionId: parent.sessionId,
+      atSequence: entered.lastSequence,
+    });
+    const childStore = await harness.sessions.open(child.sessionId);
+    if (childStore === undefined) {
+      throw new Error("Expected the child session store.");
+    }
+    const inherited = (await childStore.read()).find(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "plan_cycle_inherited",
+    );
+    if (inherited?.schemaVersion !== 3 || inherited.record.type !== "plan_cycle_inherited") {
+      throw new Error("Expected the inherited Plan record.");
+    }
+    Object.assign(inherited.record, { cycleId: "123e4567-e89b-42d3-a456-426614174099" });
+
+    await expect(lifecycle.inspect({ sessionId: child.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects forged Plan inheritance from an inactive source prefix", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-branch-inactive-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const inactiveParent = await lifecycle.create({ targetIdentity });
+    const donor = await lifecycle.create({ targetIdentity });
+    const donorPlan = (await lifecycle.enterPlan({ sessionId: donor.sessionId })).plan;
+    if (donorPlan === undefined) {
+      throw new Error("Expected the donor Plan cycle.");
+    }
+    const child = await lifecycle.branch({
+      parentSessionId: inactiveParent.sessionId,
+      atSequence: inactiveParent.lastSequence,
+    });
+    const childStore = await harness.sessions.open(child.sessionId);
+    if (childStore === undefined) {
+      throw new Error("Expected the child session store.");
+    }
+    await childStore.append({
+      schemaVersion: 3,
+      sequence: 2,
+      record: {
+        type: "plan_cycle_inherited",
+        recordVersion: 1,
+        cycleId: donorPlan.cycleId,
+        revision: donorPlan.revision,
+        policyVersion: donorPlan.policyVersion,
+        eligibleToolProfile: donorPlan.eligibleToolProfile,
+        source: {
+          sessionId: inactiveParent.sessionId,
+          throughSequence: inactiveParent.lastSequence,
+        },
+      },
+    });
+
+    await expect(lifecycle.inspect({ sessionId: child.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
 
 function promptProjectionFor(
   snapshot: {
@@ -432,6 +1204,56 @@ function canonicalFixtureJson(value: unknown): string {
       .join(",")}}`;
   }
   throw new TypeError("Fixture canonical JSON requires a JSON value.");
+}
+
+function createAdam7BoundaryPng(): Buffer {
+  const width = 4_096;
+  const height = 4_096;
+  const passes = [
+    [0, 0, 8, 8],
+    [4, 0, 8, 8],
+    [0, 4, 4, 8],
+    [2, 0, 4, 4],
+    [0, 2, 2, 4],
+    [1, 0, 2, 2],
+    [0, 1, 1, 2],
+  ] as const;
+  const rawByteLength = passes.reduce((total, [xStart, yStart, xStep, yStep]) => {
+    const passWidth = Math.ceil(Math.max(0, width - xStart) / xStep);
+    const passHeight = Math.ceil(Math.max(0, height - yStart) / yStep);
+    return total + passHeight * (passWidth * 8 + 1);
+  }, 0);
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header.set([16, 6, 0, 0, 1], 8);
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    createPngChunk("IHDR", header),
+    createPngChunk("IDAT", deflateSync(Buffer.alloc(rawByteLength))),
+    createPngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+function createPngChunk(type: "IDAT" | "IEND" | "IHDR", data: Buffer): Buffer {
+  const typeBytes = Buffer.from(type, "ascii");
+  const chunk = Buffer.alloc(12 + data.byteLength);
+  chunk.writeUInt32BE(data.byteLength, 0);
+  typeBytes.copy(chunk, 4);
+  data.copy(chunk, 8);
+  chunk.writeUInt32BE(pngFixtureCrc32(Buffer.concat([typeBytes, data])), 8 + data.byteLength);
+  return chunk;
+}
+
+function pngFixtureCrc32(bytes: Uint8Array): number {
+  let crc = 0xffffffff;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
+  }
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
 function snapshotWithLastPromptProjection<Snapshot extends { readonly promptContext?: object }>(
@@ -2998,6 +3820,77 @@ test("SessionLifecycle trusts validated image bytes over names and rejects image
           message: "The selected image is corrupt or has an unsupported image format.",
         },
       },
+    });
+    expect(driverCalls).toBe(1);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle admits a compressed 16-bit RGBA Adam7 PNG at the exact image boundary", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-vision-adam7-boundary-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const selectedPath = join(testRoot, "boundary.png");
+  const pngBytes = createAdam7BoundaryPng();
+  const visionIdentity: ModelTargetIdentity = {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash-vision-exp",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  };
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, pngBytes);
+  let driverCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    driverCalls += 1;
+    return [
+      { type: "text_delta", text: "The boundary image was admitted." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: visionIdentity,
+        driver,
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+        modalityProfile: {
+          profileVersion: 1,
+          explicitUserImages: "supported",
+          imageToolResults: "unsupported",
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: visionIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: preparedDirectDeepSeekV2ContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    stateRoot: join(testRoot, "state"),
+    workspaceRoot,
+  });
+
+  try {
+    await expect(
+      lifecycle.admit({
+        targetIdentity: visionIdentity,
+        input: { text: "Inspect the exact boundary image." },
+        resourceSelections: [{ type: "local_file", path: selectedPath }],
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The boundary image was admitted." },
     });
     expect(driverCalls).toBe(1);
   } finally {

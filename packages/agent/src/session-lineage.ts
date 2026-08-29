@@ -8,6 +8,7 @@ import {
 import {
   isCompleteBranchBoundary,
   isGenesisRecord,
+  planCycleSnapshotFromRecords,
   promptContextRecordFromRecords,
 } from "./session-history-folds.js";
 import { validateCurrentSessionHistory } from "./session-history-validation.js";
@@ -47,12 +48,13 @@ export function createSessionLineageTraversal(input: {
     genesis: SessionGenesisRecord,
     records: readonly SessionRecord[],
   ): Promise<void> {
-    await validateSessionLineageAncestors(genesis, new Set([genesis.record.sessionId]));
+    await validateSessionLineageAncestors(genesis, records, new Set([genesis.record.sessionId]));
     await validateInheritedContextEvidence(genesis, records);
   }
 
   async function validateSessionLineageAncestors(
     genesis: SessionGenesisRecord,
+    records: readonly SessionRecord[],
     visited: ReadonlySet<string>,
   ): Promise<void> {
     const lineage = genesis.record.lineage;
@@ -63,6 +65,7 @@ export function createSessionLineageTraversal(input: {
       throw new SessionLifecycleError("session_invalid");
     }
     const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(genesis);
+    validateInheritedPlanCycle(genesis, records, prefixRecords);
     const expectedPromptContext = promptContextRecordFromRecords(parentGenesis, prefixRecords);
     if (!isDeepStrictEqual(genesis.record.promptContext, expectedPromptContext)) {
       throw new SessionLifecycleError("session_invalid");
@@ -76,14 +79,62 @@ export function createSessionLineageTraversal(input: {
       }
       await validateSessionLineageAncestors(
         declaredParentGenesis,
+        declaredParentRecords,
         new Set([...visited, lineage.parentSessionId]),
       );
       return;
     }
     await validateSessionLineageAncestors(
       parentGenesis,
+      await input.readRecords(parentGenesis.record.sessionId),
       new Set([...visited, lineage.parentSessionId]),
     );
+  }
+
+  function validateInheritedPlanCycle(
+    genesis: SessionGenesisRecord,
+    records: readonly SessionRecord[],
+    prefixRecords: readonly SessionRecord[],
+  ): void {
+    const lineage = genesis.record.lineage;
+    if (lineage === undefined) {
+      return;
+    }
+    const inherited = records.filter(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "plan_cycle_inherited",
+    );
+    const expected = planCycleSnapshotFromRecords(prefixRecords);
+    if (expected === undefined) {
+      if (inherited.length > 0) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return;
+    }
+    const actual = inherited[0];
+    const sourceSessionId =
+      "recordVersion" in lineage ? lineage.sourceSessionId : lineage.parentSessionId;
+    const sourceEventPosition =
+      "recordVersion" in lineage ? lineage.sourceEventPosition : lineage.parentEventPosition;
+    if (
+      inherited.length !== 1 ||
+      actual?.schemaVersion !== 3 ||
+      actual.sequence !== 2 ||
+      actual.record.type !== "plan_cycle_inherited" ||
+      actual.record.source.sessionId !== sourceSessionId ||
+      actual.record.source.throughSequence !== sourceEventPosition ||
+      !isDeepStrictEqual(
+        {
+          state: "exploring",
+          cycleId: actual.record.cycleId,
+          revision: actual.record.revision,
+          policyVersion: actual.record.policyVersion,
+          eligibleToolProfile: actual.record.eligibleToolProfile,
+        },
+        expected,
+      )
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
   }
 
   async function sessionInheritsSourceBoundary(

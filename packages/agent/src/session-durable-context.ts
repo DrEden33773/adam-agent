@@ -2,6 +2,7 @@ import type { ModelMessage } from "./agent-session-contracts.js";
 import type { ContextEvidenceV1 } from "./durable-context.js";
 import type { InputResourceOccurrenceV1 } from "./input-resources.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
+import type { PlanCycleSnapshot } from "./plan-mode.js";
 import type { PromptContextRecord } from "./prompt-assembly.js";
 import type {
   ExtensionSkillSourceV1,
@@ -28,6 +29,7 @@ export type AgentSessionDurableContext = {
   readonly inputResourceRunBytes?: number;
   readonly initialMessages?: readonly ModelMessage[];
   readonly nextSequence: number;
+  readonly plan?: PlanCycleSnapshot;
   readonly newRunId?: string;
   readonly projectId?: string;
   readonly promptContext?: PromptContextRecord | undefined;

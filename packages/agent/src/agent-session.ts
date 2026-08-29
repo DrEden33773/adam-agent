@@ -60,6 +60,7 @@ import {
   prepareExplicitUserImageMessagesV1,
   projectedContentUsageV1,
 } from "./model-user-content.js";
+import type { PlanCycleSnapshot } from "./plan-mode.js";
 import {
   assemblePromptMessagesV1,
   createPromptContextV1,
@@ -153,6 +154,8 @@ export class AgentSession {
   readonly #model: ModelDriver;
   readonly #modalityProfile: ModelModalityProfile | undefined;
   readonly #tools: ToolRegistry | undefined;
+  readonly #fixedRequestTools: readonly ModelToolDefinition[] | undefined;
+  readonly #plan: PlanCycleSnapshot | undefined;
   readonly #permissions: PermissionPolicy | undefined;
   #promptContext: PromptContextRecord | undefined;
   #skillContext: SkillContextRecordV1 | undefined;
@@ -244,6 +247,13 @@ export class AgentSession {
             "run_shell",
           ])
         : captureToolRegistry(dependencies.tools, selectedToolNames);
+    this.#plan = this.#durableContext?.plan;
+    this.#fixedRequestTools =
+      this.#durableContext !== undefined && durablePromptContext === undefined
+        ? undefined
+        : this.#plan === undefined
+          ? (this.#tools?.definitions() ?? [])
+          : planRequestToolDefinitions(this.#tools, this.#plan);
     this.#permissions = dependencies.permissions;
     this.#promptContext =
       this.#durableContext === undefined
@@ -551,7 +561,7 @@ export class AgentSession {
         return this.#settleTurnLimitExceeded();
       }
       let requestMessages = this.#assemblePromptMessages(messages);
-      const requestTools = this.#tools?.definitions() ?? [];
+      const requestTools = this.#fixedRequestTools ?? this.#tools?.definitions() ?? [];
       let activeEstimate =
         this.#contextProfile === undefined
           ? undefined
@@ -1449,7 +1459,7 @@ export class AgentSession {
       const replacementTooLarge =
         this.#estimatePromptTokens(
           this.#assemblePromptMessages(replacementMessages),
-          this.#tools?.definitions() ?? [],
+          this.#fixedRequestTools ?? this.#tools?.definitions() ?? [],
         ) >= contextProfile.postCompactTargetTokens;
       if (replacementTooLarge) {
         const smallerRetryMessages = shrinkContextMessagesForRetry(replacementMessages);
@@ -1949,9 +1959,11 @@ export class AgentSession {
         error: {
           code: "unknown_tool",
           message:
-            call.name === "search_repository"
-              ? "Repository search is unavailable in this historical Tool Profile. Start a new session to use search_repository."
-              : `Unknown tool: ${call.name}`,
+            this.#plan !== undefined
+              ? "Plan denies tools outside its exact eligible Tool Profile."
+              : call.name === "search_repository"
+                ? "Repository search is unavailable in this historical Tool Profile. Start a new session to use search_repository."
+                : `Unknown tool: ${call.name}`,
         },
       };
       toolResultsById.set(call.id, { call, result });
@@ -1965,6 +1977,13 @@ export class AgentSession {
       return undefined;
     }
     const preparedPermissionSubject = preparedCall.permissionSubject;
+    const permissionInput: PermissionPolicyInput = {
+      callId: call.id,
+      name: call.name,
+      effect: adapter.effect,
+      scope: "call",
+      subject: preparedPermissionSubject,
+    };
     const visibleModelSkillSelection =
       preparedPermissionSubject.type === "skill" &&
       preparedPermissionSubject.operation === "activate" &&
@@ -1977,6 +1996,32 @@ export class AgentSession {
         error: {
           code: "skill_unavailable",
           message: "The requested Agent Skill is unavailable in the visible catalog.",
+        },
+      };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    const eligiblePlanDefinition = this.#plan?.eligibleToolProfile.definitions.find(
+      (definition) => definition.name === call.name,
+    );
+    if (
+      this.#plan !== undefined &&
+      (eligiblePlanDefinition === undefined ||
+        eligiblePlanDefinition.definitionDigest !== adapter.definitionDigest ||
+        eligiblePlanDefinition.effect !== adapter.effect ||
+        adapter.effect !== "read")
+    ) {
+      await this.#emit({
+        type: "tool_permission_decided",
+        decision: "deny",
+        ...permissionInput,
+      });
+      const result: ToolResult = {
+        status: "failed",
+        error: {
+          code: "permission_denied",
+          message: `Permission denied for tool in Plan: ${call.name}`,
         },
       };
       toolResultsById.set(call.id, { call, result });
@@ -2050,15 +2095,8 @@ export class AgentSession {
         }
       }
     }
-    const permissionInput: PermissionPolicyInput = {
-      callId: call.id,
-      name: call.name,
-      effect: adapter.effect,
-      scope: "call",
-      subject: preparedCall.permissionSubject,
-    };
     const policyDecision =
-      preparedPermissionSubject.type === "input_resource"
+      this.#plan !== undefined || preparedPermissionSubject.type === "input_resource"
         ? "allow"
         : (this.#permissions?.decide(permissionInput) ?? "deny");
     if (signal.aborted) {
@@ -3723,6 +3761,38 @@ function filterLiveToolRegistry(
     definitions: () => tools.definitions().filter((definition) => selected.has(definition.name)),
     resolve: (name) => (selected.has(name) ? tools.resolve(name) : undefined),
   };
+}
+
+function planRequestToolDefinitions(
+  tools: ToolRegistry | undefined,
+  plan: PlanCycleSnapshot | undefined,
+): readonly ModelToolDefinition[] {
+  if (tools === undefined) {
+    if (plan !== undefined) {
+      throw new TypeError("The exact Plan Tool Profile is not supported.");
+    }
+    return [];
+  }
+  if (plan === undefined) {
+    return tools.definitions();
+  }
+  const visibleDefinitions = new Map(
+    tools.definitions().map((definition) => [definition.name, definition] as const),
+  );
+  return plan.eligibleToolProfile.definitions.map((definition) => {
+    const modelDefinition = visibleDefinitions.get(definition.name);
+    const adapter = tools.resolve(definition.name);
+    if (
+      modelDefinition === undefined ||
+      adapter === undefined ||
+      adapter.definitionDigest !== definition.definitionDigest ||
+      adapter.effect !== definition.effect ||
+      definition.effect !== "read"
+    ) {
+      throw new TypeError("The exact Plan Tool Profile is not supported.");
+    }
+    return modelDefinition;
+  });
 }
 
 function areOptionalUsageDetailsValid(

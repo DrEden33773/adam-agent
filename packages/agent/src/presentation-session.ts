@@ -500,6 +500,7 @@ export async function createPresentationSession(
               skills: projectSkills(created),
               projectPaths,
               mcp: projectMcp(created),
+              ...(created.plan === undefined ? {} : { plan: created.plan }),
             },
     };
     let attachmentAvailable = initialDraft !== null || sessionSupportsInputResources(created);
@@ -1080,6 +1081,7 @@ export async function createPresentationSession(
             skills: projectSkills(snapshot),
             projectPaths,
             mcp: projectMcp(snapshot),
+            ...(snapshot.plan === undefined ? {} : { plan: snapshot.plan }),
           },
         },
         draft: null,
@@ -2763,6 +2765,58 @@ export async function createPresentationSession(
             status: "rejected",
             code: "authority_rejected",
             message: "The session name was not accepted.",
+          };
+        }
+      }
+      if (command.type === "enter_plan") {
+        if (command.sessionId !== state.authoritative.active?.session.id) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected session is no longer active.",
+          };
+        }
+        try {
+          const snapshot = await options.lifecycle.enterPlan(command);
+          await activateSnapshot(snapshot);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch (error) {
+          if (error instanceof SessionLifecycleError && error.code === "session_plan_unavailable") {
+            return {
+              status: "rejected",
+              code: "not_available",
+              message: error.message,
+            };
+          }
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "Plan could not be entered from the current session state.",
+          };
+        }
+      }
+      if (command.type === "exit_plan") {
+        const plan = state.authoritative.active?.plan;
+        if (
+          command.sessionId !== state.authoritative.active?.session.id ||
+          command.cycleId !== plan?.cycleId ||
+          command.revision !== plan.revision
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected Plan cycle is no longer current.",
+          };
+        }
+        try {
+          const snapshot = await options.lifecycle.exitPlan(command);
+          await activateSnapshot(snapshot);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "The current Plan cycle could not be exited.",
           };
         }
       }
