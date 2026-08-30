@@ -54,6 +54,15 @@ const alternateTargetIdentity: ModelTargetIdentity = {
   profileVersion: 1,
   certification: "experimental",
 };
+const hostileTargetIdentity: ModelTargetIdentity = {
+  targetId:
+    "fixture-catalog-owned-target-with-a-deliberately-long-exact-identity-for-responsive-detail-wrapping.direct",
+  vendor: "fixture-provider",
+  modelId: "fixture-hostile-catalog",
+  route: "direct",
+  profileVersion: 1,
+  certification: "experimental",
+};
 const launchTargetIdentities: readonly ModelTargetIdentity[] = [
   {
     targetId: "deepseek-v4-flash.direct",
@@ -320,6 +329,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       options.scenario === "reasoning-large-multiple" ||
       options.scenario === "reasoning-artifact-session-race" ||
       options.scenario === "target-navigation" ||
+      options.scenario === "target-navigation-unavailable" ||
       options.scenario === "tool-multiple" ||
       options.scenario === "unsafe-history"
         ? await lifecycle.create({ targetIdentity }).then(async (created) => {
@@ -384,7 +394,10 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
                 sessionId: created.sessionId,
                 input: { text: "Resume transcript" },
               });
-            } else if (options.scenario === "target-navigation") {
+            } else if (
+              options.scenario === "target-navigation" ||
+              options.scenario === "target-navigation-unavailable"
+            ) {
               await lifecycle.continue({
                 sessionId: created.sessionId,
                 input: { text: "Keep historical target identity" },
@@ -482,6 +495,18 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
                   : { [turnComposerStageBarrier]: composerBarrier }),
               },
     );
+    if (options.scenario === "target-connection-multiple" && options.controlRoot !== undefined) {
+      const targetIds = ["deepseek-v4-flash.direct", "deepseek-v4-pro.direct"] as const;
+      const started = targetIds.map((targetId) =>
+        waitForFile(options.controlRoot as string, `target-connection-pending-${targetId}`),
+      );
+      for (const targetId of targetIds) {
+        void presentation.dispatch({ type: "test_target_connection", targetId });
+      }
+      if ((await Promise.all(started)).some((ready) => !ready)) {
+        throw new Error("The multiple target connection fixture did not become pending.");
+      }
+    }
     const clipboard = options.clipboard ?? clipboardAdapter(options);
     const deadlineScheduler = options.deadlineScheduler ?? controlledDeadlineScheduler(options);
     const tuiPresentation = observeTuiDispatch(presentation, options);
@@ -803,6 +828,7 @@ function observeTuiDispatch(
   }
   let artifactReadCount = 0;
   let reasoningSettlementObserved = false;
+  let targetNavigationSettlementObserved = false;
   return {
     async close() {
       await presentation.close();
@@ -936,6 +962,21 @@ function observeTuiDispatch(
         ) {
           reasoningSettlementObserved = true;
           void writeFile(join(controlRoot, "reasoning-session-settled"), "settled\n", "utf8");
+        }
+        if (
+          !targetNavigationSettlementObserved &&
+          options.scenario === "target-navigation" &&
+          controlRoot !== undefined &&
+          state.authoritative.active?.session.targetId === alternateTargetIdentity.targetId &&
+          state.authoritative.active.session.status === "settled" &&
+          state.transient === null
+        ) {
+          targetNavigationSettlementObserved = true;
+          void writeFile(
+            join(controlRoot, "target-navigation-session-settled"),
+            "settled\n",
+            "utf8",
+          );
         }
       }),
   };
@@ -1251,7 +1292,10 @@ function createFixtureModelTargets(options: {
         };
       } else if (options.scenario === "resume") {
         yield { type: "text_delta", text: "Previous answer." };
-      } else if (options.scenario === "target-navigation") {
+      } else if (
+        options.scenario === "target-navigation" ||
+        options.scenario === "target-navigation-unavailable"
+      ) {
         yield { type: "text_delta", text: "Target navigation answer." };
       } else if (options.scenario === "shell") {
         const latest = request.messages.at(-1);
@@ -1613,45 +1657,84 @@ function createFixtureModelTargets(options: {
     async snapshot() {
       if (options.launch !== undefined) {
         return {
-          targets: launchTargetIdentities.map((identity) => ({
-            identity,
-            readiness: {
-              status: "available" as const,
-              credentialSource: "deterministic launch fixture",
-            },
-            contextProfile: preparedDirectDeepSeekV2ContextProfile,
-            thinkingCapability: requireFixtureThinkingCapability(identity.targetId),
-            ...(identity.modelId === "deepseek-v4-flash-vision-exp"
-              ? {
-                  modalityProfile: {
-                    profileVersion: 1 as const,
-                    explicitUserImages: "supported" as const,
-                    imageToolResults: "unsupported" as const,
+          targets: [
+            ...launchTargetIdentities.map((identity) => ({
+              identity,
+              catalog: fixtureCatalogMetadata(identity),
+              readiness: {
+                status: "available" as const,
+                credentialSource: "deterministic launch fixture",
+              },
+              contextProfile: preparedDirectDeepSeekV2ContextProfile,
+              thinkingCapability: requireFixtureThinkingCapability(identity.targetId),
+              connectionTest: "supported" as const,
+              ...(identity.modelId === "deepseek-v4-flash-vision-exp"
+                ? {
+                    modalityProfile: {
+                      profileVersion: 1 as const,
+                      explicitUserImages: "supported" as const,
+                      imageToolResults: "unsupported" as const,
+                    },
+                    upstreamLifecycle: "experimental" as const,
+                  }
+                : {}),
+            })),
+            ...(options.scenario === "target-unavailable"
+              ? [
+                  {
+                    identity: alternateTargetIdentity,
+                    catalog: fixtureCatalogMetadata(alternateTargetIdentity),
+                    readiness: {
+                      status: "missing" as const,
+                      credentialSource: "UNAVAILABLE_TEST_KEY",
+                    },
+                    contextProfile,
                   },
-                  connectionTest: "supported" as const,
-                  upstreamLifecycle: "experimental" as const,
-                }
-              : {}),
-          })),
+                ]
+              : []),
+            ...(options.scenario === "target-picker-hostile"
+              ? [
+                  {
+                    identity: hostileTargetIdentity,
+                    catalog: fixtureCatalogMetadata(hostileTargetIdentity),
+                    readiness: {
+                      status: "available" as const,
+                      credentialSource: "目录凭据\u001b]52;c;YXR0YWNr\u0007HOSTILE_TEST_KEY",
+                    },
+                    contextProfile: preparedDirectDeepSeekV2ContextProfile,
+                    upstreamLifecycle: "stable" as const,
+                  },
+                ]
+              : []),
+          ],
         };
       }
       return {
         targets: [
           {
             identity: targetIdentity,
+            catalog: fixtureCatalogMetadata(targetIdentity),
             readiness: { status: "available", credentialSource: "deterministic TUI fixture" },
             contextProfile,
             ...(options.scenario === "streaming" || options.scenario === "reasoning-streaming"
               ? { thinkingCapability: requireFixtureThinkingCapability(targetIdentity.targetId) }
               : {}),
           },
-          ...(options.scenario === "target-navigation"
+          ...(options.scenario === "target-navigation" ||
+          options.scenario === "target-navigation-unavailable"
             ? [
                 {
                   identity: alternateTargetIdentity,
+                  catalog: fixtureCatalogMetadata(alternateTargetIdentity),
                   readiness: {
-                    status: "available" as const,
-                    credentialSource: "deterministic alternate TUI fixture",
+                    status:
+                      options.scenario === "target-navigation-unavailable"
+                        ? ("missing" as const)
+                        : ("available" as const),
+                    credentialSource:
+                      options.scenario === "target-navigation-unavailable"
+                        ? "UNAVAILABLE_TRANSITION_KEY"
+                        : "deterministic alternate TUI fixture",
                   },
                   contextProfile,
                 },
@@ -1662,7 +1745,31 @@ function createFixtureModelTargets(options: {
     },
     async testConnection(input) {
       input.signal.throwIfAborted();
-      return input.targetId === "deepseek-v4-flash-vision-exp.direct"
+      if (
+        (options.scenario === "target-connection-pending" ||
+          options.scenario === "target-connection-multiple") &&
+        options.controlRoot !== undefined
+      ) {
+        const multiple = options.scenario === "target-connection-multiple";
+        await writeFile(
+          join(
+            options.controlRoot,
+            multiple ? `target-connection-pending-${input.targetId}` : "target-connection-pending",
+          ),
+          `${input.targetId}\n`,
+          "utf8",
+        );
+        if (
+          !(await waitForFile(
+            options.controlRoot,
+            multiple ? `release-target-connection-${input.targetId}` : "release-target-connection",
+            input.signal,
+          ))
+        ) {
+          throw input.signal.reason;
+        }
+      }
+      return input.targetId.startsWith("deepseek-")
         ? { status: "reachable", diagnostic: null }
         : {
             status: "unreachable",
@@ -1673,6 +1780,64 @@ function createFixtureModelTargets(options: {
           };
     },
   };
+}
+
+function fixtureCatalogMetadata(identity: ModelTargetIdentity) {
+  if (identity.modelId === "deepseek-v4-flash") {
+    return {
+      displayName: "DeepSeek V4 Flash",
+      summary: "Fast general-purpose coding model.",
+      capabilities: ["reasoning", "tool-use"] as const,
+      modalities: ["text"] as const,
+      recommended: true,
+    };
+  }
+  if (identity.modelId === "deepseek-v4-pro") {
+    return {
+      displayName: "DeepSeek V4 Pro",
+      summary: "Higher-capability coding model for complex work.",
+      capabilities: ["reasoning", "tool-use"] as const,
+      modalities: ["text"] as const,
+      recommended: false,
+    };
+  }
+  if (identity.modelId === "deepseek-v4-flash-vision-exp") {
+    return {
+      displayName: "DeepSeek V4 Flash Vision",
+      summary: "Vision-capable coding model for image-aware work.",
+      capabilities: ["reasoning", "tool-use"] as const,
+      modalities: ["text", "image"] as const,
+      recommended: false,
+    };
+  }
+  if (identity.modelId === "fake-local") {
+    return {
+      displayName: "Deterministic local model",
+      summary: "Deterministic current model used by the production TUI fixture.",
+      capabilities: ["tool-use"] as const,
+      modalities: ["text"] as const,
+      recommended: false,
+    };
+  }
+  if (identity.modelId === "fake-other") {
+    return {
+      displayName: "Deterministic alternate model",
+      summary: "Deterministic model target used by the production TUI fixture.",
+      capabilities: ["tool-use"] as const,
+      modalities: ["text"] as const,
+      recommended: false,
+    };
+  }
+  if (identity.modelId === "fixture-hostile-catalog") {
+    return {
+      displayName: "超长目录模型名称不会被裁剪 Alpha\u001b]52;c;YXR0YWNr\u0007",
+      summary: "目录权威摘要包含中文且控制序列必须保持惰性。\u001b[31munsafe\u001b[0m",
+      capabilities: ["tool-use"] as const,
+      modalities: ["text"] as const,
+      recommended: false,
+    };
+  }
+  throw new TypeError(`The fixture catalog metadata for ${identity.targetId} is unavailable.`);
 }
 
 function requireLaunchTargetIdentity(targetId: string): ModelTargetIdentity {

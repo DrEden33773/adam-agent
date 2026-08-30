@@ -2082,6 +2082,13 @@ test("PresentationSession projects exact target identity and readiness for proje
         targets: [
           {
             identity: targetIdentity,
+            catalog: {
+              displayName: "Catalog-owned Flash name",
+              summary: "Catalog-owned launch summary.",
+              capabilities: ["reasoning", "tool-use"],
+              modalities: ["text"],
+              recommended: true,
+            },
             readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
             contextProfile,
             thinkingCapability,
@@ -2145,6 +2152,12 @@ test("PresentationSession projects exact target identity and readiness for proje
         {
           targetId: "deepseek-v4-flash.direct",
           label: "deepseek-v4-flash",
+          provider: "deepseek",
+          displayName: "Catalog-owned Flash name",
+          summary: "Catalog-owned launch summary.",
+          capabilities: ["reasoning", "tool-use"],
+          modalities: ["text"],
+          recommended: true,
           route: "direct",
           certification: "Certified",
           readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
@@ -2164,6 +2177,12 @@ test("PresentationSession projects exact target identity and readiness for proje
         {
           targetId: "deepseek-v4-flash-vision-exp.direct",
           label: "deepseek-v4-flash-vision-exp",
+          provider: "deepseek",
+          displayName: "Unknown model target",
+          summary: "No catalog description is available.",
+          capabilities: [],
+          modalities: [],
+          recommended: false,
           route: "direct",
           certification: "Certified",
           upstreamLifecycle: "Experimental",
@@ -2179,6 +2198,12 @@ test("PresentationSession projects exact target identity and readiness for proje
         {
           targetId: "poolside-laguna-s-2.1-free.gateway",
           label: "poolside/laguna-s-2.1-free",
+          provider: "poolside",
+          displayName: "Unknown model target",
+          summary: "No catalog description is available.",
+          capabilities: [],
+          modalities: [],
+          recommended: false,
           route: "vercel-ai-gateway",
           certification: "Experimental",
           readiness: { status: "missing", credentialSource: "AI_GATEWAY_API_KEY" },

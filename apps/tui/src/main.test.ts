@@ -735,6 +735,33 @@ function latestSynchronizedFrame(output: string): readonly string[] {
   return Array.from({ length: lines.length }, (_, index) => lines[index] ?? "");
 }
 
+function containsColorSgrSequence(text: string): boolean {
+  let cursor = 0;
+  while (cursor < text.length) {
+    const introducer = text.indexOf("\u001b[", cursor);
+    if (introducer < 0) return false;
+    let terminator = introducer + 2;
+    while (
+      terminator < text.length &&
+      ((text[terminator] ?? "") === ";" ||
+        ((text[terminator] ?? "") >= "0" && (text[terminator] ?? "") <= "9"))
+    ) {
+      terminator += 1;
+    }
+    if (text[terminator] === "m") {
+      const codes = text
+        .slice(introducer + 2, terminator)
+        .split(";")
+        .map((code) => Number(code));
+      if (codes.some((code) => (code >= 30 && code <= 49) || (code >= 90 && code <= 107))) {
+        return true;
+      }
+    }
+    cursor = introducer + 2;
+  }
+  return false;
+}
+
 function keywordLabel(text: string): string {
   return `\u001b[1m\u001b[38;2;203;166;247m${text}\u001b[39m\u001b[22m`;
 }
@@ -778,7 +805,7 @@ function lastAbsoluteCursorColumn(output: string): number | undefined {
     .at(-1);
 }
 
-test("the production TUI selects an exact available target before creating an empty-project session", async () => {
+test("the production target picker renders catalog-owned product names and keeps exact identity in details", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-target-picker-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -793,16 +820,216 @@ test("the production TUI selects an exact available target before creating an em
     });
     await fixture.waitForCompleteFrameAfter("Select an exact model target", 0);
     expectFramedOverlay(fixture.output(), "Select an exact model target");
-    await fixture.waitFor("deepseek-v4-flash.direct");
-    await fixture.waitFor("deepseek-v4-pro.direct");
-    const targetFrame = latestSynchronizedFrame(fixture.output()).join("\n");
-    expect(targetFrame).toContain("deepseek-v4-flash-vision-exp.d");
-    expect(targetFrame).toContain("Upstream Experimental");
+    const beforeResize = fixture.output().length;
+    await fixture.resize(120, 40);
+    await fixture.waitForCompleteFrameAfter("DeepSeek V4 Flash Vision", beforeResize);
+    const targetFrame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
+    expect(targetFrame).toContain("DeepSeek V4 Flash");
+    expect(targetFrame).toContain("DeepSeek V4 Pro");
+    expect(targetFrame).toContain("DeepSeek V4 Flash Vision");
+    expect(targetFrame).toContain("Exact target  deepseek-v4-flash.direct");
+    expect(targetFrame).not.toContain("deepseek-v4-pro.direct");
+    expect(targetFrame).not.toContain("deepseek-v4-flash-vision-exp.direct");
     fixture.write("\r");
     await fixture.waitFor("Adam · New session");
     await fixture.waitFor("deepseek-v4-flash.direct · Certified");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production target picker preserves query and selection across responsive layout round trips", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-target-picker-responsive-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitForCompleteFrameAfter("Select an exact model target", 0);
+    fixture.write("pro");
+    await fixture.waitFor("Search: pro");
+
+    for (const columns of [40, 80, 120, 200, 80, 40]) {
+      await fixture.resize(columns, 40);
+      const frame = fixture.screen() ?? [];
+      const selected = frame.join("\n");
+      expect(selected).toContain("Search: pro");
+      expect(selected).toContain("DeepSeek V4 Pro");
+      expect(selected).toContain("Exact target");
+      expect(selected).toContain("deepseek-v4-pro.direct");
+      expect(
+        frame.filter((line) => visibleWidth(line) > columns),
+        `overflow at ${columns} columns`,
+      ).toEqual([]);
+      expect(
+        frame.some((line) => line.includes("Models [focused]") && line.includes("Details")),
+      ).toBe(columns >= 120);
+    }
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production target picker keeps its focused section and footer reachable at supported narrow heights", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-target-picker-height-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitForCompleteFrameAfter("Select an exact model target", 0);
+
+    for (const rows of [12, 24]) {
+      await fixture.resize(40, rows);
+      let frameLines = fixture.screen() ?? [];
+      let frame = frameLines.join("\n");
+      expect(frame).toContain("Models [focused]");
+      expect(frame).toContain("DeepSeek V4 Flash");
+      expect(frame.replace(/[\s│]+/gu, " ")).toContain("Esc Close");
+      expect(frame).toContain("┌");
+      expect(frame).toContain("└");
+      expect(frameLines.filter((line) => line.length > 0).length).toBeLessThanOrEqual(rows);
+      expect(frameLines.every((line) => visibleWidth(line) <= 40)).toBe(true);
+
+      const beforeDetails = fixture.output().length;
+      fixture.write("\t");
+      await fixture.waitForAfter("Details [focused]", beforeDetails);
+      frameLines = fixture.screen() ?? [];
+      frame = frameLines.join("\n");
+      expect(frame.replace(/[\s│]+/gu, " ")).toContain("Exact target deepseek-v4-flash.direct");
+      expect(frame.replace(/[\s│]+/gu, " ")).toContain("Esc Close");
+      expect(frameLines.filter((line) => line.length > 0).length).toBeLessThanOrEqual(rows);
+      expect(frameLines.every((line) => visibleWidth(line) <= 40)).toBe(true);
+
+      if (rows === 12) {
+        expect(frame).not.toContain("↑ Up");
+        expect(frame).toContain("↓ Down");
+        expect(frame).not.toContain("PgUp");
+        expect(frame).toContain("PgDn Page");
+        const beforePageDown = fixture.output().length;
+        fixture.write("\u001b[6~");
+        await fixture.waitForAfter("Details [focused]", beforePageDown);
+        const pagedDown = (fixture.screen() ?? []).join("\n");
+        expect(pagedDown).not.toBe(frame);
+        expect(pagedDown).toContain("PgUp/PgDn Page");
+        const beforePageUp = fixture.output().length;
+        fixture.write("\u001b[5~");
+        await fixture.waitForAfter("Details [focused]", beforePageUp);
+        expect((fixture.screen() ?? []).join("\n")).toContain("PgDn Page");
+
+        const beforeScroll = fixture.output().length;
+        for (let offset = 0; offset < 20; offset += 1) fixture.write("\u001b[B");
+        await fixture.waitForAfter("Thinking", beforeScroll);
+        const bottom = (fixture.screen() ?? []).join("\n");
+        expect(bottom.replace(/[\s│]+/gu, " ")).toContain("Esc Close");
+        expect(bottom).toContain("↑ Up");
+        expect(bottom).not.toContain("↓ Down");
+        expect(bottom).toContain("PgUp Page");
+        expect(bottom).not.toContain("PgDn");
+        const beforeBottomPageUp = fixture.output().length;
+        fixture.write("\u001b[5~");
+        await fixture.waitForAfter("Details [focused]", beforeBottomPageUp);
+        expect((fixture.screen() ?? []).join("\n")).not.toBe(bottom);
+        const beforeBottomPageDown = fixture.output().length;
+        fixture.write("\u001b[6~");
+        await fixture.waitForAfter("Thinking", beforeBottomPageDown);
+        expect((fixture.screen() ?? []).join("\n")).toContain("PgUp Page");
+        const beforeSingleUp = fixture.output().length;
+        fixture.write("\u001b[A");
+        await fixture.waitForAfter("Details [focused]", beforeSingleUp);
+        expect((fixture.screen() ?? []).join("\n")).not.toBe(bottom);
+        for (let offset = 0; offset < 19; offset += 1) fixture.write("\u001b[A");
+        await fixture.waitFor("Exact target  deepseek-v4-flash.direct");
+      }
+
+      const beforeModels = fixture.output().length;
+      fixture.write("\t");
+      await fixture.waitForAfter("Models [focused]", beforeModels);
+    }
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production target picker preserves long catalog truth and details focus across every responsive boundary", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-target-picker-hostile-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const unsafeClipboardSequence = "\u001b]52;c;YXR0YWNr\u0007";
+  const unsafeColorSequence = "\u001b[31munsafe\u001b[0m";
+  const exactTargetId =
+    "fixture-catalog-owned-target-with-a-deliberately-long-exact-identity-for-responsive-detail-wrapping.direct";
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: {},
+      noColor: true,
+      scenario: "target-picker-hostile",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("超长");
+    await fixture.waitFor("Search: 超长");
+    fixture.write("\t");
+    await fixture.waitFor("Details [focused]");
+
+    for (const columns of [40, 79, 80, 119, 120, 200]) {
+      await fixture.resize(columns, 40);
+      const frame = fixture.screen() ?? [];
+      const rawFrame = latestSynchronizedFrame(fixture.output());
+      const rendered = frame.join("\n");
+      const normalizedWideCells = rendered.replace(/(?<=\p{Script=Han}) /gu, "");
+      expect(normalizedWideCells).toContain("Search: 超长");
+      expect(normalizedWideCells).toContain("超长目录模型名称不会被裁剪 Alpha");
+      expect(rendered).toContain("Details [focused]");
+      if (columns >= 80) {
+        expect(rendered).toContain("Upstream  Stable");
+      }
+      expect(rendered.replace(/[\s│]/gu, "")).toContain(exactTargetId);
+      expect(
+        rawFrame.filter((line) => visibleWidth(line) > columns),
+        `overflow at ${columns} columns`,
+      ).toEqual([]);
+      expect(containsColorSgrSequence(rawFrame.join("\n"))).toBe(false);
+      expect(rendered).toContain("UNCERTIFIED · Ready");
+      expect(
+        frame.some((line) => line.includes("Models") && line.includes("Details [focused]")),
+      ).toBe(columns >= 120);
+      const modelLine = frame.find((line) => line.includes("Alpha"));
+      expect(modelLine?.includes("UNCERTIFIED · Ready")).toBe(columns >= 80 && columns < 120);
+      if (columns === 200) {
+        const borderLine = frame.find((line) => line.includes("┌"));
+        expect(borderLine).toBeDefined();
+        const border = borderLine?.slice(borderLine.indexOf("┌")) ?? "";
+        expect(visibleWidth(border)).toBeLessThanOrEqual(144);
+        const beforeDetailScroll = fixture.output().length;
+        for (let offset = 0; offset < 6; offset += 1) {
+          fixture.write("\u001b[B");
+        }
+        await fixture.waitForAfter("Thinking  Not available", beforeDetailScroll);
+        const scrolledDetails = (fixture.screen() ?? []).join("\n");
+        expect(scrolledDetails).toContain("Context  1,000,000 tokens");
+        expect(scrolledDetails).toContain("Thinking  Not available");
+      }
+    }
+
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).not.toContain(unsafeClipboardSequence);
+    expect(result.stdout).not.toContain(unsafeColorSequence);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -844,6 +1071,183 @@ test("the production TUI tests a configured exact target without conflating reac
       terminal.input("\u0011");
     }
     await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production target picker checks the focused API without turning connection state into row truth", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-picker-connection-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    const initial = (fixture.screen() ?? []).join("\n");
+    expect(initial).toContain("Connection not checked");
+    expect(initial).not.toContain("Configured · Not tested");
+    expect(initial).not.toContain("/help · Tab complete");
+    const flashIndex = initial.indexOf("DeepSeek V4 Flash");
+    const proIndex = initial.indexOf("DeepSeek V4 Pro");
+    expect(flashIndex).toBeGreaterThanOrEqual(0);
+    expect(proIndex).toBeGreaterThan(flashIndex);
+
+    fixture.write("direct");
+    await fixture.waitFor("Search: direct");
+    expect((fixture.screen() ?? []).join("\n")).toContain("Connection not checked");
+    const modelOrder = (lines: readonly string[]) =>
+      lines
+        .filter((line) => line.includes("DeepSeek V4") && line.includes("Ready"))
+        .map((line) =>
+          line.includes("Flash Vision") ? "vision" : line.includes("Pro") ? "pro" : "flash",
+        );
+    const beforeConnectionOrder = modelOrder(fixture.screen() ?? []);
+    fixture.write("\t");
+    await fixture.waitFor("Details [focused]");
+    fixture.write("x");
+    expect((fixture.screen() ?? []).join("\n")).toContain("Search: direct");
+    fixture.write("c");
+    await fixture.waitFor("Reachable");
+    const settled = (fixture.screen() ?? []).join("\n");
+    expect(settled).toContain("Connection  Reachable");
+    const settledLines = fixture.screen() ?? [];
+    expect(modelOrder(settledLines)).toEqual(beforeConnectionOrder);
+    expect(settled).toContain("c Check API");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production target picker preserves one in-flight API check identity across responsive layouts without persistence", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-picker-connection-pending-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const readDurableState = () =>
+    readFilesRecursively(stateRoot).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return "";
+      throw error;
+    });
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      launch: {},
+      scenario: "target-connection-pending",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\u001b[B");
+    await fixture.waitFor("Exact target  deepseek-v4-pro.direct");
+    const beforeCheck = await readDurableState();
+    fixture.write("\t");
+    await fixture.waitFor("Details [focused]");
+    fixture.write("c");
+    await waitForFileContents(
+      join(controlRoot, "target-connection-pending"),
+      "deepseek-v4-pro.direct\n",
+    );
+    await fixture.waitFor("Connection  Checking API…");
+
+    for (const columns of [40, 120, 200, 80]) {
+      await fixture.resize(columns, 40);
+      const frame = (fixture.screen() ?? []).join("\n");
+      expect(frame).toContain("DeepSeek V4 Pro");
+      expect(frame.replace(/[\s│]/gu, "")).toContain("deepseek-v4-pro.direct");
+      expect(frame).toContain("Connection  Checking API…");
+      expect(frame.replace(/[\s│]+/gu, " ")).toContain(
+        "Checking API for DeepSeek V4 Pro (deepseek-v4-pro.direct)…",
+      );
+      expect(frame.replace(/[\s│]+/gu, " ")).toContain("c Cancel DeepSeek V4 Pro API check");
+    }
+    expect(await readDurableState()).toBe(beforeCheck);
+
+    const beforeModels = fixture.output().length;
+    fixture.write("\t");
+    await fixture.waitForAfter("Models [focused]", beforeModels);
+    fixture.write("\u001b[B");
+    await fixture.waitFor("Exact target  deepseek-v4-flash-vision-exp.direct");
+    expect((fixture.screen() ?? []).join("\n").replace(/[\s│]+/gu, " ")).toContain(
+      "Checking API for DeepSeek V4 Pro (deepseek-v4-pro.direct)…",
+    );
+    const beforeDetails = fixture.output().length;
+    fixture.write("\t");
+    await fixture.waitForAfter("Details [focused]", beforeDetails);
+    expect((fixture.screen() ?? []).join("\n").replace(/[\s│]+/gu, " ")).toContain(
+      "c Cancel DeepSeek V4 Pro API check",
+    );
+    fixture.write("c");
+    await fixture.waitFor("API check cancelled for DeepSeek V4 Pro (deepseek-v4-pro.direct).");
+    expect(await readDurableState()).toBe(beforeCheck);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("multiple authoritative API checks require one exact Testing selection before cancellation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-picker-connection-multiple-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      launch: {},
+      scenario: "target-connection-multiple",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("vision");
+    await fixture.waitFor("Search: vision");
+    const beforeVisionDetails = fixture.output().length;
+    fixture.write("\t");
+    await fixture.waitForAfter("Details [focused]", beforeVisionDetails);
+    const nonTestingDetails = (fixture.screen() ?? []).join("\n");
+    expect(nonTestingDetails).not.toContain("c Check API");
+    expect(nonTestingDetails).not.toContain("c Cancel");
+
+    fixture.write("c");
+    const beforeModels = fixture.output().length;
+    fixture.write("\t");
+    await fixture.waitForAfter("Models [focused]", beforeModels);
+    for (let index = 0; index < "vision".length; index += 1) fixture.write("\u007f");
+    const beforeProQuery = fixture.output().length;
+    fixture.write("pro");
+    await fixture.waitForAfter("Search: pro", beforeProQuery);
+    const beforeProDetails = fixture.output().length;
+    fixture.write("\t");
+    await fixture.waitForAfter("Details [focused]", beforeProDetails);
+    expect((fixture.screen() ?? []).join("\n").replace(/[\s│]+/gu, " ")).toContain(
+      "c Cancel DeepSeek V4 Pro API check",
+    );
+
+    fixture.write("c");
+    await fixture.waitFor("API check cancelled for DeepSeek V4 Pro (deepseek-v4-pro.direct).");
+    expect((fixture.screen() ?? []).join("\n").replace(/[\s│]+/gu, " ")).toContain(
+      "c Cancel DeepSeek V4 Flash API check",
+    );
+
+    await writeFile(
+      join(controlRoot, "release-target-connection-deepseek-v4-flash.direct"),
+      "release\n",
+      "utf8",
+    );
+    await fixture.waitFor("c Check API");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -955,30 +1359,31 @@ test("the production target picker saves and clears its focused exact default se
     fixture.write("\u0013");
     await fixture.waitFor("Saved deepseek-v4-flash.direct as the default");
     const configurationPath = join(configRoot, "adam-agent", "config.json");
-    await waitForPath(configurationPath);
-    expect(await readFile(configurationPath, "utf8")).toBe(
-      `${JSON.stringify({
-        schemaVersion: 2,
-        defaultTargetId: "deepseek-v4-flash.direct",
-        modelPolicy: {
-          contextWindowTokens: null,
-          maximumOutputTokens: null,
-          automaticCompactionWindowTokens: null,
-        },
-      })}\n`,
+    const savedConfiguration = `${JSON.stringify({
+      schemaVersion: 2,
+      defaultTargetId: "deepseek-v4-flash.direct",
+      modelPolicy: {
+        contextWindowTokens: null,
+        maximumOutputTokens: null,
+        automaticCompactionWindowTokens: null,
+      },
+    })}\n`;
+    await expect(waitForFileContents(configurationPath, savedConfiguration)).resolves.toBe(
+      savedConfiguration,
     );
     fixture.write("\u0013");
     await fixture.waitFor("Cleared the saved default target");
-    expect(await readFile(configurationPath, "utf8")).toBe(
-      `${JSON.stringify({
-        schemaVersion: 2,
-        defaultTargetId: null,
-        modelPolicy: {
-          contextWindowTokens: null,
-          maximumOutputTokens: null,
-          automaticCompactionWindowTokens: null,
-        },
-      })}\n`,
+    const clearedConfiguration = `${JSON.stringify({
+      schemaVersion: 2,
+      defaultTargetId: null,
+      modelPolicy: {
+        contextWindowTokens: null,
+        maximumOutputTokens: null,
+        automaticCompactionWindowTokens: null,
+      },
+    })}\n`;
+    await expect(waitForFileContents(configurationPath, clearedConfiguration)).resolves.toBe(
+      clearedConfiguration,
     );
     fixture.write("\u0011");
     const result = await fixture.closed;
@@ -990,7 +1395,170 @@ test("the production target picker saves and clears its focused exact default se
   }
 });
 
-test("the production target picker clears a saved default that is absent from the catalog", async () => {
+test("the production target picker sorts and clears the saved default in place", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-target-default-row-"));
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  const configurationPath = join(configDirectory, "config.json");
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+  await mkdir(workspaceRoot);
+  await writeFile(
+    configurationPath,
+    `${JSON.stringify({ schemaVersion: 1, defaultTargetId: "deepseek-v4-pro.direct" })}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+
+  try {
+    const fixture = startFixture({ launch: { configRoot }, stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforePicker = fixture.output().length;
+    fixture.write("/target\r");
+    await fixture.waitForCompleteFrameAfter("Select an exact model target", beforePicker);
+    const frame = (fixture.screen() ?? []).join("\n");
+    expect(frame.indexOf("DeepSeek V4 Pro")).toBeLessThan(frame.indexOf("DeepSeek V4 Flash"));
+    expect(frame).toMatch(/DeepSeek V4 Pro.*DEFAULT.*Ready/u);
+    expect(frame).toMatch(/DeepSeek V4 Flash.*RECOMMENDED.*Ready/u);
+    expect(frame).not.toContain("Clear saved default");
+
+    fixture.write("\u0013");
+    await fixture.waitFor("Cleared the saved default target");
+    await waitForFileContents(
+      configurationPath,
+      `${JSON.stringify({
+        schemaVersion: 2,
+        defaultTargetId: null,
+        modelPolicy: {
+          contextWindowTokens: null,
+          maximumOutputTokens: null,
+          automaticCompactionWindowTokens: null,
+        },
+      })}\n`,
+    );
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production target picker keeps an unavailable target searchable without durable side effects", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-target-unavailable-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const configurationPath = join(configRoot, "adam-agent", "config.json");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: { configRoot },
+      scenario: "target-unavailable",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("alternate");
+    await fixture.waitFor("Search: alternate");
+    const focused = (fixture.screen() ?? []).join("\n");
+    expect(focused).toMatch(/Deterministic alternate model.*Setup/u);
+
+    const beforeRemediation = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForAfter("is not ready. Set", beforeRemediation);
+    const remediation = (fixture.screen() ?? []).join("\n");
+    expect(remediation).toContain("is not ready. Set");
+    expect(remediation).toContain("UNAVAILABLE_TEST_KEY and");
+    expect(remediation).toContain("retry.");
+    for (const [columns, rows] of [
+      [40, 12],
+      [120, 40],
+      [80, 40],
+    ] as const) {
+      await fixture.resize(columns, rows);
+      const resizedNotice = (fixture.screen() ?? []).join("\n");
+      expect(resizedNotice).toContain("Deterministic alternate model");
+      expect(resizedNotice.replace(/[\s│]+/gu, "")).toContain(
+        "Deterministicalternatemodelisnotready.SetUNAVAILABLE_TEST_KEYandretry.",
+      );
+      if (rows === 12) {
+        expect(resizedNotice).toContain("UNCERTIFIED · Setup");
+        expect(resizedNotice.replace(/[\s│]+/gu, " ")).toContain(
+          "Enter Setup help · Type Search · Tab Details · Esc Close",
+        );
+        expect(resizedNotice).toContain("└");
+      }
+    }
+    const beforeDefault = fixture.output().length;
+    fixture.write("\u0013");
+    await fixture.waitForAfter("is not ready. Set", beforeDefault);
+    await expect(readFile(configurationPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    const durable = await readFilesRecursively(stateRoot).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return "";
+      throw error;
+    });
+    expect(durable).not.toContain('"type":"session_genesis"');
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an unavailable saved default stays recoverable through its explicit Clear default action", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unavailable-default-"));
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  const configurationPath = join(configDirectory, "config.json");
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+  await mkdir(workspaceRoot);
+  await writeFile(
+    configurationPath,
+    `${JSON.stringify({ schemaVersion: 1, defaultTargetId: "fake.other" })}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+
+  try {
+    const fixture = startFixture({
+      launch: { configRoot },
+      scenario: "target-unavailable",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("alternate");
+    await fixture.waitFor("Search: alternate");
+    const unavailableDefault = (fixture.screen() ?? []).join("\n");
+    expect(unavailableDefault).toMatch(/Deterministic alternate model.*DEFAULT.*Setup/u);
+    expect(unavailableDefault).toContain("Ctrl+S Clear default");
+    expect(unavailableDefault).toContain("Enter Setup help");
+    expect(unavailableDefault).not.toContain("Save default");
+
+    fixture.write("\u0013");
+    await fixture.waitFor("Cleared the saved default target.");
+    await waitForFileContents(
+      configurationPath,
+      `${JSON.stringify({
+        schemaVersion: 2,
+        defaultTargetId: null,
+        modelPolicy: {
+          contextWindowTokens: null,
+          maximumOutputTokens: null,
+          automaticCompactionWindowTokens: null,
+        },
+      })}\n`,
+    );
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production target picker repairs an absent saved default through the focused real model", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-clear-missing-target-"));
   const configRoot = join(testRoot, "config");
   const configDirectory = join(configRoot, "adam-agent");
@@ -1016,13 +1584,21 @@ test("the production target picker clears a saved default that is absent from th
   try {
     const fixture = startFixture({ launch: { configRoot }, stateRoot, workspaceRoot });
     await fixture.waitFor("Select an exact model target");
-    await fixture.waitFor("Clear saved default");
-    fixture.write("clear");
-    await fixture.waitFor("Search: clear");
-    const beforeClear = fixture.output().length;
-    fixture.write("\u001b[A");
-    fixture.write("\r");
-    await fixture.waitForAfter("Cleared the saved default target", beforeClear);
+    expect((fixture.screen() ?? []).join("\n")).not.toContain("Clear saved default");
+    const beforeSave = fixture.output().length;
+    fixture.write("\u0013");
+    const savedConfiguration = `${JSON.stringify({
+      schemaVersion: 2,
+      defaultTargetId: "deepseek-v4-flash.direct",
+      modelPolicy: {
+        contextWindowTokens: null,
+        maximumOutputTokens: null,
+        automaticCompactionWindowTokens: null,
+      },
+    })}\n`;
+    await waitForFileContents(configurationPath, savedConfiguration);
+    await fixture.waitForAfter("Saved deepseek-v4-flash.direct as the default.", beforeSave);
+    fixture.write("\u0013");
     const expectedConfiguration = `${JSON.stringify({
       schemaVersion: 2,
       defaultTargetId: null,
@@ -5724,30 +6300,51 @@ test("the branch compatibility alias selects an authoritative complete boundary"
   }
 });
 
-test("slash Model and Target share an immutable-target transition page", async () => {
+test("slash Model and Target expose an explicit current-boundary fork onto the focused target", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-target-navigation-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
   await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
 
   try {
-    const fixture = startFixture({ scenario: "target-navigation", stateRoot, workspaceRoot });
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "target-navigation",
+      stateRoot,
+      workspaceRoot,
+    });
     await fixture.waitForCompleteFrameAfter("Target navigation answer.", 0);
     await fixture.waitForCompleteFrameAfter(" · idle", 0);
     const beforeModel = fixture.output().length;
     fixture.write("/model \r");
     await fixture.waitForAfter("Select an exact model target", beforeModel);
-    await fixture.waitForAfter(
-      "Current fake.local · existing session target immutable",
-      beforeModel,
-    );
+    await fixture.waitForAfter("Deterministic local model", beforeModel);
+    const initial = (fixture.screen() ?? []).join("\n");
+    expect(initial).toContain("CURRENT · Ready");
+    expect(initial).toContain("Ctrl+N New session");
+    expect(initial).toContain("Ctrl+F Fork current boundary");
+    const beforeUnsupportedDetails = fixture.output().length;
+    fixture.write("\t");
+    await fixture.waitForAfter("Details [focused]", beforeUnsupportedDetails);
+    expect((fixture.screen() ?? []).join("\n")).not.toContain("c Check API");
+    const beforeUnsupportedModels = fixture.output().length;
+    fixture.write("\t");
+    await fixture.waitForAfter("Models [focused]", beforeUnsupportedModels);
     fixture.write("other");
     await fixture.waitFor("Search: other");
+    await fixture.waitFor("Deterministic alternate model");
+    const beforeForkState = await readFilesRecursively(stateRoot);
+    expect(beforeForkState).not.toContain('"targetId":"fake.other"');
     fixture.write("\u0006");
-    await fixture.waitFor("fake.other · Experimental");
+    await fixture.waitFor("Adam · Branch of");
     const beforeTarget = fixture.output().length;
     fixture.write("/target \r");
     await fixture.waitForAfter("Select an exact model target", beforeTarget);
+    const transitioned = (fixture.screen() ?? []).join("\n");
+    expect(transitioned).toContain("Deterministic alternate model");
+    expect(transitioned).toContain("CURRENT · UNCERTIFIED · Ready");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     const durableState = await readFilesRecursively(stateRoot);
@@ -5755,6 +6352,110 @@ test("slash Model and Target share an immutable-target transition page", async (
     expect(durableState).toContain('"targetId":"fake.other"');
     expect(durableState).not.toContain('"text":"/model"');
     expect(durableState).not.toContain('"text":"/target"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an active target transition creates a new session only through its explicit New session action", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-target-new-session-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "target-navigation",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitForCompleteFrameAfter("Target navigation answer.", 0);
+    await fixture.waitForCompleteFrameAfter(" · idle", 0);
+    const backgroundFrame = fixture.screen() ?? [];
+    const backgroundStatusLine = backgroundFrame.find((line) => line.includes("fake.local ·"));
+    const backgroundHelpLine = backgroundFrame.find((line) =>
+      line.includes("/help · Tab complete"),
+    );
+    expect(backgroundStatusLine).toBeDefined();
+    expect(backgroundHelpLine).toBeDefined();
+    fixture.write("/model \r");
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("other");
+    await fixture.waitFor("Search: other");
+    await fixture.waitFor("Deterministic alternate model");
+    const beforeAction = await readFilesRecursively(stateRoot);
+    expect(beforeAction).not.toContain('"targetId":"fake.other"');
+    fixture.write("\u000e");
+    await fixture.waitFor("Adam · New session");
+    const afterAction = await readFilesRecursively(stateRoot);
+    expect(afterAction).toContain('"targetId":"fake.local"');
+    expect(afterAction).not.toContain('"targetId":"fake.other"');
+    fixture.write("Use the explicit alternate target\r");
+    await waitForPath(join(controlRoot, "target-navigation-session-settled"));
+    const afterAdmission = await readFilesRecursively(stateRoot);
+    expect(afterAdmission).toContain('"targetId":"fake.other"');
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an unavailable active-session target rejects Select, Default, New session, and Fork without side effects", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-target-transition-unavailable-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      scenario: "target-navigation-unavailable",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitForCompleteFrameAfter("Target navigation answer.", 0);
+    await fixture.waitForCompleteFrameAfter(" · idle", 0);
+    const backgroundFrame = fixture.screen() ?? [];
+    const backgroundStatusLine = backgroundFrame.find((line) => line.includes("fake.local ·"));
+    const backgroundHelpLine = backgroundFrame.find((line) =>
+      line.includes("/help · Tab complete"),
+    );
+    expect(backgroundStatusLine).toBeDefined();
+    expect(backgroundHelpLine).toBeDefined();
+    fixture.write("/model \r");
+    await fixture.waitFor("Select an exact model target");
+    const isolated = (fixture.screen() ?? []).join("\n");
+    expect(isolated).not.toContain(backgroundStatusLine?.trim());
+    expect(isolated).not.toContain(backgroundHelpLine?.trim());
+    fixture.write("other");
+    await fixture.waitFor("Search: other");
+    await fixture.waitFor("Deterministic alternate model");
+    const unavailableFooter = (fixture.screen() ?? []).join("\n");
+    expect(unavailableFooter).toContain("Enter Setup help");
+    expect(unavailableFooter).not.toContain("Ctrl+N New session");
+    expect(unavailableFooter).not.toContain("Ctrl+F Fork current boundary");
+    expect(unavailableFooter).not.toContain("Ctrl+S");
+    expect(unavailableFooter).not.toContain("c Check API");
+    const beforeSelection = await readFilesRecursively(stateRoot);
+    fixture.write("\r");
+    await fixture.waitFor("UNAVAILABLE_TRANSITION_KEY");
+    expect((fixture.screen() ?? []).join("\n")).not.toContain(
+      "Selected Deterministic alternate model.",
+    );
+    expect(await readFilesRecursively(stateRoot)).toBe(beforeSelection);
+
+    for (const action of ["\u0013", "\u000e", "\u0006"]) {
+      const beforeRejection = fixture.output().length;
+      fixture.write(action);
+      await fixture.waitForAfter("UNAVAILABLE_TRANSITION_KEY", beforeRejection);
+      expect(await readFilesRecursively(stateRoot)).toBe(beforeSelection);
+    }
+    expect(beforeSelection).not.toContain('"targetId":"fake.other"');
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

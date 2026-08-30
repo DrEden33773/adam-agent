@@ -67,6 +67,7 @@ export {
 } from "./model-driver-error.js";
 export {
   createModelTargets,
+  type ModelTargetCatalogMetadata,
   type ModelTargetConnectionTestResult,
   ModelTargetError,
   type ModelTargetIdentity,

@@ -31,6 +31,12 @@ export type ThinkingPolicySelectionDisplay = {
 export type TargetDisplay = {
   readonly targetId: string;
   readonly label: string;
+  readonly provider: string;
+  readonly displayName: string;
+  readonly summary: string;
+  readonly capabilities: readonly ("reasoning" | "tool-use")[];
+  readonly modalities: readonly ("text" | "image")[];
+  readonly recommended: boolean;
   readonly route: "direct" | "vercel-ai-gateway";
   readonly certification: "Certified" | "Experimental";
   readonly upstreamLifecycle?: "Experimental" | "Stable";
