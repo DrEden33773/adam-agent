@@ -92,6 +92,23 @@ function modelTargetsWithDriver(driver: ModelDriver): ModelTargets {
   };
 }
 
+function completedTodoItemId(messages: readonly ModelMessage[], name: string): string | undefined {
+  const message = messages.findLast(
+    (candidate) => candidate.role === "tool" && candidate.name === name,
+  );
+  const output =
+    message?.role === "tool" && message.result.status === "completed"
+      ? message.result.output
+      : undefined;
+  const item =
+    typeof output === "object" && output !== null ? Reflect.get(output, "item") : undefined;
+  const id = typeof item === "object" && item !== null ? Reflect.get(item, "id") : undefined;
+  if (typeof id !== "string") {
+    return undefined;
+  }
+  return id;
+}
+
 const visionResponsesIdentity: ModelTargetIdentity = {
   targetId: "deepseek-v4-flash-vision-exp.direct",
   vendor: "deepseek",
@@ -100,6 +117,395 @@ const visionResponsesIdentity: ModelTargetIdentity = {
   profileVersion: 2,
   certification: "certified",
 };
+
+test("SessionLifecycle folds Todo state across a deterministic restart", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-todo-restart-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  let firstCall = 0;
+  const firstDriver = new FakeModelDriver(() => {
+    firstCall += 1;
+    return firstCall === 1
+      ? [
+          { type: "tool_call_start", id: "create-restart-todo", name: "create_todo" },
+          {
+            type: "tool_call_delta",
+            id: "create-restart-todo",
+            json: '{"title":"Survive restart","details":"Exact durable details"}',
+          },
+          { type: "tool_call_end", id: "create-restart-todo" },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          { type: "text_delta", text: "Created before restart." },
+          { type: "finish", reason: "stop" },
+        ];
+  });
+  const firstLifecycle = harness.createLifecycle({
+    modelTargets: modelTargetsWithDriver(firstDriver),
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const created = await firstLifecycle.create({ targetIdentity });
+    await firstLifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Create one durable Todo." },
+    });
+    const records = await (await harness.sessions.open(created.sessionId))?.read();
+    const createdRecord = records?.find(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_created",
+    );
+    if (createdRecord?.schemaVersion !== 3 || createdRecord.record.type !== "todo_created") {
+      throw new Error("Expected one durable Todo creation record.");
+    }
+    const todoId = createdRecord.record.item.id;
+    await firstLifecycle.close();
+
+    let resumedCall = 0;
+    const resumedDriver = new FakeModelDriver((request) => {
+      resumedCall += 1;
+      const summary = request.messages.find(
+        (message) =>
+          message.role === "assistant" &&
+          message.content.startsWith("Adam runtime Todo summary v1"),
+      );
+      expect(summary?.content).toContain(
+        '"storeRevision":1,"counts":{"pending":1,"inProgress":0,"completed":0}',
+      );
+      if (resumedCall === 1) {
+        return [
+          { type: "tool_call_start", id: "get-restarted-todo", name: "get_todo" },
+          {
+            type: "tool_call_delta",
+            id: "get-restarted-todo",
+            json: JSON.stringify({ id: todoId }),
+          },
+          { type: "tool_call_end", id: "get-restarted-todo" },
+          { type: "finish", reason: "tool_calls" },
+        ];
+      }
+      expect(request.messages.at(-1)).toMatchObject({
+        role: "tool",
+        name: "get_todo",
+        result: {
+          status: "completed",
+          output: {
+            storeRevision: 1,
+            item: {
+              id: todoId,
+              status: "pending",
+              title: "Survive restart",
+              details: "Exact durable details",
+            },
+          },
+        },
+      });
+      return [
+        { type: "text_delta", text: "Read after restart." },
+        { type: "finish", reason: "stop" },
+      ];
+    });
+    const resumedLifecycle = harness.createLifecycle({
+      modelTargets: modelTargetsWithDriver(resumedDriver),
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+      stateRoot,
+      tools: createCodingToolRegistry({ workspaceRoot }),
+      workspaceRoot,
+    });
+    await expect(
+      resumedLifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Read the durable Todo after restart." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Read after restart." },
+    });
+    await resumedLifecycle.close();
+  } finally {
+    await firstLifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a self-consistent forged Todo dependency cycle", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-todo-cycle-tamper-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let firstId: string | undefined;
+  let secondId: string | undefined;
+  let call = 0;
+  const driver = new FakeModelDriver((request) => {
+    call += 1;
+    const latestTodoId = completedTodoItemId(request.messages, "create_todo");
+    if (call === 1) {
+      return [
+        { type: "tool_call_start", id: "create-cycle-anchor", name: "create_todo" },
+        {
+          type: "tool_call_delta",
+          id: "create-cycle-anchor",
+          json: '{"title":"Cycle anchor"}',
+        },
+        { type: "tool_call_end", id: "create-cycle-anchor" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (call === 2) {
+      if (latestTodoId === undefined) {
+        throw new Error("Expected the first created Todo ID.");
+      }
+      firstId = latestTodoId;
+      return [
+        { type: "tool_call_start", id: "create-cycle-dependent", name: "create_todo" },
+        {
+          type: "tool_call_delta",
+          id: "create-cycle-dependent",
+          json: JSON.stringify({ title: "Cycle dependent", dependencyIds: [firstId] }),
+        },
+        { type: "tool_call_end", id: "create-cycle-dependent" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (call === 3) {
+      if (latestTodoId === undefined) {
+        throw new Error("Expected the second created Todo ID.");
+      }
+      secondId = latestTodoId;
+      return [
+        { type: "tool_call_start", id: "update-cycle-forge", name: "update_todo" },
+        {
+          type: "tool_call_delta",
+          id: "update-cycle-forge",
+          json: JSON.stringify({
+            id: firstId,
+            expectedItemRevision: 1,
+            expectedStoreRevision: 2,
+            title: "Cycle anchor updated",
+          }),
+        },
+        { type: "tool_call_end", id: "update-cycle-forge" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    return [
+      { type: "text_delta", text: "The valid acyclic update completed." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: modelTargetsWithDriver(driver),
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Create two Todos and update the first without a cycle." },
+        limits: { maxTurns: 3 },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "failed", error: { code: "turn_limit_exceeded" } },
+    });
+    const store = await harness.sessions.open(created.sessionId);
+    const records = await store?.read();
+    const response = records?.find(
+      (entry) =>
+        entry.schemaVersion === 3 &&
+        entry.record.type === "model_response_completed" &&
+        entry.record.response.toolCalls.some((toolCall) => toolCall.id === "update-cycle-forge"),
+    );
+    const terminal = records?.find(
+      (entry) =>
+        entry.schemaVersion === 3 &&
+        entry.record.type === "runtime_event" &&
+        entry.record.event.type === "tool_completed" &&
+        entry.record.event.callId === "update-cycle-forge",
+    );
+    const updated = records?.find(
+      (entry) =>
+        entry.schemaVersion === 3 &&
+        entry.record.type === "todo_updated" &&
+        entry.record.callId === "update-cycle-forge",
+    );
+    if (
+      response?.schemaVersion !== 3 ||
+      response.record.type !== "model_response_completed" ||
+      terminal?.schemaVersion !== 3 ||
+      terminal.record.type !== "runtime_event" ||
+      terminal.record.event.type !== "tool_completed" ||
+      updated?.schemaVersion !== 3 ||
+      updated.record.type !== "todo_updated" ||
+      firstId === undefined ||
+      secondId === undefined
+    ) {
+      throw new Error("Expected one complete Todo update history.");
+    }
+    const updateCall = response.record.response.toolCalls.find(
+      (toolCall) => toolCall.id === "update-cycle-forge",
+    );
+    if (updateCall === undefined) {
+      throw new Error("Expected the Todo update model call.");
+    }
+    const forgedArguments = JSON.stringify({
+      id: firstId,
+      expectedItemRevision: 1,
+      expectedStoreRevision: 2,
+      title: "Cycle anchor updated",
+      dependencyIds: [secondId],
+    });
+    Object.assign(updateCall, { argumentsJson: forgedArguments });
+    const updateIntent = response.record.response.toolIntents.find(
+      (intent) => intent.callId === "update-cycle-forge",
+    );
+    if (updateIntent === undefined) {
+      throw new Error("Expected the Todo update intent.");
+    }
+    Object.assign(updateIntent, {
+      argumentsDigest: `sha256:${createHash("sha256").update(forgedArguments).digest("hex")}`,
+    });
+    Object.assign(updated.record.item, { dependencyIds: [secondId] });
+    const terminalOutput = terminal.record.event.output as {
+      readonly item?: { readonly dependencyIds?: readonly string[] };
+    };
+    if (terminalOutput.item === undefined) {
+      throw new Error("Expected the Todo update terminal output.");
+    }
+    Object.assign(terminalOutput.item, { dependencyIds: [secondId] });
+
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle Plan may read Todo but cannot mutate or materialize it", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-todo-policy-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let todoId: string | undefined;
+  let call = 0;
+  const requests: ModelMessage[][] = [];
+  const driver = new FakeModelDriver((request) => {
+    requests.push([...request.messages]);
+    call += 1;
+    if (call === 1) {
+      return [
+        { type: "tool_call_start", id: "create-before-plan", name: "create_todo" },
+        {
+          type: "tool_call_delta",
+          id: "create-before-plan",
+          json: '{"title":"Readable during Plan"}',
+        },
+        { type: "tool_call_end", id: "create-before-plan" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (call === 2) {
+      todoId = completedTodoItemId(request.messages, "create_todo");
+      if (todoId === undefined) {
+        throw new Error("Expected the created Todo output.");
+      }
+      return [
+        { type: "text_delta", text: "Todo created before Plan." },
+        { type: "finish", reason: "stop" },
+      ];
+    }
+    if (call === 3) {
+      expect(request.tools.map((tool) => tool.name)).toEqual(
+        expect.arrayContaining(["get_todo", "list_todos", "submit_plan"]),
+      );
+      expect(request.tools.map((tool) => tool.name)).not.toEqual(
+        expect.arrayContaining(["create_todo", "update_todo"]),
+      );
+      return [
+        { type: "tool_call_start", id: "get-during-plan", name: "get_todo" },
+        {
+          type: "tool_call_delta",
+          id: "get-during-plan",
+          json: JSON.stringify({ id: todoId }),
+        },
+        { type: "tool_call_end", id: "get-during-plan" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (call === 4) {
+      expect(request.messages.at(-1)).toMatchObject({
+        role: "tool",
+        name: "get_todo",
+        result: { status: "completed", output: { item: { id: todoId } } },
+      });
+      return [
+        { type: "tool_call_start", id: "create-during-plan", name: "create_todo" },
+        {
+          type: "tool_call_delta",
+          id: "create-during-plan",
+          json: '{"title":"Must not materialize"}',
+        },
+        { type: "tool_call_end", id: "create-during-plan" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.at(-1)).toMatchObject({
+      role: "tool",
+      name: "create_todo",
+      result: { status: "failed", error: { code: "permission_denied" } },
+    });
+    return [
+      { type: "text_delta", text: "Plan read without Todo mutation." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets: modelTargetsWithDriver(driver),
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Create one Todo before planning." },
+    });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const planned = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Inspect Todo without mutating it." },
+    });
+    expect(planned.result).toEqual({
+      status: "completed",
+      answer: "Plan read without Todo mutation.",
+    });
+    expect(planned.snapshot.todo).toEqual({
+      policyVersion: "todo-policy.v1",
+      storeRevision: 1,
+      counts: { pending: 1, inProgress: 0, completed: 0 },
+      blockedCount: 0,
+    });
+    expect(requests).toHaveLength(5);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
 
 test("SessionLifecycle exposes submit_plan only while exploring and makes it terminal for the run", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-submit-tool-"));
@@ -701,6 +1107,8 @@ test("SessionLifecycle cold recovery preserves a historical read-v1 Plan profile
         "activate_skill",
         "read_skill_resource",
         "read_input_resource",
+        "get_todo",
+        "list_todos",
         "submit_plan",
       ]);
       return [
@@ -814,6 +1222,8 @@ test("SessionLifecycle Plan exposes only its exact eligible profile and denies a
         "activate_skill",
         "read_skill_resource",
         "read_input_resource",
+        "get_todo",
+        "list_todos",
         "submit_plan",
       ]);
       return [
@@ -1492,6 +1902,392 @@ test("SessionLifecycle prefix branch inherits the exact selected exploring Plan 
   }
 });
 
+test("SessionLifecycle prefix branch inherits Todo identity and then diverges locally", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-todo-branch-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let todoId: string | undefined;
+  const driver = new FakeModelDriver((request) => {
+    const latestUser = request.messages.findLast((message) => message.role === "user");
+    if (latestUser?.role !== "user" || typeof latestUser.content !== "string") {
+      throw new Error("Expected one exact Todo branch prompt.");
+    }
+    const latestTool = request.messages.at(-1);
+    if (latestUser.content === "Create the parent Todo.") {
+      return latestTool?.role === "user"
+        ? [
+            { type: "tool_call_start", id: "create-parent-todo", name: "create_todo" },
+            {
+              type: "tool_call_delta",
+              id: "create-parent-todo",
+              json: '{"title":"Shared branch identity"}',
+            },
+            { type: "tool_call_end", id: "create-parent-todo" },
+            { type: "finish", reason: "tool_calls" },
+          ]
+        : [
+            { type: "text_delta", text: "Parent Todo created." },
+            { type: "finish", reason: "stop" },
+          ];
+    }
+    if (latestUser.content === "Complete only the child Todo.") {
+      return latestTool?.role === "user"
+        ? [
+            { type: "tool_call_start", id: "update-child-todo", name: "update_todo" },
+            {
+              type: "tool_call_delta",
+              id: "update-child-todo",
+              json: JSON.stringify({
+                id: todoId,
+                expectedItemRevision: 1,
+                expectedStoreRevision: 1,
+                status: "completed",
+              }),
+            },
+            { type: "tool_call_end", id: "update-child-todo" },
+            { type: "finish", reason: "tool_calls" },
+          ]
+        : [
+            { type: "text_delta", text: "Child Todo completed." },
+            { type: "finish", reason: "stop" },
+          ];
+    }
+    expect(latestTool).toMatchObject({
+      role: "user",
+      content: "Read the unchanged parent Todo.",
+    });
+    const summary = request.messages.find(
+      (message) =>
+        message.role === "assistant" && message.content.startsWith("Adam runtime Todo summary v1"),
+    );
+    expect(summary?.content).toContain(
+      '"storeRevision":1,"counts":{"pending":1,"inProgress":0,"completed":0}',
+    );
+    return [
+      { type: "text_delta", text: "Parent remained pending." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: modelTargetsWithDriver(driver),
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const parent = await lifecycle.create({ targetIdentity });
+    const parentRun = await lifecycle.continue({
+      sessionId: parent.sessionId,
+      input: { text: "Create the parent Todo." },
+    });
+    const parentRecords = await (await harness.sessions.open(parent.sessionId))?.read();
+    const createdRecord = parentRecords?.find(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_created",
+    );
+    if (createdRecord?.schemaVersion !== 3 || createdRecord.record.type !== "todo_created") {
+      throw new Error("Expected one parent Todo record.");
+    }
+    todoId = createdRecord.record.item.id;
+    const child = await lifecycle.branch({
+      parentSessionId: parent.sessionId,
+      atSequence: parentRun.snapshot.lastSequence,
+    });
+    await expect(
+      lifecycle.continue({
+        sessionId: child.sessionId,
+        input: { text: "Complete only the child Todo." },
+      }),
+    ).resolves.toMatchObject({ result: { status: "completed", answer: "Child Todo completed." } });
+    await expect(
+      lifecycle.continue({
+        sessionId: parent.sessionId,
+        input: { text: "Read the unchanged parent Todo." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Parent remained pending." },
+    });
+    const childRecords = await (await harness.sessions.open(child.sessionId))?.read();
+    expect(
+      childRecords?.find(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_store_inherited",
+      ),
+    ).toMatchObject({
+      record: {
+        policyVersion: "todo-policy.v1",
+        storeRevision: 1,
+        items: [{ id: todoId, status: "pending", itemRevision: 1 }],
+      },
+    });
+    expect(
+      childRecords?.find(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_updated",
+      ),
+    ).toMatchObject({ record: { item: { id: todoId, status: "completed", itemRevision: 2 } } });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a valid-looking inherited Todo store that diverges from its source prefix", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-todo-branch-tamper-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver((request) =>
+    request.messages.at(-1)?.role === "user"
+      ? [
+          { type: "tool_call_start", id: "create-tamper-todo", name: "create_todo" },
+          {
+            type: "tool_call_delta",
+            id: "create-tamper-todo",
+            json: '{"title":"Source-bound Todo"}',
+          },
+          { type: "tool_call_end", id: "create-tamper-todo" },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          { type: "text_delta", text: "Todo ready for branching." },
+          { type: "finish", reason: "stop" },
+        ],
+  );
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: modelTargetsWithDriver(driver),
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const parent = await lifecycle.create({ targetIdentity });
+    const parentRun = await lifecycle.continue({
+      sessionId: parent.sessionId,
+      input: { text: "Create one source-bound Todo." },
+    });
+    const child = await lifecycle.branch({
+      parentSessionId: parent.sessionId,
+      atSequence: parentRun.snapshot.lastSequence,
+    });
+    const childStore = await harness.sessions.open(child.sessionId);
+    const inherited = (await childStore?.read())?.find(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_store_inherited",
+    );
+    if (inherited?.schemaVersion !== 3 || inherited.record.type !== "todo_store_inherited") {
+      throw new Error("Expected the inherited Todo store.");
+    }
+    Object.assign(inherited.record.items[0] as object, { title: "Forged but schema-valid Todo" });
+
+    await expect(lifecycle.inspect({ sessionId: child.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle branches a Todo store larger than one record through bounded inheritance chunks", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-todo-branch-chunks-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const details = "x".repeat(8 * 1024);
+  const driver = new FakeModelDriver((request) => {
+    const latestUser = request.messages.findLast((message) => message.role === "user");
+    const latest = request.messages.at(-1);
+    if (latestUser?.role !== "user" || typeof latestUser.content !== "string") {
+      throw new Error("Expected one exact Todo chunking prompt.");
+    }
+    if (latest?.role === "user") {
+      const batchOffset = latestUser.content === "Create Todo batch one." ? 0 : 64;
+      return [
+        ...Array.from({ length: 64 }, (_, index) => {
+          const ordinal = batchOffset + index;
+          const callId = `create-chunked-todo-${ordinal}`;
+          return [
+            { type: "tool_call_start" as const, id: callId, name: "create_todo" },
+            {
+              type: "tool_call_delta" as const,
+              id: callId,
+              json: JSON.stringify({ title: `Chunked Todo ${ordinal}`, details }),
+            },
+            { type: "tool_call_end" as const, id: callId },
+          ];
+        }).flat(),
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    return [
+      { type: "text_delta", text: "Todo batch created." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: modelTargetsWithDriver(driver),
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const parent = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: parent.sessionId,
+      input: { text: "Create Todo batch one." },
+    });
+    const completed = await lifecycle.continue({
+      sessionId: parent.sessionId,
+      input: { text: "Create Todo batch two." },
+    });
+    const child = await lifecycle.branch({
+      parentSessionId: parent.sessionId,
+      atSequence: completed.snapshot.lastSequence,
+    });
+    const childRecords = await (await harness.sessions.open(child.sessionId))?.read();
+    const inherited = childRecords?.filter(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_store_inherited",
+    );
+
+    expect(inherited?.length).toBeGreaterThan(1);
+    expect(
+      inherited?.every((entry) => Buffer.byteLength(JSON.stringify(entry), "utf8") <= 1024 * 1024),
+    ).toBe(true);
+    await expect(lifecycle.inspect({ sessionId: child.sessionId })).resolves.toMatchObject({
+      todo: {
+        storeRevision: 128,
+        counts: { pending: 128, inProgress: 0, completed: 0 },
+      },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle binds Todo reads to the exact folded store revision", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-todo-read-revision-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let todoId: string | undefined;
+  const driver = new FakeModelDriver((request) => {
+    const latestUser = request.messages.findLast((message) => message.role === "user");
+    const latestTool = request.messages.at(-1);
+    if (latestUser?.role !== "user" || typeof latestUser.content !== "string") {
+      throw new Error("Expected one exact Todo revision prompt.");
+    }
+    if (latestTool?.role === "user" && latestUser.content === "Create the revision Todo.") {
+      return [
+        { type: "tool_call_start", id: "create-revision-todo", name: "create_todo" },
+        {
+          type: "tool_call_delta",
+          id: "create-revision-todo",
+          json: '{"title":"Revision-bound Todo"}',
+        },
+        { type: "tool_call_end", id: "create-revision-todo" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (latestTool?.role === "user" && latestUser.content === "Update the revision Todo.") {
+      return [
+        { type: "tool_call_start", id: "update-revision-todo", name: "update_todo" },
+        {
+          type: "tool_call_delta",
+          id: "update-revision-todo",
+          json: JSON.stringify({
+            id: todoId,
+            expectedItemRevision: 1,
+            expectedStoreRevision: 1,
+            title: "Newer revision",
+          }),
+        },
+        { type: "tool_call_end", id: "update-revision-todo" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    return [
+      { type: "text_delta", text: "Todo mutation settled." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const backing = createInMemorySessionStoreDirectory<SessionRecord>();
+  let stalePrefix: readonly SessionRecord[] | undefined;
+  let serveStalePrefixOnce = false;
+  const wrapStore = (
+    store: Awaited<ReturnType<SessionStoreDirectory<SessionRecord>["create"]>>,
+  ) => ({
+    append: (record: SessionRecord) => store.append(record),
+    appendBatch: (records: readonly SessionRecord[]) => store.appendBatch(records),
+    async read() {
+      if (serveStalePrefixOnce && stalePrefix !== undefined) {
+        serveStalePrefixOnce = false;
+        return stalePrefix;
+      }
+      return store.read();
+    },
+  });
+  const directory: SessionStoreDirectory<SessionRecord> = {
+    async create(sessionId) {
+      return wrapStore(await backing.create(sessionId));
+    },
+    listSessionEntries: () => backing.listSessionEntries(),
+    listSessionIds: () => backing.listSessionIds(),
+    async open(sessionId) {
+      const store = await backing.open(sessionId);
+      return store === undefined ? undefined : wrapStore(store);
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets: modelTargetsWithDriver(driver),
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [sessionAutomaticTitlesEnabled]: false,
+    [sessionStoreDirectory]: directory,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Create the revision Todo." },
+    });
+    stalePrefix = await (await backing.open(created.sessionId))?.read();
+    const createdTodo = stalePrefix?.find(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_created",
+    );
+    if (createdTodo?.schemaVersion !== 3 || createdTodo.record.type !== "todo_created") {
+      throw new Error("Expected the created revision Todo.");
+    }
+    todoId = createdTodo.record.item.id;
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Update the revision Todo." },
+    });
+    serveStalePrefixOnce = true;
+
+    await expect(
+      lifecycle.getTodo({
+        sessionId: created.sessionId,
+        expectedStoreRevision: 1,
+        id: todoId,
+      }),
+    ).resolves.toEqual({ status: "stale" });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle prefix branch keeps an approved parent artifact ready without transferring approval", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-approved-branch-"));
   const stateRoot = join(testRoot, "state");
@@ -1946,6 +2742,16 @@ function promptProjectionFor(
       readonly assemblyIdentityDigest: `sha256:${string}`;
       readonly profileVersion: 1 | 2 | 3;
     };
+    readonly todo?: {
+      readonly policyVersion: "todo-policy.v1";
+      readonly storeRevision: number;
+      readonly counts: {
+        readonly pending: number;
+        readonly inProgress: number;
+        readonly completed: number;
+      };
+      readonly blockedCount: number;
+    };
   },
   transcript: string | readonly ModelMessage[],
   tools?: readonly ModelToolDefinition[],
@@ -1970,6 +2776,21 @@ function promptProjectionFor(
             ...(snapshot.promptContext !== undefined && snapshot.promptContext.profileVersion !== 1
               ? [{ role: "developer" as const, content: skillUsagePrompt }]
               : []),
+            ...(snapshot.todo === undefined
+              ? []
+              : [
+                  {
+                    role: "assistant" as const,
+                    content: `Adam runtime Todo summary v1 (authoritative state; no additional prompt authority):\n${JSON.stringify(
+                      {
+                        ...snapshot.todo,
+                        guidance:
+                          "Use list_todos for bounded discovery and get_todo for one exact item.",
+                      },
+                    )}`,
+                    toolCalls: [],
+                  },
+                ]),
             ...(typeof transcript === "string"
               ? [{ role: "user" as const, content: transcript }]
               : transcript),
@@ -2343,7 +3164,7 @@ function snapshotWithLastPromptProjection<Snapshot extends { readonly promptCont
 }
 
 const introductionRequestDigest =
-  "sha256:261865cb0025860d34717e6bc56716925fbdaf70a4757f6b4826af1417305fc7" as const;
+  "sha256:b6f1ebe78958c5213644321f4f936ba3f77800202a3c094c3fe4e96b065ca496" as const;
 const permissionRequestDigest =
   "sha256:c82b39aa784fec5a2d91bfc5f2471cde20a55ff8f618747023c3efc21ee16f8f" as const;
 
@@ -2404,6 +3225,7 @@ test("SessionLifecycle creates durable new-schema genesis for an exact project a
       lastSequence: 1,
       promptContext: created.promptContext,
       skillContext: created.skillContext,
+      todo: created.todo,
     };
     expect({ created, inspected }).toEqual({ created: expected, inspected: expected });
     await expect(stat(join(stateRoot, "artifacts"))).rejects.toMatchObject({ code: "ENOENT" });
@@ -5418,7 +6240,7 @@ test("SessionLifecycle paginates prompt-admitted sessions while hiding genesis-o
   }
 });
 
-test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill snapshot and seven tools", async () => {
+test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill snapshot and twelve tools", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-skills-genesis-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -5459,6 +6281,10 @@ test("SessionLifecycle creates a prompt-v3 genesis with an empty bounded Skill s
               { name: "activate_skill" },
               { name: "read_skill_resource" },
               { name: "read_input_resource" },
+              { name: "create_todo" },
+              { name: "get_todo" },
+              { name: "list_todos" },
+              { name: "update_todo" },
             ],
           },
         },
@@ -5906,6 +6732,7 @@ test("SessionLifecycle branches a complete boundary by reference without changin
         lastSequence: 1,
         promptContext: parent.promptContext,
         skillContext: parent.skillContext,
+        todo: parent.todo,
         lineage: {
           parentSessionId: parent.sessionId,
           parentEventPosition: 1,
@@ -5982,6 +6809,12 @@ test("SessionLifecycle continues a branch from its referenced parent context", a
       childRequest: [
         { role: "system", content: basePrompt },
         { role: "developer", content: skillUsagePrompt },
+        {
+          role: "assistant",
+          content:
+            'Adam runtime Todo summary v1 (authoritative state; no additional prompt authority):\n{"policyVersion":"todo-policy.v1","storeRevision":0,"counts":{"pending":0,"inProgress":0,"completed":0},"blockedCount":0,"guidance":"Use list_todos for bounded discovery and get_todo for one exact item."}',
+          toolCalls: [],
+        },
         { role: "user", content: "Parent prompt" },
         { role: "assistant", content: "Parent answer", toolCalls: [] },
         { role: "user", content: "Child prompt" },
@@ -6088,6 +6921,12 @@ test("SessionLifecycle retains inherited branch context across a cold continuati
       childRequest: [
         { role: "system", content: basePrompt },
         { role: "developer", content: skillUsagePrompt },
+        {
+          role: "assistant",
+          content:
+            'Adam runtime Todo summary v1 (authoritative state; no additional prompt authority):\n{"policyVersion":"todo-policy.v1","storeRevision":0,"counts":{"pending":0,"inProgress":0,"completed":0},"blockedCount":0,"guidance":"Use list_todos for bounded discovery and get_todo for one exact item."}',
+          toolCalls: [],
+        },
         { role: "user", content: "Parent prompt" },
         { role: "assistant", content: "Parent answer", toolCalls: [] },
         { role: "user", content: "Child prompt" },
@@ -6141,6 +6980,7 @@ test("SessionLifecycle branches to an explicit compatible exact target only when
       lastSequence: 1,
       promptContext: parent.promptContext,
       skillContext: parent.skillContext,
+      todo: parent.todo,
       lineage: {
         parentSessionId: parent.sessionId,
         parentEventPosition: parentRun.snapshot.lastSequence,

@@ -1288,6 +1288,11 @@ describe("OpenAICompatibleModelDriver", () => {
         result: { status: "completed", answer: "The project is Adam Agent." },
         secondRequestMessages: [
           { role: "system", content: adamBasePrompt },
+          {
+            role: "assistant",
+            content:
+              'Adam runtime Todo summary v1 (authoritative state; no additional prompt authority):\n{"policyVersion":"todo-policy.v1","storeRevision":0,"counts":{"pending":0,"inProgress":0,"completed":0},"blockedCount":0,"guidance":"Use list_todos for bounded discovery and get_todo for one exact item."}',
+          },
           { role: "user", content: "What is the project name?" },
           {
             role: "assistant",

@@ -500,6 +500,7 @@ export async function createPresentationSession(
               skills: projectSkills(created),
               projectPaths,
               mcp: projectMcp(created),
+              ...(created.todo === undefined ? {} : { todo: created.todo }),
               ...(created.plan === undefined ? {} : { plan: created.plan }),
             },
     };
@@ -1102,6 +1103,7 @@ export async function createPresentationSession(
             skills: projectSkills(snapshot),
             projectPaths,
             mcp: projectMcp(snapshot),
+            ...(snapshot.todo === undefined ? {} : { todo: snapshot.todo }),
             ...(snapshot.plan === undefined ? {} : { plan: snapshot.plan }),
           },
         },
@@ -1742,6 +1744,129 @@ export async function createPresentationSession(
           code: "presentation_closed",
           message: "The presentation session is closed.",
         };
+      }
+      if (command.type === "list_todos") {
+        const active = state.authoritative.active;
+        if (command.sessionId !== active?.session.id) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected session is no longer active.",
+          };
+        }
+        if (active.todo === undefined) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message:
+              "Todo is unavailable in this historical Tool Profile. Start a new session to use Todo.",
+          };
+        }
+        if (command.expectedStoreRevision !== active.todo.storeRevision) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected Todo store revision is no longer current.",
+          };
+        }
+        try {
+          const result = await options.lifecycle.listTodos({
+            sessionId: command.sessionId,
+            expectedStoreRevision: command.expectedStoreRevision,
+            ...(command.filter.status === null ? {} : { status: command.filter.status }),
+            ...(command.filter.titleContains === null
+              ? {}
+              : { titleContains: command.filter.titleContains }),
+            limit: command.limit,
+            ...(command.cursor === null ? {} : { cursor: command.cursor }),
+          });
+          if (result.status === "stale" || result.status === "failed") {
+            return {
+              status: "rejected",
+              code:
+                result.status === "stale" || result.error.code === "todo_cursor_stale"
+                  ? "stale_interaction"
+                  : "invalid_command",
+              message:
+                result.status === "stale"
+                  ? "The selected Todo store revision is no longer current."
+                  : result.error.message,
+            };
+          }
+          return {
+            status: "admitted",
+            commandId: randomUUID(),
+            resource: null,
+            todo: { type: "todo_page", ...result.output },
+          };
+        } catch (error) {
+          return {
+            status: "rejected",
+            code:
+              error instanceof SessionLifecycleError && error.code === "session_todo_unavailable"
+                ? "not_available"
+                : "authority_rejected",
+            message: "The Todo page could not be read safely.",
+          };
+        }
+      }
+      if (command.type === "get_todo") {
+        const active = state.authoritative.active;
+        if (command.sessionId !== active?.session.id) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected session is no longer active.",
+          };
+        }
+        if (active.todo === undefined) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message:
+              "Todo is unavailable in this historical Tool Profile. Start a new session to use Todo.",
+          };
+        }
+        if (command.expectedStoreRevision !== active.todo.storeRevision) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected Todo store revision is no longer current.",
+          };
+        }
+        try {
+          const result = await options.lifecycle.getTodo(command);
+          if (result.status === "stale" || result.status === "failed") {
+            return {
+              status: "rejected",
+              code:
+                result.status === "stale"
+                  ? "stale_interaction"
+                  : result.error.code === "not_found"
+                    ? "not_available"
+                    : "invalid_command",
+              message:
+                result.status === "stale"
+                  ? "The selected Todo store revision is no longer current."
+                  : result.error.message,
+            };
+          }
+          return {
+            status: "admitted",
+            commandId: randomUUID(),
+            resource: null,
+            todo: { type: "todo_entity", ...result.output },
+          };
+        } catch (error) {
+          return {
+            status: "rejected",
+            code:
+              error instanceof SessionLifecycleError && error.code === "session_todo_unavailable"
+                ? "not_available"
+                : "authority_rejected",
+            message: "The Todo entity could not be read safely.",
+          };
+        }
       }
       if (command.type === "cancel_target_connection_test") {
         const active = activeConnectionTests.get(command.targetId);

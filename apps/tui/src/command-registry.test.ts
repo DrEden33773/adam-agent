@@ -24,6 +24,18 @@ test("the TUI Registry hides attachment actions for a historical text-only sessi
   ).toBe(true);
 });
 
+test("the TUI Registry exposes the read-only Todo navigator", () => {
+  expect(adamCommandRegistry.parse("/todos")).toMatchObject({
+    kind: "known",
+    argumentsText: "",
+    command: {
+      id: "todos",
+      usage: "/todos",
+      summary: "Browse the authoritative Todo store without mutation.",
+    },
+  });
+});
+
 test("the TUI Registry exposes only descriptor commands backed by project changes", () => {
   const registry = createAdamCommandRegistryFromContributions([
     {

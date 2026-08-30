@@ -63,6 +63,15 @@ import type {
   SessionRecord,
 } from "./session-store.js";
 import { isSkillContextRecordV1Valid } from "./skills.js";
+import {
+  createTodoMutationV1,
+  emptyTodoStoreSnapshotV1,
+  isTodoStoreSnapshotV1Valid,
+  type TodoItemV1,
+  type TodoStoreSnapshotV1,
+  todoStoreSnapshotDigestV1,
+  updateTodoMutationV1,
+} from "./todo.js";
 import type { PermissionSubject } from "./tool-runtime.js";
 import { canonicalChangePreviewForToolCall } from "./tool-runtime.js";
 
@@ -184,6 +193,19 @@ export function validateCurrentSessionHistory(
   let activePlanGitPolicyDigest: string | undefined;
   let activePlanEligibleToolProfile: PlanEligibleToolProfileV1 | undefined;
   let activePlanGitAttested = false;
+  let todoSnapshot: TodoStoreSnapshotV1 = emptyTodoStoreSnapshotV1();
+  let inheritedTodoChunks:
+    | {
+        readonly chunkCount: number;
+        readonly items: TodoItemV1[];
+        readonly policyVersion: TodoStoreSnapshotV1["policyVersion"];
+        readonly snapshotDigest: `sha256:${string}`;
+        readonly source: { readonly sessionId: string; readonly throughSequence: number };
+        readonly storeRevision: number;
+        nextChunkIndex: number;
+      }
+    | undefined;
+  let sawTodoInheritance = false;
   const activatableRepositoryRevisions = new Map<number, ValidatedToolState>();
   const publishedRepositoryRevisions = new Set<number>();
   let mcpWorkspaceConfirmation: SessionMcpWorkspaceConfirmedRecord["record"] | undefined;
@@ -202,6 +224,9 @@ export function validateCurrentSessionHistory(
   for (const entry of currentRecords.slice(1)) {
     const record = entry.record;
     if (record.type === "session_genesis") {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    if (inheritedTodoChunks !== undefined && record.type !== "todo_store_inherited") {
       throw new SessionLifecycleError("session_invalid");
     }
     if (record.type === "plan_cycle_entered") {
@@ -429,6 +454,153 @@ export function validateCurrentSessionHistory(
       activePlanGitPolicyDigest = undefined;
       activePlanEligibleToolProfile = undefined;
       activePlanGitAttested = false;
+      continue;
+    }
+    if (record.type === "todo_store_inherited") {
+      const lineage = genesis.record.lineage;
+      const sourceSessionId =
+        lineage === undefined
+          ? undefined
+          : "sourceSessionId" in lineage
+            ? lineage.sourceSessionId
+            : lineage.parentSessionId;
+      const sourceSequence =
+        lineage === undefined
+          ? undefined
+          : "sourceEventPosition" in lineage
+            ? lineage.sourceEventPosition
+            : lineage.parentEventPosition;
+      if (
+        run !== undefined ||
+        sawTodoInheritance ||
+        todoSnapshot.storeRevision !== 0 ||
+        todoSnapshot.items.length !== 0 ||
+        record.source.sessionId !== sourceSessionId ||
+        record.source.throughSequence !== sourceSequence
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const chunks =
+        inheritedTodoChunks ??
+        (() => {
+          if (record.chunkIndex !== 0 || record.itemOffset !== 0) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          return {
+            chunkCount: record.chunkCount,
+            items: [],
+            policyVersion: record.policyVersion,
+            snapshotDigest: record.snapshotDigest,
+            source: record.source,
+            storeRevision: record.storeRevision,
+            nextChunkIndex: 0,
+          };
+        })();
+      if (
+        record.chunkIndex !== chunks.nextChunkIndex ||
+        record.chunkCount !== chunks.chunkCount ||
+        record.itemOffset !== chunks.items.length ||
+        record.policyVersion !== chunks.policyVersion ||
+        record.snapshotDigest !== chunks.snapshotDigest ||
+        record.storeRevision !== chunks.storeRevision ||
+        !isDeepStrictEqual(record.source, chunks.source)
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      chunks.items.push(...record.items);
+      chunks.nextChunkIndex += 1;
+      if (chunks.nextChunkIndex === chunks.chunkCount) {
+        const snapshot: TodoStoreSnapshotV1 = {
+          policyVersion: chunks.policyVersion,
+          storeRevision: chunks.storeRevision,
+          items: chunks.items,
+        };
+        if (
+          !isTodoStoreSnapshotV1Valid(snapshot) ||
+          todoStoreSnapshotDigestV1(snapshot) !== chunks.snapshotDigest
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        todoSnapshot = snapshot;
+        inheritedTodoChunks = undefined;
+        sawTodoInheritance = true;
+      } else {
+        inheritedTodoChunks = chunks;
+      }
+      continue;
+    }
+    if (record.type === "todo_created") {
+      const toolState = toolStates.get(record.callId);
+      let input: unknown;
+      try {
+        input = JSON.parse(toolState?.call.argumentsJson ?? "") as unknown;
+      } catch {
+        input = undefined;
+      }
+      const mutation = createTodoMutationV1(todoSnapshot, input, record.item.id);
+      if (
+        run?.runId !== record.runId ||
+        activePlanState !== undefined ||
+        toolState?.call.name !== "create_todo" ||
+        !toolState.requested ||
+        !toolState.started ||
+        !toolState.terminal ||
+        toolState.terminalErrorCode !== undefined ||
+        mutation.status !== "completed" ||
+        record.storeRevision !== mutation.snapshot.storeRevision ||
+        !isDeepStrictEqual(record.item, mutation.item) ||
+        !isDeepStrictEqual(toolState.terminalOutput, {
+          policyVersion: record.policyVersion,
+          storeRevision: record.storeRevision,
+          item: record.item,
+        })
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      todoSnapshot = mutation.snapshot;
+      continue;
+    }
+    if (record.type === "todo_updated") {
+      const toolState = toolStates.get(record.callId);
+      let input:
+        | {
+            readonly id?: unknown;
+            readonly expectedStoreRevision?: unknown;
+            readonly expectedItemRevision?: unknown;
+            readonly title?: unknown;
+            readonly details?: unknown;
+            readonly dependencyIds?: unknown;
+            readonly status?: unknown;
+          }
+        | undefined;
+      try {
+        input = JSON.parse(toolState?.call.argumentsJson ?? "") as typeof input;
+      } catch {
+        input = undefined;
+      }
+      const mutation = updateTodoMutationV1(todoSnapshot, input);
+      if (
+        run?.runId !== record.runId ||
+        activePlanState !== undefined ||
+        toolState?.call.name !== "update_todo" ||
+        !toolState.requested ||
+        !toolState.started ||
+        !toolState.terminal ||
+        toolState.terminalErrorCode !== undefined ||
+        mutation.status !== "completed" ||
+        record.expectedStoreRevision !== input?.expectedStoreRevision ||
+        record.expectedItemRevision !== input?.expectedItemRevision ||
+        record.storeRevision !== mutation.snapshot.storeRevision ||
+        !isDeepStrictEqual(record.item, mutation.item) ||
+        !isDeepStrictEqual(toolState.terminalOutput, {
+          policyVersion: record.policyVersion,
+          storeRevision: record.storeRevision,
+          item: record.item,
+        })
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      todoSnapshot = mutation.snapshot;
       continue;
     }
     if (record.type === "mcp_workspace_confirmed") {
@@ -1814,6 +1986,9 @@ export function validateCurrentSessionHistory(
       }
       continue;
     }
+    throw new SessionLifecycleError("session_invalid");
+  }
+  if (inheritedTodoChunks !== undefined) {
     throw new SessionLifecycleError("session_invalid");
   }
   validateContextCompactionHistory(genesis, currentRecords);

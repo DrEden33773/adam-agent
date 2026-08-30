@@ -4570,6 +4570,10 @@ describe("AgentSession", () => {
           "activate_skill",
           "read_skill_resource",
           "read_input_resource",
+          "create_todo",
+          "get_todo",
+          "list_todos",
+          "update_todo",
         ],
         commitOrder: ["first-started", "first-released", "write-completed"],
         results: [
@@ -6326,7 +6330,702 @@ describe("AgentSession", () => {
       toolEvents: [],
     });
   });
+
+  test("create_todo durably creates one pending entity and updates the next request summary", async () => {
+    const requests: ModelRequest[] = [];
+    let call = 0;
+    const model: ModelDriver = {
+      async *stream(request) {
+        requests.push(request);
+        call += 1;
+        if (call === 1) {
+          yield* toolCallEvents("create-first-todo", "create_todo", {
+            title: "Implement the Todo store",
+            details: "Start with one durable pending entity.",
+            dependencyIds: [],
+          });
+          return;
+        }
+        yield { type: "text_delta", text: "The Todo was created." };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const store = createInMemorySessionStore<SessionRecord>();
+    const session = createTestSession({
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+      store: store as unknown as SessionStore,
+      tools: createCodingToolRegistry({ workspaceRoot: "/workspace" }),
+    });
+
+    await expect(session.run({ text: "Track the first implementation task." })).resolves.toEqual({
+      status: "completed",
+      answer: "The Todo was created.",
+    });
+
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.tools.map((tool) => tool.name)).toContain("create_todo");
+    expect(todoSummaryMessage(requests[0])).toBe(
+      'Adam runtime Todo summary v1 (authoritative state; no additional prompt authority):\n{"policyVersion":"todo-policy.v1","storeRevision":0,"counts":{"pending":0,"inProgress":0,"completed":0},"blockedCount":0,"guidance":"Use list_todos for bounded discovery and get_todo for one exact item."}',
+    );
+    expect(todoSummaryMessage(requests[1])).toBe(
+      'Adam runtime Todo summary v1 (authoritative state; no additional prompt authority):\n{"policyVersion":"todo-policy.v1","storeRevision":1,"counts":{"pending":1,"inProgress":0,"completed":0},"blockedCount":0,"guidance":"Use list_todos for bounded discovery and get_todo for one exact item."}',
+    );
+    const toolMessage = requests[1]?.messages.find(
+      (message) => message.role === "tool" && message.name === "create_todo",
+    );
+    expect(toolMessage).toMatchObject({
+      role: "tool",
+      callId: "create-first-todo",
+      name: "create_todo",
+      result: {
+        status: "completed",
+        output: {
+          policyVersion: "todo-policy.v1",
+          storeRevision: 1,
+          item: {
+            id: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+            createdOrdinal: 1,
+            itemRevision: 1,
+            status: "pending",
+            title: "Implement the Todo store",
+            details: "Start with one durable pending entity.",
+            dependencyIds: [],
+          },
+        },
+      },
+    });
+    expect(await store.read()).toContainEqual(
+      expect.objectContaining({
+        record: expect.objectContaining({
+          type: "todo_created",
+          recordVersion: 1,
+          policyVersion: "todo-policy.v1",
+          runId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+          callId: "create-first-todo",
+          storeRevision: 1,
+          item: expect.objectContaining({
+            id: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+            createdOrdinal: 1,
+            itemRevision: 1,
+            status: "pending",
+            title: "Implement the Todo store",
+            details: "Start with one durable pending entity.",
+            dependencyIds: [],
+          }),
+        }),
+      }),
+    );
+  });
+
+  test("create_todo requires ordinary exact call-scoped write permission before mutation", async () => {
+    const requests: ModelRequest[] = [];
+    let call = 0;
+    const model = new FakeModelDriver((request) => {
+      requests.push(request);
+      call += 1;
+      return call === 1
+        ? toolCallEvents("permission-guarded-todo", "create_todo", {
+            title: "Must remain uncommitted",
+          })
+        : [
+            { type: "text_delta", text: "The denied Todo was not created." },
+            { type: "finish", reason: "stop" },
+          ];
+    });
+    const store = createInMemorySessionStore<SessionRecord>();
+    const permissionRequests: RuntimeEvent[] = [];
+    const toolEvents: RuntimeEvent[] = [];
+    const session = createTestSession({
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["write"] }),
+      store: store as unknown as SessionStore,
+      tools: createCodingToolRegistry({ workspaceRoot: "/workspace" }),
+    });
+    session.subscribe((event) => {
+      if (event.type.startsWith("tool_")) {
+        toolEvents.push(event);
+      }
+      if (event.type === "tool_permission_requested") {
+        permissionRequests.push(event);
+        session.decidePermission({ requestId: event.requestId, decision: "deny" });
+      }
+    });
+
+    await expect(session.run({ text: "Try one denied Todo mutation." })).resolves.toEqual({
+      status: "completed",
+      answer: "The denied Todo was not created.",
+    });
+
+    expect({ permissionRequests, toolEvents }).toEqual({
+      permissionRequests: [
+        expect.objectContaining({
+          type: "tool_permission_requested",
+          callId: "permission-guarded-todo",
+          name: "create_todo",
+          effect: "write",
+          scope: "call",
+          subject: { type: "workspace_path", path: "." },
+        }),
+      ],
+      toolEvents: expect.arrayContaining([
+        expect.objectContaining({
+          type: "tool_permission_requested",
+          callId: "permission-guarded-todo",
+        }),
+      ]),
+    });
+    expect(
+      requests[1]?.messages.findLast(
+        (message) => message.role === "tool" && message.name === "create_todo",
+      ),
+    ).toMatchObject({ result: { status: "failed", error: { code: "permission_denied" } } });
+    expect(todoSummaryMessage(requests[1])).toContain('"storeRevision":0');
+    expect(
+      (await store.read()).filter(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_created",
+      ),
+    ).toHaveLength(0);
+  });
+
+  test("get_todo returns one exact full durable entity without mutating Todo state", async () => {
+    const requests: ModelRequest[] = [];
+    let call = 0;
+    const model: ModelDriver = {
+      async *stream(request) {
+        requests.push(request);
+        call += 1;
+        if (call === 1) {
+          yield* toolCallEvents("create-todo-for-get", "create_todo", {
+            title: "Read this exact Todo",
+            details: "The full details must remain available.",
+          });
+          return;
+        }
+        if (call === 2) {
+          const item = todoItemFromToolMessage(request, "create_todo");
+          yield* toolCallEvents("get-exact-todo", "get_todo", { id: item.id });
+          return;
+        }
+        yield { type: "text_delta", text: "The exact Todo was read." };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const store = createInMemorySessionStore<SessionRecord>();
+    const session = createTestSession({
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+      store: store as unknown as SessionStore,
+      tools: createCodingToolRegistry({ workspaceRoot: "/workspace" }),
+    });
+
+    await expect(session.run({ text: "Create and read one Todo." })).resolves.toEqual({
+      status: "completed",
+      answer: "The exact Todo was read.",
+    });
+
+    expect(requests[0]?.tools.map((tool) => tool.name)).toContain("get_todo");
+    const created = todoItemFromToolMessage(requests[1], "create_todo");
+    const read = todoItemFromToolMessage(requests[2], "get_todo");
+    expect(read).toEqual(created);
+    expect(todoSummaryMessage(requests[2])).toBe(todoSummaryMessage(requests[1]));
+    expect(
+      (await store.read()).filter(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_created",
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("list_todos returns bounded summaries in stable created order", async () => {
+    const requests: ModelRequest[] = [];
+    let call = 0;
+    const model: ModelDriver = {
+      async *stream(request) {
+        requests.push(request);
+        call += 1;
+        if (call === 1) {
+          yield* toolCallEvents("create-list-first", "create_todo", { title: "First Todo" });
+          return;
+        }
+        if (call === 2) {
+          yield* toolCallEvents("create-list-second", "create_todo", {
+            title: "Second Todo",
+            details: "Details are not part of list summaries.",
+          });
+          return;
+        }
+        if (call === 3) {
+          yield* toolCallEvents("list-created-todos", "list_todos", {});
+          return;
+        }
+        yield { type: "text_delta", text: "The Todo summaries were listed." };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const session = createTestSession({
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+      tools: createCodingToolRegistry({ workspaceRoot: "/workspace" }),
+    });
+
+    await expect(session.run({ text: "Create and list two Todos." })).resolves.toEqual({
+      status: "completed",
+      answer: "The Todo summaries were listed.",
+    });
+
+    expect(requests[0]?.tools.map((tool) => tool.name)).toContain("list_todos");
+    const listMessage = requests[3]?.messages.findLast(
+      (message) => message.role === "tool" && message.name === "list_todos",
+    );
+    expect(listMessage).toMatchObject({
+      result: {
+        status: "completed",
+        output: {
+          policyVersion: "todo-policy.v1",
+          storeRevision: 2,
+          items: [
+            {
+              id: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+              createdOrdinal: 1,
+              itemRevision: 1,
+              status: "pending",
+              title: "First Todo",
+              dependencyCount: 0,
+              blocked: false,
+            },
+            {
+              id: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+              createdOrdinal: 2,
+              itemRevision: 1,
+              status: "pending",
+              title: "Second Todo",
+              dependencyCount: 0,
+              blocked: false,
+            },
+          ],
+          nextCursor: null,
+        },
+      },
+    });
+  });
+
+  test("update_todo applies exact item and store CAS before changing status", async () => {
+    const requests: ModelRequest[] = [];
+    let call = 0;
+    const model: ModelDriver = {
+      async *stream(request) {
+        requests.push(request);
+        call += 1;
+        if (call === 1) {
+          yield* toolCallEvents("create-todo-for-update", "create_todo", {
+            title: "Advance this Todo",
+          });
+          return;
+        }
+        if (call === 2) {
+          const item = todoItemFromToolMessage(request, "create_todo");
+          yield* toolCallEvents("update-exact-todo", "update_todo", {
+            id: item.id,
+            expectedItemRevision: item.itemRevision,
+            expectedStoreRevision: 1,
+            status: "in_progress",
+          });
+          return;
+        }
+        yield { type: "text_delta", text: "The Todo is now in progress." };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const store = createInMemorySessionStore<SessionRecord>();
+    const session = createTestSession({
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+      store: store as unknown as SessionStore,
+      tools: createCodingToolRegistry({ workspaceRoot: "/workspace" }),
+    });
+
+    await expect(session.run({ text: "Create and start one Todo." })).resolves.toEqual({
+      status: "completed",
+      answer: "The Todo is now in progress.",
+    });
+
+    expect(requests[0]?.tools.map((tool) => tool.name)).toContain("update_todo");
+    expect(todoItemFromToolMessage(requests[2], "update_todo")).toMatchObject({
+      id: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+      createdOrdinal: 1,
+      itemRevision: 2,
+      status: "in_progress",
+      title: "Advance this Todo",
+      dependencyIds: [],
+    });
+    expect(todoSummaryMessage(requests[2])).toBe(
+      'Adam runtime Todo summary v1 (authoritative state; no additional prompt authority):\n{"policyVersion":"todo-policy.v1","storeRevision":2,"counts":{"pending":0,"inProgress":1,"completed":0},"blockedCount":0,"guidance":"Use list_todos for bounded discovery and get_todo for one exact item."}',
+    );
+    expect(await store.read()).toContainEqual(
+      expect.objectContaining({
+        record: expect.objectContaining({
+          type: "todo_updated",
+          recordVersion: 1,
+          policyVersion: "todo-policy.v1",
+          expectedStoreRevision: 1,
+          expectedItemRevision: 1,
+          storeRevision: 2,
+          item: expect.objectContaining({ itemRevision: 2, status: "in_progress" }),
+        }),
+      }),
+    );
+  });
+
+  test("Todo dependencies block premature in-progress transitions without consuming revisions", async () => {
+    const requests: ModelRequest[] = [];
+    let prerequisiteId: string | undefined;
+    let dependentId: string | undefined;
+    let call = 0;
+    const model: ModelDriver = {
+      async *stream(request) {
+        requests.push(request);
+        call += 1;
+        if (call === 1) {
+          yield* toolCallEvents("create-prerequisite", "create_todo", {
+            title: "Finish the prerequisite",
+          });
+          return;
+        }
+        if (call === 2) {
+          prerequisiteId = todoItemFromToolMessage(request, "create_todo").id as string;
+          yield* toolCallEvents("create-dependent", "create_todo", {
+            title: "Start only after the prerequisite",
+            dependencyIds: [prerequisiteId],
+          });
+          return;
+        }
+        if (call === 3) {
+          dependentId = todoItemFromToolMessage(request, "create_todo").id as string;
+          yield* toolCallEvents("start-blocked-dependent", "update_todo", {
+            id: dependentId,
+            expectedItemRevision: 1,
+            expectedStoreRevision: 2,
+            status: "in_progress",
+          });
+          return;
+        }
+        yield { type: "text_delta", text: "The blocked Todo remained pending." };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const store = createInMemorySessionStore<SessionRecord>();
+    const session = createTestSession({
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+      store: store as unknown as SessionStore,
+      tools: createCodingToolRegistry({ workspaceRoot: "/workspace" }),
+    });
+
+    await expect(session.run({ text: "Track one strong Todo dependency." })).resolves.toEqual({
+      status: "completed",
+      answer: "The blocked Todo remained pending.",
+    });
+
+    const rejected = requests[3]?.messages.findLast(
+      (message) => message.role === "tool" && message.name === "update_todo",
+    );
+    expect(rejected).toMatchObject({
+      result: {
+        status: "failed",
+        error: { code: "todo_dependency_incomplete" },
+      },
+    });
+    expect(todoSummaryMessage(requests[3])).toBe(
+      'Adam runtime Todo summary v1 (authoritative state; no additional prompt authority):\n{"policyVersion":"todo-policy.v1","storeRevision":2,"counts":{"pending":2,"inProgress":0,"completed":0},"blockedCount":1,"guidance":"Use list_todos for bounded discovery and get_todo for one exact item."}',
+    );
+    expect(prerequisiteId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(dependentId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(
+      (await store.read()).filter(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_updated",
+      ),
+    ).toHaveLength(0);
+  });
+
+  test("update_todo rejects a dependency cycle atomically", async () => {
+    const requests: ModelRequest[] = [];
+    let firstId: string | undefined;
+    let secondId: string | undefined;
+    let call = 0;
+    const model: ModelDriver = {
+      async *stream(request) {
+        requests.push(request);
+        call += 1;
+        if (call === 1) {
+          yield* toolCallEvents("create-cycle-first", "create_todo", { title: "Cycle A" });
+          return;
+        }
+        if (call === 2) {
+          firstId = todoItemFromToolMessage(request, "create_todo").id as string;
+          yield* toolCallEvents("create-cycle-second", "create_todo", {
+            title: "Cycle B",
+            dependencyIds: [firstId],
+          });
+          return;
+        }
+        if (call === 3) {
+          secondId = todoItemFromToolMessage(request, "create_todo").id as string;
+          yield* toolCallEvents("close-cycle", "update_todo", {
+            id: firstId,
+            expectedItemRevision: 1,
+            expectedStoreRevision: 2,
+            dependencyIds: [secondId],
+          });
+          return;
+        }
+        yield { type: "text_delta", text: "The dependency cycle was rejected." };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const store = createInMemorySessionStore<SessionRecord>();
+    const session = createTestSession({
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+      store: store as unknown as SessionStore,
+      tools: createCodingToolRegistry({ workspaceRoot: "/workspace" }),
+    });
+
+    await expect(session.run({ text: "Reject a cyclic Todo graph." })).resolves.toEqual({
+      status: "completed",
+      answer: "The dependency cycle was rejected.",
+    });
+
+    expect(
+      requests[3]?.messages.findLast(
+        (message) => message.role === "tool" && message.name === "update_todo",
+      ),
+    ).toMatchObject({
+      result: { status: "failed", error: { code: "todo_dependency_cycle" } },
+    });
+    expect(firstId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(secondId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(todoSummaryMessage(requests[3])).toContain('"storeRevision":2');
+    expect(
+      (await store.read()).filter(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_updated",
+      ),
+    ).toHaveLength(0);
+  });
+
+  test("update_todo requires completed descendants to reopen first", async () => {
+    const requests: ModelRequest[] = [];
+    let prerequisiteId: string | undefined;
+    let dependentId: string | undefined;
+    let call = 0;
+    const model: ModelDriver = {
+      async *stream(request) {
+        requests.push(request);
+        call += 1;
+        if (call === 1) {
+          yield* toolCallEvents("create-reopen-prerequisite", "create_todo", {
+            title: "Reopen prerequisite",
+          });
+          return;
+        }
+        if (call === 2) {
+          prerequisiteId = todoItemFromToolMessage(request, "create_todo").id as string;
+          yield* toolCallEvents("create-reopen-dependent", "create_todo", {
+            title: "Reopen dependent",
+            dependencyIds: [prerequisiteId],
+          });
+          return;
+        }
+        if (call === 3) {
+          dependentId = todoItemFromToolMessage(request, "create_todo").id as string;
+          yield* toolCallEvents("complete-reopen-prerequisite", "update_todo", {
+            id: prerequisiteId,
+            expectedItemRevision: 1,
+            expectedStoreRevision: 2,
+            status: "completed",
+          });
+          return;
+        }
+        if (call === 4) {
+          yield* toolCallEvents("complete-reopen-dependent", "update_todo", {
+            id: dependentId,
+            expectedItemRevision: 1,
+            expectedStoreRevision: 3,
+            status: "completed",
+          });
+          return;
+        }
+        if (call === 5) {
+          yield* toolCallEvents("reject-reopen-prerequisite", "update_todo", {
+            id: prerequisiteId,
+            expectedItemRevision: 2,
+            expectedStoreRevision: 4,
+            status: "pending",
+          });
+          return;
+        }
+        if (call === 6) {
+          yield* toolCallEvents("reopen-dependent-first", "update_todo", {
+            id: dependentId,
+            expectedItemRevision: 2,
+            expectedStoreRevision: 4,
+            status: "pending",
+          });
+          return;
+        }
+        if (call === 7) {
+          yield* toolCallEvents("reopen-prerequisite-last", "update_todo", {
+            id: prerequisiteId,
+            expectedItemRevision: 2,
+            expectedStoreRevision: 5,
+            status: "pending",
+          });
+          return;
+        }
+        yield { type: "text_delta", text: "The descendants reopened in dependency order." };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const store = createInMemorySessionStore<SessionRecord>();
+    const session = createTestSession({
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+      store: store as unknown as SessionStore,
+      tools: createCodingToolRegistry({ workspaceRoot: "/workspace" }),
+    });
+
+    await expect(
+      session.run({ text: "Reopen this completed Todo chain safely." }),
+    ).resolves.toEqual({
+      status: "completed",
+      answer: "The descendants reopened in dependency order.",
+    });
+
+    expect(
+      requests[5]?.messages.findLast(
+        (message) => message.role === "tool" && message.name === "update_todo",
+      ),
+    ).toMatchObject({
+      result: { status: "failed", error: { code: "todo_completed_dependent" } },
+    });
+    expect(todoSummaryMessage(requests[5])).toContain('"storeRevision":4');
+    expect(todoSummaryMessage(requests[7])).toContain(
+      '"storeRevision":6,"counts":{"pending":2,"inProgress":0,"completed":0}',
+    );
+    expect(prerequisiteId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(dependentId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(
+      (await store.read()).filter(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_updated",
+      ),
+    ).toHaveLength(4);
+  });
+
+  test("update_todo rejects a stale item or store revision atomically", async () => {
+    const requests: ModelRequest[] = [];
+    let todoId: string | undefined;
+    let call = 0;
+    const model: ModelDriver = {
+      async *stream(request) {
+        requests.push(request);
+        call += 1;
+        if (call === 1) {
+          yield* toolCallEvents("create-cas", "create_todo", { title: "CAS guarded" });
+          return;
+        }
+        if (call === 2) {
+          todoId = todoItemFromToolMessage(request, "create_todo").id as string;
+          yield* toolCallEvents("stale-store-cas", "update_todo", {
+            id: todoId,
+            expectedItemRevision: 1,
+            expectedStoreRevision: 0,
+            title: "Must not commit",
+          });
+          return;
+        }
+        if (call === 3) {
+          yield* toolCallEvents("stale-item-cas", "update_todo", {
+            id: todoId,
+            expectedItemRevision: 2,
+            expectedStoreRevision: 1,
+            title: "Still must not commit",
+          });
+          return;
+        }
+        yield { type: "text_delta", text: "Both stale writes were rejected." };
+        yield { type: "finish", reason: "stop" };
+      },
+    };
+    const store = createInMemorySessionStore<SessionRecord>();
+    const session = createTestSession({
+      model,
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+      store: store as unknown as SessionStore,
+      tools: createCodingToolRegistry({ workspaceRoot: "/workspace" }),
+    });
+
+    await expect(session.run({ text: "Reject stale Todo writes." })).resolves.toEqual({
+      status: "completed",
+      answer: "Both stale writes were rejected.",
+    });
+
+    for (const request of requests.slice(2, 4)) {
+      expect(
+        request.messages.findLast(
+          (message) => message.role === "tool" && message.name === "update_todo",
+        ),
+      ).toMatchObject({
+        result: { status: "failed", error: { code: "todo_revision_stale" } },
+      });
+      expect(todoSummaryMessage(request)).toContain('"storeRevision":1');
+    }
+    expect(todoId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(
+      (await store.read()).filter(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_updated",
+      ),
+    ).toHaveLength(0);
+  });
 });
+
+function todoSummaryMessage(request: ModelRequest | undefined): string | undefined {
+  const message = request?.messages.find(
+    (message) =>
+      message.role === "assistant" && message.content.startsWith("Adam runtime Todo summary v1"),
+  );
+  return typeof message?.content === "string" ? message.content : undefined;
+}
+
+function todoItemFromToolMessage(
+  request: ModelRequest | undefined,
+  name: string,
+): Readonly<Record<string, unknown>> & { readonly id: string; readonly itemRevision: number } {
+  const message = request?.messages.findLast(
+    (candidate) => candidate.role === "tool" && candidate.name === name,
+  );
+  const output =
+    message?.role === "tool" && message.result.status === "completed"
+      ? message.result.output
+      : undefined;
+  const item =
+    typeof output === "object" && output !== null ? Reflect.get(output, "item") : undefined;
+  const id = typeof item === "object" && item !== null ? Reflect.get(item, "id") : undefined;
+  const itemRevision =
+    typeof item === "object" && item !== null ? Reflect.get(item, "itemRevision") : undefined;
+  if (
+    message?.role !== "tool" ||
+    message.result.status !== "completed" ||
+    typeof item !== "object" ||
+    item === null ||
+    typeof id !== "string" ||
+    typeof itemRevision !== "number"
+  ) {
+    throw new TypeError(`Expected one completed ${name} Todo item.`);
+  }
+  return item as Readonly<Record<string, unknown>> & {
+    readonly id: string;
+    readonly itemRevision: number;
+  };
+}
 
 async function createAgentSessionStore(storeKind: "in-memory" | "JSONL") {
   if (storeKind === "in-memory") {

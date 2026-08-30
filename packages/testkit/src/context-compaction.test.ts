@@ -1855,6 +1855,147 @@ test("AgentSession durably compacts before the next ordinary provider call", asy
   }
 });
 
+test("AgentSession injects the same authoritative Todo summary into ordinary, compaction, and post-compaction requests", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-todo-compaction-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    join(workspaceRoot, "context.txt"),
+    "todo compaction context ".repeat(2_000),
+    "utf8",
+  );
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "10000000-0000-4000-8000-000000000031",
+      projectId: `sha256:${"3".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const requests: ModelRequest[] = [];
+  let ordinaryCall = 0;
+  const model: ModelDriver = {
+    async *stream(request) {
+      requests.push(request);
+      if (request.purpose === "compaction") {
+        yield {
+          type: "text_delta",
+          text: JSON.stringify({
+            schemaVersion: 1,
+            objective: "Preserve Todo state through compaction.",
+            constraints: [],
+            progress: ["The large context was read."],
+            unresolvedQuestions: [],
+            failures: [],
+            remainingVerification: [],
+            nextSafeAction: "Complete the ordinary turn.",
+          }),
+        };
+        yield { type: "usage", inputTokens: 560, outputTokens: 40 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall === 1) {
+        yield { type: "usage", inputTokens: 20, outputTokens: 8 };
+        yield { type: "tool_call_start", id: "read-todo-context", name: "read_file" };
+        yield {
+          type: "tool_call_delta",
+          id: "read-todo-context",
+          json: '{"path":"context.txt"}',
+        };
+        yield { type: "tool_call_end", id: "read-todo-context" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Todo state survived compaction." };
+      yield { type: "usage", inputTokens: 90, outputTokens: 12 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const tools = createCodingToolRegistry({ workspaceRoot });
+  const todoContextProfile: ContextProfile = {
+    ...contextProfile,
+    contextWindowTokens: 50_000,
+    compactAtTokens: 10_000,
+    postCompactTargetTokens: 8_000,
+  };
+  const session = new AgentSession({
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: {
+      nextSequence: 2,
+      promptContext: createPromptContextV1(tools),
+      targetIdentity,
+      todo: {
+        policyVersion: "todo-policy.v1",
+        storeRevision: 1,
+        items: [
+          {
+            id: "10000000-0000-4000-8000-000000000032",
+            createdOrdinal: 1,
+            itemRevision: 1,
+            status: "pending",
+            title: "Preserve this Todo",
+            dependencyIds: [],
+          },
+        ],
+      },
+    },
+    contextProfile: todoContextProfile,
+  } as ConstructorParameters<typeof AgentSession>[0] & {
+    readonly [sessionDurableContext]: unknown;
+  });
+
+  try {
+    await expect(session.run({ text: "Read the context and preserve the Todo." })).resolves.toEqual(
+      {
+        status: "completed",
+        answer: "Todo state survived compaction.",
+      },
+    );
+    expect(requests.map((request) => request.purpose)).toEqual([
+      "ordinary",
+      "compaction",
+      "ordinary",
+    ]);
+    const summaries = requests.map((request) => {
+      const messages =
+        request.purpose === "compaction"
+          ? ((
+              JSON.parse(
+                request.messages.find(
+                  (message) => message.role === "user" && typeof message.content === "string",
+                )?.content as string,
+              ) as { readonly messages: readonly ModelRequest["messages"][number][] }
+            ).messages ?? [])
+          : request.messages;
+      return messages.find(
+        (message) =>
+          message.role === "assistant" &&
+          message.content.startsWith("Adam runtime Todo summary v1"),
+      );
+    });
+    expect(summaries).toHaveLength(3);
+    expect(summaries[0]).toBeDefined();
+    expect(summaries[1]).toEqual(summaries[0]);
+    expect(summaries[2]).toEqual(summaries[0]);
+    expect(summaries[0]).toMatchObject({
+      role: "assistant",
+      content: expect.stringContaining(
+        '{"policyVersion":"todo-policy.v1","storeRevision":1,"counts":{"pending":1,"inProgress":0,"completed":0},"blockedCount":0',
+      ),
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("AgentSession reinjects the exact approved Plan projection into compaction and post-compaction requests", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-approved-plan-compaction-"));
   const workspaceRoot = join(testRoot, "workspace");

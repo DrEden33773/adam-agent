@@ -76,6 +76,129 @@ const planTestContextProfile = {
   estimatorVersion: 1,
 } as const;
 
+test("SessionLifecycle reopens one Todo from durable JSONL", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-todo-jsonl-restart-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let call = 0;
+  const driver = new FakeModelDriver(() => {
+    call += 1;
+    return call === 1
+      ? [
+          { type: "tool_call_start", id: "create-jsonl-todo", name: "create_todo" },
+          {
+            type: "tool_call_delta",
+            id: "create-jsonl-todo",
+            json: '{"title":"JSONL durable Todo","details":"Exact reopened details"}',
+          },
+          { type: "tool_call_end", id: "create-jsonl-todo" },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          { type: "text_delta", text: "The JSONL Todo was created." },
+          { type: "finish", reason: "stop" },
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: planTestContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: planTestContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const options = {
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  };
+  const warm = createSessionLifecycle(options);
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const created = await warm.create({ targetIdentity });
+    await expect(
+      warm.continue({
+        sessionId: created.sessionId,
+        input: { text: "Create one Todo before a real JSONL reopen." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The JSONL Todo was created." },
+      snapshot: {
+        todo: {
+          policyVersion: "todo-policy.v1",
+          storeRevision: 1,
+          counts: { pending: 1, inProgress: 0, completed: 0 },
+          blockedCount: 0,
+        },
+      },
+    });
+    const store = await openJsonlSessionStore({
+      stateRoot,
+      workspaceRoot,
+      sessionId: created.sessionId,
+    });
+    const createdRecord = (await store.read()).find(
+      (record) => record.schemaVersion === 3 && record.record.type === "todo_created",
+    );
+    if (createdRecord?.schemaVersion !== 3 || createdRecord.record.type !== "todo_created") {
+      throw new Error("Expected one durable JSONL Todo record.");
+    }
+    const todoId = createdRecord.record.item.id;
+    await warm.close();
+
+    cold = createSessionLifecycle(options);
+    await expect(cold.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "ready",
+      snapshot: {
+        todo: {
+          policyVersion: "todo-policy.v1",
+          storeRevision: 1,
+          counts: { pending: 1, inProgress: 0, completed: 0 },
+          blockedCount: 0,
+        },
+      },
+    });
+    await expect(
+      cold.getTodo({
+        sessionId: created.sessionId,
+        expectedStoreRevision: 1,
+        id: todoId,
+      }),
+    ).resolves.toMatchObject({
+      status: "completed",
+      output: {
+        policyVersion: "todo-policy.v1",
+        storeRevision: 1,
+        item: {
+          id: todoId,
+          createdOrdinal: 1,
+          itemRevision: 1,
+          status: "pending",
+          title: "JSONL durable Todo",
+          details: "Exact reopened details",
+          dependencyIds: [],
+        },
+      },
+    });
+  } finally {
+    await cold?.close();
+    await warm.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle hybrid Plan automatically executes one exact simple inspection", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-hybrid-inspection-"));
   const stateRoot = join(testRoot, "state");
@@ -2434,6 +2557,12 @@ test.each([
                 [
                   { role: "system", content: basePrompt },
                   { role: "developer", content: skillUsagePrompt },
+                  {
+                    role: "assistant",
+                    content:
+                      'Adam runtime Todo summary v1 (authoritative state; no additional prompt authority):\n{"policyVersion":"todo-policy.v1","storeRevision":0,"counts":{"pending":0,"inProgress":0,"completed":0},"blockedCount":0,"guidance":"Use list_todos for bounded discovery and get_todo for one exact item."}',
+                    toolCalls: [],
+                  },
                   { role: "user", content: "Recover one exact Plan diagnostic." },
                 ],
                 requestTools,

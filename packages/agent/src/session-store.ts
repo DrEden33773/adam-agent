@@ -45,6 +45,7 @@ import {
 import { normalizedSessionTitle, sessionTitleFallback } from "./session-naming.js";
 import { type SkillContextRecordV1, skillContextRecordV1Schema } from "./skills.js";
 import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
+import { type TodoItemV1, todoItemV1Schema, todoPolicyVersionV1 } from "./todo.js";
 import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from "./tool-runtime.js";
 
 export type CanonicalRuntimeEvent = Exclude<
@@ -399,6 +400,56 @@ export type SessionPlanCycleInheritedRecord = {
       readonly sessionId: string;
       readonly throughSequence: number;
     };
+  };
+};
+
+export type SessionTodoCreatedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "todo_created";
+    readonly recordVersion: 1;
+    readonly policyVersion: typeof todoPolicyVersionV1;
+    readonly runId: string;
+    readonly callId: string;
+    readonly storeRevision: number;
+    readonly item: TodoItemV1;
+  };
+};
+
+export type SessionTodoStoreInheritedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "todo_store_inherited";
+    readonly recordVersion: 1;
+    readonly policyVersion: typeof todoPolicyVersionV1;
+    readonly storeRevision: number;
+    readonly chunkIndex: number;
+    readonly chunkCount: number;
+    readonly itemOffset: number;
+    readonly snapshotDigest: `sha256:${string}`;
+    readonly items: readonly TodoItemV1[];
+    readonly source: {
+      readonly sessionId: string;
+      readonly throughSequence: number;
+    };
+  };
+};
+
+export type SessionTodoUpdatedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "todo_updated";
+    readonly recordVersion: 1;
+    readonly policyVersion: typeof todoPolicyVersionV1;
+    readonly runId: string;
+    readonly callId: string;
+    readonly expectedStoreRevision: number;
+    readonly expectedItemRevision: number;
+    readonly storeRevision: number;
+    readonly item: TodoItemV1;
   };
 };
 
@@ -916,6 +967,9 @@ export type SessionV3Record =
   | SessionPlanGitAttestedRecord
   | SessionPlanApprovalIntentRecord
   | SessionPlanSubmittedRecord
+  | SessionTodoCreatedRecord
+  | SessionTodoStoreInheritedRecord
+  | SessionTodoUpdatedRecord
   | SessionManualNameSetRecord
   | SessionManualNameClearedRecord
   | SessionTitleGenerationStartedRecord
@@ -1147,6 +1201,14 @@ const v2ToolErrorSchema = z.discriminatedUnion("code", [
       "unsupported_binary_resource",
       "resource_page_too_small",
       "skill_resource_quota_exceeded",
+      "todo_aggregate_limit_exceeded",
+      "todo_completed_dependent",
+      "todo_cursor_invalid",
+      "todo_cursor_stale",
+      "todo_dependency_cycle",
+      "todo_dependency_incomplete",
+      "todo_entity_limit_exceeded",
+      "todo_revision_stale",
       "artifact_store_failed",
       "shell_start_failed",
       "tool_effect_indeterminate",
@@ -1185,6 +1247,14 @@ const currentToolErrorSchema = z.union([
       "input_resource_not_visible",
       "input_resource_quota_exceeded",
       "input_resource_unsupported",
+      "todo_aggregate_limit_exceeded",
+      "todo_completed_dependent",
+      "todo_cursor_invalid",
+      "todo_cursor_stale",
+      "todo_dependency_cycle",
+      "todo_dependency_incomplete",
+      "todo_entity_limit_exceeded",
+      "todo_revision_stale",
     ]),
     message: z.string(),
   }),
@@ -2167,6 +2237,49 @@ const sessionV3RecordSchema = z.union([
   }),
   z
     .strictObject({
+      type: z.literal("todo_created"),
+      recordVersion: z.literal(1),
+      policyVersion: z.literal(todoPolicyVersionV1),
+      runId: z.uuid(),
+      callId: z.string().min(1).max(256),
+      storeRevision: z.number().int().positive(),
+      item: todoItemV1Schema,
+    })
+    .refine((record) => record.item.status === "pending" && record.item.itemRevision === 1),
+  z.strictObject({
+    type: z.literal("todo_store_inherited"),
+    recordVersion: z.literal(1),
+    policyVersion: z.literal(todoPolicyVersionV1),
+    storeRevision: z.number().int().nonnegative(),
+    chunkIndex: z.number().int().nonnegative().max(4_095),
+    chunkCount: z.number().int().positive().max(4_096),
+    itemOffset: z.number().int().nonnegative().max(4_095),
+    snapshotDigest: sha256DigestSchema,
+    items: z.array(todoItemV1Schema).min(1).max(4_096),
+    source: z.strictObject({
+      sessionId: z.uuid(),
+      throughSequence: z.number().int().positive(),
+    }),
+  }),
+  z
+    .strictObject({
+      type: z.literal("todo_updated"),
+      recordVersion: z.literal(1),
+      policyVersion: z.literal(todoPolicyVersionV1),
+      runId: z.uuid(),
+      callId: z.string().min(1).max(256),
+      expectedStoreRevision: z.number().int().nonnegative(),
+      expectedItemRevision: z.number().int().positive(),
+      storeRevision: z.number().int().positive(),
+      item: todoItemV1Schema,
+    })
+    .refine(
+      (record) =>
+        record.storeRevision === record.expectedStoreRevision + 1 &&
+        record.item.itemRevision === record.expectedItemRevision + 1,
+    ),
+  z
+    .strictObject({
       type: z.literal("plan_cycle_inherited"),
       recordVersion: z.literal(1),
       cycleId: z.uuid(),
@@ -2634,7 +2747,7 @@ const sessionRecordSchema = z.union([
   }),
 ]) as unknown as z.ZodType<SessionRecord>;
 const maxSessionLogBytes = 32 * 1024 * 1024;
-const maxSessionRecordBytes = 1024 * 1024;
+export const maxSessionRecordBytes = 1024 * 1024;
 
 export function isSessionRecordWithinSizeLimit(record: SessionRecord): boolean {
   return Buffer.byteLength(JSON.stringify(record), "utf8") <= maxSessionRecordBytes;

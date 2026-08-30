@@ -6439,6 +6439,36 @@ test("slash Artifacts opens one bounded assistant artifact page", async () => {
   }
 });
 
+test("slash Todos opens the authoritative read-only list and exact detail", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-todo-navigator-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "todo", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Create the exact Todo fixture\r");
+    await fixture.waitFor("Todo fixture created.");
+    await fixture.waitFor("Todo 1/0/0 · 0 blocked");
+    const beforeTodos = fixture.output().length;
+    fixture.write("/todos\r");
+    await fixture.waitForCompleteFrameAfter("Todos · revision 1", beforeTodos);
+    const listFrame = fixture.output().slice(beforeTodos);
+    expectFramedOverlay(listFrame, "Todos · revision 1");
+    expect(listFrame).toContain("Exact Todo fixture");
+    expect(listFrame).toContain("pending · ready · revision 1");
+    const beforeDetail = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Todo detail · read-only", beforeDetail);
+    expect(fixture.output().slice(beforeDetail)).toContain("Caller-visible Todo detail.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("slash Artifacts loads artifact references from older active chronology", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-artifact-history-"));
   const workspaceRoot = join(testRoot, "workspace");

@@ -159,12 +159,15 @@ import type {
 } from "./session-snapshot-contracts.js";
 import {
   createJsonlSessionStoreDirectory,
+  isSessionRecordWithinSizeLimit,
+  maxSessionRecordBytes,
   type SessionGenesisRecord,
   type SessionMcpWorkspaceConfirmedRecord,
   type SessionModelResponseField,
   type SessionRecord,
   type SessionStore,
   type SessionStoreDirectory,
+  type SessionTodoStoreInheritedRecord,
 } from "./session-store.js";
 import {
   buildSkillResourceManifestV1,
@@ -183,6 +186,19 @@ import {
   type ThinkingPolicySelectionV1,
   type ThinkingPolicySnapshotV1,
 } from "./thinking-policy.js";
+import {
+  getTodoV1,
+  hasTodoToolProfileV1,
+  listTodosV1,
+  modelMessagesWithTodoSummaryV1,
+  type TodoGetResultV1,
+  type TodoItemV1,
+  type TodoListResultV1,
+  type TodoStoreSnapshotV1,
+  todoLimitsV1,
+  todoStoreSnapshotDigestV1,
+  todoStoreSnapshotFromRecordsV1,
+} from "./todo.js";
 import {
   bindInputResourceToolRegistry,
   createCodingToolRegistry,
@@ -606,6 +622,19 @@ export interface SessionLifecycle {
   inspectContextUsage(input: {
     readonly sessionId: string;
   }): Promise<SessionContextUsageSnapshot | null>;
+  getTodo(input: {
+    readonly sessionId: string;
+    readonly expectedStoreRevision: number;
+    readonly id: string;
+  }): Promise<TodoGetResultV1 | { readonly status: "stale" }>;
+  listTodos(input: {
+    readonly sessionId: string;
+    readonly expectedStoreRevision: number;
+    readonly status?: "pending" | "in_progress" | "completed";
+    readonly titleContains?: string;
+    readonly limit?: number;
+    readonly cursor?: string;
+  }): Promise<TodoListResultV1 | { readonly status: "stale" }>;
   listProjectSessions(input?: {
     readonly cursor?: string;
     readonly limit?: number;
@@ -2330,6 +2359,16 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           });
           nextSequence += 1;
         }
+        const parentTodo = todoStoreSnapshotFromRecordsV1(parentPrefix);
+        if (parentTodo.storeRevision > 0) {
+          const inheritedTodoRecords = createInheritedTodoStoreRecordsV1({
+            firstSequence: nextSequence,
+            snapshot: parentTodo,
+            source: { sessionId: sourceSessionId, throughSequence: sourceEventPosition },
+          });
+          await store.appendBatch(inheritedTodoRecords);
+          nextSequence += inheritedTodoRecords.length;
+        }
         const extensionSources = await resolveExtensionSkillSources(options);
         if (hasSkillPromptContext(parentPromptContext) && parentSkillContext !== undefined) {
           const reconciled = reconcileExtensionSkillContextV1({
@@ -2913,6 +2952,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           options,
           activeSkillContext,
         );
+        const todo =
+          activePromptContext !== undefined &&
+          hasTodoToolProfileV1(activePromptContext.toolProfile.definitions)
+            ? todoStoreSnapshotFromRecordsV1(replayRecords)
+            : undefined;
         const referencedModelResponseArtifactBytes = await replayArtifactBytesFromLineage(
           options,
           lineage,
@@ -3078,6 +3122,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             ...(planApproval === undefined ? {} : { planKickoff: planApproval }),
             ...(runtimePlan === undefined ? {} : { plan: runtimePlan }),
             ...(planRevision === undefined ? {} : { planRevision }),
+            ...(todo === undefined ? {} : { todo }),
             referencedModelResponseArtifactBytes,
             skillResourceLineageBytes,
             inputResourceLineageBytes,
@@ -3957,6 +4002,41 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     async inspectContextUsage(input) {
       await prepareSessionInspection(input.sessionId);
       return inspectSessionContextUsage(input);
+    },
+    async getTodo(input) {
+      await prepareSessionInspection(input.sessionId);
+      const snapshot = await inspectSession({ sessionId: input.sessionId });
+      if (snapshot.schemaVersion !== 3 || snapshot.todo === undefined) {
+        throw new SessionLifecycleError("session_todo_unavailable");
+      }
+      const records = await readSessionRecords(options, input.sessionId);
+      const todo = todoStoreSnapshotFromRecordsV1(records);
+      if (todo.storeRevision !== input.expectedStoreRevision) {
+        return { status: "stale" };
+      }
+      return getTodoV1(todo, { id: input.id });
+    },
+    async listTodos(input) {
+      await prepareSessionInspection(input.sessionId);
+      const snapshot = await inspectSession({ sessionId: input.sessionId });
+      if (snapshot.schemaVersion !== 3 || snapshot.todo === undefined) {
+        throw new SessionLifecycleError("session_todo_unavailable");
+      }
+      const records = await readSessionRecords(options, input.sessionId);
+      const todo = todoStoreSnapshotFromRecordsV1(records);
+      if (todo.storeRevision !== input.expectedStoreRevision) {
+        return { status: "stale" };
+      }
+      return listTodosV1(
+        todo,
+        {
+          ...(input.status === undefined ? {} : { status: input.status }),
+          ...(input.titleContains === undefined ? {} : { titleContains: input.titleContains }),
+          ...(input.limit === undefined ? {} : { limit: input.limit }),
+          ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+        },
+        input.sessionId,
+      );
     },
     async listProjectSessions(input = {}) {
       const limit = input.limit ?? 100;
@@ -5157,12 +5237,15 @@ async function validatePromptProjectionDigests(
     )
       ? ownMessages
       : [...inheritedMessages, ...ownMessages];
-    const messages = assemblePromptMessagesV1(
+    const assembledMessages = assemblePromptMessagesV1(
       transcript,
       context,
       skillContext,
       activeSkillContents,
     );
+    const messages = hasTodoToolProfileV1(context.toolProfile.definitions)
+      ? modelMessagesWithTodoSummaryV1(assembledMessages, todoStoreSnapshotFromRecordsV1(prefix))
+      : assembledMessages;
     const plan = planCycleSnapshotFromRecords(prefix);
     const tools =
       plan === undefined
@@ -6968,6 +7051,80 @@ export function effectiveSessionStateRoot(configured: string | undefined): strin
   return xdgStateHome === undefined || xdgStateHome.length === 0
     ? join(homedir(), ".local", "state", "adam-agent")
     : join(xdgStateHome, "adam-agent");
+}
+
+function createInheritedTodoStoreRecordsV1(input: {
+  readonly firstSequence: number;
+  readonly snapshot: TodoStoreSnapshotV1;
+  readonly source: { readonly sessionId: string; readonly throughSequence: number };
+}): readonly SessionTodoStoreInheritedRecord[] {
+  const snapshotDigest = todoStoreSnapshotDigestV1(input.snapshot);
+  const chunks: TodoItemV1[][] = [];
+  let current: TodoItemV1[] = [];
+  const recordFor = (items: readonly TodoItemV1[]): SessionTodoStoreInheritedRecord => ({
+    schemaVersion: 3,
+    sequence: input.firstSequence + todoLimitsV1.maximumEntities - 1,
+    record: {
+      type: "todo_store_inherited",
+      recordVersion: 1,
+      policyVersion: input.snapshot.policyVersion,
+      storeRevision: input.snapshot.storeRevision,
+      chunkIndex: todoLimitsV1.maximumEntities - 1,
+      chunkCount: todoLimitsV1.maximumEntities,
+      itemOffset: todoLimitsV1.maximumEntities - 1,
+      snapshotDigest,
+      items,
+      source: input.source,
+    },
+  });
+  const conservativeEnvelopeBytes = Buffer.byteLength(JSON.stringify(recordFor([])), "utf8");
+  let currentBytes = conservativeEnvelopeBytes;
+  for (const item of input.snapshot.items) {
+    const itemBytes = Buffer.byteLength(JSON.stringify(item), "utf8");
+    const candidateBytes = currentBytes + itemBytes + (current.length === 0 ? 0 : 1);
+    if (candidateBytes <= maxSessionRecordBytes) {
+      current.push(item);
+      currentBytes = candidateBytes;
+      continue;
+    }
+    if (current.length === 0) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    chunks.push(current);
+    current = [item];
+    currentBytes = conservativeEnvelopeBytes + itemBytes;
+    if (currentBytes > maxSessionRecordBytes) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+  }
+  if (current.length > 0) {
+    chunks.push(current);
+  }
+  let itemOffset = 0;
+  const records = chunks.map((items, chunkIndex): SessionTodoStoreInheritedRecord => {
+    const record: SessionTodoStoreInheritedRecord = {
+      schemaVersion: 3,
+      sequence: input.firstSequence + chunkIndex,
+      record: {
+        type: "todo_store_inherited",
+        recordVersion: 1,
+        policyVersion: input.snapshot.policyVersion,
+        storeRevision: input.snapshot.storeRevision,
+        chunkIndex,
+        chunkCount: chunks.length,
+        itemOffset,
+        snapshotDigest,
+        items,
+        source: input.source,
+      },
+    };
+    itemOffset += items.length;
+    return record;
+  });
+  if (records.length === 0 || records.some((record) => !isSessionRecordWithinSizeLimit(record))) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return records;
 }
 
 function sessionStoreDirectoryFrom(

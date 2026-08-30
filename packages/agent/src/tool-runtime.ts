@@ -35,6 +35,16 @@ import {
   createRepositorySearchToolAdapter,
   type RepositorySearchBackend,
 } from "./repository-search.js";
+import {
+  createTodoInputV1Schema,
+  createTodoToolDefinitionV1,
+  getTodoInputV1Schema,
+  getTodoToolDefinitionV1,
+  listTodoInputV1Schema,
+  listTodoToolDefinitionV1,
+  updateTodoInputV1Schema,
+  updateTodoToolDefinitionV1,
+} from "./todo.js";
 
 export type ToolEffect = "read" | "write" | "execute" | "network" | "delegate" | "administrative";
 
@@ -104,6 +114,14 @@ export type ToolResult =
               | "search_cursor_invalid"
               | "search_cursor_stale"
               | "search_quota_exceeded"
+              | "todo_aggregate_limit_exceeded"
+              | "todo_completed_dependent"
+              | "todo_cursor_invalid"
+              | "todo_cursor_stale"
+              | "todo_dependency_cycle"
+              | "todo_dependency_incomplete"
+              | "todo_entity_limit_exceeded"
+              | "todo_revision_stale"
               | "artifact_store_failed"
               | "mcp_protocol_error"
               | "mcp_output_invalid"
@@ -997,6 +1015,122 @@ function createCodingToolRegistryInternal(options: {
     artifactStore: options.artifactStore,
     occurrences: [],
   });
+  const createTodoAdapter = identifyToolAdapter(
+    {
+      definition: createTodoToolDefinitionV1,
+      outputSchema: z.json(),
+      effect: "write",
+      cancellation: "unsupported",
+      maximumResult: {},
+      prepare(argumentsJson) {
+        const parsedArguments = parseInput(createTodoInputV1Schema, argumentsJson);
+        if (!parsedArguments.success) {
+          return invalidToolInput();
+        }
+        return {
+          status: "ready",
+          permissionSubject: { type: "workspace_path", path: "." },
+          async execute() {
+            return {
+              status: "failed",
+              error: {
+                code: "unknown_tool",
+                message: "create_todo is available only through an active Adam session.",
+              },
+            };
+          },
+        };
+      },
+    },
+    "never",
+  );
+  const getTodoAdapter = identifyToolAdapter(
+    {
+      definition: getTodoToolDefinitionV1,
+      outputSchema: z.json(),
+      effect: "read",
+      cancellation: "unsupported",
+      maximumResult: {},
+      prepare(argumentsJson) {
+        const parsedArguments = parseInput(getTodoInputV1Schema, argumentsJson);
+        if (!parsedArguments.success) {
+          return invalidToolInput();
+        }
+        return {
+          status: "ready",
+          permissionSubject: { type: "workspace_path", path: "." },
+          async execute() {
+            return {
+              status: "failed",
+              error: {
+                code: "unknown_tool",
+                message: "get_todo is available only through an active Adam session.",
+              },
+            };
+          },
+        };
+      },
+    },
+    "safe",
+  );
+  const listTodoAdapter = identifyToolAdapter(
+    {
+      definition: listTodoToolDefinitionV1,
+      outputSchema: z.json(),
+      effect: "read",
+      cancellation: "unsupported",
+      maximumResult: { maximumBytes: 16 * 1024 },
+      prepare(argumentsJson) {
+        const parsedArguments = parseInput(listTodoInputV1Schema, argumentsJson);
+        if (!parsedArguments.success) {
+          return invalidToolInput();
+        }
+        return {
+          status: "ready",
+          permissionSubject: { type: "workspace_path", path: "." },
+          async execute() {
+            return {
+              status: "failed",
+              error: {
+                code: "unknown_tool",
+                message: "list_todos is available only through an active Adam session.",
+              },
+            };
+          },
+        };
+      },
+    },
+    "safe",
+  );
+  const updateTodoAdapter = identifyToolAdapter(
+    {
+      definition: updateTodoToolDefinitionV1,
+      outputSchema: z.json(),
+      effect: "write",
+      cancellation: "unsupported",
+      maximumResult: {},
+      prepare(argumentsJson) {
+        const parsedArguments = parseInput(updateTodoInputV1Schema, argumentsJson);
+        if (!parsedArguments.success) {
+          return invalidToolInput();
+        }
+        return {
+          status: "ready",
+          permissionSubject: { type: "workspace_path", path: "." },
+          async execute() {
+            return {
+              status: "failed",
+              error: {
+                code: "unknown_tool",
+                message: "update_todo is available only through an active Adam session.",
+              },
+            };
+          },
+        };
+      },
+    },
+    "never",
+  );
   const adapters = [
     requireAdapter(readTools, "read_file"),
     requireAdapter(readTools, "search_repository"),
@@ -1006,6 +1140,10 @@ function createCodingToolRegistryInternal(options: {
     activateSkillAdapter,
     readSkillResourceAdapter,
     inputResourceAdapter,
+    createTodoAdapter,
+    getTodoAdapter,
+    listTodoAdapter,
+    updateTodoAdapter,
   ];
   const adaptersByName = new Map(adapters.map((adapter) => [adapter.definition.name, adapter]));
 

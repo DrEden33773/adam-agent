@@ -218,9 +218,11 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     ...(preferences === undefined ? {} : { preferences }),
     permissions: createPermissionPolicy({
       allowedEffects:
-        options.scenario === "tool-artifact" || options.scenario === "shell"
-          ? ["read", "execute"]
-          : ["read"],
+        options.scenario === "todo"
+          ? ["read", "write"]
+          : options.scenario === "tool-artifact" || options.scenario === "shell"
+            ? ["read", "execute"]
+            : ["read"],
       askedEffects: ["write"],
     }),
     workspaceTrust:
@@ -1092,6 +1094,23 @@ function createFixtureModelTargets(options: {
           return;
         }
         yield { type: "text_delta", text: "Search complete." };
+      } else if (options.scenario === "todo") {
+        const latest = request.messages.at(-1);
+        if (latest?.role === "user") {
+          yield { type: "tool_call_start", id: "create-todo-fixture", name: "create_todo" };
+          yield {
+            type: "tool_call_delta",
+            id: "create-todo-fixture",
+            json: JSON.stringify({
+              title: "Exact Todo fixture",
+              details: "Caller-visible Todo detail.",
+            }),
+          };
+          yield { type: "tool_call_end", id: "create-todo-fixture" };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: "Todo fixture created." };
       } else if (options.scenario === "tool-multiple") {
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {

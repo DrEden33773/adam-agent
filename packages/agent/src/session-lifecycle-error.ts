@@ -9,6 +9,7 @@ export class SessionLifecycleError extends Error {
     | "session_thinking_policy_unsupported"
     | "session_persistence_failed"
     | "session_plan_unavailable"
+    | "session_todo_unavailable"
     | "session_skill_confirmation_required"
     | "session_skill_policy_rejected"
     | "session_skill_unavailable"
@@ -83,6 +84,8 @@ function sessionLifecycleErrorMessage(code: SessionLifecycleError["code"]): stri
       return "The new session could not be persisted.";
     case "session_plan_unavailable":
       return "Plan is unavailable in this historical Tool Profile. Start a new session to use Plan.";
+    case "session_todo_unavailable":
+      return "Todo is unavailable in this historical Tool Profile. Start a new session to use Todo.";
     case "session_skill_unavailable":
       return "One selected Agent Skill is unavailable for draft admission.";
     case "session_skill_confirmation_required":

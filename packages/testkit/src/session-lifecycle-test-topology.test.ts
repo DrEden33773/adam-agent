@@ -41,6 +41,7 @@ const operatingSystemTestNames = [
   "SessionLifecycle rejects an input resource above the exact eight MiB file bound",
   "SessionLifecycle rejects input resources above the exact sixteen MiB run aggregate",
   "SessionLifecycle rejects input resources above the exact sixty-four MiB lineage aggregate",
+  "SessionLifecycle reopens one Todo from durable JSONL",
   "SessionLifecycle real-process continuation preserves a completed safe read and starts a new attempt",
   "SessionLifecycle real-process restart marks a killed structured patch as indeterminate without replay",
   "SessionLifecycle real-process branch writes independently, survives restart, and stays project-scoped",
@@ -201,9 +202,23 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
 
   const behaviorNames = declaredTestNames(behaviorSource);
   const operatingSystemNames = declaredTestNames(operatingSystemSource);
-  expect.soft(behaviorNames).toHaveLength(109);
+  expect.soft(behaviorNames).toHaveLength(116);
   expect.soft(operatingSystemNames).toEqual([...operatingSystemTestNames].sort());
-  expect.soft(operatingSystemNames).toHaveLength(28);
+  expect.soft(operatingSystemNames).toHaveLength(29);
+  expect
+    .soft(behaviorNames.filter((name) => name.includes("Todo")))
+    .toEqual([
+      "SessionLifecycle Plan may read Todo but cannot mutate or materialize it",
+      "SessionLifecycle binds Todo reads to the exact folded store revision",
+      "SessionLifecycle branches a Todo store larger than one record through bounded inheritance chunks",
+      "SessionLifecycle folds Todo state across a deterministic restart",
+      "SessionLifecycle prefix branch inherits Todo identity and then diverges locally",
+      "SessionLifecycle rejects a self-consistent forged Todo dependency cycle",
+      "SessionLifecycle rejects a valid-looking inherited Todo store that diverges from its source prefix",
+    ]);
+  expect
+    .soft(operatingSystemNames.filter((name) => name.includes("Todo")))
+    .toEqual(["SessionLifecycle reopens one Todo from durable JSONL"]);
   expect.soft(operatingSystemTestNames.filter((name) => behaviorNames.includes(name))).toEqual([]);
   const combinedNames = [...behaviorNames, ...operatingSystemNames];
   expect.soft(new Set(combinedNames).size).toBe(combinedNames.length);
