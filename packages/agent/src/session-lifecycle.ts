@@ -69,7 +69,16 @@ import {
   modelTargetUsesContextProfile,
   sameModelTargetIdentity,
 } from "./model-targets.js";
-import { createReadOnlyPlanToolProfileV1, type PlanEligibleToolProfileV1 } from "./plan-mode.js";
+import { planGitAutomaticPolicyV1 } from "./plan-git-policy.js";
+import {
+  createPlanToolProfileV1,
+  type PlanEligibleToolProfileV1,
+  type PlanPolicyVersion,
+} from "./plan-mode.js";
+import {
+  createPlanShellEnvironmentV1,
+  type PlanShellEnvironmentV1,
+} from "./plan-shell-environment.js";
 import {
   createProjectLifecycleOwner,
   type ProjectLifecycleOwner,
@@ -244,6 +253,13 @@ export type SessionLogicalRunStartedBarrier = {
 /** Tests only. Production lifecycle instances always default automatic titles on. */
 export const sessionAutomaticTitlesEnabled = Symbol("adam-agent.session-automatic-titles-enabled");
 
+/** Tests only. Production Plan entry captures the live shell environment. */
+export const planShellEnvironmentFactory = Symbol("adam-agent.plan-shell-environment-factory");
+
+export type PlanShellEnvironmentFactory = () =>
+  | PlanShellEnvironmentV1
+  | Promise<PlanShellEnvironmentV1>;
+
 /** Tests only. Production lifecycle instances use the OS-backed project owner. */
 export const sessionProjectLifecycleOwner = Symbol("adam-agent.session-project-lifecycle-owner");
 
@@ -311,6 +327,7 @@ export type SessionLifecycleOptions = {
   readonly [sessionTitleDeadlineScheduler]?: SessionTitleDeadlineScheduler;
   readonly [sessionLogicalRunStartedBarrier]?: SessionLogicalRunStartedBarrier;
   readonly [sessionAutomaticTitlesEnabled]?: boolean;
+  readonly [planShellEnvironmentFactory]?: PlanShellEnvironmentFactory;
   readonly [sessionCloseDrainBarrier]?: SessionCloseDrainBarrier;
   readonly [sessionProjectLifecycleOwner]?: ProjectLifecycleOwner;
   readonly [sessionStoreDirectory]?: SessionStoreDirectory<SessionRecord>;
@@ -2241,6 +2258,21 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               cycleId: parentPlan.cycleId,
               revision: parentPlan.revision,
               policyVersion: parentPlan.policyVersion,
+              ...(parentPlan.shellPolicyVersion === undefined
+                ? {}
+                : { shellPolicyVersion: parentPlan.shellPolicyVersion }),
+              ...(parentPlan.shellEnvironment === undefined
+                ? {}
+                : { shellEnvironment: parentPlan.shellEnvironment }),
+              ...(parentPlan.gitPolicyVersion === undefined
+                ? {}
+                : { gitPolicyVersion: parentPlan.gitPolicyVersion }),
+              ...(parentPlan.gitPolicyDigest === undefined
+                ? {}
+                : { gitPolicyDigest: parentPlan.gitPolicyDigest }),
+              ...(parentPlan.gitAttestation === undefined
+                ? {}
+                : { gitAttestation: parentPlan.gitAttestation }),
               eligibleToolProfile: parentPlan.eligibleToolProfile,
               source: { sessionId: sourceSessionId, throughSequence: sourceEventPosition },
             },
@@ -4232,7 +4264,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           throw new SessionLifecycleError("session_plan_unavailable");
         }
         const records = await readSessionRecords(options, input.sessionId);
-        const eligibleToolProfile = readOnlyPlanToolProfile(inspected, options.tools);
+        const eligibleToolProfile = planToolProfile(
+          inspected,
+          options.tools,
+          "plan-policy.hybrid-v1",
+        );
+        const shellEnvironment = await (
+          options[planShellEnvironmentFactory] ?? createPlanShellEnvironmentV1
+        )();
         const store = await openSessionStore(options, input.sessionId);
         await store.append({
           schemaVersion: 3,
@@ -4242,7 +4281,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             recordVersion: 1,
             cycleId: randomUUID(),
             revision: 1,
-            policyVersion: "plan-policy.read-v1",
+            policyVersion: "plan-policy.hybrid-v1",
+            shellPolicyVersion: "plan-shell-policy.v1",
+            shellEnvironment,
+            gitPolicyVersion: planGitAutomaticPolicyV1.version,
+            gitPolicyDigest: planGitAutomaticPolicyV1.digest,
             eligibleToolProfile,
           },
         });
@@ -5728,8 +5771,7 @@ function createAgentResumeState(
             candidate.record.runId === runId &&
             candidate.record.event.type === "tool_permission_decided" &&
             candidate.record.event.callId === call.id &&
-            candidate.record.event.name === call.name &&
-            candidate.record.event.decision === "allow",
+            candidate.record.event.name === call.name,
         );
         const permissionEvent =
           permission?.record.type === "runtime_event" &&
@@ -5780,6 +5822,7 @@ function createAgentResumeState(
         const reusablePermission =
           repositoryTrigger === undefined &&
           exactIntent &&
+          permissionEvent?.decision === "allow" &&
           permissionEvent?.effect !== undefined &&
           permissionEvent.scope === "call" &&
           permissionEvent.subject !== undefined
@@ -5807,46 +5850,57 @@ function createAgentResumeState(
             candidate.record.callId === call.id,
         );
         const replayResult =
-          committedSkillResource?.record.type === "skill_resource_read_committed"
+          permissionEvent?.decision === "deny"
             ? {
-                status: "completed" as const,
-                output: {
-                  qualifiedId: committedSkillResource.record.qualifiedId,
-                  activationIndex: committedSkillResource.record.activationIndex,
-                  catalogRevision: committedSkillResource.record.catalogRevision,
-                  manifestRevision: committedSkillResource.record.manifestRevision,
-                  path: committedSkillResource.record.path,
-                  offset: committedSkillResource.record.offset,
-                  byteCount: committedSkillResource.record.byteCount,
-                  totalByteCount: committedSkillResource.record.totalByteCount,
-                  eof: committedSkillResource.record.eof,
-                  fileDigest: committedSkillResource.record.fileDigest,
-                  pageDigest: committedSkillResource.record.pageDigest,
-                  content: committedSkillResource.record.content,
-                  ...(committedSkillResource.record.executionToken === undefined
-                    ? {}
-                    : { executionToken: committedSkillResource.record.executionToken }),
+                status: "failed" as const,
+                error: {
+                  code: "permission_denied" as const,
+                  message:
+                    snapshot.plan !== undefined && permissionEvent.requestId === undefined
+                      ? `Permission denied for tool in Plan: ${call.name}`
+                      : `Permission denied for tool: ${call.name}`,
                 },
               }
-            : committedInputResource?.record.type === "input_resource_read_committed"
+            : committedSkillResource?.record.type === "skill_resource_read_committed"
               ? {
                   status: "completed" as const,
                   output: {
-                    occurrenceId: committedInputResource.record.occurrenceId,
-                    displayName: committedInputResource.record.displayName,
-                    offset: committedInputResource.record.offset,
-                    byteCount: committedInputResource.record.byteCount,
-                    totalByteCount: committedInputResource.record.totalByteCount,
-                    eof: committedInputResource.record.eof,
-                    nextCursor: committedInputResource.record.nextCursor,
-                    digest: committedInputResource.record.digest,
-                    pageDigest: committedInputResource.record.pageDigest,
-                    content: committedInputResource.record.content,
+                    qualifiedId: committedSkillResource.record.qualifiedId,
+                    activationIndex: committedSkillResource.record.activationIndex,
+                    catalogRevision: committedSkillResource.record.catalogRevision,
+                    manifestRevision: committedSkillResource.record.manifestRevision,
+                    path: committedSkillResource.record.path,
+                    offset: committedSkillResource.record.offset,
+                    byteCount: committedSkillResource.record.byteCount,
+                    totalByteCount: committedSkillResource.record.totalByteCount,
+                    eof: committedSkillResource.record.eof,
+                    fileDigest: committedSkillResource.record.fileDigest,
+                    pageDigest: committedSkillResource.record.pageDigest,
+                    content: committedSkillResource.record.content,
+                    ...(committedSkillResource.record.executionToken === undefined
+                      ? {}
+                      : { executionToken: committedSkillResource.record.executionToken }),
                   },
                 }
-              : committedInputResource?.record.type === "input_resource_image_read_committed"
-                ? { status: "completed" as const, output: committedInputResource.record.image }
-                : undefined;
+              : committedInputResource?.record.type === "input_resource_read_committed"
+                ? {
+                    status: "completed" as const,
+                    output: {
+                      occurrenceId: committedInputResource.record.occurrenceId,
+                      displayName: committedInputResource.record.displayName,
+                      offset: committedInputResource.record.offset,
+                      byteCount: committedInputResource.record.byteCount,
+                      totalByteCount: committedInputResource.record.totalByteCount,
+                      eof: committedInputResource.record.eof,
+                      nextCursor: committedInputResource.record.nextCursor,
+                      digest: committedInputResource.record.digest,
+                      pageDigest: committedInputResource.record.pageDigest,
+                      content: committedInputResource.record.content,
+                    },
+                  }
+                : committedInputResource?.record.type === "input_resource_image_read_committed"
+                  ? { status: "completed" as const, output: committedInputResource.record.image }
+                  : undefined;
         pendingToolCalls.push({
           call,
           requested,
@@ -6609,22 +6663,35 @@ async function openSessionStore(
   return store;
 }
 
-function readOnlyPlanToolProfile(
+function planToolProfile(
   snapshot: CurrentSessionSnapshot,
   tools: ToolRegistry | undefined,
+  policyVersion: PlanPolicyVersion,
 ): PlanEligibleToolProfileV1 {
   const source = snapshot.promptContext?.toolProfile;
   if (source === undefined || tools === undefined) {
     throw new SessionLifecycleError("session_invalid");
   }
-  return readOnlyPlanToolProfileFromAuthority(
-    source,
-    tools,
-    snapshot.mcp?.workspaceConfirmed === true ? snapshot.mcp.profile : undefined,
-  );
+  const mcpSnapshot = snapshot.mcp?.workspaceConfirmed === true ? snapshot.mcp : undefined;
+  const mcpProfile =
+    mcpSnapshot?.profile === undefined
+      ? undefined
+      : {
+          ...mcpSnapshot.profile,
+          tools: mcpSnapshot.profile.tools.map((tool) => {
+            const server = mcpSnapshot.servers.find(
+              (candidate) => candidate.serverId === tool.serverId,
+            );
+            if (server === undefined) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+            return { ...tool, serverDefinitionDigest: server.definitionDigest };
+          }),
+        };
+  return planToolProfileFromAuthority(source, tools, mcpProfile, policyVersion);
 }
 
-function readOnlyPlanToolProfileFromAuthority(
+function planToolProfileFromAuthority(
   source: NonNullable<CurrentSessionSnapshot["promptContext"]>["toolProfile"],
   tools: ToolRegistry,
   mcpProfile:
@@ -6632,11 +6699,15 @@ function readOnlyPlanToolProfileFromAuthority(
         readonly digest: `sha256:${string}`;
         readonly tools: readonly {
           readonly qualifiedName: string;
+          readonly serverId: string;
+          readonly originalName: string;
+          readonly serverDefinitionDigest: `sha256:${string}`;
           readonly definitionDigest: `sha256:${string}`;
           readonly effect: ToolEffect;
         }[];
       }
     | undefined,
+  policyVersion: PlanPolicyVersion,
 ): PlanEligibleToolProfileV1 {
   const mcpTools = new Map(
     mcpProfile?.tools.map((tool) => [tool.qualifiedName, tool] as const) ?? [],
@@ -6645,12 +6716,25 @@ function readOnlyPlanToolProfileFromAuthority(
   for (const definition of source.definitions) {
     const mcp = mcpTools.get(definition.name);
     if (mcp !== undefined) {
-      if (mcp.effect === "read") {
+      if (
+        mcp.effect === "read" ||
+        (policyVersion === "plan-policy.hybrid-v1" &&
+          (mcp.effect === "execute" || mcp.effect === "network"))
+      ) {
         definitions.push({
           name: definition.name,
           definitionDigest: mcp.definitionDigest,
           effect: mcp.effect,
           source: "mcp",
+          ...(policyVersion === "plan-policy.hybrid-v1"
+            ? {
+                mcp: {
+                  serverId: mcp.serverId,
+                  originalName: mcp.originalName,
+                  serverDefinitionDigest: mcp.serverDefinitionDigest,
+                },
+              }
+            : {}),
         });
       }
       continue;
@@ -6659,7 +6743,12 @@ function readOnlyPlanToolProfileFromAuthority(
     if (adapter === undefined || !/^sha256:[0-9a-f]{64}$/u.test(adapter.definitionDigest)) {
       throw new SessionLifecycleError("session_invalid");
     }
-    if (adapter.effect === "read") {
+    if (
+      adapter.effect === "read" ||
+      (policyVersion === "plan-policy.hybrid-v1" &&
+        definition.name === "run_shell" &&
+        adapter.effect === "execute")
+    ) {
       definitions.push({
         name: definition.name,
         definitionDigest: adapter.definitionDigest as `sha256:${string}`,
@@ -6668,7 +6757,7 @@ function readOnlyPlanToolProfileFromAuthority(
       });
     }
   }
-  return createReadOnlyPlanToolProfileV1({
+  return createPlanToolProfileV1({
     source: { version: source.version, digest: source.digest },
     definitions,
   });
@@ -6705,10 +6794,11 @@ async function validatePlanToolProfilesFromLineage(
     ) {
       throw new SessionLifecycleError("session_invalid");
     }
-    const expected = readOnlyPlanToolProfileFromAuthority(
+    const expected = planToolProfileFromAuthority(
       promptContext.toolProfile,
       options.tools,
       mcpProfile,
+      entry.record.policyVersion,
     );
     if (!isDeepStrictEqual(entry.record.eligibleToolProfile, expected)) {
       throw new SessionLifecycleError("session_invalid");

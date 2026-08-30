@@ -60,6 +60,15 @@ import {
   prepareExplicitUserImageMessagesV1,
   projectedContentUsageV1,
 } from "./model-user-content.js";
+import {
+  downgradePlanCommandAssessmentV1,
+  type PlanCommandAssessment,
+} from "./plan-command-assessment.js";
+import {
+  assessPlanCommandExecutionV1,
+  resolvePlanTrustedExecutableV1,
+} from "./plan-executable-policy.js";
+import { createPlanGitAttestationV1, type PlanGitAttestationV1 } from "./plan-git-policy.js";
 import type { PlanCycleSnapshot } from "./plan-mode.js";
 import {
   assemblePromptMessagesV1,
@@ -156,6 +165,7 @@ export class AgentSession {
   readonly #tools: ToolRegistry | undefined;
   readonly #fixedRequestTools: readonly ModelToolDefinition[] | undefined;
   readonly #plan: PlanCycleSnapshot | undefined;
+  #planGitAttestation: PlanGitAttestationV1 | undefined;
   readonly #permissions: PermissionPolicy | undefined;
   #promptContext: PromptContextRecord | undefined;
   #skillContext: SkillContextRecordV1 | undefined;
@@ -248,6 +258,7 @@ export class AgentSession {
           ])
         : captureToolRegistry(dependencies.tools, selectedToolNames);
     this.#plan = this.#durableContext?.plan;
+    this.#planGitAttestation = this.#plan?.gitAttestation;
     this.#fixedRequestTools =
       this.#durableContext !== undefined && durablePromptContext === undefined
         ? undefined
@@ -1977,12 +1988,47 @@ export class AgentSession {
       return undefined;
     }
     const preparedPermissionSubject = preparedCall.permissionSubject;
+    const planCommandAssessment =
+      this.#plan?.policyVersion === "plan-policy.hybrid-v1" &&
+      call.name === "run_shell" &&
+      preparedPermissionSubject.type === "command"
+        ? this.#plan.shellEnvironment !== undefined && this.#repositoryWorkspaceRoot !== undefined
+          ? await assessPlanCommandExecutionV1({
+              rawCommand: preparedPermissionSubject.command,
+              shellEnvironment: this.#plan.shellEnvironment,
+              workspaceRoot: this.#repositoryWorkspaceRoot,
+              ...(this.#planGitAttestation === undefined
+                ? {}
+                : { gitAttestation: this.#planGitAttestation }),
+            })
+          : downgradePlanCommandAssessmentV1(
+              preparedPermissionSubject.command,
+              "environment_untrusted",
+            )
+        : undefined;
+    if (planCommandAssessment?.status === "invalid") {
+      const result: ToolResult = {
+        status: "failed",
+        error: {
+          code: "invalid_tool_input",
+          message: "The Plan shell command does not satisfy the bounded command grammar.",
+        },
+      };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    const permissionSubject = planPermissionSubject(
+      this.#plan,
+      preparedPermissionSubject,
+      planCommandAssessment,
+    );
     const permissionInput: PermissionPolicyInput = {
       callId: call.id,
       name: call.name,
       effect: adapter.effect,
       scope: "call",
-      subject: preparedPermissionSubject,
+      subject: permissionSubject,
     };
     const visibleModelSkillSelection =
       preparedPermissionSubject.type === "skill" &&
@@ -2005,13 +2051,14 @@ export class AgentSession {
     const eligiblePlanDefinition = this.#plan?.eligibleToolProfile.definitions.find(
       (definition) => definition.name === call.name,
     );
-    if (
-      this.#plan !== undefined &&
-      (eligiblePlanDefinition === undefined ||
-        eligiblePlanDefinition.definitionDigest !== adapter.definitionDigest ||
-        eligiblePlanDefinition.effect !== adapter.effect ||
-        adapter.effect !== "read")
-    ) {
+    const planDisposition = planToolDisposition(
+      this.#plan,
+      eligiblePlanDefinition,
+      adapter,
+      preparedPermissionSubject,
+      planCommandAssessment,
+    );
+    if (this.#plan !== undefined && planDisposition === "deny") {
       await this.#emit({
         type: "tool_permission_decided",
         decision: "deny",
@@ -2096,9 +2143,13 @@ export class AgentSession {
       }
     }
     const policyDecision =
-      this.#plan !== undefined || preparedPermissionSubject.type === "input_resource"
-        ? "allow"
-        : (this.#permissions?.decide(permissionInput) ?? "deny");
+      this.#plan !== undefined
+        ? planDisposition === "ask"
+          ? "ask"
+          : "allow"
+        : preparedPermissionSubject.type === "input_resource"
+          ? "allow"
+          : (this.#permissions?.decide(permissionInput) ?? "deny");
     if (signal.aborted) {
       return this.#settleCancelled();
     }
@@ -2180,6 +2231,15 @@ export class AgentSession {
       toolName: call.name,
       sessionId: this.#durableContext?.sessionId ?? this.#runtimeSessionId,
       toolProfileDigest: this.#promptContext?.toolProfile.digest ?? "prompt-profile-v0",
+      ...(call.name === "run_shell" && this.#plan?.shellEnvironment !== undefined
+        ? { planShellEnvironment: this.#plan.shellEnvironment }
+        : {}),
+      ...(call.name === "run_shell" && planCommandAssessment !== undefined
+        ? { planCommandAssessment }
+        : {}),
+      ...(call.name === "run_shell" && this.#planGitAttestation !== undefined
+        ? { planGitAttestation: this.#planGitAttestation }
+        : {}),
     } as const;
     const result =
       call.name === "activate_skill"
@@ -2191,6 +2251,7 @@ export class AgentSession {
             : await preparedCall.execute(executionContext);
     toolResultsById.set(call.id, { call, result });
     await this.#appendToolResult(messages, call, result);
+    await this.#commitPlanGitAttestation(call, result);
     if (result.status === "failed" && result.error.code === "tool_effect_indeterminate") {
       return this.#settle({
         status: "failed",
@@ -2198,6 +2259,50 @@ export class AgentSession {
       });
     }
     return undefined;
+  }
+
+  async #commitPlanGitAttestation(call: ToolCall, result: ToolResult): Promise<void> {
+    const runId = this.#activeRunId;
+    const plan = this.#plan;
+    const shellEnvironment = plan?.shellEnvironment;
+    const workspaceRoot = this.#repositoryWorkspaceRoot;
+    if (
+      this.#planGitAttestation !== undefined ||
+      runId === undefined ||
+      plan?.policyVersion !== "plan-policy.hybrid-v1" ||
+      shellEnvironment === undefined ||
+      workspaceRoot === undefined ||
+      call.name !== "run_shell" ||
+      !isExactGitVersionToolCall(call) ||
+      !isExactGitVersionToolResult(result)
+    ) {
+      return;
+    }
+    const executable = await resolvePlanTrustedExecutableV1({
+      commandName: "git",
+      shellEnvironment,
+      workspaceRoot,
+    });
+    if (executable === undefined) {
+      return;
+    }
+    const attestation = createPlanGitAttestationV1({
+      executable,
+      shellEnvironmentDigest: shellEnvironment.digest,
+    });
+    await this.#appendRecord({
+      schemaVersion: 3,
+      sequence: this.#nextSequence,
+      record: {
+        type: "plan_git_attested",
+        recordVersion: 1,
+        cycleId: plan.cycleId,
+        runId,
+        callId: call.id,
+        attestation,
+      },
+    });
+    this.#planGitAttestation = attestation;
   }
 
   async #activateModelSelectedSkill(call: ToolCall): Promise<ToolResult> {
@@ -3787,7 +3892,7 @@ function planRequestToolDefinitions(
       adapter === undefined ||
       adapter.definitionDigest !== definition.definitionDigest ||
       adapter.effect !== definition.effect ||
-      definition.effect !== "read"
+      !planProfileAllowsDefinition(plan, definition)
     ) {
       throw new TypeError("The exact Plan Tool Profile is not supported.");
     }
@@ -3795,11 +3900,139 @@ function planRequestToolDefinitions(
   });
 }
 
+function planProfileAllowsDefinition(
+  plan: PlanCycleSnapshot,
+  definition: PlanCycleSnapshot["eligibleToolProfile"]["definitions"][number],
+): boolean {
+  if (definition.effect === "read") {
+    return true;
+  }
+  if (
+    plan.policyVersion !== "plan-policy.hybrid-v1" ||
+    plan.shellPolicyVersion !== "plan-shell-policy.v1"
+  ) {
+    return false;
+  }
+  return (
+    (definition.source === "builtin" &&
+      definition.name === "run_shell" &&
+      definition.effect === "execute") ||
+    (definition.source === "mcp" &&
+      (definition.effect === "execute" || definition.effect === "network"))
+  );
+}
+
+function planToolDisposition(
+  plan: PlanCycleSnapshot | undefined,
+  definition: PlanCycleSnapshot["eligibleToolProfile"]["definitions"][number] | undefined,
+  adapter: NonNullable<ReturnType<ToolRegistry["resolve"]>>,
+  subject: PermissionSubject,
+  commandAssessment: PlanCommandAssessment | undefined,
+): "allow" | "ask" | "deny" | undefined {
+  if (plan === undefined) {
+    return undefined;
+  }
+  if (
+    definition === undefined ||
+    definition.definitionDigest !== adapter.definitionDigest ||
+    definition.effect !== adapter.effect ||
+    !planProfileAllowsDefinition(plan, definition)
+  ) {
+    return "deny";
+  }
+  if (definition.effect === "read") {
+    return "allow";
+  }
+  if (
+    definition.source === "builtin" &&
+    definition.name === "run_shell" &&
+    definition.effect === "execute" &&
+    subject.type === "command" &&
+    commandAssessment !== undefined
+  ) {
+    return commandAssessment.disposition === "allow_inspection"
+      ? "allow"
+      : commandAssessment.disposition === "ask_ambiguous"
+        ? "ask"
+        : "deny";
+  }
+  if (
+    definition.source === "mcp" &&
+    (definition.effect === "execute" || definition.effect === "network")
+  ) {
+    return "ask";
+  }
+  return "deny";
+}
+
+function planPermissionSubject(
+  plan: PlanCycleSnapshot | undefined,
+  subject: PermissionSubject,
+  assessment: PlanCommandAssessment | undefined,
+): PermissionSubject {
+  if (
+    plan?.policyVersion !== "plan-policy.hybrid-v1" ||
+    plan.shellPolicyVersion !== "plan-shell-policy.v1" ||
+    plan.shellEnvironment === undefined ||
+    plan.gitPolicyVersion !== "git-auto-policy.v1" ||
+    plan.gitPolicyDigest === undefined ||
+    subject.type !== "command" ||
+    assessment === undefined ||
+    assessment.status !== "assessed"
+  ) {
+    return subject;
+  }
+  return {
+    type: "plan_command",
+    command: subject.command,
+    cwd: subject.cwd,
+    planCycleId: plan.cycleId,
+    planPolicyVersion: plan.policyVersion,
+    shellPolicyVersion: plan.shellPolicyVersion,
+    shellEnvironmentVersion: plan.shellEnvironment.version,
+    shellEnvironmentDigest: plan.shellEnvironment.digest,
+    toolProfileDigest: plan.eligibleToolProfile.digest,
+    gitPolicyVersion: plan.gitPolicyVersion,
+    gitPolicyDigest: plan.gitPolicyDigest,
+    assessment: {
+      version: assessment.version,
+      disposition: assessment.disposition,
+      reasons: assessment.reasons,
+      digest: assessment.digest,
+    },
+  };
+}
+
 function areOptionalUsageDetailsValid(
   usage: Extract<ModelEvent, { readonly type: "usage" }>,
 ): boolean {
   return [usage.reasoningTokens, usage.cachedInputTokens, usage.cacheMissInputTokens].every(
     (value) => value === undefined || isNonnegativeSafeInteger(value),
+  );
+}
+
+function isExactGitVersionToolCall(call: ToolCall): boolean {
+  try {
+    const parsed = JSON.parse(call.argumentsJson) as unknown;
+    return (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      !Array.isArray(parsed) &&
+      (parsed as { readonly command?: unknown }).command === "git --version"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isExactGitVersionToolResult(result: ToolResult): boolean {
+  return (
+    result.status === "completed" &&
+    isDeepStrictEqual(result.output, {
+      termination: { type: "exited", exitCode: 0 },
+      stdout: { tail: "git version 2.43.0\n", totalBytes: 19, omittedBytes: 0 },
+      stderr: { tail: "", totalBytes: 0, omittedBytes: 0 },
+    })
   );
 }
 

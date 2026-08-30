@@ -25,6 +25,7 @@ import {
 } from "@adam-agent/agent";
 import {
   createInMemorySessionStoreDirectory,
+  createPlanToolProfileV1,
   mcpActivationSettlementBarrier,
   mcpBeforeToolDispatchBarrier,
   mcpCatalogStaleDurableBarrier,
@@ -5119,6 +5120,106 @@ test("SessionLifecycle rejects a core and MCP qualified-name collision before mo
   }
 });
 
+test("SessionLifecycle cold inspection preserves a historical read-v1 MCP Plan profile", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-plan-read-v1-recovery-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+
+  const {
+    harness,
+    lifecycle: initial,
+    peer,
+  } = createScriptedMcpLifecycle(
+    { stateRoot, workspaceRoot },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+  try {
+    const committed = await commitFixtureEchoTool(initial, "read");
+    await initial.enterPlan({ sessionId: committed.sessionId });
+    const initialStore = await harness.sessions.open(committed.sessionId);
+    if (initialStore === undefined) {
+      throw new Error("The fixture requires the historical Plan session store.");
+    }
+    const hybridRecords = await initialStore.read();
+    const transportClosed = peer.nextClose("fixture");
+    await expect(initial.close()).resolves.toEqual({ status: "closed" });
+    await transportClosed;
+
+    const historicalDirectory = createInMemorySessionStoreDirectory<SessionRecord>();
+    const historicalStore = await historicalDirectory.create(committed.sessionId);
+    let convertedCycles = 0;
+    for (const entry of hybridRecords) {
+      const historicalEntry: SessionRecord =
+        entry.schemaVersion === 3 && entry.record.type === "plan_cycle_entered"
+          ? {
+              ...entry,
+              record: {
+                type: entry.record.type,
+                recordVersion: entry.record.recordVersion,
+                cycleId: entry.record.cycleId,
+                revision: entry.record.revision,
+                policyVersion: "plan-policy.read-v1",
+                eligibleToolProfile: createPlanToolProfileV1({
+                  source: entry.record.eligibleToolProfile.source,
+                  definitions: entry.record.eligibleToolProfile.definitions.flatMap(
+                    (definition) => {
+                      if (definition.effect !== "read") {
+                        return [];
+                      }
+                      return [
+                        {
+                          name: definition.name,
+                          definitionDigest: definition.definitionDigest,
+                          effect: definition.effect,
+                          source: definition.source,
+                        },
+                      ];
+                    },
+                  ),
+                }),
+              },
+            }
+          : entry;
+      if (historicalEntry !== entry) {
+        convertedCycles += 1;
+      }
+      await historicalStore.append(historicalEntry);
+    }
+    expect(convertedCycles).toBe(1);
+
+    cold = createSessionLifecycle({
+      [mcpTransportFactory]: createScriptedMcpTransportFactory({
+        fixture: ordinaryScriptedMcpServer(),
+      }),
+      [sessionStoreDirectory]: historicalDirectory,
+      stateRoot,
+      workspaceRoot,
+    });
+    await expect(cold.inspect({ sessionId: committed.sessionId })).resolves.toMatchObject({
+      plan: {
+        policyVersion: "plan-policy.read-v1",
+        eligibleToolProfile: {
+          definitions: expect.arrayContaining([
+            {
+              name: committed.qualifiedName,
+              definitionDigest: committed.definitionDigest,
+              effect: "read",
+              source: "mcp",
+            },
+          ]),
+        },
+      },
+    });
+  } finally {
+    await initial.close();
+    await cold?.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle Plan auto-allows an exact committed read-only MCP tool", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-plan-read-"));
   const stateRoot = join(testRoot, "state");
@@ -5134,6 +5235,7 @@ test("SessionLifecycle Plan auto-allows an exact committed read-only MCP tool", 
       expect(request.tools.map((tool) => tool.name)).toEqual([
         "read_file",
         "search_repository",
+        "run_shell",
         "activate_skill",
         "read_skill_resource",
         "read_input_resource",
@@ -5201,6 +5303,11 @@ test("SessionLifecycle Plan auto-allows an exact committed read-only MCP tool", 
       definitionDigest: committed.definitionDigest,
       effect: "read",
       source: "mcp",
+      mcp: {
+        serverId: committed.serverId,
+        originalName: committed.originalName,
+        serverDefinitionDigest: committed.serverDefinitionDigest,
+      },
     });
 
     await expect(
@@ -5222,8 +5329,291 @@ test("SessionLifecycle Plan auto-allows an exact committed read-only MCP tool", 
   }
 });
 
-test("SessionLifecycle Plan denies every committed non-read MCP effect before dispatch", async () => {
-  const deniedEffects = ["execute", "network", "delegate", "administrative"] as const;
+test("SessionLifecycle hybrid Plan asks for each exact committed executable MCP effect", async () => {
+  const askedEffects = ["execute", "network"] as const;
+
+  for (const effect of askedEffects) {
+    const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-mcp-plan-${effect}-ask-`));
+    const stateRoot = join(testRoot, "state");
+    const workspaceRoot = join(testRoot, "workspace");
+    await mkdir(workspaceRoot);
+    await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+
+    let qualifiedName: string | undefined;
+    let requestCount = 0;
+    const driver = new FakeModelDriver((request) => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        expect(request.tools.some((tool) => tool.name === qualifiedName)).toBe(true);
+        return [
+          { type: "tool_call_start", id: `plan-mcp-${effect}`, name: qualifiedName as string },
+          { type: "tool_call_delta", id: `plan-mcp-${effect}`, json: '{"value":"forbidden"}' },
+          { type: "tool_call_end", id: `plan-mcp-${effect}` },
+          { type: "finish", reason: "tool_calls" },
+        ];
+      }
+      expect(request.messages.at(-1)).toMatchObject({
+        role: "tool",
+        name: qualifiedName,
+        result: { status: "failed", error: { code: "permission_denied" } },
+      });
+      return [
+        { type: "text_delta", text: `Plan requested exact approval for the ${effect} MCP effect.` },
+        { type: "finish", reason: "stop" },
+      ];
+    });
+    const modelTargets: ModelTargets = {
+      async resolve() {
+        return { identity: targetIdentity, driver, contextProfile };
+      },
+      async snapshot() {
+        return {
+          targets: [
+            {
+              identity: targetIdentity,
+              readiness: { status: "available", credentialSource: "test" },
+              contextProfile,
+            },
+          ],
+        };
+      },
+    };
+    const { lifecycle, peer } = createScriptedMcpLifecycle(
+      {
+        modelTargets,
+        permissions: createPermissionPolicy({
+          allowedEffects: ["read", "write", "execute", "network", "delegate", "administrative"],
+        }),
+        stateRoot,
+        workspaceRoot,
+      },
+      { fixture: ordinaryScriptedMcpServer() },
+    );
+    const permissionEvents: RuntimeEvent[] = [];
+    lifecycle.subscribe((event) => {
+      if (event.type === "tool_permission_requested") {
+        permissionEvents.push(event);
+        lifecycle.decidePermission({ requestId: event.requestId, decision: "deny" });
+      }
+    });
+
+    try {
+      const committed = await commitFixtureEchoTool(lifecycle, effect);
+      qualifiedName = committed.qualifiedName;
+      const entered = await lifecycle.enterPlan({ sessionId: committed.sessionId });
+      expect(
+        entered.plan?.eligibleToolProfile.definitions.some(
+          (definition) => definition.name === committed.qualifiedName,
+        ),
+      ).toBe(true);
+
+      await expect(
+        lifecycle.continue({
+          sessionId: committed.sessionId,
+          input: { text: `Try the committed ${effect} MCP tool in Plan.` },
+          limits: { maxTurns: 2 },
+        }),
+      ).resolves.toMatchObject({
+        result: {
+          status: "completed",
+          answer: `Plan requested exact approval for the ${effect} MCP effect.`,
+        },
+      });
+      expect(permissionEvents).toHaveLength(1);
+      expect(permissionEvents[0]).toMatchObject({
+        name: qualifiedName,
+        effect,
+        scope: "call",
+        subject: {
+          type: "mcp_tool",
+          qualifiedName,
+          argumentsDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        },
+      });
+      expect(peer.requests("fixture").filter((request) => request.method === "tools/call")).toEqual(
+        [],
+      );
+    } finally {
+      await lifecycle.close();
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test("SessionLifecycle cold inspection rejects consistently forged hybrid Plan MCP permission identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-mcp-plan-permission-tamper-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeScriptedMcpConfiguration(testRoot, workspaceRoot);
+
+  let qualifiedName: string | undefined;
+  let requestCount = 0;
+  const driver = new FakeModelDriver(() => {
+    requestCount += 1;
+    return requestCount === 1
+      ? [
+          {
+            type: "tool_call_start",
+            id: "plan-mcp-durable-identity",
+            name: qualifiedName as string,
+          },
+          {
+            type: "tool_call_delta",
+            id: "plan-mcp-durable-identity",
+            json: '{"value":"durable"}',
+          },
+          { type: "tool_call_end", id: "plan-mcp-durable-identity" },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          { type: "text_delta", text: "The exact durable permission was denied." },
+          { type: "finish", reason: "stop" },
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const {
+    harness,
+    lifecycle: initial,
+    peer,
+  } = createScriptedMcpLifecycle(
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({
+        allowedEffects: ["read", "write", "execute", "network", "delegate", "administrative"],
+      }),
+      stateRoot,
+      workspaceRoot,
+    },
+    { fixture: ordinaryScriptedMcpServer() },
+  );
+  initial.subscribe((event) => {
+    if (event.type === "tool_permission_requested") {
+      initial.decidePermission({ requestId: event.requestId, decision: "deny" });
+    }
+  });
+
+  try {
+    const committed = await commitFixtureEchoTool(initial, "execute");
+    qualifiedName = committed.qualifiedName;
+    await initial.enterPlan({ sessionId: committed.sessionId });
+    await expect(
+      initial.continue({
+        sessionId: committed.sessionId,
+        input: { text: "Request the exact executable MCP tool." },
+        limits: { maxTurns: 2 },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The exact durable permission was denied." },
+    });
+    const initialStore = await harness.sessions.open(committed.sessionId);
+    if (initialStore === undefined) {
+      throw new Error("The fixture requires the durable Plan permission session store.");
+    }
+    const validRecords = await initialStore.read();
+    const transportClosed = peer.nextClose("fixture");
+    await expect(initial.close()).resolves.toEqual({ status: "closed" });
+    await transportClosed;
+
+    const tamperCases = [
+      { field: "requestId" },
+      { field: "serverId" },
+      { field: "originalName" },
+      { field: "qualifiedName" },
+      { field: "serverDefinitionDigest" },
+      { field: "definitionDigest" },
+      { field: "argumentsDigest" },
+    ] as const;
+    for (const tamper of tamperCases) {
+      const corruptedDirectory = createInMemorySessionStoreDirectory<SessionRecord>();
+      const corruptedStore = await corruptedDirectory.create(committed.sessionId);
+      let corruptedEvents = 0;
+      for (const entry of validRecords) {
+        let corruptedEntry: SessionRecord = entry;
+        if (
+          entry.schemaVersion === 3 &&
+          entry.record.type === "runtime_event" &&
+          (entry.record.event.type === "tool_permission_requested" ||
+            entry.record.event.type === "tool_permission_decided") &&
+          entry.record.event.subject?.type === "mcp_tool"
+        ) {
+          const event = entry.record.event;
+          const subject = event.subject;
+          if (subject?.type !== "mcp_tool") {
+            throw new Error("The fixture requires an MCP permission subject.");
+          }
+          const corruptedEvent: typeof event =
+            tamper.field === "requestId"
+              ? { ...event, requestId: `${event.requestId}-forged` }
+              : {
+                  ...event,
+                  subject: {
+                    ...subject,
+                    ...(tamper.field === "serverId" ? { serverId: "forged" } : {}),
+                    ...(tamper.field === "originalName" ? { originalName: "forged" } : {}),
+                    ...(tamper.field === "qualifiedName" ? { qualifiedName: "forged" } : {}),
+                    ...(tamper.field === "serverDefinitionDigest"
+                      ? { serverDefinitionDigest: `sha256:${"3".repeat(64)}` as const }
+                      : {}),
+                    ...(tamper.field === "definitionDigest"
+                      ? { definitionDigest: `sha256:${"4".repeat(64)}` as const }
+                      : {}),
+                    ...(tamper.field === "argumentsDigest"
+                      ? { argumentsDigest: `sha256:${"5".repeat(64)}` as const }
+                      : {}),
+                  },
+                };
+          corruptedEntry = {
+            ...entry,
+            record: { ...entry.record, event: corruptedEvent },
+          };
+          corruptedEvents += 1;
+        }
+        await corruptedStore.append(corruptedEntry);
+      }
+      expect(corruptedEvents, tamper.field).toBe(2);
+
+      const cold = createSessionLifecycle({
+        [mcpTransportFactory]: createScriptedMcpTransportFactory({
+          fixture: ordinaryScriptedMcpServer(),
+        }),
+        [sessionStoreDirectory]: corruptedDirectory,
+        modelTargets,
+        stateRoot,
+        workspaceRoot,
+      });
+      try {
+        await expect(
+          cold.inspect({ sessionId: committed.sessionId }),
+          tamper.field,
+        ).rejects.toMatchObject({ code: "session_invalid" });
+      } finally {
+        await cold.close();
+      }
+    }
+  } finally {
+    await initial.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle hybrid Plan denies every generic mutating MCP effect before dispatch", async () => {
+  const deniedEffects = ["write", "delegate", "administrative"] as const;
 
   for (const effect of deniedEffects) {
     const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-mcp-plan-${effect}-deny-`));

@@ -11,11 +11,13 @@ import {
 import {
   createInMemorySessionStoreDirectory,
   createTrustedWorkspaceTrustForTesting,
+  createUnavailablePlanShellEnvironmentV1,
   type McpClientTransport,
   type McpTransportFactory,
   type ProjectLifecycleOwner,
   ProjectLifecycleOwnerError,
   type ProjectLifecycleOwnerLease,
+  planShellEnvironmentFactory,
   type SessionRecord,
   type SessionStoreDirectory,
   sessionAutomaticTitlesEnabled,
@@ -319,6 +321,8 @@ export function createSessionLifecycleForTesting(
     workspaceTrust:
       options.workspaceTrust ?? createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
     [sessionAutomaticTitlesEnabled]: false,
+    [planShellEnvironmentFactory]:
+      options[planShellEnvironmentFactory] ?? createUnavailablePlanShellEnvironmentV1,
   });
 }
 
@@ -343,6 +347,8 @@ export function createInMemorySessionLifecycleHarness(): {
         workspaceTrust:
           options.workspaceTrust ?? createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
         [sessionAutomaticTitlesEnabled]: false,
+        [planShellEnvironmentFactory]:
+          options[planShellEnvironmentFactory] ?? createUnavailablePlanShellEnvironmentV1,
         [sessionProjectLifecycleOwner]: owner,
         [sessionStoreDirectory]: directory,
       });

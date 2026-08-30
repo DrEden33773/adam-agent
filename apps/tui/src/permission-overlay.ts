@@ -5,6 +5,7 @@ import {
   Key,
   matchesKey,
   truncateToWidth,
+  visibleWidth,
 } from "@earendil-works/pi-tui";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import type { AdamTuiTheme } from "./theme.js";
@@ -69,14 +70,33 @@ export class PermissionOverlay implements Component, Focusable {
   invalidate(): void {}
 
   render(width: number): string[] {
-    const subject = truncateToWidth(safeTerminalText(this.#interaction.subject.value), width);
+    const subject = exactTerminalSubject(this.#interaction.subject.value);
     const effect =
       this.#interaction.effect === "read"
         ? this.#theme.keyword(this.#interaction.effect)
         : this.#theme.danger(this.#interaction.effect);
-    const actionLine = `${this.#theme.keyword("Action")} ${effect} · ${this.#theme.keyword(
+    const actionPrefix = `${this.#theme.keyword("Action")} ${effect} · ${this.#theme.keyword(
       "Subject",
-    )} ${this.#theme.subject(subject)}`;
+    )} `;
+    const actionPrefixWidth = visibleWidth(actionPrefix);
+    const actionLines =
+      width > actionPrefixWidth
+        ? wrapExactText(subject, width - actionPrefixWidth).map((line, index) =>
+            index === 0 ? `${actionPrefix}${this.#theme.subject(line)}` : this.#theme.subject(line),
+          )
+        : [
+            ...wrapExactText(
+              `Action ${this.#interaction.effect} · Subject `,
+              Math.max(1, width),
+            ).map((line) => this.#theme.keyword(line)),
+            ...wrapExactText(subject, Math.max(1, width)).map((line) => this.#theme.subject(line)),
+          ];
+    const warningLine =
+      this.#interaction.warning === undefined
+        ? []
+        : wrapExactText(safeTerminalText(this.#interaction.warning), Math.max(1, width)).map(
+            (line) => this.#theme.danger(line),
+          );
     const options = this.#allowEnabled
       ? `${this.#selection === "allow" ? ">" : " "} ${this.#theme.allow("Allow")}    ${
           this.#selection === "deny" ? ">" : " "
@@ -100,7 +120,8 @@ export class PermissionOverlay implements Component, Focusable {
       width < 60
         ? [
             this.#theme.toolTitle("Permission required"),
-            actionLine,
+            ...actionLines,
+            ...warningLine,
             options,
             "Enter · Esc deny · Ctrl+C abort",
             previewPosition,
@@ -108,7 +129,8 @@ export class PermissionOverlay implements Component, Focusable {
           ]
         : [
             this.#theme.toolTitle("Permission required"),
-            actionLine,
+            ...actionLines,
+            ...warningLine,
             "",
             ...preview,
             "",
@@ -123,4 +145,44 @@ export class PermissionOverlay implements Component, Focusable {
     const maximum = Math.max(0, this.#preview.split("\n").length - this.#previewPageSize);
     this.#previewOffset = Math.max(0, Math.min(maximum, this.#previewOffset + lines));
   }
+}
+
+const graphemeSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+function wrapExactText(value: string, maximumWidth: number): string[] {
+  if (value.length === 0) {
+    return [""];
+  }
+  const lines: string[] = [];
+  let line = "";
+  let lineWidth = 0;
+  for (const { segment } of graphemeSegmenter.segment(value)) {
+    const segmentWidth = visibleWidth(segment);
+    if (line.length > 0 && lineWidth + segmentWidth > maximumWidth) {
+      lines.push(line);
+      line = "";
+      lineWidth = 0;
+    }
+    line += segment;
+    lineWidth += segmentWidth;
+  }
+  if (line.length > 0) {
+    lines.push(line);
+  }
+  return lines;
+}
+
+function exactTerminalSubject(value: string): string {
+  const safe = safeTerminalText(value);
+  if (safe === value) {
+    return value;
+  }
+  return [...JSON.stringify(value)]
+    .map((character) => {
+      if (safeTerminalText(character) === character) {
+        return character;
+      }
+      return `\\u${(character.codePointAt(0) as number).toString(16).padStart(4, "0")}`;
+    })
+    .join("");
 }

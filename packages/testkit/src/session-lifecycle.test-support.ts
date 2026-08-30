@@ -4,6 +4,8 @@ import {
 } from "@adam-agent/agent";
 import {
   createTrustedWorkspaceTrustForTesting,
+  createUnavailablePlanShellEnvironmentV1,
+  planShellEnvironmentFactory,
   sessionAutomaticTitlesEnabled,
 } from "@adam-agent/agent/internal-testing";
 
@@ -38,5 +40,7 @@ export function createSessionLifecycleForTests(
     workspaceTrust:
       options.workspaceTrust ?? createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
     [sessionAutomaticTitlesEnabled]: false,
+    [planShellEnvironmentFactory]:
+      options[planShellEnvironmentFactory] ?? createUnavailablePlanShellEnvironmentV1,
   });
 }

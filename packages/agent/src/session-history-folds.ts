@@ -1012,8 +1012,28 @@ export function planCycleSnapshotFromRecords(
         cycleId: entry.record.cycleId,
         revision: entry.record.revision,
         policyVersion: entry.record.policyVersion,
+        ...(entry.record.shellPolicyVersion === undefined
+          ? {}
+          : { shellPolicyVersion: entry.record.shellPolicyVersion }),
+        ...(entry.record.shellEnvironment === undefined
+          ? {}
+          : { shellEnvironment: entry.record.shellEnvironment }),
+        ...(entry.record.gitPolicyVersion === undefined
+          ? {}
+          : { gitPolicyVersion: entry.record.gitPolicyVersion }),
+        ...(entry.record.gitPolicyDigest === undefined
+          ? {}
+          : { gitPolicyDigest: entry.record.gitPolicyDigest }),
+        ...("gitAttestation" in entry.record && entry.record.gitAttestation !== undefined
+          ? { gitAttestation: entry.record.gitAttestation }
+          : {}),
         eligibleToolProfile: entry.record.eligibleToolProfile,
       };
+    } else if (
+      entry.record.type === "plan_git_attested" &&
+      entry.record.cycleId === active?.cycleId
+    ) {
+      active = { ...active, gitAttestation: entry.record.attestation };
     } else if (
       entry.record.type === "plan_cycle_exited" &&
       entry.record.cycleId === active?.cycleId &&

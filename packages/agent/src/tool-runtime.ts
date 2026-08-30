@@ -1,7 +1,7 @@
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { type FileHandle, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
+import { chmod, type FileHandle, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 
@@ -23,6 +23,14 @@ import {
   type PatchFileSystem,
   PatchTransactionError,
 } from "./patch-transaction.js";
+import {
+  isPlanAutomaticGitCommandV1,
+  type PlanCommandAssessment,
+  planCommandArgumentsV1,
+} from "./plan-command-assessment.js";
+import { isPlanCommandExecutionIdentityCurrentV1 } from "./plan-executable-policy.js";
+import { type PlanGitAttestationV1, planGitEnvironmentV1 } from "./plan-git-policy.js";
+import type { PlanShellEnvironmentV1 } from "./plan-shell-environment.js";
 import {
   createRepositorySearchToolAdapter,
   type RepositorySearchBackend,
@@ -205,6 +213,9 @@ type ToolExecutionContext = {
   readonly toolName: string;
   readonly sessionId: string;
   readonly toolProfileDigest: string;
+  readonly planShellEnvironment?: PlanShellEnvironmentV1;
+  readonly planCommandAssessment?: PlanCommandAssessment;
+  readonly planGitAttestation?: PlanGitAttestationV1;
 };
 
 class ToolExecutionError extends Error {
@@ -253,6 +264,25 @@ export type PermissionSubject =
       readonly type: "command";
       readonly command: string;
       readonly cwd: ".";
+    }
+  | {
+      readonly type: "plan_command";
+      readonly command: string;
+      readonly cwd: ".";
+      readonly planCycleId: string;
+      readonly planPolicyVersion: "plan-policy.hybrid-v1";
+      readonly shellPolicyVersion: "plan-shell-policy.v1";
+      readonly shellEnvironmentVersion: "plan-shell-env.v1";
+      readonly shellEnvironmentDigest: `sha256:${string}`;
+      readonly toolProfileDigest: `sha256:${string}`;
+      readonly gitPolicyVersion: "git-auto-policy.v1";
+      readonly gitPolicyDigest: `sha256:${string}`;
+      readonly assessment: {
+        readonly version: 1;
+        readonly disposition: "allow_inspection" | "ask_ambiguous" | "deny_mutation";
+        readonly reasons: readonly string[];
+        readonly digest: `sha256:${string}`;
+      };
     }
   | {
       readonly type: "skill";
@@ -814,6 +844,15 @@ function createCodingToolRegistryInternal(options: {
                 toolName: context.toolName,
                 artifactStore: options.artifactStore,
                 limits: shellLimits,
+                ...(context.planShellEnvironment === undefined
+                  ? {}
+                  : { planShellEnvironment: context.planShellEnvironment }),
+                ...(context.planCommandAssessment === undefined
+                  ? {}
+                  : { planCommandAssessment: context.planCommandAssessment }),
+                ...(context.planGitAttestation === undefined
+                  ? {}
+                  : { planGitAttestation: context.planGitAttestation }),
               }),
             );
           },
@@ -1107,16 +1146,52 @@ async function runShellCommand(options: {
   readonly toolName: string;
   readonly artifactStore: ArtifactStore | undefined;
   readonly limits: ShellRuntimeLimits;
+  readonly planShellEnvironment?: PlanShellEnvironmentV1;
+  readonly planCommandAssessment?: PlanCommandAssessment;
+  readonly planGitAttestation?: PlanGitAttestationV1;
 }): Promise<JsonValue> {
-  const isolatedHome = await mkdtemp(join(tmpdir(), "adam-agent-shell-home-"));
+  if (
+    options.planShellEnvironment !== undefined &&
+    "status" in options.planShellEnvironment.shell
+  ) {
+    throw new ToolExecutionError(
+      "shell_start_failed",
+      "The Plan shell was unavailable when this cycle captured its execution identity.",
+    );
+  }
+  if (
+    options.planShellEnvironment !== undefined &&
+    (options.planCommandAssessment === undefined ||
+      !(await isPlanCommandExecutionIdentityCurrentV1({
+        rawCommand: options.command,
+        assessment: options.planCommandAssessment,
+        shellEnvironment: options.planShellEnvironment,
+        workspaceRoot: options.workspaceRoot,
+        ...(options.planGitAttestation === undefined
+          ? {}
+          : { gitAttestation: options.planGitAttestation }),
+      })))
+  ) {
+    throw new ToolExecutionError(
+      "shell_start_failed",
+      "The frozen Plan shell execution identity changed before process start.",
+    );
+  }
+  const temporaryRoot = options.planShellEnvironment?.variables.TMPDIR ?? tmpdir();
+  const isolatedHome = await mkdtemp(join(temporaryRoot, "adam-agent-shell-home-"));
   try {
+    await chmod(isolatedHome, 0o700);
     const processOutput = await new Promise<ShellProcessOutput>((resolvePromise, rejectPromise) => {
       let child: ChildProcessWithoutNullStreams;
       try {
         child = spawn("/bin/sh", ["-c", options.command], {
           cwd: options.workspaceRoot,
           detached: true,
-          env: createShellEnvironment(isolatedHome),
+          env: createShellEnvironment(
+            isolatedHome,
+            options.planShellEnvironment,
+            isAutomaticGitCommand(options.command),
+          ),
           stdio: ["pipe", "pipe", "pipe"],
         });
         child.stdin.end();
@@ -1344,7 +1419,18 @@ type ShellProcessOutput = {
   readonly stderr: ShellStreamAccumulator;
 };
 
-function createShellEnvironment(isolatedHome: string): NodeJS.ProcessEnv {
+function createShellEnvironment(
+  isolatedHome: string,
+  planShellEnvironment?: PlanShellEnvironmentV1,
+  automaticGit = false,
+): NodeJS.ProcessEnv {
+  if (planShellEnvironment !== undefined) {
+    return {
+      HOME: isolatedHome,
+      ...planShellEnvironment.variables,
+      ...(automaticGit ? planGitEnvironmentV1.variables : {}),
+    };
+  }
   const { PATH: executablePath } = process.env;
   const environment: NodeJS.ProcessEnv = {
     HOME: isolatedHome,
@@ -1358,6 +1444,12 @@ function createShellEnvironment(isolatedHome: string): NodeJS.ProcessEnv {
     }
   }
   return environment;
+}
+
+function isAutomaticGitCommand(rawCommand: string): boolean {
+  return (
+    planCommandArgumentsV1(rawCommand)?.some((argv) => isPlanAutomaticGitCommandV1(argv)) === true
+  );
 }
 
 function signalProcessGroup(pid: number | undefined, signal: NodeJS.Signals): void {

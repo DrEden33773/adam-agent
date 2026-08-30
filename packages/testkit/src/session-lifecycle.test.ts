@@ -33,6 +33,8 @@ import {
 } from "@adam-agent/agent";
 import {
   createInMemorySessionStoreDirectory,
+  createPlanToolProfileV1,
+  createUnavailablePlanShellEnvironmentV1,
   inputResourceIngestBarrier,
   openJsonlSessionStore,
   type ProjectLifecycleOwner,
@@ -48,6 +50,7 @@ import {
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
+import { exercisePlanShellRecoveryFixture } from "./plan-shell-recovery.test-support.js";
 import {
   sessionLifecycleAnswerOnlyDeepSeekStream as answerOnlyDeepSeekStream,
   sessionLifecycleBasePrompt as basePrompt,
@@ -96,7 +99,326 @@ const codingToolDefinitions = createCodingToolRegistry({
   workspaceRoot: "/tmp/adam-agent-session-lifecycle-tool-definitions",
 }).definitions();
 
-test("SessionLifecycle Plan exposes only its exact read profile and denies a forged write call", async () => {
+test("SessionLifecycle enters Plan with an unavailable shell snapshot and fails before spawn", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-shell-unavailable-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return [
+        { type: "tool_call_start", id: "unavailable-shell", name: "run_shell" },
+        {
+          type: "tool_call_delta",
+          id: "unavailable-shell",
+          json: JSON.stringify({ command: "uname -s" }),
+        },
+        { type: "tool_call_end", id: "unavailable-shell" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.at(-1)).toMatchObject({
+      role: "tool",
+      callId: "unavailable-shell",
+      result: { status: "failed", error: { code: "shell_start_failed" } },
+    });
+    return [
+      { type: "text_delta", text: "The unavailable shell failed closed before spawn." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+  const events: RuntimeEvent[] = [];
+  lifecycle.subscribe((event) => {
+    events.push(event);
+    if (event.type === "tool_permission_requested") {
+      lifecycle.decidePermission({ requestId: event.requestId, decision: "allow" });
+    }
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const entered = await lifecycle.enterPlan({ sessionId: created.sessionId });
+    expect(entered.plan?.shellEnvironment?.shell).toEqual({
+      status: "unavailable",
+      lookupPath: "/bin/sh",
+    });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Inspect the operating system." },
+      }),
+    ).resolves.toMatchObject({
+      result: {
+        status: "completed",
+        answer: "The unavailable shell failed closed before spawn.",
+      },
+    });
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "tool_permission_requested",
+        name: "run_shell",
+        subject: expect.objectContaining({
+          type: "plan_command",
+          assessment: expect.objectContaining({ reasons: ["environment_untrusted"] }),
+        }),
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "tool_failed",
+        name: "run_shell",
+        error: expect.objectContaining({ code: "shell_start_failed" }),
+      }),
+    );
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  {
+    label: "a mismatched durable assessment",
+    command: "unknown --diagnose",
+    decision: "allow",
+    assessmentMatches: false,
+    omitPermissionRequest: false,
+    started: false,
+    outcome: "reask",
+  },
+  {
+    label: "a forged direct allow",
+    command: "unknown --diagnose",
+    decision: "allow",
+    assessmentMatches: true,
+    omitPermissionRequest: true,
+    started: false,
+    outcome: "invalid",
+  },
+  {
+    label: "a started shell effect",
+    command: "unknown --diagnose",
+    decision: "allow",
+    assessmentMatches: true,
+    omitPermissionRequest: false,
+    started: true,
+    outcome: "indeterminate",
+  },
+  {
+    label: "an exact ambiguous deny before result",
+    command: "unknown --diagnose",
+    decision: "deny",
+    assessmentMatches: true,
+    omitPermissionRequest: false,
+    started: false,
+    outcome: "denied",
+  },
+  {
+    label: "an exact hard deny before result",
+    command: "touch forbidden.txt",
+    decision: "deny",
+    assessmentMatches: true,
+    omitPermissionRequest: true,
+    started: false,
+    outcome: "denied",
+  },
+])(
+  "SessionLifecycle hybrid Plan semantic recovery folds $label",
+  async ({ command, decision, assessmentMatches, omitPermissionRequest, started, outcome }) => {
+    const recovered = await exercisePlanShellRecoveryFixture({
+      shellEnvironmentFactory: createUnavailablePlanShellEnvironmentV1,
+      command,
+      decision: decision as "allow" | "deny",
+      assessmentMatches,
+      omitPermissionRequest,
+      started,
+    });
+
+    if (outcome === "invalid") {
+      expect(recovered).toMatchObject({
+        resume: { status: "rejected", code: "session_invalid" },
+        providerCalls: 0,
+        publicEvents: [],
+      });
+      return;
+    }
+    if (outcome === "indeterminate") {
+      expect(recovered).toMatchObject({
+        resume: {
+          status: "ready",
+          snapshotStatus: "settled",
+          runResult: { status: "failed", error: { code: "tool_effect_indeterminate" } },
+        },
+        providerCalls: 0,
+        publicEvents: [],
+      });
+      return;
+    }
+    expect(recovered).toMatchObject({
+      resume: { status: "ready", snapshotStatus: "interrupted" },
+      continuationResult: {
+        status: "completed",
+        answer: "Recovered the exact Plan shell boundary.",
+      },
+      observedToolResult: { status: "failed", error: { code: "permission_denied" } },
+      providerCalls: 1,
+      secondResume: {
+        snapshotStatus: "settled",
+        runResult: {
+          status: "completed",
+          answer: "Recovered the exact Plan shell boundary.",
+        },
+      },
+    });
+    expect(
+      recovered.publicEvents.filter((event) => event.type === "tool_permission_requested"),
+    ).toHaveLength(outcome === "reask" ? 1 : 0);
+    expect(recovered.publicEvents.filter((event) => event.type === "tool_started")).toHaveLength(0);
+    if (outcome === "denied") {
+      expect(
+        recovered.publicEvents.filter((event) => event.type === "tool_permission_decided"),
+      ).toHaveLength(0);
+    }
+  },
+);
+
+test("SessionLifecycle cold recovery preserves a historical read-v1 Plan profile", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-read-v1-recovery-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const registry = createCodingToolRegistry({ workspaceRoot });
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      expect(request.tools.map((tool) => tool.name)).toEqual([
+        "read_file",
+        "search_repository",
+        "activate_skill",
+        "read_skill_resource",
+        "read_input_resource",
+      ]);
+      return [
+        { type: "tool_call_start", id: "historical-shell", name: "run_shell" },
+        { type: "tool_call_delta", id: "historical-shell", json: '{"command":"uname -s"}' },
+        { type: "tool_call_end", id: "historical-shell" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    expect(request.messages.at(-1)).toMatchObject({
+      role: "tool",
+      callId: "historical-shell",
+      result: { status: "failed", error: { code: "permission_denied" } },
+    });
+    return [
+      { type: "text_delta", text: "The historical Plan remained read-only." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const warm = harness.createLifecycle({ modelTargets, stateRoot, tools: registry, workspaceRoot });
+  let cold: ReturnType<typeof harness.createLifecycle> | undefined;
+
+  try {
+    const created = await warm.create({ targetIdentity });
+    const source = created.promptContext?.toolProfile;
+    const store = await harness.sessions.open(created.sessionId);
+    if (source === undefined || store === undefined) {
+      throw new Error("Expected the created session authority.");
+    }
+    const eligibleToolProfile = createPlanToolProfileV1({
+      source: { version: source.version, digest: source.digest },
+      definitions: source.definitions.flatMap((definition) => {
+        const adapter = registry.resolve(definition.name);
+        return adapter?.effect === "read"
+          ? [
+              {
+                name: definition.name,
+                definitionDigest: adapter.definitionDigest as `sha256:${string}`,
+                effect: adapter.effect,
+                source: "builtin" as const,
+              },
+            ]
+          : [];
+      }),
+    });
+    await store.append({
+      schemaVersion: 3,
+      sequence: created.lastSequence + 1,
+      record: {
+        type: "plan_cycle_entered",
+        recordVersion: 1,
+        cycleId: "123e4567-e89b-42d3-a456-426614176100",
+        revision: 1,
+        policyVersion: "plan-policy.read-v1",
+        eligibleToolProfile,
+      },
+    });
+    await warm.close();
+    cold = harness.createLifecycle({ modelTargets, stateRoot, tools: registry, workspaceRoot });
+
+    await expect(cold.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "ready",
+      snapshot: { plan: { policyVersion: "plan-policy.read-v1" } },
+    });
+    await expect(
+      cold.continue({
+        sessionId: created.sessionId,
+        input: { text: "Try a shell command in the historical Plan." },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "The historical Plan remained read-only." },
+      snapshot: { plan: { policyVersion: "plan-policy.read-v1" } },
+    });
+  } finally {
+    await warm.close();
+    await cold?.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle Plan exposes only its exact eligible profile and denies a forged write call", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-write-deny-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -108,6 +430,7 @@ test("SessionLifecycle Plan exposes only its exact read profile and denies a for
       expect(request.tools.map((tool) => tool.name)).toEqual([
         "read_file",
         "search_repository",
+        "run_shell",
         "activate_skill",
         "read_skill_resource",
         "read_input_resource",
@@ -169,7 +492,13 @@ test("SessionLifecycle Plan exposes only its exact read profile and denies a for
       }),
     ).resolves.toMatchObject({
       result: { status: "completed", answer: "The mutation was denied by Plan." },
-      snapshot: { plan: { state: "exploring", policyVersion: "plan-policy.read-v1" } },
+      snapshot: {
+        plan: {
+          state: "exploring",
+          policyVersion: "plan-policy.hybrid-v1",
+          shellPolicyVersion: "plan-shell-policy.v1",
+        },
+      },
     });
     await expect(readFile(join(workspaceRoot, "forbidden.txt"), "utf8")).rejects.toMatchObject({
       code: "ENOENT",
@@ -522,10 +851,10 @@ test("SessionLifecycle rejects an unsupported durable Plan policy before model u
       `${created.sessionId}.jsonl`,
     );
     const durableHistory = await readFile(sessionPath, "utf8");
-    expect(durableHistory.match(/plan-policy\.read-v1/gu)).toHaveLength(1);
+    expect(durableHistory.match(/plan-policy\.hybrid-v1/gu)).toHaveLength(1);
     await writeFile(
       sessionPath,
-      durableHistory.replace("plan-policy.read-v1", "plan-policy.future-v99"),
+      durableHistory.replace("plan-policy.hybrid-v1", "plan-policy.future-v99"),
       "utf8",
     );
     const modelTargets: ModelTargets = {
@@ -850,6 +1179,18 @@ test("SessionLifecycle rejects forged Plan inheritance from an inactive source p
         cycleId: donorPlan.cycleId,
         revision: donorPlan.revision,
         policyVersion: donorPlan.policyVersion,
+        ...(donorPlan.shellPolicyVersion === undefined
+          ? {}
+          : { shellPolicyVersion: donorPlan.shellPolicyVersion }),
+        ...(donorPlan.shellEnvironment === undefined
+          ? {}
+          : { shellEnvironment: donorPlan.shellEnvironment }),
+        ...(donorPlan.gitPolicyVersion === undefined
+          ? {}
+          : { gitPolicyVersion: donorPlan.gitPolicyVersion }),
+        ...(donorPlan.gitPolicyDigest === undefined
+          ? {}
+          : { gitPolicyDigest: donorPlan.gitPolicyDigest }),
         eligibleToolProfile: donorPlan.eligibleToolProfile,
         source: {
           sessionId: inactiveParent.sessionId,

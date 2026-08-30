@@ -81,6 +81,9 @@ export async function commitFixtureEchoTool(
   readonly sessionId: string;
   readonly qualifiedName: string;
   readonly definitionDigest: `sha256:${string}`;
+  readonly serverId: string;
+  readonly originalName: string;
+  readonly serverDefinitionDigest: `sha256:${string}`;
 }> {
   const created = await lifecycle.create({ targetIdentity: trustedMcpTargetIdentity });
   if (created.mcp === undefined) {
@@ -131,5 +134,8 @@ export async function commitFixtureEchoTool(
     sessionId: created.sessionId,
     qualifiedName: echo.qualifiedName,
     definitionDigest: echo.definitionDigest,
+    serverId: preview.serverId,
+    originalName: echo.originalName,
+    serverDefinitionDigest: preview.definitionDigest,
   };
 }

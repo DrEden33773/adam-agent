@@ -19,7 +19,10 @@ import type { McpToolProfileV1 } from "./mcp-profile-contracts.js";
 import { modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import { imageInputLimitsV1, type ProjectedContentUsageV1 } from "./model-user-content.js";
+import type { PlanShellPolicyVersion } from "./plan-command-assessment.js";
+import type { PlanGitAttestationV1 } from "./plan-git-policy.js";
 import type { PlanEligibleToolProfileV1, PlanPolicyVersion } from "./plan-mode.js";
+import type { PlanShellEnvironmentV1 } from "./plan-shell-environment.js";
 import {
   type PromptContextRecord,
   type PromptContextRecordV1,
@@ -43,7 +46,7 @@ export type CanonicalRuntimeEvent = Exclude<
 
 type V1PermissionSubject = Exclude<
   PermissionSubject,
-  { readonly type: "extension_capability" | "mcp_tool" | "patch" | "skill" }
+  { readonly type: "extension_capability" | "mcp_tool" | "patch" | "plan_command" | "skill" }
 >;
 type V1ToolError = {
   readonly code:
@@ -304,7 +307,24 @@ export type SessionPlanCycleEnteredRecord = {
     readonly cycleId: string;
     readonly revision: 1;
     readonly policyVersion: PlanPolicyVersion;
+    readonly shellPolicyVersion?: PlanShellPolicyVersion;
+    readonly shellEnvironment?: PlanShellEnvironmentV1;
+    readonly gitPolicyVersion?: "git-auto-policy.v1";
+    readonly gitPolicyDigest?: `sha256:${string}`;
     readonly eligibleToolProfile: PlanEligibleToolProfileV1;
+  };
+};
+
+export type SessionPlanGitAttestedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "plan_git_attested";
+    readonly recordVersion: 1;
+    readonly cycleId: string;
+    readonly runId: string;
+    readonly callId: string;
+    readonly attestation: PlanGitAttestationV1;
   };
 };
 
@@ -329,6 +349,11 @@ export type SessionPlanCycleInheritedRecord = {
     readonly cycleId: string;
     readonly revision: number;
     readonly policyVersion: PlanPolicyVersion;
+    readonly shellPolicyVersion?: PlanShellPolicyVersion;
+    readonly shellEnvironment?: PlanShellEnvironmentV1;
+    readonly gitPolicyVersion?: "git-auto-policy.v1";
+    readonly gitPolicyDigest?: `sha256:${string}`;
+    readonly gitAttestation?: PlanGitAttestationV1;
     readonly eligibleToolProfile: PlanEligibleToolProfileV1;
     readonly source: {
       readonly sessionId: string;
@@ -847,6 +872,7 @@ export type SessionV3Record =
   | SessionPlanCycleEnteredRecord
   | SessionPlanCycleExitedRecord
   | SessionPlanCycleInheritedRecord
+  | SessionPlanGitAttestedRecord
   | SessionManualNameSetRecord
   | SessionManualNameClearedRecord
   | SessionTitleGenerationStartedRecord
@@ -1241,6 +1267,56 @@ const inputResourcePermissionSubjectSchema = z.strictObject({
   type: z.literal("input_resource"),
   occurrenceId: z.string().min(1).max(256),
 });
+const planCommandPermissionSubjectSchema = z.strictObject({
+  type: z.literal("plan_command"),
+  command: z
+    .string()
+    .min(1)
+    .max(16 * 1024),
+  cwd: z.literal("."),
+  planCycleId: z.uuid(),
+  planPolicyVersion: z.literal("plan-policy.hybrid-v1"),
+  shellPolicyVersion: z.literal("plan-shell-policy.v1"),
+  shellEnvironmentVersion: z.literal("plan-shell-env.v1"),
+  shellEnvironmentDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  toolProfileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  gitPolicyVersion: z.literal("git-auto-policy.v1"),
+  gitPolicyDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  assessment: z.strictObject({
+    version: z.literal(1),
+    disposition: z.enum(["allow_inspection", "ask_ambiguous", "deny_mutation"]),
+    reasons: z
+      .array(
+        z.enum([
+          "automatic_system_inspection",
+          "automatic_git_inspection",
+          "automatic_workspace_inspection",
+          "command_too_large",
+          "environment_untrusted",
+          "executable_untrusted",
+          "git_attestation_required",
+          "git_repository_untrusted",
+          "in_place_mutation",
+          "invalid_unicode",
+          "malformed_command",
+          "output_redirection",
+          "path_untrusted",
+          "recognized_mutation",
+          "shell_builtin_or_indirection",
+          "token_too_large",
+          "too_many_arguments",
+          "too_many_paths",
+          "too_many_segments",
+          "unclassified_command",
+          "unsupported_control",
+          "unsupported_syntax",
+        ]),
+      )
+      .min(1)
+      .max(32),
+    digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  }),
+});
 const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("file"), path: z.string() }),
   z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
@@ -1249,6 +1325,7 @@ const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
   skillPermissionSubjectSchema,
   mcpPermissionSubjectSchema,
   inputResourcePermissionSubjectSchema,
+  planCommandPermissionSubjectSchema,
   z.strictObject({
     type: z.literal("command"),
     command: z.string(),
@@ -1658,10 +1735,68 @@ const planEligibleToolProfileV1Schema: z.ZodType<PlanEligibleToolProfileV1> = z.
         definitionDigest: sha256DigestSchema,
         effect: z.enum(["read", "write", "execute", "network", "delegate", "administrative"]),
         source: z.enum(["builtin", "mcp"]),
+        mcp: z
+          .strictObject({
+            serverId: z.string().min(1).max(128),
+            originalName: z.string().min(1).max(256),
+            serverDefinitionDigest: sha256DigestSchema,
+          })
+          .optional(),
       }),
     )
     .min(1)
     .max(64),
+  digest: sha256DigestSchema,
+});
+const planShellFileIdentityV1Schema = z.strictObject({
+  lookupPath: z.string().startsWith("/"),
+  canonicalPath: z.string().startsWith("/"),
+  device: z.string().regex(/^\d+$/u),
+  inode: z.string().regex(/^\d+$/u),
+  mode: z.number().int().nonnegative(),
+  size: z
+    .number()
+    .int()
+    .nonnegative()
+    .max(8 * 1024 * 1024),
+  modifiedMilliseconds: z.number().nonnegative(),
+  digest: sha256DigestSchema,
+});
+const planShellEnvironmentV1Schema: z.ZodType<PlanShellEnvironmentV1> = z
+  .strictObject({
+    version: z.literal("plan-shell-env.v1"),
+    pathEntries: z
+      .array(
+        z
+          .string()
+          .max(4_096)
+          .refine((entry) => !entry.includes("\0")),
+      )
+      .min(1)
+      .max(128),
+    variables: z.strictObject({
+      PATH: z.string().max(16_384),
+      LANG: z.literal("C"),
+      LC_ALL: z.literal("C"),
+      TERM: z.literal("dumb"),
+      TMPDIR: z.string().startsWith("/"),
+    }),
+    home: z.strictObject({ allocation: z.literal("owner-only-empty-per-call") }),
+    shell: z.union([
+      planShellFileIdentityV1Schema.extend({ lookupPath: z.literal("/bin/sh") }),
+      z.strictObject({ status: z.literal("unavailable"), lookupPath: z.literal("/bin/sh") }),
+    ]),
+    digest: sha256DigestSchema,
+  })
+  .refine((environment) => environment.variables.PATH === environment.pathEntries.join(":"));
+const planGitAttestationV1Schema: z.ZodType<PlanGitAttestationV1> = z.strictObject({
+  version: z.literal("git-auto-attestation.v1"),
+  gitVersion: z.literal("git version 2.43.0"),
+  executable: planShellFileIdentityV1Schema,
+  shellEnvironmentDigest: sha256DigestSchema,
+  gitEnvironmentDigest: sha256DigestSchema,
+  gitPolicyVersion: z.literal("git-auto-policy.v1"),
+  gitPolicyDigest: sha256DigestSchema,
   digest: sha256DigestSchema,
 });
 const sessionV3RecordSchema = z.union([
@@ -1869,13 +2004,37 @@ const sessionV3RecordSchema = z.union([
       .max(inputResourceLimitsV1.maximumOccurrencesPerRun)
       .optional(),
   }),
+  z
+    .strictObject({
+      type: z.literal("plan_cycle_entered"),
+      recordVersion: z.literal(1),
+      cycleId: z.uuid(),
+      revision: z.literal(1),
+      policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+      shellPolicyVersion: z.literal("plan-shell-policy.v1").optional(),
+      shellEnvironment: planShellEnvironmentV1Schema.optional(),
+      gitPolicyVersion: z.literal("git-auto-policy.v1").optional(),
+      gitPolicyDigest: sha256DigestSchema.optional(),
+      eligibleToolProfile: planEligibleToolProfileV1Schema,
+    })
+    .refine(
+      (record) =>
+        (record.policyVersion === "plan-policy.hybrid-v1") ===
+          (record.shellPolicyVersion === "plan-shell-policy.v1") &&
+        (record.policyVersion === "plan-policy.hybrid-v1") ===
+          (record.shellEnvironment?.version === "plan-shell-env.v1") &&
+        (record.policyVersion === "plan-policy.hybrid-v1") ===
+          (record.gitPolicyVersion === "git-auto-policy.v1") &&
+        (record.policyVersion === "plan-policy.hybrid-v1") ===
+          (record.gitPolicyDigest !== undefined),
+    ),
   z.strictObject({
-    type: z.literal("plan_cycle_entered"),
+    type: z.literal("plan_git_attested"),
     recordVersion: z.literal(1),
     cycleId: z.uuid(),
-    revision: z.literal(1),
-    policyVersion: z.literal("plan-policy.read-v1"),
-    eligibleToolProfile: planEligibleToolProfileV1Schema,
+    runId: z.uuid(),
+    callId: z.string().min(1).max(256),
+    attestation: planGitAttestationV1Schema,
   }),
   z.strictObject({
     type: z.literal("plan_cycle_exited"),
@@ -1884,18 +2043,39 @@ const sessionV3RecordSchema = z.union([
     revision: z.number().int().positive(),
     reason: z.literal("user_cancelled"),
   }),
-  z.strictObject({
-    type: z.literal("plan_cycle_inherited"),
-    recordVersion: z.literal(1),
-    cycleId: z.uuid(),
-    revision: z.number().int().positive(),
-    policyVersion: z.literal("plan-policy.read-v1"),
-    eligibleToolProfile: planEligibleToolProfileV1Schema,
-    source: z.strictObject({
-      sessionId: z.uuid(),
-      throughSequence: z.number().int().positive(),
-    }),
-  }),
+  z
+    .strictObject({
+      type: z.literal("plan_cycle_inherited"),
+      recordVersion: z.literal(1),
+      cycleId: z.uuid(),
+      revision: z.number().int().positive(),
+      policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+      shellPolicyVersion: z.literal("plan-shell-policy.v1").optional(),
+      shellEnvironment: planShellEnvironmentV1Schema.optional(),
+      gitPolicyVersion: z.literal("git-auto-policy.v1").optional(),
+      gitPolicyDigest: sha256DigestSchema.optional(),
+      gitAttestation: planGitAttestationV1Schema.optional(),
+      eligibleToolProfile: planEligibleToolProfileV1Schema,
+      source: z.strictObject({
+        sessionId: z.uuid(),
+        throughSequence: z.number().int().positive(),
+      }),
+    })
+    .refine(
+      (record) =>
+        (record.policyVersion === "plan-policy.hybrid-v1") ===
+          (record.shellPolicyVersion === "plan-shell-policy.v1") &&
+        (record.policyVersion === "plan-policy.hybrid-v1") ===
+          (record.shellEnvironment?.version === "plan-shell-env.v1") &&
+        (record.policyVersion === "plan-policy.hybrid-v1") ===
+          (record.gitPolicyVersion === "git-auto-policy.v1") &&
+        (record.policyVersion === "plan-policy.hybrid-v1") ===
+          (record.gitPolicyDigest !== undefined) &&
+        (record.gitAttestation === undefined ||
+          (record.gitAttestation.shellEnvironmentDigest === record.shellEnvironment?.digest &&
+            record.gitAttestation.gitPolicyVersion === record.gitPolicyVersion &&
+            record.gitAttestation.gitPolicyDigest === record.gitPolicyDigest)),
+    ),
   z.strictObject({
     type: z.literal("session_manual_name_set"),
     recordVersion: z.literal(1),
