@@ -201,7 +201,7 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
 
   const behaviorNames = declaredTestNames(behaviorSource);
   const operatingSystemNames = declaredTestNames(operatingSystemSource);
-  expect.soft(behaviorNames).toHaveLength(96);
+  expect.soft(behaviorNames).toHaveLength(109);
   expect.soft(operatingSystemNames).toEqual([...operatingSystemTestNames].sort());
   expect.soft(operatingSystemNames).toHaveLength(28);
   expect.soft(operatingSystemTestNames.filter((name) => behaviorNames.includes(name))).toEqual([]);

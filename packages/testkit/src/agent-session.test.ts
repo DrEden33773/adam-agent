@@ -850,6 +850,7 @@ describe("AgentSession", () => {
         }
         await backingStore.append(record);
       },
+      appendBatch: (records) => backingStore.appendBatch(records),
       read: () => backingStore.read(),
     };
     let modelCalls = 0;
@@ -989,6 +990,11 @@ describe("AgentSession", () => {
         records.push(record);
         if (record.event.type === "session_interrupted") {
           throw new Error("The durable write completed before the adapter reported failure.");
+        }
+      },
+      async appendBatch(records) {
+        for (const record of records) {
+          await this.append(record);
         }
       },
       async read() {

@@ -8,6 +8,7 @@ import type {
 } from "@ai-sdk/provider";
 import { APICallError } from "@ai-sdk/provider";
 import type { ModelDriver, ModelEvent, ModelRequest } from "./agent-session-contracts.js";
+import { modelMessagesWithApprovedPlanProjectionV1 } from "./approved-plan-projection.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
 import { ModelDriverError } from "./model-driver-error.js";
 import type { ThinkingPolicyMappingV1 } from "./thinking-policy.js";
@@ -209,7 +210,7 @@ function isIgnoredStructuralPart(part: LanguageModelV4StreamPart): boolean {
 }
 
 function mapPrompt(request: ModelRequest): LanguageModelV4Prompt {
-  return request.messages.map(mapMessage);
+  return modelMessagesWithApprovedPlanProjectionV1(request).map(mapMessage);
 }
 
 function mapMessage(message: ModelRequest["messages"][number]): LanguageModelV4Message {

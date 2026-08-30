@@ -44,7 +44,7 @@ export {
   planGitEnvironmentV1,
 } from "./plan-git-policy.js";
 export { isExactPlanMcpPermissionEventV1 } from "./plan-mcp-permission-validation.js";
-export { createPlanToolProfileV1 } from "./plan-mode.js";
+export { createPlanToolProfileV1, submitPlanToolDefinitionV1 } from "./plan-mode.js";
 export {
   createPlanShellEnvironmentV1,
   createUnavailablePlanShellEnvironmentV1,
@@ -100,7 +100,9 @@ export {
   mcpActivationSettlementBarrier,
   mcpCatalogStaleDurableBarrier,
   mcpCatalogStaleObservationBarrier,
+  type PlanApprovalIntentBarrier,
   type PlanShellEnvironmentFactory,
+  planApprovalIntentBarrier,
   planShellEnvironmentFactory,
   type SessionCloseDrainBarrier,
   type SessionLogicalRunStartedBarrier,

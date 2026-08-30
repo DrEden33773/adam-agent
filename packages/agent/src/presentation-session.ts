@@ -507,6 +507,7 @@ export async function createPresentationSession(
     let attachmentUnavailableReason = attachmentAvailable
       ? null
       : "New session required for attachments";
+    let planRevisionIntent: PresentationDisplayState["composer"]["revisionIntent"] = null;
     let state: PresentationDisplayState = {
       revision: 1,
       authoritative,
@@ -522,6 +523,7 @@ export async function createPresentationSession(
         attachmentAvailable,
         unavailableReason: attachmentUnavailableReason,
         sealed: false,
+        revisionIntent: planRevisionIntent,
         resources: [],
       },
       transient: null,
@@ -589,6 +591,7 @@ export async function createPresentationSession(
         attachmentAvailable,
         unavailableReason: attachmentUnavailableReason,
         sealed: snapshot.sealed,
+        revisionIntent: planRevisionIntent,
         resources: snapshot.resources,
       };
     };
@@ -980,6 +983,12 @@ export async function createPresentationSession(
           settlement: Promise<void> | null;
         }
       | undefined;
+    let activePlanCommand:
+      | {
+          readonly key: string;
+          readonly receipt: Promise<CommandReceipt>;
+        }
+      | undefined;
     let snapshotActivationQueue = Promise.resolve();
     const activateSnapshotNow = async (snapshot: CurrentSessionSnapshot): Promise<void> => {
       const activatedRecords = await readActiveBranchRecords(options, snapshot.sessionId);
@@ -1049,6 +1058,18 @@ export async function createPresentationSession(
       attachmentUnavailableReason = attachmentAvailable
         ? null
         : "New session required for attachments";
+      const revisionPlan = snapshot.plan;
+      if (
+        planRevisionIntent !== null &&
+        (revisionPlan?.state !== "ready" ||
+          planRevisionIntent.sessionId !== snapshot.sessionId ||
+          planRevisionIntent.cycleId !== revisionPlan.cycleId ||
+          planRevisionIntent.revision !== revisionPlan.revision ||
+          planRevisionIntent.planId !== revisionPlan.submission.planId ||
+          planRevisionIntent.contentDigest !== revisionPlan.submission.contentDigest)
+      ) {
+        planRevisionIntent = null;
+      }
       state = {
         revision: state.revision + 1,
         authoritative: {
@@ -1628,6 +1649,92 @@ export async function createPresentationSession(
           }
         : null;
 
+    const continueApprovedPlan = (
+      command: Extract<PresentationCommand, { readonly type: "approve_plan" | "continue_plan" }>,
+      failureMessage: string,
+    ): Promise<CommandReceipt> => {
+      const commandKey = [
+        command.sessionId,
+        command.commandId,
+        command.cycleId,
+        command.revision,
+        command.planId,
+        command.contentDigest,
+      ].join(":");
+      if (activePlanCommand?.key === commandKey) {
+        return activePlanCommand.receipt;
+      }
+      if (activeRun !== undefined) {
+        return Promise.resolve({
+          status: "rejected",
+          code: "conflict",
+          message: "The active session already has a running command.",
+        });
+      }
+      const controller = new AbortController();
+      const runState = {
+        sessionId: command.sessionId,
+        controller,
+        settlement: null as Promise<void> | null,
+      };
+      activeRun = runState;
+      state = {
+        ...state,
+        revision: state.revision + 1,
+        transient: { activity: "working", assistant: null, reasoning: null },
+      };
+      publishStateChange();
+      const operation = (async (): Promise<CommandReceipt> => {
+        try {
+          const continued = await options.lifecycle.continue({
+            sessionId: command.sessionId,
+            signal: controller.signal,
+            planApproval: {
+              commandId: command.commandId,
+              cycleId: command.cycleId,
+              revision: command.revision,
+              planId: command.planId,
+              contentDigest: command.contentDigest,
+            },
+          });
+          if (!closed) {
+            await activateSnapshot(continued.snapshot);
+          }
+          return { status: "admitted", commandId: command.commandId, resource: null };
+        } catch {
+          if (!closed) {
+            try {
+              const inspected = await options.lifecycle.inspect({ sessionId: command.sessionId });
+              if (inspected.schemaVersion === 3) {
+                await activateSnapshot(inspected);
+              }
+            } catch {
+              // The command receipt remains fail-closed when refresh is also unavailable.
+            }
+          }
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: failureMessage,
+          };
+        } finally {
+          if (activePlanCommand?.key === commandKey) {
+            activePlanCommand = undefined;
+          }
+          if (activeRun === runState) {
+            activeRun = undefined;
+          }
+          if (!closed && state.transient !== null) {
+            state = { ...state, revision: state.revision + 1, transient: null };
+            publishStateChange();
+          }
+        }
+      })();
+      activePlanCommand = { key: commandKey, receipt: operation };
+      runState.settlement = operation.then(() => undefined);
+      return operation;
+    };
+
     const dispatch = async (command: PresentationCommand): Promise<CommandReceipt> => {
       if (closed) {
         return {
@@ -2035,6 +2142,31 @@ export async function createPresentationSession(
             message: "The active session already has a running command.",
           };
         }
+        const activePlan = state.authoritative.active.plan;
+        const revisionIntent = state.composer.revisionIntent;
+        if (activePlan?.state === "approved_not_started") {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "Continue the approved Plan implementation before sending another turn.",
+          };
+        }
+        if (activePlan?.state === "ready") {
+          if (
+            revisionIntent === null ||
+            revisionIntent.sessionId !== command.sessionId ||
+            revisionIntent.cycleId !== activePlan.cycleId ||
+            revisionIntent.revision !== activePlan.revision ||
+            revisionIntent.planId !== activePlan.submission?.planId ||
+            revisionIntent.contentDigest !== activePlan.submission?.contentDigest
+          ) {
+            return {
+              status: "rejected",
+              code: "conflict",
+              message: "Review the current Plan artifact before sending another turn.",
+            };
+          }
+        }
         const skillResolution = resolveSkillMentions({
           text: command.text,
           explicitQualifiedIds: command.skills,
@@ -2109,6 +2241,16 @@ export async function createPresentationSession(
           ...(command.thinkingSelection === null
             ? {}
             : { thinkingSelection: command.thinkingSelection }),
+          ...(activePlan?.state !== "ready" || revisionIntent === null
+            ? {}
+            : {
+                planRevision: {
+                  cycleId: revisionIntent.cycleId,
+                  revision: revisionIntent.revision,
+                  planId: revisionIntent.planId,
+                  contentDigest: revisionIntent.contentDigest,
+                },
+              }),
         });
         const settlement = continuation
           .then(async (continued) => {
@@ -2157,6 +2299,7 @@ export async function createPresentationSession(
             }
           );
         }
+        planRevisionIntent = null;
         await turnComposer.clear();
         return { status: "admitted", commandId, resource: null };
       }
@@ -2670,6 +2813,7 @@ export async function createPresentationSession(
         const completeReadAvailable =
           (command.artifact.source === "change_preview" &&
             command.artifact.byteCount <= 64 * 1024) ||
+          (command.artifact.source === "plan" && command.artifact.byteCount <= 64 * 1024) ||
           (command.artifact.source === "model_response" &&
             command.artifact.byteCount <= maximumModelResponseContentBytes);
         if (
@@ -2792,6 +2936,121 @@ export async function createPresentationSession(
             status: "rejected",
             code: "authority_rejected",
             message: "Plan could not be entered from the current session state.",
+          };
+        }
+      }
+      if (command.type === "revise_plan") {
+        const plan = state.authoritative.active?.plan;
+        if (
+          command.sessionId !== state.authoritative.active?.session.id ||
+          plan?.state !== "ready" ||
+          command.cycleId !== plan.cycleId ||
+          command.revision !== plan.revision ||
+          command.planId !== plan.submission?.planId ||
+          command.contentDigest !== plan.submission?.contentDigest
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected Plan artifact is no longer current.",
+          };
+        }
+        planRevisionIntent = {
+          sessionId: command.sessionId,
+          cycleId: command.cycleId,
+          revision: command.revision,
+          planId: command.planId,
+          contentDigest: command.contentDigest,
+        };
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          composer: projectTurnComposer(),
+        };
+        publishStateChange();
+        return { status: "admitted", commandId: randomUUID(), resource: null };
+      }
+      if (command.type === "approve_plan") {
+        const plan = state.authoritative.active?.plan;
+        const exactReady =
+          plan?.state === "ready" &&
+          command.cycleId === plan.cycleId &&
+          command.revision === plan.revision &&
+          command.planId === plan.submission?.planId &&
+          command.contentDigest === plan.submission?.contentDigest;
+        const exactDurableReplay =
+          plan?.state === "approved_not_started" &&
+          plan.approval !== undefined &&
+          command.commandId === plan.approval.commandId &&
+          command.cycleId === plan.cycleId &&
+          command.revision === plan.revision &&
+          command.planId === plan.submission?.planId &&
+          command.contentDigest === plan.submission?.contentDigest;
+        if (
+          command.sessionId !== state.authoritative.active?.session.id ||
+          (!exactReady && !exactDurableReplay)
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected Plan artifact is no longer current.",
+          };
+        }
+        return continueApprovedPlan(
+          command,
+          "The approved Plan implementation could not be started.",
+        );
+      }
+      if (command.type === "continue_plan") {
+        const plan = state.authoritative.active?.plan;
+        if (
+          command.sessionId !== state.authoritative.active?.session.id ||
+          plan?.state !== "approved_not_started" ||
+          plan.approval === undefined ||
+          plan.submission === undefined ||
+          command.commandId !== plan.approval.commandId ||
+          command.cycleId !== plan.cycleId ||
+          command.revision !== plan.revision ||
+          command.planId !== plan.submission.planId ||
+          command.contentDigest !== plan.submission.contentDigest
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected Plan implementation intent is no longer current.",
+          };
+        }
+        return continueApprovedPlan(
+          command,
+          "The approved Plan implementation could not be continued.",
+        );
+      }
+      if (command.type === "cancel_plan") {
+        const plan = state.authoritative.active?.plan;
+        if (
+          command.sessionId !== state.authoritative.active?.session.id ||
+          plan?.state !== "ready" ||
+          plan.submission === undefined ||
+          command.cycleId !== plan.cycleId ||
+          command.revision !== plan.revision ||
+          command.planId !== plan.submission.planId ||
+          command.contentDigest !== plan.submission.contentDigest
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected Plan artifact is no longer current.",
+          };
+        }
+        try {
+          const snapshot = await options.lifecycle.cancelPlan(command);
+          await activateSnapshot(snapshot);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "The current Plan artifact could not be cancelled.",
           };
         }
       }
@@ -3343,6 +3602,16 @@ function isKnownArtifact(
   artifact: import("@adam-agent/presentation").ArtifactReference,
 ): boolean {
   const candidates = [
+    ...(active.plan?.submission === undefined
+      ? []
+      : [
+          {
+            id: active.plan.submission.artifact.id,
+            mediaType: active.plan.submission.artifact.mediaType,
+            byteCount: active.plan.submission.artifact.byteCount,
+            source: "plan" as const,
+          },
+        ]),
     ...active.linkedOperations.flatMap((operation) =>
       operation.artifacts.map((artifact) => artifact.reference),
     ),
@@ -3360,6 +3629,16 @@ function isKnownArtifact(
         return [
           ...item.artifacts,
           ...(item.changePreviewRef === null ? [] : [item.changePreviewRef]),
+        ];
+      }
+      if (item.type === "plan_submission") {
+        return [
+          {
+            id: item.submission.artifact.id,
+            mediaType: item.submission.artifact.mediaType,
+            byteCount: item.submission.artifact.byteCount,
+            source: "plan" as const,
+          },
         ];
       }
       return [];

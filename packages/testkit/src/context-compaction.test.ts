@@ -151,6 +151,7 @@ test("AgentSession persists an answer above 256 KiB by durable artifact before p
         durabilityOrder.push("response-reference");
       }
     },
+    appendBatch: (records) => jsonlStore.appendBatch(records),
     read: () => jsonlStore.read(),
   };
   const model: ModelDriver = {
@@ -365,6 +366,7 @@ test("AgentSession rejects text plus reasoning above the shared 64 MiB response 
   };
   const store: SessionStore = {
     async append() {},
+    async appendBatch() {},
     async read() {
       return [];
     },
@@ -397,6 +399,7 @@ test("AgentSession accepts separate text and reasoning at the shared 64 MiB boun
   };
   const store: SessionStore = {
     async append() {},
+    async appendBatch() {},
     async read() {
       return [];
     },
@@ -726,6 +729,7 @@ test("AgentSession permits an orphan only after artifact durability and before r
       }
       await innerStore.append(record);
     },
+    appendBatch: (records) => innerStore.appendBatch(records),
     read: () => innerStore.read(),
   };
   const model: ModelDriver = {
@@ -821,6 +825,7 @@ test("SessionLifecycle completes bounded markers after a crash following the res
         }
         await jsonlStore.append(record);
       },
+      appendBatch: (records) => jsonlStore.appendBatch(records),
       read: () => jsonlStore.read(),
     };
     const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
@@ -1431,6 +1436,59 @@ test("AgentSession fails closed before sending a non-positive output budget", as
   expect(modelCalls).toBe(0);
 });
 
+test("AgentSession reserves ordinary output capacity for the exact approved Plan projection", async () => {
+  let observedMaximumOutputTokens: number | undefined;
+  const model: ModelDriver = {
+    async *stream(request) {
+      observedMaximumOutputTokens = request.maximumOutputTokens;
+      yield { type: "text_delta", text: "Approved Plan budget observed." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const budgetProfile: ContextProfile = {
+    version: 2,
+    contextWindowTokens: 1_000,
+    maximumOutputTokens: 800,
+    ordinaryOutputReserveTokens: 10,
+    compactionSummaryMaximumOutputTokens: 100,
+    compactAtTokens: 900,
+    postCompactTargetTokens: 500,
+    retainedTargetTokens: 100,
+    estimatorVersion: 1,
+  };
+  const approvedPlan = {
+    version: 1 as const,
+    sessionId: "11000000-0000-4000-8000-000000000021",
+    commandId: "11000000-0000-4000-8000-000000000022",
+    kickoffRunId: "11000000-0000-4000-8000-000000000023",
+    cycleId: "11000000-0000-4000-8000-000000000024",
+    revision: 2,
+    planId: "11000000-0000-4000-8000-000000000025",
+    contentDigest: `sha256:${"3".repeat(64)}` as const,
+    title: "Approved Plan budget",
+    markdown: "# Approved Plan budget\n",
+    policyVersion: "plan-policy.hybrid-v1" as const,
+    toolProfileDigest: `sha256:${"4".repeat(64)}` as const,
+  };
+  const dependencies = {
+    model,
+    store: createInMemorySessionStore(),
+    [sessionDurableContext]: {
+      nextSequence: 1,
+      newRunId: approvedPlan.kickoffRunId,
+      approvedPlan,
+      targetIdentity,
+    },
+    contextProfile: budgetProfile,
+  };
+
+  await expect(new AgentSession(dependencies).run({ text: "Implement it." })).resolves.toEqual({
+    status: "completed",
+    answer: "Approved Plan budget observed.",
+  });
+  expect(observedMaximumOutputTokens).toBeLessThan(800);
+});
+
 test("AgentSession uses the latest provider input sample for the next v2 output budget", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-context-output-sample-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -1797,6 +1855,174 @@ test("AgentSession durably compacts before the next ordinary provider call", asy
   }
 });
 
+test("AgentSession reinjects the exact approved Plan projection into compaction and post-compaction requests", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-approved-plan-compaction-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "context.txt"), "approved plan context ".repeat(160), "utf8");
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "10000000-0000-4000-8000-000000000021",
+      projectId: `sha256:${"2".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const planKickoff = {
+    sessionId: "10000000-0000-4000-8000-000000000021",
+    commandId: "10000000-0000-4000-8000-000000000022",
+    kickoffRunId: "10000000-0000-4000-8000-000000000023",
+    cycleId: "10000000-0000-4000-8000-000000000024",
+    revision: 2,
+    planId: "10000000-0000-4000-8000-000000000025",
+    contentDigest: `sha256:${"3".repeat(64)}` as const,
+    policyVersion: "plan-policy.hybrid-v1" as const,
+    toolProfileDigest: `sha256:${"4".repeat(64)}` as const,
+  };
+  const approvedPlan = {
+    version: 1 as const,
+    ...planKickoff,
+    title: "Approved plan",
+    markdown: "# Approved plan\n",
+  };
+  const observed: Array<ModelRequest["approvedPlan"]> = [];
+  let ordinaryCall = 0;
+  const summary = JSON.stringify({
+    schemaVersion: 1,
+    objective: "Implement the exact approved plan.",
+    constraints: [],
+    progress: ["The context file was read."],
+    unresolvedQuestions: [],
+    failures: [],
+    remainingVerification: ["Return the final answer."],
+    nextSafeAction: "Continue implementation.",
+  });
+  const model: ModelDriver = {
+    async *stream(request) {
+      observed.push(request.approvedPlan);
+      if (request.purpose === "compaction") {
+        yield { type: "text_delta", text: summary };
+        yield { type: "usage", inputTokens: 560, outputTokens: 40 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCall += 1;
+      if (ordinaryCall === 1) {
+        yield { type: "usage", inputTokens: 20, outputTokens: 8 };
+        yield { type: "tool_call_start", id: "read-approved-context", name: "read_file" };
+        yield {
+          type: "tool_call_delta",
+          id: "read-approved-context",
+          json: '{"path":"context.txt"}',
+        };
+        yield { type: "tool_call_end", id: "read-approved-context" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Approved implementation completed." };
+      yield { type: "usage", inputTokens: 90, outputTokens: 12 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    tools: createReadToolRegistry({ workspaceRoot }),
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    [sessionDurableContext]: {
+      nextSequence: 2,
+      newRunId: planKickoff.kickoffRunId,
+      planKickoff,
+      approvedPlan,
+      targetIdentity,
+    },
+    contextProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  try {
+    await expect(session.run({ text: "Implement the approved plan." })).resolves.toEqual({
+      status: "completed",
+      answer: "Approved implementation completed.",
+    });
+    expect(observed).toHaveLength(3);
+    expect(observed).toEqual([approvedPlan, approvedPlan, approvedPlan]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession rejects compaction when the exact approved Plan projection cannot fit", async () => {
+  const store = createInMemorySessionStore<SessionRecord>();
+  await store.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      sessionId: "11000000-0000-4000-8000-000000000031",
+      projectId: `sha256:${"e".repeat(64)}`,
+      targetIdentity,
+    },
+  });
+  const constrainedProfile: ContextProfile = {
+    version: 2,
+    contextWindowTokens: 700,
+    maximumOutputTokens: 100,
+    ordinaryOutputReserveTokens: 20,
+    compactionSummaryMaximumOutputTokens: 100,
+    compactAtTokens: 120,
+    postCompactTargetTokens: 100,
+    retainedTargetTokens: 0,
+    estimatorVersion: 1,
+  };
+  const approvedPlan = {
+    version: 1 as const,
+    sessionId: "11000000-0000-4000-8000-000000000031",
+    commandId: "11000000-0000-4000-8000-000000000032",
+    kickoffRunId: "11000000-0000-4000-8000-000000000033",
+    cycleId: "11000000-0000-4000-8000-000000000034",
+    revision: 2,
+    planId: "11000000-0000-4000-8000-000000000035",
+    contentDigest: `sha256:${"5".repeat(64)}` as const,
+    markdown: `# Approved Plan\n\n${"protected implementation step\n".repeat(200)}`,
+    policyVersion: "plan-policy.hybrid-v1" as const,
+    toolProfileDigest: `sha256:${"6".repeat(64)}` as const,
+  };
+  let modelCalls = 0;
+  const model: ModelDriver = {
+    async *stream() {
+      modelCalls += 1;
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const dependencies = {
+    model,
+    store: store as unknown as ConstructorParameters<typeof AgentSession>[0]["store"],
+    [sessionDurableContext]: {
+      nextSequence: 2,
+      newRunId: approvedPlan.kickoffRunId,
+      approvedPlan,
+      targetIdentity,
+    },
+    contextProfile: constrainedProfile,
+  };
+  const session = new AgentSession(dependencies);
+
+  await expect(
+    session.run({ text: `Implement with this active context: ${"x".repeat(400)}` }),
+  ).resolves.toEqual({
+    status: "failed",
+    error: {
+      code: "context_compaction_input_unrecoverable",
+      message: "The protected context cannot fit in one compaction request.",
+    },
+  });
+  expect(modelCalls).toBe(0);
+});
+
 test("AgentSession fails before the model when protected compaction input cannot fit", async () => {
   const store = createInMemorySessionStore<SessionRecord>();
   await store.append({
@@ -2070,6 +2296,7 @@ test("AgentSession never uses a compacted projection when checkpoint persistence
       }
       await durableStore.append(record);
     },
+    appendBatch: (records) => durableStore.appendBatch(records),
     read: () => durableStore.read(),
   };
   const requests: ModelRequest[] = [];

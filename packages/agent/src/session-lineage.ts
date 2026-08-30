@@ -103,13 +103,20 @@ export function createSessionLineageTraversal(input: {
     const inherited = records.filter(
       (entry) => entry.schemaVersion === 3 && entry.record.type === "plan_cycle_inherited",
     );
-    const expected = planCycleSnapshotFromRecords(prefixRecords);
-    if (expected === undefined) {
+    const sourcePlan = planCycleSnapshotFromRecords(prefixRecords);
+    if (sourcePlan === undefined) {
       if (inherited.length > 0) {
         throw new SessionLifecycleError("session_invalid");
       }
       return;
     }
+    const expected =
+      sourcePlan.state === "approved_not_started"
+        ? (() => {
+            const { approval: _approval, ...withoutApproval } = sourcePlan;
+            return { ...withoutApproval, state: "ready" as const };
+          })()
+        : sourcePlan;
     const actual = inherited[0];
     const sourceSessionId =
       "recordVersion" in lineage ? lineage.sourceSessionId : lineage.parentSessionId;
@@ -124,7 +131,7 @@ export function createSessionLineageTraversal(input: {
       actual.record.source.throughSequence !== sourceEventPosition ||
       !isDeepStrictEqual(
         {
-          state: "exploring",
+          state: actual.record.state ?? "exploring",
           cycleId: actual.record.cycleId,
           revision: actual.record.revision,
           policyVersion: actual.record.policyVersion,
@@ -144,6 +151,9 @@ export function createSessionLineageTraversal(input: {
             ? {}
             : { gitAttestation: actual.record.gitAttestation }),
           eligibleToolProfile: actual.record.eligibleToolProfile,
+          ...(actual.record.submission === undefined
+            ? {}
+            : { submission: actual.record.submission }),
         },
         expected,
       )

@@ -5,6 +5,7 @@ import type {
   ModelRequest,
   ModelUserContentPart,
 } from "./agent-session-contracts.js";
+import { modelMessagesWithApprovedPlanProjectionV1 } from "./approved-plan-projection.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
 import { ModelDriverError } from "./model-driver-error.js";
 
@@ -135,7 +136,7 @@ export class DirectDeepSeekResponsesModelDriver implements ModelDriver {
 function mapRequest(request: ModelRequest, model: string, maximumOutputTokens: number) {
   return {
     model,
-    input: request.messages.flatMap(mapMessage),
+    input: modelMessagesWithApprovedPlanProjectionV1(request).flatMap(mapMessage),
     max_output_tokens: Math.min(request.maximumOutputTokens, maximumOutputTokens),
     stream: true,
     ...(request.tools.length === 0

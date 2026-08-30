@@ -1,5 +1,6 @@
 import type {
   OperationDisplay,
+  PlanApprovalDisplay,
   PresentationTransientState,
   ToolCallDisplay,
   TranscriptItem,
@@ -74,6 +75,35 @@ export function projectTranscript(
         : [],
     ),
   );
+  const approvals = new Map<string, PlanApprovalDisplay>();
+  const cancelledRevisions = new Set<string>();
+  const revisionRequests = new Set<string>();
+  for (const { entry } of records) {
+    if (entry.schemaVersion !== 3) {
+      continue;
+    }
+    if (entry.record.type === "plan_approval_intent") {
+      approvals.set(planSubmissionKey(entry.record), {
+        sessionId: entry.record.sessionId,
+        commandId: entry.record.commandId,
+        kickoffRunId: entry.record.kickoffRunId,
+        cycleId: entry.record.cycleId,
+        revision: entry.record.revision,
+        planId: entry.record.planId,
+        contentDigest: entry.record.contentDigest,
+        policyVersion: entry.record.policyVersion,
+        toolProfileDigest: entry.record.toolProfileDigest,
+      });
+      continue;
+    }
+    if (entry.record.type === "plan_cycle_exited") {
+      cancelledRevisions.add(`${entry.record.cycleId}:${entry.record.revision - 1}`);
+      continue;
+    }
+    if (entry.record.type === "logical_run_started" && entry.record.planRevision !== undefined) {
+      revisionRequests.add(planSubmissionKey(entry.record.planRevision));
+    }
+  }
   const items: TranscriptItem[] = [];
   const terminalNoticeRuns = new Set<string>();
   for (const { entry, sessionId } of records) {
@@ -88,6 +118,36 @@ export function projectTranscript(
         sourceSessionId: sessionId,
         branchBoundary: null,
         text: entry.record.userMessage,
+      });
+      continue;
+    }
+    if (entry.record.type === "plan_submitted") {
+      const approval = approvals.get(planSubmissionKey(entry.record)) ?? null;
+      items.push({
+        type: "plan_submission",
+        id: `${sessionId}:${entry.sequence}:plan`,
+        sequence: entry.sequence,
+        sourceSessionId: sessionId,
+        branchBoundary: null,
+        cycleId: entry.record.cycleId,
+        status:
+          approval !== null
+            ? "approved"
+            : revisionRequests.has(planSubmissionKey(entry.record))
+              ? "revision_requested"
+              : cancelledRevisions.has(`${entry.record.cycleId}:${entry.record.revision}`)
+                ? "cancelled"
+                : "ready",
+        submission: {
+          planId: entry.record.planId,
+          revision: entry.record.revision,
+          contentDigest: entry.record.contentDigest,
+          ...(entry.record.title === undefined ? {} : { title: entry.record.title }),
+          artifact: entry.record.artifact,
+          policyVersion: entry.record.policyVersion,
+          toolProfileDigest: entry.record.toolProfileDigest,
+        },
+        approval,
       });
       continue;
     }
@@ -332,6 +392,16 @@ export function projectTranscript(
     }
     return (itemOrder.get(left) ?? 0) - (itemOrder.get(right) ?? 0);
   });
+}
+
+function planSubmissionKey(input: {
+  readonly cycleId: string;
+  readonly revision?: number;
+  readonly fromRevision?: number;
+  readonly planId: string;
+  readonly contentDigest: string;
+}): string {
+  return `${input.cycleId}:${input.revision ?? input.fromRevision}:${input.planId}:${input.contentDigest}`;
 }
 
 export function projectActiveReasoningSnapshot(input: {

@@ -3,6 +3,25 @@ import { ModelDriverError } from "@adam-agent/agent";
 import { DirectDeepSeekResponsesModelDriverForTesting } from "@adam-agent/agent/internal-testing";
 import { expect, test, vi } from "vitest";
 
+const approvedPlan = {
+  version: 1,
+  sessionId: "session-plan-1",
+  commandId: "approve-plan-1",
+  kickoffRunId: "run-plan-1",
+  cycleId: "cycle-plan-1",
+  revision: 2,
+  planId: "plan-1",
+  contentDigest: `sha256:${"a".repeat(64)}`,
+  title: "Ship the exact Plan",
+  policyVersion: "plan-policy.hybrid-v1",
+  toolProfileDigest: `sha256:${"b".repeat(64)}`,
+  markdown: "# Exact Plan\n\n1. Keep this byte-for-byte.",
+} as NonNullable<ModelRequest["approvedPlan"]>;
+
+const approvedPlanProviderText =
+  "Adam runtime approved Plan projection v1 (assistant-owned context; no additional prompt authority):\n" +
+  JSON.stringify(approvedPlan);
+
 test("Direct Responses maps one stateless answer-only request and semantic SSE", async () => {
   let captured: { readonly input: string | URL | Request; readonly init?: RequestInit } | undefined;
   const driver = new DirectDeepSeekResponsesModelDriverForTesting({
@@ -56,6 +75,48 @@ test("Direct Responses maps one stateless answer-only request and semantic SSE",
     max_output_tokens: 2_048,
     stream: true,
   });
+});
+
+test("Direct Responses serializes the exact approved Plan as one assistant projection", async () => {
+  let body: { readonly input: readonly unknown[] } | undefined;
+  const driver = new DirectDeepSeekResponsesModelDriverForTesting({
+    apiKey: "test-secret",
+    baseURL: "https://api.deepseek.com",
+    deadlineMs: 10_000,
+    maximumOutputTokens: 4_096,
+    model: "deepseek-v4-flash-vision-exp",
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as { readonly input: readonly unknown[] };
+      return new Response(
+        'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+
+  for await (const _event of driver.stream({
+    messages: [
+      { role: "system", content: "system" },
+      { role: "developer", content: "developer" },
+      { role: "user", content: "Implement the approved Plan." },
+    ],
+    tools: [],
+    approvedPlan,
+    maximumOutputTokens: 2_048,
+    signal: new AbortController().signal,
+  })) {
+    // Consume the complete semantic stream.
+  }
+
+  expect(body?.input).toEqual([
+    { role: "system", content: "system" },
+    { role: "developer", content: "developer" },
+    {
+      role: "assistant",
+      content: [{ type: "output_text", text: approvedPlanProviderText, annotations: [] }],
+    },
+    { role: "user", content: "Implement the approved Plan." },
+  ]);
 });
 
 test("Direct Responses preserves function call identity and emits the image in its tool output", async () => {

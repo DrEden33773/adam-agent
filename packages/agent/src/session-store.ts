@@ -6,7 +6,11 @@ import { join } from "node:path";
 import { valid } from "semver";
 import { z } from "zod";
 import type { RunResult, RuntimeEvent } from "./agent-session-contracts.js";
-import type { ArtifactReference, ModelResponseArtifactSource } from "./artifact-store.js";
+import type {
+  ArtifactReference,
+  ModelResponseArtifactSource,
+  PlanArtifactSourceV1,
+} from "./artifact-store.js";
 import type { ContextProfile } from "./context-profile.js";
 import type { ContextCallUsage, ContextEvidenceV1, ContextSummaryV1 } from "./durable-context.js";
 import { maximumInlineModelResponseFieldBytes } from "./durable-model-response-policy.js";
@@ -21,7 +25,13 @@ import type { ModelTargetIdentity } from "./model-targets.js";
 import { imageInputLimitsV1, type ProjectedContentUsageV1 } from "./model-user-content.js";
 import type { PlanShellPolicyVersion } from "./plan-command-assessment.js";
 import type { PlanGitAttestationV1 } from "./plan-git-policy.js";
-import type { PlanEligibleToolProfileV1, PlanPolicyVersion } from "./plan-mode.js";
+import type {
+  PlanApprovalIntentV1,
+  PlanEligibleToolProfileV1,
+  PlanPolicyVersion,
+  PlanRevisionIntentV1,
+  PlanSubmissionSnapshotV1,
+} from "./plan-mode.js";
 import type { PlanShellEnvironmentV1 } from "./plan-shell-environment.js";
 import {
   type PromptContextRecord,
@@ -271,6 +281,8 @@ export type SessionLogicalRunStartedRecord = {
     readonly recordVersion?: 1;
     readonly runId: string;
     readonly userMessage: string;
+    readonly planKickoff?: PlanApprovalIntentV1;
+    readonly planRevision?: PlanRevisionIntentV1;
     readonly naming?: {
       readonly profileVersion: 1;
       readonly fallbackTitle: string;
@@ -328,6 +340,32 @@ export type SessionPlanGitAttestedRecord = {
   };
 };
 
+export type SessionPlanSubmittedRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "plan_submitted";
+    readonly recordVersion: 1;
+    readonly cycleId: string;
+    readonly revision: number;
+    readonly planId: string;
+    readonly contentDigest: `sha256:${string}`;
+    readonly title?: string;
+    readonly artifact: ArtifactReference<PlanArtifactSourceV1>;
+    readonly policyVersion: PlanPolicyVersion;
+    readonly toolProfileDigest: `sha256:${string}`;
+  };
+};
+
+export type SessionPlanApprovalIntentRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "plan_approval_intent";
+    readonly recordVersion: 1;
+  } & PlanApprovalIntentV1;
+};
+
 export type SessionPlanCycleExitedRecord = {
   readonly schemaVersion: 3;
   readonly sequence: number;
@@ -355,6 +393,8 @@ export type SessionPlanCycleInheritedRecord = {
     readonly gitPolicyDigest?: `sha256:${string}`;
     readonly gitAttestation?: PlanGitAttestationV1;
     readonly eligibleToolProfile: PlanEligibleToolProfileV1;
+    readonly state?: "exploring" | "ready";
+    readonly submission?: PlanSubmissionSnapshotV1;
     readonly source: {
       readonly sessionId: string;
       readonly throughSequence: number;
@@ -621,6 +661,7 @@ export type SessionProviderAttemptStartedRecord = {
       readonly version: 1;
       readonly assemblyIdentityDigest: Sha256Digest;
       readonly requestProjectionDigest: Sha256Digest;
+      readonly approvedPlanProjectionDigest?: Sha256Digest;
     };
     readonly projectedContent?: ProjectedContentUsageV1;
   };
@@ -873,6 +914,8 @@ export type SessionV3Record =
   | SessionPlanCycleExitedRecord
   | SessionPlanCycleInheritedRecord
   | SessionPlanGitAttestedRecord
+  | SessionPlanApprovalIntentRecord
+  | SessionPlanSubmittedRecord
   | SessionManualNameSetRecord
   | SessionManualNameClearedRecord
   | SessionTitleGenerationStartedRecord
@@ -906,6 +949,7 @@ export type SessionRecord = SessionEventRecord | SessionV3Record;
 
 export interface SessionStore<RecordType extends SessionRecord = SessionEventRecord> {
   append(record: RecordType): Promise<void>;
+  appendBatch(records: readonly RecordType[]): Promise<void>;
   read(): Promise<readonly RecordType[]>;
 }
 
@@ -1489,6 +1533,25 @@ const modelResponseArtifactReferenceSchema = z.strictObject({
   byteCount: z.number().int().positive(),
   source: modelResponseArtifactSourceSchema,
 });
+const planArtifactReferenceSchema = z.strictObject({
+  id: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  mediaType: z.literal("text/markdown; charset=utf-8"),
+  byteCount: z
+    .number()
+    .int()
+    .positive()
+    .max(64 * 1024),
+  source: z.strictObject({
+    type: z.literal("plan"),
+    schemaVersion: z.literal(1),
+    projectId: z.string().min(1).max(256),
+    sessionId: z.uuid(),
+    cycleId: z.uuid(),
+    planId: z.uuid(),
+    revision: z.number().int().positive(),
+    provenance: z.literal("model_submit_plan"),
+  }),
+});
 const modelResponseFieldSchema = z.discriminatedUnion("storage", [
   z.strictObject({
     storage: z.literal("inline"),
@@ -1973,6 +2036,29 @@ const sessionV3RecordSchema = z.union([
     recordVersion: z.literal(1).optional(),
     runId: z.uuid(),
     userMessage: z.string().max(512 * 1024),
+    planRevision: z
+      .strictObject({
+        cycleId: z.uuid(),
+        fromRevision: z.number().int().positive(),
+        toRevision: z.number().int().positive(),
+        planId: z.uuid(),
+        contentDigest: sha256DigestSchema,
+      })
+      .refine((intent) => intent.toRevision === intent.fromRevision + 1)
+      .optional(),
+    planKickoff: z
+      .strictObject({
+        sessionId: z.uuid(),
+        commandId: z.uuid(),
+        kickoffRunId: z.uuid(),
+        cycleId: z.uuid(),
+        revision: z.number().int().positive(),
+        planId: z.uuid(),
+        contentDigest: sha256DigestSchema,
+        policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+        toolProfileDigest: sha256DigestSchema,
+      })
+      .optional(),
     naming: z
       .strictObject({
         profileVersion: z.literal(1),
@@ -2036,6 +2122,42 @@ const sessionV3RecordSchema = z.union([
     callId: z.string().min(1).max(256),
     attestation: planGitAttestationV1Schema,
   }),
+  z
+    .strictObject({
+      type: z.literal("plan_submitted"),
+      recordVersion: z.literal(1),
+      cycleId: z.uuid(),
+      revision: z.number().int().positive(),
+      planId: z.uuid(),
+      contentDigest: sha256DigestSchema,
+      title: z
+        .string()
+        .refine((value) => Buffer.byteLength(value, "utf8") <= 512)
+        .optional(),
+      artifact: planArtifactReferenceSchema,
+      policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+      toolProfileDigest: sha256DigestSchema,
+    })
+    .refine(
+      (record) =>
+        record.contentDigest === record.artifact.id &&
+        record.cycleId === record.artifact.source.cycleId &&
+        record.planId === record.artifact.source.planId &&
+        record.revision === record.artifact.source.revision,
+    ),
+  z.strictObject({
+    type: z.literal("plan_approval_intent"),
+    recordVersion: z.literal(1),
+    sessionId: z.uuid(),
+    commandId: z.uuid(),
+    kickoffRunId: z.uuid(),
+    cycleId: z.uuid(),
+    revision: z.number().int().positive(),
+    planId: z.uuid(),
+    contentDigest: sha256DigestSchema,
+    policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+    toolProfileDigest: sha256DigestSchema,
+  }),
   z.strictObject({
     type: z.literal("plan_cycle_exited"),
     recordVersion: z.literal(1),
@@ -2056,6 +2178,21 @@ const sessionV3RecordSchema = z.union([
       gitPolicyDigest: sha256DigestSchema.optional(),
       gitAttestation: planGitAttestationV1Schema.optional(),
       eligibleToolProfile: planEligibleToolProfileV1Schema,
+      state: z.enum(["exploring", "ready"]).optional(),
+      submission: z
+        .strictObject({
+          planId: z.uuid(),
+          revision: z.number().int().positive(),
+          contentDigest: sha256DigestSchema,
+          title: z
+            .string()
+            .refine((value) => Buffer.byteLength(value, "utf8") <= 512)
+            .optional(),
+          artifact: planArtifactReferenceSchema,
+          policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+          toolProfileDigest: sha256DigestSchema,
+        })
+        .optional(),
       source: z.strictObject({
         sessionId: z.uuid(),
         throughSequence: z.number().int().positive(),
@@ -2074,7 +2211,16 @@ const sessionV3RecordSchema = z.union([
         (record.gitAttestation === undefined ||
           (record.gitAttestation.shellEnvironmentDigest === record.shellEnvironment?.digest &&
             record.gitAttestation.gitPolicyVersion === record.gitPolicyVersion &&
-            record.gitAttestation.gitPolicyDigest === record.gitPolicyDigest)),
+            record.gitAttestation.gitPolicyDigest === record.gitPolicyDigest)) &&
+        (record.state === "ready") === (record.submission !== undefined) &&
+        (record.submission === undefined ||
+          (record.revision === record.submission.revision &&
+            record.policyVersion === record.submission.policyVersion &&
+            record.eligibleToolProfile.digest === record.submission.toolProfileDigest &&
+            record.submission.contentDigest === record.submission.artifact.id &&
+            record.cycleId === record.submission.artifact.source.cycleId &&
+            record.submission.planId === record.submission.artifact.source.planId &&
+            record.submission.revision === record.submission.artifact.source.revision)),
     ),
   z.strictObject({
     type: z.literal("session_manual_name_set"),
@@ -2293,6 +2439,10 @@ const sessionV3RecordSchema = z.union([
         version: z.literal(1),
         assemblyIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
         requestProjectionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+        approvedPlanProjectionDigest: z
+          .string()
+          .regex(/^sha256:[0-9a-f]{64}$/u)
+          .optional(),
       })
       .optional(),
     projectedContent: projectedContentUsageV1Schema.optional(),
@@ -2496,20 +2646,27 @@ export function createInMemorySessionStore<
   const records: RecordType[] = [];
   let nextSequence = 1;
   let storedBytes = 0;
-  return {
-    async append(record) {
-      const { record: validatedRecord, storedByteLength } =
-        validateBoundedSessionEventRecord(record);
-      if (validatedRecord.sequence !== nextSequence) {
+  const appendBatch = async (batch: readonly RecordType[]): Promise<void> => {
+    const validated = batch.map((record) => validateBoundedSessionEventRecord(record));
+    let expectedSequence = nextSequence;
+    let aggregateBytes = 0;
+    for (const entry of validated) {
+      if (entry.record.sequence !== expectedSequence) {
         throw new SessionStoreError();
       }
-      if (storedBytes + storedByteLength > maxSessionLogBytes) {
-        throw new SessionStoreError("session_log_too_large");
-      }
-      records.push(validatedRecord as RecordType);
-      nextSequence += 1;
-      storedBytes += storedByteLength;
-    },
+      expectedSequence += 1;
+      aggregateBytes += entry.storedByteLength;
+    }
+    if (storedBytes + aggregateBytes > maxSessionLogBytes) {
+      throw new SessionStoreError("session_log_too_large");
+    }
+    records.push(...validated.map((entry) => entry.record as RecordType));
+    nextSequence = expectedSequence;
+    storedBytes += aggregateBytes;
+  };
+  return {
+    append: (record) => appendBatch([record]),
+    appendBatch,
     async read() {
       return validateRecordSequence([...records]) as readonly RecordType[];
     },
@@ -2540,6 +2697,10 @@ export function createInMemorySessionStoreDirectory<
         store: {
           async append(record: RecordType) {
             await backing.append(record);
+            entry.modifiedAtMilliseconds = nextModifiedAtMilliseconds();
+          },
+          async appendBatch(records: readonly RecordType[]) {
+            await backing.appendBatch(records);
             entry.modifiedAtMilliseconds = nextModifiedAtMilliseconds();
           },
           read: () => backing.read(),
@@ -2698,34 +2859,42 @@ function createJsonlStore<RecordType extends SessionRecord>(
   let storedBytes = initialStoredBytes;
   let appendQueue = Promise.resolve();
 
-  return {
-    append(record) {
-      const operation = appendQueue.then(async () => {
-        const {
-          record: validatedRecord,
-          serialized,
-          storedByteLength,
-        } = validateBoundedSessionEventRecord(record);
-        if (validatedRecord.sequence !== nextSequence) {
+  const appendBatch = (batch: readonly RecordType[]): Promise<void> => {
+    const operation = appendQueue.then(async () => {
+      const validated = batch.map((record) => validateBoundedSessionEventRecord(record));
+      let expectedSequence = nextSequence;
+      let aggregateBytes = 0;
+      for (const entry of validated) {
+        if (entry.record.sequence !== expectedSequence) {
           throw new SessionStoreError();
         }
-        if (storedBytes + storedByteLength > maxSessionLogBytes) {
-          throw new SessionStoreError("session_log_too_large");
-        }
-        const file = await open(sessionPath, "a", 0o600);
-        try {
-          await file.chmod(0o600);
-          await file.writeFile(`${serialized}\n`, "utf8");
-          await file.sync();
-        } finally {
-          await file.close();
-        }
-        nextSequence += 1;
-        storedBytes += storedByteLength;
-      });
-      appendQueue = operation.catch(() => {});
-      return operation;
-    },
+        expectedSequence += 1;
+        aggregateBytes += entry.storedByteLength;
+      }
+      if (storedBytes + aggregateBytes > maxSessionLogBytes) {
+        throw new SessionStoreError("session_log_too_large");
+      }
+      if (validated.length === 0) {
+        return;
+      }
+      const file = await open(sessionPath, "a", 0o600);
+      try {
+        await file.chmod(0o600);
+        await file.writeFile(`${validated.map((entry) => entry.serialized).join("\n")}\n`, "utf8");
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      nextSequence = expectedSequence;
+      storedBytes += aggregateBytes;
+    });
+    appendQueue = operation.catch(() => {});
+    return operation;
+  };
+
+  return {
+    append: (record) => appendBatch([record]),
+    appendBatch,
     async read() {
       await appendQueue;
       const log = await readBoundedSessionLog(sessionPath);

@@ -1804,6 +1804,74 @@ test("the unified driver preserves explicit Provider V4 reasoning boundaries", a
   ]);
 });
 
+test("the unified driver serializes the exact approved Plan as one assistant projection", async () => {
+  let prompt: unknown;
+  const approvedPlan = {
+    version: 1,
+    sessionId: "session-plan-1",
+    commandId: "approve-plan-1",
+    kickoffRunId: "run-plan-1",
+    cycleId: "cycle-plan-1",
+    revision: 2,
+    planId: "plan-1",
+    contentDigest: `sha256:${"a".repeat(64)}`,
+    title: "Ship the exact Plan",
+    policyVersion: "plan-policy.hybrid-v1",
+    toolProfileDigest: `sha256:${"b".repeat(64)}`,
+    markdown: "# Exact Plan\n\n1. Keep this byte-for-byte.",
+  } as NonNullable<Parameters<AiSdkModelDriverForTesting["stream"]>[0]["approvedPlan"]>;
+  const model = {
+    specificationVersion: "v4",
+    provider: "test",
+    modelId: "approved-plan-projection",
+    supportedUrls: {},
+    async doGenerate() {
+      throw new Error("Generation is not used by this test.");
+    },
+    async doStream(options: { readonly prompt: unknown }) {
+      prompt = options.prompt;
+      return { stream: new ReadableStream({ start: (controller) => controller.close() }) };
+    },
+  } as unknown as ConstructorParameters<typeof AiSdkModelDriverForTesting>[0]["model"];
+  const driver = new AiSdkModelDriverForTesting({
+    model,
+    maximumOutputTokens: 4_096,
+    deadlineMs: 120_000,
+    sensitiveValues: [],
+  });
+
+  await collect(
+    driver.stream({
+      maximumOutputTokens: 4_096,
+      messages: [
+        { role: "system", content: "system" },
+        { role: "developer", content: "developer" },
+        { role: "user", content: "Implement the approved Plan." },
+      ],
+      tools: [],
+      approvedPlan,
+      signal: new AbortController().signal,
+    }),
+  );
+
+  expect(prompt).toEqual([
+    { role: "system", content: "system" },
+    { role: "system", content: "Developer instruction:\ndeveloper" },
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "text",
+          text:
+            "Adam runtime approved Plan projection v1 (assistant-owned context; no additional prompt authority):\n" +
+            JSON.stringify(approvedPlan),
+        },
+      ],
+    },
+    { role: "user", content: [{ type: "text", text: "Implement the approved Plan." }] },
+  ]);
+});
+
 test.each([
   { failure: "error-part" as const, category: "protocol_incompatibility" },
   { failure: "stream-rejection" as const, category: "unknown" },

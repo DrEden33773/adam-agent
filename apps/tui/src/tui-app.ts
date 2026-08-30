@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type {
   ActiveSessionDisplay,
   ArtifactReference,
@@ -63,6 +65,11 @@ import { mcpAdvanceCommand } from "./mcp-advance.js";
 import { McpWizard } from "./mcp-wizard.js";
 import { OverlayFrame } from "./overlay-frame.js";
 import { PermissionOverlay } from "./permission-overlay.js";
+import {
+  PlanCancellationConfirmation,
+  PlanContinuationSelector,
+  PlanReviewSelector,
+} from "./plan-review-selector.js";
 import { ProjectPathPicker } from "./project-path-picker.js";
 import { reasoningFoldTitle } from "./reasoning-fold.js";
 import { ResourceReloadPicker } from "./resource-reload-picker.js";
@@ -403,11 +410,22 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly hide: () => void;
       }
     | undefined;
+  let planActionOverlay:
+    | {
+        readonly close: () => void;
+        readonly draft: string;
+        readonly hide: () => void;
+        readonly subjectKey: string;
+      }
+    | undefined;
+  let dismissedPlanSubjectKey: string | undefined;
+  let planReviewReadGeneration = 0;
   type CloseableOverlay = {
     readonly close: () => void;
     readonly hide: () => void;
   };
   const closeableOverlaysInPrecedence = (): readonly (CloseableOverlay | undefined)[] => [
+    planActionOverlay,
     helpNavigator,
     artifactNavigator,
     mcpWizard,
@@ -425,6 +443,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const focusedCloseableOverlay = (): CloseableOverlay | undefined =>
     closeableOverlaysInPrecedence().find((overlay) => overlay !== undefined);
   const hideSessionScopedOverlays = () => {
+    planActionOverlay?.hide();
+    planActionOverlay = undefined;
+    dismissedPlanSubjectKey = undefined;
     skillPalette?.hide();
     skillPalette = undefined;
     pathPicker?.hide();
@@ -613,6 +634,322 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     };
   };
 
+  const planActionSubjectKey = (active: ActiveSessionDisplay | null): string | undefined => {
+    const plan = active?.plan;
+    const submission = plan?.submission;
+    if (
+      active === null ||
+      plan === undefined ||
+      submission === undefined ||
+      (plan.state !== "ready" && plan.state !== "approved_not_started")
+    ) {
+      return undefined;
+    }
+    return [
+      active.session.id,
+      plan.state,
+      plan.cycleId,
+      plan.revision,
+      submission.planId,
+      submission.contentDigest,
+      plan.approval?.commandId ?? "unapproved",
+    ].join(":");
+  };
+
+  const hidePlanActionOverlay = (dismiss: boolean, restoreDraft = false): void => {
+    const overlay = planActionOverlay;
+    if (overlay === undefined) {
+      return;
+    }
+    overlay.hide();
+    planActionOverlay = undefined;
+    if (restoreDraft) {
+      editor.setText(overlay.draft);
+    }
+    if (dismiss) {
+      dismissedPlanSubjectKey = overlay.subjectKey;
+    }
+    tui.setFocus(editor);
+    tui.requestRender();
+  };
+
+  const settlePlanAction = (
+    promise: ReturnType<PresentationSession["dispatch"]>,
+    options_: {
+      readonly failure: string;
+      readonly progress: string;
+      readonly sessionId: string;
+      readonly success: string;
+    },
+  ): void => {
+    const actionId = showNotice(
+      "progress",
+      options_.progress,
+      "until_replaced",
+      options_.sessionId,
+    );
+    void promise
+      .then((receipt) => {
+        settleNotice(
+          actionId,
+          receipt.status === "admitted" ? "success" : "error",
+          receipt.status === "admitted" ? options_.success : receipt.message,
+          receipt.status === "admitted" ? "until_next_action" : "until_edit",
+          options_.sessionId,
+        );
+      })
+      .catch(() => {
+        settleNotice(actionId, "error", options_.failure, "until_edit", options_.sessionId);
+      })
+      .finally(() => {
+        editor.disableSubmit = false;
+        renderState();
+      });
+  };
+
+  const showPlanReview = (
+    active: ActiveSessionDisplay,
+    force = false,
+    draftOverride?: string,
+  ): void => {
+    const plan = active.plan;
+    const submission = plan?.submission;
+    if (plan?.state !== "ready" || submission === undefined) {
+      return;
+    }
+    const subjectKey = planActionSubjectKey(active);
+    if (subjectKey === undefined || (!force && dismissedPlanSubjectKey === subjectKey)) {
+      return;
+    }
+    planActionOverlay?.hide();
+    planActionOverlay = undefined;
+    if (force) {
+      dismissedPlanSubjectKey = undefined;
+    }
+    const draft = draftOverride ?? editor.getExpandedText();
+    const generation = ++planReviewReadGeneration;
+    void options.presentation
+      .dispatch({
+        type: "read_artifact",
+        artifact: {
+          id: submission.artifact.id,
+          mediaType: submission.artifact.mediaType,
+          byteCount: submission.artifact.byteCount,
+          source: "plan",
+        },
+        range: null,
+      })
+      .then((receipt) => {
+        const current = options.presentation.getState().authoritative.active;
+        if (
+          generation !== planReviewReadGeneration ||
+          current === null ||
+          planActionSubjectKey(current) !== subjectKey
+        ) {
+          return;
+        }
+        if (
+          receipt.status !== "admitted" ||
+          receipt.resource === null ||
+          !("text" in receipt.resource)
+        ) {
+          showNotice(
+            "error",
+            receipt.status === "rejected"
+              ? receipt.message
+              : "The exact Plan artifact is unavailable for review.",
+            "until_next_action",
+            active.session.id,
+          );
+          return;
+        }
+        let handle: { hide(): void } | undefined;
+        const close = () => hidePlanActionOverlay(true, true);
+        const selector = new PlanReviewSelector({
+          contentDigest: submission.contentDigest,
+          markdown: receipt.resource.text,
+          onClose: close,
+          onSelect(action) {
+            if (action === "approve") {
+              const commandId = randomUUID();
+              hidePlanActionOverlay(true);
+              settlePlanAction(
+                options.presentation.dispatch({
+                  type: "approve_plan",
+                  commandId,
+                  sessionId: active.session.id,
+                  cycleId: plan.cycleId,
+                  revision: plan.revision,
+                  planId: submission.planId,
+                  contentDigest: submission.contentDigest,
+                }),
+                {
+                  failure: "The exact Plan approval could not be admitted safely.",
+                  progress: "Approving the exact plan and starting implementation…",
+                  sessionId: active.session.id,
+                  success: "Approved Plan implementation completed.",
+                },
+              );
+              return;
+            }
+            if (action === "revise") {
+              hidePlanActionOverlay(true, true);
+              settlePlanAction(
+                options.presentation.dispatch({
+                  type: "revise_plan",
+                  sessionId: active.session.id,
+                  cycleId: plan.cycleId,
+                  revision: plan.revision,
+                  planId: submission.planId,
+                  contentDigest: submission.contentDigest,
+                }),
+                {
+                  failure: "Revision intent could not be created safely.",
+                  progress: "Returning this exact plan to the main composer…",
+                  sessionId: active.session.id,
+                  success: "Revision intent active; submit the main composer when ready.",
+                },
+              );
+              return;
+            }
+            hidePlanActionOverlay(false);
+            showPlanCancellation(active);
+          },
+          theme,
+          ...(submission.title === undefined ? {} : { title: submission.title }),
+        });
+        handle = showOverlay(selector, {
+          width: "80%",
+          minWidth: 48,
+          maxHeight: "80%",
+          margin: 1,
+        });
+        planActionOverlay = { close, draft, hide: () => handle?.hide(), subjectKey };
+        clearNotice();
+        tui.requestRender();
+      })
+      .catch(() => {
+        if (generation === planReviewReadGeneration) {
+          showNotice(
+            "error",
+            "The exact Plan artifact is unavailable for review.",
+            "until_next_action",
+            active.session.id,
+          );
+        }
+      });
+  };
+
+  const showPlanCancellation = (active: ActiveSessionDisplay): void => {
+    const plan = active.plan;
+    const submission = plan?.submission;
+    const subjectKey = planActionSubjectKey(active);
+    if (plan?.state !== "ready" || submission === undefined || subjectKey === undefined) {
+      return;
+    }
+    const draft = editor.getExpandedText();
+    let handle: { hide(): void } | undefined;
+    const back = () => {
+      hidePlanActionOverlay(false);
+      const current = options.presentation.getState().authoritative.active;
+      if (current !== null) {
+        showPlanReview(current, true);
+      }
+    };
+    const confirmation = new PlanCancellationConfirmation({
+      onBack: back,
+      onConfirm() {
+        hidePlanActionOverlay(true);
+        settlePlanAction(
+          options.presentation.dispatch({
+            type: "cancel_plan",
+            sessionId: active.session.id,
+            cycleId: plan.cycleId,
+            revision: plan.revision,
+            planId: submission.planId,
+            contentDigest: submission.contentDigest,
+          }),
+          {
+            failure: "The exact Plan cancellation could not be admitted safely.",
+            progress: "Cancelling this exact plan…",
+            sessionId: active.session.id,
+            success: "Plan cancelled.",
+          },
+        );
+      },
+      theme,
+    });
+    handle = showOverlay(confirmation, {
+      width: "70%",
+      minWidth: 44,
+      maxHeight: "70%",
+      margin: 1,
+    });
+    planActionOverlay = { close: back, draft, hide: () => handle?.hide(), subjectKey };
+    tui.requestRender();
+  };
+
+  const showPlanContinuation = (
+    active: ActiveSessionDisplay,
+    force = false,
+    draftOverride?: string,
+  ): void => {
+    const plan = active.plan;
+    const submission = plan?.submission;
+    const approval = plan?.approval;
+    const subjectKey = planActionSubjectKey(active);
+    if (
+      plan?.state !== "approved_not_started" ||
+      submission === undefined ||
+      approval === undefined ||
+      subjectKey === undefined ||
+      (!force && dismissedPlanSubjectKey === subjectKey)
+    ) {
+      return;
+    }
+    planActionOverlay?.hide();
+    planActionOverlay = undefined;
+    if (force) {
+      dismissedPlanSubjectKey = undefined;
+    }
+    const draft = draftOverride ?? editor.getExpandedText();
+    let handle: { hide(): void } | undefined;
+    const close = () => hidePlanActionOverlay(true);
+    const selector = new PlanContinuationSelector({
+      onClose: close,
+      onContinue() {
+        hidePlanActionOverlay(true);
+        settlePlanAction(
+          options.presentation.dispatch({
+            type: "continue_plan",
+            commandId: approval.commandId,
+            sessionId: active.session.id,
+            cycleId: plan.cycleId,
+            revision: plan.revision,
+            planId: submission.planId,
+            contentDigest: submission.contentDigest,
+          }),
+          {
+            failure: "The durable Plan implementation intent could not be continued safely.",
+            progress: "Continuing the durable approved implementation…",
+            sessionId: active.session.id,
+            success: "Approved Plan implementation completed.",
+          },
+        );
+      },
+      theme,
+    });
+    handle = showOverlay(selector, {
+      width: "75%",
+      minWidth: 46,
+      maxHeight: "70%",
+      margin: 1,
+    });
+    planActionOverlay = { close, draft, hide: () => handle?.hide(), subjectKey };
+    clearNotice();
+    tui.requestRender();
+  };
+
   const renderState = () => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
@@ -636,6 +973,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         targetPickerDismissed = false;
       }
       previousActiveSessionId = active?.session.id;
+    }
+    const currentPlanSubjectKey = planActionSubjectKey(active);
+    if (planActionOverlay !== undefined && planActionOverlay.subjectKey !== currentPlanSubjectKey) {
+      planActionOverlay.hide();
+      planActionOverlay = undefined;
     }
     if (active?.mcp !== null && active?.mcp !== undefined && mcpWizard !== undefined) {
       mcpWizard.wizard.setState(active.mcp);
@@ -661,6 +1003,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       workspaceTrustPage.hide();
       workspaceTrustPage = undefined;
       tui.setFocus(editor);
+    }
+    if (
+      active !== null &&
+      permission === undefined &&
+      planActionOverlay === undefined &&
+      focusedCloseableOverlay() === undefined &&
+      currentPlanSubjectKey !== undefined &&
+      dismissedPlanSubjectKey !== currentPlanSubjectKey
+    ) {
+      if (active.plan?.state === "ready") {
+        showPlanReview(active);
+      } else if (active.plan?.state === "approved_not_started") {
+        showPlanContinuation(active);
+      }
     }
     const needsSessionChoice =
       active === null && state.authoritative.sessions.items.length > 0 && !newSessionSelected;
@@ -1081,6 +1437,44 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           itemAnchor = assistant;
         }
         previousWasAssistant = true;
+      } else if (item.type === "plan_submission") {
+        transcript.addChild(new Spacer(1));
+        const plan = new Box(1, 1, theme.toolBackground);
+        plan.addChild(
+          new ResponsiveLine(
+            theme.toolTitle(safeTerminalText(item.submission.title ?? "Submitted Plan")),
+          ),
+        );
+        plan.addChild(
+          new ResponsiveLine(
+            theme.toolOutput(
+              safeTerminalText(
+                `revision ${item.submission.revision} · ${item.status} · ${item.submission.artifact.byteCount} bytes · /artifacts to inspect`,
+              ),
+            ),
+          ),
+        );
+        plan.addChild(
+          new ResponsiveLine(
+            theme.muted(
+              safeTerminalText(`plan ${item.submission.planId} · ${item.submission.contentDigest}`),
+            ),
+          ),
+        );
+        if (item.approval !== null) {
+          plan.addChild(
+            new ResponsiveLine(
+              theme.muted(
+                safeTerminalText(
+                  `approval ${item.approval.commandId} · kickoff ${item.approval.kickoffRunId}`,
+                ),
+              ),
+            ),
+          );
+        }
+        transcript.addChild(plan);
+        itemAnchor = plan;
+        previousWasAssistant = false;
       } else if (item.type === "reasoning_block") {
         durableReasoningIds.add(item.id);
         renderReasoning(item, item.artifact);
@@ -1478,8 +1872,22 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`;
       const olderHistorySummary =
         active.transcript.olderCursor === null ? "" : " · older history available";
-      const planSummary = active.plan === undefined ? "" : " · Plan exploring · read-only";
-      const compactPlanSummary = active.plan === undefined ? "" : " · plan read-only";
+      const planSummary =
+        active.plan === undefined
+          ? ""
+          : active.plan.state === "exploring"
+            ? " · Plan exploring · read-only"
+            : active.plan.state === "ready"
+              ? ` · Plan ready r${active.plan.revision} · review required`
+              : " · Plan approved · not started";
+      const compactPlanSummary =
+        active.plan === undefined
+          ? ""
+          : active.plan.state === "exploring"
+            ? " · plan read-only"
+            : active.plan.state === "ready"
+              ? " · plan ready"
+              : " · plan pending";
       footer.setText({
         wide: theme.muted(
           `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
@@ -2411,6 +2819,28 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (text.trim().length === 0) {
       return;
     }
+    const earlyParsed = commandRegistry.parse(text);
+    if (
+      active !== null &&
+      earlyParsed.kind === "not_command" &&
+      active.plan?.state === "ready" &&
+      state.composer.revisionIntent === null
+    ) {
+      editor.disableSubmit = false;
+      editor.setText(text);
+      showPlanReview(active, true, text);
+      return;
+    }
+    if (
+      active !== null &&
+      earlyParsed.kind === "not_command" &&
+      active.plan?.state === "approved_not_started"
+    ) {
+      editor.disableSubmit = false;
+      editor.setText(text);
+      showPlanContinuation(active, true, text);
+      return;
+    }
     beginNoticeAction();
     if (active === null) {
       if (state.draft === null) {
@@ -2644,6 +3074,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         return;
       }
       const plan = active.plan;
+      if (plan?.state === "ready") {
+        editor.disableSubmit = false;
+        showPlanReview(active, true);
+        return;
+      }
+      if (plan?.state === "approved_not_started") {
+        editor.disableSubmit = false;
+        showPlanContinuation(active, true);
+        return;
+      }
       const entering = plan === undefined;
       const planActionId = showNotice(
         "progress",
