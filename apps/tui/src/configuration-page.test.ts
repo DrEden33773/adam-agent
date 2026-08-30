@@ -13,6 +13,12 @@ const modelPolicy: UserModelPolicyDisplay = {
 const target: TargetDisplay = {
   targetId: "deepseek-v4-flash.direct",
   label: "DeepSeek V4 Flash",
+  provider: "deepseek",
+  displayName: "DeepSeek V4 Flash",
+  summary: "Fast general-purpose coding model.",
+  capabilities: ["reasoning", "tool-use"],
+  modalities: ["text"],
+  recommended: true,
   route: "direct",
   certification: "Certified",
   readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },

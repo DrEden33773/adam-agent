@@ -2209,6 +2209,13 @@ test("the target snapshot reports exact Certified identities and safe credential
           profileVersion: 3,
           certification: "certified",
         },
+        catalog: {
+          displayName: "DeepSeek V4 Flash",
+          summary: "Fast general-purpose coding model.",
+          capabilities: ["reasoning", "tool-use"],
+          modalities: ["text"],
+          recommended: true,
+        },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
         contextProfile: {
           version: 2,
@@ -2240,6 +2247,13 @@ test("the target snapshot reports exact Certified identities and safe credential
           profileVersion: 3,
           certification: "certified",
         },
+        catalog: {
+          displayName: "DeepSeek V4 Pro",
+          summary: "Higher-capability coding model for complex work.",
+          capabilities: ["reasoning", "tool-use"],
+          modalities: ["text"],
+          recommended: false,
+        },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
         contextProfile: {
           version: 2,
@@ -2270,6 +2284,13 @@ test("the target snapshot reports exact Certified identities and safe credential
           route: "direct",
           profileVersion: 2,
           certification: "certified",
+        },
+        catalog: {
+          displayName: "DeepSeek V4 Flash Vision",
+          summary: "Vision-capable coding model for image-aware work.",
+          capabilities: ["reasoning", "tool-use"],
+          modalities: ["text", "image"],
+          recommended: false,
         },
         readiness: { status: "available", credentialSource: "DEEPSEEK_API_KEY" },
         contextProfile: {
@@ -2308,6 +2329,13 @@ test("the target snapshot reports exact Certified identities and safe credential
           upstreamProviderId: "poolside",
           profileVersion: 1,
           certification: "experimental",
+        },
+        catalog: {
+          displayName: "Poolside Laguna S 2.1 Free",
+          summary: "Experimental free coding route through Vercel AI Gateway.",
+          capabilities: ["tool-use"],
+          modalities: ["text"],
+          recommended: false,
         },
         readiness: { status: "missing", credentialSource: "AI_GATEWAY_API_KEY" },
         contextProfile: {
@@ -2484,19 +2512,42 @@ test("current Direct DeepSeek v3 selection retains exact historical v2 and v1 re
     targets.snapshot({ includeHistoricalProfiles: true, signal: new AbortController().signal }),
   ).resolves.toMatchObject({
     targets: [
-      { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 3 } },
-      { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 3 } },
-      { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 2 } },
-      { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 2 } },
-      { identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 1 } },
-      { identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 1 } },
+      {
+        identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 3 },
+        catalog: { displayName: "DeepSeek V4 Flash", modalities: ["text"] },
+      },
+      {
+        identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 3 },
+        catalog: { displayName: "DeepSeek V4 Pro", modalities: ["text"] },
+      },
+      {
+        identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 2 },
+        catalog: { displayName: "DeepSeek V4 Flash", modalities: ["text"] },
+      },
+      {
+        identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 2 },
+        catalog: { displayName: "DeepSeek V4 Pro", modalities: ["text"] },
+      },
+      {
+        identity: { targetId: "deepseek-v4-flash.direct", profileVersion: 1 },
+        catalog: { displayName: "DeepSeek V4 Flash", modalities: ["text"] },
+      },
+      {
+        identity: { targetId: "deepseek-v4-pro.direct", profileVersion: 1 },
+        catalog: { displayName: "DeepSeek V4 Pro", modalities: ["text"] },
+      },
       {
         identity: { targetId: "deepseek-v4-flash-vision-exp.direct", profileVersion: 2 },
+        catalog: { displayName: "DeepSeek V4 Flash Vision", modalities: ["text", "image"] },
       },
       {
         identity: { targetId: "deepseek-v4-flash-vision-exp.direct", profileVersion: 1 },
+        catalog: { displayName: "DeepSeek V4 Flash Vision", modalities: ["text", "image"] },
       },
-      { identity: { targetId: "poolside-laguna-s-2.1-free.gateway", profileVersion: 1 } },
+      {
+        identity: { targetId: "poolside-laguna-s-2.1-free.gateway", profileVersion: 1 },
+        catalog: { displayName: "Poolside Laguna S 2.1 Free", modalities: ["text"] },
+      },
     ],
   });
 });

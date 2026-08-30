@@ -25,9 +25,18 @@ export type ModelTargetReadiness = {
   readonly credentialSource: string;
 };
 
+export type ModelTargetCatalogMetadata = {
+  readonly displayName: string;
+  readonly summary: string;
+  readonly capabilities: readonly ("reasoning" | "tool-use")[];
+  readonly modalities: readonly ("text" | "image")[];
+  readonly recommended: boolean;
+};
+
 export type ModelTargetSnapshot = {
   readonly targets: readonly {
     readonly identity: ModelTargetIdentity;
+    readonly catalog?: ModelTargetCatalogMetadata;
     readonly readiness: ModelTargetReadiness;
     readonly contextProfile: ContextProfile;
     readonly modalityProfile?: ModelModalityProfile;
@@ -270,6 +279,35 @@ const experimentalGatewayTarget: ModelTargetIdentity = Object.freeze({
   certification: "experimental",
 });
 
+const directFlashCatalog: ModelTargetCatalogMetadata = Object.freeze({
+  displayName: "DeepSeek V4 Flash",
+  summary: "Fast general-purpose coding model.",
+  capabilities: Object.freeze(["reasoning", "tool-use"] as const),
+  modalities: Object.freeze(["text"] as const),
+  recommended: true,
+});
+const directProCatalog: ModelTargetCatalogMetadata = Object.freeze({
+  displayName: "DeepSeek V4 Pro",
+  summary: "Higher-capability coding model for complex work.",
+  capabilities: Object.freeze(["reasoning", "tool-use"] as const),
+  modalities: Object.freeze(["text"] as const),
+  recommended: false,
+});
+const directVisionCatalog: ModelTargetCatalogMetadata = Object.freeze({
+  displayName: "DeepSeek V4 Flash Vision",
+  summary: "Vision-capable coding model for image-aware work.",
+  capabilities: Object.freeze(["reasoning", "tool-use"] as const),
+  modalities: Object.freeze(["text", "image"] as const),
+  recommended: false,
+});
+const experimentalGatewayCatalog: ModelTargetCatalogMetadata = Object.freeze({
+  displayName: "Poolside Laguna S 2.1 Free",
+  summary: "Experimental free coding route through Vercel AI Gateway.",
+  capabilities: Object.freeze(["tool-use"] as const),
+  modalities: Object.freeze(["text"] as const),
+  recommended: false,
+});
+
 export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
   const deadlineMs = options.deadlineMs ?? 120_000;
   const connectionDeadlineMs = options.connectionDeadlineMs ?? 10_000;
@@ -497,6 +535,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
             : currentDirectDeepSeekTargets
           ).map((identity) => ({
             identity,
+            catalog: catalogMetadataFor(identity),
             readiness: { status, credentialSource: "DEEPSEEK_API_KEY" },
             contextProfile: directDeepSeekContextProfileFor(identity),
             connectionTest: "supported" as const,
@@ -520,6 +559,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
           })),
           {
             identity: experimentalGatewayTarget,
+            catalog: experimentalGatewayCatalog,
             readiness: {
               status: gatewayStatus,
               credentialSource: "AI_GATEWAY_API_KEY",
@@ -530,6 +570,19 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
       };
     },
   };
+}
+
+function catalogMetadataFor(identity: ModelTargetIdentity): ModelTargetCatalogMetadata {
+  if (identity.targetId === "deepseek-v4-flash.direct") {
+    return directFlashCatalog;
+  }
+  if (identity.targetId === "deepseek-v4-pro.direct") {
+    return directProCatalog;
+  }
+  if (identity.targetId === "deepseek-v4-flash-vision-exp.direct") {
+    return directVisionCatalog;
+  }
+  throw new TypeError(`Missing catalog metadata for model target ${identity.targetId}.`);
 }
 
 function connectionFailure(

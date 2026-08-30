@@ -436,9 +436,22 @@ export async function createPresentationSession(
       targets: {
         items: (modelTargetSnapshot?.targets ?? []).map((target) => {
           const context = configuredTargetContexts.get(target.identity.targetId);
+          const catalog = target.catalog ?? {
+            displayName: "Unknown model target",
+            summary: "No catalog description is available.",
+            capabilities: [],
+            modalities: [],
+            recommended: false,
+          };
           return {
             targetId: target.identity.targetId,
             label: target.identity.modelId,
+            provider: target.identity.vendor,
+            displayName: catalog.displayName,
+            summary: catalog.summary,
+            capabilities: catalog.capabilities,
+            modalities: catalog.modalities,
+            recommended: catalog.recommended,
             route: target.identity.route,
             certification:
               target.identity.certification === "certified" ? "Certified" : "Experimental",

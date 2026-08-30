@@ -546,6 +546,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       basis: "auto",
       minSize: 1,
       shrink: 1,
+      visible: () => targetPicker === undefined,
     },
   ]);
   tui.setLayoutRoot(
@@ -965,6 +966,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const renderState = () => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
+    targetPicker?.picker.setTargets(
+      state.authoritative.targets.items,
+      state.authoritative.targets.defaultTargetId,
+    );
     if (statusNotice?.sessionId !== undefined && statusNotice.sessionId !== active?.session.id) {
       clearNotice();
     }
@@ -1180,7 +1185,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         tui.setFocus(editor);
         tui.requestRender();
       };
+      const unavailableTargetNotice = (target: TargetDisplay): string =>
+        `${target.displayName} is not ready. Set ${target.readiness.credentialSource} and retry.`;
+      const targetIdentity = (target: TargetDisplay): string =>
+        `${target.displayName} (${target.targetId})`;
+      const forkSource =
+        active === null ? undefined : completeChronologyBoundaries(active.transcript.items).at(-1);
       const picker = new TargetPicker({
+        columns: () => physicalTerminal.columns,
+        maximumContentRows: () => Math.max(1, physicalTerminal.rows - 2),
+        canFork: forkSource !== undefined,
         defaultTargetId: state.authoritative.targets.defaultTargetId,
         targets: state.authoritative.targets.items,
         theme,
@@ -1189,15 +1203,68 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           ? { currentTargetId: active.session.targetId }
           : {}),
         onClose: close,
+        onCheckConnection(target) {
+          if (target.connection === undefined || target.connection.configured !== "Configured") {
+            picker.setNotice(
+              target.readiness.status === "available"
+                ? "This exact target has no explicit API check."
+                : unavailableTargetNotice(target),
+            );
+            tui.requestRender();
+            return;
+          }
+          const cancelling = target.connection.reachability === "Testing";
+          picker.setNotice(
+            cancelling
+              ? `Cancelling API check for ${targetIdentity(target)}…`
+              : `Checking API for ${targetIdentity(target)}…`,
+          );
+          tui.requestRender();
+          void options.presentation
+            .dispatch({
+              type: cancelling
+                ? ("cancel_target_connection_test" as const)
+                : ("test_target_connection" as const),
+              targetId: target.targetId,
+            })
+            .then((receipt) => {
+              if (targetPicker?.picker !== picker) {
+                return;
+              }
+              if (receipt.status === "rejected") {
+                picker.setNotice(`API check for ${targetIdentity(target)}: ${receipt.message}`);
+              } else {
+                picker.setNotice(
+                  cancelling
+                    ? `API check cancelled for ${targetIdentity(target)}.`
+                    : `API check completed for ${targetIdentity(target)}.`,
+                );
+              }
+              renderState();
+            })
+            .catch(() => {
+              if (targetPicker?.picker === picker) {
+                picker.setNotice(
+                  `The API check for ${targetIdentity(target)} could not be dispatched safely.`,
+                );
+                tui.requestRender();
+              }
+            });
+        },
         ...(state.authoritative.targets.diagnostic !== null
           ? { initialNotice: state.authoritative.targets.diagnostic.message }
           : startupTargetFailure === null
             ? {}
             : { initialNotice: startupTargetFailure }),
         onSelect(target) {
+          if (target.readiness.status !== "available") {
+            picker.setNotice(unavailableTargetNotice(target));
+            tui.requestRender();
+            return;
+          }
           if (targetPickerIntent === "transition") {
             picker.setNotice(
-              `Selected ${target.targetId} · press Ctrl+N for New Session or Ctrl+F to Fork the current complete boundary.`,
+              `Selected ${target.displayName}. Choose Ctrl+N New session${forkSource === undefined ? "." : " or Ctrl+F Fork current boundary."}`,
             );
             tui.requestRender();
             return;
@@ -1209,17 +1276,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         },
         onFork(target) {
           if (target.readiness.status !== "available") {
-            picker.setNotice(
-              `The exact target ${target.targetId} is missing its required credential.`,
-            );
+            picker.setNotice(unavailableTargetNotice(target));
             tui.requestRender();
             return;
           }
-          const source =
-            active === null
-              ? undefined
-              : completeChronologyBoundaries(active.transcript.items).at(-1);
-          if (active === null || source === undefined) {
+          if (active === null || forkSource === undefined) {
             picker.setNotice("No complete authoritative chronology boundary is visible.");
             tui.requestRender();
             return;
@@ -1228,7 +1289,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             .dispatch({
               type: "branch_session",
               parentSessionId: active.session.id,
-              sourceBoundary: source.boundary,
+              sourceBoundary: forkSource.boundary,
               targetId: target.targetId,
             })
             .then((receipt) => {
@@ -1249,9 +1310,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         },
         onSetDefault(target) {
           if (target !== null && target.readiness.status !== "available") {
-            picker.setNotice(
-              `The exact target ${target.targetId} is missing its required credential.`,
-            );
+            picker.setNotice(unavailableTargetNotice(target));
             tui.requestRender();
             return;
           }
@@ -1284,9 +1343,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       });
       function createSessionFromTarget(target: TargetDisplay, afterAdmission?: () => void): void {
         if (target.readiness.status !== "available") {
-          picker.setNotice(
-            `The exact target ${target.targetId} is missing its required credential.`,
-          );
+          picker.setNotice(unavailableTargetNotice(target));
           tui.requestRender();
           return;
         }
@@ -1318,10 +1375,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           });
       }
       handle = showOverlay(picker, {
-        width: "80%",
-        minWidth: 36,
-        maxHeight: "80%",
-        margin: 1,
+        width: 144,
+        maxHeight: "100%",
+        margin: 0,
       });
       targetPicker = { close, picker, hide: () => handle?.hide() };
     }
