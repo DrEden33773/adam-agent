@@ -25,7 +25,7 @@ const operatingSystemTestNames = [
   "SessionLifecycle hybrid Plan asks before a workspace PATH shadow can execute",
   "SessionLifecycle hybrid Plan asks for a near miss from each mandatory Git family",
   "SessionLifecycle hybrid Plan asks once for one exact ambiguous diagnostic",
-  "SessionLifecycle hybrid Plan attests Git and automatically executes all five repository families",
+  "SessionLifecycle hybrid Plan binds repository Git automation to the frozen installed build",
   "SessionLifecycle hybrid Plan automatically executes one exact simple inspection",
   "SessionLifecycle hybrid Plan durably freezes its shell environment identity",
   "SessionLifecycle hybrid Plan executes an approved call with only its frozen environment",

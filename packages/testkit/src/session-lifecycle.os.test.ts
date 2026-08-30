@@ -1966,7 +1966,12 @@ test("SessionLifecycle real-process branch writes independently, survives restar
   }
 }, 20_000);
 
-test("SessionLifecycle hybrid Plan attests Git and automatically executes all five repository families", async () => {
+test("SessionLifecycle hybrid Plan binds repository Git automation to the frozen installed build", async () => {
+  const installedGitVersion = execFileSync("/usr/bin/git", ["--version"], {
+    encoding: "utf8",
+    env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+  }).trimEnd();
+  const supportedGitBuild = installedGitVersion === "git version 2.43.0";
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-git-families-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -1988,7 +1993,6 @@ test("SessionLifecycle hybrid Plan attests Git and automatically executes all fi
   await runGitFixtureCommand(workspaceRoot, ["config", "user.email", "adam@example.test"]);
   await runGitFixtureCommand(workspaceRoot, ["add", "README.md"]);
   await runGitFixtureCommand(workspaceRoot, ["commit", "-m", "fixture"]);
-  process.env[executablePathName] = "/usr/bin:/bin";
   const commands = [
     "git --version",
     "git --no-pager status --porcelain=v1 --untracked-files=normal --ignore-submodules=all",
@@ -2055,6 +2059,7 @@ test("SessionLifecycle hybrid Plan attests Git and automatically executes all fi
   });
 
   try {
+    process.env[executablePathName] = "/usr/bin:/bin";
     const created = await lifecycle.create({ targetIdentity });
     await lifecycle.enterPlan({ sessionId: created.sessionId });
     const continued = await lifecycle.continue({
@@ -2063,25 +2068,26 @@ test("SessionLifecycle hybrid Plan attests Git and automatically executes all fi
       limits: { maxTurns: commands.length + 1 },
     });
 
-    expect({ result: continued.result, plan: continued.snapshot.plan }).toMatchObject({
-      result: {
-        status: "completed",
-        answer: "Every mandatory Git family executed automatically after attestation.",
-      },
-      plan: {
-        gitAttestation: {
-          version: "git-auto-attestation.v1",
-          gitVersion: "git version 2.43.0",
-          digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
-        },
-      },
+    expect(continued.result).toEqual({
+      status: "completed",
+      answer: supportedGitBuild
+        ? "Every mandatory Git family executed automatically after attestation."
+        : "A mandatory Git family did not execute automatically.",
     });
-    expect(events.filter((event) => event.type === "tool_permission_requested")).toHaveLength(0);
     const completedShellEvents = events.filter(
       (event): event is Extract<RuntimeEvent, { readonly type: "tool_completed" }> =>
         event.type === "tool_completed" && event.name === "run_shell",
     );
-    expect(completedShellEvents).toHaveLength(commands.length);
+    const permissionRequests = events.filter(
+      (event): event is Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }> =>
+        event.type === "tool_permission_requested" && event.name === "run_shell",
+    );
+    expect(completedShellEvents).toHaveLength(supportedGitBuild ? commands.length : 1);
+    expect(
+      permissionRequests.map((event) =>
+        event.subject.type === "plan_command" ? event.subject.command : undefined,
+      ),
+    ).toEqual(supportedGitBuild ? [] : commands.slice(1));
     for (const event of completedShellEvents) {
       expect(event.output).toMatchObject({
         termination: { type: "exited", exitCode: 0 },
@@ -2089,23 +2095,42 @@ test("SessionLifecycle hybrid Plan attests Git and automatically executes all fi
       });
     }
     expect(completedShellEvents[0]?.output).toMatchObject({
-      stdout: { tail: "git version 2.43.0\n", omittedBytes: 0 },
+      stdout: { tail: `${installedGitVersion}\n`, omittedBytes: 0 },
     });
-    expect(completedShellEvents[1]?.output).toMatchObject({
-      stdout: { tail: "", omittedBytes: 0 },
-    });
-    expect(completedShellEvents[2]?.output).toMatchObject({
-      stdout: { tail: "true\n", omittedBytes: 0 },
-    });
-    expect(completedShellEvents[3]?.output).toMatchObject({
-      stdout: { tail: expect.stringContaining("fixture"), omittedBytes: 0 },
-    });
-    expect(completedShellEvents[4]?.output).toMatchObject({
-      stdout: { tail: "", omittedBytes: 0 },
-    });
-    expect(completedShellEvents[5]?.output).toMatchObject({
-      stdout: { tail: expect.stringContaining("README.md"), omittedBytes: 0 },
-    });
+    if (supportedGitBuild) {
+      expect(continued.snapshot.plan?.gitAttestation).toMatchObject({
+        version: "git-auto-attestation.v1",
+        gitVersion: "git version 2.43.0",
+        digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      });
+      expect(completedShellEvents[1]?.output).toMatchObject({
+        stdout: { tail: "", omittedBytes: 0 },
+      });
+      expect(completedShellEvents[2]?.output).toMatchObject({
+        stdout: { tail: "true\n", omittedBytes: 0 },
+      });
+      expect(completedShellEvents[3]?.output).toMatchObject({
+        stdout: { tail: expect.stringContaining("fixture"), omittedBytes: 0 },
+      });
+      expect(completedShellEvents[4]?.output).toMatchObject({
+        stdout: { tail: "", omittedBytes: 0 },
+      });
+      expect(completedShellEvents[5]?.output).toMatchObject({
+        stdout: { tail: expect.stringContaining("README.md"), omittedBytes: 0 },
+      });
+    } else {
+      expect(continued.snapshot.plan?.gitAttestation).toBeUndefined();
+      expect(permissionRequests).toHaveLength(commands.length - 1);
+      for (const request of permissionRequests) {
+        expect(request.subject).toMatchObject({
+          type: "plan_command",
+          assessment: {
+            disposition: "ask_ambiguous",
+            reasons: ["git_attestation_required"],
+          },
+        });
+      }
+    }
     const child = await lifecycle.branch({
       parentSessionId: created.sessionId,
       atSequence: continued.snapshot.lastSequence,
