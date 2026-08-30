@@ -718,7 +718,9 @@ test("MCP canonical identity and durable Tool Profile contracts have package-int
 
   expect.soft(actualOwners).toEqual(expectedOwners);
   expect.soft(actualTypeOwners).toEqual(expectedTypeOwners);
-  expect.soft(canonicalConsumers).toEqual(["mcp-host.ts", "mcp-profile-contracts.ts"]);
+  expect
+    .soft(canonicalConsumers)
+    .toEqual(["mcp-host.ts", "mcp-profile-contracts.ts", "plan-mcp-permission-validation.ts"]);
   expect
     .soft(profileConsumers)
     .toEqual([

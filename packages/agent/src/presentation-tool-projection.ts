@@ -205,6 +205,12 @@ export function projectPendingPermissionCandidates(
         callId: entry.record.event.callId,
         effect: entry.record.event.effect,
         subject,
+        ...(entry.record.event.subject?.type === "plan_command"
+          ? {
+              warning:
+                "Plan parsing is not a sandbox. Approval may run project code, write cache or artifacts, read accessible data, or use network.",
+            }
+          : {}),
         canAllow: entry.record.event.effect !== "write",
         changePreviewRef,
       },
@@ -390,7 +396,7 @@ function safeToolSubject(
   if (subject?.type === "file" || subject?.type === "workspace_path") {
     return { type: "path", value: subject.path };
   }
-  if (subject?.type === "command") {
+  if (subject?.type === "command" || subject?.type === "plan_command") {
     return { type: "command", value: subject.command };
   }
   const outputRecord = jsonRecord(output);

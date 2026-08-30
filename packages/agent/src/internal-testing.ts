@@ -33,6 +33,22 @@ export {
 } from "./mcp-host.js";
 export { preparedDirectDeepSeekV2ContextProfile } from "./model-targets.js";
 export type { PatchFileSystem } from "./patch-transaction.js";
+export { assessPlanCommandV1 } from "./plan-command-assessment.js";
+export {
+  assessPlanCommandExecutionV1,
+  resolvePlanTrustedExecutableV1,
+} from "./plan-executable-policy.js";
+export {
+  createPlanGitAttestationV1,
+  planGitAutomaticPolicyV1,
+  planGitEnvironmentV1,
+} from "./plan-git-policy.js";
+export { isExactPlanMcpPermissionEventV1 } from "./plan-mcp-permission-validation.js";
+export { createPlanToolProfileV1 } from "./plan-mode.js";
+export {
+  createPlanShellEnvironmentV1,
+  createUnavailablePlanShellEnvironmentV1,
+} from "./plan-shell-environment.js";
 export {
   type PresentationArtifactReadBarrier,
   type PresentationHydrationBarrier,
@@ -84,6 +100,8 @@ export {
   mcpActivationSettlementBarrier,
   mcpCatalogStaleDurableBarrier,
   mcpCatalogStaleObservationBarrier,
+  type PlanShellEnvironmentFactory,
+  planShellEnvironmentFactory,
   type SessionCloseDrainBarrier,
   type SessionLogicalRunStartedBarrier,
   type SessionRuntimeNotificationTransform,

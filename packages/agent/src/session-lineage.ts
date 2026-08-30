@@ -128,6 +128,21 @@ export function createSessionLineageTraversal(input: {
           cycleId: actual.record.cycleId,
           revision: actual.record.revision,
           policyVersion: actual.record.policyVersion,
+          ...(actual.record.shellPolicyVersion === undefined
+            ? {}
+            : { shellPolicyVersion: actual.record.shellPolicyVersion }),
+          ...(actual.record.shellEnvironment === undefined
+            ? {}
+            : { shellEnvironment: actual.record.shellEnvironment }),
+          ...(actual.record.gitPolicyVersion === undefined
+            ? {}
+            : { gitPolicyVersion: actual.record.gitPolicyVersion }),
+          ...(actual.record.gitPolicyDigest === undefined
+            ? {}
+            : { gitPolicyDigest: actual.record.gitPolicyDigest }),
+          ...(actual.record.gitAttestation === undefined
+            ? {}
+            : { gitAttestation: actual.record.gitAttestation }),
           eligibleToolProfile: actual.record.eligibleToolProfile,
         },
         expected,

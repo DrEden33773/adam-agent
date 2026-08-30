@@ -20,7 +20,11 @@ import {
 } from "./input-resources.js";
 import { isMcpToolProfileV1Valid } from "./mcp-profile-contracts.js";
 import { sameModelTargetIdentity } from "./model-targets.js";
-import { isReadOnlyPlanToolProfileV1Valid } from "./plan-mode.js";
+import { assessPlanCommandV1 } from "./plan-command-assessment.js";
+import { isPlanGitAttestationV1Valid, planGitAutomaticPolicyV1 } from "./plan-git-policy.js";
+import { isExactPlanMcpPermissionEventV1 } from "./plan-mcp-permission-validation.js";
+import { isPlanToolProfileV1Valid, type PlanEligibleToolProfileV1 } from "./plan-mode.js";
+import { isPlanShellEnvironmentV1Valid } from "./plan-shell-environment.js";
 import {
   commitMcpToolProfileV3,
   hasSkillPromptContext,
@@ -59,16 +63,19 @@ import type {
   SessionRecord,
 } from "./session-store.js";
 import { isSkillContextRecordV1Valid } from "./skills.js";
+import type { PermissionSubject } from "./tool-runtime.js";
 import { canonicalChangePreviewForToolCall } from "./tool-runtime.js";
 
 type ValidatedToolState = {
   readonly call: { readonly id: string; readonly name: string; readonly argumentsJson: string };
   readonly intent: {
+    readonly definitionDigest?: string | undefined;
     readonly effect?: string | undefined;
   };
   decision?: "allow" | "deny";
   changePreviewRef?: ArtifactReference<ChangePreviewArtifactSource>;
   permissionRequestId?: string;
+  permissionSubject?: PermissionSubject;
   requested: boolean;
   repositoryActivationPublished?: boolean;
   repositoryDisposition?: "mutation_retry_required" | "read_continue" | "unavailable";
@@ -162,6 +169,14 @@ export function validateCurrentSessionHistory(
   const titleGenerationIds = new Set<string>();
   let activePlanCycleId: string | undefined;
   let activePlanRevision: number | undefined;
+  let activePlanPolicyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1" | undefined;
+  let activePlanShellPolicyVersion: "plan-shell-policy.v1" | undefined;
+  let activePlanShellEnvironmentDigest: string | undefined;
+  let activePlanToolProfileDigest: string | undefined;
+  let activePlanGitPolicyVersion: "git-auto-policy.v1" | undefined;
+  let activePlanGitPolicyDigest: string | undefined;
+  let activePlanEligibleToolProfile: PlanEligibleToolProfileV1 | undefined;
+  let activePlanGitAttested = false;
   const activatableRepositoryRevisions = new Map<number, ValidatedToolState>();
   const publishedRepositoryRevisions = new Set<number>();
   let mcpWorkspaceConfirmation: SessionMcpWorkspaceConfirmedRecord["record"] | undefined;
@@ -186,7 +201,17 @@ export function validateCurrentSessionHistory(
       if (
         run !== undefined ||
         activePlanCycleId !== undefined ||
-        !isReadOnlyPlanToolProfileV1Valid(record.eligibleToolProfile) ||
+        !isPlanToolProfileV1Valid(record.eligibleToolProfile, record.policyVersion) ||
+        (record.policyVersion === "plan-policy.hybrid-v1") !==
+          (record.shellPolicyVersion === "plan-shell-policy.v1") ||
+        (record.policyVersion === "plan-policy.hybrid-v1") !==
+          (record.shellEnvironment !== undefined) ||
+        (record.policyVersion === "plan-policy.hybrid-v1") !==
+          (record.gitPolicyVersion === planGitAutomaticPolicyV1.version) ||
+        (record.policyVersion === "plan-policy.hybrid-v1") !==
+          (record.gitPolicyDigest === planGitAutomaticPolicyV1.digest) ||
+        (record.shellEnvironment !== undefined &&
+          !isPlanShellEnvironmentV1Valid(record.shellEnvironment)) ||
         record.eligibleToolProfile.source.version !== activePromptContext?.toolProfile.version ||
         record.eligibleToolProfile.source.digest !== activePromptContext.toolProfile.digest
       ) {
@@ -194,6 +219,14 @@ export function validateCurrentSessionHistory(
       }
       activePlanCycleId = record.cycleId;
       activePlanRevision = record.revision;
+      activePlanPolicyVersion = record.policyVersion;
+      activePlanShellPolicyVersion = record.shellPolicyVersion;
+      activePlanShellEnvironmentDigest = record.shellEnvironment?.digest;
+      activePlanToolProfileDigest = record.eligibleToolProfile.digest;
+      activePlanGitPolicyVersion = record.gitPolicyVersion;
+      activePlanGitPolicyDigest = record.gitPolicyDigest;
+      activePlanEligibleToolProfile = record.eligibleToolProfile;
+      activePlanGitAttested = false;
       continue;
     }
     if (record.type === "plan_cycle_inherited") {
@@ -212,7 +245,22 @@ export function validateCurrentSessionHistory(
         lineage === undefined ||
         record.source.sessionId !== sourceSessionId ||
         record.source.throughSequence !== sourceSequence ||
-        !isReadOnlyPlanToolProfileV1Valid(record.eligibleToolProfile) ||
+        !isPlanToolProfileV1Valid(record.eligibleToolProfile, record.policyVersion) ||
+        (record.policyVersion === "plan-policy.hybrid-v1") !==
+          (record.shellPolicyVersion === "plan-shell-policy.v1") ||
+        (record.policyVersion === "plan-policy.hybrid-v1") !==
+          (record.shellEnvironment !== undefined) ||
+        (record.policyVersion === "plan-policy.hybrid-v1") !==
+          (record.gitPolicyVersion === planGitAutomaticPolicyV1.version) ||
+        (record.policyVersion === "plan-policy.hybrid-v1") !==
+          (record.gitPolicyDigest === planGitAutomaticPolicyV1.digest) ||
+        (record.shellEnvironment !== undefined &&
+          !isPlanShellEnvironmentV1Valid(record.shellEnvironment)) ||
+        (record.gitAttestation !== undefined &&
+          (!isPlanGitAttestationV1Valid(record.gitAttestation) ||
+            record.gitAttestation.shellEnvironmentDigest !== record.shellEnvironment?.digest ||
+            record.gitAttestation.gitPolicyVersion !== record.gitPolicyVersion ||
+            record.gitAttestation.gitPolicyDigest !== record.gitPolicyDigest)) ||
         record.eligibleToolProfile.source.version !== activePromptContext?.toolProfile.version ||
         record.eligibleToolProfile.source.digest !== activePromptContext.toolProfile.digest
       ) {
@@ -220,6 +268,44 @@ export function validateCurrentSessionHistory(
       }
       activePlanCycleId = record.cycleId;
       activePlanRevision = record.revision;
+      activePlanPolicyVersion = record.policyVersion;
+      activePlanShellPolicyVersion = record.shellPolicyVersion;
+      activePlanShellEnvironmentDigest = record.shellEnvironment?.digest;
+      activePlanToolProfileDigest = record.eligibleToolProfile.digest;
+      activePlanGitPolicyVersion = record.gitPolicyVersion;
+      activePlanGitPolicyDigest = record.gitPolicyDigest;
+      activePlanEligibleToolProfile = record.eligibleToolProfile;
+      activePlanGitAttested = record.gitAttestation !== undefined;
+      continue;
+    }
+    if (record.type === "plan_git_attested") {
+      const toolState = toolStates.get(record.callId);
+      const completed = currentRecords.some(
+        (candidate) =>
+          candidate.sequence < entry.sequence &&
+          candidate.schemaVersion === 3 &&
+          candidate.record.type === "runtime_event" &&
+          candidate.record.runId === record.runId &&
+          candidate.record.event.type === "tool_completed" &&
+          candidate.record.event.callId === record.callId &&
+          candidate.record.event.name === "run_shell" &&
+          isExactGitVersionOutput(candidate.record.event.output),
+      );
+      if (
+        run?.runId !== record.runId ||
+        record.cycleId !== activePlanCycleId ||
+        activePlanGitAttested ||
+        activePlanShellEnvironmentDigest !== record.attestation.shellEnvironmentDigest ||
+        activePlanGitPolicyVersion !== record.attestation.gitPolicyVersion ||
+        activePlanGitPolicyDigest !== record.attestation.gitPolicyDigest ||
+        !isPlanGitAttestationV1Valid(record.attestation) ||
+        toolState?.call.name !== "run_shell" ||
+        !isExactGitVersionArguments(toolState.call.argumentsJson) ||
+        !completed
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      activePlanGitAttested = true;
       continue;
     }
     if (record.type === "plan_cycle_exited") {
@@ -232,6 +318,14 @@ export function validateCurrentSessionHistory(
       }
       activePlanCycleId = undefined;
       activePlanRevision = undefined;
+      activePlanPolicyVersion = undefined;
+      activePlanShellPolicyVersion = undefined;
+      activePlanShellEnvironmentDigest = undefined;
+      activePlanToolProfileDigest = undefined;
+      activePlanGitPolicyVersion = undefined;
+      activePlanGitPolicyDigest = undefined;
+      activePlanEligibleToolProfile = undefined;
+      activePlanGitAttested = false;
       continue;
     }
     if (record.type === "mcp_workspace_confirmed") {
@@ -1454,6 +1548,24 @@ export function validateCurrentSessionHistory(
         throw new SessionLifecycleError("session_invalid");
       }
       if (
+        (event.type === "tool_permission_requested" || event.type === "tool_permission_decided") &&
+        !isValidPlanPermissionEvent({
+          event,
+          runId: run.runId,
+          state,
+          activePlanCycleId,
+          activePlanPolicyVersion,
+          activePlanShellPolicyVersion,
+          activePlanShellEnvironmentDigest,
+          activePlanToolProfileDigest,
+          activePlanGitPolicyVersion,
+          activePlanGitPolicyDigest,
+          activePlanEligibleToolProfile,
+        })
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      if (
         state.call.name === "read_skill_resource" &&
         event.type === "tool_completed" &&
         !committedSkillResourceReads.has(event.callId)
@@ -1466,6 +1578,20 @@ export function validateCurrentSessionHistory(
         }
         state.requested = true;
       } else if (event.type === "tool_permission_requested") {
+        const isPlanReassessment =
+          state.started === false &&
+          state.decision === "allow" &&
+          (state.permissionRequestId === undefined ||
+            state.permissionRequestId === event.requestId) &&
+          state.permissionSubject?.type === "plan_command" &&
+          state.permissionSubject.assessment.disposition !== "deny_mutation" &&
+          event.subject?.type === "plan_command" &&
+          event.subject.assessment.disposition === "ask_ambiguous" &&
+          !isDeepStrictEqual(state.permissionSubject, event.subject);
+        if (isPlanReassessment) {
+          delete state.decision;
+          delete state.permissionSubject;
+        }
         if (
           !state.requested ||
           state.started ||
@@ -1476,6 +1602,9 @@ export function validateCurrentSessionHistory(
         }
         validatePermissionEffect(state, event.effect);
         state.permissionRequestId ??= event.requestId;
+        if (event.subject !== undefined) {
+          state.permissionSubject = event.subject;
+        }
       } else if (event.type === "tool_permission_decided") {
         if (
           !state.requested ||
@@ -1488,6 +1617,15 @@ export function validateCurrentSessionHistory(
           throw new SessionLifecycleError("session_invalid");
         }
         validatePermissionEffect(state, event.effect);
+        if (
+          state.permissionSubject !== undefined &&
+          !isDeepStrictEqual(state.permissionSubject, event.subject)
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        if (event.subject !== undefined) {
+          state.permissionSubject = event.subject;
+        }
         state.decision = event.decision;
       } else if (event.type === "tool_started") {
         if (!state.requested || state.started || state.decision !== "allow") {
@@ -1514,6 +1652,40 @@ export function validateCurrentSessionHistory(
     throw new SessionLifecycleError("session_invalid");
   }
   validateContextCompactionHistory(genesis, currentRecords);
+}
+
+function isExactGitVersionArguments(argumentsJson: string): boolean {
+  try {
+    const parsed = JSON.parse(argumentsJson) as unknown;
+    return (
+      typeof parsed === "object" &&
+      parsed !== null &&
+      !Array.isArray(parsed) &&
+      (parsed as { readonly command?: unknown }).command === "git --version"
+    );
+  } catch {
+    return false;
+  }
+}
+
+function isExactGitVersionOutput(output: unknown): boolean {
+  if (typeof output !== "object" || output === null || Array.isArray(output)) {
+    return false;
+  }
+  const value = output as {
+    readonly termination?: unknown;
+    readonly stdout?: unknown;
+    readonly stderr?: unknown;
+  };
+  return (
+    isDeepStrictEqual(value.termination, { type: "exited", exitCode: 0 }) &&
+    isDeepStrictEqual(value.stdout, {
+      tail: "git version 2.43.0\n",
+      totalBytes: 19,
+      omittedBytes: 0,
+    }) &&
+    isDeepStrictEqual(value.stderr, { tail: "", totalBytes: 0, omittedBytes: 0 })
+  );
 }
 
 function isContextTerminalFailure(
@@ -1833,6 +2005,132 @@ function validateCompletedResponse(record: SessionModelResponseCompletedRecord["
       throw new SessionLifecycleError("session_invalid");
     }
     callIds.add(call.id);
+  }
+}
+
+function isValidPlanPermissionEvent(input: {
+  readonly event: Extract<
+    RuntimeEvent,
+    { readonly type: "tool_permission_requested" | "tool_permission_decided" }
+  >;
+  readonly runId: string;
+  readonly state: ValidatedToolState;
+  readonly activePlanCycleId: string | undefined;
+  readonly activePlanPolicyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1" | undefined;
+  readonly activePlanShellPolicyVersion: "plan-shell-policy.v1" | undefined;
+  readonly activePlanShellEnvironmentDigest: string | undefined;
+  readonly activePlanToolProfileDigest: string | undefined;
+  readonly activePlanGitPolicyVersion: "git-auto-policy.v1" | undefined;
+  readonly activePlanGitPolicyDigest: string | undefined;
+  readonly activePlanEligibleToolProfile: PlanEligibleToolProfileV1 | undefined;
+}): boolean {
+  if (input.activePlanCycleId === undefined) {
+    return input.event.subject?.type !== "plan_command";
+  }
+  const subject = input.event.subject;
+  const eligibleDefinition = input.activePlanEligibleToolProfile?.definitions.find(
+    (definition) => definition.name === input.state.call.name,
+  );
+  const hasExactEligibleDefinition =
+    eligibleDefinition !== undefined &&
+    eligibleDefinition.effect === input.state.intent.effect &&
+    eligibleDefinition.definitionDigest === input.state.intent.definitionDigest;
+  if (
+    input.activePlanPolicyVersion === "plan-policy.hybrid-v1" &&
+    input.state.call.name === "run_shell"
+  ) {
+    if (
+      !hasExactEligibleDefinition ||
+      eligibleDefinition.source !== "builtin" ||
+      subject?.type !== "plan_command" ||
+      input.event.effect !== "execute" ||
+      input.event.scope !== "call" ||
+      subject.command !== exactRunShellCommand(input.state.call.argumentsJson) ||
+      subject.cwd !== "." ||
+      subject.planCycleId !== input.activePlanCycleId ||
+      subject.planPolicyVersion !== input.activePlanPolicyVersion ||
+      subject.shellPolicyVersion !== input.activePlanShellPolicyVersion ||
+      subject.shellEnvironmentVersion !== "plan-shell-env.v1" ||
+      subject.shellEnvironmentDigest !== input.activePlanShellEnvironmentDigest ||
+      subject.toolProfileDigest !== input.activePlanToolProfileDigest ||
+      subject.gitPolicyVersion !== input.activePlanGitPolicyVersion ||
+      subject.gitPolicyDigest !== input.activePlanGitPolicyDigest
+    ) {
+      return false;
+    }
+    const rawAssessment = assessPlanCommandV1(subject.command);
+    if (
+      rawAssessment.status !== "assessed" ||
+      (subject.assessment.disposition === "allow_inspection" &&
+        rawAssessment.disposition !== "allow_inspection") ||
+      (subject.assessment.disposition === "deny_mutation" &&
+        rawAssessment.disposition !== "deny_mutation") ||
+      (subject.assessment.disposition === "ask_ambiguous" &&
+        rawAssessment.disposition === "deny_mutation")
+    ) {
+      return false;
+    }
+    if (subject.assessment.disposition === "ask_ambiguous") {
+      return input.event.requestId !== undefined;
+    }
+    if (input.event.type === "tool_permission_requested" || input.event.requestId !== undefined) {
+      return false;
+    }
+    return subject.assessment.disposition === "allow_inspection"
+      ? input.event.decision === "allow"
+      : input.event.decision === "deny";
+  }
+  if (subject?.type === "plan_command") {
+    return false;
+  }
+  if (!hasExactEligibleDefinition) {
+    return (
+      input.event.type === "tool_permission_decided" &&
+      input.event.requestId === undefined &&
+      input.event.decision === "deny"
+    );
+  }
+  if (
+    input.activePlanPolicyVersion === "plan-policy.hybrid-v1" &&
+    eligibleDefinition.source === "mcp" &&
+    (input.state.intent.effect === "execute" || input.state.intent.effect === "network")
+  ) {
+    return isExactPlanMcpPermissionEventV1({
+      event: input.event,
+      runId: input.runId,
+      callId: input.state.call.id,
+      callName: input.state.call.name,
+      argumentsJson: input.state.call.argumentsJson,
+      effect: input.state.intent.effect,
+      definitionDigest: input.state.intent.definitionDigest,
+      eligibleDefinition,
+    });
+  }
+  if (input.state.intent.effect === "read") {
+    return (
+      input.event.type === "tool_permission_decided" &&
+      input.event.requestId === undefined &&
+      input.event.decision === "allow"
+    );
+  }
+  return true;
+}
+
+function exactRunShellCommand(argumentsJson: string): string | undefined {
+  try {
+    const parsed = JSON.parse(argumentsJson) as unknown;
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      Array.isArray(parsed) ||
+      Object.keys(parsed).length !== 1
+    ) {
+      return undefined;
+    }
+    const command = (parsed as { readonly command?: unknown }).command;
+    return typeof command === "string" ? command : undefined;
+  } catch {
+    return undefined;
   }
 }
 

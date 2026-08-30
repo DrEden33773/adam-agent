@@ -377,7 +377,8 @@ export type ActiveSessionDisplay = {
     readonly state: "exploring";
     readonly cycleId: string;
     readonly revision: number;
-    readonly policyVersion: "plan-policy.read-v1";
+    readonly policyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1";
+    readonly shellPolicyVersion?: "plan-shell-policy.v1";
     readonly eligibleToolProfile: {
       readonly version: 1;
       readonly source: { readonly version: 1; readonly digest: `sha256:${string}` };
@@ -663,6 +664,7 @@ export type PendingInteraction = {
   readonly callId: string;
   readonly effect: "read" | "write" | "execute" | "network" | "delegate" | "administrative";
   readonly subject: { readonly type: "path" | "command" | "generic"; readonly value: string };
+  readonly warning?: string;
   readonly canAllow: boolean;
   readonly changePreviewRef: ArtifactReference | null;
 };

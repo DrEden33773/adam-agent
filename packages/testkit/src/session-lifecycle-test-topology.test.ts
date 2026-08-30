@@ -9,6 +9,9 @@ const operatingSystemSuitePath = fileURLToPath(
   new URL("./session-lifecycle.os.test.ts", import.meta.url),
 );
 const supportPath = fileURLToPath(new URL("./session-lifecycle.test-support.ts", import.meta.url));
+const planRecoverySupportPath = fileURLToPath(
+  new URL("./plan-shell-recovery.test-support.ts", import.meta.url),
+);
 const topologySuitePath = fileURLToPath(import.meta.url);
 const testkitSourcePath = fileURLToPath(new URL(".", import.meta.url));
 
@@ -19,6 +22,15 @@ const operatingSystemTestNames = [
   "SessionLifecycle cold resume reconstructs the exact historical Vision Chat image bytes",
   "SessionLifecycle cold resume reads an immutable input resource after its source is deleted",
   "SessionLifecycle follows one selected symlink without persisting its source path",
+  "SessionLifecycle hybrid Plan asks before a workspace PATH shadow can execute",
+  "SessionLifecycle hybrid Plan asks for a near miss from each mandatory Git family",
+  "SessionLifecycle hybrid Plan asks once for one exact ambiguous diagnostic",
+  "SessionLifecycle hybrid Plan attests Git and automatically executes all five repository families",
+  "SessionLifecycle hybrid Plan automatically executes one exact simple inspection",
+  "SessionLifecycle hybrid Plan durably freezes its shell environment identity",
+  "SessionLifecycle hybrid Plan executes an approved call with only its frozen environment",
+  "SessionLifecycle hybrid Plan hard-denies one recognized shell mutation",
+  "SessionLifecycle hybrid Plan recovery reuses 'the exact durable assessment' only before shell start",
   "SessionLifecycle rejects a competing project writer before model dispatch and takes over after owner death",
   "SessionLifecycle rejects a corrupt immutable input resource before cold provider projection",
   "SessionLifecycle rejects a dangling selected symlink before provider dispatch",
@@ -35,18 +47,22 @@ const operatingSystemTestNames = [
 ] as const;
 
 test("SessionLifecycle behavior and OS contracts keep separate environment ownership", async () => {
-  const [behaviorSource, operatingSystemSource, supportSource] = await Promise.all([
-    readFile(behaviorSuitePath, "utf8"),
-    readOptional(operatingSystemSuitePath),
-    readOptional(supportPath),
-  ]);
+  const [behaviorSource, operatingSystemSource, supportSource, planRecoverySupportSource] =
+    await Promise.all([
+      readFile(behaviorSuitePath, "utf8"),
+      readOptional(operatingSystemSuitePath),
+      readOptional(supportPath),
+      readOptional(planRecoverySupportPath),
+    ]);
 
   expect.soft(operatingSystemSource.length).toBeGreaterThan(0);
   expect.soft(supportSource.length).toBeGreaterThan(0);
+  expect.soft(planRecoverySupportSource.length).toBeGreaterThan(0);
   expect
     .soft(uniqueRuntimeModuleSpecifiers(behaviorSource))
     .toEqual([
       "./index.js",
+      "./plan-shell-recovery.test-support.js",
       "./session-lifecycle.test-support.js",
       "@adam-agent/agent",
       "@adam-agent/agent/internal-testing",
@@ -85,7 +101,12 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
     .toEqual(["createSessionLifecycle"]);
   expect
     .soft(runtimeImportedBindings(supportSource, "@adam-agent/agent/internal-testing"))
-    .toEqual(["createTrustedWorkspaceTrustForTesting", "sessionAutomaticTitlesEnabled"]);
+    .toEqual([
+      "createTrustedWorkspaceTrustForTesting",
+      "createUnavailablePlanShellEnvironmentV1",
+      "planShellEnvironmentFactory",
+      "sessionAutomaticTitlesEnabled",
+    ]);
   expect
     .soft(topLevelValueDeclarations(supportSource))
     .toEqual([
@@ -96,12 +117,32 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
       "function:createSessionLifecycleForTests",
     ]);
   expect
+    .soft(uniqueRuntimeModuleSpecifiers(planRecoverySupportSource))
+    .toEqual([
+      "./index.js",
+      "./session-lifecycle.test-support.js",
+      "@adam-agent/agent",
+      "@adam-agent/agent/internal-testing",
+      "node:crypto",
+      "node:fs/promises",
+      "node:os",
+      "node:path",
+    ]);
+  expect
+    .soft(topLevelValueDeclarations(planRecoverySupportSource))
+    .toEqual([
+      "const:contextProfile=ObjectLiteralExpression",
+      "function:exercisePlanShellRecoveryFixture",
+    ]);
+  expect
     .soft(topLevelValueDeclarations(operatingSystemSource))
     .toEqual([
       "const:lifecycleOwnerFixturePath=CallExpression",
       "const:childObservations=NewExpression",
       "const:visionResponsesIdentity=ObjectLiteralExpression",
+      "const:planTestContextProfile=ObjectLiteralExpression",
       "function:exerciseColdVisionResponsesArtifactFailure",
+      "function:runGitFixtureCommand",
       "function:observeChild",
       "function:waitForChildMessage",
       "function:waitForFixtureRecord",
@@ -119,12 +160,20 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
     .toEqual(["session-lifecycle.os.test.ts"]);
   expect.soft(presentFragments(behaviorSource, ["beforeAll(", "afterAll("])).toEqual([]);
   expect.soft(presentFragments(operatingSystemSource, ["beforeAll(", "afterAll("])).toEqual([]);
-  expect.soft(presentFragments(supportSource, ["beforeAll(", "afterAll("])).toEqual([]);
   expect
     .soft(
-      presentFragments(`${behaviorSource}\n${operatingSystemSource}\n${supportSource}`, [
-        "vi.mock(",
+      presentFragments(`${supportSource}\n${planRecoverySupportSource}`, [
+        "beforeAll(",
+        "afterAll(",
       ]),
+    )
+    .toEqual([]);
+  expect
+    .soft(
+      presentFragments(
+        `${behaviorSource}\n${operatingSystemSource}\n${supportSource}\n${planRecoverySupportSource}`,
+        ["vi.mock("],
+      ),
     )
     .toEqual([]);
   expect
@@ -143,7 +192,7 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
   expect.soft(presentFragments(operatingSystemSource, ["session-lifecycle.test.js"])).toEqual([]);
   expect
     .soft(
-      presentFragments(supportSource, [
+      presentFragments(`${supportSource}\n${planRecoverySupportSource}`, [
         "session-lifecycle.test.js",
         "session-lifecycle.os.test.js",
       ]),
@@ -152,9 +201,9 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
 
   const behaviorNames = declaredTestNames(behaviorSource);
   const operatingSystemNames = declaredTestNames(operatingSystemSource);
-  expect.soft(behaviorNames).toHaveLength(89);
+  expect.soft(behaviorNames).toHaveLength(96);
   expect.soft(operatingSystemNames).toEqual([...operatingSystemTestNames].sort());
-  expect.soft(operatingSystemNames).toHaveLength(19);
+  expect.soft(operatingSystemNames).toHaveLength(28);
   expect.soft(operatingSystemTestNames.filter((name) => behaviorNames.includes(name))).toEqual([]);
   const combinedNames = [...behaviorNames, ...operatingSystemNames];
   expect.soft(new Set(combinedNames).size).toBe(combinedNames.length);

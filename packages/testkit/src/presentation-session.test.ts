@@ -40,11 +40,13 @@ import {
   assemblePromptMessagesV1,
   createInMemorySessionStoreDirectory,
   createTrustedWorkspaceTrustForTesting,
+  createUnavailablePlanShellEnvironmentV1,
   digestPromptRequestV1,
   inputResourceIngestBarrier,
   mcpCatalogStaleDurableBarrier,
   mcpTransportFactory,
   openJsonlSessionStore,
+  planShellEnvironmentFactory,
   preparedDirectDeepSeekV2ContextProfile,
   presentationCatalogPageSize,
   presentationHistoryPageSize,
@@ -96,6 +98,8 @@ function createSessionLifecycle(
     ...options,
     workspaceTrust:
       options.workspaceTrust ?? createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
+    [planShellEnvironmentFactory]:
+      options[planShellEnvironmentFactory] ?? createUnavailablePlanShellEnvironmentV1,
   });
 }
 
@@ -828,7 +832,7 @@ test("PresentationSession opens an empty project catalog without creating a sess
   }
 });
 
-test("PresentationSession durably enters a read-only Plan cycle and rehydrates its exact identity", async () => {
+test("PresentationSession durably enters a hybrid Plan cycle and rehydrates its exact identity", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-enter-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -854,7 +858,8 @@ test("PresentationSession durably enters a read-only Plan cycle and rehydrates i
       state: "exploring",
       cycleId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
       revision: 1,
-      policyVersion: "plan-policy.read-v1",
+      policyVersion: "plan-policy.hybrid-v1",
+      shellPolicyVersion: "plan-shell-policy.v1",
     });
 
     await presentation.close();
@@ -877,7 +882,7 @@ test("PresentationSession durably enters a read-only Plan cycle and rehydrates i
   }
 });
 
-test("PresentationSession freezes the exact eligible read-only Tool Profile for a Plan cycle", async () => {
+test("PresentationSession freezes the exact eligible hybrid Tool Profile for a Plan cycle", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-profile-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -913,13 +918,14 @@ test("PresentationSession freezes the exact eligible read-only Tool Profile for 
       [
         "read_file",
         "search_repository",
+        "run_shell",
         "activate_skill",
         "read_skill_resource",
         "read_input_resource",
       ].map((name) => ({
         name,
         definitionDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
-        effect: "read",
+        effect: name === "run_shell" ? "execute" : "read",
         source: "builtin",
       })),
     );
@@ -972,7 +978,8 @@ test("PresentationSession exits one Plan cycle and enters a distinct later cycle
     expect(second).toMatchObject({
       state: "exploring",
       revision: 1,
-      policyVersion: "plan-policy.read-v1",
+      policyVersion: "plan-policy.hybrid-v1",
+      shellPolicyVersion: "plan-shell-policy.v1",
       eligibleToolProfile: first.eligibleToolProfile,
     });
     expect(second?.cycleId).not.toBe(first.cycleId);
@@ -9285,6 +9292,100 @@ test("PresentationSession projects one live pending permission with its inline t
     }
   } finally {
     unsubscribeLifecycle();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession projects the truthful Plan shell warning for one exact pending command", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-permission-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const command = "/usr/bin/printf 'diagnostic\\n'";
+  const model = new FakeModelDriver([
+    { type: "tool_call_start", id: "pending-plan-shell", name: "run_shell" },
+    {
+      type: "tool_call_delta",
+      id: "pending-plan-shell",
+      json: JSON.stringify({ command }),
+    },
+    { type: "tool_call_end", id: "pending-plan-shell" },
+    { type: "finish", reason: "tool_calls" },
+  ]);
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["execute"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an active session.");
+    }
+    await presentation.dispatch({ type: "enter_plan", sessionId });
+    const pendingVisible = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (presentation.getState().authoritative.active?.pendingInteractions.length === 1) {
+        pendingVisible.resolve();
+      }
+    });
+    const continuation = lifecycle.continue({
+      sessionId,
+      input: { text: "Run the exact ambiguous diagnostic." },
+      limits: { maxTurns: 1 },
+    });
+    await pendingVisible.promise;
+    const pending = presentation.getState().authoritative.active?.pendingInteractions[0];
+
+    expect(pending).toMatchObject({
+      type: "permission",
+      callId: "pending-plan-shell",
+      effect: "execute",
+      subject: { type: "command", value: command },
+      warning:
+        "Plan parsing is not a sandbox. Approval may run project code, write cache or artifacts, read accessible data, or use network.",
+      canAllow: true,
+      changePreviewRef: null,
+    });
+    if (pending === undefined) {
+      throw new Error("Expected the pending Plan shell permission.");
+    }
+    await presentation.dispatch({
+      type: "decide_permission",
+      requestId: pending.requestId,
+      decision: "deny",
+    });
+    await continuation;
+    unsubscribe();
+    await presentation.close();
+  } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }

@@ -285,6 +285,9 @@ function formatPermissionPrompt(
   if (event.subject.type === "command") {
     return `Allow ${event.name} at "${event.subject.cwd}": ${quoteForTerminal(event.subject.command)} [y/N] `;
   }
+  if (event.subject.type === "plan_command") {
+    return `Allow ${event.name} Plan execute at "${event.subject.cwd}": ${quoteForTerminal(event.subject.command)}. Plan parsing is not a sandbox; approval may run project code, write cache or artifacts, read accessible data, or use network. [y/N] `;
+  }
   if (event.subject.type === "patch") {
     const operations = event.subject.operations
       .map((operation) =>

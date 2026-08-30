@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   symlink,
   truncate,
@@ -21,16 +22,21 @@ import {
   createPermissionPolicy,
   createReadToolRegistry,
   type ModelTargets,
+  type RuntimeEvent,
   SessionLifecycleError,
   type ToolRegistry,
 } from "@adam-agent/agent";
 import {
+  assessPlanCommandExecutionV1,
+  createPlanShellEnvironmentV1,
+  digestPromptRequestV1,
   inputResourceIngestBarrier,
   openJsonlSessionStore,
+  planShellEnvironmentFactory,
   type SessionRecord,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
-import { FakeModelDriver } from "./index.js";
+import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
 import {
   sessionLifecycleAnswerOnlyDeepSeekStream as answerOnlyDeepSeekStream,
   sessionLifecycleBasePrompt as basePrompt,
@@ -58,6 +64,663 @@ const visionResponsesIdentity = {
   profileVersion: 2,
   certification: "certified",
 } as const;
+
+const planTestContextProfile = {
+  version: 1,
+  contextWindowTokens: 1_000_000,
+  maximumOutputTokens: 32_768,
+  compactAtTokens: 800_000,
+  postCompactTargetTokens: 200_000,
+  retainedTargetTokens: 20_000,
+  estimatorVersion: 1,
+} as const;
+
+test("SessionLifecycle hybrid Plan automatically executes one exact simple inspection", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-hybrid-inspection-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const executablePathName = "PATH";
+  const previousPath = process.env[executablePathName];
+  process.env[executablePathName] = "/usr/bin:/bin";
+  await mkdir(workspaceRoot);
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return [
+        { type: "tool_call_start", id: "plan-uname", name: "run_shell" },
+        {
+          type: "tool_call_delta",
+          id: "plan-uname",
+          json: JSON.stringify({ command: "uname -s" }),
+        },
+        { type: "tool_call_end", id: "plan-uname" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    const latestMessage = request.messages.at(-1);
+    const completedAutomatically =
+      latestMessage?.role === "tool" &&
+      latestMessage.name === "run_shell" &&
+      latestMessage.result.status === "completed" &&
+      JSON.stringify(latestMessage.result.output) ===
+        JSON.stringify({
+          termination: { type: "exited", exitCode: 0 },
+          stdout: { tail: "Linux\n", totalBytes: 6, omittedBytes: 0 },
+          stderr: { tail: "", totalBytes: 0, omittedBytes: 0 },
+        });
+    return [
+      {
+        type: "text_delta",
+        text: completedAutomatically
+          ? "The Plan inspection completed automatically."
+          : "The Plan inspection did not complete automatically.",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: planTestContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: planTestContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["execute"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [planShellEnvironmentFactory]: createPlanShellEnvironmentV1,
+  });
+  const events: RuntimeEvent[] = [];
+  lifecycle.subscribe((event) => {
+    events.push(event);
+    if (event.type === "tool_permission_requested") {
+      lifecycle.decidePermission({ requestId: event.requestId, decision: "deny" });
+    }
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Inspect the Linux system name without changing anything." },
+      limits: { maxTurns: 2 },
+    });
+
+    expect({
+      result: continued.result,
+      plan: continued.snapshot.plan,
+      permissionRequests: events.filter((event) => event.type === "tool_permission_requested")
+        .length,
+      permissionSubject: events.find((event) => event.type === "tool_permission_requested")
+        ?.subject,
+      toolStarted: events.some(
+        (event) =>
+          event.type === "tool_started" &&
+          event.callId === "plan-uname" &&
+          event.name === "run_shell",
+      ),
+    }).toMatchObject({
+      result: { status: "completed", answer: "The Plan inspection completed automatically." },
+      plan: {
+        state: "exploring",
+        policyVersion: "plan-policy.hybrid-v1",
+        shellPolicyVersion: "plan-shell-policy.v1",
+      },
+      permissionRequests: 0,
+      permissionSubject: undefined,
+      toolStarted: true,
+    });
+  } finally {
+    await lifecycle.close();
+    if (previousPath === undefined) {
+      delete process.env[executablePathName];
+    } else {
+      process.env[executablePathName] = previousPath;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle hybrid Plan durably freezes its shell environment identity", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-shell-environment-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const { PATH: executablePath = "" } = process.env;
+  await mkdir(workspaceRoot);
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [planShellEnvironmentFactory]: createPlanShellEnvironmentV1,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const entered = await lifecycle.enterPlan({ sessionId: created.sessionId });
+
+    expect(entered.plan).toMatchObject({
+      policyVersion: "plan-policy.hybrid-v1",
+      shellPolicyVersion: "plan-shell-policy.v1",
+      shellEnvironment: {
+        version: "plan-shell-env.v1",
+        pathEntries: executablePath.split(":"),
+        variables: {
+          PATH: executablePath,
+          LANG: "C",
+          LC_ALL: "C",
+          TERM: "dumb",
+        },
+        home: { allocation: "owner-only-empty-per-call" },
+        shell: {
+          lookupPath: "/bin/sh",
+          canonicalPath: "/usr/bin/dash",
+          digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        },
+        digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+      },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle hybrid Plan executes an approved call with only its frozen environment", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-shell-execution-env-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const sentinelName = "ADAM_PLAN_SECRET_SENTINEL";
+  const previousSentinel = process.env[sentinelName];
+  const { PATH: executablePath = "" } = process.env;
+  process.env[sentinelName] = "must-not-reach-plan-shell";
+  await mkdir(workspaceRoot);
+  const canonicalTemporaryRoot = await realpath(tmpdir());
+  let requestCount = 0;
+  const command = `/usr/bin/env && /usr/bin/stat -c 'HOME_MODE=%a' "$HOME" && /usr/bin/find "$HOME" -mindepth 1 -print`;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return [
+        { type: "tool_call_start", id: "plan-env", name: "run_shell" },
+        {
+          type: "tool_call_delta",
+          id: "plan-env",
+          json: JSON.stringify({ command }),
+        },
+        { type: "tool_call_end", id: "plan-env" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    const latestMessage = request.messages.at(-1);
+    const toolOutput =
+      latestMessage?.role === "tool" &&
+      latestMessage.name === "run_shell" &&
+      latestMessage.result.status === "completed" &&
+      typeof latestMessage.result.output === "object" &&
+      latestMessage.result.output !== null
+        ? (latestMessage.result.output as { readonly stdout?: { readonly tail?: unknown } })
+        : undefined;
+    const stdout = toolOutput?.stdout;
+    const lines = typeof stdout?.tail === "string" ? stdout.tail.trimEnd().split("\n") : [];
+    const environment = Object.fromEntries(
+      lines
+        .filter((line) => line.includes("=") && !line.startsWith("HOME_MODE="))
+        .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]),
+    );
+    const {
+      PATH: observedPath,
+      LANG: observedLang,
+      LC_ALL: observedLcAll,
+      TERM: observedTerm,
+      TMPDIR: observedTemporaryRoot,
+      HOME: observedHome,
+    } = environment;
+    return [
+      {
+        type: "text_delta",
+        text:
+          observedPath === executablePath &&
+          observedLang === "C" &&
+          observedLcAll === "C" &&
+          observedTerm === "dumb" &&
+          observedTemporaryRoot === canonicalTemporaryRoot &&
+          environment[sentinelName] === undefined &&
+          observedHome?.startsWith(`${canonicalTemporaryRoot}/adam-agent-shell-home-`) === true &&
+          lines.at(-1) === "HOME_MODE=700"
+            ? "The approved Plan shell used only its frozen environment."
+            : "The approved Plan shell environment drifted.",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: planTestContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: planTestContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["execute"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [planShellEnvironmentFactory]: createPlanShellEnvironmentV1,
+  });
+  const events: RuntimeEvent[] = [];
+  lifecycle.subscribe((event) => {
+    events.push(event);
+    if (event.type === "tool_permission_requested") {
+      lifecycle.decidePermission({ requestId: event.requestId, decision: "allow" });
+    }
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const entered = await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Inspect the frozen Plan shell environment." },
+      limits: { maxTurns: 2 },
+    });
+    const request = events.find(
+      (event) => event.type === "tool_permission_requested" && event.callId === "plan-env",
+    );
+
+    expect({ result: continued.result, request }).toMatchObject({
+      result: {
+        status: "completed",
+        answer: "The approved Plan shell used only its frozen environment.",
+      },
+      request: {
+        subject: {
+          type: "plan_command",
+          shellEnvironmentVersion: "plan-shell-env.v1",
+          shellEnvironmentDigest: entered.plan?.shellEnvironment?.digest,
+        },
+      },
+    });
+  } finally {
+    if (previousSentinel === undefined) {
+      delete process.env[sentinelName];
+    } else {
+      process.env[sentinelName] = previousSentinel;
+    }
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle hybrid Plan asks before a workspace PATH shadow can execute", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-shell-shadow-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const executableRoot = join(workspaceRoot, "bin");
+  const executablePathName = "PATH";
+  const previousPath = process.env[executablePathName];
+  await mkdir(executableRoot, { recursive: true });
+  await writeFile(
+    join(executableRoot, "uname"),
+    "#!/bin/sh\n/usr/bin/printf 'shadowed\\n'\n",
+    "utf8",
+  );
+  await chmod(join(executableRoot, "uname"), 0o755);
+  process.env[executablePathName] = `${executableRoot}:/usr/bin:/bin`;
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return [
+        { type: "tool_call_start", id: "plan-shadow", name: "run_shell" },
+        { type: "tool_call_delta", id: "plan-shadow", json: '{"command":"uname -s"}' },
+        { type: "tool_call_end", id: "plan-shadow" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    const latestMessage = request.messages.at(-1);
+    const shadowExecuted =
+      latestMessage?.role === "tool" &&
+      latestMessage.name === "run_shell" &&
+      latestMessage.result.status === "completed" &&
+      typeof latestMessage.result.output === "object" &&
+      latestMessage.result.output !== null &&
+      JSON.stringify(latestMessage.result.output).includes("shadowed\\n");
+    return [
+      {
+        type: "text_delta",
+        text: shadowExecuted
+          ? "The PATH shadow executed only after exact approval."
+          : "The PATH shadow did not execute as approved.",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: planTestContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: planTestContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["execute"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [planShellEnvironmentFactory]: createPlanShellEnvironmentV1,
+  });
+  const events: RuntimeEvent[] = [];
+  lifecycle.subscribe((event) => {
+    events.push(event);
+    if (event.type === "tool_permission_requested") {
+      lifecycle.decidePermission({ requestId: event.requestId, decision: "allow" });
+    }
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Inspect the system identity." },
+      limits: { maxTurns: 2 },
+    });
+    const requests = events.filter(
+      (event) => event.type === "tool_permission_requested" && event.callId === "plan-shadow",
+    );
+
+    expect({ result: continued.result, requests }).toMatchObject({
+      result: {
+        status: "completed",
+        answer: "The PATH shadow executed only after exact approval.",
+      },
+      requests: [
+        {
+          subject: {
+            type: "plan_command",
+            assessment: {
+              disposition: "ask_ambiguous",
+              reasons: ["environment_untrusted"],
+            },
+          },
+        },
+      ],
+    });
+  } finally {
+    if (previousPath === undefined) {
+      delete process.env[executablePathName];
+    } else {
+      process.env[executablePathName] = previousPath;
+    }
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle hybrid Plan hard-denies one recognized shell mutation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-hybrid-mutation-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const markerPath = join(workspaceRoot, "forbidden.txt");
+  await mkdir(workspaceRoot);
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return [
+        { type: "tool_call_start", id: "plan-touch", name: "run_shell" },
+        {
+          type: "tool_call_delta",
+          id: "plan-touch",
+          json: JSON.stringify({ command: "touch forbidden.txt" }),
+        },
+        { type: "tool_call_end", id: "plan-touch" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    const latestMessage = request.messages.at(-1);
+    const deniedByPlan =
+      latestMessage?.role === "tool" &&
+      latestMessage.name === "run_shell" &&
+      latestMessage.result.status === "failed" &&
+      latestMessage.result.error.code === "permission_denied";
+    return [
+      {
+        type: "text_delta",
+        text: deniedByPlan
+          ? "The shell mutation was denied by Plan."
+          : "The shell mutation escaped Plan denial.",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: planTestContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: planTestContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["execute"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [planShellEnvironmentFactory]: createPlanShellEnvironmentV1,
+  });
+  const events: RuntimeEvent[] = [];
+  lifecycle.subscribe((event) => {
+    events.push(event);
+    if (event.type === "tool_permission_requested") {
+      lifecycle.decidePermission({ requestId: event.requestId, decision: "allow" });
+    }
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Try to create forbidden.txt while Plan is active." },
+      limits: { maxTurns: 2 },
+    });
+
+    expect({
+      result: continued.result,
+      permissionRequests: events.filter((event) => event.type === "tool_permission_requested")
+        .length,
+      toolStarted: events.some(
+        (event) => event.type === "tool_started" && event.callId === "plan-touch",
+      ),
+    }).toEqual({
+      result: { status: "completed", answer: "The shell mutation was denied by Plan." },
+      permissionRequests: 0,
+      toolStarted: false,
+    });
+    await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle hybrid Plan asks once for one exact ambiguous diagnostic", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-hybrid-ambiguous-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const command = "/usr/bin/printf 'approved diagnostic\\n'";
+  const executablePathName = "PATH";
+  const previousPath = process.env[executablePathName];
+  process.env[executablePathName] = "/usr/bin:/bin";
+  await mkdir(workspaceRoot);
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    if (requestCount === 1) {
+      return [
+        { type: "tool_call_start", id: "plan-diagnostic", name: "run_shell" },
+        {
+          type: "tool_call_delta",
+          id: "plan-diagnostic",
+          json: JSON.stringify({ command }),
+        },
+        { type: "tool_call_end", id: "plan-diagnostic" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    const latestMessage = request.messages.at(-1);
+    const approvedExactCall =
+      latestMessage?.role === "tool" &&
+      latestMessage.name === "run_shell" &&
+      latestMessage.result.status === "completed" &&
+      JSON.stringify(latestMessage.result.output) ===
+        JSON.stringify({
+          termination: { type: "exited", exitCode: 0 },
+          stdout: { tail: "approved diagnostic\n", totalBytes: 20, omittedBytes: 0 },
+          stderr: { tail: "", totalBytes: 0, omittedBytes: 0 },
+        });
+    return [
+      {
+        type: "text_delta",
+        text: approvedExactCall
+          ? "The exact ambiguous diagnostic was approved once."
+          : "The ambiguous diagnostic approval was not exact.",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: planTestContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: planTestContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["execute"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [planShellEnvironmentFactory]: createPlanShellEnvironmentV1,
+  });
+  const events: RuntimeEvent[] = [];
+  lifecycle.subscribe((event) => {
+    events.push(event);
+    if (event.type === "tool_permission_requested") {
+      lifecycle.decidePermission({ requestId: event.requestId, decision: "allow" });
+    }
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const entered = await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const plan = entered.plan;
+    if (plan === undefined) {
+      throw new Error("Expected the entered hybrid Plan cycle.");
+    }
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Run the exact diagnostic only after asking me." },
+      limits: { maxTurns: 2 },
+    });
+    const permissionRequest = events.find(
+      (event) => event.type === "tool_permission_requested" && event.callId === "plan-diagnostic",
+    );
+
+    expect({ result: continued.result, permissionRequest }).toMatchObject({
+      result: {
+        status: "completed",
+        answer: "The exact ambiguous diagnostic was approved once.",
+      },
+      permissionRequest: {
+        name: "run_shell",
+        effect: "execute",
+        scope: "call",
+        subject: {
+          type: "plan_command",
+          command,
+          cwd: ".",
+          planCycleId: plan.cycleId,
+          planPolicyVersion: "plan-policy.hybrid-v1",
+          shellPolicyVersion: "plan-shell-policy.v1",
+          toolProfileDigest: plan.eligibleToolProfile.digest,
+          assessment: {
+            disposition: "ask_ambiguous",
+            reasons: ["unclassified_command"],
+            digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+          },
+        },
+      },
+    });
+    expect(
+      events.filter(
+        (event) => event.type === "tool_permission_requested" && event.callId === "plan-diagnostic",
+      ),
+    ).toHaveLength(1);
+  } finally {
+    await lifecycle.close();
+    if (previousPath === undefined) {
+      delete process.env[executablePathName];
+    } else {
+      process.env[executablePathName] = previousPath;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
 
 test("SessionLifecycle cold resume reads an immutable input resource after its source is deleted", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-input-resource-cold-resume-"));
@@ -1303,6 +1966,619 @@ test("SessionLifecycle real-process branch writes independently, survives restar
   }
 }, 20_000);
 
+test("SessionLifecycle hybrid Plan attests Git and automatically executes all five repository families", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-git-families-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const executablePathName = "PATH";
+  const previousPath = process.env[executablePathName];
+  const contextProfile = {
+    version: 1 as const,
+    contextWindowTokens: 1_000_000,
+    maximumOutputTokens: 32_768,
+    compactAtTokens: 800_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+    estimatorVersion: 1 as const,
+  };
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "README.md"), "Git Plan fixture\n", "utf8");
+  await runGitFixtureCommand(workspaceRoot, ["init"]);
+  await runGitFixtureCommand(workspaceRoot, ["config", "user.name", "Adam Test"]);
+  await runGitFixtureCommand(workspaceRoot, ["config", "user.email", "adam@example.test"]);
+  await runGitFixtureCommand(workspaceRoot, ["add", "README.md"]);
+  await runGitFixtureCommand(workspaceRoot, ["commit", "-m", "fixture"]);
+  process.env[executablePathName] = "/usr/bin:/bin";
+  const commands = [
+    "git --version",
+    "git --no-pager status --porcelain=v1 --untracked-files=normal --ignore-submodules=all",
+    "git --no-pager rev-parse --is-inside-work-tree",
+    "git --no-pager log --oneline --decorate=no -n 1",
+    "git --no-pager diff --no-ext-diff --no-textconv --ignore-submodules=all --name-only -- README.md",
+    "git --no-pager show --no-ext-diff --no-textconv --ignore-submodules=all --stat HEAD",
+  ] as const;
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    const command = commands[requestCount];
+    requestCount += 1;
+    if (command !== undefined) {
+      const callId = `plan-git-${requestCount}`;
+      return [
+        { type: "tool_call_start", id: callId, name: "run_shell" },
+        { type: "tool_call_delta", id: callId, json: JSON.stringify({ command }) },
+        { type: "tool_call_end", id: callId },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    const latestMessage = request.messages.at(-1);
+    return [
+      {
+        type: "text_delta",
+        text:
+          latestMessage?.role === "tool" && latestMessage.result.status === "completed"
+            ? "Every mandatory Git family executed automatically after attestation."
+            : "A mandatory Git family did not execute automatically.",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["execute"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [planShellEnvironmentFactory]: createPlanShellEnvironmentV1,
+  });
+  const events: RuntimeEvent[] = [];
+  lifecycle.subscribe((event) => {
+    events.push(event);
+    if (event.type === "tool_permission_requested") {
+      lifecycle.decidePermission({ requestId: event.requestId, decision: "deny" });
+    }
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Inspect this ordinary Git repository." },
+      limits: { maxTurns: commands.length + 1 },
+    });
+
+    expect({ result: continued.result, plan: continued.snapshot.plan }).toMatchObject({
+      result: {
+        status: "completed",
+        answer: "Every mandatory Git family executed automatically after attestation.",
+      },
+      plan: {
+        gitAttestation: {
+          version: "git-auto-attestation.v1",
+          gitVersion: "git version 2.43.0",
+          digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+        },
+      },
+    });
+    expect(events.filter((event) => event.type === "tool_permission_requested")).toHaveLength(0);
+    const completedShellEvents = events.filter(
+      (event): event is Extract<RuntimeEvent, { readonly type: "tool_completed" }> =>
+        event.type === "tool_completed" && event.name === "run_shell",
+    );
+    expect(completedShellEvents).toHaveLength(commands.length);
+    for (const event of completedShellEvents) {
+      expect(event.output).toMatchObject({
+        termination: { type: "exited", exitCode: 0 },
+        stderr: { tail: "", omittedBytes: 0 },
+      });
+    }
+    expect(completedShellEvents[0]?.output).toMatchObject({
+      stdout: { tail: "git version 2.43.0\n", omittedBytes: 0 },
+    });
+    expect(completedShellEvents[1]?.output).toMatchObject({
+      stdout: { tail: "", omittedBytes: 0 },
+    });
+    expect(completedShellEvents[2]?.output).toMatchObject({
+      stdout: { tail: "true\n", omittedBytes: 0 },
+    });
+    expect(completedShellEvents[3]?.output).toMatchObject({
+      stdout: { tail: expect.stringContaining("fixture"), omittedBytes: 0 },
+    });
+    expect(completedShellEvents[4]?.output).toMatchObject({
+      stdout: { tail: "", omittedBytes: 0 },
+    });
+    expect(completedShellEvents[5]?.output).toMatchObject({
+      stdout: { tail: expect.stringContaining("README.md"), omittedBytes: 0 },
+    });
+    const child = await lifecycle.branch({
+      parentSessionId: created.sessionId,
+      atSequence: continued.snapshot.lastSequence,
+    });
+    expect(child.plan?.gitAttestation).toEqual(continued.snapshot.plan?.gitAttestation);
+  } finally {
+    await lifecycle.close();
+    if (previousPath === undefined) {
+      delete process.env[executablePathName];
+    } else {
+      process.env[executablePathName] = previousPath;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle hybrid Plan asks for a near miss from each mandatory Git family", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-git-near-misses-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const executablePathName = "PATH";
+  const previousPath = process.env[executablePathName];
+  const contextProfile = {
+    version: 1 as const,
+    contextWindowTokens: 1_000_000,
+    maximumOutputTokens: 32_768,
+    compactAtTokens: 800_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+    estimatorVersion: 1 as const,
+  };
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "README.md"), "Git Plan near misses\n", "utf8");
+  await runGitFixtureCommand(workspaceRoot, ["init"]);
+  process.env[executablePathName] = "/usr/bin:/bin";
+  const commands = [
+    "git --version",
+    "git status",
+    "git --no-pager rev-parse HEAD",
+    "git --no-pager log --oneline --decorate=short -n 1",
+    "git --no-pager diff --cached --no-ext-diff --no-textconv --ignore-submodules=all",
+    "git --no-pager show --no-ext-diff --no-textconv --ignore-submodules=all --stat HEAD~1",
+  ] as const;
+  let requestCount = 0;
+  const driver = new FakeModelDriver(() => {
+    const command = commands[requestCount];
+    requestCount += 1;
+    if (command !== undefined) {
+      const callId = `plan-git-near-${requestCount}`;
+      return [
+        { type: "tool_call_start", id: callId, name: "run_shell" },
+        { type: "tool_call_delta", id: callId, json: JSON.stringify({ command }) },
+        { type: "tool_call_end", id: callId },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    return [
+      { type: "text_delta", text: "Every mandatory Git near miss required exact approval." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createInMemorySessionLifecycleHarness().createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: [], askedEffects: ["execute"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [planShellEnvironmentFactory]: createPlanShellEnvironmentV1,
+  });
+  const events: RuntimeEvent[] = [];
+  lifecycle.subscribe((event) => {
+    events.push(event);
+    if (event.type === "tool_permission_requested") {
+      lifecycle.decidePermission({ requestId: event.requestId, decision: "deny" });
+    }
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Try one near miss from every Git family." },
+      limits: { maxTurns: commands.length + 1 },
+    });
+    const permissionRequests = events.filter(
+      (event): event is Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }> =>
+        event.type === "tool_permission_requested" && event.name === "run_shell",
+    );
+
+    expect(continued.result).toEqual({
+      status: "completed",
+      answer: "Every mandatory Git near miss required exact approval.",
+    });
+    expect(permissionRequests).toHaveLength(5);
+    expect(
+      permissionRequests.map((event) =>
+        event.subject.type === "plan_command" ? event.subject.command : undefined,
+      ),
+    ).toEqual(commands.slice(1));
+    expect(
+      events.filter((event) => event.type === "tool_completed" && event.name === "run_shell"),
+    ).toHaveLength(1);
+  } finally {
+    await lifecycle.close();
+    if (previousPath === undefined) {
+      delete process.env[executablePathName];
+    } else {
+      process.env[executablePathName] = previousPath;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  {
+    label: "the exact durable assessment",
+    assessmentMatches: true,
+    omitPermissionRequest: false,
+    started: false,
+  },
+])(
+  "SessionLifecycle hybrid Plan recovery reuses $label only before shell start",
+  async ({ assessmentMatches, omitPermissionRequest, started }) => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-shell-recovery-"));
+    const stateRoot = join(testRoot, "state");
+    const workspaceRoot = join(testRoot, "workspace");
+    const executablePathName = "PATH";
+    const previousPath = process.env[executablePathName];
+    process.env[executablePathName] = "/usr/bin:/bin";
+    await mkdir(workspaceRoot);
+    const command = "/usr/bin/printf 'recovered diagnostic\\n'";
+    const call = {
+      id: "plan-shell-recovery",
+      name: "run_shell",
+      argumentsJson: JSON.stringify({ command }),
+    } as const;
+    const runId = assessmentMatches
+      ? "123e4567-e89b-42d3-a456-426614176001"
+      : "123e4567-e89b-42d3-a456-426614176002";
+    let cold:
+      | ReturnType<ReturnType<typeof createInMemorySessionLifecycleHarness>["createLifecycle"]>
+      | undefined;
+    const driver = new FakeModelDriver((request) => {
+      expect(request.messages.at(-1)).toMatchObject({
+        role: "tool",
+        callId: call.id,
+        name: call.name,
+        result: assessmentMatches
+          ? { status: "completed" }
+          : { status: "failed", error: { code: "permission_denied" } },
+      });
+      return [
+        { type: "text_delta", text: "Recovered the exact Plan shell boundary." },
+        { type: "finish", reason: "stop" },
+      ];
+    });
+    const modelTargets: ModelTargets = {
+      async resolve() {
+        return {
+          identity: targetIdentity,
+          driver,
+          contextProfile: {
+            version: 1,
+            contextWindowTokens: 1_000_000,
+            maximumOutputTokens: 32_768,
+            compactAtTokens: 800_000,
+            postCompactTargetTokens: 200_000,
+            retainedTargetTokens: 20_000,
+            estimatorVersion: 1,
+          },
+        };
+      },
+      async snapshot() {
+        return {
+          targets: [
+            {
+              identity: targetIdentity,
+              readiness: { status: "available", credentialSource: "deterministic test adapter" },
+              contextProfile: {
+                version: 1,
+                contextWindowTokens: 1_000_000,
+                maximumOutputTokens: 32_768,
+                compactAtTokens: 800_000,
+                postCompactTargetTokens: 200_000,
+                retainedTargetTokens: 20_000,
+                estimatorVersion: 1,
+              },
+            },
+          ],
+        };
+      },
+    };
+    const harness = createInMemorySessionLifecycleHarness();
+    const tools = createCodingToolRegistry({ workspaceRoot });
+    const warm = harness.createLifecycle({
+      modelTargets,
+      stateRoot,
+      tools,
+      workspaceRoot,
+      [planShellEnvironmentFactory]: createPlanShellEnvironmentV1,
+    });
+
+    try {
+      const created = await warm.create({ targetIdentity });
+      const entered = await warm.enterPlan({ sessionId: created.sessionId });
+      const plan = entered.plan;
+      const shellTool = tools.resolve("run_shell");
+      if (
+        plan?.shellEnvironment === undefined ||
+        plan.gitPolicyVersion !== "git-auto-policy.v1" ||
+        plan.gitPolicyDigest === undefined ||
+        shellTool === undefined
+      ) {
+        throw new Error("Expected the hybrid Plan shell authority.");
+      }
+      const assessment = await assessPlanCommandExecutionV1({
+        rawCommand: command,
+        shellEnvironment: plan.shellEnvironment,
+        workspaceRoot,
+      });
+      if (assessment.status !== "assessed" || assessment.disposition !== "ask_ambiguous") {
+        throw new Error("Expected one ambiguous Plan shell assessment.");
+      }
+      const subject = {
+        type: "plan_command" as const,
+        command,
+        cwd: "." as const,
+        planCycleId: plan.cycleId,
+        planPolicyVersion: "plan-policy.hybrid-v1" as const,
+        shellPolicyVersion: "plan-shell-policy.v1" as const,
+        shellEnvironmentVersion: "plan-shell-env.v1" as const,
+        shellEnvironmentDigest: plan.shellEnvironment.digest,
+        toolProfileDigest: plan.eligibleToolProfile.digest,
+        gitPolicyVersion: plan.gitPolicyVersion,
+        gitPolicyDigest: plan.gitPolicyDigest,
+        assessment: {
+          version: 1 as const,
+          disposition: assessment.disposition,
+          reasons: assessment.reasons,
+          digest: assessmentMatches ? assessment.digest : (`sha256:${"0".repeat(64)}` as const),
+        },
+      };
+      const planToolNames = new Set(
+        plan.eligibleToolProfile.definitions.map((definition) => definition.name),
+      );
+      const requestTools = tools
+        .definitions()
+        .filter((definition) => planToolNames.has(definition.name));
+      const store = await harness.sessions.open(created.sessionId);
+      if (store === undefined || entered.promptContext === undefined) {
+        throw new Error("Expected the created Plan session store and prompt context.");
+      }
+      const records = [
+        {
+          schemaVersion: 3,
+          record: {
+            type: "logical_run_started",
+            runId,
+            userMessage: "Recover one exact Plan diagnostic.",
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "user_message", text: "Recover one exact Plan diagnostic." },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "provider_attempt_started",
+            runId,
+            turn: 1,
+            attempt: 1,
+            targetIdentity,
+            promptProjection: {
+              version: 1,
+              assemblyIdentityDigest: entered.promptContext.assemblyIdentityDigest,
+              requestProjectionDigest: digestPromptRequestV1(
+                [
+                  { role: "system", content: basePrompt },
+                  { role: "developer", content: skillUsagePrompt },
+                  { role: "user", content: "Recover one exact Plan diagnostic." },
+                ],
+                requestTools,
+              ),
+            },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: { type: "runtime_event", runId, event: { type: "model_message_started" } },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "model_response_completed",
+            runId,
+            turn: 1,
+            attempt: 1,
+            targetIdentity,
+            response: {
+              text: "",
+              toolCalls: [call],
+              toolIntents: [
+                {
+                  callId: call.id,
+                  name: call.name,
+                  argumentsDigest: `sha256:${createHash("sha256")
+                    .update(call.argumentsJson)
+                    .digest("hex")}`,
+                  effect: "execute",
+                  definitionDigest: shellTool.definitionDigest,
+                  replay: "never",
+                },
+              ],
+              finishReason: "tool_calls",
+            },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "model_message_completed", text: "" },
+          },
+        },
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: { type: "tool_requested", callId: call.id, name: call.name },
+          },
+        },
+        ...(!omitPermissionRequest
+          ? [
+              {
+                schemaVersion: 3,
+                record: {
+                  type: "runtime_event",
+                  runId,
+                  event: {
+                    type: "tool_permission_requested",
+                    requestId: `${runId}:${call.id}`,
+                    callId: call.id,
+                    name: call.name,
+                    effect: "execute",
+                    scope: "call",
+                    subject,
+                  },
+                },
+              } as const,
+            ]
+          : []),
+        {
+          schemaVersion: 3,
+          record: {
+            type: "runtime_event",
+            runId,
+            event: {
+              type: "tool_permission_decided",
+              ...(omitPermissionRequest ? {} : { requestId: `${runId}:${call.id}` }),
+              callId: call.id,
+              name: call.name,
+              decision: "allow",
+              effect: "execute",
+              scope: "call",
+              subject,
+            },
+          },
+        },
+        ...(started
+          ? [
+              {
+                schemaVersion: 3,
+                record: {
+                  type: "runtime_event",
+                  runId,
+                  event: { type: "tool_started", callId: call.id, name: call.name },
+                },
+              } as const,
+            ]
+          : []),
+      ] satisfies readonly Omit<
+        Extract<SessionRecord, { readonly schemaVersion: 3 }>,
+        "sequence"
+      >[];
+      for (const [index, record] of records.entries()) {
+        await store.append({
+          ...record,
+          sequence: entered.lastSequence + index + 1,
+        } as SessionRecord);
+      }
+      await warm.close();
+      cold = harness.createLifecycle({
+        modelTargets,
+        stateRoot,
+        tools,
+        workspaceRoot,
+        [planShellEnvironmentFactory]: createPlanShellEnvironmentV1,
+      });
+      const publicEvents: RuntimeEvent[] = [];
+      cold.subscribe((event) => {
+        publicEvents.push(event);
+        if (event.type === "tool_permission_requested") {
+          cold?.decidePermission({ requestId: event.requestId, decision: "deny" });
+        }
+      });
+
+      if (omitPermissionRequest) {
+        await expect(cold.resume({ sessionId: created.sessionId })).rejects.toMatchObject({
+          code: "session_invalid",
+        });
+        return;
+      }
+      if (started) {
+        await expect(cold.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+          status: "ready",
+          snapshot: {
+            status: "settled",
+            run: { result: { status: "failed", error: { code: "tool_effect_indeterminate" } } },
+          },
+        });
+        expect(publicEvents).toHaveLength(0);
+        return;
+      }
+      await expect(cold.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+        status: "ready",
+        snapshot: { status: "interrupted", plan: { cycleId: plan.cycleId } },
+      });
+      await expect(cold.continue({ sessionId: created.sessionId })).resolves.toMatchObject({
+        result: { status: "completed", answer: "Recovered the exact Plan shell boundary." },
+      });
+      expect(
+        publicEvents.filter((event) => event.type === "tool_permission_requested"),
+      ).toHaveLength(assessmentMatches ? 0 : 1);
+      expect(publicEvents.filter((event) => event.type === "tool_started")).toHaveLength(
+        assessmentMatches ? 1 : 0,
+      );
+    } finally {
+      await warm.close();
+      await cold?.close();
+      if (previousPath === undefined) {
+        delete process.env[executablePathName];
+      } else {
+        process.env[executablePathName] = previousPath;
+      }
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
 type CurrentSessionSnapshotForFixture = {
   readonly sessionId: string;
   readonly lineage?: {
@@ -1465,6 +2741,43 @@ async function exerciseColdVisionResponsesArtifactFailure(
     await warm.close();
     await rm(testRoot, { recursive: true, force: true });
   }
+}
+
+async function runGitFixtureCommand(
+  workspaceRoot: string,
+  arguments_: readonly string[],
+): Promise<void> {
+  await new Promise<void>((resolvePromise, rejectPromise) => {
+    const child = spawn("/usr/bin/git", arguments_, {
+      cwd: workspaceRoot,
+      env: {
+        HOME: workspaceRoot,
+        PATH: "/usr/bin:/bin",
+        LANG: "C",
+        LC_ALL: "C",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_SYSTEM: "/dev/null",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_TERMINAL_PROMPT: "0",
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    let stderr = "";
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.once("error", rejectPromise);
+    child.once("close", (code, signal) => {
+      if (code === 0 && signal === null) {
+        resolvePromise();
+      } else {
+        rejectPromise(
+          new Error(`Git fixture command failed (${String(code)}/${String(signal)}): ${stderr}`),
+        );
+      }
+    });
+  });
 }
 
 function observeChild(child: ChildProcess): void {
