@@ -21,9 +21,15 @@ const {
   DEEPSEEK_API_KEY: apiKey,
   ADAM_AGENT_LIVE_TESTS: liveTestSelection,
   ADAM_AGENT_MODEL: configuredModel,
+  NODE_TLS_REJECT_UNAUTHORIZED: tlsVerificationOverride,
 } = process.env;
 const liveTestsEnabled = liveTestSelection === "1";
-const liveTest = test.skipIf(!liveTestsEnabled || apiKey === undefined || apiKey.length === 0);
+const liveTest = test.skipIf(
+  !liveTestsEnabled ||
+    apiKey === undefined ||
+    apiKey.length === 0 ||
+    tlsVerificationOverride === "0",
+);
 const liveApiKey = apiKey ?? "";
 const model = configuredModel ?? "deepseek-v4-pro";
 
@@ -58,6 +64,10 @@ for (const targetId of ["deepseek-v4-flash.direct", "deepseek-v4-pro.direct"] as
 
 test.skipIf(!liveTestsEnabled)("requires DEEPSEEK_API_KEY for the live gate", () => {
   expect(liveApiKey.length).toBeGreaterThan(0);
+});
+
+test.skipIf(!liveTestsEnabled)("requires normal TLS verification for the live gate", () => {
+  expect(tlsVerificationOverride).not.toBe("0");
 });
 
 liveTest(
@@ -192,6 +202,97 @@ liveTest(
   },
   180_000,
 );
+
+for (const scenario of [
+  {
+    targetId: "deepseek-v4-flash.direct",
+    projectName: "Silver Meridian",
+    profileVersion: 3,
+    slug: "flash",
+  },
+  {
+    targetId: "deepseek-v4-pro.direct",
+    projectName: "Cobalt Lantern",
+    profileVersion: 3,
+    slug: "pro",
+  },
+  {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    projectName: "Indigo Atlas",
+    profileVersion: 1,
+    slug: "vision-chat",
+  },
+  {
+    targetId: "deepseek-v4-flash-vision-exp.direct",
+    projectName: "Golden Vector",
+    profileVersion: 2,
+    slug: "vision-responses",
+  },
+] as const) {
+  liveTest(
+    `R0 ${scenario.targetId} profile ${scenario.profileVersion} completes one read-tool round trip`,
+    async () => {
+      const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-live-r0-${scenario.slug}-`));
+      const workspaceRoot = join(testRoot, "workspace");
+      const events: RuntimeEvent[] = [];
+      try {
+        await mkdir(workspaceRoot);
+        await writeFile(join(workspaceRoot, "README.md"), `# ${scenario.projectName}\n`, "utf8");
+        const modelTargets = createModelTargets({
+          environment: { DEEPSEEK_API_KEY: liveApiKey },
+          deadlineMs: 90_000,
+        });
+        const target = (
+          await modelTargets.snapshot({
+            includeHistoricalProfiles: true,
+            signal: new AbortController().signal,
+          })
+        ).targets.find(
+          ({ identity }) =>
+            identity.targetId === scenario.targetId &&
+            identity.profileVersion === scenario.profileVersion,
+        );
+        if (target === undefined) {
+          throw new Error(`Expected ${scenario.targetId} profile ${scenario.profileVersion}.`);
+        }
+        const resolved = await modelTargets.resolve({
+          targetId: target.identity.targetId,
+          targetIdentity: target.identity,
+          allowExperimental: false,
+          signal: new AbortController().signal,
+        });
+        const session = new AgentSession({
+          maximumOutputTokens: 4_096,
+          model: resolved.driver,
+          store: createInMemorySessionStore(),
+          permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+          tools: createReadToolRegistry({ workspaceRoot }),
+        });
+        session.subscribe((event) => events.push(event));
+
+        const result = await session.run({
+          text: "Use read_file to read README.md, then reply with only the H1 project name.",
+        });
+
+        expect({ result, targetIdentity: resolved.identity }).toEqual({
+          result: {
+            status: "completed",
+            answer: expect.stringContaining(scenario.projectName),
+          },
+          targetIdentity: target.identity,
+        });
+        expect(events).toContainEqual({
+          type: "tool_requested",
+          callId: expect.any(String),
+          name: "read_file",
+        });
+      } finally {
+        await rm(testRoot, { recursive: true, force: true });
+      }
+    },
+    180_000,
+  );
+}
 
 liveTest(
   "Vision Chat eager image observes one exact quadrant order and durable resource truth",

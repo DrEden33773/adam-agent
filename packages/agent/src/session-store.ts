@@ -20,7 +20,7 @@ import {
   inputResourceOccurrenceV1Schema,
 } from "./input-resources.js";
 import type { McpToolProfileV1 } from "./mcp-profile-contracts.js";
-import { modelDriverErrorCategories } from "./model-driver-error.js";
+import { modelDriverDiagnosticCodes, modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import { imageInputLimitsV1, type ProjectedContentUsageV1 } from "./model-user-content.js";
 import type { PlanShellPolicyVersion } from "./plan-command-assessment.js";
@@ -1098,6 +1098,7 @@ const runFailureSchema: z.ZodType<RunFailure> = z.discriminatedUnion("code", [
     code: z.literal("model_request_failed"),
     message: z.string(),
     category: z.enum(modelDriverErrorCategories),
+    diagnosticCode: z.enum(modelDriverDiagnosticCodes).optional(),
     status: z.number().int().min(100).max(599).optional(),
     providerCode: z.string().max(128).optional(),
     requestId: z.string().max(128).optional(),
@@ -1106,6 +1107,7 @@ const runFailureSchema: z.ZodType<RunFailure> = z.discriminatedUnion("code", [
     code: z.literal("context_compaction_failed"),
     message: z.string(),
     category: z.enum(modelDriverErrorCategories),
+    diagnosticCode: z.enum(modelDriverDiagnosticCodes).optional(),
     status: z.number().int().min(100).max(599).optional(),
     providerCode: z.string().max(128).optional(),
     requestId: z.string().max(128).optional(),

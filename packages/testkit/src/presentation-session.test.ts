@@ -12285,6 +12285,40 @@ test("PresentationSession maps canonical failure codes to bounded safe run notic
       },
       expectedMessage: "The model run failed.",
     },
+    {
+      code: "model_request_failed",
+      error: {
+        code: "model_request_failed",
+        message: "private provider detail",
+        category: "invalid_request",
+        status: 400,
+        providerCode: "invalid_request_error",
+        requestId: "request-safe-1",
+      },
+      expectedMessage: "The provider rejected the request as invalid. HTTP 400",
+    },
+    {
+      code: "context_compaction_failed",
+      error: {
+        code: "context_compaction_failed",
+        message: "private compaction detail",
+        category: "rate_limit",
+        status: 429,
+        providerCode: "rate_limit_exceeded",
+        requestId: "request-safe-2",
+      },
+      expectedMessage: "Context compaction rate limit was reached. HTTP 429",
+    },
+    {
+      code: "model_request_failed",
+      error: {
+        code: "model_request_failed",
+        message: "private provider detail",
+        category: "authentication",
+        diagnosticCode: "tool_schema_root_not_object",
+      },
+      expectedMessage: "The provider rejected the configured credential.",
+    },
   ] as const;
 
   for (const [index, scenario] of scenarios.entries()) {
@@ -12344,6 +12378,12 @@ test("PresentationSession maps canonical failure codes to bounded safe run notic
           message: scenario.expectedMessage,
         });
         expect(JSON.stringify(notice)).not.toContain(scenario.error.message);
+        if ("providerCode" in scenario.error) {
+          expect(JSON.stringify(notice)).not.toContain(scenario.error.providerCode);
+        }
+        if ("requestId" in scenario.error) {
+          expect(JSON.stringify(notice)).not.toContain(scenario.error.requestId);
+        }
       } finally {
         await presentation.close();
       }

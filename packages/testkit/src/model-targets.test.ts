@@ -78,6 +78,141 @@ test("an exact Direct DeepSeek target returns a public answer-only model driver"
   });
 });
 
+test("a Direct DeepSeek target projects an object-only union tool schema on the provider wire", async () => {
+  const requests: unknown[] = [];
+  const canonicalInputSchema = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    oneOf: [
+      {
+        type: "object",
+        properties: {
+          kind: { type: "string", const: "content" },
+          query: { type: "string" },
+        },
+        required: ["kind", "query"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
+        properties: {
+          kind: { type: "string", const: "path" },
+          query: { type: "string" },
+        },
+        required: ["kind", "query"],
+        additionalProperties: false,
+      },
+    ],
+  } as const;
+  const canonicalBefore = structuredClone(canonicalInputSchema);
+  const targets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+    fetch: async (_input, init) => {
+      requests.push(JSON.parse(String(init?.body)));
+      return new Response(answerOnlyDeepSeekStream, {
+        headers: { "content-type": "text/event-stream" },
+        status: 200,
+      });
+    },
+  });
+  const { driver } = await targets.resolve({
+    targetId: "deepseek-v4-flash.direct",
+    allowExperimental: false,
+    signal: new AbortController().signal,
+  });
+
+  await collect(
+    driver.stream({
+      messages: [{ role: "user", content: "Search the repository" }],
+      tools: [
+        {
+          name: "search_repository",
+          description: "Search repository content or paths.",
+          inputSchema: canonicalInputSchema,
+        },
+      ],
+      maximumOutputTokens: 4_096,
+      signal: new AbortController().signal,
+    }),
+  );
+
+  expect(requests).toEqual([
+    expect.objectContaining({
+      tools: [
+        {
+          type: "function",
+          function: {
+            name: "search_repository",
+            description: "Search repository content or paths.",
+            parameters: { ...canonicalBefore, type: "object" },
+          },
+        },
+      ],
+    }),
+  ]);
+  expect(canonicalInputSchema).toEqual(canonicalBefore);
+});
+
+test.each([
+  ["a scalar root", { type: "string" }],
+  ["an array root", { type: "array", items: { type: "string" } }],
+  ["a nullable object type array", { type: ["object", "null"] }],
+  [
+    "a root reference",
+    { $ref: "#/$defs/input", $defs: { input: { type: "object", properties: {} } } },
+  ],
+  ["properties without an object type", { properties: { query: { type: "string" } } }],
+  ["an empty object union", { oneOf: [] }],
+  ["an allOf object", { allOf: [{ type: "object", properties: {} }] }],
+  ["a mixed object and scalar union", { oneOf: [{ type: "object" }, { type: "string" }] }],
+  [
+    "simultaneous oneOf and anyOf roots",
+    { oneOf: [{ type: "object" }], anyOf: [{ type: "object" }] },
+  ],
+] as const)(
+  "a Direct DeepSeek target rejects %s before provider dispatch",
+  async (_scenario, inputSchema) => {
+    const fetchProvider = vi.fn(async () =>
+      Promise.resolve(
+        new Response(answerOnlyDeepSeekStream, {
+          headers: { "content-type": "text/event-stream" },
+          status: 200,
+        }),
+      ),
+    );
+    const targets = createModelTargets({
+      environment: { DEEPSEEK_API_KEY: "test-deepseek-key" },
+      fetch: fetchProvider,
+    });
+    const { driver } = await targets.resolve({
+      targetId: "deepseek-v4-flash.direct",
+      allowExperimental: false,
+      signal: new AbortController().signal,
+    });
+
+    const error = await collectError(
+      driver.stream({
+        messages: [{ role: "user", content: "Use the invalid tool" }],
+        tools: [
+          {
+            name: "invalid_tool",
+            description: "This fixture has a provider-incompatible root schema.",
+            inputSchema,
+          },
+        ],
+        maximumOutputTokens: 4_096,
+        signal: new AbortController().signal,
+      }),
+    );
+
+    expect(error).toMatchObject({
+      category: "protocol_incompatibility",
+      diagnosticCode: "tool_schema_root_not_object",
+      message: "A model tool schema is incompatible with the Direct DeepSeek function interface.",
+    });
+    expect(fetchProvider).not.toHaveBeenCalled();
+  },
+);
+
 test("the exact Vision Chat target projects immutable PNG bytes through Direct Chat", async () => {
   const requests: Array<{ readonly url: string; readonly body: unknown }> = [];
   const targets = createModelTargets({
@@ -1951,6 +2086,64 @@ test.each([
   },
 );
 
+test("the unified driver classifies a provider API error delivered as a stream part", async () => {
+  const privateValue = "provider-private-secret";
+  const apiCallError = Object.assign(new Error(`private ${privateValue}`), {
+    [Symbol.for("vercel.ai.error.AI_APICallError")]: true,
+    statusCode: 429,
+    responseHeaders: { "x-request-id": `request-${privateValue}` },
+    data: {
+      error: {
+        code: `rate-${privateValue}`,
+        message: `private summary ${privateValue}`,
+      },
+    },
+  });
+  const model = {
+    specificationVersion: "v4",
+    provider: "test",
+    modelId: "stream-api-error",
+    supportedUrls: {},
+    async doGenerate() {
+      throw new Error("Generation is not used by this test.");
+    },
+    async doStream() {
+      return {
+        stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue({ type: "error", error: apiCallError });
+            controller.close();
+          },
+        }),
+      };
+    },
+  } as unknown as ConstructorParameters<typeof AiSdkModelDriverForTesting>[0]["model"];
+  const driver = new AiSdkModelDriverForTesting({
+    model,
+    maximumOutputTokens: 4_096,
+    deadlineMs: 120_000,
+    sensitiveValues: [privateValue],
+  });
+
+  const error = await collectError(
+    driver.stream({
+      maximumOutputTokens: 4_096,
+      messages: [{ role: "user", content: "Classify the provider stream failure." }],
+      tools: [],
+      signal: new AbortController().signal,
+    }),
+  );
+
+  expect(error).toMatchObject({
+    category: "rate_limit",
+    status: 429,
+    providerCode: "rate-[REDACTED]",
+    requestId: "request-[REDACTED]",
+    responseSummary: "private summary [REDACTED]",
+  });
+  expect(JSON.stringify(error)).not.toContain(privateValue);
+});
+
 test("the unified driver counts every Provider V4 part against the 2,000,000 part ceiling", async () => {
   let emitted = 0;
   const model = {
@@ -2459,6 +2652,12 @@ test("an opted-in Gateway target resolves only as an exact Experimental identity
 });
 
 test("the Experimental Gateway target pins one upstream in the public V4 request", async () => {
+  const canonicalInputSchema = {
+    oneOf: [
+      { type: "object", properties: { kind: { const: "content" } }, required: ["kind"] },
+      { type: "object", properties: { kind: { const: "path" } }, required: ["kind"] },
+    ],
+  } as const;
   const requests: Array<{
     readonly url: string;
     readonly modelId: string | null;
@@ -2488,7 +2687,13 @@ test("the Experimental Gateway target pins one upstream in the public V4 request
     driver.stream({
       maximumOutputTokens: 4_096,
       messages: [{ role: "user", content: "Introduce yourself" }],
-      tools: [],
+      tools: [
+        {
+          name: "search_repository",
+          description: "Search repository content or paths.",
+          inputSchema: canonicalInputSchema,
+        },
+      ],
       signal: new AbortController().signal,
     }),
   );
@@ -2500,6 +2705,14 @@ test("the Experimental Gateway target pins one upstream in the public V4 request
       body: expect.objectContaining({
         prompt: [{ role: "user", content: [{ type: "text", text: "Introduce yourself" }] }],
         providerOptions: { gateway: { only: ["poolside"] } },
+        tools: [
+          {
+            type: "function",
+            name: "search_repository",
+            description: "Search repository content or paths.",
+            inputSchema: canonicalInputSchema,
+          },
+        ],
       }),
     },
   ]);

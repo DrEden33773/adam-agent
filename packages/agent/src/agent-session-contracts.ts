@@ -1,7 +1,7 @@
 import type { ArtifactReference, ChangePreviewArtifactSource } from "./artifact-store.js";
 import type { ContextCallUsage } from "./durable-context.js";
 import type { InputResourceOccurrenceV1 } from "./input-resources.js";
-import type { ModelDriverErrorCategory } from "./model-driver-error.js";
+import type { ModelDriverDiagnosticCode, ModelDriverErrorCategory } from "./model-driver-error.js";
 import type { ApprovedPlanProjectionV1 } from "./plan-mode.js";
 import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import type {
@@ -180,6 +180,7 @@ export type RunResult =
             readonly code: "model_request_failed";
             readonly message: string;
             readonly category: ModelDriverErrorCategory;
+            readonly diagnosticCode?: ModelDriverDiagnosticCode | undefined;
             readonly status?: number | undefined;
             readonly providerCode?: string | undefined;
             readonly requestId?: string | undefined;
@@ -188,6 +189,7 @@ export type RunResult =
             readonly code: "context_compaction_failed";
             readonly message: string;
             readonly category: ModelDriverErrorCategory;
+            readonly diagnosticCode?: ModelDriverDiagnosticCode | undefined;
             readonly status?: number | undefined;
             readonly providerCode?: string | undefined;
             readonly requestId?: string | undefined;

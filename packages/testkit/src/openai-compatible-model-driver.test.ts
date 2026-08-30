@@ -385,7 +385,7 @@ describe("OpenAICompatibleModelDriver", () => {
       status: "failed",
       error: {
         code: "model_request_failed",
-        message: "The model provider rejected authentication.",
+        message: "The model provider rejected the configured credential.",
         category: "authentication",
         status: 401,
         providerCode: "invalid-[REDACTED]",
@@ -966,6 +966,59 @@ describe("OpenAICompatibleModelDriver", () => {
     ]);
   });
 
+  test("projects an object-only union tool schema on the DeepSeek provider wire", async () => {
+    let body: { readonly tools?: readonly unknown[] } | undefined;
+    const canonicalInputSchema = {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      oneOf: [
+        { type: "object", properties: { kind: { const: "content" } }, required: ["kind"] },
+        { type: "object", properties: { kind: { const: "path" } }, required: ["kind"] },
+      ],
+    } as const;
+    const canonicalBefore = structuredClone(canonicalInputSchema);
+    const driver = new OpenAICompatibleModelDriver({
+      profile: "deepseek",
+      apiKey: "test-deepseek-key",
+      baseURL: "https://deepseek.invalid",
+      model: "deepseek-test",
+      maximumOutputTokens: 4_096,
+      fetch: async (_input, init) => {
+        body = JSON.parse(String(init?.body)) as { readonly tools?: readonly unknown[] };
+        return new Response(answerOnlyStream, {
+          headers: { "content-type": "text/event-stream" },
+          status: 200,
+        });
+      },
+    });
+
+    await collect(
+      driver.stream({
+        maximumOutputTokens: 4_096,
+        messages: [{ role: "user", content: "Search the repository." }],
+        tools: [
+          {
+            name: "search_repository",
+            description: "Search repository content or paths.",
+            inputSchema: canonicalInputSchema,
+          },
+        ],
+        signal: new AbortController().signal,
+      }),
+    );
+
+    expect(body?.tools).toEqual([
+      {
+        type: "function",
+        function: {
+          name: "search_repository",
+          description: "Search repository content or paths.",
+          parameters: { ...canonicalBefore, type: "object" },
+        },
+      },
+    ]);
+    expect(canonicalInputSchema).toEqual(canonicalBefore);
+  });
+
   test("serializes the exact approved Plan as one non-authoritative assistant projection", async () => {
     const requests: Array<{ readonly messages: readonly unknown[] }> = [];
     const driver = new OpenAICompatibleModelDriver({
@@ -1229,7 +1282,7 @@ describe("OpenAICompatibleModelDriver", () => {
           status: "failed",
           error: {
             code: "model_request_failed",
-            message: "The model provider returned an incomplete tool call.",
+            message: "The model provider response was incompatible with Adam.",
             category: "protocol_incompatibility",
           },
         },
