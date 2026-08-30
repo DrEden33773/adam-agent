@@ -1430,8 +1430,7 @@ test("the production TUI switches an exact draft target without creating durable
     const beforeTarget = fixture.output().length;
     fixture.write("/target\r");
     await fixture.waitForAfter("Select an exact model target", beforeTarget);
-    fixture.write("\u001b[B");
-    fixture.write("\r");
+    fixture.write("\u001b[B\r");
     await fixture.waitForAfter("deepseek-v4-pro.direct · Certified", beforeTarget);
     fixture.write("\u0011");
     const result = await fixture.closed;
@@ -2716,6 +2715,216 @@ test("the production TUI toggles and displays authoritative read-only Plan statu
     await fixture.waitForAfter("Exited read-only Plan.", beforeExit);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeExit)).join("\n");
     expect(frame).not.toContain("Plan exploring · read-only");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI reviews, revises, and implements the exact ready Plan", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-review-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "plan-review", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
+    fixture.write("/plan\r");
+    await fixture.waitFor("Plan exploring · read-only");
+
+    const beforeInitialSubmission = fixture.output().length;
+    fixture.write("Create the exact implementation plan\r");
+    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeInitialSubmission);
+    let frame = latestSynchronizedFrame(fixture.output().slice(beforeInitialSubmission)).join("\n");
+    expect(frame).toContain("Fixture plan 1");
+    expect(frame).toContain("# Fixture plan 1");
+    expect(frame).toContain("Implement the exact reviewed change.");
+    expect(frame).toContain("sha256:");
+    expect(frame).toContain("Approve and implement");
+    expect(frame).toContain("Request changes…");
+    expect(frame).toContain("Cancel plan");
+
+    fixture.write("\u001b[B");
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter(
+      "Revision intent active; submit the main composer when ready.",
+      beforeInitialSubmission,
+    );
+
+    const beforeRevisionSubmit = fixture.output().length;
+    fixture.write("Preserve this revision request\r");
+    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeRevisionSubmit);
+    frame = latestSynchronizedFrame(fixture.output()).join("\n");
+    expect(frame).toContain("Review exact submitted plan");
+    expect(frame).toContain("# Fixture plan 2");
+    const beforeApproval = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter(
+      "Approved Plan implementation complete.",
+      beforeApproval,
+    );
+    await fixture.waitForCompleteFrameAfter(
+      "Approved Plan implementation completed.",
+      beforeApproval,
+    );
+    const beforeArtifacts = fixture.output().length;
+    fixture.write("/artifacts \r");
+    await fixture.waitForCompleteFrameAfter("Session artifacts", beforeArtifacts);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeArtifacts)).join("\n");
+    expect(frame).toContain("Fixture plan 2");
+    expect(frame).toContain("approved");
+    const beforeArtifactSelection = fixture.output().length;
+    fixture.write("\u001b[B");
+    await fixture.waitForCompleteFrameAfter("Fixture plan 2", beforeArtifactSelection);
+    const beforeArtifactDetail = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Artifact detail", beforeArtifactDetail);
+    frame = latestSynchronizedFrame(fixture.output().slice(beforeArtifactDetail)).join("\n");
+    expect(frame).toContain("# Fixture plan 2");
+    expect(frame).toContain("Implement the exact reviewed change.");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI keeps the exact composer draft while a ready Plan review is dismissed", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-draft-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "plan-review", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
+    fixture.write("/plan\r");
+    await fixture.waitFor("Plan exploring · read-only");
+    const beforePlan = fixture.output().length;
+    fixture.write("Create a plan whose ready state must remain exact\r");
+    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);
+
+    const beforeFirstDismiss = fixture.output().length;
+    fixture.write("\u001b");
+    await fixture.waitForCompleteFrameAfter("Plan ready r2 · review required", beforeFirstDismiss);
+    const beforeReopen = fixture.output().length;
+    fixture.write("Preserve this exact revision draft\r");
+    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeReopen);
+    const beforeDismiss = fixture.output().length;
+    fixture.write("\u001b");
+    await fixture.waitForCompleteFrameAfter("Plan ready r2 · review required", beforeDismiss);
+    const screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("Preserve this exact revision draft");
+    expect(screen).toContain("Plan ready r2 · review required");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI cancels a ready Plan only after concise confirmation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-cancel-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "plan-review", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
+    fixture.write("/plan\r");
+    await fixture.waitFor("Plan exploring · read-only");
+    const beforePlan = fixture.output().length;
+    fixture.write("Create a plan that will be cancelled exactly\r");
+    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);
+
+    const openCancellation = async (): Promise<void> => {
+      let beforeSelection = fixture.output().length;
+      fixture.write("\u001b[B");
+      await fixture.waitForCompleteFrameAfter("Request changes…", beforeSelection);
+      beforeSelection = fixture.output().length;
+      fixture.write("\u001b[B");
+      await fixture.waitForCompleteFrameAfter("Cancel plan", beforeSelection);
+      const beforeConfirmation = fixture.output().length;
+      fixture.write("\r");
+      await fixture.waitForCompleteFrameAfter("Cancel this exact plan?", beforeConfirmation);
+    };
+
+    await openCancellation();
+    const beforeSafeDefault = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeSafeDefault);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("Plan ready r2 · review required");
+
+    await openCancellation();
+    const beforeConfirmSelection = fixture.output().length;
+    fixture.write("\u001b[B");
+    await fixture.waitForCompleteFrameAfter("Confirm cancellation", beforeConfirmSelection);
+    const beforeCancellation = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Plan cancelled.", beforeCancellation);
+    const screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("Plan cancelled.");
+    expect(screen).not.toContain("Plan ready");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI explicitly continues a recovered unstarted Plan approval", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-recovery-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      scenario: "plan-review-recovery",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
+    fixture.write("/plan\r");
+    await fixture.waitFor("Plan exploring · read-only");
+    const beforePlan = fixture.output().length;
+    fixture.write("Create a plan whose durable approval must be recovered\r");
+    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);
+
+    const beforeApproval = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Continue implementation", beforeApproval);
+    let screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("Approved plan has not started");
+    expect(screen).not.toContain("Approved Plan implementation complete.");
+
+    const beforeDismiss = fixture.output().length;
+    fixture.write("\u001b");
+    await fixture.waitForCompleteFrameAfter("Plan approved · not started", beforeDismiss);
+    const beforeReopen = fixture.output().length;
+    fixture.write("Do not create a second approval command\r");
+    await fixture.waitForCompleteFrameAfter("Continue implementation", beforeReopen);
+
+    const beforeContinue = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter(
+      "Approved Plan implementation completed.",
+      beforeContinue,
+    );
+    screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("Approved Plan implementation complete.");
+    expect(screen).toContain("Approved Plan implementation completed.");
 
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });

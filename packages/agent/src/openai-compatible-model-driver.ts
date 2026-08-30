@@ -15,6 +15,7 @@ import type {
   ModelMessage,
   ModelRequest,
 } from "./agent-session-contracts.js";
+import { modelMessagesWithApprovedPlanProjectionV1 } from "./approved-plan-projection.js";
 import { ModelDriverError } from "./model-driver-error.js";
 
 const maximumNormalizedTextBytes = 512 * 1024;
@@ -103,7 +104,7 @@ export class OpenAICompatibleModelDriver implements ModelDriver {
   }
 
   async *#stream(request: ModelRequest): AsyncIterable<ModelEvent> {
-    const messages = request.messages.map((message) =>
+    const messages = modelMessagesWithApprovedPlanProjectionV1(request).map((message) =>
       mapMessage(message, this.#model.startsWith("deepseek-v4-")),
     );
     const tools: ChatCompletionTool[] = request.tools.map((tool) => ({

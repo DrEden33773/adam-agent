@@ -67,6 +67,7 @@ const emptyComposer = {
   attachmentAvailable: false,
   unavailableReason: "New session required for attachments",
   sealed: false,
+  revisionIntent: null,
   resources: [],
 } as const;
 

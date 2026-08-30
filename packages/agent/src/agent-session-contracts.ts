@@ -2,6 +2,7 @@ import type { ArtifactReference, ChangePreviewArtifactSource } from "./artifact-
 import type { ContextCallUsage } from "./durable-context.js";
 import type { InputResourceOccurrenceV1 } from "./input-resources.js";
 import type { ModelDriverErrorCategory } from "./model-driver-error.js";
+import type { ApprovedPlanProjectionV1 } from "./plan-mode.js";
 import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import type {
   ModelToolDefinition,
@@ -63,6 +64,7 @@ export type ModelMessage =
 export type ModelRequest = {
   readonly messages: readonly ModelMessage[];
   readonly tools: readonly ModelToolDefinition[];
+  readonly approvedPlan?: ApprovedPlanProjectionV1;
   readonly maximumOutputTokens: number;
   readonly purpose?: "ordinary" | "title" | "compaction";
   readonly signal: AbortSignal;

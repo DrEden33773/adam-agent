@@ -24,6 +24,7 @@ import {
   createTrustedWorkspaceTrustForTesting,
   mcpCloseConfirmation,
   type PresentationArtifactReadBarrier,
+  planApprovalIntentBarrier,
   preparedDirectDeepSeekV2ContextProfile,
   presentationArtifactReadBarrier,
   presentationHistoryPageSize,
@@ -195,6 +196,15 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
           },
         });
   const lifecycle = createSessionLifecycle({
+    ...(options.scenario === "plan-review-recovery"
+      ? {
+          [planApprovalIntentBarrier]: {
+            afterDurableRecord() {
+              throw new Error("Injected stop after durable Plan approval intent.");
+            },
+          },
+        }
+      : {}),
     ...(options.scenario === "mcp-close-unconfirmed"
       ? {
           [mcpCloseConfirmation]: {
@@ -997,6 +1007,7 @@ function createFixtureModelTargets(options: {
     throw new TypeError("The streaming fixtures require --control-root.");
   }
   let artifactResponseOrdinal = 0;
+  let planSubmissionOrdinal = 0;
   let reasoningViewportOrdinal = 0;
   let toolPreviewOrdinal = 0;
   const model: ModelDriver = {
@@ -1031,7 +1042,33 @@ function createFixtureModelTargets(options: {
         yield { type: "finish", reason: "stop" };
         return;
       }
-      if (options.scenario === "read") {
+      if (options.scenario === "plan-review" || options.scenario === "plan-review-recovery") {
+        if (request.approvedPlan !== undefined) {
+          yield { type: "text_delta", text: "Approved Plan implementation complete." };
+        } else {
+          const latest = request.messages.at(-1);
+          if (
+            latest?.role !== "user" ||
+            !request.tools.some((tool) => tool.name === "submit_plan")
+          ) {
+            throw new TypeError("The Plan review fixture requires one exploring user turn.");
+          }
+          planSubmissionOrdinal += 1;
+          const callId = `submit-plan-review-${planSubmissionOrdinal}`;
+          yield { type: "tool_call_start", id: callId, name: "submit_plan" };
+          yield {
+            type: "tool_call_delta",
+            id: callId,
+            json: JSON.stringify({
+              title: `Fixture plan ${planSubmissionOrdinal}`,
+              markdown: `# Fixture plan ${planSubmissionOrdinal}\n\n1. Implement the exact reviewed change.\n2. Verify it.\n`,
+            }),
+          };
+          yield { type: "tool_call_end", id: callId };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+      } else if (options.scenario === "read") {
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {
           yield { type: "tool_call_start", id: "read-readme", name: "read_file" };

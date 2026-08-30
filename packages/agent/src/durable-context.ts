@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 
 import { z } from "zod";
 import type { ModelDriver, ModelMessage, ModelUserContentPart } from "./agent-session-contracts.js";
+import { modelMessagesWithApprovedPlanProjectionV1 } from "./approved-plan-projection.js";
 import {
   type ContextProfile,
   resolveCompactionSummaryMaximumOutputTokens,
@@ -11,6 +12,7 @@ import type {
   ProjectedContentUsageV1,
   ProjectedExplicitUserImageArtifactUsageV1,
 } from "./model-user-content.js";
+import type { ApprovedPlanProjectionV1 } from "./plan-mode.js";
 import type { SessionRecord } from "./session-store.js";
 import type { PermissionSubject } from "./tool-runtime.js";
 
@@ -250,6 +252,7 @@ export function digestContextRecordPrefix(records: readonly SessionRecord[]): `s
 }
 
 export async function generateContextSummary(input: {
+  readonly approvedPlan?: ApprovedPlanProjectionV1;
   readonly evidence: ContextEvidenceV1;
   readonly messages: readonly ModelMessage[];
   readonly model: ModelDriver;
@@ -277,7 +280,11 @@ export async function generateContextSummary(input: {
     input.preparedRequest?.messages ?? createContextSummaryRequestMessages(input);
   const maximumOutputTokens = resolveCompactionSummaryMaximumOutputTokens(input.profile);
   if (
-    estimatePreparedContextSummaryRequestTokens(requestMessages, input.profile) +
+    estimatePreparedContextSummaryRequestTokens(
+      requestMessages,
+      input.profile,
+      input.approvedPlan,
+    ) +
       maximumOutputTokens >
     input.profile.contextWindowTokens
   ) {
@@ -290,6 +297,7 @@ export async function generateContextSummary(input: {
     for await (const event of input.model.stream({
       messages: requestMessages,
       tools: [],
+      ...(input.approvedPlan === undefined ? {} : { approvedPlan: input.approvedPlan }),
       maximumOutputTokens,
       purpose: "compaction",
       signal: input.signal,
@@ -381,6 +389,7 @@ export async function generateContextSummary(input: {
 }
 
 export function estimateContextSummaryRequestTokens(input: {
+  readonly approvedPlan?: ApprovedPlanProjectionV1;
   readonly evidence: ContextEvidenceV1;
   readonly messages: readonly ModelMessage[];
   readonly profile: ContextProfile;
@@ -388,6 +397,7 @@ export function estimateContextSummaryRequestTokens(input: {
   return estimatePreparedContextSummaryRequestTokens(
     createContextSummaryRequestMessages(input),
     input.profile,
+    input.approvedPlan,
   );
 }
 
@@ -397,6 +407,7 @@ export type PreparedContextSummaryRequestV1 = {
 };
 
 export function prepareContextSummaryRequestV1(input: {
+  readonly approvedPlan?: ApprovedPlanProjectionV1;
   readonly evidence: ContextEvidenceV1;
   readonly messages: readonly ModelMessage[];
   readonly profile: ContextProfile;
@@ -417,6 +428,7 @@ export function prepareContextSummaryRequestV1(input: {
 }
 
 function createContextSummaryRequestMessages(input: {
+  readonly approvedPlan?: ApprovedPlanProjectionV1;
   readonly evidence: ContextEvidenceV1;
   readonly messages: readonly ModelMessage[];
   readonly profile: ContextProfile;
@@ -428,7 +440,7 @@ function createContextSummaryRequestMessages(input: {
       fitContextMessages(sourceMessages, maximumFittedToolResultBytes),
     );
     if (
-      estimatePreparedContextSummaryRequestTokens(request, input.profile) +
+      estimatePreparedContextSummaryRequestTokens(request, input.profile, input.approvedPlan) +
         resolveCompactionSummaryMaximumOutputTokens(input.profile) <=
       input.profile.contextWindowTokens
     ) {
@@ -602,9 +614,13 @@ function isProjectableImagePart(
 function estimatePreparedContextSummaryRequestTokens(
   messages: readonly ModelMessage[],
   profile: ContextProfile,
+  approvedPlan?: ApprovedPlanProjectionV1,
 ): number {
   return estimateActiveContextTokens(
-    messages.map((message) => {
+    modelMessagesWithApprovedPlanProjectionV1({
+      messages,
+      ...(approvedPlan === undefined ? {} : { approvedPlan }),
+    }).map((message) => {
       if (
         (message.role !== "user" && message.role !== "tool") ||
         message.content === undefined ||

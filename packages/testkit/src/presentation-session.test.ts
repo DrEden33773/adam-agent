@@ -46,6 +46,7 @@ import {
   mcpCatalogStaleDurableBarrier,
   mcpTransportFactory,
   openJsonlSessionStore,
+  planApprovalIntentBarrier,
   planShellEnvironmentFactory,
   preparedDirectDeepSeekV2ContextProfile,
   presentationCatalogPageSize,
@@ -122,6 +123,58 @@ function settledModelTargets(answer = "Presentation fixture answer."): ModelTarg
     { type: "text_delta", text: answer },
     { type: "finish", reason: "stop" },
   ]);
+  return {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+}
+
+function planSubmittingModelTargets(input: {
+  readonly markdown: string;
+  readonly title?: string;
+  readonly laterAnswer?: string;
+  readonly onRequest?: (
+    requestCount: number,
+    request: Parameters<ModelDriver["stream"]>[0],
+  ) => void;
+}): ModelTargets {
+  let requestCount = 0;
+  const driver = new FakeModelDriver((request) => {
+    requestCount += 1;
+    input.onRequest?.(requestCount, request);
+    if (requestCount === 1) {
+      expect(request.tools.map((tool) => tool.name)).toContain("submit_plan");
+      return [
+        { type: "tool_call_start", id: "submit-plan", name: "submit_plan" },
+        {
+          type: "tool_call_delta",
+          id: "submit-plan",
+          json: JSON.stringify({
+            ...(input.title === undefined ? {} : { title: input.title }),
+            markdown: input.markdown,
+          }),
+        },
+        { type: "tool_call_end", id: "submit-plan" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    return [
+      { type: "text_delta", text: input.laterAnswer ?? "Revising the exact plan." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
   return {
     async resolve() {
       return { identity: targetIdentity, driver, contextProfile };
@@ -819,6 +872,7 @@ test("PresentationSession opens an empty project catalog without creating a sess
         unavailableReason: "New session required for attachments",
         sealed: false,
         resources: [],
+        revisionIntent: null,
       },
       transient: null,
     });
@@ -877,6 +931,705 @@ test("PresentationSession durably enters a hybrid Plan cycle and rehydrates its 
     expect(presentation.getState().authoritative.active?.plan).toEqual(entered);
   } finally {
     await presentation?.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession projects the exact immutable plan identity from SessionLifecycle", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-submit-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const markdown = "# Exact plan\n\n1. Inspect `src/`.\n2. Implement the approved change.\n";
+  const title = "Exact implementation plan";
+  const markdownBytes = Buffer.from(markdown, "utf8");
+  const contentDigest = `sha256:${createHash("sha256").update(markdownBytes).digest("hex")}`;
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: planSubmittingModelTargets({ markdown, title }),
+    stateRoot,
+    workspaceRoot,
+  });
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({ type: "enter_plan", sessionId: created.sessionId });
+    const exploring = presentation.getState().authoritative.active?.plan;
+    if (exploring === undefined) {
+      throw new Error("Expected an exploring Plan cycle.");
+    }
+
+    const submitted = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Submit the exact completed plan." },
+    });
+    const ready = submitted.snapshot.plan;
+    if (ready?.state !== "ready") {
+      throw new Error("Expected the submitted plan to be ready.");
+    }
+    expect(ready).toEqual({
+      ...exploring,
+      state: "ready",
+      revision: 2,
+      submission: {
+        planId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+        revision: 2,
+        contentDigest,
+        title,
+        artifact: {
+          id: contentDigest,
+          mediaType: "text/markdown; charset=utf-8",
+          byteCount: markdownBytes.byteLength,
+          source: {
+            type: "plan",
+            schemaVersion: 1,
+            projectId: created.projectId,
+            sessionId: created.sessionId,
+            cycleId: exploring.cycleId,
+            planId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+            revision: 2,
+            provenance: "model_submit_plan",
+          },
+        },
+        policyVersion: exploring.policyVersion,
+        toolProfileDigest: exploring.eligibleToolProfile.digest,
+      },
+    });
+    expect(ready.submission.artifact.source.planId).toBe(ready.submission.planId);
+    await presentation.close();
+    presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    expect(presentation.getState().authoritative.active?.plan).toEqual(ready);
+  } finally {
+    await presentation?.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession creates Plan revision intent without changing durable ready state", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-revise-intent-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: planSubmittingModelTargets({ markdown: "# Revise me\n" }),
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const exploring = await lifecycle.enterPlan({ sessionId: created.sessionId });
+    if (exploring.plan?.state !== "exploring") {
+      throw new Error("Expected an exploring Plan cycle.");
+    }
+    const submittedResult = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Submit the first exact plan." },
+    });
+    const submitted = submittedResult.snapshot;
+    if (submitted.plan?.state !== "ready") {
+      throw new Error("Expected a ready Plan artifact.");
+    }
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const before = await lifecycle.inspect({ sessionId: created.sessionId });
+
+    await expect(
+      presentation.dispatch({
+        type: "revise_plan",
+        sessionId: created.sessionId,
+        cycleId: submitted.plan.cycleId,
+        revision: submitted.plan.revision,
+        planId: submitted.plan.submission.planId,
+        contentDigest: submitted.plan.submission.contentDigest,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+
+    expect(presentation.getState().composer.revisionIntent).toEqual({
+      sessionId: created.sessionId,
+      cycleId: submitted.plan.cycleId,
+      revision: submitted.plan.revision,
+      planId: submitted.plan.submission.planId,
+      contentDigest: submitted.plan.submission.contentDigest,
+    });
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toEqual(before);
+    await expect(
+      presentation.dispatch({
+        type: "cancel_plan",
+        sessionId: created.sessionId,
+        cycleId: submitted.plan.cycleId,
+        revision: submitted.plan.revision,
+        planId: submitted.plan.submission.planId,
+        contentDigest: submitted.plan.submission.contentDigest,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer.revisionIntent).toBeNull();
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession submits revision feedback as one ordinary turn that stales ready state", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-revise-submit-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: planSubmittingModelTargets({
+      markdown: "# First revision\n",
+      laterAnswer: "I will revise the plan.",
+    }),
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const exploring = await lifecycle.enterPlan({ sessionId: created.sessionId });
+    if (exploring.plan?.state !== "exploring") {
+      throw new Error("Expected an exploring Plan cycle.");
+    }
+    const submittedResult = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Submit the first exact plan." },
+    });
+    const submitted = submittedResult.snapshot;
+    if (submitted.plan?.state !== "ready") {
+      throw new Error("Expected a ready Plan artifact.");
+    }
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({
+      type: "revise_plan",
+      sessionId: created.sessionId,
+      cycleId: submitted.plan.cycleId,
+      revision: submitted.plan.revision,
+      planId: submitted.plan.submission.planId,
+      contentDigest: submitted.plan.submission.contentDigest,
+    });
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_prompt",
+        sessionId: created.sessionId,
+        text: "Keep the first step, but add a rollback check.",
+        skills: [],
+        thinkingSelection: null,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+
+    const revised = await lifecycle.inspect({ sessionId: created.sessionId });
+    if (revised.schemaVersion !== 3) {
+      throw new Error("Expected the current Session schema.");
+    }
+    expect(revised).toMatchObject({
+      plan: {
+        state: "exploring",
+        cycleId: submitted.plan.cycleId,
+        revision: submitted.plan.revision + 1,
+        policyVersion: submitted.plan.policyVersion,
+        eligibleToolProfile: submitted.plan.eligibleToolProfile,
+      },
+    });
+    expect(revised.plan).not.toHaveProperty("submission");
+    expect(presentation.getState().composer.revisionIntent).toBeNull();
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession durably records exact Plan approval intent before implementation starts", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-approval-intent-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let providerCalls = 0;
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: planSubmittingModelTargets({
+      markdown: "# Approved implementation\n",
+      onRequest: (count) => {
+        providerCalls = count;
+      },
+    }),
+    stateRoot,
+    workspaceRoot,
+    [planApprovalIntentBarrier]: {
+      afterDurableRecord() {
+        throw new Error("injected crash before implementation kickoff");
+      },
+    },
+  });
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const submitted = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Submit the exact completed plan." },
+    });
+    if (submitted.snapshot.plan?.state !== "ready") {
+      throw new Error("Expected a ready Plan artifact.");
+    }
+    const ready = submitted.snapshot.plan;
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+
+    await expect(
+      presentation.dispatch({
+        type: "approve_plan",
+        commandId: "123e4567-e89b-42d3-a456-426614176020",
+        sessionId: created.sessionId,
+        cycleId: ready.cycleId,
+        revision: ready.revision,
+        planId: ready.submission.planId,
+        contentDigest: ready.submission.contentDigest,
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "authority_rejected" });
+
+    expect(providerCalls).toBe(1);
+    const recovered = await lifecycle.inspect({ sessionId: created.sessionId });
+    if (recovered.schemaVersion !== 3) {
+      throw new Error("Expected the current Session schema.");
+    }
+    const recoveredPlan = recovered.plan;
+    if (recoveredPlan?.state !== "approved_not_started") {
+      throw new Error("Expected the durable unstarted Plan approval.");
+    }
+    expect(recoveredPlan).toMatchObject({
+      state: "approved_not_started",
+      cycleId: ready.cycleId,
+      revision: ready.revision,
+      submission: ready.submission,
+      approval: {
+        commandId: "123e4567-e89b-42d3-a456-426614176020",
+        kickoffRunId: expect.stringMatching(/^[0-9a-f-]{36}$/u),
+        planId: ready.submission.planId,
+        contentDigest: ready.submission.contentDigest,
+        policyVersion: ready.policyVersion,
+        toolProfileDigest: ready.eligibleToolProfile.digest,
+      },
+    });
+    const records = await readInMemoryPresentationRecords(harness.sessions)(created.sessionId);
+    const approvalIndex = records.findIndex(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "plan_approval_intent",
+    );
+    expect(approvalIndex).toBeGreaterThan(-1);
+    expect(
+      records
+        .slice(approvalIndex + 1)
+        .some(
+          (entry) =>
+            entry.schemaVersion === 3 &&
+            entry.record.type === "logical_run_started" &&
+            entry.record.runId === recoveredPlan.approval.kickoffRunId,
+        ),
+    ).toBe(false);
+    await expect(
+      presentation.dispatch({
+        type: "approve_plan",
+        commandId: "123e4567-e89b-42d3-a456-426614176020",
+        sessionId: created.sessionId,
+        cycleId: ready.cycleId,
+        revision: ready.revision,
+        planId: ready.submission.planId,
+        contentDigest: ready.submission.contentDigest,
+      }),
+    ).resolves.toMatchObject({
+      status: "admitted",
+      commandId: "123e4567-e89b-42d3-a456-426614176020",
+    });
+    expect(providerCalls).toBeGreaterThanOrEqual(2);
+    const completedRecords = await readInMemoryPresentationRecords(harness.sessions)(
+      created.sessionId,
+    );
+    expect(
+      completedRecords.filter(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "plan_approval_intent",
+      ),
+    ).toHaveLength(1);
+    expect(
+      completedRecords.filter(
+        (entry) =>
+          entry.schemaVersion === 3 &&
+          entry.record.type === "logical_run_started" &&
+          entry.record.planKickoff?.commandId === "123e4567-e89b-42d3-a456-426614176020",
+      ),
+    ).toHaveLength(1);
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession owns an approved Plan kickoff as the active cancellable run", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-active-kickoff-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const kickoffStarted = Promise.withResolvers<void>();
+  const releaseKickoff = Promise.withResolvers<void>();
+  let logicalRunCount = 0;
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: planSubmittingModelTargets({
+      markdown: "# Active implementation\n",
+      laterAnswer: "Implemented the active approved plan.",
+    }),
+    stateRoot,
+    workspaceRoot,
+    [sessionLogicalRunStartedBarrier]: {
+      async afterDurableRecord() {
+        logicalRunCount += 1;
+        if (logicalRunCount === 2) {
+          kickoffStarted.resolve();
+          await releaseKickoff.promise;
+        }
+      },
+    },
+  });
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+  let approving: Promise<unknown> | undefined;
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const submitted = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Submit the active implementation plan." },
+    });
+    if (submitted.snapshot.plan?.state !== "ready") {
+      throw new Error("Expected a ready Plan artifact.");
+    }
+    const ready = submitted.snapshot.plan;
+    presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    approving = presentation.dispatch({
+      type: "approve_plan",
+      commandId: "123e4567-e89b-42d3-a456-426614176029",
+      sessionId: created.sessionId,
+      cycleId: ready.cycleId,
+      revision: ready.revision,
+      planId: ready.submission.planId,
+      contentDigest: ready.submission.contentDigest,
+    });
+    await kickoffStarted.promise;
+
+    expect(presentation.getState().transient).toMatchObject({ activity: "working" });
+    const duplicateApproval = presentation.dispatch({
+      type: "approve_plan",
+      commandId: "123e4567-e89b-42d3-a456-426614176029",
+      sessionId: created.sessionId,
+      cycleId: ready.cycleId,
+      revision: ready.revision,
+      planId: ready.submission.planId,
+      contentDigest: ready.submission.contentDigest,
+    });
+    const concurrentPrompt = presentation.dispatch({
+      type: "submit_prompt",
+      sessionId: created.sessionId,
+      text: "This must not race the approved kickoff.",
+      skills: [],
+      thinkingSelection: null,
+    });
+    releaseKickoff.resolve();
+
+    await expect(concurrentPrompt).resolves.toMatchObject({ status: "rejected", code: "conflict" });
+    await expect(approving).resolves.toMatchObject({ status: "admitted" });
+    await expect(duplicateApproval).resolves.toMatchObject({
+      status: "admitted",
+      commandId: "123e4567-e89b-42d3-a456-426614176029",
+    });
+    expect(presentation.getState().transient).toBeNull();
+    await presentation.close();
+    presentation = undefined;
+  } finally {
+    releaseKickoff.resolve();
+    await approving?.catch(() => undefined);
+    await presentation?.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession explicitly continues one recovered Plan approval with its reserved kickoff projection", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-kickoff-recovery-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const markdown = "# Exact approved plan\n\n1. Make the bounded change.\n2. Verify it.\n";
+  let kickoffRequest: Parameters<ModelDriver["stream"]>[0] | undefined;
+  const modelTargets = planSubmittingModelTargets({
+    markdown,
+    laterAnswer: "Implemented the exact approved plan.",
+    onRequest: (count, request) => {
+      if (count === 2) {
+        kickoffRequest = request;
+      }
+    },
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  let lifecycle = harness.createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [planApprovalIntentBarrier]: {
+      afterDurableRecord() {
+        throw new Error("injected crash before implementation kickoff");
+      },
+    },
+  });
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const submitted = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Submit the exact completed plan." },
+    });
+    if (submitted.snapshot.plan?.state !== "ready") {
+      throw new Error("Expected a ready Plan artifact.");
+    }
+    const ready = submitted.snapshot.plan;
+    const commandId = "123e4567-e89b-42d3-a456-426614176021";
+    presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({
+      type: "approve_plan",
+      commandId,
+      sessionId: created.sessionId,
+      cycleId: ready.cycleId,
+      revision: ready.revision,
+      planId: ready.submission.planId,
+      contentDigest: ready.submission.contentDigest,
+    });
+    const approved = await lifecycle.inspect({ sessionId: created.sessionId });
+    if (approved.schemaVersion !== 3 || approved.plan?.state !== "approved_not_started") {
+      throw new Error("Expected a recoverable unstarted approval.");
+    }
+    const approval = approved.plan.approval;
+
+    await presentation.close();
+    presentation = undefined;
+    await lifecycle.close();
+    lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    expect(presentation.getState().authoritative.active?.plan).toMatchObject({
+      state: "approved_not_started",
+      approval,
+    });
+
+    await expect(
+      presentation.dispatch({
+        type: "continue_plan",
+        commandId,
+        sessionId: created.sessionId,
+        cycleId: ready.cycleId,
+        revision: ready.revision,
+        planId: ready.submission.planId,
+        contentDigest: ready.submission.contentDigest,
+      }),
+    ).resolves.toMatchObject({ status: "admitted", commandId });
+
+    expect(kickoffRequest?.approvedPlan).toEqual({
+      version: 1,
+      sessionId: created.sessionId,
+      commandId,
+      kickoffRunId: approval.kickoffRunId,
+      cycleId: ready.cycleId,
+      revision: ready.revision,
+      planId: ready.submission.planId,
+      contentDigest: ready.submission.contentDigest,
+      title: undefined,
+      markdown,
+      policyVersion: ready.policyVersion,
+      toolProfileDigest: ready.eligibleToolProfile.digest,
+    });
+    const settled = await lifecycle.inspect({ sessionId: created.sessionId });
+    if (settled.schemaVersion !== 3) {
+      throw new Error("Expected the current Session schema.");
+    }
+    expect(settled.plan).toBeUndefined();
+    const records = await readInMemoryPresentationRecords(harness.sessions)(created.sessionId);
+    expect(
+      records.filter(
+        (entry) => entry.schemaVersion === 3 && entry.record.type === "plan_approval_intent",
+      ),
+    ).toHaveLength(1);
+    expect(
+      records.filter(
+        (entry) =>
+          entry.schemaVersion === 3 &&
+          entry.record.type === "logical_run_started" &&
+          entry.record.runId === approval.kickoffRunId,
+      ),
+    ).toHaveLength(1);
+    expect(records).toContainEqual(
+      expect.objectContaining({
+        record: expect.objectContaining({
+          type: "provider_attempt_started",
+          runId: approval.kickoffRunId,
+          promptProjection: expect.objectContaining({
+            approvedPlanProjectionDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
+          }),
+        }),
+      }),
+    );
+  } finally {
+    await presentation?.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession rejects stale approval and cancels only the exact current ready Plan artifact", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-cancel-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: planSubmittingModelTargets({ markdown: "# Cancel this plan\n" }),
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const submitted = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Submit the cancellable plan." },
+    });
+    if (submitted.snapshot.plan?.state !== "ready") {
+      throw new Error("Expected a ready Plan artifact.");
+    }
+    const ready = submitted.snapshot.plan;
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+
+    const beforeStaleApproval = await lifecycle.inspect({ sessionId: created.sessionId });
+    await expect(
+      presentation.dispatch({
+        type: "exit_plan",
+        sessionId: created.sessionId,
+        cycleId: ready.cycleId,
+        revision: ready.revision,
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "authority_rejected" });
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toEqual(
+      beforeStaleApproval,
+    );
+    await expect(
+      presentation.dispatch({
+        type: "approve_plan",
+        commandId: "123e4567-e89b-42d3-a456-426614176026",
+        sessionId: created.sessionId,
+        cycleId: ready.cycleId,
+        revision: ready.revision,
+        planId: ready.submission.planId,
+        contentDigest: `sha256:${"0".repeat(64)}`,
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "stale_interaction" });
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toEqual(
+      beforeStaleApproval,
+    );
+
+    await expect(
+      presentation.dispatch({
+        type: "cancel_plan",
+        sessionId: created.sessionId,
+        cycleId: ready.cycleId,
+        revision: ready.revision,
+        planId: ready.submission.planId,
+        contentDigest: ready.submission.contentDigest,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+
+    const cancelled = await lifecycle.inspect({ sessionId: created.sessionId });
+    if (cancelled.schemaVersion !== 3) {
+      throw new Error("Expected the current Session schema.");
+    }
+    expect(cancelled.plan).toBeUndefined();
+    const records = await readInMemoryPresentationRecords(harness.sessions)(created.sessionId);
+    expect(records.at(-1)).toMatchObject({
+      record: {
+        type: "plan_cycle_exited",
+        cycleId: ready.cycleId,
+        revision: ready.revision + 1,
+        reason: "user_cancelled",
+      },
+    });
+    await presentation.close();
+  } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -3231,6 +3984,7 @@ test("PresentationSession keeps its draft when logical input persistence fails",
           }
           await store.append(record);
         },
+        appendBatch: (records) => store.appendBatch(records),
         read: () => store.read(),
       };
       wrappedStores.set(sessionId, wrapped);
@@ -3589,6 +4343,7 @@ test("PresentationSession opens an exact target as a process-local draft", async
         unavailableReason: null,
         sealed: false,
         resources: [],
+        revisionIntent: null,
       },
       transient: null,
     });

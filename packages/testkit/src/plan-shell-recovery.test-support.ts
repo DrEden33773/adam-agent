@@ -16,6 +16,7 @@ import {
   type PlanShellEnvironmentFactory,
   planShellEnvironmentFactory,
   type SessionRecord,
+  submitPlanToolDefinitionV1,
 } from "@adam-agent/agent/internal-testing";
 import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
 import {
@@ -161,7 +162,8 @@ export async function exercisePlanShellRecoveryFixture(options: {
     );
     const requestTools = tools
       .definitions()
-      .filter((definition) => planToolNames.has(definition.name));
+      .filter((definition) => planToolNames.has(definition.name))
+      .concat(submitPlanToolDefinitionV1);
     const store = await harness.sessions.open(created.sessionId);
     if (store === undefined) {
       throw new Error("Expected the created Plan session store.");

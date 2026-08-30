@@ -1029,11 +1029,88 @@ export function planCycleSnapshotFromRecords(
           : {}),
         eligibleToolProfile: entry.record.eligibleToolProfile,
       };
+      if (
+        entry.record.type === "plan_cycle_inherited" &&
+        entry.record.state === "ready" &&
+        entry.record.submission !== undefined
+      ) {
+        active = { ...active, state: "ready", submission: entry.record.submission };
+      }
     } else if (
       entry.record.type === "plan_git_attested" &&
       entry.record.cycleId === active?.cycleId
     ) {
       active = { ...active, gitAttestation: entry.record.attestation };
+    } else if (
+      entry.record.type === "plan_submitted" &&
+      active?.state === "exploring" &&
+      entry.record.cycleId === active.cycleId &&
+      entry.record.revision === active.revision + 1
+    ) {
+      active = {
+        ...active,
+        state: "ready",
+        revision: entry.record.revision,
+        submission: {
+          planId: entry.record.planId,
+          revision: entry.record.revision,
+          contentDigest: entry.record.contentDigest,
+          ...(entry.record.title === undefined ? {} : { title: entry.record.title }),
+          artifact: entry.record.artifact,
+          policyVersion: entry.record.policyVersion,
+          toolProfileDigest: entry.record.toolProfileDigest,
+        },
+      };
+    } else if (
+      entry.record.type === "plan_approval_intent" &&
+      active?.state === "ready" &&
+      entry.record.cycleId === active.cycleId &&
+      entry.record.revision === active.revision &&
+      entry.record.planId === active.submission.planId &&
+      entry.record.contentDigest === active.submission.contentDigest &&
+      entry.record.policyVersion === active.policyVersion &&
+      entry.record.toolProfileDigest === active.eligibleToolProfile.digest
+    ) {
+      active = {
+        ...active,
+        state: "approved_not_started",
+        approval: {
+          sessionId: entry.record.sessionId,
+          commandId: entry.record.commandId,
+          kickoffRunId: entry.record.kickoffRunId,
+          cycleId: entry.record.cycleId,
+          revision: entry.record.revision,
+          planId: entry.record.planId,
+          contentDigest: entry.record.contentDigest,
+          policyVersion: entry.record.policyVersion,
+          toolProfileDigest: entry.record.toolProfileDigest,
+        },
+      };
+    } else if (
+      entry.record.type === "logical_run_started" &&
+      entry.record.planKickoff !== undefined &&
+      active?.state === "approved_not_started" &&
+      entry.record.runId === active.approval.kickoffRunId &&
+      entry.record.planKickoff.commandId === active.approval.commandId &&
+      entry.record.planKickoff.planId === active.submission.planId &&
+      entry.record.planKickoff.contentDigest === active.submission.contentDigest
+    ) {
+      active = undefined;
+    } else if (
+      entry.record.type === "logical_run_started" &&
+      entry.record.planRevision !== undefined &&
+      active?.state === "ready" &&
+      entry.record.planRevision.cycleId === active.cycleId &&
+      entry.record.planRevision.fromRevision === active.revision &&
+      entry.record.planRevision.planId === active.submission.planId &&
+      entry.record.planRevision.contentDigest === active.submission.contentDigest
+    ) {
+      const { submission: _submission, ...withoutSubmission } = active;
+      active = {
+        ...withoutSubmission,
+        state: "exploring",
+        revision: entry.record.planRevision.toRevision,
+      };
     } else if (
       entry.record.type === "plan_cycle_exited" &&
       entry.record.cycleId === active?.cycleId &&

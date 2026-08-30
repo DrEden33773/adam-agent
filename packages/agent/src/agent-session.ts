@@ -18,6 +18,7 @@ import type {
   RuntimeEventNotificationListener,
   UserInput,
 } from "./agent-session-contracts.js";
+import { modelMessagesWithApprovedPlanProjectionV1 } from "./approved-plan-projection.js";
 import type {
   ArtifactReference,
   ArtifactStore,
@@ -69,7 +70,11 @@ import {
   resolvePlanTrustedExecutableV1,
 } from "./plan-executable-policy.js";
 import { createPlanGitAttestationV1, type PlanGitAttestationV1 } from "./plan-git-policy.js";
-import type { PlanCycleSnapshot } from "./plan-mode.js";
+import {
+  digestApprovedPlanProjectionV1,
+  type PlanCycleSnapshot,
+  submitPlanToolDefinitionV1,
+} from "./plan-mode.js";
 import {
   assemblePromptMessagesV1,
   createPromptContextV1,
@@ -164,7 +169,7 @@ export class AgentSession {
   readonly #modalityProfile: ModelModalityProfile | undefined;
   readonly #tools: ToolRegistry | undefined;
   readonly #fixedRequestTools: readonly ModelToolDefinition[] | undefined;
-  readonly #plan: PlanCycleSnapshot | undefined;
+  #plan: PlanCycleSnapshot | undefined;
   #planGitAttestation: PlanGitAttestationV1 | undefined;
   readonly #permissions: PermissionPolicy | undefined;
   #promptContext: PromptContextRecord | undefined;
@@ -406,6 +411,12 @@ export class AgentSession {
                 : { recordVersion: 1 as const, inputResources: input.inputResources }),
               runId: this.#activeRunId,
               userMessage: input.text,
+              ...(this.#durableContext.planKickoff === undefined
+                ? {}
+                : { planKickoff: this.#durableContext.planKickoff }),
+              ...(this.#durableContext.planRevision === undefined
+                ? {}
+                : { planRevision: this.#durableContext.planRevision }),
               ...(isFirstLogicalRun && !genesisHasFallback
                 ? {
                     naming: {
@@ -668,6 +679,7 @@ export class AgentSession {
       );
       if (this.#durableContext !== undefined) {
         const targetIdentity = this.#durableContext.targetIdentity;
+        const approvedPlan = this.#durableContext.approvedPlan;
         const appendAttempt = async () => {
           await this.#appendRecord({
             schemaVersion: 3,
@@ -686,6 +698,12 @@ export class AgentSession {
                       version: 1 as const,
                       assemblyIdentityDigest: this.#promptContext.assemblyIdentityDigest,
                       requestProjectionDigest: digestPromptRequestV1(requestMessages, requestTools),
+                      ...(approvedPlan === undefined
+                        ? {}
+                        : {
+                            approvedPlanProjectionDigest:
+                              digestApprovedPlanProjectionV1(approvedPlan),
+                          }),
                     },
                   }),
             },
@@ -754,6 +772,9 @@ export class AgentSession {
             preparedUserImages.projections,
           ),
           tools: requestTools,
+          ...(this.#durableContext?.approvedPlan === undefined
+            ? {}
+            : { approvedPlan: this.#durableContext.approvedPlan }),
           maximumOutputTokens,
           purpose: "ordinary",
           signal,
@@ -1112,6 +1133,11 @@ export class AgentSession {
         }
         uniqueCalls.set(call.id, call);
       }
+      if (completedCalls.length > 1 && completedCalls.some((call) => call.name === "submit_plan")) {
+        return this.#settleProtocolInvalid(
+          "submit_plan must be the only tool request in its terminal model response.",
+        );
+      }
       const toolIntents = completedCalls.map((call) => this.#createToolIntent(call));
 
       const persisted = await this.#persistDurableModelResponse({
@@ -1189,9 +1215,15 @@ export class AgentSession {
     if (profile === undefined) {
       throw new TypeError("Prompt token estimation requires a context profile.");
     }
+    const providerMessages = modelMessagesWithApprovedPlanProjectionV1({
+      messages,
+      ...(this.#durableContext?.approvedPlan === undefined
+        ? {}
+        : { approvedPlan: this.#durableContext.approvedPlan }),
+    });
     return this.#promptContext === undefined
-      ? estimateActiveContextTokens(messages, profile)
-      : estimatePromptTokensV1(messages, tools, profile);
+      ? estimateActiveContextTokens(providerMessages, profile)
+      : estimatePromptTokensV1(providerMessages, tools, profile);
   }
 
   async #compactContext(
@@ -1327,6 +1359,9 @@ export class AgentSession {
         reduceContextEvidence(records, runId, sourceThrough),
       );
       const preparedRequest = prepareContextSummaryRequestV1({
+        ...(durableContext.approvedPlan === undefined
+          ? {}
+          : { approvedPlan: durableContext.approvedPlan }),
         evidence,
         messages: projectedSummaryMessages,
         profile: contextProfile,
@@ -1365,6 +1400,9 @@ export class AgentSession {
       let compacted: Awaited<ReturnType<typeof generateContextSummary>>;
       try {
         compacted = await generateContextSummary({
+          ...(durableContext.approvedPlan === undefined
+            ? {}
+            : { approvedPlan: durableContext.approvedPlan }),
           evidence,
           messages: projectedSummaryMessages,
           model: this.#model,
@@ -1477,11 +1515,17 @@ export class AgentSession {
         const canRetryWithSmallerInput =
           attemptNumber < lastAttemptNumber &&
           estimateContextSummaryRequestTokens({
+            ...(durableContext.approvedPlan === undefined
+              ? {}
+              : { approvedPlan: durableContext.approvedPlan }),
             evidence,
             messages: smallerRetryMessages,
             profile: contextProfile,
           }) <
             estimateContextSummaryRequestTokens({
+              ...(durableContext.approvedPlan === undefined
+                ? {}
+                : { approvedPlan: durableContext.approvedPlan }),
               evidence,
               messages: summaryMessages,
               profile: contextProfile,
@@ -1963,6 +2007,9 @@ export class AgentSession {
       await this.#appendToolResult(messages, call, recordedCall.result);
       return undefined;
     }
+    if (call.name === "submit_plan") {
+      return this.#submitPlan(call, messages, toolResultsById);
+    }
     const adapter = this.#tools?.resolve(call.name);
     if (adapter === undefined) {
       const result: ToolResult = {
@@ -2303,6 +2350,125 @@ export class AgentSession {
       },
     });
     this.#planGitAttestation = attestation;
+  }
+
+  async #submitPlan(
+    call: ToolCall,
+    messages: ModelMessage[],
+    toolResultsById: Map<string, { readonly call: ToolCall; readonly result: ToolResult }>,
+  ): Promise<RunResult> {
+    const plan = this.#plan;
+    const durableContext = this.#durableContext;
+    const artifactStore = this.#artifactStore;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(call.argumentsJson);
+    } catch {
+      parsed = undefined;
+    }
+    const input =
+      parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+        ? (parsed as Record<string, unknown>)
+        : undefined;
+    const keys = input === undefined ? [] : Object.keys(input).sort();
+    const { markdown, title } = input ?? {};
+    const markdownBytes = typeof markdown === "string" ? Buffer.from(markdown, "utf8") : undefined;
+    if (
+      plan?.state !== "exploring" ||
+      durableContext?.projectId === undefined ||
+      durableContext.sessionId === undefined ||
+      artifactStore === undefined ||
+      this.#activeRunId === undefined ||
+      markdownBytes === undefined ||
+      markdownBytes.byteLength === 0 ||
+      markdownBytes.byteLength > 64 * 1024 ||
+      (title !== undefined &&
+        (typeof title !== "string" || Buffer.byteLength(title, "utf8") > 512)) ||
+      keys.some((key) => key !== "markdown" && key !== "title")
+    ) {
+      const result: ToolResult = {
+        status: "failed",
+        error: {
+          code: "invalid_tool_input",
+          message: "submit_plan requires bounded Markdown and an optional bounded title.",
+        },
+      };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return this.#settleProtocolInvalid("The submitted Plan artifact is invalid.");
+    }
+    await this.#emit({ type: "tool_started", callId: call.id, name: call.name });
+    const planId = randomUUID();
+    const revision = plan.revision + 1;
+    const artifact = await artifactStore.write({
+      bytes: markdownBytes,
+      mediaType: "text/markdown; charset=utf-8",
+      source: {
+        type: "plan",
+        schemaVersion: 1,
+        projectId: durableContext.projectId,
+        sessionId: durableContext.sessionId,
+        cycleId: plan.cycleId,
+        planId,
+        revision,
+        provenance: "model_submit_plan",
+      },
+    });
+    const result: ToolResult = {
+      status: "completed",
+      output: { status: "ready", planId, revision, contentDigest: artifact.id },
+    };
+    toolResultsById.set(call.id, { call, result });
+    const completedEvent = {
+      type: "tool_completed",
+      callId: call.id,
+      name: call.name,
+      output: result.output,
+    } as const;
+    await this.#appendRecordsAtomically([
+      {
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "runtime_event",
+          runId: this.#activeRunId,
+          event: completedEvent,
+        },
+      },
+      {
+        schemaVersion: 3,
+        sequence: this.#nextSequence + 1,
+        record: {
+          type: "plan_submitted",
+          recordVersion: 1,
+          cycleId: plan.cycleId,
+          revision,
+          planId,
+          contentDigest: artifact.id as `sha256:${string}`,
+          ...(typeof title === "string" ? { title } : {}),
+          artifact,
+          policyVersion: plan.policyVersion,
+          toolProfileDigest: plan.eligibleToolProfile.digest,
+        },
+      },
+    ]);
+    this.#publish(completedEvent);
+    messages.push({ role: "tool", callId: call.id, name: call.name, result });
+    this.#plan = {
+      ...plan,
+      state: "ready",
+      revision,
+      submission: {
+        planId,
+        revision,
+        contentDigest: artifact.id as `sha256:${string}`,
+        ...(typeof title === "string" ? { title } : {}),
+        artifact,
+        policyVersion: plan.policyVersion,
+        toolProfileDigest: plan.eligibleToolProfile.digest,
+      },
+    };
+    return this.#settle({ status: "completed", answer: "" });
   }
 
   async #activateModelSelectedSkill(call: ToolCall): Promise<ToolResult> {
@@ -3453,6 +3619,15 @@ export class AgentSession {
     this.#nextSequence += 1;
   }
 
+  async #appendRecordsAtomically(records: readonly SessionRecord[]): Promise<void> {
+    try {
+      await this.#store.appendBatch(records);
+    } catch {
+      throw new SessionPersistenceError();
+    }
+    this.#nextSequence += records.length;
+  }
+
   async #persistDurableModelResponse(input: {
     readonly answer: string;
     readonly reasoning: string;
@@ -3884,7 +4059,7 @@ function planRequestToolDefinitions(
   const visibleDefinitions = new Map(
     tools.definitions().map((definition) => [definition.name, definition] as const),
   );
-  return plan.eligibleToolProfile.definitions.map((definition) => {
+  const definitions = plan.eligibleToolProfile.definitions.map((definition) => {
     const modelDefinition = visibleDefinitions.get(definition.name);
     const adapter = tools.resolve(definition.name);
     if (
@@ -3898,6 +4073,7 @@ function planRequestToolDefinitions(
     }
     return modelDefinition;
   });
+  return plan.state === "exploring" ? [...definitions, submitPlanToolDefinitionV1] : definitions;
 }
 
 function planProfileAllowsDefinition(

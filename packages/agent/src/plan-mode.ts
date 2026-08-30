@@ -1,11 +1,27 @@
 import { createHash } from "node:crypto";
 
+import type { ArtifactReference, PlanArtifactSourceV1 } from "./artifact-store.js";
 import type { PlanShellPolicyVersion } from "./plan-command-assessment.js";
 import type { PlanGitAttestationV1 } from "./plan-git-policy.js";
 import type { PlanShellEnvironmentV1 } from "./plan-shell-environment.js";
-import type { ToolEffect } from "./tool-runtime.js";
+import type { ModelToolDefinition, ToolEffect } from "./tool-runtime.js";
 
 export const planPolicyVersions = ["plan-policy.read-v1", "plan-policy.hybrid-v1"] as const;
+
+export const submitPlanToolDefinitionV1: ModelToolDefinition = {
+  name: "submit_plan",
+  description:
+    "Publish the exact completed Markdown plan for external review. This ends the current Plan run.",
+  inputSchema: {
+    type: "object",
+    additionalProperties: false,
+    required: ["markdown"],
+    properties: {
+      title: { type: "string" },
+      markdown: { type: "string" },
+    },
+  },
+};
 
 export type PlanPolicyVersion = (typeof planPolicyVersions)[number];
 
@@ -31,8 +47,7 @@ export type PlanEligibleToolProfileV1 = {
   readonly digest: `sha256:${string}`;
 };
 
-export type PlanCycleSnapshot = {
-  readonly state: "exploring";
+type PlanCycleSnapshotBase = {
   readonly cycleId: string;
   readonly revision: number;
   readonly policyVersion: PlanPolicyVersion;
@@ -43,6 +58,75 @@ export type PlanCycleSnapshot = {
   readonly gitAttestation?: PlanGitAttestationV1;
   readonly eligibleToolProfile: PlanEligibleToolProfileV1;
 };
+
+export type PlanSubmissionSnapshotV1 = {
+  readonly planId: string;
+  readonly revision: number;
+  readonly contentDigest: `sha256:${string}`;
+  readonly title?: string;
+  readonly artifact: ArtifactReference<PlanArtifactSourceV1>;
+  readonly policyVersion: PlanPolicyVersion;
+  readonly toolProfileDigest: `sha256:${string}`;
+};
+
+export type PlanRevisionIntentV1 = {
+  readonly cycleId: string;
+  readonly fromRevision: number;
+  readonly toRevision: number;
+  readonly planId: string;
+  readonly contentDigest: `sha256:${string}`;
+};
+
+export type PlanApprovalIntentV1 = {
+  readonly sessionId: string;
+  readonly commandId: string;
+  readonly kickoffRunId: string;
+  readonly cycleId: string;
+  readonly revision: number;
+  readonly planId: string;
+  readonly contentDigest: `sha256:${string}`;
+  readonly policyVersion: PlanPolicyVersion;
+  readonly toolProfileDigest: `sha256:${string}`;
+};
+
+export type ApprovedPlanProjectionV1 = PlanApprovalIntentV1 & {
+  readonly version: 1;
+  readonly title?: string;
+  readonly markdown: string;
+};
+
+export function digestApprovedPlanProjectionV1(
+  input: Omit<ApprovedPlanProjectionV1, "markdown">,
+): `sha256:${string}` {
+  return `sha256:${createHash("sha256")
+    .update(
+      JSON.stringify({
+        version: input.version,
+        sessionId: input.sessionId,
+        commandId: input.commandId,
+        kickoffRunId: input.kickoffRunId,
+        cycleId: input.cycleId,
+        revision: input.revision,
+        planId: input.planId,
+        contentDigest: input.contentDigest,
+        title: input.title ?? null,
+        policyVersion: input.policyVersion,
+        toolProfileDigest: input.toolProfileDigest,
+      }),
+    )
+    .digest("hex")}`;
+}
+
+export type PlanCycleSnapshot = PlanCycleSnapshotBase &
+  (
+    | { readonly state: "exploring" }
+    | { readonly state: "ready"; readonly submission: PlanSubmissionSnapshotV1 }
+    | {
+        readonly state: "approved_not_started";
+        readonly submission: PlanSubmissionSnapshotV1;
+        readonly approval: PlanApprovalIntentV1;
+      }
+  );
 
 export function createPlanToolProfileV1(
   input: Omit<PlanEligibleToolProfileV1, "digest" | "version">,

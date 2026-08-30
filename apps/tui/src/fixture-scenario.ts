@@ -17,6 +17,8 @@ export const fixtureScenarios = [
   "mutation-after-release",
   "mutation-after-release-with-continuation-barrier",
   "mutation-delayed-preview",
+  "plan-review",
+  "plan-review-recovery",
   "provider-no-usage",
   "provider-usage",
   "read",

@@ -83,6 +83,7 @@ type ValidatedToolState = {
   started: boolean;
   terminal: boolean;
   terminalErrorCode?: string;
+  terminalOutput?: unknown;
 };
 
 type ValidatedAttemptState = {
@@ -169,6 +170,12 @@ export function validateCurrentSessionHistory(
   const titleGenerationIds = new Set<string>();
   let activePlanCycleId: string | undefined;
   let activePlanRevision: number | undefined;
+  let activePlanState: "exploring" | "ready" | "approved_not_started" | undefined;
+  let activePlanId: string | undefined;
+  let activePlanContentDigest: string | undefined;
+  let activePlanApprovalCommandId: string | undefined;
+  let activePlanKickoffRunId: string | undefined;
+  let planSubmissionTerminal = false;
   let activePlanPolicyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1" | undefined;
   let activePlanShellPolicyVersion: "plan-shell-policy.v1" | undefined;
   let activePlanShellEnvironmentDigest: string | undefined;
@@ -219,6 +226,7 @@ export function validateCurrentSessionHistory(
       }
       activePlanCycleId = record.cycleId;
       activePlanRevision = record.revision;
+      activePlanState = "exploring";
       activePlanPolicyVersion = record.policyVersion;
       activePlanShellPolicyVersion = record.shellPolicyVersion;
       activePlanShellEnvironmentDigest = record.shellEnvironment?.digest;
@@ -261,6 +269,17 @@ export function validateCurrentSessionHistory(
             record.gitAttestation.shellEnvironmentDigest !== record.shellEnvironment?.digest ||
             record.gitAttestation.gitPolicyVersion !== record.gitPolicyVersion ||
             record.gitAttestation.gitPolicyDigest !== record.gitPolicyDigest)) ||
+        (record.state === "ready") !== (record.submission !== undefined) ||
+        (record.submission !== undefined &&
+          (record.submission.revision !== record.revision ||
+            record.submission.policyVersion !== record.policyVersion ||
+            record.submission.toolProfileDigest !== record.eligibleToolProfile.digest ||
+            record.submission.contentDigest !== record.submission.artifact.id ||
+            record.submission.artifact.source.projectId !== genesis.record.projectId ||
+            record.submission.artifact.source.sessionId !== record.source.sessionId ||
+            record.submission.artifact.source.cycleId !== record.cycleId ||
+            record.submission.artifact.source.planId !== record.submission.planId ||
+            record.submission.artifact.source.revision !== record.revision)) ||
         record.eligibleToolProfile.source.version !== activePromptContext?.toolProfile.version ||
         record.eligibleToolProfile.source.digest !== activePromptContext.toolProfile.digest
       ) {
@@ -268,6 +287,7 @@ export function validateCurrentSessionHistory(
       }
       activePlanCycleId = record.cycleId;
       activePlanRevision = record.revision;
+      activePlanState = record.state === "ready" ? "ready" : "exploring";
       activePlanPolicyVersion = record.policyVersion;
       activePlanShellPolicyVersion = record.shellPolicyVersion;
       activePlanShellEnvironmentDigest = record.shellEnvironment?.digest;
@@ -276,6 +296,8 @@ export function validateCurrentSessionHistory(
       activePlanGitPolicyDigest = record.gitPolicyDigest;
       activePlanEligibleToolProfile = record.eligibleToolProfile;
       activePlanGitAttested = record.gitAttestation !== undefined;
+      activePlanId = record.submission?.planId;
+      activePlanContentDigest = record.submission?.contentDigest;
       continue;
     }
     if (record.type === "plan_git_attested") {
@@ -308,6 +330,82 @@ export function validateCurrentSessionHistory(
       activePlanGitAttested = true;
       continue;
     }
+    if (record.type === "plan_submitted") {
+      const submittedTool = [...toolStates.values()].find(
+        (state) => state.call.name === "submit_plan",
+      );
+      let submittedArguments: { readonly markdown?: unknown; readonly title?: unknown } | undefined;
+      try {
+        submittedArguments = JSON.parse(submittedTool?.call.argumentsJson ?? "") as {
+          readonly markdown?: unknown;
+          readonly title?: unknown;
+        };
+      } catch {
+        submittedArguments = undefined;
+      }
+      if (
+        activePlanState !== "exploring" ||
+        record.cycleId !== activePlanCycleId ||
+        record.revision !== (activePlanRevision ?? 0) + 1 ||
+        record.policyVersion !== activePlanPolicyVersion ||
+        record.toolProfileDigest !== activePlanToolProfileDigest ||
+        record.contentDigest !== record.artifact.id ||
+        record.artifact.source.projectId !== genesis.record.projectId ||
+        record.artifact.source.sessionId !== genesis.record.sessionId ||
+        record.artifact.source.cycleId !== record.cycleId ||
+        record.artifact.source.planId !== record.planId ||
+        record.artifact.source.revision !== record.revision ||
+        run === undefined ||
+        attemptState?.status !== "completed" ||
+        attemptState.response?.response.finishReason !== "tool_calls" ||
+        toolStates.size !== 1 ||
+        submittedTool === undefined ||
+        !submittedTool.requested ||
+        !submittedTool.started ||
+        !submittedTool.terminal ||
+        submittedTool.terminalErrorCode !== undefined ||
+        typeof submittedArguments?.markdown !== "string" ||
+        `sha256:${createHash("sha256").update(submittedArguments.markdown).digest("hex")}` !==
+          record.contentDigest ||
+        record.artifact.byteCount !== Buffer.byteLength(submittedArguments.markdown, "utf8") ||
+        !isDeepStrictEqual(submittedTool.terminalOutput, {
+          status: "ready",
+          planId: record.planId,
+          revision: record.revision,
+          contentDigest: record.contentDigest,
+        }) ||
+        submittedArguments.title !== record.title
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      activePlanRevision = record.revision;
+      activePlanState = "ready";
+      activePlanId = record.planId;
+      activePlanContentDigest = record.contentDigest;
+      planSubmissionTerminal = true;
+      continue;
+    }
+    if (record.type === "plan_approval_intent") {
+      if (
+        run !== undefined ||
+        activePlanState !== "ready" ||
+        record.sessionId !== genesis.record.sessionId ||
+        record.cycleId !== activePlanCycleId ||
+        record.revision !== activePlanRevision ||
+        record.planId !== activePlanId ||
+        record.contentDigest !== activePlanContentDigest ||
+        record.policyVersion !== activePlanPolicyVersion ||
+        record.toolProfileDigest !== activePlanToolProfileDigest ||
+        activePlanApprovalCommandId !== undefined ||
+        activePlanKickoffRunId !== undefined
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      activePlanState = "approved_not_started";
+      activePlanApprovalCommandId = record.commandId;
+      activePlanKickoffRunId = record.kickoffRunId;
+      continue;
+    }
     if (record.type === "plan_cycle_exited") {
       if (
         run !== undefined ||
@@ -318,6 +416,11 @@ export function validateCurrentSessionHistory(
       }
       activePlanCycleId = undefined;
       activePlanRevision = undefined;
+      activePlanState = undefined;
+      activePlanId = undefined;
+      activePlanContentDigest = undefined;
+      activePlanApprovalCommandId = undefined;
+      activePlanKickoffRunId = undefined;
       activePlanPolicyVersion = undefined;
       activePlanShellPolicyVersion = undefined;
       activePlanShellEnvironmentDigest = undefined;
@@ -579,6 +682,7 @@ export function validateCurrentSessionHistory(
         committedInputResourceReads.clear();
         skillResourceRunBytes = 0;
         inputResourceRunBytes = 0;
+        planSubmissionTerminal = false;
       }
       if (
         run !== undefined ||
@@ -591,6 +695,57 @@ export function validateCurrentSessionHistory(
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
+      if (record.planKickoff !== undefined) {
+        if (
+          record.planRevision !== undefined ||
+          activePlanState !== "approved_not_started" ||
+          record.runId !== activePlanKickoffRunId ||
+          record.planKickoff.sessionId !== genesis.record.sessionId ||
+          record.planKickoff.commandId !== activePlanApprovalCommandId ||
+          record.planKickoff.kickoffRunId !== activePlanKickoffRunId ||
+          record.planKickoff.cycleId !== activePlanCycleId ||
+          record.planKickoff.revision !== activePlanRevision ||
+          record.planKickoff.planId !== activePlanId ||
+          record.planKickoff.contentDigest !== activePlanContentDigest ||
+          record.planKickoff.policyVersion !== activePlanPolicyVersion ||
+          record.planKickoff.toolProfileDigest !== activePlanToolProfileDigest
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        activePlanCycleId = undefined;
+        activePlanRevision = undefined;
+        activePlanState = undefined;
+        activePlanId = undefined;
+        activePlanContentDigest = undefined;
+        activePlanPolicyVersion = undefined;
+        activePlanShellPolicyVersion = undefined;
+        activePlanShellEnvironmentDigest = undefined;
+        activePlanToolProfileDigest = undefined;
+        activePlanGitPolicyVersion = undefined;
+        activePlanGitPolicyDigest = undefined;
+        activePlanEligibleToolProfile = undefined;
+        activePlanGitAttested = false;
+        activePlanApprovalCommandId = undefined;
+        activePlanKickoffRunId = undefined;
+      } else if (record.planRevision !== undefined) {
+        if (
+          activePlanState !== "ready" ||
+          record.planRevision.cycleId !== activePlanCycleId ||
+          record.planRevision.fromRevision !== activePlanRevision ||
+          record.planRevision.toRevision !== record.planRevision.fromRevision + 1 ||
+          record.planRevision.planId !== activePlanId ||
+          record.planRevision.contentDigest !== activePlanContentDigest
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        activePlanRevision = record.planRevision.toRevision;
+        activePlanState = "exploring";
+        activePlanId = undefined;
+        activePlanContentDigest = undefined;
+      } else if (activePlanState === "ready" || activePlanState === "approved_not_started") {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      planSubmissionTerminal = false;
       for (const resource of record.inputResources ?? []) {
         visibleInputResources.set(resource.occurrenceId, resource);
       }
@@ -1466,7 +1621,11 @@ export function validateCurrentSessionHistory(
           JSON.stringify(terminalIntent) !== JSON.stringify(event.result)) ||
         (event.result.status === "completed" &&
           (attemptState?.status !== "completed" ||
-            attemptState.response?.response.finishReason !== "stop" ||
+            (attemptState.response?.response.finishReason !== "stop" &&
+              !(
+                planSubmissionTerminal &&
+                attemptState.response?.response.finishReason === "tool_calls"
+              )) ||
             inlineModelResponseField(attemptState.response.response.text) !== event.result.answer ||
             !sawModelCompletion)) ||
         (event.result.status === "incomplete" &&
@@ -1628,7 +1787,11 @@ export function validateCurrentSessionHistory(
         }
         state.decision = event.decision;
       } else if (event.type === "tool_started") {
-        if (!state.requested || state.started || state.decision !== "allow") {
+        if (
+          !state.requested ||
+          state.started ||
+          (state.call.name !== "submit_plan" && state.decision !== "allow")
+        ) {
           throw new SessionLifecycleError("session_invalid");
         }
         state.started = true;
@@ -1645,6 +1808,8 @@ export function validateCurrentSessionHistory(
         state.terminal = true;
         if (event.type === "tool_failed") {
           state.terminalErrorCode = event.error.code;
+        } else {
+          state.terminalOutput = event.output;
         }
       }
       continue;

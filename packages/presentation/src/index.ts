@@ -152,7 +152,7 @@ export type ArtifactReference = {
   readonly id: string;
   readonly mediaType: string;
   readonly byteCount: number;
-  readonly source: "model_response" | "tool_output" | "change_preview" | "operation";
+  readonly source: "model_response" | "tool_output" | "change_preview" | "operation" | "plan";
 };
 
 export type ArtifactChunk = {
@@ -318,6 +318,54 @@ export type OperationLinkDisplay = {
   readonly branchBoundary: BranchSourceBoundary;
 };
 
+export type PlanSubmissionDisplay = {
+  readonly planId: string;
+  readonly revision: number;
+  readonly contentDigest: `sha256:${string}`;
+  readonly title?: string;
+  readonly artifact: {
+    readonly id: string;
+    readonly mediaType: string;
+    readonly byteCount: number;
+    readonly source: {
+      readonly type: "plan";
+      readonly schemaVersion: 1;
+      readonly projectId: string;
+      readonly sessionId: string;
+      readonly cycleId: string;
+      readonly planId: string;
+      readonly revision: number;
+      readonly provenance: "model_submit_plan";
+    };
+  };
+  readonly policyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1";
+  readonly toolProfileDigest: `sha256:${string}`;
+};
+
+export type PlanApprovalDisplay = {
+  readonly sessionId: string;
+  readonly commandId: string;
+  readonly kickoffRunId: string;
+  readonly cycleId: string;
+  readonly revision: number;
+  readonly planId: string;
+  readonly contentDigest: `sha256:${string}`;
+  readonly policyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1";
+  readonly toolProfileDigest: `sha256:${string}`;
+};
+
+export type PlanSubmissionHistoryDisplay = {
+  readonly type: "plan_submission";
+  readonly id: string;
+  readonly sequence: number;
+  readonly sourceSessionId: string;
+  readonly branchBoundary: null;
+  readonly cycleId: string;
+  readonly status: "ready" | "revision_requested" | "cancelled" | "approved";
+  readonly submission: PlanSubmissionDisplay;
+  readonly approval: PlanApprovalDisplay | null;
+};
+
 export type TranscriptItem =
   | UserMessageDisplay
   | AssistantMessageDisplay
@@ -325,6 +373,7 @@ export type TranscriptItem =
   | CompactionMarkerDisplay
   | SessionNoticeDisplay
   | ToolCallDisplay
+  | PlanSubmissionHistoryDisplay
   | OperationLinkDisplay;
 
 export type BranchSourceBoundary = {
@@ -374,7 +423,7 @@ export type ActiveSessionDisplay = {
   readonly projectPaths: ProjectPathCatalogDisplay;
   readonly mcp: McpDisplay | null;
   readonly plan?: {
-    readonly state: "exploring";
+    readonly state: "exploring" | "ready" | "approved_not_started";
     readonly cycleId: string;
     readonly revision: number;
     readonly policyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1";
@@ -390,6 +439,8 @@ export type ActiveSessionDisplay = {
       }[];
       readonly digest: `sha256:${string}`;
     };
+    readonly submission?: PlanSubmissionDisplay;
+    readonly approval?: PlanApprovalDisplay;
   };
 };
 
@@ -684,6 +735,13 @@ export type TurnComposerDisplay = {
   readonly attachmentAvailable: boolean;
   readonly unavailableReason: string | null;
   readonly sealed: boolean;
+  readonly revisionIntent: {
+    readonly sessionId: string;
+    readonly cycleId: string;
+    readonly revision: number;
+    readonly planId: string;
+    readonly contentDigest: `sha256:${string}`;
+  } | null;
   readonly resources: readonly {
     readonly id: string;
     readonly displayName: string;
@@ -790,6 +848,40 @@ export type PresentationCommand =
   | {
       readonly type: "enter_plan";
       readonly sessionId: string;
+    }
+  | {
+      readonly type: "revise_plan";
+      readonly sessionId: string;
+      readonly cycleId: string;
+      readonly revision: number;
+      readonly planId: string;
+      readonly contentDigest: `sha256:${string}`;
+    }
+  | {
+      readonly type: "approve_plan";
+      readonly commandId: string;
+      readonly sessionId: string;
+      readonly cycleId: string;
+      readonly revision: number;
+      readonly planId: string;
+      readonly contentDigest: `sha256:${string}`;
+    }
+  | {
+      readonly type: "continue_plan";
+      readonly commandId: string;
+      readonly sessionId: string;
+      readonly cycleId: string;
+      readonly revision: number;
+      readonly planId: string;
+      readonly contentDigest: `sha256:${string}`;
+    }
+  | {
+      readonly type: "cancel_plan";
+      readonly sessionId: string;
+      readonly cycleId: string;
+      readonly revision: number;
+      readonly planId: string;
+      readonly contentDigest: `sha256:${string}`;
     }
   | {
       readonly type: "exit_plan";

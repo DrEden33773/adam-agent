@@ -103,9 +103,8 @@ describe("one-shot CLI deterministic coding process", () => {
         cwd: workspaceRoot,
         environment: { HOME: userHome, XDG_CONFIG_HOME: configRoot },
         stateRoot,
-        stdin: "y\ny\n",
+        permissionDecisions: ["y", "y"],
       });
-
       expect({ result, content: await readFile(demoPath, "utf8") }).toEqual({
         result: {
           stdout: "The demo file was updated and verified.\n",
@@ -127,7 +126,7 @@ async function runCliArguments(input: {
   readonly cwd: string;
   readonly environment?: Readonly<Record<string, string>>;
   readonly stateRoot: string;
-  readonly stdin?: string;
+  readonly permissionDecisions?: readonly string[];
 }): Promise<CliResult> {
   const environment: NodeJS.ProcessEnv = { ...process.env, ...input.environment };
   for (const name of [
@@ -148,13 +147,38 @@ async function runCliArguments(input: {
     },
     stdio: ["pipe", "pipe", "pipe"],
   });
-  child.stdin.end(input.stdin ?? "");
-
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
+  let permissionPromptOffset = 0;
+  let permissionDecisionIndex = 0;
+  let allPermissionDecisionsWritten = false;
   let spawnError: Error | undefined;
-  child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-  child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdout.push(chunk);
+    if (allPermissionDecisionsWritten) {
+      child.stdin.end();
+    }
+  });
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderr.push(chunk);
+    const stderrText = Buffer.concat(stderr).toString("utf8");
+    let promptIndex = stderrText.indexOf("[y/N] ", permissionPromptOffset);
+    while (promptIndex !== -1) {
+      permissionPromptOffset = promptIndex + "[y/N] ".length;
+      const decision = input.permissionDecisions?.[permissionDecisionIndex];
+      if (decision !== undefined) {
+        permissionDecisionIndex += 1;
+        child.stdin.write(`${decision}\n`);
+        if (permissionDecisionIndex === input.permissionDecisions?.length) {
+          allPermissionDecisionsWritten = true;
+        }
+      }
+      promptIndex = stderrText.indexOf("[y/N] ", permissionPromptOffset);
+    }
+  });
+  if (input.permissionDecisions === undefined || input.permissionDecisions.length === 0) {
+    child.stdin.end();
+  }
 
   return await new Promise<CliResult>((resolve, reject) => {
     child.once("error", (error) => {

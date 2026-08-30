@@ -34,6 +34,7 @@ import {
   openJsonlSessionStore,
   planShellEnvironmentFactory,
   type SessionRecord,
+  submitPlanToolDefinitionV1,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
@@ -2395,7 +2396,8 @@ test.each([
       );
       const requestTools = tools
         .definitions()
-        .filter((definition) => planToolNames.has(definition.name));
+        .filter((definition) => planToolNames.has(definition.name))
+        .concat(submitPlanToolDefinitionV1);
       const store = await harness.sessions.open(created.sessionId);
       if (store === undefined || entered.promptContext === undefined) {
         throw new Error("Expected the created Plan session store and prompt context.");
@@ -2578,7 +2580,8 @@ test.each([
         expect(publicEvents).toHaveLength(0);
         return;
       }
-      await expect(cold.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+      const recovered = await cold.resume({ sessionId: created.sessionId });
+      expect(recovered).toMatchObject({
         status: "ready",
         snapshot: { status: "interrupted", plan: { cycleId: plan.cycleId } },
       });

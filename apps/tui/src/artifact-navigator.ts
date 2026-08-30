@@ -26,6 +26,21 @@ export function activeChronologyArtifacts(
   operations: readonly OperationDisplay[] = [],
 ): readonly ArtifactEntry[] {
   const chronology = items.flatMap((item) => {
+    if (item.type === "plan_submission") {
+      return [
+        {
+          artifact: {
+            id: item.submission.artifact.id,
+            mediaType: item.submission.artifact.mediaType,
+            byteCount: item.submission.artifact.byteCount,
+            source: "plan" as const,
+          },
+          description: `${item.submission.artifact.byteCount} bytes · ${item.submission.artifact.mediaType} · ${item.status}`,
+          key: `${item.id}:plan`,
+          label: item.submission.title ?? `Plan revision ${item.submission.revision}`,
+        },
+      ];
+    }
     if (item.type === "assistant_message" && item.artifact !== null) {
       return [
         {

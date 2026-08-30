@@ -78,12 +78,24 @@ export type InputResourceArtifactSourceV1 = {
   readonly provenance: "user_local_file";
 };
 
+export type PlanArtifactSourceV1 = {
+  readonly type: "plan";
+  readonly schemaVersion: 1;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly cycleId: string;
+  readonly planId: string;
+  readonly revision: number;
+  readonly provenance: "model_submit_plan";
+};
+
 export type ArtifactSource =
   | ChangePreviewArtifactSource
   | ExtensionArtifactSource
   | InputResourceArtifactSourceV1
   | McpToolResultArtifactSourceV1
   | ModelResponseArtifactSource
+  | PlanArtifactSourceV1
   | SkillArtifactSource
   | ToolArtifactSource;
 

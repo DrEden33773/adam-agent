@@ -71,9 +71,15 @@ import {
 } from "./model-targets.js";
 import { planGitAutomaticPolicyV1 } from "./plan-git-policy.js";
 import {
+  type ApprovedPlanProjectionV1,
   createPlanToolProfileV1,
+  digestApprovedPlanProjectionV1,
+  type PlanApprovalIntentV1,
   type PlanEligibleToolProfileV1,
   type PlanPolicyVersion,
+  type PlanRevisionIntentV1,
+  type PlanSubmissionSnapshotV1,
+  submitPlanToolDefinitionV1,
 } from "./plan-mode.js";
 import {
   createPlanShellEnvironmentV1,
@@ -250,6 +256,15 @@ export type SessionLogicalRunStartedBarrier = {
   }): Promise<void>;
 };
 
+/** Tests only. Production Plan approval proceeds directly from durable intent to kickoff. */
+export const planApprovalIntentBarrier = Symbol("adam-agent.plan-approval-intent-barrier");
+
+export type PlanApprovalIntentBarrier = {
+  afterDurableRecord(
+    input: PlanApprovalIntentV1 & { readonly sequence: number },
+  ): Promise<void> | void;
+};
+
 /** Tests only. Production lifecycle instances always default automatic titles on. */
 export const sessionAutomaticTitlesEnabled = Symbol("adam-agent.session-automatic-titles-enabled");
 
@@ -326,6 +341,7 @@ export type SessionLifecycleOptions = {
   readonly [mcpCloseConfirmation]?: McpCloseConfirmation;
   readonly [sessionTitleDeadlineScheduler]?: SessionTitleDeadlineScheduler;
   readonly [sessionLogicalRunStartedBarrier]?: SessionLogicalRunStartedBarrier;
+  readonly [planApprovalIntentBarrier]?: PlanApprovalIntentBarrier;
   readonly [sessionAutomaticTitlesEnabled]?: boolean;
   readonly [planShellEnvironmentFactory]?: PlanShellEnvironmentFactory;
   readonly [sessionCloseDrainBarrier]?: SessionCloseDrainBarrier;
@@ -501,6 +517,19 @@ export type SessionCommand =
       readonly signal?: AbortSignal;
       readonly thinkingSelection?: ThinkingPolicySelectionV1;
       readonly resourceSelections?: readonly InputResourceSelectionV1[];
+      readonly planRevision?: {
+        readonly cycleId: string;
+        readonly revision: number;
+        readonly planId: string;
+        readonly contentDigest: `sha256:${string}`;
+      };
+      readonly planApproval?: {
+        readonly commandId: string;
+        readonly cycleId: string;
+        readonly revision: number;
+        readonly planId: string;
+        readonly contentDigest: `sha256:${string}`;
+      };
     }
   | ({
       readonly type: "branch";
@@ -537,6 +566,19 @@ export interface SessionLifecycle {
     readonly signal?: AbortSignal;
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
     readonly resourceSelections?: readonly InputResourceSelectionV1[];
+    readonly planRevision?: {
+      readonly cycleId: string;
+      readonly revision: number;
+      readonly planId: string;
+      readonly contentDigest: `sha256:${string}`;
+    };
+    readonly planApproval?: {
+      readonly commandId: string;
+      readonly cycleId: string;
+      readonly revision: number;
+      readonly planId: string;
+      readonly contentDigest: `sha256:${string}`;
+    };
   }): Promise<SessionContinueResult>;
   configureMcp(command: McpConfigurationCommand): Promise<McpConfigurationResult>;
   configureWorkspaceTrust(
@@ -547,6 +589,13 @@ export interface SessionLifecycle {
   enableAutomaticTitles(): void;
   ensureAutomaticTitle(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
   enterPlan(input: { readonly sessionId: string }): Promise<CurrentSessionSnapshot>;
+  cancelPlan(input: {
+    readonly sessionId: string;
+    readonly cycleId: string;
+    readonly revision: number;
+    readonly planId: string;
+    readonly contentDigest: `sha256:${string}`;
+  }): Promise<CurrentSessionSnapshot>;
   exitPlan(input: {
     readonly sessionId: string;
     readonly cycleId: string;
@@ -2274,6 +2323,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                 ? {}
                 : { gitAttestation: parentPlan.gitAttestation }),
               eligibleToolProfile: parentPlan.eligibleToolProfile,
+              state: parentPlan.state === "exploring" ? "exploring" : "ready",
+              ...(parentPlan.state === "exploring" ? {} : { submission: parentPlan.submission }),
               source: { sessionId: sourceSessionId, throughSequence: sourceEventPosition },
             },
           });
@@ -2452,13 +2503,21 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     async continue(input) {
       if (
         (input.runId !== undefined && !z.uuid().safeParse(input.runId).success) ||
+        (input.planApproval !== undefined &&
+          (!z.uuid().safeParse(input.planApproval.commandId).success ||
+            input.input !== undefined ||
+            input.runId !== undefined ||
+            input.planRevision !== undefined ||
+            input.resourceSelections !== undefined ||
+            input.thinkingSelection !== undefined)) ||
         (input.resourceSelections !== undefined && input.input === undefined) ||
         input.input?.inputResources !== undefined
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
-      const effectiveRunId =
+      let effectiveRunId =
         input.resourceSelections === undefined ? input.runId : (input.runId ?? randomUUID());
+      let effectiveInput = input.input;
       disarmMcpIdle(input.sessionId);
       await waitForMcpIdleOperation(input.sessionId);
       const continued = await withOwner(async () => {
@@ -2474,7 +2533,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           }
           throw new SessionLifecycleError("session_invalid");
         }
-        if (resumed.snapshot.status === "settled" && input.input === undefined) {
+        if (
+          resumed.snapshot.status === "settled" &&
+          effectiveInput === undefined &&
+          input.planApproval === undefined
+        ) {
           throw new SessionLifecycleError("session_invalid");
         }
         if (resumed.snapshot.mcp?.status === "mcp_shutdown_unconfirmed") {
@@ -2493,7 +2556,97 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ) {
           throw new SessionLifecycleError("session_invalid");
         }
-        if (resumed.snapshot.status === "interrupted" && input.input !== undefined) {
+        if (resumed.snapshot.status === "interrupted" && effectiveInput !== undefined) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const artifactRoot = join(effectiveSessionStateRoot(options.stateRoot), "artifacts");
+        const artifactStore = await createFileArtifactStore({ root: artifactRoot });
+        let planRevision: PlanRevisionIntentV1 | undefined;
+        let planApproval: PlanApprovalIntentV1 | undefined;
+        let approvedSubmission: PlanSubmissionSnapshotV1 | undefined;
+        let approvedPlan: ApprovedPlanProjectionV1 | undefined;
+        let runtimePlan = resumed.snapshot.plan;
+        if (input.planApproval !== undefined) {
+          const currentPlan = resumed.snapshot.plan;
+          if (
+            currentPlan === undefined ||
+            currentPlan.state === "exploring" ||
+            input.planApproval.cycleId !== currentPlan.cycleId ||
+            input.planApproval.revision !== currentPlan.revision ||
+            input.planApproval.planId !== currentPlan.submission.planId ||
+            input.planApproval.contentDigest !== currentPlan.submission.contentDigest
+          ) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          approvedSubmission = currentPlan.submission;
+          if (currentPlan.state === "ready") {
+            planApproval = {
+              sessionId: input.sessionId,
+              commandId: input.planApproval.commandId,
+              kickoffRunId: randomUUID(),
+              cycleId: currentPlan.cycleId,
+              revision: currentPlan.revision,
+              planId: currentPlan.submission.planId,
+              contentDigest: currentPlan.submission.contentDigest,
+              policyVersion: currentPlan.policyVersion,
+              toolProfileDigest: currentPlan.eligibleToolProfile.digest,
+            };
+            approvedPlan = await materializeApprovedPlanProjection(
+              artifactStore,
+              planApproval,
+              approvedSubmission,
+            );
+            const sequence = resumed.snapshot.lastSequence + 1;
+            const approvalStore = await openSessionStore(options, input.sessionId);
+            await approvalStore.append({
+              schemaVersion: 3,
+              sequence,
+              record: { type: "plan_approval_intent", recordVersion: 1, ...planApproval },
+            });
+            await options[planApprovalIntentBarrier]?.afterDurableRecord({
+              ...planApproval,
+              sequence,
+            });
+          } else {
+            if (input.planApproval.commandId !== currentPlan.approval.commandId) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+            planApproval = currentPlan.approval;
+            approvedPlan = await materializeApprovedPlanProjection(
+              artifactStore,
+              planApproval,
+              approvedSubmission,
+            );
+          }
+          effectiveRunId = planApproval.kickoffRunId;
+          effectiveInput = { text: "Implement the approved plan." };
+          runtimePlan = undefined;
+        } else if (input.planRevision !== undefined) {
+          const ready = resumed.snapshot.plan;
+          if (
+            effectiveInput === undefined ||
+            ready?.state !== "ready" ||
+            input.planRevision.cycleId !== ready.cycleId ||
+            input.planRevision.revision !== ready.revision ||
+            input.planRevision.planId !== ready.submission.planId ||
+            input.planRevision.contentDigest !== ready.submission.contentDigest
+          ) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          planRevision = {
+            cycleId: ready.cycleId,
+            fromRevision: ready.revision,
+            toRevision: ready.revision + 1,
+            planId: ready.submission.planId,
+            contentDigest: ready.submission.contentDigest,
+          };
+          const { submission: _submission, ...withoutSubmission } = ready;
+          runtimePlan = {
+            ...withoutSubmission,
+            state: "exploring",
+            revision: planRevision.toRevision,
+          };
+        } else if (resumed.snapshot.plan?.state === "ready" && effectiveInput !== undefined) {
           throw new SessionLifecycleError("session_invalid");
         }
         if (options.modelTargets === undefined) {
@@ -2534,11 +2687,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         ) {
           throw new SessionLifecycleError("session_model_target_incompatible");
         }
-        if (input.input === undefined && input.thinkingSelection !== undefined) {
+        if (effectiveInput === undefined && input.thinkingSelection !== undefined) {
           throw new SessionLifecycleError("session_invalid");
         }
         const newRunThinkingPolicy =
-          input.input === undefined
+          effectiveInput === undefined
             ? undefined
             : preparedAdmission !== undefined && preparedAdmission.runId === input.runId
               ? preparedAdmission.thinkingPolicy
@@ -2792,13 +2945,36 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           resumed.snapshot.status === "interrupted"
             ? createAgentResumeState(replayRecords, options, resumed.snapshot)
             : undefined;
+        if (resumeState !== undefined && planApproval === undefined) {
+          const kickoffRecord = replayRecords.findLast(
+            (record) =>
+              record.schemaVersion === 3 &&
+              record.record.type === "logical_run_started" &&
+              record.record.runId === resumeState.agentState.runId &&
+              record.record.planKickoff !== undefined,
+          );
+          const recoveredKickoff =
+            kickoffRecord?.schemaVersion === 3 &&
+            kickoffRecord.record.type === "logical_run_started"
+              ? kickoffRecord.record.planKickoff
+              : undefined;
+          if (recoveredKickoff !== undefined) {
+            const recoveredSubmission = planSubmissionForApproval(replayRecords, recoveredKickoff);
+            if (recoveredSubmission === undefined) {
+              throw new SessionLifecycleError("session_invalid");
+            }
+            planApproval = recoveredKickoff;
+            approvedSubmission = recoveredSubmission;
+            runtimePlan = undefined;
+          }
+        }
         const recoveredThinkingPolicy =
           resumeState?.thinkingPolicy === undefined
             ? undefined
             : requireRecoveredThinkingPolicy(resolved, resumeState.thinkingPolicy);
         if (
           effectiveRunId !== undefined &&
-          (input.input === undefined ||
+          (effectiveInput === undefined ||
             resumeState !== undefined ||
             replayRecords.some(
               (record) =>
@@ -2824,7 +3000,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                 ...resumeState.agentState,
                 messages: [...inheritedMessages, ...resumeState.agentState.messages],
               };
-        if (resumeState === undefined && input.input === undefined) {
+        if (resumeState === undefined && effectiveInput === undefined) {
           throw new SessionLifecycleError("session_invalid");
         }
         const store = await openSessionStore(options, input.sessionId);
@@ -2833,8 +3009,17 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             readonly [sessionDurableOutputLimits]?: AgentSessionDurableOutputLimits;
           }
         )[sessionDurableOutputLimits];
-        const artifactRoot = join(effectiveSessionStateRoot(options.stateRoot), "artifacts");
-        const artifactStore = await createFileArtifactStore({ root: artifactRoot });
+        if (
+          approvedPlan === undefined &&
+          planApproval !== undefined &&
+          approvedSubmission !== undefined
+        ) {
+          approvedPlan = await materializeApprovedPlanProjection(
+            artifactStore,
+            planApproval,
+            approvedSubmission,
+          );
+        }
         await validateVisibleInputResourceArtifacts(artifactStore, visibleInputResources);
         const inputResources =
           input.resourceSelections === undefined
@@ -2854,9 +3039,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               });
         input.signal?.throwIfAborted();
         const runInput =
-          input.input === undefined || inputResources.length === 0
-            ? input.input
-            : { ...input.input, inputResources };
+          effectiveInput === undefined || inputResources.length === 0
+            ? effectiveInput
+            : { ...effectiveInput, inputResources };
         const runtimeInputResources = [...visibleInputResources, ...inputResources];
         if (runtimeInputResources.length > inputResourceLimitsV1.maximumOccurrencesPerLineage) {
           throw new InputResourceError(
@@ -2889,7 +3074,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               ? {}
               : { inputResources: runtimeInputResources }),
             projectId: resumed.snapshot.projectId,
-            ...(resumed.snapshot.plan === undefined ? {} : { plan: resumed.snapshot.plan }),
+            ...(approvedPlan === undefined ? {} : { approvedPlan }),
+            ...(planApproval === undefined ? {} : { planKickoff: planApproval }),
+            ...(runtimePlan === undefined ? {} : { plan: runtimePlan }),
+            ...(planRevision === undefined ? {} : { planRevision }),
             referencedModelResponseArtifactBytes,
             skillResourceLineageBytes,
             inputResourceLineageBytes,
@@ -4306,7 +4494,45 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           inspected.schemaVersion !== 3 ||
           (inspected.status !== "idle" && inspected.status !== "settled") ||
           inspected.plan?.cycleId !== input.cycleId ||
-          inspected.plan.revision !== input.revision
+          inspected.plan.revision !== input.revision ||
+          inspected.plan.state !== "exploring"
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const records = await readSessionRecords(options, input.sessionId);
+        const store = await openSessionStore(options, input.sessionId);
+        await store.append({
+          schemaVersion: 3,
+          sequence: (records.at(-1)?.sequence ?? 0) + 1,
+          record: {
+            type: "plan_cycle_exited",
+            recordVersion: 1,
+            cycleId: input.cycleId,
+            revision: input.revision + 1,
+            reason: "user_cancelled",
+          },
+        });
+        const snapshot = await inspectSession({ sessionId: input.sessionId });
+        if (snapshot.schemaVersion !== 3) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        return snapshot;
+      });
+    },
+    async cancelPlan(input) {
+      if (activeSession !== undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return withOwner(async () => {
+        const inspected = await inspectSession({ sessionId: input.sessionId });
+        if (
+          inspected.schemaVersion !== 3 ||
+          (inspected.status !== "idle" && inspected.status !== "settled") ||
+          inspected.plan?.state !== "ready" ||
+          inspected.plan.cycleId !== input.cycleId ||
+          inspected.plan.revision !== input.revision ||
+          inspected.plan.submission.planId !== input.planId ||
+          inspected.plan.submission.contentDigest !== input.contentDigest
         ) {
           throw new SessionLifecycleError("session_invalid");
         }
@@ -4941,22 +5167,50 @@ async function validatePromptProjectionDigests(
     const tools =
       plan === undefined
         ? context.toolProfile.definitions.map(({ definition }) => definition)
-        : plan.eligibleToolProfile.definitions.map((eligible) => {
-            const definition = context.toolProfile.definitions.find(
-              (candidate) => candidate.name === eligible.name,
-            )?.definition;
-            if (
-              definition === undefined ||
-              plan.eligibleToolProfile.source.version !== context.toolProfile.version ||
-              plan.eligibleToolProfile.source.digest !== context.toolProfile.digest
-            ) {
-              throw new SessionLifecycleError("session_invalid");
-            }
-            return definition;
-          });
+        : [
+            ...plan.eligibleToolProfile.definitions.map((eligible) => {
+              const definition = context.toolProfile.definitions.find(
+                (candidate) => candidate.name === eligible.name,
+              )?.definition;
+              if (
+                definition === undefined ||
+                plan.eligibleToolProfile.source.version !== context.toolProfile.version ||
+                plan.eligibleToolProfile.source.digest !== context.toolProfile.digest
+              ) {
+                throw new SessionLifecycleError("session_invalid");
+              }
+              return definition;
+            }),
+            ...(plan.state === "exploring" ? [submitPlanToolDefinitionV1] : []),
+          ];
+    const providerRunId = entry.record.runId;
+    const kickoff = prefix.findLast(
+      (candidate) =>
+        candidate.schemaVersion === 3 &&
+        candidate.record.type === "logical_run_started" &&
+        candidate.record.runId === providerRunId &&
+        candidate.record.planKickoff !== undefined,
+    );
+    const kickoffIntent =
+      kickoff?.schemaVersion === 3 &&
+      kickoff.record.type === "logical_run_started" &&
+      kickoff.record.planKickoff !== undefined
+        ? kickoff.record.planKickoff
+        : undefined;
+    const submission =
+      kickoffIntent === undefined ? undefined : planSubmissionForApproval(prefix, kickoffIntent);
+    const expectedApprovedPlanDigest =
+      kickoffIntent !== undefined && submission !== undefined
+        ? digestApprovedPlanProjectionV1({
+            version: 1,
+            ...kickoffIntent,
+            ...(submission.title === undefined ? {} : { title: submission.title }),
+          })
+        : undefined;
     if (
+      entry.record.promptProjection.approvedPlanProjectionDigest !== expectedApprovedPlanDigest ||
       digestPromptRequestV1(messages, tools) !==
-      entry.record.promptProjection.requestProjectionDigest
+        entry.record.promptProjection.requestProjectionDigest
     ) {
       throw new SessionLifecycleError("session_invalid");
     }
@@ -5664,12 +5918,20 @@ function createAgentResumeState(
     contextCheckpoint?.record.type === "context_compaction_committed"
       ? contextCheckpoint.record
       : undefined;
-  const messages: NonNullable<AgentSessionDurableContext["resume"]>["messages"][number][] =
-    contextCheckpointRecord !== undefined
-      ? modelMessagesFromCompleteRecords(
-          currentRecords.filter((record) => record.sequence <= (contextCheckpoint?.sequence ?? 0)),
-        )
-      : [createInputResourceUserMessageV1(run.record.userMessage, run.record.inputResources)];
+  const checkpointIncludesCurrentRun =
+    contextCheckpointRecord !== undefined && (contextCheckpoint?.sequence ?? 0) >= run.sequence;
+  const messages: NonNullable<AgentSessionDurableContext["resume"]>["messages"][number][] = [
+    ...modelMessagesFromCompleteRecords(
+      currentRecords.filter((record) =>
+        checkpointIncludesCurrentRun
+          ? record.sequence <= (contextCheckpoint?.sequence ?? 0)
+          : record.sequence < run.sequence,
+      ),
+    ),
+    ...(checkpointIncludesCurrentRun
+      ? []
+      : [createInputResourceUserMessageV1(run.record.userMessage, run.record.inputResources)]),
+  ];
   const toolResults: Array<
     NonNullable<AgentSessionDurableContext["resume"]>["toolResults"][number]
   > = [];
@@ -6224,6 +6486,80 @@ async function validateVisibleInputResourceArtifacts(
       );
     }
   }
+}
+
+async function materializeApprovedPlanProjection(
+  artifactStore: ArtifactStore,
+  approval: PlanApprovalIntentV1,
+  submission: PlanSubmissionSnapshotV1,
+): Promise<ApprovedPlanProjectionV1> {
+  let bytes: Uint8Array | undefined;
+  try {
+    bytes = await artifactStore.read(submission.artifact.id, { maximumBytes: 64 * 1_024 });
+  } catch {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  if (
+    bytes === undefined ||
+    bytes.byteLength !== submission.artifact.byteCount ||
+    `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== submission.contentDigest
+  ) {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  let markdown: string;
+  try {
+    markdown = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new SessionLifecycleError("session_invalid");
+  }
+  return {
+    version: 1,
+    ...approval,
+    ...(submission.title === undefined ? {} : { title: submission.title }),
+    markdown,
+  };
+}
+
+function planSubmissionForApproval(
+  records: readonly SessionRecord[],
+  approval: PlanApprovalIntentV1,
+): PlanSubmissionSnapshotV1 | undefined {
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const entry = records[index];
+    if (entry?.schemaVersion !== 3) {
+      continue;
+    }
+    if (
+      entry.record.type === "plan_submitted" &&
+      entry.record.cycleId === approval.cycleId &&
+      entry.record.revision === approval.revision &&
+      entry.record.planId === approval.planId &&
+      entry.record.contentDigest === approval.contentDigest
+    ) {
+      return {
+        planId: entry.record.planId,
+        revision: entry.record.revision,
+        contentDigest: entry.record.contentDigest,
+        ...(entry.record.title === undefined ? {} : { title: entry.record.title }),
+        artifact: entry.record.artifact,
+        policyVersion: entry.record.policyVersion,
+        toolProfileDigest: entry.record.toolProfileDigest,
+      };
+    }
+    const inherited = entry.record;
+    if (
+      inherited.type === "plan_cycle_inherited" &&
+      inherited.state === "ready" &&
+      inherited.submission !== undefined &&
+      inherited.cycleId === approval.cycleId &&
+      inherited.revision === approval.revision &&
+      inherited.submission.planId === approval.planId &&
+      inherited.submission.contentDigest === approval.contentDigest
+    ) {
+      return inherited.submission;
+    }
+  }
+  return undefined;
 }
 
 async function canonicalProjectId(workspaceRoot: string): Promise<string> {

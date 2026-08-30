@@ -5240,6 +5240,7 @@ test("SessionLifecycle Plan auto-allows an exact committed read-only MCP tool", 
         "read_skill_resource",
         "read_input_resource",
         qualifiedName,
+        "submit_plan",
       ]);
       return [
         { type: "tool_call_start", id: "plan-mcp-read", name: qualifiedName as string },

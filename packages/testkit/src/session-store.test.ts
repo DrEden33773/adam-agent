@@ -307,6 +307,39 @@ test("SessionStore adapters read legacy v1 records and current v2 patch records"
   }
 });
 
+test("SessionStore adapters append one validated record batch all-or-none before one durable read", async () => {
+  const { testRoot, stores } = await createContractStores(
+    "adam-agent-session-atomic-batch-",
+    "session-atomic-batch",
+  );
+  const first: SessionEventRecord = {
+    schemaVersion: 2,
+    runId,
+    sequence: 1,
+    event: { type: "user_message", text: "first" },
+  };
+  const second: SessionEventRecord = {
+    schemaVersion: 2,
+    runId,
+    sequence: 2,
+    event: { type: "model_message_started" },
+  };
+  const wrongSequence: SessionEventRecord = { ...second, sequence: 3 };
+
+  try {
+    for (const [name, store] of stores) {
+      await expect(store.appendBatch([first, wrongSequence]), name).rejects.toBeInstanceOf(
+        SessionStoreError,
+      );
+      expect(await store.read(), name).toEqual([]);
+      await store.appendBatch([first, second]);
+      expect(await store.read(), name).toEqual([first, second]);
+    }
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionStore adapters do not widen the historical v2 tool-error schema", async () => {
   const { testRoot, stores } = await createContractStores(
     "adam-agent-session-v2-input-resource-error-",
