@@ -3841,7 +3841,7 @@ test("AgentSession never retries a context overflow after ordinary output has be
     status: "failed",
     error: {
       code: "model_request_failed",
-      message: "The provider rejected the context length.",
+      message: "The model provider rejected the request as invalid.",
       category: "invalid_request",
       status: 400,
       providerCode: "context_length_exceeded",

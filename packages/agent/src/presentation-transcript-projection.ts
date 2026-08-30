@@ -5,7 +5,7 @@ import type {
   ToolCallDisplay,
   TranscriptItem,
 } from "@adam-agent/presentation";
-import type { RuntimeEvent } from "./agent-session-contracts.js";
+import type { RunResult, RuntimeEvent } from "./agent-session-contracts.js";
 import type { SessionRecord } from "./session-store.js";
 
 type PresentationTranscriptHistoryRecord = {
@@ -249,7 +249,7 @@ export function projectTranscript(
               branchBoundary: { sessionId, sequence: entry.sequence },
               status: "failed",
               code: result.error.code,
-              message: safeRunFailureMessage(result.error.code),
+              message: safeRunFailureMessage(result.error),
             }
           : {
               type: "session_notice",
@@ -468,12 +468,25 @@ export function providerDisplayName(vendor: string | undefined): string {
   return vendor === "deepseek" ? "DeepSeek" : (vendor ?? "Provider");
 }
 
-function safeRunFailureMessage(code: string): string {
+type FailedRunError = Extract<RunResult, { readonly status: "failed" }>["error"];
+
+function safeRunFailureMessage(error: FailedRunError): string {
+  const code = error.code;
   if (code === "tool_effect_indeterminate") {
     return "A tool effect requires inspection before continuing.";
   }
   if (code === "session_persistence_failed") {
     return "The session could not make its result durable.";
+  }
+  if (code === "model_request_failed" || code === "context_compaction_failed") {
+    const summary = safeModelDriverFailureSummary(error);
+    const status = error.status;
+    const metadata = [
+      status !== undefined && Number.isSafeInteger(status) && status >= 100 && status <= 599
+        ? `HTTP ${status}`
+        : undefined,
+    ].filter((value): value is string => value !== undefined);
+    return metadata.length === 0 ? summary : `${summary} ${metadata.join(" · ")}`;
   }
   if (code.startsWith("context_") || code.startsWith("token_")) {
     return "The run could not continue within its context limits.";
@@ -482,4 +495,44 @@ function safeRunFailureMessage(code: string): string {
     return "The requested Skill activation failed.";
   }
   return "The model run failed.";
+}
+
+function safeModelDriverFailureSummary(
+  error: Extract<
+    FailedRunError,
+    { readonly code: "model_request_failed" | "context_compaction_failed" }
+  >,
+): string {
+  if (
+    error.category === "protocol_incompatibility" &&
+    error.diagnosticCode === "tool_schema_root_not_object"
+  ) {
+    return "A tool schema is incompatible with the selected provider.";
+  }
+  const subject =
+    error.code === "context_compaction_failed" ? "Context compaction" : "The provider";
+  switch (error.category) {
+    case "authentication":
+      return `${subject} rejected the configured credential.`;
+    case "authorization":
+      return `${subject} denied the request.`;
+    case "billing":
+      return `${subject} could not run the request because billing is unavailable.`;
+    case "rate_limit":
+      return `${subject} rate limit was reached.`;
+    case "invalid_request":
+      return `${subject} rejected the request as invalid.`;
+    case "provider":
+      return `${subject} could not complete the request.`;
+    case "transport":
+      return `${subject} connection failed.`;
+    case "protocol_incompatibility":
+      return `${subject} response was incompatible with Adam.`;
+    case "timeout":
+      return `${subject} request reached its deadline.`;
+    case "aborted":
+      return `${subject} request was aborted.`;
+    case "unknown":
+      return `${subject} request failed.`;
+  }
 }

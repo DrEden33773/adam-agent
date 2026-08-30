@@ -993,7 +993,7 @@ describe("one-shot CLI", () => {
 
       expect(result).toEqual({
         stdout: "",
-        stderr: "The model provider rejected authentication.\n",
+        stderr: "The model provider rejected the configured credential.\n",
         exitCode: 1,
         signal: null,
       });

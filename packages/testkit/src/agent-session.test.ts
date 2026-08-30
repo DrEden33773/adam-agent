@@ -627,7 +627,7 @@ describe("AgentSession", () => {
       status: "failed",
       error: {
         code: "model_request_failed",
-        message: "The provider stream failed.",
+        message: "The model provider connection failed.",
         category: "transport",
       },
     });
@@ -655,12 +655,104 @@ describe("AgentSession", () => {
           status: "failed",
           error: {
             code: "model_request_failed",
-            message: "The provider stream failed.",
+            message: "The model provider connection failed.",
             category: "transport",
           },
         },
       },
     ]);
+  });
+
+  test("a model request failure settles with bounded diagnostics and no provider text", async () => {
+    const privateValue = "private-provider-body-and-secret";
+    const model: ModelDriver = {
+      async *stream() {
+        yield await Promise.reject(
+          new ModelDriverError(
+            "protocol_incompatibility",
+            `The provider exposed ${privateValue}.`,
+            {
+              cause: new Error(`private cause ${privateValue}`),
+              diagnosticCode: "tool_schema_root_not_object",
+              status: 400,
+              providerCode: "invalid_request_error",
+              requestId: "request-safe-1",
+              responseSummary: `private summary ${privateValue}`,
+            },
+          ),
+        );
+      },
+    };
+    const store = createInMemorySessionStore<SessionRecord>();
+    const session = createTestSession({ model, store: store as unknown as SessionStore });
+    const events: RuntimeEvent[] = [];
+    session.subscribe((event) => events.push(event));
+
+    const result = await session.run({ text: "Keep only safe provider diagnostics" });
+
+    const expectedResult = {
+      status: "failed",
+      error: {
+        code: "model_request_failed",
+        message: "A model tool schema is incompatible with the selected provider.",
+        category: "protocol_incompatibility",
+        diagnosticCode: "tool_schema_root_not_object",
+        status: 400,
+        providerCode: "invalid_request_error",
+        requestId: "request-safe-1",
+      },
+    } as const;
+    expect(result).toEqual(expectedResult);
+    expect(events.at(-1)).toEqual({ type: "session_settled", result: expectedResult });
+    expect(await store.read()).toContainEqual(
+      expect.objectContaining({
+        event: expect.objectContaining({ type: "session_settled", result: expectedResult }),
+      }),
+    );
+    expect(JSON.stringify({ result, events, records: await store.read() })).not.toContain(
+      privateValue,
+    );
+    expect(JSON.stringify({ result, events, records: await store.read() })).not.toContain(
+      "responseSummary",
+    );
+  });
+
+  test("malformed model failure metadata cannot turn settlement into a persistence failure", async () => {
+    const malformedError = Object.assign(
+      new ModelDriverError("unknown", "private provider failure", {
+        cause: new Error("private provider cause"),
+        status: 99,
+        providerCode: "x".repeat(129),
+        requestId: "request\nwith-control-character",
+      }),
+      { category: "invented_category", diagnosticCode: "tool_schema_root_not_object" },
+    );
+    const model: ModelDriver = {
+      async *stream() {
+        yield await Promise.reject(malformedError);
+      },
+    };
+    const store = createInMemorySessionStore<SessionRecord>();
+    const session = createTestSession({ model, store: store as unknown as SessionStore });
+
+    const result = await session.run({ text: "Normalize malformed provider metadata" });
+
+    expect(result).toEqual({
+      status: "failed",
+      error: {
+        code: "model_request_failed",
+        message: "The model provider request failed.",
+        category: "unknown",
+      },
+    });
+    expect(await store.read()).toContainEqual(
+      expect.objectContaining({
+        event: expect.objectContaining({ type: "session_settled", result }),
+      }),
+    );
+    expect(JSON.stringify({ result, records: await store.read() })).not.toContain(
+      "private provider",
+    );
   });
 
   test("cancelling an active provider reasoning block settles it as interrupted", async () => {

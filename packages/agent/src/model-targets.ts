@@ -460,6 +460,7 @@ export function createModelTargets(options: ModelTargetsOptions): ModelTargets {
           model: provider(identity.modelId),
           maximumOutputTokens: contextProfile.maximumOutputTokens,
           deadlineMs,
+          toolSchemaProjection: "deepseek-function-parameters-v1",
           sideCallThinkingPolicies: {
             title: {
               requestPath: "provider_options.deepseek",

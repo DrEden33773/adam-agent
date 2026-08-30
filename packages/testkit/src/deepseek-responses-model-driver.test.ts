@@ -77,6 +77,68 @@ test("Direct Responses maps one stateless answer-only request and semantic SSE",
   });
 });
 
+test("Direct Responses projects an object-only union tool schema on the provider wire", async () => {
+  let body: { readonly tools?: readonly unknown[] } | undefined;
+  const canonicalInputSchema = {
+    $schema: "https://json-schema.org/draft/2020-12/schema",
+    anyOf: [
+      {
+        type: "object",
+        properties: { kind: { type: "string", const: "content" } },
+        required: ["kind"],
+        additionalProperties: false,
+      },
+      {
+        type: "object",
+        properties: { kind: { type: "string", const: "path" } },
+        required: ["kind"],
+        additionalProperties: false,
+      },
+    ],
+  } as const;
+  const canonicalBefore = structuredClone(canonicalInputSchema);
+  const driver = new DirectDeepSeekResponsesModelDriverForTesting({
+    apiKey: "test-secret",
+    baseURL: "https://api.deepseek.com",
+    deadlineMs: 10_000,
+    maximumOutputTokens: 4_096,
+    model: "deepseek-v4-flash-vision-exp",
+    fetch: async (_input, init) => {
+      body = JSON.parse(String(init?.body)) as { readonly tools?: readonly unknown[] };
+      return new Response(
+        'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed"}}\n\n',
+        { status: 200, headers: { "content-type": "text/event-stream" } },
+      );
+    },
+  });
+
+  for await (const _event of driver.stream({
+    messages: [{ role: "user", content: "Search the repository" }],
+    tools: [
+      {
+        name: "search_repository",
+        description: "Search repository content or paths.",
+        inputSchema: canonicalInputSchema,
+      },
+    ],
+    maximumOutputTokens: 2_048,
+    signal: new AbortController().signal,
+  })) {
+    // Consume the complete semantic stream.
+  }
+
+  expect(body?.tools).toEqual([
+    {
+      type: "function",
+      name: "search_repository",
+      description: "Search repository content or paths.",
+      parameters: { ...canonicalBefore, type: "object" },
+      strict: false,
+    },
+  ]);
+  expect(canonicalInputSchema).toEqual(canonicalBefore);
+});
+
 test("Direct Responses serializes the exact approved Plan as one assistant projection", async () => {
   let body: { readonly input: readonly unknown[] } | undefined;
   const driver = new DirectDeepSeekResponsesModelDriverForTesting({
@@ -775,7 +837,7 @@ test("Direct Responses classifies bounded provider errors without retaining its 
     fetch: async () =>
       Response.json(
         { error: { code: "billing_error", message: "balance test-secret" } },
-        { status: 402 },
+        { status: 402, headers: { "x-request-id": "request-test-secret" } },
       ),
   });
   const error = await collectError(
@@ -791,6 +853,7 @@ test("Direct Responses classifies bounded provider errors without retaining its 
     category: "billing",
     status: 402,
     providerCode: "billing_error",
+    requestId: "request-[REDACTED]",
     responseSummary: "balance [REDACTED]",
   });
   expect(JSON.stringify(error)).not.toContain("test-secret");

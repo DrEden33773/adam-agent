@@ -1164,6 +1164,90 @@ test("PresentationSession transcript projection has one package-internal owner",
   expect.soft(directTestImports).toEqual([]);
 });
 
+test("Direct DeepSeek tool schema projection has one package-internal owner", async () => {
+  const agentSourceRoot = join(productRoot, "packages", "agent", "src");
+  const sourceFiles = (await readdir(agentSourceRoot, { recursive: true }))
+    .filter((entry) => entry.endsWith(".ts"))
+    .sort();
+  const sources = await Promise.all(
+    sourceFiles.map(async (sourceFile) => ({
+      path: sourceFile,
+      source: await readFile(join(agentSourceRoot, sourceFile), "utf8"),
+    })),
+  );
+  const ownerSource =
+    sources.find(({ path }) => path === "model-tool-schema-projection.ts")?.source ?? "";
+  const owners = sources
+    .filter(({ source }) => /\bfunction\s+projectModelToolDefinitions\s*\(/u.test(source))
+    .map(({ path }) => path);
+  const consumers = sources
+    .filter(({ source }) => moduleSpecifiers(source).includes("./model-tool-schema-projection.js"))
+    .map(({ path }) => path);
+  const publicFacadeSource = sources.find(({ path }) => path === "index.ts")?.source ?? "";
+  const testingFacadeSource =
+    sources.find(({ path }) => path === "internal-testing.ts")?.source ?? "";
+  const testPaths = (
+    await Promise.all(
+      ["apps", "packages"].map(async (root) => {
+        const packageRoots = await readdir(join(productRoot, root), { withFileTypes: true });
+        return (
+          await Promise.all(
+            packageRoots
+              .filter((entry) => entry.isDirectory())
+              .map(async (entry) => {
+                try {
+                  return (
+                    await readdir(join(productRoot, root, entry.name, "src"), {
+                      recursive: true,
+                    })
+                  )
+                    .filter((path) => path.endsWith(".test.ts"))
+                    .map((path) => join(productRoot, root, entry.name, "src", path));
+                } catch (error) {
+                  if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+                    return [];
+                  }
+                  throw error;
+                }
+              }),
+          )
+        ).flat();
+      }),
+    )
+  ).flat();
+  const directTestImports = (
+    await Promise.all(
+      testPaths
+        .filter((testPath) => testPath !== fileURLToPath(import.meta.url))
+        .map(async (testPath) =>
+          moduleSpecifiers(await readFile(testPath, "utf8")).some((specifier) =>
+            /model-tool-schema-projection\.js$/u.test(specifier),
+          )
+            ? relative(productRoot, testPath)
+            : undefined,
+        ),
+    )
+  ).filter((path): path is string => path !== undefined);
+
+  expect.soft(ownerSource).toMatch(/export function projectModelToolDefinitions\s*\(/u);
+  expect.soft(owners).toEqual(["model-tool-schema-projection.ts"]);
+  expect
+    .soft(consumers)
+    .toEqual([
+      "ai-sdk-model-driver.ts",
+      "deepseek-responses-model-driver.ts",
+      "openai-compatible-model-driver.ts",
+    ]);
+  expect
+    .soft([...moduleSpecifiers(ownerSource)].sort())
+    .toEqual(["./model-driver-error.js", "./tool-runtime.js"]);
+  for (const facadeSource of [publicFacadeSource, testingFacadeSource]) {
+    expect.soft(moduleSpecifiers(facadeSource)).not.toContain("./model-tool-schema-projection.js");
+    expect.soft(facadeSource).not.toContain("projectModelToolDefinitions");
+  }
+  expect.soft(directTestImports).toEqual([]);
+});
+
 test("the runtime module detector covers every value-bearing module form", () => {
   expect(
     runtimeModuleSpecifiers(`

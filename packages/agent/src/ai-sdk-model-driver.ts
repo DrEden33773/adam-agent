@@ -11,6 +11,10 @@ import type { ModelDriver, ModelEvent, ModelRequest } from "./agent-session-cont
 import { modelMessagesWithApprovedPlanProjectionV1 } from "./approved-plan-projection.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
 import { ModelDriverError } from "./model-driver-error.js";
+import {
+  type ModelToolSchemaProjectionProfile,
+  projectModelToolDefinitions,
+} from "./model-tool-schema-projection.js";
 import type { ThinkingPolicyMappingV1 } from "./thinking-policy.js";
 
 const maximumToolArgumentBytes = 2 * 1024 * 1024;
@@ -40,6 +44,7 @@ export class AiSdkModelDriver implements ModelDriver {
     | Readonly<Partial<Record<"title" | "compaction", ThinkingPolicyMappingV1>>>
     | undefined;
   readonly #sensitiveValues: readonly string[];
+  readonly #toolSchemaProjection: ModelToolSchemaProjectionProfile | undefined;
 
   constructor(options: {
     readonly model: LanguageModelV4;
@@ -50,6 +55,7 @@ export class AiSdkModelDriver implements ModelDriver {
       Partial<Record<"title" | "compaction", ThinkingPolicyMappingV1>>
     >;
     readonly sensitiveValues: readonly string[];
+    readonly toolSchemaProjection?: ModelToolSchemaProjectionProfile | undefined;
   }) {
     this.#deadlineMs = options.deadlineMs;
     this.#model = options.model;
@@ -57,6 +63,7 @@ export class AiSdkModelDriver implements ModelDriver {
     this.#providerOptions = options.providerOptions;
     this.#sideCallThinkingPolicies = options.sideCallThinkingPolicies;
     this.#sensitiveValues = options.sensitiveValues;
+    this.#toolSchemaProjection = options.toolSchemaProjection;
   }
 
   async *stream(request: ModelRequest): AsyncIterable<ModelEvent> {
@@ -94,7 +101,10 @@ export class AiSdkModelDriver implements ModelDriver {
         ...(request.tools.length === 0
           ? {}
           : {
-              tools: request.tools.map(
+              tools: (this.#toolSchemaProjection === undefined
+                ? request.tools
+                : projectModelToolDefinitions(request.tools, this.#toolSchemaProjection)
+              ).map(
                 (tool): LanguageModelV4FunctionTool => ({
                   type: "function",
                   name: tool.name,
@@ -121,7 +131,7 @@ export class AiSdkModelDriver implements ModelDriver {
         if (isIgnoredStructuralPart(part)) {
           continue;
         }
-        const events = [...mapStreamPart(part, normalization)];
+        const events = [...mapStreamPart(part, normalization, this.#sensitiveValues)];
         if (part.type === "finish") {
           if (deadlineTimer !== undefined) {
             clearTimeout(deadlineTimer);
@@ -281,6 +291,7 @@ function parseToolInput(argumentsJson: string): unknown {
 function* mapStreamPart(
   part: LanguageModelV4StreamPart,
   normalization: StreamNormalization,
+  sensitiveValues: readonly string[],
 ): Iterable<ModelEvent> {
   switch (part.type) {
     case "stream-start":
@@ -394,6 +405,9 @@ function* mapStreamPart(
       }
       return;
     case "error":
+      if (APICallError.isInstance(part.error)) {
+        throw classifyAiSdkError(part.error, sensitiveValues);
+      }
       throw new ModelDriverError(
         "protocol_incompatibility",
         `The Vercel provider returned an invalid stream part (${errorKind(part.error)}).`,

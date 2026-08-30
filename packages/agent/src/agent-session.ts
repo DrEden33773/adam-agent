@@ -55,7 +55,13 @@ import {
   inputResourcePageV1Schema,
   materializeInputResourceImageV1,
 } from "./input-resources.js";
-import { ModelDriverError } from "./model-driver-error.js";
+import {
+  type ModelDriverDiagnosticCode,
+  ModelDriverError,
+  type ModelDriverErrorCategory,
+  modelDriverDiagnosticCodes,
+  modelDriverErrorCategories,
+} from "./model-driver-error.js";
 import {
   applyPreparedExplicitUserImageMessagesV1,
   prepareExplicitUserImageMessagesV1,
@@ -3532,15 +3538,13 @@ export class AgentSession {
   }
 
   async #settleModelRequestFailed(error: ModelDriverError): Promise<RunResult> {
+    const diagnostic = normalizeModelDriverFailure(error);
     const result: RunResult = {
       status: "failed",
       error: {
         code: "model_request_failed",
-        message: error.message,
-        category: error.category,
-        ...(error.status === undefined ? {} : { status: error.status }),
-        ...(error.providerCode === undefined ? {} : { providerCode: error.providerCode }),
-        ...(error.requestId === undefined ? {} : { requestId: error.requestId }),
+        message: modelRequestFailureMessage(diagnostic.category, diagnostic.diagnosticCode),
+        ...diagnostic,
       },
     };
     return this.#settle(result);
@@ -3637,17 +3641,16 @@ export class AgentSession {
   async #settleContextCompactionFailed(error: ContextCompactionError): Promise<RunResult> {
     if (error.code === "context_compaction_failed") {
       const providerError = error.cause instanceof ModelDriverError ? error.cause : undefined;
+      const diagnostic =
+        providerError === undefined
+          ? ({ category: "unknown" } as const)
+          : normalizeModelDriverFailure(providerError);
       const result: RunResult = {
         status: "failed",
         error: {
           code: error.code,
           message: error.message,
-          category: providerError?.category ?? "unknown",
-          ...(providerError?.status === undefined ? {} : { status: providerError.status }),
-          ...(providerError?.providerCode === undefined
-            ? {}
-            : { providerCode: providerError.providerCode }),
-          ...(providerError?.requestId === undefined ? {} : { requestId: providerError.requestId }),
+          ...diagnostic,
         },
       };
       return this.#settle(result);
@@ -4134,6 +4137,75 @@ export class AgentSession {
           }),
       replay: adapter?.replay ?? "never",
     };
+  }
+}
+
+function normalizeModelDriverFailure(error: ModelDriverError): {
+  readonly category: ModelDriverErrorCategory;
+  readonly diagnosticCode?: ModelDriverDiagnosticCode | undefined;
+  readonly status?: number | undefined;
+  readonly providerCode?: string | undefined;
+  readonly requestId?: string | undefined;
+} {
+  const category = modelDriverErrorCategories.includes(error.category) ? error.category : "unknown";
+  const diagnosticCode =
+    category === "protocol_incompatibility" &&
+    modelDriverDiagnosticCodes.includes(error.diagnosticCode as ModelDriverDiagnosticCode)
+      ? (error.diagnosticCode as ModelDriverDiagnosticCode)
+      : undefined;
+  const status =
+    Number.isSafeInteger(error.status) &&
+    (error.status as number) >= 100 &&
+    (error.status as number) <= 599
+      ? error.status
+      : undefined;
+  const providerCode = normalizeModelDriverToken(error.providerCode);
+  const requestId = normalizeModelDriverToken(error.requestId);
+  return {
+    category,
+    ...(diagnosticCode === undefined ? {} : { diagnosticCode }),
+    ...(status === undefined ? {} : { status }),
+    ...(providerCode === undefined ? {} : { providerCode }),
+    ...(requestId === undefined ? {} : { requestId }),
+  };
+}
+
+function normalizeModelDriverToken(value: string | undefined): string | undefined {
+  return value !== undefined && value.length > 0 && value.length <= 128 && /^[!-~]+$/u.test(value)
+    ? value
+    : undefined;
+}
+
+function modelRequestFailureMessage(
+  category: ModelDriverErrorCategory,
+  diagnosticCode: ModelDriverDiagnosticCode | undefined,
+): string {
+  if (diagnosticCode === "tool_schema_root_not_object") {
+    return "A model tool schema is incompatible with the selected provider.";
+  }
+  switch (category) {
+    case "authentication":
+      return "The model provider rejected the configured credential.";
+    case "authorization":
+      return "The model provider denied the request.";
+    case "billing":
+      return "The model provider could not run the request because billing is unavailable.";
+    case "rate_limit":
+      return "The model provider rate limit was reached.";
+    case "invalid_request":
+      return "The model provider rejected the request as invalid.";
+    case "provider":
+      return "The model provider could not complete the request.";
+    case "transport":
+      return "The model provider connection failed.";
+    case "protocol_incompatibility":
+      return "The model provider response was incompatible with Adam.";
+    case "timeout":
+      return "The model provider request reached its deadline.";
+    case "aborted":
+      return "The model provider request was aborted.";
+    case "unknown":
+      return "The model provider request failed.";
   }
 }
 

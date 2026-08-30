@@ -14,8 +14,13 @@ export const modelDriverErrorCategories = [
 
 export type ModelDriverErrorCategory = (typeof modelDriverErrorCategories)[number];
 
+export const modelDriverDiagnosticCodes = ["tool_schema_root_not_object"] as const;
+
+export type ModelDriverDiagnosticCode = (typeof modelDriverDiagnosticCodes)[number];
+
 export class ModelDriverError extends Error {
   readonly category: ModelDriverErrorCategory;
+  readonly diagnosticCode: ModelDriverDiagnosticCode | undefined;
   readonly status: number | undefined;
   readonly providerCode: string | undefined;
   readonly requestId: string | undefined;
@@ -26,6 +31,7 @@ export class ModelDriverError extends Error {
     message: string,
     options: {
       readonly cause: unknown;
+      readonly diagnosticCode?: ModelDriverDiagnosticCode | undefined;
       readonly status?: number | undefined;
       readonly providerCode?: string | undefined;
       readonly requestId?: string | undefined;
@@ -35,6 +41,7 @@ export class ModelDriverError extends Error {
     super(message, { cause: options.cause });
     this.name = "ModelDriverError";
     this.category = category;
+    this.diagnosticCode = options.diagnosticCode;
     this.status = options.status;
     this.providerCode = options.providerCode;
     this.requestId = options.requestId;

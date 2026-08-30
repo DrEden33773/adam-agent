@@ -60,7 +60,11 @@ export {
   type LocalInputResourceSelectionV1,
   type StagedInputResourceSelectionV1,
 } from "./input-resources.js";
-export { ModelDriverError, type ModelDriverErrorCategory } from "./model-driver-error.js";
+export {
+  type ModelDriverDiagnosticCode,
+  ModelDriverError,
+  type ModelDriverErrorCategory,
+} from "./model-driver-error.js";
 export {
   createModelTargets,
   type ModelTargetConnectionTestResult,

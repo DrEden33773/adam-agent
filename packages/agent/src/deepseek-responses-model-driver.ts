@@ -8,6 +8,7 @@ import type {
 import { modelMessagesWithApprovedPlanProjectionV1 } from "./approved-plan-projection.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
 import { ModelDriverError } from "./model-driver-error.js";
+import { projectModelToolDefinitions } from "./model-tool-schema-projection.js";
 
 const maximumSseFrameBytes = 2 * 1024 * 1024;
 const maximumToolArgumentBytes = 2 * 1024 * 1024;
@@ -142,13 +143,15 @@ function mapRequest(request: ModelRequest, model: string, maximumOutputTokens: n
     ...(request.tools.length === 0
       ? {}
       : {
-          tools: request.tools.map((tool) => ({
-            type: "function",
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.inputSchema,
-            strict: false,
-          })),
+          tools: projectModelToolDefinitions(request.tools, "deepseek-function-parameters-v1").map(
+            (tool) => ({
+              type: "function",
+              name: tool.name,
+              description: tool.description,
+              parameters: tool.inputSchema,
+              strict: false,
+            }),
+          ),
         }),
     ...(request.thinkingPolicy === undefined
       ? {}
@@ -546,6 +549,8 @@ async function responseError(response: Response, apiKey: string): Promise<ModelD
     providerMessage = undefined;
   }
   const summary = (providerMessage ?? raw).split(apiKey).join("[REDACTED]").slice(0, 512);
+  const rawRequestId = response.headers.get("x-request-id");
+  const requestId = rawRequestId?.split(apiKey).join("[REDACTED]").slice(0, 128);
   const category =
     response.status === 401
       ? "authentication"
@@ -564,9 +569,7 @@ async function responseError(response: Response, apiKey: string): Promise<ModelD
     cause: undefined,
     status: response.status,
     ...(providerCode === undefined ? {} : { providerCode }),
-    ...(response.headers.get("x-request-id") === null
-      ? {}
-      : { requestId: response.headers.get("x-request-id")?.slice(0, 128) }),
+    ...(requestId === undefined ? {} : { requestId }),
     ...(summary.length === 0 ? {} : { responseSummary: summary }),
   });
 }
