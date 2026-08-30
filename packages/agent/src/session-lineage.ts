@@ -14,6 +14,11 @@ import {
 import { validateCurrentSessionHistory } from "./session-history-validation.js";
 import { SessionLifecycleError } from "./session-lifecycle-error.js";
 import type { SessionGenesisRecord, SessionRecord } from "./session-store.js";
+import {
+  type TodoItemV1,
+  todoStoreSnapshotDigestV1,
+  todoStoreSnapshotFromRecordsV1,
+} from "./todo.js";
 
 export type SessionLineageRecordReader = (sessionId: string) => Promise<readonly SessionRecord[]>;
 
@@ -66,6 +71,7 @@ export function createSessionLineageTraversal(input: {
     }
     const { parentGenesis, prefixRecords } = await readValidatedLineagePrefix(genesis);
     validateInheritedPlanCycle(genesis, records, prefixRecords);
+    validateInheritedTodoStore(genesis, records, prefixRecords);
     const expectedPromptContext = promptContextRecordFromRecords(parentGenesis, prefixRecords);
     if (!isDeepStrictEqual(genesis.record.promptContext, expectedPromptContext)) {
       throw new SessionLifecycleError("session_invalid");
@@ -156,6 +162,67 @@ export function createSessionLineageTraversal(input: {
             : { submission: actual.record.submission }),
         },
         expected,
+      )
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+  }
+
+  function validateInheritedTodoStore(
+    genesis: SessionGenesisRecord,
+    records: readonly SessionRecord[],
+    prefixRecords: readonly SessionRecord[],
+  ): void {
+    const lineage = genesis.record.lineage;
+    if (lineage === undefined) {
+      return;
+    }
+    const sourceTodo = todoStoreSnapshotFromRecordsV1(prefixRecords);
+    const inherited = records.filter(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "todo_store_inherited",
+    );
+    if (sourceTodo.storeRevision === 0) {
+      if (inherited.length > 0) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return;
+    }
+    const sourceSessionId =
+      "recordVersion" in lineage ? lineage.sourceSessionId : lineage.parentSessionId;
+    const sourceEventPosition =
+      "recordVersion" in lineage ? lineage.sourceEventPosition : lineage.parentEventPosition;
+    const firstSequence = planCycleSnapshotFromRecords(prefixRecords) === undefined ? 2 : 3;
+    const snapshotDigest = todoStoreSnapshotDigestV1(sourceTodo);
+    const inheritedItems: TodoItemV1[] = [];
+    let itemOffset = 0;
+    for (const [chunkIndex, entry] of inherited.entries()) {
+      if (
+        entry.schemaVersion !== 3 ||
+        entry.record.type !== "todo_store_inherited" ||
+        entry.sequence !== firstSequence + chunkIndex ||
+        entry.record.chunkIndex !== chunkIndex ||
+        entry.record.chunkCount !== inherited.length ||
+        entry.record.itemOffset !== itemOffset ||
+        entry.record.policyVersion !== sourceTodo.policyVersion ||
+        entry.record.storeRevision !== sourceTodo.storeRevision ||
+        entry.record.snapshotDigest !== snapshotDigest ||
+        entry.record.source.sessionId !== sourceSessionId ||
+        entry.record.source.throughSequence !== sourceEventPosition
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      inheritedItems.push(...entry.record.items);
+      itemOffset += entry.record.items.length;
+    }
+    if (
+      inherited.length === 0 ||
+      !isDeepStrictEqual(
+        {
+          policyVersion: sourceTodo.policyVersion,
+          storeRevision: sourceTodo.storeRevision,
+          items: inheritedItems,
+        },
+        sourceTodo,
       )
     ) {
       throw new SessionLifecycleError("session_invalid");

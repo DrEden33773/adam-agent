@@ -33,6 +33,7 @@ import {
   type SkillContextRecordV1,
   skillContextSnapshot,
 } from "./skills.js";
+import { hasTodoToolProfileV1, todoStoreSnapshotFromRecordsV1, todoSummaryV1 } from "./todo.js";
 
 export function isSkillContextCatalogSuccessor(
   previous: SkillContextRecordV1,
@@ -434,6 +435,9 @@ export function snapshotFromGenesis(
   genesis: SessionGenesisRecord,
   lastSequence: number,
 ): CurrentSessionSnapshot {
+  const todo = hasTodoToolProfileV1(genesis.record.promptContext?.toolProfile.definitions ?? [])
+    ? todoSummaryV1(todoStoreSnapshotFromRecordsV1([]))
+    : undefined;
   return {
     schemaVersion: 3,
     sessionId: genesis.record.sessionId,
@@ -448,6 +452,7 @@ export function snapshotFromGenesis(
       ? {}
       : { skillContext: skillContextSnapshot(genesis.record.skillContext) }),
     ...(genesis.record.lineage === undefined ? {} : { lineage: genesis.record.lineage }),
+    ...(todo === undefined ? {} : { todo }),
   };
 }
 
@@ -903,6 +908,9 @@ export function snapshotFromRecords(
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
   const context = contextSnapshotFromRecords(records);
   const plan = planCycleSnapshotFromRecords(records);
+  const todo = hasTodoToolProfileV1(genesis.record.promptContext?.toolProfile.definitions ?? [])
+    ? todoSummaryV1(todoStoreSnapshotFromRecordsV1(records))
+    : undefined;
   const latestRun = currentRecords.findLast(
     (record) => record.record.type === "logical_run_started",
   );
@@ -915,6 +923,7 @@ export function snapshotFromRecords(
       ...(skillContext === undefined ? {} : { skillContext: skillContextSnapshot(skillContext) }),
       ...(context === undefined ? {} : { context }),
       ...(plan === undefined ? {} : { plan }),
+      ...(todo === undefined ? {} : { todo }),
       ...(artifactInspection?.degradation === undefined
         ? {}
         : { degradation: artifactInspection.degradation }),
@@ -973,6 +982,7 @@ export function snapshotFromRecords(
     ...(skillContext === undefined ? {} : { skillContext: skillContextSnapshot(skillContext) }),
     ...(context === undefined ? {} : { context }),
     ...(plan === undefined ? {} : { plan }),
+    ...(todo === undefined ? {} : { todo }),
     ...(artifactInspection?.degradation === undefined
       ? {}
       : { degradation: artifactInspection.degradation }),

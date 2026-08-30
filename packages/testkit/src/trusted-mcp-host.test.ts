@@ -5010,6 +5010,10 @@ test("SessionLifecycle keeps user-assigned MCP effect authority over server anno
       "activate_skill",
       "read_skill_resource",
       "read_input_resource",
+      "create_todo",
+      "get_todo",
+      "list_todos",
+      "update_todo",
       qualifiedName,
     ]);
     expect(requests[0]?.tools.find((tool) => tool.name === qualifiedName)?.description).toBe(
@@ -5239,6 +5243,8 @@ test("SessionLifecycle Plan auto-allows an exact committed read-only MCP tool", 
         "activate_skill",
         "read_skill_resource",
         "read_input_resource",
+        "get_todo",
+        "list_todos",
         qualifiedName,
         "submit_plan",
       ]);

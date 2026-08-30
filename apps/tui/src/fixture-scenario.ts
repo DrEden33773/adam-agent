@@ -46,6 +46,7 @@ export const fixtureScenarios = [
   "skill-selection",
   "streaming",
   "target-navigation",
+  "todo",
   "tool-artifact",
   "tool-multiple",
   "unsafe-history",

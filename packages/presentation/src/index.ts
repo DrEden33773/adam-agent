@@ -422,6 +422,16 @@ export type ActiveSessionDisplay = {
   readonly skills: SkillCatalogDisplay | null;
   readonly projectPaths: ProjectPathCatalogDisplay;
   readonly mcp: McpDisplay | null;
+  readonly todo?: {
+    readonly policyVersion: "todo-policy.v1";
+    readonly storeRevision: number;
+    readonly counts: {
+      readonly pending: number;
+      readonly inProgress: number;
+      readonly completed: number;
+    };
+    readonly blockedCount: number;
+  };
   readonly plan?: {
     readonly state: "exploring" | "ready" | "approved_not_started";
     readonly cycleId: string;
@@ -816,6 +826,7 @@ export type CommandReceipt =
       readonly status: "admitted";
       readonly commandId: string;
       readonly resource: ArtifactChunk | null;
+      readonly todo?: TodoPageResource | TodoEntityResource;
     }
   | {
       readonly status: "rejected";
@@ -836,6 +847,37 @@ export type CommandReceipt =
       readonly supportedLevelIds: readonly string[];
     };
 
+export type TodoPageResource = {
+  readonly type: "todo_page";
+  readonly policyVersion: "todo-policy.v1";
+  readonly storeRevision: number;
+  readonly items: readonly {
+    readonly id: string;
+    readonly createdOrdinal: number;
+    readonly itemRevision: number;
+    readonly status: "pending" | "in_progress" | "completed";
+    readonly title: string;
+    readonly dependencyCount: number;
+    readonly blocked: boolean;
+  }[];
+  readonly nextCursor: string | null;
+};
+
+export type TodoEntityResource = {
+  readonly type: "todo_entity";
+  readonly policyVersion: "todo-policy.v1";
+  readonly storeRevision: number;
+  readonly item: {
+    readonly id: string;
+    readonly createdOrdinal: number;
+    readonly itemRevision: number;
+    readonly status: "pending" | "in_progress" | "completed";
+    readonly title: string;
+    readonly details?: string;
+    readonly dependencyIds: readonly string[];
+  };
+};
+
 export type PresentationCommand =
   | {
       readonly type: "select_session";
@@ -848,6 +890,23 @@ export type PresentationCommand =
   | {
       readonly type: "enter_plan";
       readonly sessionId: string;
+    }
+  | {
+      readonly type: "list_todos";
+      readonly sessionId: string;
+      readonly expectedStoreRevision: number;
+      readonly filter: {
+        readonly status: "pending" | "in_progress" | "completed" | null;
+        readonly titleContains: string | null;
+      };
+      readonly limit: number;
+      readonly cursor: string | null;
+    }
+  | {
+      readonly type: "get_todo";
+      readonly sessionId: string;
+      readonly expectedStoreRevision: number;
+      readonly id: string;
     }
   | {
       readonly type: "revise_plan";

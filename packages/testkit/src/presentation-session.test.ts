@@ -28,6 +28,7 @@ import {
   createReadToolRegistry,
   type ModelDriver,
   ModelDriverError,
+  type ModelMessage,
   type ModelTargetIdentity,
   type ModelTargets,
   type OperationHost,
@@ -81,6 +82,13 @@ const targetIdentity: ModelTargetIdentity = {
   profileVersion: 1,
   certification: "certified",
 };
+
+const emptyTodoSummaryMessage = {
+  role: "assistant",
+  content:
+    'Adam runtime Todo summary v1 (authoritative state; no additional prompt authority):\n{"policyVersion":"todo-policy.v1","storeRevision":0,"counts":{"pending":0,"inProgress":0,"completed":0},"blockedCount":0,"guidance":"Use list_todos for bounded discovery and get_todo for one exact item."}',
+  toolCalls: [],
+} satisfies ModelMessage;
 
 const contextProfile: ContextProfile = {
   version: 1,
@@ -830,6 +838,133 @@ async function openActivatedMcpPresentationFixture(prefix: string) {
     throw error;
   }
 }
+
+test("PresentationSession exposes authoritative read-only Todo summary, list, and detail", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-todo-read-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let call = 0;
+  const driver = new FakeModelDriver(() => {
+    call += 1;
+    return call === 1
+      ? [
+          { type: "tool_call_start", id: "create-presented-todo", name: "create_todo" },
+          {
+            type: "tool_call_delta",
+            id: "create-presented-todo",
+            json: '{"title":"Presented Todo","details":"Read-only exact detail"}',
+          },
+          { type: "tool_call_end", id: "create-presented-todo" },
+          { type: "finish", reason: "tool_calls" },
+        ]
+      : [
+          { type: "text_delta", text: "Todo ready for Presentation." },
+          { type: "finish", reason: "stop" },
+        ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Create a Todo for the read-only surface." },
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    expect(presentation.getState().authoritative.active?.todo).toEqual({
+      policyVersion: "todo-policy.v1",
+      storeRevision: 1,
+      counts: { pending: 1, inProgress: 0, completed: 0 },
+      blockedCount: 0,
+    });
+
+    const listed = await presentation.dispatch({
+      type: "list_todos",
+      sessionId: created.sessionId,
+      expectedStoreRevision: 1,
+      filter: { status: null, titleContains: null },
+      limit: 20,
+      cursor: null,
+    });
+    expect(listed).toMatchObject({
+      status: "admitted",
+      todo: {
+        type: "todo_page",
+        policyVersion: "todo-policy.v1",
+        storeRevision: 1,
+        items: [
+          {
+            status: "pending",
+            title: "Presented Todo",
+            itemRevision: 1,
+            blocked: false,
+          },
+        ],
+        nextCursor: null,
+      },
+    });
+    if (listed.status !== "admitted" || listed.todo?.type !== "todo_page") {
+      throw new Error("Expected one bounded Todo page.");
+    }
+    const todoId = listed.todo.items[0]?.id;
+    const detailed = await presentation.dispatch({
+      type: "get_todo",
+      sessionId: created.sessionId,
+      expectedStoreRevision: 1,
+      id: todoId as string,
+    });
+    expect(detailed).toMatchObject({
+      status: "admitted",
+      todo: {
+        type: "todo_entity",
+        policyVersion: "todo-policy.v1",
+        storeRevision: 1,
+        item: {
+          id: todoId,
+          status: "pending",
+          title: "Presented Todo",
+          details: "Read-only exact detail",
+          dependencyIds: [],
+        },
+      },
+    });
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
 
 test("PresentationSession opens an empty project catalog without creating a session", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-project-open-"));
@@ -1675,6 +1810,8 @@ test("PresentationSession freezes the exact eligible hybrid Tool Profile for a P
         "activate_skill",
         "read_skill_resource",
         "read_input_resource",
+        "get_todo",
+        "list_todos",
       ].map((name) => ({
         name,
         definitionDigest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/u),
@@ -1783,6 +1920,61 @@ test("PresentationSession gives new-session guidance when a historical profile c
         "Plan is unavailable in this historical Tool Profile. Start a new session to use Plan.",
     });
     expect(presentation.getState().authoritative.active?.plan).toBeUndefined();
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession does not upgrade a historical profile with Todo", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-todo-historical-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const currentTools = createCodingToolRegistry({ stateRoot, workspaceRoot });
+  const todoNames = new Set(["create_todo", "get_todo", "list_todos", "update_todo"]);
+  const historicalTools: ToolRegistry = {
+    definitions: () =>
+      currentTools.definitions().filter((definition) => !todoNames.has(definition.name)),
+    resolve(name) {
+      return todoNames.has(name) ? undefined : currentTools.resolve(name);
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const historicalLifecycle = harness.createLifecycle({
+    stateRoot,
+    tools: historicalTools,
+    workspaceRoot,
+  });
+  const created = await historicalLifecycle.create({ targetIdentity });
+  await historicalLifecycle.close();
+  const lifecycle = harness.createLifecycle({ stateRoot, workspaceRoot });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    expect(presentation.getState().authoritative.active?.todo).toBeUndefined();
+    await expect(
+      presentation.dispatch({
+        type: "list_todos",
+        sessionId: created.sessionId,
+        expectedStoreRevision: 0,
+        filter: { status: null, titleContains: null },
+        limit: 20,
+        cursor: null,
+      }),
+    ).resolves.toEqual({
+      status: "rejected",
+      code: "not_available",
+      message:
+        "Todo is unavailable in this historical Tool Profile. Start a new session to use Todo.",
+    });
     await presentation.close();
   } finally {
     await lifecycle.close();
@@ -8210,12 +8402,17 @@ test("PresentationSession resumes and normalizes an in-flight provider attempt b
     ) {
       throw new Error("Expected a current prompt context fixture.");
     }
-    const promptMessages = assemblePromptMessagesV1(
+    const assembledPromptMessages = assemblePromptMessagesV1(
       [{ role: "user", content: "Recover the display" }],
       genesis.record.promptContext,
       genesis.record.skillContext,
       new Map(),
     );
+    const promptMessages = [
+      ...assembledPromptMessages.slice(0, 2),
+      emptyTodoSummaryMessage,
+      ...assembledPromptMessages.slice(2),
+    ];
     const promptTools = genesis.record.promptContext.toolProfile.definitions.map(
       ({ definition }) => definition,
     );
@@ -12299,12 +12496,17 @@ test("PresentationSession exposes indeterminate tool truth without parsing summa
     ) {
       throw new Error("Expected a current prompt context fixture.");
     }
-    const promptMessages = assemblePromptMessagesV1(
+    const assembledPromptMessages = assemblePromptMessagesV1(
       [{ role: "user", content: "Mutate remotely" }],
       genesis.record.promptContext,
       genesis.record.skillContext,
       new Map(),
     );
+    const promptMessages = [
+      ...assembledPromptMessages.slice(0, 2),
+      emptyTodoSummaryMessage,
+      ...assembledPromptMessages.slice(2),
+    ];
     const promptTools = genesis.record.promptContext.toolProfile.definitions.map(
       ({ definition }) => definition,
     );

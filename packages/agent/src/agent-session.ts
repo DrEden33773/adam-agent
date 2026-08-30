@@ -120,6 +120,21 @@ import {
   SkillResourceError,
   SkillsError,
 } from "./skills.js";
+import {
+  createTodoInputV1Schema,
+  createTodoMutationV1,
+  emptyTodoStoreSnapshotV1,
+  getTodoInputV1Schema,
+  getTodoV1,
+  hasTodoToolProfileV1,
+  listTodoInputV1Schema,
+  listTodosV1,
+  modelMessagesWithTodoSummaryV1,
+  type TodoStoreSnapshotV1,
+  todoPolicyVersionV1,
+  updateTodoInputV1Schema,
+  updateTodoMutationV1,
+} from "./todo.js";
 import type {
   ModelToolDefinition,
   PermissionPolicy,
@@ -169,6 +184,8 @@ export class AgentSession {
   readonly #modalityProfile: ModelModalityProfile | undefined;
   readonly #tools: ToolRegistry | undefined;
   readonly #fixedRequestTools: readonly ModelToolDefinition[] | undefined;
+  #todo: TodoStoreSnapshotV1 = emptyTodoStoreSnapshotV1();
+  readonly #todoEnabled: boolean;
   #plan: PlanCycleSnapshot | undefined;
   #planGitAttestation: PlanGitAttestationV1 | undefined;
   readonly #permissions: PermissionPolicy | undefined;
@@ -251,8 +268,22 @@ export class AgentSession {
     const durablePromptContext = this.#durableContext?.promptContext;
     const selectedToolNames =
       durablePromptContext === undefined
-        ? ["read_file", "search_repository", "write_file", "edit_file", "run_shell"]
+        ? this.#durableContext === undefined
+          ? [
+              "read_file",
+              "search_repository",
+              "write_file",
+              "edit_file",
+              "run_shell",
+              "create_todo",
+              "get_todo",
+              "list_todos",
+              "update_todo",
+            ]
+          : ["read_file", "write_file", "edit_file", "run_shell"]
         : durablePromptContext.toolProfile.definitions.map((definition) => definition.name);
+    this.#todoEnabled = hasTodoToolProfileV1(selectedToolNames.map((name) => ({ name })));
+    this.#todo = this.#durableContext?.todo ?? emptyTodoStoreSnapshotV1();
     this.#tools =
       this.#durableContext !== undefined && durablePromptContext === undefined
         ? filterLiveToolRegistry(dependencies.tools, [
@@ -1197,14 +1228,16 @@ export class AgentSession {
   }
 
   #assemblePromptMessages(transcript: readonly ModelMessage[]): readonly ModelMessage[] {
-    return this.#promptContext === undefined
-      ? [...transcript]
-      : assemblePromptMessagesV1(
-          transcript,
-          this.#promptContext,
-          this.#skillContext,
-          this.#activeSkillContents,
-        );
+    const messages =
+      this.#promptContext === undefined
+        ? [...transcript]
+        : assemblePromptMessagesV1(
+            transcript,
+            this.#promptContext,
+            this.#skillContext,
+            this.#activeSkillContents,
+          );
+    return this.#todoEnabled ? modelMessagesWithTodoSummaryV1(messages, this.#todo) : messages;
   }
 
   #estimatePromptTokens(
@@ -1353,6 +1386,9 @@ export class AgentSession {
         summaryMessages,
         preparedSummaryImages.projections,
       );
+      const projectedSummaryMessagesWithTodo = this.#todoEnabled
+        ? modelMessagesWithTodoSummaryV1(projectedSummaryMessages, this.#todo)
+        : projectedSummaryMessages;
       const records = await this.#store.read();
       const evidence = mergeContextEvidence(
         durableContext.inheritedEvidence,
@@ -1363,7 +1399,7 @@ export class AgentSession {
           ? {}
           : { approvedPlan: durableContext.approvedPlan }),
         evidence,
-        messages: projectedSummaryMessages,
+        messages: projectedSummaryMessagesWithTodo,
         profile: contextProfile,
         imageUsageByArtifactId: preparedSummaryImages.imageUsageByArtifactId,
       });
@@ -1404,7 +1440,7 @@ export class AgentSession {
             ? {}
             : { approvedPlan: durableContext.approvedPlan }),
           evidence,
-          messages: projectedSummaryMessages,
+          messages: projectedSummaryMessagesWithTodo,
           model: this.#model,
           preparedRequest,
           profile: contextProfile,
@@ -1519,7 +1555,9 @@ export class AgentSession {
               ? {}
               : { approvedPlan: durableContext.approvedPlan }),
             evidence,
-            messages: smallerRetryMessages,
+            messages: this.#todoEnabled
+              ? modelMessagesWithTodoSummaryV1(smallerRetryMessages, this.#todo)
+              : smallerRetryMessages,
             profile: contextProfile,
           }) <
             estimateContextSummaryRequestTokens({
@@ -1527,7 +1565,9 @@ export class AgentSession {
                 ? {}
                 : { approvedPlan: durableContext.approvedPlan }),
               evidence,
-              messages: summaryMessages,
+              messages: this.#todoEnabled
+                ? modelMessagesWithTodoSummaryV1(summaryMessages, this.#todo)
+                : summaryMessages,
               profile: contextProfile,
             });
         const reason = canRetryWithSmallerInput
@@ -2266,6 +2306,18 @@ export class AgentSession {
       await this.#appendToolResult(messages, call, preDispatchFailure);
       return undefined;
     }
+    if (call.name === "create_todo") {
+      return this.#createTodo(call, messages, toolResultsById, options.emitStarted);
+    }
+    if (call.name === "get_todo") {
+      return this.#getTodo(call, messages, toolResultsById, options.emitStarted);
+    }
+    if (call.name === "list_todos") {
+      return this.#listTodos(call, messages, toolResultsById, options.emitStarted);
+    }
+    if (call.name === "update_todo") {
+      return this.#updateTodo(call, messages, toolResultsById, options.emitStarted);
+    }
     if (options.emitStarted) {
       await this.#emit({ type: "tool_started", callId: call.id, name: call.name });
     }
@@ -2469,6 +2521,262 @@ export class AgentSession {
       },
     };
     return this.#settle({ status: "completed", answer: "" });
+  }
+
+  async #createTodo(
+    call: ToolCall,
+    messages: ModelMessage[],
+    toolResultsById: Map<string, { readonly call: ToolCall; readonly result: ToolResult }>,
+    emitStarted: boolean,
+  ): Promise<RunResult | undefined> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(call.argumentsJson);
+    } catch {
+      parsed = undefined;
+    }
+    const input = createTodoInputV1Schema.safeParse(parsed);
+    if (!input.success || this.#activeRunId === undefined || this.#plan !== undefined) {
+      const planDenied = input.success && this.#plan !== undefined;
+      const result: ToolResult = {
+        status: "failed",
+        error: {
+          code: planDenied ? "permission_denied" : "invalid_tool_input",
+          message: planDenied
+            ? "Plan denies Todo mutations."
+            : "create_todo requires a bounded title, optional details, and dependency IDs.",
+        },
+      };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    const mutation = createTodoMutationV1(this.#todo, input.data, randomUUID());
+    if (mutation.status === "failed") {
+      const result: ToolResult = mutation;
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    if (emitStarted) {
+      await this.#emit({ type: "tool_started", callId: call.id, name: call.name });
+    }
+    const mutationItem = mutation.item;
+    const item = {
+      id: mutationItem.id,
+      createdOrdinal: mutationItem.createdOrdinal,
+      itemRevision: mutationItem.itemRevision,
+      status: mutationItem.status,
+      title: mutationItem.title,
+      ...(mutationItem.details === undefined ? {} : { details: mutationItem.details }),
+      dependencyIds: mutationItem.dependencyIds,
+    };
+    const { storeRevision } = mutation.snapshot;
+    const result: Extract<ToolResult, { readonly status: "completed" }> = {
+      status: "completed",
+      output: { policyVersion: todoPolicyVersionV1, storeRevision, item },
+    };
+    const completedEvent = {
+      type: "tool_completed",
+      callId: call.id,
+      name: call.name,
+      output: result.output,
+    } as const;
+    await this.#appendRecordsAtomically([
+      {
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "runtime_event",
+          runId: this.#activeRunId,
+          event: completedEvent,
+        },
+      },
+      {
+        schemaVersion: 3,
+        sequence: this.#nextSequence + 1,
+        record: {
+          type: "todo_created",
+          recordVersion: 1,
+          policyVersion: todoPolicyVersionV1,
+          runId: this.#activeRunId,
+          callId: call.id,
+          storeRevision,
+          item,
+        },
+      },
+    ]);
+    toolResultsById.set(call.id, { call, result });
+    this.#publish(completedEvent);
+    messages.push({ role: "tool", callId: call.id, name: call.name, result });
+    this.#todo = mutation.snapshot;
+    return undefined;
+  }
+
+  async #getTodo(
+    call: ToolCall,
+    messages: ModelMessage[],
+    toolResultsById: Map<string, { readonly call: ToolCall; readonly result: ToolResult }>,
+    emitStarted: boolean,
+  ): Promise<RunResult | undefined> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(call.argumentsJson);
+    } catch {
+      parsed = undefined;
+    }
+    const input = getTodoInputV1Schema.safeParse(parsed);
+    const read = getTodoV1(this.#todo, input.success ? input.data : parsed);
+    if (read.status === "failed") {
+      const result: ToolResult = read;
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    if (emitStarted) {
+      await this.#emit({ type: "tool_started", callId: call.id, name: call.name });
+    }
+    const result: ToolResult = read;
+    toolResultsById.set(call.id, { call, result });
+    await this.#appendToolResult(messages, call, result);
+    return undefined;
+  }
+
+  async #listTodos(
+    call: ToolCall,
+    messages: ModelMessage[],
+    toolResultsById: Map<string, { readonly call: ToolCall; readonly result: ToolResult }>,
+    emitStarted: boolean,
+  ): Promise<RunResult | undefined> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(call.argumentsJson);
+    } catch {
+      parsed = undefined;
+    }
+    const input = listTodoInputV1Schema.safeParse(parsed);
+    if (!input.success) {
+      const result: ToolResult = {
+        status: "failed",
+        error: {
+          code: "invalid_tool_input",
+          message: "list_todos requires bounded filters, limit, and a valid cursor.",
+        },
+      };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    const listed = listTodosV1(
+      this.#todo,
+      input.data,
+      this.#durableContext?.sessionId ?? this.#runtimeSessionId,
+    );
+    if (listed.status === "failed") {
+      const result: ToolResult = listed;
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    if (emitStarted) {
+      await this.#emit({ type: "tool_started", callId: call.id, name: call.name });
+    }
+    const result: ToolResult = listed;
+    toolResultsById.set(call.id, { call, result });
+    await this.#appendToolResult(messages, call, result);
+    return undefined;
+  }
+
+  async #updateTodo(
+    call: ToolCall,
+    messages: ModelMessage[],
+    toolResultsById: Map<string, { readonly call: ToolCall; readonly result: ToolResult }>,
+    emitStarted: boolean,
+  ): Promise<RunResult | undefined> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(call.argumentsJson);
+    } catch {
+      parsed = undefined;
+    }
+    const input = updateTodoInputV1Schema.safeParse(parsed);
+    if (!input.success || this.#activeRunId === undefined || this.#plan !== undefined) {
+      const planDenied = input.success && this.#plan !== undefined;
+      const result: ToolResult = {
+        status: "failed",
+        error: {
+          code: planDenied ? "permission_denied" : "invalid_tool_input",
+          message: planDenied
+            ? "Plan denies Todo mutations."
+            : "update_todo requires an exact current Todo CAS and a valid explicit mutation.",
+        },
+      };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    const mutation = updateTodoMutationV1(this.#todo, input.data);
+    if (mutation.status === "failed") {
+      const result: ToolResult = mutation;
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
+    const mutationItem = mutation.item;
+    const item = {
+      id: mutationItem.id,
+      createdOrdinal: mutationItem.createdOrdinal,
+      itemRevision: mutationItem.itemRevision,
+      status: mutationItem.status,
+      title: mutationItem.title,
+      ...(mutationItem.details === undefined ? {} : { details: mutationItem.details }),
+      dependencyIds: mutationItem.dependencyIds,
+    };
+    if (emitStarted) {
+      await this.#emit({ type: "tool_started", callId: call.id, name: call.name });
+    }
+    const { storeRevision } = mutation.snapshot;
+    const result: Extract<ToolResult, { readonly status: "completed" }> = {
+      status: "completed",
+      output: { policyVersion: todoPolicyVersionV1, storeRevision, item },
+    };
+    const completedEvent = {
+      type: "tool_completed",
+      callId: call.id,
+      name: call.name,
+      output: result.output,
+    } as const;
+    await this.#appendRecordsAtomically([
+      {
+        schemaVersion: 3,
+        sequence: this.#nextSequence,
+        record: {
+          type: "runtime_event",
+          runId: this.#activeRunId,
+          event: completedEvent,
+        },
+      },
+      {
+        schemaVersion: 3,
+        sequence: this.#nextSequence + 1,
+        record: {
+          type: "todo_updated",
+          recordVersion: 1,
+          policyVersion: todoPolicyVersionV1,
+          runId: this.#activeRunId,
+          callId: call.id,
+          expectedStoreRevision: input.data.expectedStoreRevision,
+          expectedItemRevision: input.data.expectedItemRevision,
+          storeRevision,
+          item,
+        },
+      },
+    ]);
+    toolResultsById.set(call.id, { call, result });
+    this.#publish(completedEvent);
+    messages.push({ role: "tool", callId: call.id, name: call.name, result });
+    this.#todo = mutation.snapshot;
+    return undefined;
   }
 
   async #activateModelSelectedSkill(call: ToolCall): Promise<ToolResult> {

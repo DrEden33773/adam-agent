@@ -88,6 +88,7 @@ import { SkillPalette } from "./skill-palette.js";
 import { TargetPicker } from "./target-picker.js";
 import { type AdamTuiTheme, createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
+import { TodoNavigator } from "./todo-navigator.js";
 import { ToolPreview } from "./tool-preview.js";
 import { TranscriptViewport } from "./transcript-viewport.js";
 import { WorkspaceTrustPage } from "./workspace-trust-page.js";
@@ -410,6 +411,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly hide: () => void;
       }
     | undefined;
+  let todoNavigator:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+      }
+    | undefined;
+  let todoNavigatorGeneration = 0;
   let planActionOverlay:
     | {
         readonly close: () => void;
@@ -427,6 +435,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const closeableOverlaysInPrecedence = (): readonly (CloseableOverlay | undefined)[] => [
     planActionOverlay,
     helpNavigator,
+    todoNavigator,
     artifactNavigator,
     mcpWizard,
     pathPicker,
@@ -464,6 +473,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     configurationPage = undefined;
     artifactNavigator?.hide();
     artifactNavigator = undefined;
+    todoNavigatorGeneration += 1;
+    todoNavigator?.hide();
+    todoNavigator = undefined;
     thinkingPicker?.hide();
     thinkingPicker = undefined;
   };
@@ -1880,6 +1892,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             : active.plan.state === "ready"
               ? ` · Plan ready r${active.plan.revision} · review required`
               : " · Plan approved · not started";
+      const todoSummary =
+        active.todo === undefined
+          ? ""
+          : ` · Todo ${active.todo.counts.pending}/${active.todo.counts.inProgress}/${active.todo.counts.completed} · ${active.todo.blockedCount} blocked`;
       const compactPlanSummary =
         active.plan === undefined
           ? ""
@@ -1888,15 +1904,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             : active.plan.state === "ready"
               ? " · plan ready"
               : " · plan pending";
+      const compactTodoSummary =
+        active.todo === undefined
+          ? ""
+          : ` · todo ${active.todo.counts.pending}/${active.todo.counts.inProgress}/${active.todo.counts.completed} · ${active.todo.blockedCount} blocked`;
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
         ),
         standard: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
         ),
         narrow: theme.muted(
-          `${runStatus}${compactPlanSummary} · ${footerContextCompactText(active)}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}\n/help · Tab complete`,
+          `${runStatus}${compactPlanSummary} · ${footerContextCompactText(active)}${compactTodoSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}\n/help · Tab complete`,
         ),
       });
     }
@@ -2279,6 +2299,149 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     };
     clearNotice();
     tui.requestRender();
+  };
+  const showTodoNavigator = (expectedSessionId: string): void => {
+    const current = options.presentation.getState().authoritative.active;
+    if (current?.session.id !== expectedSessionId) {
+      showNotice(
+        "error",
+        "The active session changed before its Todo navigator opened.",
+        "until_next_action",
+      );
+      renderState();
+      return;
+    }
+    if (current.todo === undefined) {
+      showNotice(
+        "info",
+        "Todo is unavailable in this historical Tool Profile. Start a new session to use Todo.",
+        "until_next_action",
+        current.session.id,
+      );
+      renderState();
+      return;
+    }
+    todoNavigatorGeneration += 1;
+    const generation = todoNavigatorGeneration;
+    const expectedStoreRevision = current.todo.storeRevision;
+    const summary = current.todo;
+    todoNavigator?.hide();
+    todoNavigator = undefined;
+    const actionId = showNotice(
+      "progress",
+      "Loading the authoritative Todo store…",
+      "until_replaced",
+      expectedSessionId,
+    );
+    renderState();
+    void options.presentation
+      .dispatch({
+        type: "list_todos",
+        sessionId: expectedSessionId,
+        expectedStoreRevision,
+        filter: { status: null, titleContains: null },
+        limit: 20,
+        cursor: null,
+      })
+      .then((receipt) => {
+        const active = options.presentation.getState().authoritative.active;
+        if (
+          generation !== todoNavigatorGeneration ||
+          active?.session.id !== expectedSessionId ||
+          active.todo?.storeRevision !== expectedStoreRevision
+        ) {
+          return;
+        }
+        if (receipt.status === "rejected" || receipt.todo?.type !== "todo_page") {
+          settleNotice(
+            actionId,
+            "error",
+            receipt.status === "rejected" ? receipt.message : "The Todo page is unavailable.",
+            "until_replaced",
+            expectedSessionId,
+          );
+          renderState();
+          return;
+        }
+        let handle: { hide(): void } | undefined;
+        const close = () => {
+          navigator.cancelPendingRead();
+          todoNavigatorGeneration += 1;
+          handle?.hide();
+          todoNavigator = undefined;
+          tui.setFocus(editor);
+          tui.requestRender();
+        };
+        const navigator = new TodoNavigator({
+          initialPage: receipt.todo,
+          onChange: () => tui.requestRender(),
+          onClose: close,
+          async onGet(id) {
+            const detailReceipt = await options.presentation.dispatch({
+              type: "get_todo",
+              sessionId: expectedSessionId,
+              expectedStoreRevision,
+              id,
+            });
+            if (detailReceipt.status === "rejected" || detailReceipt.todo?.type !== "todo_entity") {
+              throw new Error(
+                detailReceipt.status === "rejected"
+                  ? detailReceipt.message
+                  : "The Todo entity is unavailable.",
+              );
+            }
+            return detailReceipt.todo;
+          },
+          async onList(cursor) {
+            const pageReceipt = await options.presentation.dispatch({
+              type: "list_todos",
+              sessionId: expectedSessionId,
+              expectedStoreRevision,
+              filter: { status: null, titleContains: null },
+              limit: 20,
+              cursor,
+            });
+            if (pageReceipt.status === "rejected" || pageReceipt.todo?.type !== "todo_page") {
+              throw new Error(
+                pageReceipt.status === "rejected"
+                  ? pageReceipt.message
+                  : "The Todo page is unavailable.",
+              );
+            }
+            return pageReceipt.todo;
+          },
+          summary,
+          theme,
+        });
+        handle = showOverlay(navigator, {
+          width: "90%",
+          minWidth: 36,
+          maxHeight: "80%",
+          margin: 1,
+        });
+        todoNavigator = {
+          close,
+          hide: () => {
+            navigator.cancelPendingRead();
+            handle?.hide();
+          },
+        };
+        settleNoticeClear(actionId);
+        tui.requestRender();
+      })
+      .catch(() => {
+        if (generation !== todoNavigatorGeneration) {
+          return;
+        }
+        settleNotice(
+          actionId,
+          "error",
+          "The Todo store could not be read safely.",
+          "until_replaced",
+          expectedSessionId,
+        );
+        renderState();
+      });
   };
   const showHelpNavigator = (commandId: "help" | "hotkeys", argumentsText: string): void => {
     const requestedTopic = commandId === "hotkeys" ? "hotkeys" : argumentsText.trim();
@@ -3294,6 +3457,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           renderState();
         },
       );
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "todos" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
+      editor.setText("");
+      editor.disableSubmit = false;
+      showTodoNavigator(active.session.id);
       return;
     }
     if (

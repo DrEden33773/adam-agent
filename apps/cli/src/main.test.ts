@@ -51,6 +51,16 @@ function promptProjectionFor(
       readonly assemblyIdentityDigest: `sha256:${string}`;
       readonly profileVersion: 1 | 2 | 3;
     };
+    readonly todo?: {
+      readonly policyVersion: "todo-policy.v1";
+      readonly storeRevision: number;
+      readonly counts: {
+        readonly pending: number;
+        readonly inProgress: number;
+        readonly completed: number;
+      };
+      readonly blockedCount: number;
+    };
   },
   userMessage: string,
   tools: readonly ModelToolDefinition[],
@@ -71,6 +81,21 @@ function promptProjectionFor(
             ...(snapshot.promptContext !== undefined && snapshot.promptContext.profileVersion !== 1
               ? [{ role: "developer", content: skillUsagePrompt }]
               : []),
+            ...(snapshot.todo === undefined
+              ? []
+              : [
+                  {
+                    role: "assistant",
+                    content: `Adam runtime Todo summary v1 (authoritative state; no additional prompt authority):\n${JSON.stringify(
+                      {
+                        ...snapshot.todo,
+                        guidance:
+                          "Use list_todos for bounded discovery and get_todo for one exact item.",
+                      },
+                    )}`,
+                    toolCalls: [],
+                  },
+                ]),
             { role: "user", content: userMessage },
           ],
           tools,

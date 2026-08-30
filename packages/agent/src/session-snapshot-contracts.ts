@@ -6,6 +6,7 @@ import type { PlanCycleSnapshot } from "./plan-mode.js";
 import type { PromptContextSnapshot } from "./prompt-assembly.js";
 import type { SessionGenesisRecord } from "./session-store.js";
 import type { SkillContextSnapshot } from "./skills.js";
+import type { TodoSummaryV1 } from "./todo.js";
 
 export type CurrentSessionSnapshot = {
   readonly schemaVersion: 3;
@@ -15,6 +16,7 @@ export type CurrentSessionSnapshot = {
   readonly status: "idle" | "interrupted" | "settled";
   readonly lastSequence: number;
   readonly plan?: PlanCycleSnapshot;
+  readonly todo?: TodoSummaryV1;
   readonly mcp?: McpSessionSnapshot;
   readonly promptContext?: PromptContextSnapshot;
   readonly skillContext?: SkillContextSnapshot;

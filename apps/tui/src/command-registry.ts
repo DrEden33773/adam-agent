@@ -34,6 +34,7 @@ export type AdamCommandDefinition = {
     | "skills"
     | "target"
     | "thinking"
+    | "todos"
     | "trust"
     | "tree";
   readonly name: string;
@@ -264,6 +265,14 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     name: "diffs",
     summary: "Reopen settled change previews from the active chronology.",
     usage: "/diffs",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "todos",
+    name: "todos",
+    summary: "Browse the authoritative Todo store without mutation.",
+    usage: "/todos",
   },
   {
     aliases: [],
