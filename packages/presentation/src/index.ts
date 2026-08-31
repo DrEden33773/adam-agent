@@ -1,3 +1,53 @@
+/**
+ * Removes complete CSI, OSC, and APC terminal sequences while preserving visible text.
+ * Adapted from @earendil-works/pi-tui 0.84.2 utils (MIT); see THIRD_PARTY_NOTICES.md.
+ */
+export function stripTerminalSequences(input: string): string {
+  if (!input.includes("\u001b")) {
+    return input;
+  }
+  let output = "";
+  let index = 0;
+  while (index < input.length) {
+    const sequenceLength = terminalSequenceLength(input, index);
+    if (sequenceLength > 0) {
+      index += sequenceLength;
+    } else {
+      output += input[index] ?? "";
+      index += 1;
+    }
+  }
+  return output;
+}
+
+function terminalSequenceLength(input: string, index: number): number {
+  if (input[index] !== "\u001b") {
+    return 0;
+  }
+  const introducer = input[index + 1];
+  if (introducer === "[") {
+    let cursor = index + 2;
+    while (cursor < input.length && !/[mGKHJ]/u.test(input[cursor] ?? "")) {
+      cursor += 1;
+    }
+    return cursor < input.length ? cursor + 1 - index : 0;
+  }
+  if (introducer !== "]" && introducer !== "_") {
+    return 0;
+  }
+  let cursor = index + 2;
+  while (cursor < input.length) {
+    if (input[cursor] === "\u0007") {
+      return cursor + 1 - index;
+    }
+    if (input[cursor] === "\u001b" && input[cursor + 1] === "\\") {
+      return cursor + 2 - index;
+    }
+    cursor += 1;
+  }
+  return 0;
+}
+
 export type ProjectDisplay = {
   readonly id: string;
   readonly label: string;

@@ -33,4 +33,4 @@ function isBidirectionalControl(codePoint: number): boolean {
   );
 }
 
-import { stripTerminalSequences } from "@earendil-works/pi-tui";
+import { stripTerminalSequences } from "@adam-agent/presentation";

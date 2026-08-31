@@ -6,6 +6,8 @@ Adam Agent uses the terminal mechanics package
 [`@earendil-works/pi-tui`](https://github.com/earendil-works/pi/tree/914cf1472e715297caa30db4b9535d534a9eb718/packages/tui),
 licensed under the MIT License.
 
+Adam Agent also adapts Pi TUI's bounded CSI, OSC, and APC terminal-sequence stripping behavior into the browser-safe Presentation text projection used by the Turn Composer and TUI renderer.
+
 Adam Agent's bounded tool-preview interaction and syntax-projection strategy is independently adapted from [`badlogic/pi-mono`](https://github.com/badlogic/pi-mono/tree/dcd461925db2edf69a43c8135db1180d418afd54/packages/coding-agent), also licensed under the MIT License.
 
 Copyright (c) Mario Zechner and contributors

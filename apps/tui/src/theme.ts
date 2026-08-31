@@ -25,7 +25,6 @@ export type AdamTuiTheme = {
   readonly text: (text: string) => string;
   readonly green: (text: string) => string;
   readonly overlay: (text: string) => string;
-  readonly mauve: (text: string) => string;
   readonly reference: (text: string) => string;
   readonly statusError: (text: string) => string;
   readonly statusInfo: (text: string) => string;
@@ -76,7 +75,6 @@ export function createAdamTuiTheme(noColor = noColorRequested()): AdamTuiTheme {
     text,
     green,
     overlay,
-    mauve,
     reference: color(137, 220, 235),
     brand: bold(mauve),
     muted,

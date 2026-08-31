@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { stripTerminalSequences } from "@adam-agent/presentation";
 import { normalizeExplicitUserImageToPngV1 } from "./image-input.js";
 import type { TurnComposerResourceStager } from "./input-resource-staging.js";
 import {
@@ -13,7 +14,6 @@ import {
   type StagedPastedTextSelectionV1,
 } from "./pasted-text.js";
 import type { RecoverableTurnDraftV1 } from "./recoverable-turn-draft.js";
-import { stripTerminalSequences } from "./session-naming.js";
 import type { StagedUserContentElementV1 } from "./structured-user-content.js";
 
 export {

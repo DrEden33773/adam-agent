@@ -5,6 +5,97 @@ import { createTurnComposer } from "./turn-composer.js";
 
 const digest = `sha256:${"a".repeat(64)}` as const;
 
+function createPastedTextStager(): TurnComposerResourceStager {
+  const texts = new Map<string, string>();
+  return {
+    async stage() {
+      throw new Error("No file should be staged in this test.");
+    },
+    async stageText(input) {
+      texts.set(input.id, input.text);
+      return {
+        type: "staged_pasted_text",
+        staged: {
+          stagingId: input.id,
+          id: digest,
+          mediaType: "text/plain; charset=utf-8",
+          byteCount: Buffer.byteLength(input.text, "utf8"),
+        },
+        digest,
+        byteCount: Buffer.byteLength(input.text, "utf8"),
+        lineCount: input.text.split("\n").length,
+        scalarCount: Array.from(input.text).length,
+      };
+    },
+    async readText(selection) {
+      const text = texts.get(selection.staged.stagingId);
+      if (text === undefined) {
+        throw new Error("The staged pasted text is unavailable.");
+      }
+      return text;
+    },
+    async retain() {},
+    async discard() {},
+    async close() {},
+  };
+}
+
+test("TurnComposer derives one safe bounded preview from pasted text", async () => {
+  const composer = await createTurnComposer({ onChange() {}, stager: createPastedTextStager() });
+  try {
+    await composer.stagePastedText("\u001b[31m\t《红楼梦》\u3000第五回\u001b[0m\u202e\n后文");
+    expect(composer.snapshot().pastedTexts).toMatchObject([
+      { preview: "《红楼梦》 第五回...", state: "ready" },
+    ]);
+  } finally {
+    await composer.close();
+  }
+});
+
+test("TurnComposer uses the exact empty fallback after terminal-string sanitization", async () => {
+  const composer = await createTurnComposer({ onChange() {}, stager: createPastedTextStager() });
+  try {
+    await composer.stagePastedText("\u001b_PRIVATE\u001b\\");
+    expect(composer.snapshot().pastedTexts).toMatchObject([
+      { preview: "(empty after sanitization)", state: "ready" },
+    ]);
+  } finally {
+    await composer.close();
+  }
+});
+
+test("TurnComposer removes malformed ESC controls without deleting following visible text", async () => {
+  const composer = await createTurnComposer({ onChange() {}, stager: createPastedTextStager() });
+  try {
+    await composer.stagePastedText("A\u001bXB");
+    expect(composer.snapshot().pastedTexts).toMatchObject([{ preview: "AXB", state: "ready" }]);
+  } finally {
+    await composer.close();
+  }
+});
+
+test("TurnComposer restores a derived preview without persisting a second copy", async () => {
+  const stager = createPastedTextStager();
+  const composer = await createTurnComposer({ onChange() {}, stager });
+  const recovered = await createTurnComposer({ onChange() {}, stager });
+  try {
+    const pasted = Array.from({ length: 11 }, (_, index) => `recovered paste ${index + 1}`).join(
+      "\n",
+    );
+    await composer.stagePastedText(pasted);
+    const draft = await composer.captureDraft({ type: "new_session", targetId: "fake.local" });
+    expect(draft).not.toHaveProperty("preview");
+    expect(JSON.stringify(draft)).not.toContain("recovered...");
+    await recovered.restoreDraft(draft);
+    expect(recovered.snapshot().pastedTexts).toMatchObject([
+      { preview: "recovered...", state: "ready" },
+    ]);
+  } finally {
+    await recovered.close();
+    await composer.close();
+  }
+});
+
 test("TurnComposer rejects a malformed pasted image before publishing a draft mutation", async () => {
   let publications = 0;
   let stagingInvoked = false;
