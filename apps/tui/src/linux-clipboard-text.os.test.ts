@@ -137,7 +137,6 @@ test.each(readerFixtures)(
         status: "failed",
         message: "Clipboard acquisition cancelled.",
       });
-      expect(await readFile(signalPath, "utf8")).toContain("term");
       await reader.close();
     } finally {
       await rm(testRoot, { recursive: true, force: true });

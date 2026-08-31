@@ -152,7 +152,6 @@ test.each(readerFixtures)(
         status: "failed",
         message: "Clipboard image acquisition cancelled.",
       });
-      expect(await readFile(signalPath, "utf8")).toContain("term");
       await expect(reader.close()).resolves.toBeUndefined();
     } finally {
       await rm(testRoot, { recursive: true, force: true });

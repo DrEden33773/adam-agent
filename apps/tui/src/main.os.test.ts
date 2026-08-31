@@ -299,12 +299,13 @@ process.stdin.on("data", (chunk) => {
   const detectorCommand = [process.execPath, detectorPath, outputPath, socketPath]
     .map((value) => JSON.stringify(value))
     .join(" ");
+  const tmuxFixture = { program: applicationCommand };
 
   try {
     await trustWorkspace(configRoot, workspaceRoot);
     await execFile(
       "/usr/bin/tmux",
-      ["-S", socketPath, "-f", "/dev/null", "new-session", "-d", applicationCommand],
+      ["-S", socketPath, "-f", "/dev/null", "new-session", "-d", tmuxFixture.program],
       { cwd: workspaceRoot, env: environment },
     );
     await execFile("/usr/bin/tmux", ["-S", socketPath, "pipe-pane", "-o", detectorCommand], {
@@ -318,14 +319,17 @@ process.stdin.on("data", (chunk) => {
       "pane-exited",
       "wait-for -S adam-closed",
     ]);
+    const ready = execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-ready"]);
     await execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "-S", "adam-start"]);
-    await execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-ready"]);
+    await ready;
+    const pasted = execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-pasted"]);
     await execFile("/usr/bin/tmux", ["-S", socketPath, "send-keys", "-l", "\u001bv"]);
-    await execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-pasted"]);
+    await pasted;
     expect(await readFile(outputPath, "utf8")).toContain("tmux clipboard text");
+    const restored = execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-restored"]);
+    const closed = execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-closed"]);
     await execFile("/usr/bin/tmux", ["-S", socketPath, "send-keys", "C-q"]);
-    await execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-restored"]);
-    await execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-closed"]);
+    await Promise.all([restored, closed]);
     expect(await readFile(outputPath, "utf8")).toContain("\u001b[?2004l");
     await expect(
       execFile("/usr/bin/tmux", ["-S", socketPath, "has-session"]),
