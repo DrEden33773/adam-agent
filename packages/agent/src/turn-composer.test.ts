@@ -1,6 +1,8 @@
 import { expect, test } from "vitest";
 
 import type { TurnComposerResourceStager } from "./input-resource-staging.js";
+import { pastedTextLimitsV1 } from "./pasted-text.js";
+import type { RecoverableTurnDraftV1 } from "./recoverable-turn-draft.js";
 import { createTurnComposer } from "./turn-composer.js";
 
 const digest = `sha256:${"a".repeat(64)}` as const;
@@ -92,6 +94,69 @@ test("TurnComposer restores a derived preview without persisting a second copy",
     ]);
   } finally {
     await recovered.close();
+    await composer.close();
+  }
+});
+
+test("TurnComposer expands a Skill atom to visible text without copying identity metadata", async () => {
+  const composer = await createTurnComposer({ onChange() {}, stager: createPastedTextStager() });
+  try {
+    composer.setText("$fir");
+    await expect(
+      composer.replaceText({
+        baseRevision: composer.snapshot().revision,
+        document: [
+          {
+            type: "skill",
+            elementId: "skill-occurrence",
+            name: "first",
+            qualifiedId: "skill:v1:project:.:first",
+          },
+        ],
+      }),
+    ).resolves.toBe(true);
+    expect(composer.readExpandedText()).toBe("$first");
+    expect(composer.readExpandedText()).not.toContain("skill:v1:");
+    await expect(composer.seal(new AbortController().signal)).resolves.toMatchObject({
+      text: "$first",
+      skillOccurrences: [
+        {
+          elementId: "skill-occurrence",
+          qualifiedId: "skill:v1:project:.:first",
+        },
+      ],
+    });
+  } finally {
+    await composer.close();
+  }
+});
+
+test("TurnComposer counts a candidate Skill atom against the structured text byte limit", async () => {
+  const composer = await createTurnComposer({ onChange() {}, stager: createPastedTextStager() });
+  try {
+    await composer.stagePastedText("x".repeat(pastedTextLimitsV1.maximumTextBytesPerTurn - 64));
+    const pastedText = composer
+      .snapshot()
+      .elements.find((element) => element.type === "pasted_text");
+    if (pastedText?.type !== "pasted_text") {
+      throw new Error("Expected one staged Text atom.");
+    }
+
+    await expect(
+      composer.replaceText({
+        baseRevision: composer.snapshot().revision,
+        document: [
+          { type: "pasted_text", elementId: pastedText.elementId },
+          {
+            type: "skill",
+            elementId: "maximum-name-skill",
+            name: "a".repeat(64),
+            qualifiedId: "skill:v1:project:.:maximum-name-skill",
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "limit_exceeded" });
+  } finally {
     await composer.close();
   }
 });
@@ -616,6 +681,7 @@ test("TurnComposer seals the exact ordered draft without turning resource tokens
 
 test("TurnComposer captures and restores one recoverable ordered draft through retained artifacts", async () => {
   const retained: string[] = [];
+  const pastedTexts = new Map<string, string>();
   const stager: TurnComposerResourceStager = {
     async stage(input) {
       return {
@@ -631,6 +697,29 @@ test("TurnComposer captures and restores one recoverable ordered draft through r
         mediaHint: "text",
         support: "utf8_text",
       };
+    },
+    async stageText(input) {
+      pastedTexts.set(input.id, input.text);
+      return {
+        type: "staged_pasted_text",
+        staged: {
+          stagingId: input.id,
+          id: digest,
+          mediaType: "text/plain; charset=utf-8",
+          byteCount: Buffer.byteLength(input.text, "utf8"),
+        },
+        digest,
+        byteCount: Buffer.byteLength(input.text, "utf8"),
+        lineCount: input.text.split("\n").length,
+        scalarCount: Array.from(input.text).length,
+      };
+    },
+    async readText(selection) {
+      const pasted = pastedTexts.get(selection.staged.stagingId);
+      if (pasted === undefined) {
+        throw new Error("Expected retained pasted text.");
+      }
+      return pasted;
     },
     async retain(input) {
       retained.push(input.resourceId);
@@ -652,22 +741,33 @@ test("TurnComposer captures and restores one recoverable ordered draft through r
       at: { elementId: initialText.elementId, offset: 6 },
       baseRevision: initial.revision,
     });
+    const pasted = Array.from({ length: 11 }, (_, index) => `legacy paste ${index + 1}`).join("\n");
+    await composer.stagePastedText(pasted);
 
     const draft = await composer.captureDraft({
       type: "new_session",
       targetId: "deepseek-v4-flash.direct",
     });
-    expect(retained).toHaveLength(1);
-    await recovered.restoreDraft(draft);
+    expect(draft.schemaVersion).toBe(2);
+    expect(retained).toHaveLength(2);
+    const legacyDraft: RecoverableTurnDraftV1 = {
+      ...draft,
+      schemaVersion: 1,
+      elements: draft.elements as RecoverableTurnDraftV1["elements"],
+    };
+    await recovered.restoreDraft(legacyDraft);
     expect(recovered.snapshot()).toMatchObject({
       elements: [
         { type: "text", text: "before" },
         { type: "resource", ordinal: 1 },
         { type: "text", text: "after" },
+        { type: "pasted_text", ordinal: 2 },
       ],
-      renderedText: "before[File #1]after",
+      renderedText: "before[File #1]after[Text #2]",
       resources: [{ displayName: "notes.txt", ordinal: 1, state: "ready" }],
+      pastedTexts: [{ ordinal: 2, state: "ready" }],
     });
+    expect(recovered.readExpandedText()).toBe(`before[File #1]after${pasted}`);
   } finally {
     await recovered.close();
     await composer.close();

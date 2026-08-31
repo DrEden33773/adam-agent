@@ -13,7 +13,7 @@ import {
   pastedTextLimitsV1,
   type StagedPastedTextSelectionV1,
 } from "./pasted-text.js";
-import type { RecoverableTurnDraftV1 } from "./recoverable-turn-draft.js";
+import type { RecoverableTurnDraft, RecoverableTurnDraftV2 } from "./recoverable-turn-draft.js";
 import type { StagedUserContentElementV1 } from "./structured-user-content.js";
 
 export {
@@ -55,6 +55,12 @@ export type TurnComposerElementSnapshot =
       readonly type: "pasted_text";
       readonly ordinal: number;
       readonly pastedTextId: string;
+    }
+  | {
+      readonly type: "skill";
+      readonly elementId: string;
+      readonly name: string;
+      readonly qualifiedId: string;
     };
 
 export type TurnComposerSealedElement =
@@ -72,6 +78,13 @@ export type TurnComposerSealedElement =
       readonly token: string;
       readonly text: string;
       readonly selection: StagedPastedTextSelectionV1;
+    }
+  | {
+      readonly type: "skill";
+      readonly elementId: string;
+      readonly name: string;
+      readonly qualifiedId: string;
+      readonly text: string;
     };
 
 export type TurnComposerPastedTextSnapshot = {
@@ -157,16 +170,23 @@ export type TurnComposer = {
         | { readonly type: "text"; readonly text: string }
         | { readonly type: "resource"; readonly elementId: string }
         | { readonly type: "pasted_text"; readonly elementId: string }
+        | {
+            readonly type: "skill";
+            readonly elementId: string;
+            readonly name: string;
+            readonly qualifiedId: string;
+          }
       )[];
     },
     commit?: () => Promise<void>,
   ): Promise<boolean>;
-  captureDraft(scope: RecoverableTurnDraftV1["scope"]): Promise<RecoverableTurnDraftV1>;
-  restoreDraft(draft: RecoverableTurnDraftV1): Promise<void>;
+  captureDraft(scope: RecoverableTurnDraftV2["scope"]): Promise<RecoverableTurnDraftV2>;
+  restoreDraft(draft: RecoverableTurnDraft): Promise<void>;
   undo(baseRevision: number, commit?: () => Promise<void>): Promise<boolean>;
   cancel(id: string): Promise<boolean>;
   remove(id: string, commit?: () => Promise<void>): Promise<boolean>;
   removePastedText(id: string, commit?: () => Promise<void>): Promise<boolean>;
+  removeSkill(elementId: string, commit?: () => Promise<void>): Promise<boolean>;
   setText(text: string): void;
   commitText(text: string, commit: () => Promise<void>): Promise<void>;
   seal(signal: AbortSignal): Promise<{
@@ -176,6 +196,10 @@ export type TurnComposer = {
     readonly text: string;
     readonly selections: readonly StagedInputResourceSelectionV1[];
     readonly pastedTextSelections: readonly StagedPastedTextSelectionV1[];
+    readonly skillOccurrences: readonly {
+      readonly elementId: string;
+      readonly qualifiedId: string;
+    }[];
   }>;
   unseal(): void;
   reset(baseRevision: number, commit: () => Promise<void>): Promise<boolean>;
@@ -267,15 +291,23 @@ export async function createTurnComposer(options: {
       .map((element) =>
         element.type === "text"
           ? element.text
-          : atomToken(element.type === "pasted_text" ? "text" : element.kind, element.ordinal),
+          : element.type === "skill"
+            ? `$${element.name}`
+            : atomToken(element.type === "pasted_text" ? "text" : element.kind, element.ordinal),
       )
       .join("");
 
   const literalText = (): string =>
     elements.flatMap((element) => (element.type === "text" ? [element.text] : [])).join("");
 
-  const textPayloadBytes = (literal = literalText()): number =>
+  const textPayloadBytes = (
+    literal = literalText(),
+    candidateElements: readonly TurnComposerElementSnapshot[] = elements,
+  ): number =>
     Buffer.byteLength(literal, "utf8") +
+    candidateElements
+      .filter((element) => element.type === "skill")
+      .reduce((total, element) => total + Buffer.byteLength(`$${element.name}`, "utf8"), 0) +
     [...pastedTexts.values()]
       .filter((pastedText) => pastedText.state !== "removed")
       .reduce((total, pastedText) => total + pastedText.byteCount, 0);
@@ -452,6 +484,28 @@ export async function createTurnComposer(options: {
     return { element, previousElements };
   };
 
+  const removeSkillElement = (
+    elementId: string,
+  ):
+    | {
+        readonly previousElements: readonly TurnComposerElementSnapshot[];
+      }
+    | undefined => {
+    const previousElements = elements;
+    const index = previousElements.findIndex(
+      (element) => element.type === "skill" && element.elementId === elementId,
+    );
+    if (index < 0) {
+      return undefined;
+    }
+    elements = normalizeTextElements([
+      ...previousElements.slice(0, index),
+      ...previousElements.slice(index + 1),
+    ]);
+    revision += 1;
+    return { previousElements };
+  };
+
   return {
     async captureDraft(scope) {
       const orderedResources = elements.flatMap((element) => {
@@ -504,7 +558,7 @@ export async function createTurnComposer(options: {
         }
       }
       return {
-        schemaVersion: 1,
+        schemaVersion: 2,
         scope,
         nextOrdinal,
         elements: elements.map((element) => ({ ...element })),
@@ -641,15 +695,6 @@ export async function createTurnComposer(options: {
         (element): element is Exclude<TurnComposerElementSnapshot, { readonly type: "text" }> =>
           element.type !== "text",
       );
-      const projectedAtomIds = input.document.flatMap((part) =>
-        part.type === "text" ? [] : [part.elementId],
-      );
-      if (
-        projectedAtomIds.length !== currentAtoms.length ||
-        projectedAtomIds.some((elementId, index) => currentAtoms[index]?.elementId !== elementId)
-      ) {
-        return false;
-      }
       const currentTextIdByGap = new Map<number, string>();
       let gap = 0;
       for (const element of elements) {
@@ -661,14 +706,42 @@ export async function createTurnComposer(options: {
       }
       const atomsByElementId = new Map(currentAtoms.map((atom) => [atom.elementId, atom]));
       const nextElements: TurnComposerElementSnapshot[] = [];
+      const projectedIds = new Set<string>();
+      let currentAtomIndex = 0;
       gap = 0;
       for (const part of input.document) {
         if (part.type !== "text") {
           const atom = atomsByElementId.get(part.elementId);
-          if (atom === undefined || atom.type !== part.type) {
+          if (projectedIds.has(part.elementId)) {
             return false;
           }
-          nextElements.push(atom);
+          projectedIds.add(part.elementId);
+          if (atom !== undefined) {
+            if (
+              currentAtoms[currentAtomIndex]?.elementId !== atom.elementId ||
+              atom.type !== part.type
+            ) {
+              return false;
+            }
+            if (
+              atom.type === "skill" &&
+              (part.type !== "skill" ||
+                atom.name !== part.name ||
+                atom.qualifiedId !== part.qualifiedId)
+            ) {
+              return false;
+            }
+            nextElements.push(atom);
+            currentAtomIndex += 1;
+          } else if (
+            part.type === "skill" &&
+            isValidSkillIdentity(part.name, part.qualifiedId) &&
+            !elements.some((element) => element.elementId === part.elementId)
+          ) {
+            nextElements.push({ ...part });
+          } else {
+            return false;
+          }
           gap += 1;
           continue;
         }
@@ -689,12 +762,15 @@ export async function createTurnComposer(options: {
           });
         }
       }
+      if (currentAtomIndex !== currentAtoms.length) {
+        return false;
+      }
       const nextText = nextElements
         .flatMap((element) => (element.type === "text" ? [element.text] : []))
         .join("");
       if (
         nextText.length > 512 * 1024 ||
-        textPayloadBytes(nextText) > pastedTextLimitsV1.maximumTextBytesPerTurn
+        textPayloadBytes(nextText, nextElements) > pastedTextLimitsV1.maximumTextBytesPerTurn
       ) {
         throw new TurnComposerError(
           "limit_exceeded",
@@ -827,6 +903,33 @@ export async function createTurnComposer(options: {
       if (removed === undefined || pastedText.staged === null || pastedText.text === null) {
         await discardPastedText(pastedText);
         pastedTexts.delete(id);
+      }
+      publish();
+      return true;
+    },
+    async removeSkill(elementId, commit) {
+      if (closed || sealed) {
+        return false;
+      }
+      const previousElements = elements;
+      const previousText = text;
+      const previousRevision = revision;
+      const previousUndoStack = [...undoStack];
+      const removed = removeSkillElement(elementId);
+      if (removed === undefined) {
+        return false;
+      }
+      text = literalText();
+      pushUndo({ previousElements: removed.previousElements });
+      try {
+        await commit?.();
+      } catch (error) {
+        elements = previousElements;
+        text = previousText;
+        revision = previousRevision;
+        undoStack.length = 0;
+        undoStack.push(...previousUndoStack);
+        throw error;
       }
       publish();
       return true;
@@ -1412,6 +1515,9 @@ export async function createTurnComposer(options: {
               selection: pastedText.staged,
             };
           }
+          if (element.type === "skill") {
+            return { ...element, text: `$${element.name}` };
+          }
           const resource = resourceById.get(element.resourceId);
           if (resource?.staged === null || resource?.staged === undefined) {
             throw new TurnComposerError(
@@ -1428,43 +1534,61 @@ export async function createTurnComposer(options: {
           };
         }),
         renderedText: renderedText(),
-        structuredContent: elements.map((element): StagedUserContentElementV1 => {
-          if (element.type === "text") {
-            return { type: "text", text: element.text };
-          }
-          if (element.type === "pasted_text") {
-            const selectionIndex = retainedPastedTexts.findIndex(
-              (pastedText) => pastedText.id === element.pastedTextId,
-            );
-            if (selectionIndex < 0) {
+        structuredContent: normalizeStructuredTextElements(
+          elements.map((element): StagedUserContentElementV1 => {
+            if (element.type === "text") {
+              return { type: "text", text: element.text };
+            }
+            if (element.type === "pasted_text") {
+              const selectionIndex = retainedPastedTexts.findIndex(
+                (pastedText) => pastedText.id === element.pastedTextId,
+              );
+              if (selectionIndex < 0) {
+                throw new TurnComposerError(
+                  "failed",
+                  "Every retained Text atom must be ready before send.",
+                );
+              }
+              return {
+                type: "pasted_text",
+                selectionIndex,
+                draftOrdinal: element.ordinal,
+              };
+            }
+            if (element.type === "skill") {
+              return { type: "text", text: `$${element.name}` };
+            }
+            const selectionIndex = selectionIndexById.get(element.resourceId);
+            if (selectionIndex === undefined) {
               throw new TurnComposerError(
                 "failed",
-                "Every retained Text atom must be ready before send.",
+                "Every retained input resource must be ready before send.",
               );
             }
             return {
-              type: "pasted_text",
+              type: "input_resource",
               selectionIndex,
               draftOrdinal: element.ordinal,
             };
-          }
-          const selectionIndex = selectionIndexById.get(element.resourceId);
-          if (selectionIndex === undefined) {
-            throw new TurnComposerError(
-              "failed",
-              "Every retained input resource must be ready before send.",
-            );
-          }
-          return {
-            type: "input_resource",
-            selectionIndex,
-            draftOrdinal: element.ordinal,
-          };
-        }),
-        text,
+          }),
+        ),
+        text: elements
+          .flatMap((element) =>
+            element.type === "text"
+              ? [element.text]
+              : element.type === "skill"
+                ? [`$${element.name}`]
+                : [],
+          )
+          .join(""),
         selections: retained.map((resource) => resource.staged as StagedInputResourceSelectionV1),
         pastedTextSelections: retainedPastedTexts.map(
           (pastedText) => pastedText.staged as StagedPastedTextSelectionV1,
+        ),
+        skillOccurrences: elements.flatMap((element) =>
+          element.type === "skill"
+            ? [{ elementId: element.elementId, qualifiedId: element.qualifiedId }]
+            : [],
         ),
       };
     },
@@ -1520,6 +1644,9 @@ export async function createTurnComposer(options: {
           }
           if (element.type === "resource") {
             return atomToken(element.kind, element.ordinal);
+          }
+          if (element.type === "skill") {
+            return `$${element.name}`;
           }
           const pastedText = pastedTexts.get(element.pastedTextId);
           if (pastedText?.state !== "ready" || pastedText.text === null) {
@@ -1655,4 +1782,33 @@ export async function createTurnComposer(options: {
       };
     },
   };
+}
+
+function isValidSkillIdentity(name: string, qualifiedId: string): boolean {
+  return (
+    /^[a-z0-9]+(?:-[a-z0-9]+)*$/u.test(name) &&
+    name.length <= 64 &&
+    qualifiedId.length > 0 &&
+    qualifiedId.length <= 16_384 &&
+    /^[\x20-\x7e]+$/u.test(qualifiedId) &&
+    Buffer.byteLength(qualifiedId, "utf8") <= 16_384
+  );
+}
+
+function normalizeStructuredTextElements(
+  elements: readonly StagedUserContentElementV1[],
+): readonly StagedUserContentElementV1[] {
+  const normalized: StagedUserContentElementV1[] = [];
+  for (const element of elements) {
+    const previous = normalized.at(-1);
+    if (element.type === "text" && previous?.type === "text") {
+      normalized[normalized.length - 1] = {
+        type: "text",
+        text: `${previous.text}${element.text}`,
+      };
+    } else {
+      normalized.push(element);
+    }
+  }
+  return normalized;
 }

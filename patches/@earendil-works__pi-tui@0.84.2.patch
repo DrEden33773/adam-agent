@@ -1,5 +1,5 @@
 diff --git a/dist/components/editor.d.ts b/dist/components/editor.d.ts
-index a6fedc9e3b36d066e34860d040db6df47d88c432..ced33ab6fef651b7c9d6fc8834af110f3c4ccae0 100644
+index a6fedc9e3b36d066e34860d040db6df47d88c432..a5886312e10e67795d2cbdd68a2bab23e1c5eb01 100644
 --- a/dist/components/editor.d.ts
 +++ b/dist/components/editor.d.ts
 @@ -1,4 +1,4 @@
@@ -8,7 +8,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..ced33ab6fef651b7c9d6fc8834af110f
  import { type Component, type Focusable, type TUI } from "../tui.ts";
  import { type SelectListTheme } from "./select-list.ts";
  /**
-@@ -24,12 +24,72 @@ export interface TextChunk {
+@@ -24,12 +24,73 @@ export interface TextChunk {
  export declare function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl.SegmentData[]): TextChunk[];
  export interface EditorTheme {
      borderColor: (str: string) => string;
@@ -77,11 +77,12 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..ced33ab6fef651b7c9d6fc8834af110f
 +export interface EditorStructuredCompletion {
 +    project(document: readonly EditorDocumentPart[], cursor: EditorDocumentPoint): EditorStructuredCompletionProjection | null;
 +    accept(document: readonly EditorDocumentPart[], cursor: EditorDocumentPoint, item: AutocompleteItem, prefix: string): EditorStructuredCompletionEdit | null;
++    promote?(text: string, cursorOffset: number, item: AutocompleteItem, prefix: string): EditorStructuredCompletionEdit | null;
 +}
  export declare class Editor implements Component, Focusable {
      private state;
      /** Focusable interface - set by TUI when focus changes */
-@@ -53,6 +113,7 @@ export declare class Editor implements Component, Focusable {
+@@ -53,6 +114,7 @@ export declare class Editor implements Component, Focusable {
      private autocompleteRequestTask;
      private autocompleteStartToken;
      private autocompleteRequestId;
@@ -89,7 +90,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..ced33ab6fef651b7c9d6fc8834af110f
      private pastes;
      private pasteCounter;
      private pasteBuffer;
-@@ -68,6 +129,8 @@ export declare class Editor implements Component, Focusable {
+@@ -68,6 +130,8 @@ export declare class Editor implements Component, Focusable {
      private undoStack;
      onSubmit?: (text: string) => void;
      onChange?: (text: string) => void;
@@ -98,7 +99,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..ced33ab6fef651b7c9d6fc8834af110f
      disableSubmit: boolean;
      constructor(tui: TUI, theme: EditorTheme, options?: EditorOptions);
      /** Set of currently valid paste IDs, for marker-aware segmentation. */
-@@ -79,6 +142,8 @@ export declare class Editor implements Component, Focusable {
+@@ -79,6 +143,8 @@ export declare class Editor implements Component, Focusable {
      getAutocompleteMaxVisible(): number;
      setAutocompleteMaxVisible(maxVisible: number): void;
      setAutocompleteProvider(provider: AutocompleteProvider): void;
@@ -107,7 +108,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..ced33ab6fef651b7c9d6fc8834af110f
      /**
       * Add a prompt to history for up/down arrow navigation.
       * Called after successful submission.
-@@ -107,7 +172,10 @@ export declare class Editor implements Component, Focusable {
+@@ -107,7 +173,10 @@ export declare class Editor implements Component, Focusable {
          line: number;
          col: number;
      };
@@ -119,7 +120,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..ced33ab6fef651b7c9d6fc8834af110f
       * Insert text at the current cursor position.
       * Used for programmatic insertion (e.g., clipboard image markers).
 diff --git a/dist/components/editor.js b/dist/components/editor.js
-index 4786b46932b65785cfbd2304610ca77ccead910a..5c1a37538dbad8250622417fe235b9c68a163b81 100644
+index 4786b46932b65785cfbd2304610ca77ccead910a..8035125c53bc01ea849ab57c5fa83fafb540ad51 100644
 --- a/dist/components/editor.js
 +++ b/dist/components/editor.js
 @@ -219,6 +219,7 @@ export class Editor {
@@ -763,7 +764,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..5c1a37538dbad8250622417fe235b9c6
          const snapshot = this.undoStack.pop();
          if (!snapshot)
              return;
-@@ -1803,17 +2185,73 @@ export class Editor {
+@@ -1803,17 +2185,86 @@ export class Editor {
          return firstPrefixIndex;
      }
      createAutocompleteList(prefix, items) {
@@ -787,6 +788,19 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..5c1a37538dbad8250622417fe235b9c6
 +    applyAutocompleteItem(item, prefix) {
 +        if (!this.autocompleteProvider)
 +            return false;
++        if (this.structuredDocument === null && this.structuredCompletion?.promote !== undefined) {
++            const edit = this.structuredCompletion.promote(this.getText(), this.cursorOffset(), item, prefix);
++            if (edit !== null) {
++                this.setDocument(edit.document, edit.cursor);
++                this.onEditIntent?.({
++                    type: "replace",
++                    range: edit.range,
++                    text: edit.text,
++                    document: edit.document,
++                });
++                return true;
++            }
++        }
 +        if (this.structuredDocument !== null && this.structuredCompletion !== undefined) {
 +            const edit = this.structuredCompletion.accept(this.structuredDocument, this.getDocumentCursor(), item, prefix);
 +            if (edit === null)
@@ -840,7 +854,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..5c1a37538dbad8250622417fe235b9c6
          if (this.isInSlashCommandContext(beforeCursor) && !beforeCursor.trimStart().includes(" ")) {
              this.handleSlashCommandCompletion();
          }
-@@ -1830,9 +2268,12 @@ export class Editor {
+@@ -1830,9 +2281,12 @@ export class Editor {
      requestAutocomplete(options) {
          if (!this.autocompleteProvider)
              return;
@@ -854,7 +868,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..5c1a37538dbad8250622417fe235b9c6
              if (!shouldTrigger) {
                  return;
              }
-@@ -1882,14 +2323,20 @@ export class Editor {
+@@ -1882,14 +2336,20 @@ export class Editor {
          if (options.explicitTab || options.force) {
              return 0;
          }
@@ -878,7 +892,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..5c1a37538dbad8250622417fe235b9c6
          if (!this.isAutocompleteRequestCurrent(requestId, controller, snapshotText, snapshotLine, snapshotCol)) {
              return;
          }
-@@ -1901,14 +2348,7 @@ export class Editor {
+@@ -1901,14 +2361,7 @@ export class Editor {
          }
          if (options.force && options.explicitTab && suggestions.items.length === 1) {
              const item = suggestions.items[0];
@@ -895,7 +909,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..5c1a37538dbad8250622417fe235b9c6
              return;
          }
 diff --git a/dist/components/select-list.d.ts b/dist/components/select-list.d.ts
-index d507de4ebff8e7fbaacd089677099c63b4dfff6c..f8b6caee7b1651ca1d8f5ce70ee4c2098715ae49 100644
+index d507de4ebff8e7fbaacd089677099c63b4dfff6c..0beb0e9abc13ed7a27cf31c0ca5677df37260f47 100644
 --- a/dist/components/select-list.d.ts
 +++ b/dist/components/select-list.d.ts
 @@ -22,6 +22,7 @@ export interface SelectListLayoutOptions {
@@ -907,7 +921,7 @@ index d507de4ebff8e7fbaacd089677099c63b4dfff6c..f8b6caee7b1651ca1d8f5ce70ee4c209
  export declare class SelectList implements Component {
      private items;
 diff --git a/dist/components/select-list.js b/dist/components/select-list.js
-index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..9d95baaf1e1456bb4ddd09dc00c343ba175403ed 100644
+index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..1b8d0171ebb65cdf41a37fb9ea1e104771b70e3c 100644
 --- a/dist/components/select-list.js
 +++ b/dist/components/select-list.js
 @@ -1,5 +1,5 @@

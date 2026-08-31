@@ -817,7 +817,13 @@ export type DraftPoint =
 export type DraftTextDocumentPart =
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "resource"; readonly elementId: string }
-  | { readonly type: "pasted_text"; readonly elementId: string };
+  | { readonly type: "pasted_text"; readonly elementId: string }
+  | {
+      readonly type: "skill";
+      readonly elementId: string;
+      readonly name: string;
+      readonly qualifiedId: string;
+    };
 
 export type TurnComposerDisplay = {
   readonly attachmentAvailable: boolean;
@@ -836,6 +842,13 @@ export type TurnComposerDisplay = {
         readonly type: "pasted_text";
         readonly ordinal: number;
         readonly pastedTextId: string;
+      }
+    | {
+        readonly type: "skill";
+        readonly elementId: string;
+        readonly name: string;
+        readonly qualifiedId: string;
+        readonly available: boolean;
       }
   )[];
   readonly renderedText: string;

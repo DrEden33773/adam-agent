@@ -1,6 +1,9 @@
 import { expect, test } from "vitest";
 import { AdamAutocompleteProvider } from "./command-autocomplete.js";
-import { adamStructuredEditorCompletion } from "./structured-editor-completion.js";
+import {
+  adamStructuredEditorCompletion,
+  createAdamStructuredEditorCompletion,
+} from "./structured-editor-completion.js";
 
 const provider = new AdamAutocompleteProvider({
   getProjectPaths: () => [],
@@ -66,6 +69,46 @@ test("structured completion acceptance preserves every atom identity and order",
       anchor: { partId: "right", offset: 4 },
       focus: { partId: "right", offset: 8 },
     },
+    text: "$first",
+  });
+});
+
+test("exact Skill completion promotes one literal range to an identity-bearing atom", () => {
+  let accepted:
+    | { readonly elementId: string; readonly name: string; readonly qualifiedId: string }
+    | undefined;
+  const completion = createAdamStructuredEditorCompletion({
+    onSkillAtom(identity) {
+      accepted = identity;
+    },
+  });
+  const skillItem = {
+    adamSkill: { name: "first", qualifiedId: "skill:v1:project:.:first" },
+    label: "$first",
+    value: "$first",
+  };
+  const result = completion.accept(
+    [
+      { type: "atom", id: "resource", label: "[Text #1]" },
+      { type: "text", id: "right", text: "Use $fir" },
+    ],
+    { partId: "right", offset: 8 },
+    skillItem,
+    "$fir",
+  );
+
+  expect(accepted).toMatchObject({
+    name: "first",
+    qualifiedId: "skill:v1:project:.:first",
+  });
+  expect(accepted?.elementId).toMatch(/^adam-skill-/u);
+  expect(result).toMatchObject({
+    cursor: { partId: accepted?.elementId, edge: "after" },
+    document: [
+      { type: "atom", id: "resource", label: "[Text #1]" },
+      { type: "text", id: "right", text: "Use " },
+      { type: "atom", id: accepted?.elementId, label: "$first" },
+    ],
     text: "$first",
   });
 });

@@ -1,73 +1,152 @@
+import { randomUUID } from "node:crypto";
 import type {
   EditorDocumentPart,
   EditorDocumentPoint,
   EditorStructuredCompletion,
   EditorStructuredCompletionProjection,
 } from "@earendil-works/pi-tui";
+import {
+  type SkillAutocompleteIdentity,
+  skillAutocompleteIdentity,
+} from "./command-autocomplete.js";
 
-export const adamStructuredEditorCompletion: EditorStructuredCompletion = {
-  project(document, cursor) {
-    const textCursor = textPartAtCursor(document, cursor);
-    if (textCursor === null) {
-      return null;
-    }
-    const beforeCursor = textCursor.part.text.slice(0, textCursor.offset);
-    const earlierLiteralContent = document
-      .slice(0, textCursor.index)
-      .some((part) => part.type === "text" && part.text.trim().length > 0);
-    const blockSlash = earlierLiteralContent && beforeCursor.trimStart().startsWith("/");
-    return projectTextPart(
-      blockSlash ? `x${textCursor.part.text}` : textCursor.part.text,
-      textCursor.offset + (blockSlash ? 1 : 0),
-    );
-  },
-  accept(document, cursor, item, prefix) {
-    const textCursor = textPartAtCursor(document, cursor);
-    if (textCursor === null) {
-      if (prefix.length === 0 && "edge" in cursor && item.value.length > 0) {
-        const atomIndex = document.findIndex(
-          (part) => part.type === "atom" && part.id === cursor.partId,
-        );
-        if (atomIndex < 0) {
-          return null;
-        }
-        const textPart = {
-          type: "text" as const,
-          id: nextTextPartId(document),
-          text: item.value,
-        };
-        const insertIndex = cursor.edge === "before" ? atomIndex : atomIndex + 1;
-        const nextDocument = [...document];
-        nextDocument.splice(insertIndex, 0, textPart);
-        return {
-          cursor: { partId: textPart.id, offset: item.value.length },
-          document: nextDocument,
-          range: { anchor: cursor, focus: cursor },
-          text: item.value,
-        };
+export function createAdamStructuredEditorCompletion(
+  options: {
+    readonly onSkillAtom?: (
+      identity: SkillAutocompleteIdentity & { readonly elementId: string },
+    ) => void;
+  } = {},
+): EditorStructuredCompletion {
+  return {
+    promote(text, cursorOffset, item, prefix) {
+      if (skillAutocompleteIdentity(item) === null) {
+        return null;
       }
-      return null;
-    }
-    const start = textCursor.offset - prefix.length;
-    if (start < 0 || textCursor.part.text.slice(start, textCursor.offset) !== prefix) {
-      return null;
-    }
-    const replacement = `${textCursor.part.text.slice(0, start)}${item.value}${textCursor.part.text.slice(textCursor.offset)}`;
-    const nextDocument = document.map((part) =>
-      part.id === textCursor.part.id ? { ...textCursor.part, text: replacement } : part,
-    );
-    const range = {
+      const document: readonly EditorDocumentPart[] = [
+        { type: "text", id: "adam-editor-text-1", text },
+      ];
+      return acceptSkillAtom(
+        document,
+        { partId: "adam-editor-text-1", offset: cursorOffset },
+        item,
+        prefix,
+        options.onSkillAtom,
+      );
+    },
+    project(document, cursor) {
+      const textCursor = textPartAtCursor(document, cursor);
+      if (textCursor === null) {
+        return null;
+      }
+      const beforeCursor = textCursor.part.text.slice(0, textCursor.offset);
+      const earlierLiteralContent = document
+        .slice(0, textCursor.index)
+        .some((part) => part.type === "text" && part.text.trim().length > 0);
+      const blockSlash = earlierLiteralContent && beforeCursor.trimStart().startsWith("/");
+      return projectTextPart(
+        blockSlash ? `x${textCursor.part.text}` : textCursor.part.text,
+        textCursor.offset + (blockSlash ? 1 : 0),
+      );
+    },
+    accept(document, cursor, item, prefix) {
+      const textCursor = textPartAtCursor(document, cursor);
+      if (textCursor === null) {
+        if (prefix.length === 0 && "edge" in cursor && item.value.length > 0) {
+          const atomIndex = document.findIndex(
+            (part) => part.type === "atom" && part.id === cursor.partId,
+          );
+          if (atomIndex < 0) {
+            return null;
+          }
+          const textPart = {
+            type: "text" as const,
+            id: nextTextPartId(document),
+            text: item.value,
+          };
+          const insertIndex = cursor.edge === "before" ? atomIndex : atomIndex + 1;
+          const nextDocument = [...document];
+          nextDocument.splice(insertIndex, 0, textPart);
+          return {
+            cursor: { partId: textPart.id, offset: item.value.length },
+            document: nextDocument,
+            range: { anchor: cursor, focus: cursor },
+            text: item.value,
+          };
+        }
+        return null;
+      }
+      const start = textCursor.offset - prefix.length;
+      if (start < 0 || textCursor.part.text.slice(start, textCursor.offset) !== prefix) {
+        return null;
+      }
+      const skill = skillAutocompleteIdentity(item);
+      if (skill !== null) {
+        return acceptSkillAtom(document, cursor, item, prefix, options.onSkillAtom);
+      }
+      const replacement = `${textCursor.part.text.slice(0, start)}${item.value}${textCursor.part.text.slice(textCursor.offset)}`;
+      const nextDocument = document.map((part) =>
+        part.id === textCursor.part.id ? { ...textCursor.part, text: replacement } : part,
+      );
+      const range = {
+        anchor: { partId: textCursor.part.id, offset: start },
+        focus: { partId: textCursor.part.id, offset: textCursor.offset },
+      } as const;
+      return {
+        cursor: { partId: textCursor.part.id, offset: start + item.value.length },
+        document: nextDocument,
+        range,
+        text: item.value,
+      };
+    },
+  };
+}
+
+export const adamStructuredEditorCompletion = createAdamStructuredEditorCompletion();
+
+function acceptSkillAtom(
+  document: readonly EditorDocumentPart[],
+  cursor: EditorDocumentPoint,
+  item: Parameters<EditorStructuredCompletion["accept"]>[2],
+  prefix: string,
+  onSkillAtom:
+    | ((identity: SkillAutocompleteIdentity & { readonly elementId: string }) => void)
+    | undefined,
+): ReturnType<EditorStructuredCompletion["accept"]> {
+  const skill = skillAutocompleteIdentity(item);
+  const textCursor = textPartAtCursor(document, cursor);
+  if (skill === null || textCursor === null) {
+    return null;
+  }
+  const start = textCursor.offset - prefix.length;
+  if (start < 0 || textCursor.part.text.slice(start, textCursor.offset) !== prefix) {
+    return null;
+  }
+  const elementId = `adam-skill-${randomUUID()}`;
+  const before = textCursor.part.text.slice(0, start);
+  const after = textCursor.part.text.slice(textCursor.offset);
+  const replacement = [
+    ...(before.length === 0 ? [] : [{ ...textCursor.part, text: before }]),
+    { type: "atom" as const, id: elementId, label: `$${skill.name}` },
+    ...(after.length === 0
+      ? []
+      : [{ type: "text" as const, id: nextTextPartId(document), text: after }]),
+  ];
+  const nextDocument = [
+    ...document.slice(0, textCursor.index),
+    ...replacement,
+    ...document.slice(textCursor.index + 1),
+  ];
+  onSkillAtom?.({ ...skill, elementId });
+  return {
+    cursor: { partId: elementId, edge: "after" },
+    document: nextDocument,
+    range: {
       anchor: { partId: textCursor.part.id, offset: start },
       focus: { partId: textCursor.part.id, offset: textCursor.offset },
-    } as const;
-    return {
-      cursor: { partId: textCursor.part.id, offset: start + item.value.length },
-      document: nextDocument,
-      range,
-      text: item.value,
-    };
-  },
-};
+    },
+    text: item.value,
+  };
+}
 
 function nextTextPartId(document: readonly EditorDocumentPart[]): string {
   const ids = new Set(document.map((part) => part.id));
