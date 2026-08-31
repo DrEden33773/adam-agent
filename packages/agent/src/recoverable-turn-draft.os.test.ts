@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,7 +15,7 @@ test("recoverable turn draft atomically replaces one owner-private project manif
     stateRoot: testRoot,
   });
   const first = {
-    schemaVersion: 1 as const,
+    schemaVersion: 2 as const,
     scope: { type: "new_session" as const, targetId: "deepseek-v4-flash.direct" },
     nextOrdinal: 1,
     elements: [{ elementId: "text-1", type: "text" as const, text: "first" }],
@@ -40,6 +40,13 @@ test("recoverable turn draft atomically replaces one owner-private project manif
     await repository.delete({ type: "new_session" });
     await expect(repository.load({ type: "new_session" })).resolves.toBeNull();
     await expect(readdir(draftsRoot)).resolves.toEqual([]);
+
+    const legacy = { ...first, schemaVersion: 1 as const };
+    await writeFile(join(draftsRoot, "new-session.json"), `${JSON.stringify(legacy)}\n`, {
+      mode: 0o600,
+    });
+    await expect(repository.load({ type: "new_session" })).resolves.toEqual(legacy);
+    await repository.delete({ type: "new_session" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

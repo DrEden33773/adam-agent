@@ -682,7 +682,7 @@ test("NO_COLOR Skill completion retains marker, order, columns, and source label
   }
 });
 
-test("Tab accepts one literal Skill completion without changing an adjacent Text atom", async () => {
+test("Tab accepts one exact Skill atom without changing an adjacent Text atom", async () => {
   const { fixture, testRoot } = await startPastedTextAtomFixture({
     prepare: prepareFirstStructuredCompletionSkill,
     scenario: "skill-selection",
@@ -702,7 +702,7 @@ test("Tab accepts one literal Skill completion without changing an adjacent Text
   }
 });
 
-test("Enter accepts one literal Skill completion without submitting an adjacent Text atom", async () => {
+test("Enter accepts one exact Skill atom without submitting an adjacent Text atom", async () => {
   const { fixture, stateRoot, testRoot } = await startPastedTextAtomFixture({
     prepare: prepareFirstStructuredCompletionSkill,
     scenario: "skill-selection",
@@ -5049,6 +5049,245 @@ test("Tab completes and admits a Skill mention from the current first-draft cata
     expect(durableState).toContain('"qualifiedId":"skill:v1:project:.:first"');
     expect(durableState).toContain('"reason":"user_explicit"');
     expect(durableState).toContain('"userMessage":"Use $first"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("accepted Skill completion preserves its exact identity across a recoverable restart", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-durable-skill-atom-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const userHome = join(testRoot, "home");
+  const environment = process.env as NodeJS.ProcessEnv & { HOME?: string };
+  const previousHome = environment.HOME;
+  for (const directory of [
+    join(workspaceRoot, ".agents", "skills", "shared-name"),
+    join(userHome, ".agents", "skills", "shared-name"),
+  ]) {
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      join(directory, "SKILL.md"),
+      "---\nname: shared-name\ndescription: Exact identity restart procedure.\n---\nExact body.\n",
+      "utf8",
+    );
+  }
+  environment.HOME = userHome;
+
+  try {
+    const first = startFixture({
+      launch: {},
+      scenario: "skill-selection",
+      stateRoot,
+      workspaceRoot,
+    });
+    await first.waitFor("Select an exact model target");
+    first.write("\r");
+    await first.waitFor("Adam · New session");
+    const beforeCompletion = first.output().length;
+    first.write("Use $sha");
+    await first.waitForCompleteFrameAfter("$shared-name", beforeCompletion);
+    const selected = (first.screen() ?? []).find((line) => line.includes("> $shared-name"));
+    if (selected !== undefined && !selected.includes("project:.")) {
+      first.write("\u001b[B");
+      await first.resize(79, 24);
+    }
+    first.write("\t");
+    await first.waitFor("Use $shared-name");
+    first.write("\u0011");
+    await expect(first.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    const recoveredManifest = await readFilesRecursively(join(stateRoot, "drafts"));
+    expect(recoveredManifest).toContain('"schemaVersion":2');
+    expect(recoveredManifest).toContain('"type":"skill"');
+    expect(recoveredManifest).toMatch(/"elementId":"adam-skill-[^"]+"/u);
+    expect(recoveredManifest).toContain(
+      '"name":"shared-name","qualifiedId":"skill:v1:project:.:shared-name"',
+    );
+
+    const restarted = startFixture({
+      launch: {},
+      scenario: "skill-selection",
+      stateRoot,
+      workspaceRoot,
+    });
+    await restarted.waitFor("Select an exact model target");
+    restarted.write("\r");
+    await restarted.waitFor("Use $shared-name");
+    restarted.write("\r");
+    await restarted.waitFor("Skill selection complete.");
+    restarted.write("\u0011");
+    await expect(restarted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const durable = await readFilesRecursively(stateRoot);
+    expect(durable).toContain('"qualifiedId":"skill:v1:project:.:shared-name"');
+    expect(durable).not.toContain(
+      '"qualifiedId":"skill:v1:user:shared-name","reason":"user_explicit"',
+    );
+  } finally {
+    if (previousHome === undefined) {
+      delete environment.HOME;
+    } else {
+      environment.HOME = previousHome;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a Skill atom navigates as one token and Backspace removes its exact occurrence", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-atom-backspace-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "first");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: first\ndescription: Atomic navigation procedure.\n---\nAtomic body.\n",
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("$fir");
+    await fixture.waitFor("$first");
+    fixture.write("\t");
+    await fixture.waitFor("$first");
+    fixture.write("\u001b[Dx");
+    await fixture.waitFor("x$first");
+    fixture.write("\u001b[Cy");
+    await fixture.waitFor("x$firsty");
+    fixture.write("\u001b[D\u007f");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    const recoveredManifest = await readFilesRecursively(join(stateRoot, "drafts"));
+    expect(recoveredManifest).toContain('"schemaVersion":2');
+    expect(recoveredManifest).toContain('"text":"xy"');
+    expect(recoveredManifest).not.toContain('"type":"skill"');
+    expect(recoveredManifest).not.toContain("skill:v1:project:.:first");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Delete immediately before a Skill atom removes the whole occurrence", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-atom-delete-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "first");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: first\ndescription: Atomic delete procedure.\n---\nAtomic body.\n",
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("$fir");
+    await fixture.waitFor("$first");
+    fixture.write("\ty");
+    await fixture.waitFor("$firsty");
+    fixture.write("\u001b[D\u001b[D\u001b[3~");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    const recoveredManifest = await readFilesRecursively(join(stateRoot, "drafts"));
+    expect(recoveredManifest).toContain('"text":"y"');
+    expect(recoveredManifest).not.toContain('"type":"skill"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("clipboard text paste carries no Skill identity authority", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-atom-copy-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "first");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: first\ndescription: Identity-loss copy procedure.\n---\nCopy body.\n",
+    "utf8",
+  );
+
+  try {
+    const fixture = startFixture({
+      clipboardReader: {
+        async close() {},
+        async readClipboard() {
+          return { status: "text" as const, platform: "linux_x11" as const, text: "$first" };
+        },
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("\u001bv");
+    await fixture.waitFor("Clipboard text pasted.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const pastedManifest = await readFilesRecursively(join(stateRoot, "drafts"));
+    expect(pastedManifest).toContain('"type":"text","text":"$first"');
+    expect(pastedManifest).not.toContain('"type":"skill"');
+    expect(pastedManifest).not.toContain("skill:v1:project:.:first");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("an unavailable recovered Skill atom stays visible and blocks submission without rebinding", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unavailable-skill-atom-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "first");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: first\ndescription: Recoverable unavailable procedure.\n---\nUnavailable body.\n",
+    "utf8",
+  );
+
+  try {
+    const first = startFixture({
+      launch: {},
+      scenario: "skill-selection",
+      stateRoot,
+      workspaceRoot,
+    });
+    await first.waitFor("Select an exact model target");
+    first.write("\r");
+    await first.waitFor("Adam · New session");
+    first.write("Use $fir");
+    await first.waitFor("$first");
+    const beforeAccept = first.output().length;
+    first.write("\t");
+    await first.waitForCompleteFrameAfter("Use $first", beforeAccept);
+    first.write("\u0011");
+    await expect(first.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await rm(skillDirectory, { recursive: true, force: true });
+
+    const restarted = startFixture({
+      launch: {},
+      scenario: "skill-selection",
+      stateRoot,
+      workspaceRoot,
+    });
+    await restarted.waitFor("Select an exact model target");
+    restarted.write("\r");
+    await restarted.waitFor("Use $first");
+    const diagnostic = "Skill $first is unavailable; delete it or choose a current Skill.";
+    expect((restarted.screen()?.join("\n") ?? "").replace(/\s+/gu, " ")).toContain(diagnostic);
+    const beforeSubmit = restarted.output().length;
+    restarted.write("\r");
+    await restarted.waitForAfter(diagnostic, beforeSubmit);
+    restarted.write("\u0011");
+    await expect(restarted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const durable = await readFilesRecursively(stateRoot);
+    expect(durable).not.toContain('"reason":"user_explicit"');
+    expect(durable).not.toContain('"type":"session_genesis"');
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

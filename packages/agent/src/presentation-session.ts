@@ -609,16 +609,33 @@ export async function createPresentationSession(
       return true;
     };
     let turnComposer: TurnComposer;
-    const projectTurnComposer = (): PresentationDisplayState["composer"] => {
+    const projectTurnComposer = (
+      skillCatalogOverride?: SkillCatalogDisplay | null,
+    ): PresentationDisplayState["composer"] => {
       const snapshot = turnComposer?.snapshot() ?? {
         sealed: false,
         resources: [],
         pastedTexts: [],
       };
+      const skillCatalog =
+        skillCatalogOverride === undefined
+          ? (state.authoritative.active?.skills ?? state.draft?.skills ?? null)
+          : skillCatalogOverride;
       return {
         attachmentAvailable,
         draftRevision: snapshot.revision,
-        elements: snapshot.elements,
+        elements: snapshot.elements.map((element) =>
+          element.type === "skill"
+            ? {
+                ...element,
+                available:
+                  skillCatalog?.items.some(
+                    (skill) =>
+                      skill.qualifiedId === element.qualifiedId && skill.name === element.name,
+                  ) ?? false,
+              }
+            : element,
+        ),
         renderedText: snapshot.renderedText,
         unavailableReason: attachmentUnavailableReason,
         sealed: snapshot.sealed,
@@ -1162,6 +1179,7 @@ export async function createPresentationSession(
         options,
       );
       const activatedNaming = projectSessionNaming(activatedRecords, snapshot.sessionId);
+      const activatedSkills = projectSkills(snapshot);
       const activatedSummary: SessionSummary = {
         id: snapshot.sessionId,
         label: activatedNaming.displayLabel,
@@ -1239,7 +1257,7 @@ export async function createPresentationSession(
             context: projectSessionContext(snapshot, activatedContextUsage, modelTargetSnapshot),
             pendingInteractions: activatedPendingInteractions,
             repositoryInstructions: projectRepositoryInstructions(snapshot),
-            skills: projectSkills(snapshot),
+            skills: activatedSkills,
             projectPaths,
             mcp: projectMcp(snapshot),
             ...(snapshot.todo === undefined ? {} : { todo: snapshot.todo }),
@@ -1247,7 +1265,7 @@ export async function createPresentationSession(
           },
         },
         draft: null,
-        composer: projectTurnComposer(),
+        composer: projectTurnComposer(activatedSkills),
         transient: null,
       };
       draftTargetIdentity = null;
@@ -2471,7 +2489,9 @@ export async function createPresentationSession(
           const removed =
             element.type === "resource"
               ? await turnComposer.remove(element.resourceId, persistCurrentTurnDraft)
-              : await turnComposer.removePastedText(element.pastedTextId, persistCurrentTurnDraft);
+              : element.type === "pasted_text"
+                ? await turnComposer.removePastedText(element.pastedTextId, persistCurrentTurnDraft)
+                : await turnComposer.removeSkill(element.elementId, persistCurrentTurnDraft);
           return removed
             ? { status: "admitted", commandId: randomUUID(), resource: null }
             : {
@@ -2619,7 +2639,9 @@ export async function createPresentationSession(
       if (command.type === "submit_prompt") {
         if (
           command.sessionId !== state.authoritative.active?.session.id ||
-          (command.text.trim().length === 0 && state.composer.pastedTexts.length === 0)
+          (command.text.trim().length === 0 &&
+            state.composer.pastedTexts.length === 0 &&
+            !state.composer.elements.some((element) => element.type === "skill"))
         ) {
           return {
             status: "rejected",
@@ -2659,13 +2681,23 @@ export async function createPresentationSession(
             };
           }
         }
-        const skillResolution = resolveSkillMentions({
+        const unavailableSkill = state.composer.elements.find(
+          (element) => element.type === "skill" && !element.available,
+        );
+        if (unavailableSkill?.type === "skill") {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: `Skill $${unavailableSkill.name} is unavailable; delete it or choose a current Skill.`,
+          };
+        }
+        const manualSkillResolution = resolveSkillMentions({
           text: command.text,
           explicitQualifiedIds: command.skills,
           catalog: state.authoritative.active.skills,
         });
-        if (skillResolution.status === "ambiguous") {
-          return ambiguousSkillMentionRejection(skillResolution);
+        if (manualSkillResolution.status === "ambiguous") {
+          return ambiguousSkillMentionRejection(manualSkillResolution);
         }
         if (!draftImagesFitExactTarget()) {
           return {
@@ -2718,6 +2750,12 @@ export async function createPresentationSession(
                 : "The current turn could not be sealed safely.",
           };
         }
+        const resolvedSkillIds = [
+          ...new Set([
+            ...sealedDraft.skillOccurrences.map((occurrence) => occurrence.qualifiedId),
+            ...manualSkillResolution.qualifiedIds,
+          ]),
+        ];
         const admission = Promise.withResolvers<void>();
         const admissionAfterSequence =
           state.authoritative.continuity.status === "current"
@@ -2739,9 +2777,7 @@ export async function createPresentationSession(
           sessionId: command.sessionId,
           input: {
             text: sealedDraft.text,
-            ...(skillResolution.qualifiedIds.length === 0
-              ? {}
-              : { skills: skillResolution.qualifiedIds }),
+            ...(resolvedSkillIds.length === 0 ? {} : { skills: resolvedSkillIds }),
           },
           runId: commandId,
           signal: controller.signal,
@@ -2826,7 +2862,9 @@ export async function createPresentationSession(
         const draft = state.draft;
         if (
           draft === null ||
-          (command.text.trim().length === 0 && state.composer.pastedTexts.length === 0)
+          (command.text.trim().length === 0 &&
+            state.composer.pastedTexts.length === 0 &&
+            !state.composer.elements.some((element) => element.type === "skill"))
         ) {
           return {
             status: "rejected",
@@ -2849,13 +2887,23 @@ export async function createPresentationSession(
             message: "The exact draft target is no longer available.",
           };
         }
-        const skillResolution = resolveSkillMentions({
+        const unavailableSkill = state.composer.elements.find(
+          (element) => element.type === "skill" && !element.available,
+        );
+        if (unavailableSkill?.type === "skill") {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: `Skill $${unavailableSkill.name} is unavailable; delete it or choose a current Skill.`,
+          };
+        }
+        const manualSkillResolution = resolveSkillMentions({
           text: command.text,
           explicitQualifiedIds: command.skills,
           catalog: draft.skills,
         });
-        if (skillResolution.status === "ambiguous") {
-          return ambiguousSkillMentionRejection(skillResolution);
+        if (manualSkillResolution.status === "ambiguous") {
+          return ambiguousSkillMentionRejection(manualSkillResolution);
         }
         if (!draftImagesFitExactTarget()) {
           return {
@@ -2908,15 +2956,19 @@ export async function createPresentationSession(
                 : "The current turn could not be sealed safely.",
           };
         }
+        const resolvedSkillIds = [
+          ...new Set([
+            ...sealedDraft.skillOccurrences.map((occurrence) => occurrence.qualifiedId),
+            ...manualSkillResolution.qualifiedIds,
+          ]),
+        ];
         const admission = Promise.withResolvers<string>();
         let admittedSessionId: string | null = null;
         const continuation = options.lifecycle.admit({
           targetIdentity,
           input: {
             text: sealedDraft.text,
-            ...(skillResolution.qualifiedIds.length === 0
-              ? {}
-              : { skills: skillResolution.qualifiedIds }),
+            ...(resolvedSkillIds.length === 0 ? {} : { skills: resolvedSkillIds }),
           },
           runId: commandId,
           signal: controller.signal,

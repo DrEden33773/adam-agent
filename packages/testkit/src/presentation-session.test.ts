@@ -3676,11 +3676,22 @@ test("PresentationSession scopes recoverable composer inputs to their selected s
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   const selectedPath = join(testRoot, "session-local-notes.txt");
-  await mkdir(workspaceRoot);
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "session-review");
+  await mkdir(skillDirectory, { recursive: true });
   await writeFile(selectedPath, "belongs only to the first session\n", "utf8");
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: session-review\ndescription: Session-switch exact atom procedure.\n---\nSession body.\n",
+    "utf8",
+  );
   const modelTargets = settledModelTargets("Session selection fixture answer.");
   const harness = createInMemorySessionLifecycleHarness();
-  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+  });
   const first = await lifecycle.create({ targetIdentity });
   const second = await lifecycle.create({ targetIdentity });
   await lifecycle.continue({
@@ -3707,6 +3718,26 @@ test("PresentationSession scopes recoverable composer inputs to their selected s
       type: "stage_pasted_text",
       text: Array.from({ length: 11 }, (_, index) => `session paste ${index + 1}`).join("\n"),
     });
+    const beforeSkill = presentation.getState().composer;
+    await expect(
+      presentation.dispatch({
+        type: "replace_draft_text",
+        baseRevision: beforeSkill.draftRevision,
+        document: [
+          ...beforeSkill.elements.map((element) =>
+            element.type === "resource"
+              ? ({ type: "resource" as const, elementId: element.elementId } as const)
+              : ({ type: "pasted_text" as const, elementId: element.elementId } as const),
+          ),
+          {
+            type: "skill",
+            elementId: "session-skill",
+            name: "session-review",
+            qualifiedId: "skill:v1:project:.:session-review",
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
     expect(presentation.getState().composer.resources).toHaveLength(1);
     expect(presentation.getState().composer.pastedTexts).toMatchObject([
       { preview: "session p...", state: "ready" },
@@ -3717,24 +3748,27 @@ test("PresentationSession scopes recoverable composer inputs to their selected s
     ).resolves.toMatchObject({ status: "admitted" });
     expect(presentation.getState().composer.resources).toEqual([]);
     expect(presentation.getState().composer.pastedTexts).toEqual([]);
+    expect(presentation.getState().composer.elements).toEqual([]);
 
     await expect(
       presentation.dispatch({ type: "select_session", sessionId: first.sessionId }),
     ).resolves.toMatchObject({ status: "admitted" });
-    expect(presentation.getState().composer).toMatchObject({
-      renderedText: "[File #1][Text #2]",
+    const restoredComposer = presentation.getState().composer;
+    expect(restoredComposer).toMatchObject({
+      renderedText: "[File #1][Text #2]$session-review",
       resources: [{ displayName: "session-local-notes.txt", ordinal: 1, state: "ready" }],
       pastedTexts: [{ ordinal: 2, preview: "session p...", state: "ready" }],
     });
-    await expect(
-      presentation.dispatch({
-        type: "submit_prompt",
-        sessionId: first.sessionId,
-        text: "Use the recovered session-local notes.",
-        skills: [],
-        thinkingSelection: null,
-      }),
-    ).resolves.toMatchObject({ status: "admitted" });
+    expect(restoredComposer.elements).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "skill",
+          elementId: "session-skill",
+          qualifiedId: "skill:v1:project:.:session-review",
+          available: true,
+        }),
+      ]),
+    );
   } finally {
     await presentation.close();
     await lifecycle.close();
@@ -4434,6 +4468,142 @@ test("PresentationSession keeps an ambiguous first-prompt Skill mention outside 
     expect(presentation.getState()).toMatchObject({ draft: { targetId: targetIdentity.targetId } });
     await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
     expect(providerResolutions).toBe(0);
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    if (previousHome === undefined) {
+      delete testEnvironment.HOME;
+    } else {
+      testEnvironment.HOME = previousHome;
+    }
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession preserves duplicate and same-name exact Skill atom occurrence order", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-exact-skill-atoms-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  const userHome = join(testRoot, "home");
+  const previousHome = testEnvironment.HOME;
+  for (const directory of [
+    join(workspaceRoot, ".agents", "skills", "shared-name"),
+    join(userHome, ".agents", "skills", "shared-name"),
+  ]) {
+    await mkdir(directory, { recursive: true });
+    await writeFile(
+      join(directory, "SKILL.md"),
+      "---\nname: shared-name\ndescription: Exact atom collision procedure.\n---\nExact body.\n",
+      "utf8",
+    );
+  }
+  testEnvironment.HOME = userHome;
+  const modelTargets = settledModelTargets("Exact Skill atom admission complete.");
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    const baseRevision = presentation.getState().composer.draftRevision;
+    await expect(
+      presentation.dispatch({
+        type: "replace_draft_text",
+        baseRevision,
+        document: [
+          {
+            type: "skill",
+            elementId: "project-first",
+            name: "shared-name",
+            qualifiedId: "skill:v1:project:.:shared-name",
+          },
+          {
+            type: "skill",
+            elementId: "project-second",
+            name: "shared-name",
+            qualifiedId: "skill:v1:project:.:shared-name",
+          },
+          {
+            type: "skill",
+            elementId: "user-third",
+            name: "shared-name",
+            qualifiedId: "skill:v1:user:shared-name",
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer.elements).toMatchObject([
+      { type: "skill", elementId: "project-first", available: true },
+      { type: "skill", elementId: "project-second", available: true },
+      { type: "skill", elementId: "user-third", available: true },
+    ]);
+
+    const completed = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (
+        presentation
+          .getState()
+          .authoritative.active?.transcript.items.some(
+            (item) =>
+              item.type === "assistant_message" &&
+              item.text === "Exact Skill atom admission complete.",
+          )
+      ) {
+        completed.resolve();
+      }
+    });
+    try {
+      const receipt = await presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "",
+        skills: [],
+        thinkingSelection: null,
+      });
+      if (receipt.status === "rejected") {
+        throw new Error(`${receipt.code}: ${receipt.message}`);
+      }
+      await completed.promise;
+    } finally {
+      unsubscribe();
+    }
+    const listed = await lifecycle.listProjectSessions();
+    const sessionId = listed.items[0]?.sessionId;
+    if (sessionId === undefined) {
+      throw new Error("Expected one admitted exact-Skill session.");
+    }
+    const records = await readInMemoryPresentationRecords(harness.sessions)(sessionId);
+    expect(records).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          record: expect.objectContaining({
+            type: "skill_activation_batch_committed",
+            outcomes: [
+              expect.objectContaining({ qualifiedId: "skill:v1:project:.:shared-name" }),
+              expect.objectContaining({ qualifiedId: "skill:v1:user:shared-name" }),
+            ],
+          }),
+        }),
+        expect.objectContaining({
+          record: expect.objectContaining({
+            type: "logical_run_started",
+            userMessage: "$shared-name$shared-name$shared-name",
+          }),
+        }),
+      ]),
+    );
     await presentation.close();
   } finally {
     await lifecycle.close();

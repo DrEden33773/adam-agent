@@ -17,6 +17,24 @@ type SkillCompletion = {
     | { readonly type: "extension"; readonly extensionId: string; readonly packageVersion: string };
 };
 
+export type SkillAutocompleteIdentity = {
+  readonly name: string;
+  readonly qualifiedId: string;
+};
+
+type SkillAutocompleteItem = AutocompleteItem & {
+  readonly adamSkill: SkillAutocompleteIdentity;
+};
+
+export function skillAutocompleteIdentity(
+  item: AutocompleteItem,
+): SkillAutocompleteIdentity | null {
+  const candidate = item as Partial<SkillAutocompleteItem>;
+  return candidate.adamSkill?.name === undefined || candidate.adamSkill.qualifiedId === undefined
+    ? null
+    : candidate.adamSkill;
+}
+
 export class AdamAutocompleteProvider implements AutocompleteProvider {
   readonly triggerCharacters = ["$"];
   readonly #getAttachmentsAvailable: () => boolean;
@@ -153,7 +171,8 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     if (mentionPrefix !== undefined && mentionNamePrefix !== undefined) {
       const skillItems = this.#getSkills()
         .filter((skill) => skill.name.startsWith(mentionNamePrefix))
-        .map<AutocompleteItem>((skill) => ({
+        .map<SkillAutocompleteItem>((skill) => ({
+          adamSkill: { name: skill.name, qualifiedId: skill.qualifiedId },
           value: `$${skill.name}`,
           label: this.#skill(`$${skill.name}`),
           description: safeTerminalText(`${skillSourceLabel(skill.source)} · ${skill.description}`),

@@ -32,12 +32,25 @@ test("Skill mention rows expose deterministic source labels without qualified ID
   });
   expect(suggestions?.items).toEqual([
     {
+      adamSkill: {
+        name: "shared",
+        qualifiedId: "skill:v1:project:packages/app:shared",
+      },
       value: "$shared",
       label: "$shared",
       description: "project:packages/app · Project procedure.",
     },
-    { value: "$shared", label: "$shared", description: "user · User procedure." },
     {
+      adamSkill: { name: "shared", qualifiedId: "skill:v1:user:shared" },
+      value: "$shared",
+      label: "$shared",
+      description: "user · User procedure.",
+    },
+    {
+      adamSkill: {
+        name: "shared",
+        qualifiedId: "skill:v1:extension:eve:shared",
+      },
       value: "$shared",
       label: "$shared",
       description: "extension:eve@0.3.0 · Extension procedure.",

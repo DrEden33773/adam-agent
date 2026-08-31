@@ -93,7 +93,7 @@ import { safeTerminalText } from "./safe-terminal-text.js";
 import { SessionInspector, type SessionRunStatus } from "./session-inspector.js";
 import { SessionPicker } from "./session-picker.js";
 import { SkillPalette } from "./skill-palette.js";
-import { adamStructuredEditorCompletion } from "./structured-editor-completion.js";
+import { createAdamStructuredEditorCompletion } from "./structured-editor-completion.js";
 import { TargetPicker } from "./target-picker.js";
 import { type AdamTuiTheme, createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
@@ -263,6 +263,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const transcript = transcriptViewport.document;
   const draftInputsSlot = new Container();
   const editorSlot = new Container();
+  const skillAtomIdentities = new Map<
+    string,
+    { readonly name: string; readonly qualifiedId: string }
+  >();
+  const structuredEditorCompletion = createAdamStructuredEditorCompletion({
+    onSkillAtom({ elementId, name, qualifiedId }) {
+      skillAtomIdentities.set(elementId, { name, qualifiedId });
+    },
+  });
   const createEditor = (active: ActiveSessionDisplay | null): Editor => {
     const created = new Editor(tui, theme.editor, { paddingX: 1 });
     created.setAutocompleteProvider(
@@ -305,7 +314,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         registry: commandRegistry,
       }),
     );
-    created.setStructuredCompletion(adamStructuredEditorCompletion);
+    created.setStructuredCompletion(structuredEditorCompletion);
     for (const prompt of authoritativePromptHistory(active)) {
       created.addToHistory(prompt);
     }
@@ -637,7 +646,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   ): void => {
     const scopeChanged = scope !== projectedComposerScope;
     projectedComposerScope = scope;
-    const composerKey = `${scope ?? ""}\0${composer.draftRevision}\0${composer.resources
+    const composerKey = `${scope ?? ""}\0${composer.draftRevision}\0${composer.elements
+      .map((element) =>
+        element.type === "skill"
+          ? `${element.elementId}:${element.qualifiedId}:${element.available}`
+          : element.elementId,
+      )
+      .join("|")}\0${composer.resources
       .map((resource) => `${resource.id}:${resource.state}:${resource.kind}`)
       .join("|")}\0${composer.pastedTexts
       .map((pastedText) => `${pastedText.id}:${pastedText.state}`)
@@ -669,6 +684,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return;
     }
     projectedComposerKey = composerKey;
+    if (scopeChanged) {
+      skillAtomIdentities.clear();
+    }
+    for (const element of composer.elements) {
+      if (element.type === "skill") {
+        skillAtomIdentities.set(element.elementId, {
+          name: element.name,
+          qualifiedId: element.qualifiedId,
+        });
+      }
+    }
     if (!composer.elements.some((element) => element.type !== "text")) {
       if (structuredEditorActive && composer.elements.length > 0) {
         editor.setDocument(
@@ -691,6 +717,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       if (element.type === "text") {
         return { type: "text", id: element.elementId, text: element.text };
       }
+      if (element.type === "skill") {
+        return { type: "atom", id: element.elementId, label: `$${element.name}` };
+      }
       return {
         type: "atom",
         id: element.elementId,
@@ -706,13 +735,33 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     composer: ReturnType<PresentationSession["getState"]>["composer"],
   ): void => {
     draftInputsSlot.clear();
-    if (composer.resources.length === 0 && composer.pastedTexts.length === 0) {
+    const unavailableSkills = composer.elements.filter(
+      (element) => element.type === "skill" && !element.available,
+    );
+    if (
+      composer.resources.length === 0 &&
+      composer.pastedTexts.length === 0 &&
+      unavailableSkills.length === 0
+    ) {
       return;
     }
     const resources = new Box(1, 1, theme.toolBackground);
     resources.addChild(new ResponsiveLine(theme.toolTitle("Draft inputs")));
     for (const element of composer.elements) {
       if (element.type === "text") {
+        continue;
+      }
+      if (element.type === "skill") {
+        if (!element.available) {
+          resources.addChild(
+            new ResponsiveLine(
+              theme.statusError(`Skill $${safeTerminalText(element.name)} is unavailable;`),
+            ),
+          );
+          resources.addChild(
+            new ResponsiveLine(theme.statusError("delete it or choose a current Skill.")),
+          );
+        }
         continue;
       }
       if (element.type === "pasted_text") {
@@ -2285,7 +2334,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       onSelect(path) {
         const value = `\`${safeTerminalText(path)}\``;
         if (structuredEditorActive && localStructuredDocument !== null) {
-          const edit = adamStructuredEditorCompletion.accept(
+          const edit = structuredEditorCompletion.accept(
             localStructuredDocument,
             editor.getDocumentCursor(),
             { label: value, value },
@@ -2518,14 +2567,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           document: intent.document.map((part) =>
             part.type === "text"
               ? { type: "text", text: part.text }
-              : {
-                  type:
-                    composer.elements.find((element) => element.elementId === part.id)?.type ===
-                    "pasted_text"
-                      ? ("pasted_text" as const)
-                      : ("resource" as const),
-                  elementId: part.id,
-                },
+              : skillAtomIdentities.has(part.id)
+                ? {
+                    type: "skill" as const,
+                    elementId: part.id,
+                    name: skillAtomIdentities.get(part.id)?.name ?? "",
+                    qualifiedId: skillAtomIdentities.get(part.id)?.qualifiedId ?? "",
+                  }
+                : {
+                    type:
+                      composer.elements.find((element) => element.elementId === part.id)?.type ===
+                      "pasted_text"
+                        ? ("pasted_text" as const)
+                        : ("resource" as const),
+                    elementId: part.id,
+                  },
           ),
         });
       })
@@ -3582,7 +3638,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           const edit =
             capturedDraft.document === null
               ? null
-              : adamStructuredEditorCompletion.accept(
+              : structuredEditorCompletion.accept(
                   capturedDraft.document,
                   capturedDraft.intent.cursor.point,
                   { label: clipboardResult.text, value: clipboardResult.text },
@@ -3722,7 +3778,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const submitEditorValue = (text: string) => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
-    if (text.trim().length === 0 && state.composer.pastedTexts.length === 0) {
+    if (
+      text.trim().length === 0 &&
+      state.composer.pastedTexts.length === 0 &&
+      !state.composer.elements.some((element) => element.type === "skill")
+    ) {
       return;
     }
     const earlyParsed = commandRegistry.parse(text);
