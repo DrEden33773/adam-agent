@@ -40,6 +40,7 @@ export type RecoverableTurnDraftV1 = {
     readonly elementId: string;
     readonly displayName: string;
     readonly kind: "file" | "image";
+    readonly origin?: "pasted_image" | "selected_file" | undefined;
     readonly ordinal: number;
     readonly state: "failed" | "ready";
     readonly byteCount: number | null;
@@ -59,6 +60,7 @@ export type RecoverableTurnDraftV1 = {
           readonly digest: `sha256:${string}`;
           readonly mediaHint: "binary" | "image" | "text";
           readonly support: "image" | "unsupported_binary" | "utf8_text";
+          readonly origin?: "pasted_image" | "selected_file" | undefined;
         }
       | undefined;
   }[];
@@ -105,6 +107,7 @@ const stagedSelectionSchema = z.strictObject({
   digest: digestSchema,
   mediaHint: z.enum(["binary", "image", "text"]),
   support: z.enum(["image", "unsupported_binary", "utf8_text"]),
+  origin: z.enum(["pasted_image", "selected_file"]).optional(),
 });
 const stagedPastedTextSelectionSchema: z.ZodType<StagedPastedTextSelectionV1> = z.strictObject({
   type: z.literal("staged_pasted_text"),
@@ -176,6 +179,7 @@ const draftSchema: z.ZodType<RecoverableTurnDraftV1> = z
           elementId: z.string().min(1).max(256),
           displayName: z.string().min(1).max(255),
           kind: z.enum(["file", "image"]),
+          origin: z.enum(["pasted_image", "selected_file"]).optional(),
           ordinal: z.number().int().positive().safe(),
           state: z.enum(["failed", "ready"]),
           byteCount: z
@@ -258,6 +262,8 @@ const draftSchema: z.ZodType<RecoverableTurnDraftV1> = z
             (resource.selection.displayName !== resource.displayName ||
               resource.selection.support !== resource.support ||
               resource.selection.mediaHint !== resource.mediaHint ||
+              (resource.selection.origin ?? "selected_file") !==
+                (resource.origin ?? "selected_file") ||
               resource.selection.staged.byteCount !== resource.byteCount ||
               resource.selection.staged.id !== resource.selection.digest ||
               (resource.kind === "image") !== (resource.selection.support === "image"))),

@@ -27,6 +27,7 @@ export type AdamCommandDefinition = {
     | "model"
     | "name"
     | "new"
+    | "paste-image"
     | "plan"
     | "reload"
     | "resume"
@@ -180,7 +181,7 @@ export class AdamCommandRegistry {
     const separator = normalized.search(/\s/u);
     const name = normalized.slice(1, separator < 0 ? undefined : separator);
     const argumentsText = separator < 0 ? "" : normalized.slice(separator).trimStart();
-    if (!/^[a-z]+$/.test(name)) {
+    if (!/^[a-z]+(?:-[a-z]+)*$/.test(name)) {
       return { argumentsText, kind: "unknown", name };
     }
     const command = this.#commandsByName.get(name);
@@ -281,6 +282,14 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     name: "copy",
     summary: "Copy the last assistant response or the expanded current draft.",
     usage: "/copy [draft]",
+  },
+  {
+    aliases: [],
+    availability: "idle",
+    id: "paste-image",
+    name: "paste-image",
+    summary: "Stage one PNG or JPEG image from the platform clipboard.",
+    usage: "/paste-image",
   },
   {
     aliases: [],

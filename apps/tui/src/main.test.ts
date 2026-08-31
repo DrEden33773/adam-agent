@@ -539,6 +539,139 @@ test("a 1000-scalar paste stays ordinary text even when UTF-16 length is larger"
   }
 });
 
+test("the explicit paste-image command stages one injected clipboard image through Presentation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-paste-image-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  let readerClosed = false;
+  const imageReadStarted = Promise.withResolvers<void>();
+  const releaseImageRead = Promise.withResolvers<void>();
+  const execution = runTuiFixture({
+    clipboardImageReader: {
+      async readImage() {
+        imageReadStarted.resolve();
+        await releaseImageRead.promise;
+        return {
+          status: "read",
+          platform: "linux_wayland",
+          bytes: Buffer.from(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            "base64",
+          ),
+        } as const;
+      },
+      async close() {
+        readerClosed = true;
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    await terminal.nextSynchronizedFrameContaining("Adam · New session");
+    const beforePasteImage = terminal.output().length;
+    terminal.input("/paste-image\r");
+    await imageReadStarted.promise;
+    await terminal.nextSynchronizedFrameContaining("Reading clipboard image…", beforePasteImage);
+    releaseImageRead.resolve();
+    await terminal.nextSynchronizedFrameContaining("Clipboard image staged.", beforePasteImage);
+    const screen = terminal.lines()?.join("\n") ?? "";
+    expect(screen).toContain("[Image #1]");
+    expect(screen).toContain("Pasted image");
+    expect(screen).toContain("ready");
+    terminal.input("\u0011");
+    await expect(execution).resolves.toBeUndefined();
+    expect(readerClosed).toBe(true);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  {
+    name: "empty clipboard",
+    result: {
+      status: "empty",
+      message: "The clipboard does not contain image bytes.",
+    } as const,
+    expected: "The clipboard does not contain image bytes.",
+  },
+  {
+    name: "unsupported platform reader",
+    result: {
+      status: "unsupported",
+      message: "No supported clipboard image reader is available.",
+    } as const,
+    expected: "No supported clipboard image reader is available.",
+  },
+  {
+    name: "reader deadline",
+    result: {
+      status: "failed",
+      message: "Clipboard image acquisition reached its deadline.",
+    } as const,
+    expected: "Clipboard image acquisition reached its deadline.",
+  },
+  {
+    name: "malformed bytes",
+    result: {
+      status: "read",
+      platform: "linux_x11",
+      bytes: Buffer.from("not an image"),
+    } as const,
+    expected: "The clipboard image is not a complete valid PNG or JPEG.",
+  },
+])("paste-image reports $name without creating an Image atom", async (fixture) => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-paste-image-failure-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  let readerClosed = false;
+  const execution = runTuiFixture({
+    clipboardImageReader: {
+      async readImage() {
+        return fixture.result;
+      },
+      async close() {
+        readerClosed = true;
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    await terminal.nextSynchronizedFrameContaining("Adam · New session");
+    const beforePasteImage = terminal.output().length;
+    terminal.input("/paste-image\r");
+    await terminal.nextSynchronizedFrameContaining(fixture.expected, beforePasteImage);
+    expect(terminal.lines().join("\n")).not.toContain("[Image #");
+    terminal.input("\u0011");
+    await expect(execution).resolves.toBeUndefined();
+    expect(readerClosed).toBe(true);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("the focused editor positions the IME hardware cursor on grapheme cell boundaries", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-ime-cursor-"));
   const workspaceRoot = join(testRoot, "workspace");

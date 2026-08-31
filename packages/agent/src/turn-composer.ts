@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { normalizeExplicitUserImageToPngV1 } from "./image-input.js";
 import type { TurnComposerResourceStager } from "./input-resource-staging.js";
 import {
   type InputResourceOccurrenceV1,
@@ -28,7 +29,7 @@ export type TurnComposerResourceSnapshot = {
   readonly kind: "file" | "image";
   readonly mediaHint: "binary" | "image" | "text" | null;
   readonly ordinal: number;
-  readonly origin: "selected_file";
+  readonly origin: "pasted_image" | "selected_file";
   readonly support: InputResourceOccurrenceV1["support"] | null;
   readonly token: string;
   readonly diagnostic: string | null;
@@ -94,7 +95,7 @@ type TurnComposerResource = {
   kind: "file" | "image";
   mediaHint: "binary" | "image" | "text" | null;
   readonly ordinal: number;
-  readonly origin: "selected_file";
+  readonly origin: "pasted_image" | "selected_file";
   support: InputResourceOccurrenceV1["support"] | null;
   diagnostic: string | null;
   readonly controller: AbortController;
@@ -138,6 +139,11 @@ export type TurnComposer = {
   ): Promise<string>;
   stagePastedText(
     text: string,
+    mutation?: { readonly at: TurnComposerDraftPoint; readonly baseRevision: number },
+    commit?: () => Promise<void>,
+  ): Promise<string>;
+  stagePastedImage(
+    bytes: Uint8Array,
     mutation?: { readonly at: TurnComposerDraftPoint; readonly baseRevision: number },
     commit?: () => Promise<void>,
   ): Promise<string>;
@@ -483,6 +489,7 @@ export async function createTurnComposer(options: {
           elementId: resource.elementId,
           displayName: resource.displayName,
           kind: resource.kind,
+          origin: resource.origin,
           ordinal: resource.ordinal,
           state: resource.state as "failed" | "ready",
           byteCount: resource.byteCount,
@@ -562,7 +569,7 @@ export async function createTurnComposer(options: {
           kind: recovered.kind,
           mediaHint: recovered.mediaHint,
           ordinal: recovered.ordinal,
-          origin: "selected_file",
+          origin: recovered.origin ?? "selected_file",
           support: recovered.support,
           diagnostic: recovered.diagnostic,
           controller: new AbortController(),
@@ -949,6 +956,118 @@ export async function createTurnComposer(options: {
             ? { ...element, kind: resource.kind }
             : element,
         );
+        resource.staged = staged;
+        resource.state = "ready";
+        try {
+          await commit?.();
+        } catch (error) {
+          elements = previousElements;
+          nextOrdinal = previousNextOrdinal;
+          revision = previousRevision;
+          undoStack.push(...previousUndoStack);
+          resources.delete(id);
+          await discardStaging(resource);
+          publish();
+          throw error;
+        }
+        publish();
+      })();
+      resource.settlement = settlement;
+      await settlement;
+      return id;
+    },
+    async stagePastedImage(bytes, mutation, commit) {
+      if (closed || sealed) {
+        throw new TypeError("The turn composer is not accepting pasted images.");
+      }
+      const normalizedPng = normalizeExplicitUserImageToPngV1(bytes);
+      const retainedCount =
+        [...resources.values()].filter(
+          (resource) => resource.state !== "cancelled" && resource.state !== "removed",
+        ).length +
+        [...pastedTexts.values()].filter((candidate) => candidate.state !== "removed").length;
+      if (retainedCount >= inputResourceLimitsV1.maximumOccurrencesPerRun) {
+        throw new TypeError("The turn composer input count exceeds the v1 run limit.");
+      }
+      if (options.stager.stageImage === undefined) {
+        throw new TypeError("Clipboard-image staging is unavailable.");
+      }
+      const id = randomUUID();
+      const elementId = randomUUID();
+      const ordinal = nextOrdinal;
+      const previousElements = elements;
+      const previousNextOrdinal = nextOrdinal;
+      const previousRevision = revision;
+      const previousUndoStack = [...undoStack];
+      const resource: TurnComposerResource = {
+        id,
+        elementId,
+        displayName: "Clipboard image",
+        state: "copying",
+        byteCount: null,
+        kind: "image",
+        mediaHint: "image",
+        ordinal,
+        origin: "pasted_image",
+        support: "image",
+        diagnostic: null,
+        controller: new AbortController(),
+        staged: null,
+        retained: false,
+        settlement: null,
+      };
+      insertAtomicElement(
+        { elementId, type: "resource", kind: "image", ordinal, resourceId: id },
+        mutation,
+      );
+      nextOrdinal += 1;
+      revision += 1;
+      undoStack.length = 0;
+      resources.set(id, resource);
+      publish();
+      const settlement = (async () => {
+        let staged: StagedInputResourceSelectionV1;
+        try {
+          staged = (await options.stager.stageImage?.({
+            id,
+            bytes: normalizedPng,
+            signal: resource.controller.signal,
+          })) as StagedInputResourceSelectionV1;
+        } catch (error) {
+          if (resource.state === "cancelled" || closed || !resources.has(id)) {
+            return;
+          }
+          elements = previousElements;
+          nextOrdinal = previousNextOrdinal;
+          revision = previousRevision;
+          undoStack.push(...previousUndoStack);
+          resources.delete(id);
+          publish();
+          throw error;
+        }
+        if (
+          closed ||
+          resource.state === "cancelled" ||
+          !resources.has(id) ||
+          staged.support !== "image" ||
+          staged.mediaHint !== "image" ||
+          staged.staged.mediaType !== "image/png" ||
+          staged.origin !== "pasted_image"
+        ) {
+          await options.stager.discard(staged);
+          if (!closed && resources.has(id)) {
+            elements = previousElements;
+            nextOrdinal = previousNextOrdinal;
+            revision = previousRevision;
+            undoStack.push(...previousUndoStack);
+            resources.delete(id);
+            publish();
+            throw new TypeError("The clipboard image normalization result is invalid.");
+          }
+          return;
+        }
+        resource.displayName = staged.displayName;
+        resource.byteCount = staged.staged.byteCount;
         resource.staged = staged;
         resource.state = "ready";
         try {

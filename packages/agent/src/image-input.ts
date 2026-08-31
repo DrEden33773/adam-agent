@@ -49,6 +49,50 @@ export function sniffExplicitUserImageMediaTypeV1(
   return bytes.byteLength >= 2 && bytes[0] === 0xff && bytes[1] === 0xd8 ? "image/jpeg" : undefined;
 }
 
+export function normalizeExplicitUserImageToPngV1(bytes: Uint8Array): Uint8Array {
+  const inspection = inspectExplicitUserImageV1(bytes);
+  if (inspection.status !== "valid") {
+    throw new TypeError(
+      inspection.status === "limit_exceeded"
+        ? "The clipboard image exceeds the v1 image limits."
+        : "The clipboard image is not a complete valid PNG or JPEG.",
+    );
+  }
+  let rgba: Buffer;
+  if (inspection.mediaType === "image/png") {
+    const decoded = PNG.sync.read(Buffer.from(bytes), { checkCRC: true });
+    rgba = Buffer.from(decoded.data);
+  } else {
+    const decoded = decodeJpeg(bytes, {
+      useTArray: true,
+      formatAsRGBA: true,
+      tolerantDecoding: false,
+      maxResolutionInMP: imageInputLimitsV1.maximumPixels / 1_000_000,
+      maxMemoryUsageInMB: 96,
+    });
+    rgba = Buffer.from(decoded.data);
+  }
+  const normalizedImage = new PNG({
+    width: inspection.width,
+    height: inspection.height,
+  });
+  normalizedImage.data = rgba;
+  const normalized = PNG.sync.write(normalizedImage);
+  if (normalized.byteLength > imageInputLimitsV1.maximumBytesPerImage) {
+    throw new TypeError("The normalized clipboard image exceeds the v1 image byte limit.");
+  }
+  const normalizedInspection = inspectExplicitUserImageV1(normalized);
+  if (
+    normalizedInspection.status !== "valid" ||
+    normalizedInspection.mediaType !== "image/png" ||
+    normalizedInspection.width !== inspection.width ||
+    normalizedInspection.height !== inspection.height
+  ) {
+    throw new TypeError("The clipboard image could not be normalized safely.");
+  }
+  return normalized;
+}
+
 function inspectPng(bytes: Uint8Array): ImageInspection {
   const container = inspectPngContainer(bytes);
   if (container === undefined) {

@@ -26,6 +26,11 @@ export type TurnComposerResourceStager = {
     readonly path: string;
     readonly signal: AbortSignal;
   }): Promise<StagedInputResourceSelectionV1>;
+  stageImage?(input: {
+    readonly id: string;
+    readonly bytes: Uint8Array;
+    readonly signal: AbortSignal;
+  }): Promise<StagedInputResourceSelectionV1>;
   stageText?(input: {
     readonly id: string;
     readonly text: string;
@@ -84,6 +89,29 @@ export async function createFileTurnComposerResourceStager(options: {
           digest: occurrence.digest,
           mediaHint: occurrence.mediaHint,
           support: occurrence.support,
+          origin: "selected_file",
+        };
+      } catch (error) {
+        if (staged !== undefined) {
+          await staging.discard(staged);
+        }
+        throw error;
+      }
+    },
+    async stageImage(input) {
+      let staged: StagedArtifactReference | undefined;
+      try {
+        input.signal.throwIfAborted();
+        staged = await staging.write({ bytes: input.bytes, mediaType: "image/png" });
+        input.signal.throwIfAborted();
+        return {
+          type: "staged_artifact",
+          staged,
+          displayName: "Clipboard image",
+          digest: staged.id,
+          mediaHint: "image",
+          support: "image",
+          origin: "pasted_image",
         };
       } catch (error) {
         if (staged !== undefined) {
@@ -93,25 +121,33 @@ export async function createFileTurnComposerResourceStager(options: {
       }
     },
     async stageText(input) {
-      input.signal.throwIfAborted();
-      if (!isLargePastedTextV1(input.text)) {
-        throw new TypeError("Only a large normalized paste can become a Text atom.");
+      let staged: StagedArtifactReference | undefined;
+      try {
+        input.signal.throwIfAborted();
+        if (!isLargePastedTextV1(input.text)) {
+          throw new TypeError("Only a large normalized paste can become a Text atom.");
+        }
+        const metrics = pastedTextMetricsV1(input.text);
+        if (metrics.byteCount > pastedTextLimitsV1.maximumTextBytesPerTurn) {
+          throw new TypeError("The pasted text exceeds the v1 turn limit.");
+        }
+        staged = await staging.write({
+          bytes: Buffer.from(input.text, "utf8"),
+          mediaType: "text/plain; charset=utf-8",
+        });
+        input.signal.throwIfAborted();
+        return {
+          type: "staged_pasted_text",
+          staged,
+          digest: staged.id,
+          ...metrics,
+        };
+      } catch (error) {
+        if (staged !== undefined) {
+          await staging.discard(staged);
+        }
+        throw error;
       }
-      const metrics = pastedTextMetricsV1(input.text);
-      if (metrics.byteCount > pastedTextLimitsV1.maximumTextBytesPerTurn) {
-        throw new TypeError("The pasted text exceeds the v1 turn limit.");
-      }
-      const staged = await staging.write({
-        bytes: Buffer.from(input.text, "utf8"),
-        mediaType: "text/plain; charset=utf-8",
-      });
-      input.signal.throwIfAborted();
-      return {
-        type: "staged_pasted_text",
-        staged,
-        digest: staged.id,
-        ...metrics,
-      };
     },
     async readText(selection) {
       const bytes = await staging.read(
