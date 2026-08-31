@@ -508,6 +508,145 @@ test("a chunked large bracketed paste becomes one exact expandable Text atom", a
   }
 });
 
+test("Skill completion remains available after one large pasted Text atom", async () => {
+  const { fixture, testRoot } = await startPastedTextAtomFixture({
+    prepare: prepareFirstStructuredCompletionSkill,
+    scenario: "skill-selection",
+    slug: "skill-completion",
+  });
+  try {
+    const beforeCompletion = fixture.output().length;
+    fixture.write(" Use $fir");
+    await fixture.waitForCompleteFrameAfter("$first", beforeCompletion);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Tab accepts one literal Skill completion without changing an adjacent Text atom", async () => {
+  const { fixture, testRoot } = await startPastedTextAtomFixture({
+    prepare: prepareFirstStructuredCompletionSkill,
+    scenario: "skill-selection",
+    slug: "skill-tab",
+  });
+  try {
+    fixture.write(" Use $fir");
+    await fixture.waitFor("$first");
+    const beforeAccept = fixture.output().length;
+    fixture.write("\t");
+    await fixture.waitForCompleteFrameAfter("Use $first", beforeAccept);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("[Text #1]");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Enter accepts one literal Skill completion without submitting an adjacent Text atom", async () => {
+  const { fixture, stateRoot, testRoot } = await startPastedTextAtomFixture({
+    prepare: prepareFirstStructuredCompletionSkill,
+    scenario: "skill-selection",
+    slug: "skill-enter",
+  });
+  try {
+    fixture.write(" Use $fir");
+    await fixture.waitFor("$first");
+    const beforeAccept = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Use $first", beforeAccept);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("[Text #1]");
+    fixture.write("\r");
+    await fixture.waitFor("Skill selection complete.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const durableState = await readFilesRecursively(stateRoot);
+    expect(durableState).toContain("Use $first");
+    expect(durableState).not.toContain('Use $fir"');
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash completion uses the literal text part after one pasted Text atom", async () => {
+  const { fixture, testRoot } = await startPastedTextAtomFixture({ slug: "slash-completion" });
+  try {
+    const beforeCompletion = fixture.output().length;
+    fixture.write("/pl");
+    await fixture.waitForCompleteFrameAfter("/plan", beforeCompletion);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("[Text #1]");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the existing at path picker remains atom-safe after one pasted Text atom", async () => {
+  const { fixture, testRoot } = await startPastedTextAtomFixture({
+    prepare: async (workspaceRoot) => {
+      await mkdir(join(workspaceRoot, "src"), { recursive: true });
+      await writeFile(join(workspaceRoot, "src", "alpha.ts"), "private\n", "utf8");
+    },
+    slug: "at-completion",
+  });
+  try {
+    const beforePicker = fixture.output().length;
+    fixture.write(" Inspect @");
+    await fixture.waitForCompleteFrameAfter("Select a project path", beforePicker);
+    const beforeAccept = fixture.output().length;
+    fixture.write("alpha\r");
+    await fixture.waitForCompleteFrameAfter("Inspect `src/alpha.ts`", beforeAccept);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("[Text #1]");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+async function startPastedTextAtomFixture(input: {
+  readonly prepare?: (workspaceRoot: string) => Promise<void>;
+  readonly scenario?: "skill-selection";
+  readonly slug: string;
+}) {
+  const testRoot = await mkdtemp(join(tmpdir(), `adam-agent-tui-text-atom-${input.slug}-`));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  try {
+    await mkdir(workspaceRoot, { recursive: true });
+    await input.prepare?.(workspaceRoot);
+    const fixture = startFixture({
+      ...(input.scenario === undefined ? {} : { scenario: input.scenario }),
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const pasted = Array.from({ length: 11 }, (_, index) => `structured line ${index + 1}`).join(
+      "\n",
+    );
+    fixture.write(`\u001b[200~${pasted}\u001b[201~`);
+    await fixture.waitFor("Pasted text staged.");
+    await fixture.waitFor("[Text #1]");
+    return { fixture, stateRoot, testRoot };
+  } catch (error) {
+    await rm(testRoot, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+async function prepareFirstStructuredCompletionSkill(workspaceRoot: string): Promise<void> {
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "first");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: first\ndescription: First structured completion procedure.\n---\nFirst body.\n",
+    "utf8",
+  );
+}
+
 test("a 1000-scalar paste stays ordinary text even when UTF-16 length is larger", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-scalar-paste-boundary-"));
   const workspaceRoot = join(testRoot, "workspace");

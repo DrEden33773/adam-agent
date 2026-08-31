@@ -92,6 +92,7 @@ import { safeTerminalText } from "./safe-terminal-text.js";
 import { SessionInspector, type SessionRunStatus } from "./session-inspector.js";
 import { SessionPicker } from "./session-picker.js";
 import { SkillPalette } from "./skill-palette.js";
+import { adamStructuredEditorCompletion } from "./structured-editor-completion.js";
 import { TargetPicker } from "./target-picker.js";
 import { type AdamTuiTheme, createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
@@ -299,6 +300,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         registry: commandRegistry,
       }),
     );
+    created.setStructuredCompletion(adamStructuredEditorCompletion);
     for (const prompt of authoritativePromptHistory(active)) {
       created.addToHistory(prompt);
     }
@@ -623,6 +625,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let localStructuredDocument: readonly EditorDocumentPart[] | null = null;
   let projectedComposerKey: string | null = null;
   let projectedComposerScope: string | null = null;
+  let structuredReconcileScheduled = false;
   const synchronizeStructuredComposer = (
     composer: ReturnType<PresentationSession["getState"]>["composer"],
     scope: string | null,
@@ -637,7 +640,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (!scopeChanged && composerKey === projectedComposerKey) {
       return;
     }
-    projectedComposerKey = composerKey;
     if (
       composer.resources.some(
         (resource) => resource.state === "queued" || resource.state === "copying",
@@ -646,6 +648,22 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     ) {
       return;
     }
+    if (structuredEditorActive && (draftMutationQueue.pending > 0 || draftMutationQueue.size > 0)) {
+      if (!structuredReconcileScheduled) {
+        structuredReconcileScheduled = true;
+        void draftMutationQueue.onIdle().then(
+          () => {
+            structuredReconcileScheduled = false;
+            renderState();
+          },
+          () => {
+            structuredReconcileScheduled = false;
+          },
+        );
+      }
+      return;
+    }
+    projectedComposerKey = composerKey;
     if (!composer.elements.some((element) => element.type !== "text")) {
       if (structuredEditorActive && composer.elements.length > 0) {
         editor.setDocument(
@@ -2230,6 +2248,65 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       });
   };
   let emptyDraftChangeGeneration = 0;
+  const showProjectPathPicker = (): void => {
+    const state = options.presentation.getState();
+    const active = state.authoritative.active;
+    const projectPaths = active?.projectPaths ?? state.draft?.projectPaths;
+    if (
+      pathPicker !== undefined ||
+      projectPaths === undefined ||
+      projectPaths.items.length === 0 ||
+      !isProjectPathTrigger(editor.getExpandedText())
+    ) {
+      return;
+    }
+    let handle: { hide(): void } | undefined;
+    const close = () => {
+      handle?.hide();
+      pathPicker = undefined;
+      tui.setFocus(editor);
+      tui.requestRender();
+    };
+    const picker = new ProjectPathPicker({
+      catalog: projectPaths,
+      onClose: close,
+      onSelect(path) {
+        const value = `\`${safeTerminalText(path)}\``;
+        if (structuredEditorActive && localStructuredDocument !== null) {
+          const edit = adamStructuredEditorCompletion.accept(
+            localStructuredDocument,
+            editor.getDocumentCursor(),
+            { label: value, value },
+            "@",
+          );
+          if (edit !== null) {
+            editor.setDocument(edit.document, edit.cursor);
+            editor.onEditIntent?.({
+              type: "replace",
+              document: edit.document,
+              range: edit.range,
+              text: edit.text,
+            });
+          }
+        } else {
+          const draft = editor.getExpandedText();
+          const trigger = draft.lastIndexOf("@");
+          if (trigger >= 0) {
+            editor.setText(`${draft.slice(0, trigger)}${value}${draft.slice(trigger + 1)}`);
+          }
+        }
+        close();
+      },
+      theme,
+    });
+    handle = showOverlay(picker, {
+      width: "90%",
+      minWidth: 36,
+      maxHeight: "80%",
+      margin: 1,
+    });
+    pathPicker = { close, hide: () => handle?.hide() };
+  };
   editor.onChange = () => {
     const text = editor.getExpandedText();
     emptyDraftChangeGeneration += 1;
@@ -2255,45 +2332,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       clearExitWindow();
       renderState();
     }
-    const state = options.presentation.getState();
-    const active = state.authoritative.active;
-    const projectPaths = active?.projectPaths ?? state.draft?.projectPaths;
-    if (
-      pathPicker === undefined &&
-      projectPaths !== undefined &&
-      projectPaths.items.length > 0 &&
-      isProjectPathTrigger(editor.getExpandedText())
-    ) {
-      let handle: { hide(): void } | undefined;
-      const close = () => {
-        handle?.hide();
-        pathPicker = undefined;
-        tui.setFocus(editor);
-        tui.requestRender();
-      };
-      const picker = new ProjectPathPicker({
-        catalog: projectPaths,
-        onClose: close,
-        onSelect(path) {
-          const draft = editor.getExpandedText();
-          const trigger = draft.lastIndexOf("@");
-          if (trigger >= 0) {
-            editor.setText(
-              `${draft.slice(0, trigger)}\`${safeTerminalText(path)}\`${draft.slice(trigger + 1)}`,
-            );
-          }
-          close();
-        },
-        theme,
-      });
-      handle = showOverlay(picker, {
-        width: "90%",
-        minWidth: 36,
-        maxHeight: "80%",
-        margin: 1,
-      });
-      pathPicker = { close, hide: () => handle?.hide() };
-    }
+    showProjectPathPicker();
   };
   editor.onPaste = (intent: EditorPasteIntent) => {
     if (!isLargePastedTextV1(intent.text)) {
@@ -2419,6 +2458,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const localLiteralText = intent.document
       .flatMap((part) => (part.type === "text" ? [part.text] : []))
       .join("");
+    showProjectPathPicker();
     if (localLiteralText.startsWith("/")) {
       renderState();
       return;
