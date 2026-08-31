@@ -119,7 +119,7 @@ export function projectTranscript(
         sourceSessionId: sessionId,
         branchBoundary: null,
         text:
-          entry.record.recordVersion === 2
+          entry.record.recordVersion === 2 || entry.record.recordVersion === 3
             ? projectSessionUserContentTextV1({
                 elements: entry.record.userContent,
                 occurrences: entry.record.inputResources,

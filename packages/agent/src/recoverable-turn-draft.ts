@@ -4,6 +4,7 @@ import { chmod, mkdir, open, rename, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import { z } from "zod";
+import type { StagedPastedTextSelectionV1 } from "./pasted-text.js";
 
 const maximumManifestBytes = 1024 * 1024;
 const projectIdPattern = /^sha256:([0-9a-f]{64})$/u;
@@ -26,6 +27,12 @@ export type RecoverableTurnDraftV1 = {
         readonly kind: "file" | "image";
         readonly ordinal: number;
         readonly resourceId: string;
+      }
+    | {
+        readonly elementId: string;
+        readonly type: "pasted_text";
+        readonly ordinal: number;
+        readonly pastedTextId: string;
       }
   )[];
   readonly resources: readonly {
@@ -55,6 +62,19 @@ export type RecoverableTurnDraftV1 = {
         }
       | undefined;
   }[];
+  readonly pastedTexts?:
+    | readonly {
+        readonly id: string;
+        readonly elementId: string;
+        readonly ordinal: number;
+        readonly state: "failed" | "ready";
+        readonly byteCount: number;
+        readonly lineCount: number;
+        readonly scalarCount: number;
+        readonly diagnostic: string | null;
+        readonly selection?: StagedPastedTextSelectionV1 | undefined;
+      }[]
+    | undefined;
 };
 
 export type RecoverableTurnDraftRepository = {
@@ -85,6 +105,27 @@ const stagedSelectionSchema = z.strictObject({
   digest: digestSchema,
   mediaHint: z.enum(["binary", "image", "text"]),
   support: z.enum(["image", "unsupported_binary", "utf8_text"]),
+});
+const stagedPastedTextSelectionSchema: z.ZodType<StagedPastedTextSelectionV1> = z.strictObject({
+  type: z.literal("staged_pasted_text"),
+  staged: z.strictObject({
+    stagingId: z.uuid(),
+    id: digestSchema,
+    mediaType: z.literal("text/plain; charset=utf-8"),
+    byteCount: z
+      .number()
+      .int()
+      .positive()
+      .max(1024 * 1024),
+  }),
+  digest: digestSchema,
+  byteCount: z
+    .number()
+    .int()
+    .positive()
+    .max(1024 * 1024),
+  lineCount: z.number().int().positive().safe(),
+  scalarCount: z.number().int().positive().safe(),
 });
 const draftSchema: z.ZodType<RecoverableTurnDraftV1> = z
   .strictObject({
@@ -119,6 +160,12 @@ const draftSchema: z.ZodType<RecoverableTurnDraftV1> = z
             ordinal: z.number().int().positive().safe(),
             resourceId: z.string().min(1).max(256),
           }),
+          z.strictObject({
+            elementId: z.string().min(1).max(256),
+            type: z.literal("pasted_text"),
+            ordinal: z.number().int().positive().safe(),
+            pastedTextId: z.string().min(1).max(256),
+          }),
         ]),
       )
       .max(17),
@@ -144,20 +191,47 @@ const draftSchema: z.ZodType<RecoverableTurnDraftV1> = z
         }),
       )
       .max(8),
+    pastedTexts: z
+      .array(
+        z.strictObject({
+          id: z.string().min(1).max(256),
+          elementId: z.string().min(1).max(256),
+          ordinal: z.number().int().positive().safe(),
+          state: z.enum(["failed", "ready"]),
+          byteCount: z
+            .number()
+            .int()
+            .positive()
+            .max(1024 * 1024),
+          lineCount: z.number().int().positive().safe(),
+          scalarCount: z.number().int().positive().safe(),
+          diagnostic: z.string().max(1024).nullable(),
+          selection: stagedPastedTextSelectionSchema.optional(),
+        }),
+      )
+      .max(8)
+      .optional(),
   })
   .superRefine((draft, context) => {
     const resourceElements = draft.elements.filter((element) => element.type === "resource");
+    const pastedTextElements = draft.elements.filter((element) => element.type === "pasted_text");
+    const pastedTexts = draft.pastedTexts ?? [];
     if (
       new Set(draft.elements.map((element) => element.elementId)).size !== draft.elements.length ||
       new Set(draft.resources.map((resource) => resource.id)).size !== draft.resources.length ||
       new Set(draft.resources.map((resource) => resource.ordinal)).size !==
         draft.resources.length ||
+      new Set(pastedTexts.map((pastedText) => pastedText.id)).size !== pastedTexts.length ||
+      new Set(pastedTexts.map((pastedText) => pastedText.ordinal)).size !== pastedTexts.length ||
       draft.elements.reduce(
-        (length, element) => length + (element.type === "text" ? element.text.length : 0),
+        (length, element) =>
+          length + (element.type === "text" ? Buffer.byteLength(element.text, "utf8") : 0),
         0,
-      ) >
-        512 * 1024 ||
+      ) +
+        pastedTexts.reduce((total, pastedText) => total + pastedText.byteCount, 0) >
+        1024 * 1024 ||
       resourceElements.length !== draft.resources.length ||
+      pastedTextElements.length !== pastedTexts.length ||
       resourceElements.some((element, index) => {
         const resource = draft.resources[index];
         return (
@@ -166,6 +240,15 @@ const draftSchema: z.ZodType<RecoverableTurnDraftV1> = z
           resource.elementId !== element.elementId ||
           resource.kind !== element.kind ||
           resource.ordinal !== element.ordinal
+        );
+      }) ||
+      pastedTextElements.some((element, index) => {
+        const pastedText = pastedTexts[index];
+        return (
+          pastedText === undefined ||
+          pastedText.id !== element.pastedTextId ||
+          pastedText.elementId !== element.elementId ||
+          pastedText.ordinal !== element.ordinal
         );
       }) ||
       draft.resources.some(
@@ -179,7 +262,22 @@ const draftSchema: z.ZodType<RecoverableTurnDraftV1> = z
               resource.selection.staged.id !== resource.selection.digest ||
               (resource.kind === "image") !== (resource.selection.support === "image"))),
       ) ||
-      draft.nextOrdinal <= Math.max(0, ...draft.resources.map((resource) => resource.ordinal))
+      pastedTexts.some(
+        (pastedText) =>
+          (pastedText.state === "ready") !== (pastedText.selection !== undefined) ||
+          (pastedText.selection !== undefined &&
+            (pastedText.selection.staged.id !== pastedText.selection.digest ||
+              pastedText.selection.byteCount !== pastedText.byteCount ||
+              pastedText.selection.lineCount !== pastedText.lineCount ||
+              pastedText.selection.scalarCount !== pastedText.scalarCount)),
+      ) ||
+      draft.resources.length + pastedTexts.length > 8 ||
+      draft.nextOrdinal <=
+        Math.max(
+          0,
+          ...draft.resources.map((resource) => resource.ordinal),
+          ...pastedTexts.map((pastedText) => pastedText.ordinal),
+        )
     ) {
       context.addIssue({ code: "custom", message: "The recoverable draft graph is invalid." });
     }

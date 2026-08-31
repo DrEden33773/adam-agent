@@ -115,6 +115,7 @@ export {
   type OperationStore,
   OperationStoreError,
 } from "./operation-store.js";
+export { isLargePastedTextV1, pastedTextLimitsV1 } from "./pasted-text.js";
 export {
   createPresentationPreferences,
   createWorkspaceTrust,

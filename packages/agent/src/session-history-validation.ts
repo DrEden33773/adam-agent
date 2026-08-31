@@ -20,6 +20,7 @@ import {
 } from "./input-resources.js";
 import { isMcpToolProfileV1Valid } from "./mcp-profile-contracts.js";
 import { sameModelTargetIdentity } from "./model-targets.js";
+import { pastedTextLimitsV1 } from "./pasted-text.js";
 import { assessPlanCommandV1 } from "./plan-command-assessment.js";
 import { isPlanGitAttestationV1Valid, planGitAutomaticPolicyV1 } from "./plan-git-policy.js";
 import { isExactPlanMcpPermissionEventV1 } from "./plan-mcp-permission-validation.js";
@@ -2277,10 +2278,10 @@ function areLogicalInputResourcesValid(
   visible: ReadonlyMap<string, InputResourceOccurrenceV1>,
 ): boolean {
   const resources = record.inputResources ?? [];
-  if (resources.length === 0) {
+  if (resources.length === 0 && record.recordVersion !== 3) {
     return record.recordVersion !== 2;
   }
-  if (record.recordVersion !== 1 && record.recordVersion !== 2) {
+  if (record.recordVersion !== 1 && record.recordVersion !== 2 && record.recordVersion !== 3) {
     return false;
   }
   const combined = [...visible.values(), ...resources];
@@ -2309,13 +2310,34 @@ function areLogicalInputResourcesValid(
   if (!resourcesAreValid) {
     return false;
   }
-  if (record.recordVersion !== 2) {
+  if (record.recordVersion === 1) {
     return true;
+  }
+  if (record.recordVersion !== 2 && record.recordVersion !== 3) {
+    return false;
+  }
+  const pastedTexts = record.recordVersion === 3 ? record.pastedTexts : [];
+  const pastedTextBytes = pastedTexts.reduce(
+    (total, occurrence) => total + occurrence.byteCount,
+    0,
+  );
+  if (
+    pastedTexts.some(
+      (occurrence, index) =>
+        occurrence.occurrenceId !== `${record.runId}:pasted-text:${index + 1}` ||
+        occurrence.artifact.id !== occurrence.digest ||
+        occurrence.artifact.source.runId !== record.runId ||
+        occurrence.artifact.source.occurrenceId !== occurrence.occurrenceId,
+    ) ||
+    pastedTextBytes > pastedTextLimitsV1.maximumTextBytesPerTurn
+  ) {
+    return false;
   }
   try {
     validateSessionUserContentV1({
       elements: record.userContent,
       occurrences: resources,
+      pastedTexts,
       userMessage: record.userMessage,
     });
     return true;

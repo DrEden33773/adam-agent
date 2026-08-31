@@ -23,6 +23,7 @@ import type { McpToolProfileV1 } from "./mcp-profile-contracts.js";
 import { modelDriverDiagnosticCodes, modelDriverErrorCategories } from "./model-driver-error.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import { imageInputLimitsV1, type ProjectedContentUsageV1 } from "./model-user-content.js";
+import { type PastedTextOccurrenceV1, pastedTextOccurrenceV1Schema } from "./pasted-text.js";
 import type { PlanShellPolicyVersion } from "./plan-command-assessment.js";
 import type { PlanGitAttestationV1 } from "./plan-git-policy.js";
 import type {
@@ -313,6 +314,13 @@ export type SessionLogicalRunStartedRecord = {
       | {
           readonly recordVersion: 2;
           readonly inputResources: readonly InputResourceOccurrenceV1[];
+          readonly userContent: readonly SessionUserContentElementV1[];
+          readonly pastedTexts?: never;
+        }
+      | {
+          readonly recordVersion: 3;
+          readonly inputResources: readonly InputResourceOccurrenceV1[];
+          readonly pastedTexts: readonly PastedTextOccurrenceV1[];
           readonly userContent: readonly SessionUserContentElementV1[];
         }
     );
@@ -1954,7 +1962,7 @@ const planGitAttestationV1Schema: z.ZodType<PlanGitAttestationV1> = z.strictObje
 const logicalRunStartedV2Schema = z
   .strictObject({
     type: z.literal("logical_run_started"),
-    recordVersion: z.literal(2),
+    recordVersion: z.union([z.literal(2), z.literal(3)]),
     runId: z.uuid(),
     userMessage: z.string().max(512 * 1024),
     planRevision: z
@@ -2007,15 +2015,23 @@ const logicalRunStartedV2Schema = z
     thinkingPolicy: thinkingPolicySnapshotV1Schema.optional(),
     inputResources: z
       .array(inputResourceOccurrenceV1Schema)
-      .min(1)
       .max(inputResourceLimitsV1.maximumOccurrencesPerRun),
+    pastedTexts: z.array(pastedTextOccurrenceV1Schema).min(1).max(8).optional(),
     userContent: sessionUserContentV1Schema,
   })
   .superRefine((record, context) => {
     try {
+      if (
+        (record.recordVersion === 2 &&
+          (record.inputResources.length === 0 || record.pastedTexts !== undefined)) ||
+        (record.recordVersion === 3 && record.pastedTexts === undefined)
+      ) {
+        throw new TypeError("The structured logical-run version is inconsistent.");
+      }
       validateSessionUserContentV1({
         elements: record.userContent,
         occurrences: record.inputResources,
+        pastedTexts: record.pastedTexts ?? [],
         userMessage: record.userMessage,
       });
     } catch {

@@ -2,6 +2,7 @@ import type { ArtifactReference, ChangePreviewArtifactSource } from "./artifact-
 import type { ContextCallUsage } from "./durable-context.js";
 import type { InputResourceOccurrenceV1 } from "./input-resources.js";
 import type { ModelDriverDiagnosticCode, ModelDriverErrorCategory } from "./model-driver-error.js";
+import type { PastedTextOccurrenceV1 } from "./pasted-text.js";
 import type { ApprovedPlanProjectionV1 } from "./plan-mode.js";
 import type { SessionUserContentElementV1 } from "./structured-user-content.js";
 import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
@@ -18,6 +19,8 @@ export type UserInput = {
   readonly skills?: readonly string[];
   readonly inputResources?: readonly InputResourceOccurrenceV1[];
   readonly userContent?: readonly SessionUserContentElementV1[];
+  readonly pastedTexts?: readonly PastedTextOccurrenceV1[];
+  readonly pastedTextContents?: ReadonlyMap<string, string>;
 };
 
 export type RunOptions = {

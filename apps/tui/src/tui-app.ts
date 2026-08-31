@@ -1,10 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { MessageChannel } from "node:worker_threads";
 
+import { isLargePastedTextV1 } from "@adam-agent/agent";
 import type {
   ActiveSessionDisplay,
   ArtifactReference,
   BranchSourceBoundary,
+  DraftPoint,
   OperationDisplay,
   PresentationSession,
   PresentationTransientState,
@@ -20,6 +22,7 @@ import {
   Container,
   Editor,
   type EditorDocumentPart,
+  type EditorPasteIntent,
   isKeyRelease,
   isKeyRepeat,
   Loader,
@@ -596,6 +599,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (previousEditor.onEditIntent !== undefined) {
       replacement.onEditIntent = previousEditor.onEditIntent;
     }
+    if (previousEditor.onPaste !== undefined) {
+      replacement.onPaste = previousEditor.onPaste;
+    }
     if (previousEditor.onSubmit !== undefined) {
       replacement.onSubmit = previousEditor.onSubmit;
     }
@@ -623,6 +629,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     projectedComposerScope = scope;
     const composerKey = `${scope ?? ""}\0${composer.draftRevision}\0${composer.resources
       .map((resource) => `${resource.id}:${resource.state}:${resource.kind}`)
+      .join("|")}\0${composer.pastedTexts
+      .map((pastedText) => `${pastedText.id}:${pastedText.state}`)
       .join("|")}`;
     if (!scopeChanged && composerKey === projectedComposerKey) {
       return;
@@ -631,11 +639,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (
       composer.resources.some(
         (resource) => resource.state === "queued" || resource.state === "copying",
-      )
+      ) ||
+      composer.pastedTexts.some((pastedText) => pastedText.state === "copying")
     ) {
       return;
     }
-    if (!composer.elements.some((element) => element.type === "resource")) {
+    if (!composer.elements.some((element) => element.type !== "text")) {
       if (structuredEditorActive && composer.elements.length > 0) {
         editor.setDocument(
           composer.elements.map((element) => ({
@@ -653,15 +662,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       return;
     }
-    const parts: readonly EditorDocumentPart[] = composer.elements.map((element) =>
-      element.type === "text"
-        ? { type: "text", id: element.elementId, text: element.text }
-        : {
-            type: "atom",
-            id: element.elementId,
-            label: `[${element.kind === "image" ? "Image" : "File"} #${element.ordinal}]`,
-          },
-    );
+    const parts: readonly EditorDocumentPart[] = composer.elements.map((element) => {
+      if (element.type === "text") {
+        return { type: "text", id: element.elementId, text: element.text };
+      }
+      return {
+        type: "atom",
+        id: element.elementId,
+        label: `[${element.type === "pasted_text" ? "Text" : element.kind === "image" ? "Image" : "File"} #${element.ordinal}]`,
+      };
+    });
     editor.setDocument(parts);
     structuredEditorActive = true;
     localStructuredDocument = parts;
@@ -671,12 +681,42 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     composer: ReturnType<PresentationSession["getState"]>["composer"],
   ): void => {
     draftInputsSlot.clear();
-    if (composer.resources.length === 0) {
+    if (composer.resources.length === 0 && composer.pastedTexts.length === 0) {
       return;
     }
     const resources = new Box(1, 1, theme.toolBackground);
     resources.addChild(new ResponsiveLine(theme.toolTitle("Draft inputs")));
-    for (const resource of composer.resources) {
+    for (const element of composer.elements) {
+      if (element.type === "text") {
+        continue;
+      }
+      if (element.type === "pasted_text") {
+        const pastedText = composer.pastedTexts.find(
+          (candidate) => candidate.elementId === element.elementId,
+        );
+        if (pastedText === undefined) {
+          continue;
+        }
+        resources.addChild(
+          new ResponsiveLine(
+            theme.toolOutput(
+              `${pastedText.token} · Pasted text · ${pastedText.state} · ${pastedText.lineCount} lines · ${pastedText.scalarCount} scalars · ${pastedText.byteCount} bytes`,
+            ),
+          ),
+        );
+        if (pastedText.diagnostic !== null) {
+          resources.addChild(
+            new ResponsiveLine(theme.muted(safeTerminalText(pastedText.diagnostic))),
+          );
+        }
+        continue;
+      }
+      const resource = composer.resources.find(
+        (candidate) => candidate.elementId === element.elementId,
+      );
+      if (resource === undefined) {
+        continue;
+      }
       const size = resource.byteCount === null ? "size pending" : `${resource.byteCount} bytes`;
       const media = resource.mediaHint === null ? "media pending" : resource.mediaHint;
       const support = resource.support === null ? "support pending" : resource.support;
@@ -693,7 +733,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         resources.addChild(new ResponsiveLine(theme.muted(safeTerminalText(resource.diagnostic))));
       }
     }
-    resources.addChild(new ResponsiveLine(theme.muted("/detach <index> · /cancelattach <index>")));
+    resources.addChild(
+      new ResponsiveLine(
+        theme.muted("Delete removes the adjacent atom · Undo restores it · /detach for files"),
+      ),
+    );
     draftInputsSlot.addChild(resources);
   };
 
@@ -2243,6 +2287,70 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       pathPicker = { close, hide: () => handle?.hide() };
     }
   };
+  editor.onPaste = (intent: EditorPasteIntent) => {
+    if (!isLargePastedTextV1(intent.text)) {
+      return false;
+    }
+    const visibleTextBeforePaste = editor.getExpandedText();
+    const actionId = showNotice("progress", "Staging pasted text…", "until_replaced");
+    void draftMutationQueue
+      .add(async () => {
+        if (intent.cursor.type === "text") {
+          const persisted = await options.presentation.dispatch({
+            type: "update_draft_text",
+            text: visibleTextBeforePaste,
+          });
+          if (persisted.status === "rejected") {
+            return persisted;
+          }
+        }
+        const composer = options.presentation.getState().composer;
+        let at: DraftPoint;
+        if (intent.cursor.type === "document") {
+          at =
+            "offset" in intent.cursor.point
+              ? {
+                  elementId: intent.cursor.point.partId,
+                  offset: intent.cursor.point.offset,
+                }
+              : {
+                  elementId: intent.cursor.point.partId,
+                  edge: intent.cursor.point.edge,
+                };
+        } else {
+          const textElement = composer.elements.find((element) => element.type === "text");
+          at =
+            textElement === undefined
+              ? { edge: "start" }
+              : {
+                  elementId: textElement.elementId,
+                  offset: Math.min(intent.cursor.offset, textElement.text.length),
+                };
+        }
+        return options.presentation.dispatch({
+          type: "stage_pasted_text",
+          text: intent.text,
+          mutation: { at, baseRevision: composer.draftRevision },
+        });
+      })
+      .then((receipt) => {
+        settleNotice(
+          actionId,
+          receipt?.status === "admitted" ? "success" : "error",
+          receipt?.status === "admitted"
+            ? "Pasted text staged."
+            : (receipt?.message ?? "The pasted text could not be staged."),
+          receipt?.status === "admitted" ? "until_next_action" : "until_edit",
+        );
+        renderState();
+      })
+      .catch(() => {
+        settleNotice(actionId, "error", "The pasted text could not be staged.", "until_edit");
+        renderState();
+      });
+    renderState();
+    return true;
+  };
   editor.onEditIntent = (intent) => {
     if (intent.type === "remove_atom") {
       void draftMutationQueue
@@ -2316,7 +2424,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           document: intent.document.map((part) =>
             part.type === "text"
               ? { type: "text", text: part.text }
-              : { type: "resource", elementId: part.id },
+              : {
+                  type:
+                    composer.elements.find((element) => element.elementId === part.id)?.type ===
+                    "pasted_text"
+                      ? ("pasted_text" as const)
+                      : ("resource" as const),
+                  elementId: part.id,
+                },
           ),
         });
       })
@@ -3254,10 +3369,62 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         renderState();
       });
   };
+  const copyExpandedDraft = (sessionId?: string): void => {
+    editor.disableSubmit = false;
+    projectedComposerKey = null;
+    const copyActionId = showNotice(
+      "progress",
+      "Expanding current draft for copy…",
+      "until_replaced",
+      sessionId,
+    );
+    renderState();
+    void options.presentation
+      .dispatch({ type: "read_expanded_draft" })
+      .then(async (receipt) => {
+        if (receipt.status === "rejected" || receipt.draftText === undefined) {
+          return receipt.status === "rejected"
+            ? receipt.message
+            : "The expanded draft is unavailable to copy.";
+        }
+        const copied = await copyTextToClipboard(
+          receipt.draftText,
+          options.clipboard,
+          deadlineScheduler,
+        );
+        return copied === "copied"
+          ? "Copied expanded draft."
+          : copied === "unsupported"
+            ? "Clipboard unavailable; expanded draft was not copied."
+            : "Clipboard copy failed; expanded draft was not copied.";
+      })
+      .then(
+        (message) => {
+          settleNotice(
+            copyActionId,
+            message === "Copied expanded draft." ? "success" : "error",
+            message,
+            message === "Copied expanded draft." ? "until_next_action" : "until_replaced",
+            sessionId,
+          );
+          renderState();
+        },
+        () => {
+          settleNotice(
+            copyActionId,
+            "error",
+            "The expanded draft could not be copied.",
+            "until_replaced",
+            sessionId,
+          );
+          renderState();
+        },
+      );
+  };
   const submitEditorValue = (text: string) => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
-    if (text.trim().length === 0) {
+    if (text.trim().length === 0 && state.composer.pastedTexts.length === 0) {
       return;
     }
     const earlyParsed = commandRegistry.parse(text);
@@ -3306,6 +3473,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       if (parsedDraft.kind === "known" && parsedDraft.command.id === "connection") {
         handleConnectionCommand(parsedDraft.argumentsText, state.draft.targetId);
+        return;
+      }
+      if (
+        parsedDraft.kind === "known" &&
+        parsedDraft.command.id === "copy" &&
+        parsedDraft.argumentsText === "draft"
+      ) {
+        copyExpandedDraft();
         return;
       }
       if (handleAttachmentCommand(parsedDraft)) {
@@ -3686,6 +3861,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       );
       editor.disableSubmit = false;
       renderState();
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "copy" &&
+      parsedCommand.argumentsText === "draft"
+    ) {
+      copyExpandedDraft(active.session.id);
       return;
     }
     if (

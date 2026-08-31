@@ -470,7 +470,7 @@ test("Shift+Enter and Ctrl+J preserve one exact multiline draft", async () => {
   }
 });
 
-test("a chunked large bracketed paste remains one exact expandable editor value", async () => {
+test("a chunked large bracketed paste becomes one exact expandable Text atom", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-large-paste-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -493,7 +493,44 @@ test("a chunked large bracketed paste remains one exact expandable editor value"
     await fixture.waitFor("Adam · New session");
     fixture.write(`\u001b[200~${pasted.slice(0, split)}`);
     fixture.write(`${pasted.slice(split)}\u001b[201~`);
-    await fixture.waitFor("[paste #1 +24 lines]");
+    await fixture.waitFor("Pasted text staged.");
+    await fixture.waitFor("[Text #1]");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("Draft inputs");
+    fixture.write("/copy draft\r");
+    await expect(waitForFileContents(join(controlRoot, "clipboard.txt"), pasted)).resolves.toBe(
+      pasted,
+    );
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe("[Text #1]");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a 1000-scalar paste stays ordinary text even when UTF-16 length is larger", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-scalar-paste-boundary-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const pasted = `${"界".repeat(996)}e\u0301👩💻`;
+  expect(Array.from(pasted)).toHaveLength(1_000);
+  expect(pasted.length).toBeGreaterThan(1_000);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write(`\u001b[200~${pasted}\u001b[201~`);
+    await fixture.waitFor("é👩💻");
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("[Text #1]");
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("[paste #1");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(pasted);

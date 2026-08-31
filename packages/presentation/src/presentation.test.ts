@@ -72,6 +72,7 @@ const emptyComposer = {
   sealed: false,
   revisionIntent: null,
   resources: [],
+  pastedTexts: [],
 } as const;
 
 describe("presentation reconciliation", () => {

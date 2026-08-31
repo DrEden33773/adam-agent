@@ -68,6 +68,12 @@ import {
   modelTargetUsesContextProfile,
   sameModelTargetIdentity,
 } from "./model-targets.js";
+import {
+  isLargePastedTextV1,
+  pastedTextMetricsV1,
+  promotePastedTextSelectionsV1,
+  type StagedPastedTextSelectionV1,
+} from "./pasted-text.js";
 import { planGitAutomaticPolicyV1 } from "./plan-git-policy.js";
 import {
   type ApprovedPlanProjectionV1,
@@ -181,6 +187,7 @@ import {
   skillContextSnapshot,
 } from "./skills.js";
 import {
+  attachPastedTextProjectionContentsV1,
   materializeSessionUserContentV1,
   type StagedUserContentElementV1,
 } from "./structured-user-content.js";
@@ -537,6 +544,7 @@ export type SessionCommand =
       readonly signal?: AbortSignal;
       readonly thinkingSelection?: ThinkingPolicySelectionV1;
       readonly resourceSelections?: readonly InputResourceSelectionV1[];
+      readonly pastedTextSelections?: readonly StagedPastedTextSelectionV1[];
       readonly structuredContent?: readonly StagedUserContentElementV1[];
       readonly planRevision?: {
         readonly cycleId: string;
@@ -575,6 +583,7 @@ export interface SessionLifecycle {
     readonly signal?: AbortSignal;
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
     readonly resourceSelections?: readonly InputResourceSelectionV1[];
+    readonly pastedTextSelections?: readonly StagedPastedTextSelectionV1[];
     readonly structuredContent?: readonly StagedUserContentElementV1[];
     readonly onAdmitted?: (receipt: SessionAdmissionReceipt) => void;
   }): Promise<SessionContinueResult>;
@@ -588,6 +597,7 @@ export interface SessionLifecycle {
     readonly signal?: AbortSignal;
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
     readonly resourceSelections?: readonly InputResourceSelectionV1[];
+    readonly pastedTextSelections?: readonly StagedPastedTextSelectionV1[];
     readonly structuredContent?: readonly StagedUserContentElementV1[];
     readonly planRevision?: {
       readonly cycleId: string;
@@ -2003,7 +2013,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       const runId = input.runId ?? randomUUID();
       if (
         !z.uuid().safeParse(runId).success ||
-        input.input.text.trim().length === 0 ||
+        (input.input.text.trim().length === 0 &&
+          (input.pastedTextSelections === undefined || input.pastedTextSelections.length === 0)) ||
         !draftRunLimitsAreValid(input.limits) ||
         options.modelTargets === undefined
       ) {
@@ -2076,6 +2087,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ...(input.resourceSelections === undefined
             ? {}
             : { resourceSelections: input.resourceSelections }),
+          ...(input.pastedTextSelections === undefined
+            ? {}
+            : { pastedTextSelections: input.pastedTextSelections }),
           ...(input.structuredContent === undefined
             ? {}
             : { structuredContent: input.structuredContent }),
@@ -2558,17 +2572,23 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             input.runId !== undefined ||
             input.planRevision !== undefined ||
             input.resourceSelections !== undefined ||
+            input.pastedTextSelections !== undefined ||
             input.structuredContent !== undefined ||
             input.thinkingSelection !== undefined)) ||
         (input.resourceSelections !== undefined && input.input === undefined) ||
+        (input.pastedTextSelections !== undefined && input.input === undefined) ||
         (input.structuredContent !== undefined &&
-          (input.input === undefined || input.resourceSelections === undefined)) ||
+          (input.input === undefined ||
+            (input.resourceSelections === undefined &&
+              input.pastedTextSelections === undefined))) ||
         input.input?.inputResources !== undefined
       ) {
         throw new SessionLifecycleError("session_invalid");
       }
       let effectiveRunId =
-        input.resourceSelections === undefined ? input.runId : (input.runId ?? randomUUID());
+        input.resourceSelections === undefined && input.pastedTextSelections === undefined
+          ? input.runId
+          : (input.runId ?? randomUUID());
       let effectiveInput = input.input;
       disarmMcpIdle(input.sessionId);
       await waitForMcpIdleOperation(input.sessionId);
@@ -3094,19 +3114,35 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                 selections: input.resourceSelections,
                 signal: input.signal ?? new AbortController().signal,
               });
+        const pastedTextMaterialization =
+          input.pastedTextSelections === undefined
+            ? { occurrences: [], contents: new Map<string, string>() }
+            : await promotePastedTextSelectionsV1({
+                artifactRoot,
+                artifactStore,
+                projectId: first.record.projectId,
+                sessionId: input.sessionId,
+                runId: effectiveRunId as string,
+                selections: input.pastedTextSelections,
+                signal: input.signal ?? new AbortController().signal,
+              });
         input.signal?.throwIfAborted();
         const runInput =
-          effectiveInput === undefined || inputResources.length === 0
+          effectiveInput === undefined ||
+          (inputResources.length === 0 && pastedTextMaterialization.occurrences.length === 0)
             ? effectiveInput
             : {
                 ...effectiveInput,
                 inputResources,
+                pastedTexts: pastedTextMaterialization.occurrences,
+                pastedTextContents: pastedTextMaterialization.contents,
                 ...(input.structuredContent === undefined
                   ? {}
                   : {
                       userContent: materializeSessionUserContentV1({
                         elements: input.structuredContent,
                         occurrences: inputResources,
+                        pastedTexts: pastedTextMaterialization.occurrences,
                         userMessage: effectiveInput.text,
                       }),
                     }),
@@ -6920,6 +6956,70 @@ async function materializeModelResponseArtifacts(
   let logicalReferencedBytes = 0;
 
   for (const entry of records) {
+    if (
+      entry.schemaVersion === 3 &&
+      entry.record.type === "logical_run_started" &&
+      entry.record.recordVersion === 3
+    ) {
+      const contents = new Map<string, string>();
+      let pastedTextBytes = 0;
+      for (const occurrence of entry.record.pastedTexts) {
+        const source = occurrence.artifact.source;
+        if (
+          source.type !== "pasted_text" ||
+          source.projectId !== genesis.record.projectId ||
+          source.sessionId !== genesis.record.sessionId ||
+          source.runId !== entry.record.runId ||
+          source.occurrenceId !== occurrence.occurrenceId ||
+          occurrence.artifact.id !== occurrence.digest ||
+          occurrence.artifact.byteCount !== occurrence.byteCount
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        pastedTextBytes += occurrence.byteCount;
+        if (pastedTextBytes > 1_024 * 1_024) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        let pendingArtifact = artifactCache.get(occurrence.artifact.id);
+        if (pendingArtifact === undefined) {
+          pendingArtifact = readFileArtifact({
+            root: artifactRoot,
+            id: occurrence.artifact.id,
+            maximumBytes: 1_024 * 1_024,
+          }).then((bytes) =>
+            bytes === undefined
+              ? undefined
+              : {
+                  byteCount: bytes.byteLength,
+                  text: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+                },
+          );
+          artifactCache.set(occurrence.artifact.id, pendingArtifact);
+        }
+        const resolved = await pendingArtifact;
+        if (
+          resolved === undefined ||
+          resolved.byteCount !== occurrence.byteCount ||
+          Buffer.byteLength(resolved.text, "utf8") !== occurrence.byteCount
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const metrics = pastedTextMetricsV1(resolved.text);
+        if (
+          metrics.lineCount !== occurrence.lineCount ||
+          metrics.scalarCount !== occurrence.scalarCount ||
+          !isLargePastedTextV1(resolved.text)
+        ) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        contents.set(occurrence.occurrenceId, resolved.text);
+      }
+      materialized.push({
+        ...entry,
+        record: attachPastedTextProjectionContentsV1({ ...entry.record }, contents),
+      });
+      continue;
+    }
     if (entry.schemaVersion !== 3 || entry.record.type !== "model_response_completed") {
       materialized.push(entry);
       continue;

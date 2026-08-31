@@ -754,7 +754,8 @@ export type DraftPoint =
 
 export type DraftTextDocumentPart =
   | { readonly type: "text"; readonly text: string }
-  | { readonly type: "resource"; readonly elementId: string };
+  | { readonly type: "resource"; readonly elementId: string }
+  | { readonly type: "pasted_text"; readonly elementId: string };
 
 export type TurnComposerDisplay = {
   readonly attachmentAvailable: boolean;
@@ -767,6 +768,12 @@ export type TurnComposerDisplay = {
         readonly kind: "file" | "image";
         readonly ordinal: number;
         readonly resourceId: string;
+      }
+    | {
+        readonly elementId: string;
+        readonly type: "pasted_text";
+        readonly ordinal: number;
+        readonly pastedTextId: string;
       }
   )[];
   readonly renderedText: string;
@@ -792,6 +799,18 @@ export type TurnComposerDisplay = {
     readonly support: "image" | "unsupported_binary" | "utf8_text" | null;
     readonly diagnostic: string | null;
     readonly token: string;
+  }[];
+  readonly pastedTexts: readonly {
+    readonly id: string;
+    readonly elementId: string;
+    readonly ordinal: number;
+    readonly token: string;
+    readonly state: "copying" | "ready" | "failed" | "removed";
+    readonly byteCount: number;
+    readonly lineCount: number;
+    readonly scalarCount: number;
+    readonly origin: "pasted_text";
+    readonly diagnostic: string | null;
   }[];
 };
 
@@ -859,6 +878,7 @@ export type CommandReceipt =
       readonly status: "admitted";
       readonly commandId: string;
       readonly resource: ArtifactChunk | null;
+      readonly draftText?: string;
       readonly todo?: TodoPageResource | TodoEntityResource;
     }
   | {
@@ -1097,6 +1117,14 @@ export type PresentationCommand =
       };
     }
   | {
+      readonly type: "stage_pasted_text";
+      readonly text: string;
+      readonly mutation?: {
+        readonly at: DraftPoint;
+        readonly baseRevision: number;
+      };
+    }
+  | {
       readonly type: "replace_draft_text";
       readonly baseRevision: number;
       readonly document: readonly DraftTextDocumentPart[];
@@ -1114,6 +1142,7 @@ export type PresentationCommand =
       readonly type: "clear_draft";
       readonly baseRevision: number;
     }
+  | { readonly type: "read_expanded_draft" }
   | {
       readonly type: "update_draft_text";
       readonly text: string;

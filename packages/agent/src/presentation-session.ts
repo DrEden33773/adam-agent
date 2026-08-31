@@ -548,6 +548,7 @@ export async function createPresentationSession(
         sealed: false,
         revisionIntent: planRevisionIntent,
         resources: [],
+        pastedTexts: [],
       },
       transient: null,
     };
@@ -609,7 +610,11 @@ export async function createPresentationSession(
     };
     let turnComposer: TurnComposer;
     const projectTurnComposer = (): PresentationDisplayState["composer"] => {
-      const snapshot = turnComposer?.snapshot() ?? { sealed: false, resources: [] };
+      const snapshot = turnComposer?.snapshot() ?? {
+        sealed: false,
+        resources: [],
+        pastedTexts: [],
+      };
       return {
         attachmentAvailable,
         draftRevision: snapshot.revision,
@@ -619,6 +624,7 @@ export async function createPresentationSession(
         sealed: snapshot.sealed,
         revisionIntent: planRevisionIntent,
         resources: snapshot.resources,
+        pastedTexts: snapshot.pastedTexts,
       };
     };
     turnComposer = await createTurnComposer({
@@ -676,7 +682,14 @@ export async function createPresentationSession(
       if (
         turnComposer
           .snapshot()
-          .resources.every((resource) => resource.state === "ready" || resource.state === "failed")
+          .resources.every(
+            (resource) => resource.state === "ready" || resource.state === "failed",
+          ) &&
+        turnComposer
+          .snapshot()
+          .pastedTexts.every(
+            (pastedText) => pastedText.state === "ready" || pastedText.state === "failed",
+          )
       ) {
         await persistCurrentTurnDraft();
       }
@@ -691,6 +704,37 @@ export async function createPresentationSession(
         return null;
       }
       return recovered;
+    };
+    const expandedDraftFitsExactTarget = (commandText: string): boolean => {
+      if (state.composer.pastedTexts.length === 0) {
+        return true;
+      }
+      const active = state.authoritative.active;
+      const targetId = active?.session.targetId ?? state.draft?.targetId;
+      const target = state.authoritative.targets.items.find(
+        (candidate) => candidate.targetId === targetId,
+      );
+      const profile =
+        active?.context?.profile ??
+        target?.context?.effective ??
+        target?.context?.official ??
+        modelTargetSnapshot?.targets.find((candidate) => candidate.identity.targetId === targetId)
+          ?.contextProfile;
+      if (profile === undefined) {
+        return false;
+      }
+      try {
+        const literalText = state.composer.elements
+          .flatMap((element) => (element.type === "text" ? [element.text] : []))
+          .join("");
+        const prospectiveBytes =
+          Buffer.byteLength(turnComposer.readExpandedText(), "utf8") +
+          (literalText === commandText ? 0 : Buffer.byteLength(commandText, "utf8"));
+        const estimatedInputTokens = Math.ceil(prospectiveBytes / 4);
+        return estimatedInputTokens + profile.maximumOutputTokens < profile.contextWindowTokens;
+      } catch {
+        return false;
+      }
     };
     const initialDraftScope = currentDraftScope();
     if (initialDraftScope !== null) {
@@ -2303,6 +2347,32 @@ export async function createPresentationSession(
           };
         }
       }
+      if (command.type === "stage_pasted_text") {
+        if (activeRun !== undefined || state.composer.sealed) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "Pasted text cannot be staged while the current turn is sealed.",
+          };
+        }
+        try {
+          await turnComposer.stagePastedText(
+            command.text,
+            command.mutation,
+            persistCurrentTurnDraft,
+          );
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch (error) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message:
+              error instanceof Error
+                ? error.message
+                : "The pasted text could not be staged safely.",
+          };
+        }
+      }
       if (command.type === "replace_draft_text") {
         if (activeRun !== undefined || state.composer.sealed) {
           return {
@@ -2319,11 +2389,14 @@ export async function createPresentationSession(
                 code: "stale_interaction",
                 message: "The structured draft no longer matches the current composer revision.",
               };
-        } catch {
+        } catch (error) {
           return {
             status: "rejected",
-            code: "persistence_failed",
-            message: "The recoverable structured draft could not be saved.",
+            code: error instanceof TurnComposerError ? "not_available" : "persistence_failed",
+            message:
+              error instanceof TurnComposerError
+                ? error.message
+                : "The recoverable structured draft could not be saved.",
           };
         }
       }
@@ -2339,7 +2412,11 @@ export async function createPresentationSession(
         const element = snapshot.elements.find(
           (candidate) => candidate.elementId === command.elementId,
         );
-        if (command.baseRevision !== snapshot.revision || element?.type !== "resource") {
+        if (
+          command.baseRevision !== snapshot.revision ||
+          element?.type === "text" ||
+          element === undefined
+        ) {
           return {
             status: "rejected",
             code: "stale_interaction",
@@ -2347,18 +2424,41 @@ export async function createPresentationSession(
           };
         }
         try {
-          return (await turnComposer.remove(element.resourceId, persistCurrentTurnDraft))
+          const removed =
+            element.type === "resource"
+              ? await turnComposer.remove(element.resourceId, persistCurrentTurnDraft)
+              : await turnComposer.removePastedText(element.pastedTextId, persistCurrentTurnDraft);
+          return removed
             ? { status: "admitted", commandId: randomUUID(), resource: null }
             : {
                 status: "rejected",
                 code: "stale_interaction",
                 message: "The draft element is no longer present in the current composer.",
               };
-        } catch {
+        } catch (error) {
           return {
             status: "rejected",
-            code: "persistence_failed",
-            message: "The recoverable turn draft could not be saved.",
+            code: error instanceof TurnComposerError ? "not_available" : "persistence_failed",
+            message:
+              error instanceof TurnComposerError
+                ? error.message
+                : "The recoverable turn draft could not be saved.",
+          };
+        }
+      }
+      if (command.type === "read_expanded_draft") {
+        try {
+          return {
+            status: "admitted",
+            commandId: randomUUID(),
+            resource: null,
+            draftText: turnComposer.readExpandedText(),
+          };
+        } catch (error) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: error instanceof Error ? error.message : "The expanded draft is unavailable.",
           };
         }
       }
@@ -2421,11 +2521,14 @@ export async function createPresentationSession(
         try {
           await turnComposer.commitText(command.text, persistCurrentTurnDraft);
           return { status: "admitted", commandId: randomUUID(), resource: null };
-        } catch {
+        } catch (error) {
           return {
             status: "rejected",
-            code: "persistence_failed",
-            message: "The recoverable turn draft could not be saved.",
+            code: error instanceof TurnComposerError ? "not_available" : "persistence_failed",
+            message:
+              error instanceof TurnComposerError
+                ? error.message
+                : "The recoverable turn draft could not be saved.",
           };
         }
       }
@@ -2472,7 +2575,7 @@ export async function createPresentationSession(
       if (command.type === "submit_prompt") {
         if (
           command.sessionId !== state.authoritative.active?.session.id ||
-          command.text.trim().length === 0
+          (command.text.trim().length === 0 && state.composer.pastedTexts.length === 0)
         ) {
           return {
             status: "rejected",
@@ -2519,6 +2622,14 @@ export async function createPresentationSession(
         });
         if (skillResolution.status === "ambiguous") {
           return ambiguousSkillMentionRejection(skillResolution);
+        }
+        if (!expandedDraftFitsExactTarget(command.text)) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message:
+              "The expanded draft cannot fit the exact target context. Remove or split Text atoms, or switch targets.",
+          };
         }
         const submittedScope = currentDraftScope();
         const controller = new AbortController();
@@ -2585,7 +2696,10 @@ export async function createPresentationSession(
           ...(sealedDraft.selections.length === 0
             ? {}
             : { resourceSelections: sealedDraft.selections }),
-          ...(sealedDraft.selections.length === 0
+          ...(sealedDraft.pastedTextSelections.length === 0
+            ? {}
+            : { pastedTextSelections: sealedDraft.pastedTextSelections }),
+          ...(sealedDraft.selections.length === 0 && sealedDraft.pastedTextSelections.length === 0
             ? {}
             : { structuredContent: sealedDraft.structuredContent }),
           ...(command.thinkingSelection === null
@@ -2658,7 +2772,10 @@ export async function createPresentationSession(
       }
       if (command.type === "submit_draft_prompt") {
         const draft = state.draft;
-        if (draft === null || command.text.trim().length === 0) {
+        if (
+          draft === null ||
+          (command.text.trim().length === 0 && state.composer.pastedTexts.length === 0)
+        ) {
           return {
             status: "rejected",
             code: "invalid_command",
@@ -2687,6 +2804,14 @@ export async function createPresentationSession(
         });
         if (skillResolution.status === "ambiguous") {
           return ambiguousSkillMentionRejection(skillResolution);
+        }
+        if (!expandedDraftFitsExactTarget(command.text)) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message:
+              "The expanded draft cannot fit the exact target context. Remove or split Text atoms, or switch targets.",
+          };
         }
         const submittedScope = currentDraftScope();
         const controller = new AbortController();
@@ -2738,7 +2863,10 @@ export async function createPresentationSession(
           ...(sealedDraft.selections.length === 0
             ? {}
             : { resourceSelections: sealedDraft.selections }),
-          ...(sealedDraft.selections.length === 0
+          ...(sealedDraft.pastedTextSelections.length === 0
+            ? {}
+            : { pastedTextSelections: sealedDraft.pastedTextSelections }),
+          ...(sealedDraft.selections.length === 0 && sealedDraft.pastedTextSelections.length === 0
             ? {}
             : { structuredContent: sealedDraft.structuredContent }),
           ...(command.thinkingSelection === null
