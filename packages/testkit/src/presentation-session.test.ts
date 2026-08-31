@@ -3671,7 +3671,7 @@ test("PresentationSession cancels resource staging while a turn is sealing", asy
   }
 });
 
-test("PresentationSession scopes recoverable resources to their selected session", async () => {
+test("PresentationSession scopes recoverable composer inputs to their selected session", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-select-resource-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -3703,19 +3703,28 @@ test("PresentationSession scopes recoverable resources to their selected session
 
   try {
     await presentation.dispatch({ type: "stage_input_resource", path: selectedPath });
+    await presentation.dispatch({
+      type: "stage_pasted_text",
+      text: Array.from({ length: 11 }, (_, index) => `session paste ${index + 1}`).join("\n"),
+    });
     expect(presentation.getState().composer.resources).toHaveLength(1);
+    expect(presentation.getState().composer.pastedTexts).toMatchObject([
+      { preview: "session p...", state: "ready" },
+    ]);
 
     await expect(
       presentation.dispatch({ type: "select_session", sessionId: second.sessionId }),
     ).resolves.toMatchObject({ status: "admitted" });
     expect(presentation.getState().composer.resources).toEqual([]);
+    expect(presentation.getState().composer.pastedTexts).toEqual([]);
 
     await expect(
       presentation.dispatch({ type: "select_session", sessionId: first.sessionId }),
     ).resolves.toMatchObject({ status: "admitted" });
     expect(presentation.getState().composer).toMatchObject({
-      renderedText: "[File #1]",
+      renderedText: "[File #1][Text #2]",
       resources: [{ displayName: "session-local-notes.txt", ordinal: 1, state: "ready" }],
+      pastedTexts: [{ ordinal: 2, preview: "session p...", state: "ready" }],
     });
     await expect(
       presentation.dispatch({
@@ -5264,7 +5273,7 @@ test("PresentationSession recovers the default new-session draft after a clean r
       ],
       renderedText: "before[File #1]after[Text #2]",
       resources: [{ displayName: "notes.txt", ordinal: 1, state: "ready" }],
-      pastedTexts: [{ ordinal: 2, state: "ready", lineCount: 11 }],
+      pastedTexts: [{ ordinal: 2, state: "ready", lineCount: 11, preview: "recovered..." }],
     });
     await expect(presentation.dispatch({ type: "read_expanded_draft" })).resolves.toMatchObject({
       draftText: `before[File #1]after${pasted}`,

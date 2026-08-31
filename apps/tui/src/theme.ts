@@ -22,6 +22,10 @@ export type AdamTuiTheme = {
   readonly markdown: MarkdownTheme;
   readonly muted: (text: string) => string;
   readonly primary: (text: string) => string;
+  readonly text: (text: string) => string;
+  readonly green: (text: string) => string;
+  readonly overlay: (text: string) => string;
+  readonly reference: (text: string) => string;
   readonly statusError: (text: string) => string;
   readonly statusInfo: (text: string) => string;
   readonly statusSuccess: (text: string) => string;
@@ -68,6 +72,10 @@ export function createAdamTuiTheme(noColor = noColorRequested()): AdamTuiTheme {
 
   return {
     primary: text,
+    text,
+    green,
+    overlay,
+    reference: color(137, 220, 235),
     brand: bold(mauve),
     muted,
     statusError: red,
@@ -117,11 +125,12 @@ export function createAdamTuiTheme(noColor = noColorRequested()): AdamTuiTheme {
     toolTitle: bold(mauve),
     toolOutput: subtext,
     editor: {
+      atom: color(137, 220, 235),
       borderColor: overlay,
       selectList: {
         selectedPrefix: mauve,
-        selectedText: text,
-        description: muted,
+        selectedText: mauve,
+        description: overlay,
         scrollInfo: muted,
         noMatch: muted,
       },

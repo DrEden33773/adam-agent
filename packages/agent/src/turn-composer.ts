@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isUnsafePresentationControl, stripTerminalSequences } from "@adam-agent/presentation";
 import { normalizeExplicitUserImageToPngV1 } from "./image-input.js";
 import type { TurnComposerResourceStager } from "./input-resource-staging.js";
 import {
@@ -83,6 +84,7 @@ export type TurnComposerPastedTextSnapshot = {
   readonly lineCount: number;
   readonly scalarCount: number;
   readonly origin: "pasted_text";
+  readonly preview: string;
   readonly diagnostic: string | null;
 };
 
@@ -113,6 +115,7 @@ type TurnComposerPastedText = {
   byteCount: number;
   lineCount: number;
   scalarCount: number;
+  preview: string;
   diagnostic: string | null;
   readonly controller: AbortController;
   staged: StagedPastedTextSelectionV1 | null;
@@ -212,6 +215,27 @@ export async function createTurnComposer(options: {
   let text = "";
   let sealed = false;
   let closed = false;
+  const previewSegmenter = new Intl.Segmenter("en", { granularity: "grapheme" });
+
+  const projectPastedTextPreview = (value: string): string => {
+    let safe = "";
+    for (const character of stripTerminalSequences(value)) {
+      const codePoint = character.codePointAt(0) as number;
+      if (/\p{White_Space}/u.test(character)) {
+        safe += " ";
+      } else if (isUnsafePresentationControl(codePoint)) {
+      } else {
+        safe += character;
+      }
+    }
+    const normalized = safe.replace(/ +/gu, " ").trim();
+    if (normalized.length === 0) {
+      return "(empty after sanitization)";
+    }
+    const graphemes = [...previewSegmenter.segment(normalized)].map((entry) => entry.segment);
+    const preview = graphemes.slice(0, 9).join("");
+    return graphemes.length > 9 ? `${preview}...` : preview;
+  };
 
   const publish = (): void => {
     if (!closed) {
@@ -589,6 +613,7 @@ export async function createTurnComposer(options: {
           byteCount: recovered.byteCount,
           lineCount: recovered.lineCount,
           scalarCount: recovered.scalarCount,
+          preview: recoveredText === null ? "" : projectPastedTextPreview(recoveredText),
           diagnostic:
             recovered.state === "ready" && recoveredText === null
               ? "The recoverable pasted-text bytes are unavailable."
@@ -1121,6 +1146,7 @@ export async function createTurnComposer(options: {
         byteCount: pastedBytes,
         lineCount: normalizedPastedText.split("\n").length,
         scalarCount: Array.from(normalizedPastedText).length,
+        preview: projectPastedTextPreview(normalizedPastedText),
         diagnostic: null,
         controller: new AbortController(),
         staged: null,

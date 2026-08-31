@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, expect, test } from "vitest";
 import { AppliedViewportTerminal } from "./applied-viewport-terminal.test-support.js";
 import { copySelectionToClipboard, selectionCopyMaximumBytes } from "./exit-policy.js";
@@ -509,6 +509,66 @@ test("a chunked large bracketed paste becomes one exact expandable Text atom", a
   }
 });
 
+test("a ready pasted Text presents one bounded content preview", async () => {
+  const { fixture, testRoot } = await startPastedTextAtomFixture({ slug: "ready-preview" });
+  try {
+    const screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("[Text #1] · Pasted text · structure... · 11 lines");
+    expect(screen).not.toContain("[Text #1] · Pasted text · ready ·");
+    expect(fixture.output().split("\u001b[38;2;137;220;235m[Text #1]\u001b[39m").length - 1).toBe(
+      2,
+    );
+    expect(fixture.output()).toContain("\u001b[38;2;166;227;161mstructure...\u001b[39m");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a ready pasted Text preview remains stable across responsive layouts", async () => {
+  const { fixture, testRoot } = await startPastedTextAtomFixture({ slug: "preview-responsive" });
+  try {
+    for (const columns of [40, 80, 120]) {
+      const beforeResize = fixture.output().length;
+      await fixture.resize(columns, 24);
+      const frame = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+      expect(frame.every((line) => visibleWidth(line) <= columns)).toBe(true);
+    }
+    expect(stripTerminalSequences(fixture.output())).toContain(
+      "[Text #1] · Pasted text · structure... · 11 lines",
+    );
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("NO_COLOR preserves ready pasted Text structure and preview without SGR", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-preview-no-color-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const pasted = Array.from({ length: 11 }, (_, index) => `colorless line ${index + 1}`).join("\n");
+
+  try {
+    const fixture = startFixture({ noColor: true, stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforePaste = fixture.output().length;
+    fixture.write(`\u001b[200~${pasted}\u001b[201~`);
+    await fixture.waitForCompleteFrameAfter("colorless...", beforePaste);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforePaste)).join("\n");
+    expect(frame).toContain("[Text #1] · Pasted text · colorless...");
+    expect(frame).not.toContain("\u001b[38;2;");
+    expect(frame).not.toContain("\u001b[48;2;");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("Skill completion remains available after one large pasted Text atom", async () => {
   const { fixture, testRoot } = await startPastedTextAtomFixture({
     prepare: prepareFirstStructuredCompletionSkill,
@@ -519,6 +579,102 @@ test("Skill completion remains available after one large pasted Text atom", asyn
     const beforeCompletion = fixture.output().length;
     fixture.write(" Use $fir");
     await fixture.waitForCompleteFrameAfter("$first", beforeCompletion);
+    const completionOutput = fixture.output().slice(beforeCompletion);
+    expect(completionOutput).toContain("\u001b[38;2;203;166;247m> $first");
+    expect(stripTerminalSequences(completionOutput)).toContain("project:. · First structured");
+    expect(completionOutput).not.toContain("skill:v1:project:.:first");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Skill completion restores Green and Overlay roles when Mauve selection moves", async () => {
+  const { fixture, testRoot } = await startPastedTextAtomFixture({
+    prepare: prepareTwoStructuredCompletionSkills,
+    scenario: "skill-selection",
+    slug: "skill-row-selection",
+  });
+  try {
+    const beforeCompletion = fixture.output().length;
+    fixture.write(" Use $");
+    await fixture.waitForCompleteFrameAfter("$beta", beforeCompletion);
+    let output = fixture.output().slice(beforeCompletion);
+    expect(output).toContain("\u001b[38;2;203;166;247m> $alpha");
+    expect(output).toContain("\u001b[38;2;166;227;161m$beta\u001b[39m");
+    expectSemanticCompletionRow(output, {
+      description: "project:. · alpha completion procedure.",
+      label: "$alpha",
+      selected: true,
+    });
+    expectSemanticCompletionRow(output, {
+      description: "project:. · beta completion procedure.",
+      label: "$beta",
+      selected: false,
+    });
+
+    const beforeMove = fixture.output().length;
+    fixture.write("\u001b[B");
+    await fixture.resize(79, 24);
+    output = fixture.output().slice(beforeMove);
+    expect(output).toContain("\u001b[38;2;166;227;161m$alpha\u001b[39m");
+    expect(output).toContain("\u001b[38;2;203;166;247m> $beta");
+    expectSemanticCompletionRow(output, {
+      description: "project:. · alpha completion procedure.",
+      label: "$alpha",
+      selected: false,
+    });
+    expectSemanticCompletionRow(output, {
+      description: "project:. · beta completion procedure.",
+      label: "$beta",
+      selected: true,
+    });
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+function expectSemanticCompletionRow(
+  output: string,
+  input: { readonly description: string; readonly label: string; readonly selected: boolean },
+): void {
+  if (input.selected) {
+    const start = output.indexOf(`\u001b[38;2;203;166;247m> ${input.label}`);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = output.indexOf("\u001b[39m", start);
+    expect(output.slice(start, end)).toContain(input.description);
+    return;
+  }
+  const labelSpanStart = output.indexOf(`\u001b[38;2;166;227;161m${input.label}\u001b[39m`);
+  expect(labelSpanStart).toBeGreaterThanOrEqual(0);
+  const descriptionStart = output.indexOf("\u001b[38;2;108;112;134m", labelSpanStart);
+  const descriptionEnd = output.indexOf("\u001b[39m", descriptionStart);
+  expect(output.slice(descriptionStart, descriptionEnd)).toContain(input.description);
+}
+
+test("NO_COLOR Skill completion retains marker, order, columns, and source labels", async () => {
+  const { fixture, testRoot } = await startPastedTextAtomFixture({
+    noColor: true,
+    prepare: prepareTwoStructuredCompletionSkills,
+    scenario: "skill-selection",
+    slug: "skill-row-no-color",
+  });
+  try {
+    const beforeCompletion = fixture.output().length;
+    fixture.write(" Use $");
+    await fixture.waitForCompleteFrameAfter("$beta", beforeCompletion);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeCompletion));
+    const text = frame.join("\n");
+    expect(text).toContain("> $alpha");
+    expect(text).toContain("$beta");
+    expect(text).toContain("project:. · alpha completion procedure.");
+    expect(text.indexOf("$alpha")).toBeLessThan(text.indexOf("$beta"));
+    expect(frame.every((line) => visibleWidth(line) <= 80)).toBe(true);
+    expect(text).not.toContain("\u001b[38;2;");
+    expect(text).not.toContain("\u001b[48;2;");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -609,6 +765,7 @@ test("the existing at path picker remains atom-safe after one pasted Text atom",
 });
 
 async function startPastedTextAtomFixture(input: {
+  readonly noColor?: boolean;
   readonly prepare?: (workspaceRoot: string) => Promise<void>;
   readonly scenario?: "skill-selection";
   readonly slug: string;
@@ -620,6 +777,7 @@ async function startPastedTextAtomFixture(input: {
     await mkdir(workspaceRoot, { recursive: true });
     await input.prepare?.(workspaceRoot);
     const fixture = startFixture({
+      ...(input.noColor === undefined ? {} : { noColor: input.noColor }),
       ...(input.scenario === undefined ? {} : { scenario: input.scenario }),
       stateRoot,
       workspaceRoot,
@@ -646,6 +804,18 @@ async function prepareFirstStructuredCompletionSkill(workspaceRoot: string): Pro
     "---\nname: first\ndescription: First structured completion procedure.\n---\nFirst body.\n",
     "utf8",
   );
+}
+
+async function prepareTwoStructuredCompletionSkills(workspaceRoot: string): Promise<void> {
+  for (const name of ["alpha", "beta"]) {
+    const skillDirectory = join(workspaceRoot, ".agents", "skills", name);
+    await mkdir(skillDirectory, { recursive: true });
+    await writeFile(
+      join(skillDirectory, "SKILL.md"),
+      `---\nname: ${name}\ndescription: ${name} completion procedure.\n---\n${name} body.\n`,
+      "utf8",
+    );
+  }
 }
 
 test("a 1000-scalar paste stays ordinary text even when UTF-16 length is larger", async () => {
@@ -4277,7 +4447,7 @@ test("slash completion exposes Registry usage as its argument hint", async () =>
     const beforeCompletion = fixture.output().length;
     fixture.write("/he");
     await fixture.waitForAfter("/help [topic]", beforeCompletion);
-    expect(fixture.output().slice(beforeCompletion)).toContain(keywordLabel("/help"));
+    expect(fixture.output().slice(beforeCompletion)).toContain("\u001b[38;2;203;166;247m> /help");
     fixture.write("\t\r");
     await fixture.waitForAfter("Adam Help", beforeCompletion);
     fixture.write("\u0011");
@@ -4896,7 +5066,7 @@ test("Tab completes a Help topic argument from the Registry", async () => {
     const beforeCompletion = fixture.output().length;
     fixture.write("/help hot");
     await fixture.waitForAfter("Fixed effective keyboard bindings", beforeCompletion);
-    expect(fixture.output().slice(beforeCompletion)).toContain(keywordLabel("hotkeys"));
+    expect(fixture.output().slice(beforeCompletion)).toContain("\u001b[38;2;203;166;247m> hotkeys");
     fixture.write("\t\r");
     const outcome = await Promise.race([
       fixture.waitForAfter("Effective Hotkeys", beforeCompletion).then(() => "hotkeys" as const),
