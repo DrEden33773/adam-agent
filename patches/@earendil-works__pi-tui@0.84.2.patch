@@ -119,7 +119,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..ced33ab6fef651b7c9d6fc8834af110f
       * Insert text at the current cursor position.
       * Used for programmatic insertion (e.g., clipboard image markers).
 diff --git a/dist/components/editor.js b/dist/components/editor.js
-index 4786b46932b65785cfbd2304610ca77ccead910a..29d2fa6ea0d5b0c4934f3ce150e331a37405d073 100644
+index 4786b46932b65785cfbd2304610ca77ccead910a..5c1a37538dbad8250622417fe235b9c68a163b81 100644
 --- a/dist/components/editor.js
 +++ b/dist/components/editor.js
 @@ -219,6 +219,7 @@ export class Editor {
@@ -763,8 +763,15 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..29d2fa6ea0d5b0c4934f3ce150e331a3
          const snapshot = this.undoStack.pop();
          if (!snapshot)
              return;
-@@ -1806,14 +2188,67 @@ export class Editor {
-         const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
+@@ -1803,17 +2185,73 @@ export class Editor {
+         return firstPrefixIndex;
+     }
+     createAutocompleteList(prefix, items) {
+-        const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
++        const layout = {
++            ...(prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : {}),
++            overrideSelectedStyles: true,
++        };
          return new SelectList(items, this.autocompleteMaxVisible, this.theme.selectList, layout);
      }
 +    autocompleteInput() {
@@ -833,7 +840,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..29d2fa6ea0d5b0c4934f3ce150e331a3
          if (this.isInSlashCommandContext(beforeCursor) && !beforeCursor.trimStart().includes(" ")) {
              this.handleSlashCommandCompletion();
          }
-@@ -1830,9 +2265,12 @@ export class Editor {
+@@ -1830,9 +2268,12 @@ export class Editor {
      requestAutocomplete(options) {
          if (!this.autocompleteProvider)
              return;
@@ -847,7 +854,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..29d2fa6ea0d5b0c4934f3ce150e331a3
              if (!shouldTrigger) {
                  return;
              }
-@@ -1882,14 +2320,20 @@ export class Editor {
+@@ -1882,14 +2323,20 @@ export class Editor {
          if (options.explicitTab || options.force) {
              return 0;
          }
@@ -871,7 +878,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..29d2fa6ea0d5b0c4934f3ce150e331a3
          if (!this.isAutocompleteRequestCurrent(requestId, controller, snapshotText, snapshotLine, snapshotCol)) {
              return;
          }
-@@ -1901,14 +2345,7 @@ export class Editor {
+@@ -1901,14 +2348,7 @@ export class Editor {
          }
          if (options.force && options.explicitTab && suggestions.items.length === 1) {
              const item = suggestions.items[0];
@@ -887,8 +894,20 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..29d2fa6ea0d5b0c4934f3ce150e331a3
              this.tui.requestRender();
              return;
          }
+diff --git a/dist/components/select-list.d.ts b/dist/components/select-list.d.ts
+index d507de4ebff8e7fbaacd089677099c63b4dfff6c..f8b6caee7b1651ca1d8f5ce70ee4c2098715ae49 100644
+--- a/dist/components/select-list.d.ts
++++ b/dist/components/select-list.d.ts
+@@ -22,6 +22,7 @@ export interface SelectListLayoutOptions {
+     minPrimaryColumnWidth?: number;
+     maxPrimaryColumnWidth?: number;
+     truncatePrimary?: (context: SelectListTruncatePrimaryContext) => string;
++    overrideSelectedStyles?: boolean;
+ }
+ export declare class SelectList implements Component {
+     private items;
 diff --git a/dist/components/select-list.js b/dist/components/select-list.js
-index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..443ce1d5c09d3ad4afd892509d3af448074cec13 100644
+index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..9d95baaf1e1456bb4ddd09dc00c343ba175403ed 100644
 --- a/dist/components/select-list.js
 +++ b/dist/components/select-list.js
 @@ -1,5 +1,5 @@
@@ -907,21 +926,23 @@ index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..443ce1d5c09d3ad4afd892509d3af448
          const prefixWidth = visibleWidth(prefix);
          if (descriptionSingleLine && width > 40) {
              const effectivePrimaryColumnWidth = Math.max(1, Math.min(primaryColumnWidth, width - prefixWidth - 4));
-@@ -101,7 +101,7 @@ export class SelectList {
+@@ -101,7 +101,8 @@ export class SelectList {
              if (remainingWidth > MIN_DESCRIPTION_WIDTH) {
                  const truncatedDesc = truncateToWidth(descriptionSingleLine, remainingWidth, "");
                  if (isSelected) {
 -                    return this.theme.selectedText(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`);
-+                    return this.theme.selectedText(stripTerminalSequences(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`));
++                    const selected = `${prefix}${truncatedValue}${spacing}${truncatedDesc}`;
++                    return this.theme.selectedText(this.layout.overrideSelectedStyles === true ? stripTerminalSequences(selected) : selected);
                  }
                  const descText = this.theme.description(spacing + truncatedDesc);
                  return prefix + truncatedValue + descText;
-@@ -110,7 +110,7 @@ export class SelectList {
+@@ -110,7 +111,8 @@ export class SelectList {
          const maxWidth = width - prefixWidth - 2;
          const truncatedValue = this.truncatePrimary(item, isSelected, maxWidth, maxWidth);
          if (isSelected) {
 -            return this.theme.selectedText(`${prefix}${truncatedValue}`);
-+            return this.theme.selectedText(stripTerminalSequences(`${prefix}${truncatedValue}`));
++            const selected = `${prefix}${truncatedValue}`;
++            return this.theme.selectedText(this.layout.overrideSelectedStyles === true ? stripTerminalSequences(selected) : selected);
          }
          return prefix + truncatedValue;
      }
