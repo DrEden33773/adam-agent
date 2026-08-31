@@ -63,6 +63,7 @@ import type {
   SessionRecord,
 } from "./session-store.js";
 import { isSkillContextRecordV1Valid } from "./skills.js";
+import { validateSessionUserContentV1 } from "./structured-user-content.js";
 import {
   createTodoMutationV1,
   emptyTodoStoreSnapshotV1,
@@ -2277,15 +2278,15 @@ function areLogicalInputResourcesValid(
 ): boolean {
   const resources = record.inputResources ?? [];
   if (resources.length === 0) {
-    return true;
+    return record.recordVersion !== 2;
   }
-  if (record.recordVersion !== 1) {
+  if (record.recordVersion !== 1 && record.recordVersion !== 2) {
     return false;
   }
   const combined = [...visible.values(), ...resources];
   const occurrenceIds = new Set(combined.map((resource) => resource.occurrenceId));
   const aggregateBytes = combined.reduce((sum, resource) => sum + resource.artifact.byteCount, 0);
-  return (
+  const resourcesAreValid =
     occurrenceIds.size === combined.length &&
     combined.length <= inputResourceLimitsV1.maximumOccurrencesPerLineage &&
     Number.isSafeInteger(aggregateBytes) &&
@@ -2304,8 +2305,23 @@ function areLogicalInputResourcesValid(
             resource.mediaHint === "image" &&
             (resource.artifact.mediaType === "image/jpeg" ||
               resource.artifact.mediaType === "image/png"))),
-    )
-  );
+    );
+  if (!resourcesAreValid) {
+    return false;
+  }
+  if (record.recordVersion !== 2) {
+    return true;
+  }
+  try {
+    validateSessionUserContentV1({
+      elements: record.userContent,
+      occurrences: resources,
+      userMessage: record.userMessage,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isMatchingStartedAttempt(

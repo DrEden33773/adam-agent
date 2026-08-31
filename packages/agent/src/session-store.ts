@@ -44,6 +44,11 @@ import {
 } from "./prompt-assembly.js";
 import { normalizedSessionTitle, sessionTitleFallback } from "./session-naming.js";
 import { type SkillContextRecordV1, skillContextRecordV1Schema } from "./skills.js";
+import {
+  type SessionUserContentElementV1,
+  sessionUserContentV1Schema,
+  validateSessionUserContentV1,
+} from "./structured-user-content.js";
 import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import { type TodoItemV1, todoItemV1Schema, todoPolicyVersionV1 } from "./todo.js";
 import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from "./tool-runtime.js";
@@ -274,31 +279,43 @@ export type SessionMcpCatalogStateChangedRecord = {
       };
 };
 
+type SessionLogicalRunStartedBase = {
+  readonly type: "logical_run_started";
+  readonly runId: string;
+  readonly userMessage: string;
+  readonly planKickoff?: PlanApprovalIntentV1;
+  readonly planRevision?: PlanRevisionIntentV1;
+  readonly naming?: {
+    readonly profileVersion: 1;
+    readonly fallbackTitle: string;
+  };
+  readonly skills?: readonly {
+    readonly selection: string;
+    readonly requestId: string;
+  }[];
+  readonly limits?: {
+    readonly maxTurns?: number;
+    readonly maxTokens?: number;
+  };
+  readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
+};
+
 export type SessionLogicalRunStartedRecord = {
   readonly schemaVersion: 3;
   readonly sequence: number;
-  readonly record: {
-    readonly type: "logical_run_started";
-    readonly recordVersion?: 1;
-    readonly runId: string;
-    readonly userMessage: string;
-    readonly planKickoff?: PlanApprovalIntentV1;
-    readonly planRevision?: PlanRevisionIntentV1;
-    readonly naming?: {
-      readonly profileVersion: 1;
-      readonly fallbackTitle: string;
-    };
-    readonly skills?: readonly {
-      readonly selection: string;
-      readonly requestId: string;
-    }[];
-    readonly limits?: {
-      readonly maxTurns?: number;
-      readonly maxTokens?: number;
-    };
-    readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
-    readonly inputResources?: readonly InputResourceOccurrenceV1[];
-  };
+  readonly record: SessionLogicalRunStartedBase &
+    (
+      | {
+          readonly recordVersion?: 1;
+          readonly inputResources?: readonly InputResourceOccurrenceV1[];
+          readonly userContent?: never;
+        }
+      | {
+          readonly recordVersion: 2;
+          readonly inputResources: readonly InputResourceOccurrenceV1[];
+          readonly userContent: readonly SessionUserContentElementV1[];
+        }
+    );
 };
 
 export type SessionManualNameSetRecord = {
@@ -1934,6 +1951,80 @@ const planGitAttestationV1Schema: z.ZodType<PlanGitAttestationV1> = z.strictObje
   gitPolicyDigest: sha256DigestSchema,
   digest: sha256DigestSchema,
 });
+const logicalRunStartedV2Schema = z
+  .strictObject({
+    type: z.literal("logical_run_started"),
+    recordVersion: z.literal(2),
+    runId: z.uuid(),
+    userMessage: z.string().max(512 * 1024),
+    planRevision: z
+      .strictObject({
+        cycleId: z.uuid(),
+        fromRevision: z.number().int().positive(),
+        toRevision: z.number().int().positive(),
+        planId: z.uuid(),
+        contentDigest: sha256DigestSchema,
+      })
+      .refine((intent) => intent.toRevision === intent.fromRevision + 1)
+      .optional(),
+    planKickoff: z
+      .strictObject({
+        sessionId: z.uuid(),
+        commandId: z.uuid(),
+        kickoffRunId: z.uuid(),
+        cycleId: z.uuid(),
+        revision: z.number().int().positive(),
+        planId: z.uuid(),
+        contentDigest: sha256DigestSchema,
+        policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+        toolProfileDigest: sha256DigestSchema,
+      })
+      .optional(),
+    naming: z
+      .strictObject({
+        profileVersion: z.literal(1),
+        fallbackTitle: z
+          .string()
+          .min(1)
+          .max(1_024)
+          .refine((value) => sessionTitleFallback(value) === value),
+      })
+      .optional(),
+    skills: z
+      .array(
+        z.strictObject({
+          selection: z
+            .string()
+            .min(1)
+            .max(16_384)
+            .refine((value) => /^[\x20-\x7e]+$/u.test(value)),
+          requestId: z.string().min(1).max(256),
+        }),
+      )
+      .max(8)
+      .optional(),
+    limits: sessionRunLimitsSchema.optional(),
+    thinkingPolicy: thinkingPolicySnapshotV1Schema.optional(),
+    inputResources: z
+      .array(inputResourceOccurrenceV1Schema)
+      .min(1)
+      .max(inputResourceLimitsV1.maximumOccurrencesPerRun),
+    userContent: sessionUserContentV1Schema,
+  })
+  .superRefine((record, context) => {
+    try {
+      validateSessionUserContentV1({
+        elements: record.userContent,
+        occurrences: record.inputResources,
+        userMessage: record.userMessage,
+      });
+    } catch {
+      context.addIssue({
+        code: "custom",
+        message: "Structured user content must exactly reference the durable input resources.",
+      });
+    }
+  });
 const sessionV3RecordSchema = z.union([
   sessionGenesisV1RecordSchema,
   sessionGenesisV2RecordSchema,
@@ -2162,6 +2253,7 @@ const sessionV3RecordSchema = z.union([
       .max(inputResourceLimitsV1.maximumOccurrencesPerRun)
       .optional(),
   }),
+  logicalRunStartedV2Schema,
   z
     .strictObject({
       type: z.literal("plan_cycle_entered"),

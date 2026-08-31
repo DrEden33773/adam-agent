@@ -517,9 +517,10 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       } catch (error) {
         presentationFailure = error;
       }
-      if (options.scenario === "mcp-close-unconfirmed") {
-        lifecycleCloseAttempted = true;
-        requireConfirmedLifecycleClose(await lifecycle.close());
+      lifecycleCloseAttempted = true;
+      requireConfirmedLifecycleClose(await lifecycle.close());
+      if (options.controlRoot !== undefined) {
+        await writeFile(join(options.controlRoot, "tui-runtime-closed"), "closed\n", "utf8");
       }
       if (presentationFailure !== undefined) {
         throw presentationFailure;

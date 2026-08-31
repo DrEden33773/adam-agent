@@ -127,6 +127,7 @@ export type ArtifactStagingStore = {
     readonly bytes: Uint8Array;
     readonly mediaType: string;
   }): Promise<StagedArtifactReference>;
+  retain(reference: StagedArtifactReference): Promise<void>;
   discard(reference: StagedArtifactReference): Promise<void>;
   close(): Promise<void>;
 };
@@ -166,6 +167,13 @@ export async function createFileArtifactStagingStore(options: {
       owned.delete(reference.stagingId);
       await unlinkTemporary(join(stagingRoot, reference.stagingId));
       await removeEmptyDirectory(stagingRoot);
+    },
+    async retain(reference) {
+      requireStagingId(reference.stagingId);
+      if (!owned.delete(reference.stagingId)) {
+        throw new Error("The provisional artifact is not owned by this staging store.");
+      }
+      await syncDirectory(stagingRoot);
     },
     async close() {
       const retained = [...owned];

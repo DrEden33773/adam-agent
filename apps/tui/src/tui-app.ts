@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { MessageChannel } from "node:worker_threads";
 
 import type {
   ActiveSessionDisplay,
@@ -18,6 +19,7 @@ import {
   type Component,
   Container,
   Editor,
+  type EditorDocumentPart,
   isKeyRelease,
   isKeyRepeat,
   Loader,
@@ -31,6 +33,7 @@ import {
   truncateToWidth,
   VStack,
 } from "@earendil-works/pi-tui";
+import PQueue from "p-queue";
 import {
   ArtifactNavigator,
   activeChronologyArtifacts,
@@ -250,6 +253,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const header = new Text();
   const transcriptViewport = new TranscriptViewport();
   const transcript = transcriptViewport.document;
+  const draftInputsSlot = new Container();
   const editorSlot = new Container();
   const createEditor = (active: ActiveSessionDisplay | null): Editor => {
     const created = new Editor(tui, theme.editor, { paddingX: 1 });
@@ -296,6 +300,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     return created;
   };
   let editor = createEditor(options.presentation.getState().authoritative.active);
+  const draftMutationQueue = new PQueue({ concurrency: 1 });
   let projectedPromptHistory = authoritativePromptHistory(
     options.presentation.getState().authoritative.active,
   );
@@ -536,6 +541,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     },
     {
       component: new VStack([
+        draftInputsSlot,
         editorSlot,
         {
           component: statusLine,
@@ -587,17 +593,108 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (previousEditor.onChange !== undefined) {
       replacement.onChange = previousEditor.onChange;
     }
+    if (previousEditor.onEditIntent !== undefined) {
+      replacement.onEditIntent = previousEditor.onEditIntent;
+    }
     if (previousEditor.onSubmit !== undefined) {
       replacement.onSubmit = previousEditor.onSubmit;
     }
     editorSlot.clear();
     editorSlot.addChild(replacement);
     editor = replacement;
+    structuredEditorActive = false;
+    projectedComposerKey = null;
     projectedPromptHistory = nextHistory;
     projectedHistorySessionId = nextSessionId;
     if (wasFocused) {
       tui.setFocus(editor);
     }
+  };
+
+  let structuredEditorActive = false;
+  let localStructuredDocument: readonly EditorDocumentPart[] | null = null;
+  let projectedComposerKey: string | null = null;
+  let projectedComposerScope: string | null = null;
+  const synchronizeStructuredComposer = (
+    composer: ReturnType<PresentationSession["getState"]>["composer"],
+    scope: string | null,
+  ): void => {
+    const scopeChanged = scope !== projectedComposerScope;
+    projectedComposerScope = scope;
+    const composerKey = `${scope ?? ""}\0${composer.draftRevision}\0${composer.resources
+      .map((resource) => `${resource.id}:${resource.state}:${resource.kind}`)
+      .join("|")}`;
+    if (!scopeChanged && composerKey === projectedComposerKey) {
+      return;
+    }
+    projectedComposerKey = composerKey;
+    if (
+      composer.resources.some(
+        (resource) => resource.state === "queued" || resource.state === "copying",
+      )
+    ) {
+      return;
+    }
+    if (!composer.elements.some((element) => element.type === "resource")) {
+      if (structuredEditorActive && composer.elements.length > 0) {
+        editor.setDocument(
+          composer.elements.map((element) => ({
+            type: "text" as const,
+            id: element.elementId,
+            text: element.type === "text" ? element.text : "",
+          })),
+        );
+      } else if (structuredEditorActive) {
+        editor.setText(composer.renderedText);
+        structuredEditorActive = false;
+        localStructuredDocument = null;
+      } else if (scopeChanged && composer.elements.length > 0) {
+        editor.setText(composer.renderedText);
+      }
+      return;
+    }
+    const parts: readonly EditorDocumentPart[] = composer.elements.map((element) =>
+      element.type === "text"
+        ? { type: "text", id: element.elementId, text: element.text }
+        : {
+            type: "atom",
+            id: element.elementId,
+            label: `[${element.kind === "image" ? "Image" : "File"} #${element.ordinal}]`,
+          },
+    );
+    editor.setDocument(parts);
+    structuredEditorActive = true;
+    localStructuredDocument = parts;
+  };
+
+  const synchronizeDraftInputs = (
+    composer: ReturnType<PresentationSession["getState"]>["composer"],
+  ): void => {
+    draftInputsSlot.clear();
+    if (composer.resources.length === 0) {
+      return;
+    }
+    const resources = new Box(1, 1, theme.toolBackground);
+    resources.addChild(new ResponsiveLine(theme.toolTitle("Draft inputs")));
+    for (const resource of composer.resources) {
+      const size = resource.byteCount === null ? "size pending" : `${resource.byteCount} bytes`;
+      const media = resource.mediaHint === null ? "media pending" : resource.mediaHint;
+      const support = resource.support === null ? "support pending" : resource.support;
+      resources.addChild(
+        new ResponsiveLine(
+          theme.toolOutput(
+            safeTerminalText(
+              `${resource.token} · Selected file · ${resource.state} · ${resource.displayName} · ${size} · ${media} · ${support}`,
+            ),
+          ),
+        ),
+      );
+      if (resource.diagnostic !== null) {
+        resources.addChild(new ResponsiveLine(theme.muted(safeTerminalText(resource.diagnostic))));
+      }
+    }
+    resources.addChild(new ResponsiveLine(theme.muted("/detach <index> · /cancelattach <index>")));
+    draftInputsSlot.addChild(resources);
   };
 
   const clearExitWindow = () => {
@@ -974,6 +1071,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       clearNotice();
     }
     synchronizePromptHistory(active);
+    synchronizeStructuredComposer(
+      state.composer,
+      active?.session.id ?? state.draft?.targetId ?? null,
+    );
+    synchronizeDraftInputs(state.composer);
     const activeSessionChanged = active?.session.id !== previousActiveSessionId;
     if (activeSessionChanged) {
       transcriptViewport.followEnd();
@@ -1748,33 +1850,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         transcriptViewport.focus(operationAnchorId(operation.operationId), terminal.columns);
       }
     }
-    if (state.composer.resources.length > 0) {
-      transcript.addChild(new Spacer(1));
-      const resources = new Box(1, 1, theme.toolBackground);
-      resources.addChild(new ResponsiveLine(theme.toolTitle("Linked input resources")));
-      for (const [index, resource] of state.composer.resources.entries()) {
-        const size = resource.byteCount === null ? "size pending" : `${resource.byteCount} bytes`;
-        const support = resource.support === null ? "support pending" : resource.support;
-        resources.addChild(
-          new ResponsiveLine(
-            theme.toolOutput(
-              safeTerminalText(
-                `${index + 1} · ${resource.state} · ${resource.displayName} · ${size} · ${support}`,
-              ),
-            ),
-          ),
-        );
-        if (resource.diagnostic !== null) {
-          resources.addChild(
-            new ResponsiveLine(theme.muted(safeTerminalText(resource.diagnostic))),
-          );
-        }
-      }
-      resources.addChild(
-        new ResponsiveLine(theme.muted("/detach <index> · /cancelattach <index>")),
-      );
-      transcript.addChild(resources);
-    }
     const transientReasoning = state.transient?.reasoning;
     if (
       transientReasoning !== null &&
@@ -2000,6 +2075,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     } else {
       statusLine.setText("");
     }
+    if (permission === undefined && focusedCloseableOverlay() === undefined) {
+      tui.setFocus(editor);
+    }
     tui.requestRender();
   };
   const handleThinkingCommand = (argumentsText: string): void => {
@@ -2082,11 +2160,41 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     clearNotice();
     tui.requestRender();
   };
+  const persistEditorText = (text: string): void => {
+    if (options.presentation.getState().composer.sealed) {
+      return;
+    }
+    void draftMutationQueue
+      .add(() => options.presentation.dispatch({ type: "update_draft_text", text }))
+      .then((receipt) => {
+        if (receipt?.status === "rejected" && receipt.code !== "conflict") {
+          showNotice("error", receipt.message, "until_edit");
+          renderState();
+        }
+      })
+      .catch(() => {
+        showNotice("error", "The recoverable draft text could not be saved.", "until_edit");
+        renderState();
+      });
+  };
+  let emptyDraftChangeGeneration = 0;
   editor.onChange = () => {
-    void options.presentation.dispatch({
-      type: "update_draft_text",
-      text: editor.getExpandedText(),
-    });
+    const text = editor.getExpandedText();
+    emptyDraftChangeGeneration += 1;
+    if (text.length === 0) {
+      const generation = emptyDraftChangeGeneration;
+      queueMicrotask(() => {
+        if (
+          generation === emptyDraftChangeGeneration &&
+          !structuredEditorActive &&
+          editor.getExpandedText().length === 0
+        ) {
+          persistEditorText("");
+        }
+      });
+    } else if (!text.startsWith("/")) {
+      persistEditorText(text);
+    }
     if (statusNotice?.lifetime === "until_edit" || statusNotice?.lifetime === "until_next_action") {
       clearNotice();
       renderState();
@@ -2134,6 +2242,94 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       });
       pathPicker = { close, hide: () => handle?.hide() };
     }
+  };
+  editor.onEditIntent = (intent) => {
+    if (intent.type === "remove_atom") {
+      void draftMutationQueue
+        .add(() => {
+          const composer = options.presentation.getState().composer;
+          return options.presentation.dispatch({
+            type: "remove_draft_element",
+            baseRevision: composer.draftRevision,
+            elementId: intent.atomId,
+          });
+        })
+        .then((receipt) => {
+          if (receipt?.status === "admitted") {
+            showNotice("success", "Input resource removed.", "until_next_action");
+          } else {
+            showNotice(
+              "error",
+              receipt?.message ?? "The input resource could not be removed.",
+              "until_edit",
+            );
+          }
+          renderState();
+        })
+        .catch(() => {
+          showNotice("error", "The input resource could not be removed.", "until_edit");
+          renderState();
+        });
+      return;
+    }
+    if (intent.type === "undo") {
+      void draftMutationQueue
+        .add(() => {
+          const composer = options.presentation.getState().composer;
+          return options.presentation.dispatch({
+            type: "undo_draft",
+            baseRevision: composer.draftRevision,
+          });
+        })
+        .then((receipt) => {
+          if (receipt?.status === "admitted") {
+            showNotice("success", "Draft edit undone.", "until_next_action");
+          } else {
+            showNotice(
+              "error",
+              receipt?.message ?? "The draft edit could not be undone.",
+              "until_edit",
+            );
+          }
+          renderState();
+        })
+        .catch(() => {
+          showNotice("error", "The draft edit could not be undone.", "until_edit");
+          renderState();
+        });
+      return;
+    }
+    localStructuredDocument = intent.document;
+    const localLiteralText = intent.document
+      .flatMap((part) => (part.type === "text" ? [part.text] : []))
+      .join("");
+    if (localLiteralText.startsWith("/")) {
+      renderState();
+      return;
+    }
+    void draftMutationQueue
+      .add(() => {
+        const composer = options.presentation.getState().composer;
+        return options.presentation.dispatch({
+          type: "replace_draft_text",
+          baseRevision: composer.draftRevision,
+          document: intent.document.map((part) =>
+            part.type === "text"
+              ? { type: "text", text: part.text }
+              : { type: "resource", elementId: part.id },
+          ),
+        });
+      })
+      .then((receipt) => {
+        if (receipt?.status === "rejected") {
+          showNotice("error", receipt.message, "until_edit");
+        }
+        renderState();
+      })
+      .catch(() => {
+        showNotice("error", "The recoverable draft edit could not be saved.", "until_edit");
+        renderState();
+      });
   };
   const showChronologyPicker = (mode: "fork" | "read_only"): void => {
     const state = options.presentation.getState();
@@ -2921,10 +3117,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     editor.setText("");
     editor.disableSubmit = false;
     const actionId = showNotice("progress", "Staging input resource…", "until_replaced", sessionId);
-    void options.presentation
-      .dispatch({ type: "stage_input_resource", path })
+    void draftMutationQueue
+      .add(() => options.presentation.dispatch({ type: "update_draft_text", text: "" }))
+      .then((cleared) =>
+        cleared?.status === "rejected"
+          ? cleared
+          : options.presentation.dispatch({ type: "stage_input_resource", path }),
+      )
       .then((receipt) => {
-        if (receipt.status === "admitted") {
+        if (receipt?.status === "admitted") {
           settleNotice(
             actionId,
             "success",
@@ -2933,7 +3134,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             sessionId,
           );
         } else {
-          settleNotice(actionId, "error", receipt.message, "until_edit", sessionId);
+          settleNotice(
+            actionId,
+            "error",
+            receipt?.message ?? "The selected input resource could not be staged.",
+            "until_edit",
+            sessionId,
+          );
         }
       })
       .catch(() => {
@@ -3032,7 +3239,22 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     return false;
   };
-  editor.onSubmit = (text) => {
+  const requestSessionPickerAfterDraftFlush = (): void => {
+    editor.setText("");
+    editor.disableSubmit = false;
+    void draftMutationQueue
+      .onIdle()
+      .then(() => {
+        sessionPickerDismissed = false;
+        sessionPickerRequested = true;
+        renderState();
+      })
+      .catch(() => {
+        showNotice("error", "The current draft could not be saved before resume.", "until_edit");
+        renderState();
+      });
+  };
+  const submitEditorValue = (text: string) => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
     if (text.trim().length === 0) {
@@ -3101,11 +3323,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         parsedDraft.command.id === "resume" &&
         parsedDraft.argumentsText.length === 0
       ) {
-        editor.setText("");
-        editor.disableSubmit = false;
-        sessionPickerDismissed = false;
-        sessionPickerRequested = true;
-        renderState();
+        requestSessionPickerAfterDraftFlush();
         return;
       }
       if (
@@ -3759,11 +3977,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       parsedCommand.command.id === "resume" &&
       parsedCommand.argumentsText.length === 0
     ) {
-      editor.setText("");
-      editor.disableSubmit = false;
-      sessionPickerDismissed = false;
-      sessionPickerRequested = true;
-      renderState();
+      requestSessionPickerAfterDraftFlush();
       return;
     }
     if (
@@ -4275,6 +4489,41 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         tui.requestRender();
       });
   };
+  editor.onSubmit = (visibleText) => {
+    emptyDraftChangeGeneration += 1;
+    if (!structuredEditorActive && visibleText.startsWith("/")) {
+      submitEditorValue(visibleText);
+      return;
+    }
+    if (structuredEditorActive) {
+      const localLiteralText = (localStructuredDocument ?? [])
+        .flatMap((part) => (part.type === "text" ? [part.text] : []))
+        .join("");
+      if (localLiteralText.startsWith("/")) {
+        submitEditorValue(localLiteralText);
+        return;
+      }
+    }
+    editor.disableSubmit = true;
+    void draftMutationQueue
+      .onIdle()
+      .then(() => {
+        if (structuredEditorActive) {
+          const composer = options.presentation.getState().composer;
+          const literalText = composer.elements
+            .flatMap((element) => (element.type === "text" ? [element.text] : []))
+            .join("");
+          submitEditorValue(literalText);
+        } else {
+          submitEditorValue(visibleText);
+        }
+      })
+      .catch(() => {
+        editor.disableSubmit = false;
+        showNotice("error", "The recoverable draft could not be sealed.", "until_edit");
+        renderState();
+      });
+  };
   requestPolicyRender = renderState;
   renderState();
   const unsubscribe = options.presentation.subscribe(renderState);
@@ -4297,7 +4546,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         failures.push(error);
       }
     };
-    attempt(removeTerminationListeners);
     attempt(clearExitWindow);
     attempt(unsubscribe);
     for (const overlay of closeableOverlaysInPrecedence()) {
@@ -4311,6 +4559,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     operationLoaders.clear();
     attempt(() => tui.stop({ preserveScreen: true }));
+    try {
+      const visibleDraft = editor.getExpandedText();
+      if (
+        draftMutationQueue.pending > 0 ||
+        draftMutationQueue.size > 0 ||
+        structuredEditorActive ||
+        (visibleDraft.length > 0 && !visibleDraft.startsWith("/"))
+      ) {
+        await draftMutationQueue.onIdle();
+      }
+    } catch (error) {
+      failures.push(error);
+    }
     try {
       if (copyDraft) {
         const clipboardResult = await copyDraftToClipboard(
@@ -4337,6 +4598,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     } catch (error) {
       failures.push(error);
     }
+    attempt(removeTerminationListeners);
     if (failures.length === 0) {
       exited.resolve();
     } else if (failures.length === 1) {
@@ -4349,8 +4611,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     void stop(true);
   };
   const handleTerminationSignal = (signal: "SIGHUP" | "SIGTERM") => {
-    process.exitCode = signal === "SIGHUP" ? 129 : 143;
-    void stop(false);
+    if (stopping) {
+      return;
+    }
+    const exitCode = signal === "SIGHUP" ? 129 : 143;
+    // Promises do not retain the Node process while the queued draft mutation starts.
+    const closeLease = new MessageChannel();
+    closeLease.port1.ref();
+    closeLease.port2.ref();
+    void stop(false).finally(() => {
+      process.exitCode = exitCode;
+      closeLease.port1.close();
+      closeLease.port2.close();
+    });
   };
   function handleSighup(): void {
     handleTerminationSignal("SIGHUP");

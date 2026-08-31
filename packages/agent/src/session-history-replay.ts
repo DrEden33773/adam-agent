@@ -5,7 +5,12 @@ import {
   createInputResourceUserMessageV1,
 } from "./input-resources.js";
 import { SessionLifecycleError } from "./session-lifecycle-error.js";
-import type { SessionModelResponseField, SessionRecord } from "./session-store.js";
+import type {
+  SessionLogicalRunStartedRecord,
+  SessionModelResponseField,
+  SessionRecord,
+} from "./session-store.js";
+import { createSessionUserContentMessageV1 } from "./structured-user-content.js";
 
 export function modelMessagesFromCompleteRecords(
   records: readonly SessionRecord[],
@@ -49,9 +54,7 @@ export function modelMessagesFromCanonicalRecords(
   const messages: ModelMessage[] = [];
   for (const record of currentRecords) {
     if (record.record.type === "logical_run_started") {
-      messages.push(
-        createInputResourceUserMessageV1(record.record.userMessage, record.record.inputResources),
-      );
+      messages.push(createLogicalRunUserMessageV1(record.record));
       continue;
     }
     if (record.record.type !== "model_response_completed") {
@@ -95,6 +98,18 @@ export function modelMessagesFromCanonicalRecords(
     }
   }
   return messages;
+}
+
+export function createLogicalRunUserMessageV1(
+  record: SessionLogicalRunStartedRecord["record"],
+): ModelMessage {
+  return record.recordVersion === 2
+    ? createSessionUserContentMessageV1({
+        elements: record.userContent,
+        occurrences: record.inputResources,
+        userMessage: record.userMessage,
+      })
+    : createInputResourceUserMessageV1(record.userMessage, record.inputResources);
 }
 
 export function inlineModelResponseField(field: string | SessionModelResponseField): string {

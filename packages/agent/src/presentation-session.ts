@@ -53,6 +53,11 @@ import {
 } from "./presentation-transcript-projection.js";
 import { listProjectPaths } from "./project-path-catalog.js";
 import {
+  createRecoverableTurnDraftRepository,
+  type RecoverableTurnDraftRepository,
+  type TurnDraftScopeV1,
+} from "./recoverable-turn-draft.js";
+import {
   type SessionNamingHistoryState,
   sessionNamingStateFromRecords,
 } from "./session-history-folds.js";
@@ -109,6 +114,7 @@ export type PresentationSessionRecordReader = (
 ) => Promise<readonly SessionRecord[]>;
 
 type PresentationSessionBaseOptions = {
+  readonly draftPersistencePolicy?: "process_only" | "recoverable";
   readonly lifecycle: SessionLifecycle;
   readonly modelTargets?: ModelTargets;
   readonly operations?: OperationHost;
@@ -535,6 +541,9 @@ export async function createPresentationSession(
             },
       composer: {
         attachmentAvailable,
+        draftRevision: 0,
+        elements: [],
+        renderedText: "",
         unavailableReason: attachmentUnavailableReason,
         sealed: false,
         revisionIntent: planRevisionIntent,
@@ -603,6 +612,9 @@ export async function createPresentationSession(
       const snapshot = turnComposer?.snapshot() ?? { sealed: false, resources: [] };
       return {
         attachmentAvailable,
+        draftRevision: snapshot.revision,
+        elements: snapshot.elements,
+        renderedText: snapshot.renderedText,
         unavailableReason: attachmentUnavailableReason,
         sealed: snapshot.sealed,
         revisionIntent: planRevisionIntent,
@@ -628,6 +640,65 @@ export async function createPresentationSession(
           : { stageBarrier: options[turnComposerStageBarrier] }),
       }),
     });
+    const recoverableDrafts: RecoverableTurnDraftRepository | null =
+      options.draftPersistencePolicy === "process_only"
+        ? null
+        : await createRecoverableTurnDraftRepository({
+            projectId: state.authoritative.project.id,
+            stateRoot: effectiveSessionStateRoot(options.stateRoot),
+          });
+    const currentDraftScope = (): TurnDraftScopeV1 | null => {
+      const active = state.authoritative.active;
+      if (active !== null) {
+        return { type: "session", sessionId: active.session.id };
+      }
+      return state.draft === null ? null : { type: "new_session" };
+    };
+    const persistCurrentTurnDraft = async (): Promise<void> => {
+      const scope = currentDraftScope();
+      if (recoverableDrafts === null || scope === null) {
+        return;
+      }
+      const snapshot = turnComposer.snapshot();
+      if (snapshot.elements.length === 0) {
+        await recoverableDrafts.delete(scope);
+        return;
+      }
+      await recoverableDrafts.save(
+        await turnComposer.captureDraft(
+          scope.type === "new_session"
+            ? { type: "new_session", targetId: state.draft?.targetId ?? "" }
+            : scope,
+        ),
+      );
+    };
+    const persistSettledCurrentTurnDraft = async (): Promise<void> => {
+      if (
+        turnComposer
+          .snapshot()
+          .resources.every((resource) => resource.state === "ready" || resource.state === "failed")
+      ) {
+        await persistCurrentTurnDraft();
+      }
+    };
+    const loadTurnDraft = async (scope: TurnDraftScopeV1, targetId?: string) => {
+      const recovered = await recoverableDrafts?.load(scope);
+      if (
+        recovered === undefined ||
+        recovered === null ||
+        (recovered.scope.type === "new_session" && recovered.scope.targetId !== targetId)
+      ) {
+        return null;
+      }
+      return recovered;
+    };
+    const initialDraftScope = currentDraftScope();
+    if (initialDraftScope !== null) {
+      const recovered = await loadTurnDraft(initialDraftScope, state.draft?.targetId);
+      if (recovered !== null) {
+        await turnComposer.restoreDraft(recovered);
+      }
+    }
     const operationAdmissions = new Set<Promise<void>>();
     const operationRefreshes = new Set<Promise<void>>();
     const operationObservers = new Map<string, AbortController>();
@@ -2127,7 +2198,9 @@ export async function createPresentationSession(
         operationRepairs.clear();
         operationCursors.clear();
         activeSessionThroughSequence = 0;
-        await turnComposer.clear();
+        await persistSettledCurrentTurnDraft();
+        const recovered = await loadTurnDraft({ type: "new_session" }, targetIdentity.targetId);
+        await turnComposer.clear({ preserveRetained: true });
         attachmentAvailable = true;
         attachmentUnavailableReason = null;
         state = {
@@ -2150,6 +2223,9 @@ export async function createPresentationSession(
           transient: null,
         };
         draftTargetIdentity = targetIdentity;
+        if (recovered !== null) {
+          await turnComposer.restoreDraft(recovered);
+        }
         publishStateChange();
         return { status: "admitted", commandId: randomUUID(), resource: null };
       }
@@ -2182,8 +2258,16 @@ export async function createPresentationSession(
             }
             snapshot = resumed.snapshot;
           }
-          await turnComposer.clear();
+          await persistSettledCurrentTurnDraft();
+          const recovered = await loadTurnDraft({
+            type: "session",
+            sessionId: command.sessionId,
+          });
+          await turnComposer.clear({ preserveRetained: true });
           await activateSnapshot(snapshot);
+          if (recovered !== null) {
+            await turnComposer.restoreDraft(recovered);
+          }
           return { status: "admitted", commandId: randomUUID(), resource: null };
         } catch {
           return {
@@ -2209,13 +2293,120 @@ export async function createPresentationSession(
           };
         }
         try {
-          await turnComposer.stage(command.path);
+          await turnComposer.stage(command.path, command.mutation, persistCurrentTurnDraft);
           return { status: "admitted", commandId: randomUUID(), resource: null };
         } catch {
           return {
             status: "rejected",
             code: "not_available",
             message: "The selected input resource could not be staged.",
+          };
+        }
+      }
+      if (command.type === "replace_draft_text") {
+        if (activeRun !== undefined || state.composer.sealed) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "The current turn cannot change while it is sealed.",
+          };
+        }
+        try {
+          return (await turnComposer.replaceText(command, persistCurrentTurnDraft))
+            ? { status: "admitted", commandId: randomUUID(), resource: null }
+            : {
+                status: "rejected",
+                code: "stale_interaction",
+                message: "The structured draft no longer matches the current composer revision.",
+              };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The recoverable structured draft could not be saved.",
+          };
+        }
+      }
+      if (command.type === "remove_draft_element") {
+        if (activeRun !== undefined || state.composer.sealed) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "The current turn cannot change while it is sealed.",
+          };
+        }
+        const snapshot = turnComposer.snapshot();
+        const element = snapshot.elements.find(
+          (candidate) => candidate.elementId === command.elementId,
+        );
+        if (command.baseRevision !== snapshot.revision || element?.type !== "resource") {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The draft element is no longer present in the current composer.",
+          };
+        }
+        try {
+          return (await turnComposer.remove(element.resourceId, persistCurrentTurnDraft))
+            ? { status: "admitted", commandId: randomUUID(), resource: null }
+            : {
+                status: "rejected",
+                code: "stale_interaction",
+                message: "The draft element is no longer present in the current composer.",
+              };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The recoverable turn draft could not be saved.",
+          };
+        }
+      }
+      if (command.type === "undo_draft") {
+        if (activeRun !== undefined || state.composer.sealed) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "The current turn cannot be undone while it is sealed.",
+          };
+        }
+        try {
+          return (await turnComposer.undo(command.baseRevision, persistCurrentTurnDraft))
+            ? { status: "admitted", commandId: randomUUID(), resource: null }
+            : {
+                status: "rejected",
+                code: "stale_interaction",
+                message: "The draft undo no longer targets the current composer revision.",
+              };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The restored turn draft could not be saved.",
+          };
+        }
+      }
+      if (command.type === "clear_draft") {
+        if (activeRun !== undefined || state.composer.sealed) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "The current turn cannot be cleared while it is sealed.",
+          };
+        }
+        try {
+          return (await turnComposer.reset(command.baseRevision, persistCurrentTurnDraft))
+            ? { status: "admitted", commandId: randomUUID(), resource: null }
+            : {
+                status: "rejected",
+                code: "stale_interaction",
+                message: "The draft clear no longer targets the current settled composer revision.",
+              };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The cleared turn draft could not be saved.",
           };
         }
       }
@@ -2227,8 +2418,16 @@ export async function createPresentationSession(
             message: "The current turn text cannot change while the turn is sealed.",
           };
         }
-        turnComposer.setText(command.text);
-        return { status: "admitted", commandId: randomUUID(), resource: null };
+        try {
+          await turnComposer.commitText(command.text, persistCurrentTurnDraft);
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The recoverable turn draft could not be saved.",
+          };
+        }
       }
       if (command.type === "remove_input_resource") {
         if (activeRun !== undefined || state.composer.sealed) {
@@ -2238,13 +2437,21 @@ export async function createPresentationSession(
             message: "An input resource cannot be removed while the current turn is sealed.",
           };
         }
-        return (await turnComposer.remove(command.resourceId))
-          ? { status: "admitted", commandId: randomUUID(), resource: null }
-          : {
-              status: "rejected",
-              code: "stale_interaction",
-              message: "The input resource is no longer present in the current composer.",
-            };
+        try {
+          return (await turnComposer.remove(command.resourceId, persistCurrentTurnDraft))
+            ? { status: "admitted", commandId: randomUUID(), resource: null }
+            : {
+                status: "rejected",
+                code: "stale_interaction",
+                message: "The input resource is no longer present in the current composer.",
+              };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The recoverable turn draft could not be saved.",
+          };
+        }
       }
       if (command.type === "cancel_input_resource") {
         if (activeRun !== undefined || state.composer.sealed) {
@@ -2313,6 +2520,7 @@ export async function createPresentationSession(
         if (skillResolution.status === "ambiguous") {
           return ambiguousSkillMentionRejection(skillResolution);
         }
+        const submittedScope = currentDraftScope();
         const controller = new AbortController();
         const commandId = randomUUID();
         const runState = {
@@ -2331,6 +2539,7 @@ export async function createPresentationSession(
         try {
           turnComposer.setText(command.text);
           sealedDraft = await turnComposer.seal(controller.signal);
+          await persistCurrentTurnDraft();
         } catch (error) {
           if (activeRun === runState) {
             activeRun = undefined;
@@ -2376,6 +2585,9 @@ export async function createPresentationSession(
           ...(sealedDraft.selections.length === 0
             ? {}
             : { resourceSelections: sealedDraft.selections }),
+          ...(sealedDraft.selections.length === 0
+            ? {}
+            : { structuredContent: sealedDraft.structuredContent }),
           ...(command.thinkingSelection === null
             ? {}
             : { thinkingSelection: command.thinkingSelection }),
@@ -2438,6 +2650,9 @@ export async function createPresentationSession(
           );
         }
         planRevisionIntent = null;
+        if (recoverableDrafts !== null && submittedScope !== null) {
+          await recoverableDrafts.delete(submittedScope);
+        }
         await turnComposer.clear();
         return { status: "admitted", commandId, resource: null };
       }
@@ -2473,6 +2688,7 @@ export async function createPresentationSession(
         if (skillResolution.status === "ambiguous") {
           return ambiguousSkillMentionRejection(skillResolution);
         }
+        const submittedScope = currentDraftScope();
         const controller = new AbortController();
         const commandId = randomUUID();
         const runState = {
@@ -2491,6 +2707,7 @@ export async function createPresentationSession(
         try {
           turnComposer.setText(command.text);
           sealedDraft = await turnComposer.seal(controller.signal);
+          await persistCurrentTurnDraft();
         } catch (error) {
           if (activeRun === runState) {
             activeRun = undefined;
@@ -2521,6 +2738,9 @@ export async function createPresentationSession(
           ...(sealedDraft.selections.length === 0
             ? {}
             : { resourceSelections: sealedDraft.selections }),
+          ...(sealedDraft.selections.length === 0
+            ? {}
+            : { structuredContent: sealedDraft.structuredContent }),
           ...(command.thinkingSelection === null
             ? {}
             : { thinkingSelection: command.thinkingSelection }),
@@ -2596,6 +2816,9 @@ export async function createPresentationSession(
             message: "The admitted draft session could not be read from durable history.",
           };
         }
+        if (recoverableDrafts !== null && submittedScope !== null) {
+          await recoverableDrafts.delete(submittedScope);
+        }
         await turnComposer.clear();
         await activateSnapshot(admittedSnapshot);
         return { status: "admitted", commandId, resource: null };
@@ -2623,6 +2846,7 @@ export async function createPresentationSession(
           };
         }
         try {
+          await persistSettledCurrentTurnDraft();
           const snapshot = await options.lifecycle.branch({
             parentSessionId: command.parentSessionId,
             ...(command.sourceBoundary === undefined
@@ -2630,7 +2854,7 @@ export async function createPresentationSession(
               : { sourceBoundary: command.sourceBoundary }),
             ...(command.targetId === null ? {} : { targetId: command.targetId }),
           });
-          await turnComposer.clear();
+          await turnComposer.clear({ preserveRetained: true });
           await activateSnapshot(snapshot);
           return { status: "admitted", commandId: randomUUID(), resource: null };
         } catch {
@@ -3561,6 +3785,7 @@ export async function createPresentationSession(
         if (closed) {
           return;
         }
+        await persistSettledCurrentTurnDraft();
         closed = true;
         activeRun?.controller.abort();
         const connectionSettlements = [...activeConnectionTests.values()].flatMap((active) =>

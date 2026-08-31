@@ -65,6 +65,9 @@ const emptySnapshot: AuthoritativePresentationSnapshot = {
 
 const emptyComposer = {
   attachmentAvailable: false,
+  draftRevision: 0,
+  elements: [],
+  renderedText: "",
   unavailableReason: "New session required for attachments",
   sealed: false,
   revisionIntent: null,

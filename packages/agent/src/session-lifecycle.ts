@@ -31,7 +31,6 @@ import {
   withInternalExtensionSkillSourcesCurrent,
 } from "./extension-host.js";
 import {
-  createInputResourceUserMessageV1,
   InputResourceError,
   type InputResourceOccurrenceV1,
   type InputResourceSelectionV1,
@@ -140,6 +139,7 @@ import {
   snapshotFromRecords,
 } from "./session-history-folds.js";
 import {
+  createLogicalRunUserMessageV1,
   inlineModelResponseField,
   modelMessagesFromCompleteRecords,
 } from "./session-history-replay.js";
@@ -180,6 +180,10 @@ import {
   type SkillResourceManifestV1,
   skillContextSnapshot,
 } from "./skills.js";
+import {
+  materializeSessionUserContentV1,
+  type StagedUserContentElementV1,
+} from "./structured-user-content.js";
 import {
   resolveThinkingPolicy,
   ThinkingPolicyError,
@@ -533,6 +537,7 @@ export type SessionCommand =
       readonly signal?: AbortSignal;
       readonly thinkingSelection?: ThinkingPolicySelectionV1;
       readonly resourceSelections?: readonly InputResourceSelectionV1[];
+      readonly structuredContent?: readonly StagedUserContentElementV1[];
       readonly planRevision?: {
         readonly cycleId: string;
         readonly revision: number;
@@ -570,6 +575,7 @@ export interface SessionLifecycle {
     readonly signal?: AbortSignal;
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
     readonly resourceSelections?: readonly InputResourceSelectionV1[];
+    readonly structuredContent?: readonly StagedUserContentElementV1[];
     readonly onAdmitted?: (receipt: SessionAdmissionReceipt) => void;
   }): Promise<SessionContinueResult>;
   branch(input: SessionBranchInput): Promise<CurrentSessionSnapshot>;
@@ -582,6 +588,7 @@ export interface SessionLifecycle {
     readonly signal?: AbortSignal;
     readonly thinkingSelection?: ThinkingPolicySelectionV1;
     readonly resourceSelections?: readonly InputResourceSelectionV1[];
+    readonly structuredContent?: readonly StagedUserContentElementV1[];
     readonly planRevision?: {
       readonly cycleId: string;
       readonly revision: number;
@@ -2069,6 +2076,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ...(input.resourceSelections === undefined
             ? {}
             : { resourceSelections: input.resourceSelections }),
+          ...(input.structuredContent === undefined
+            ? {}
+            : { structuredContent: input.structuredContent }),
           ...(input.thinkingSelection === undefined
             ? {}
             : { thinkingSelection: input.thinkingSelection }),
@@ -2548,8 +2558,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             input.runId !== undefined ||
             input.planRevision !== undefined ||
             input.resourceSelections !== undefined ||
+            input.structuredContent !== undefined ||
             input.thinkingSelection !== undefined)) ||
         (input.resourceSelections !== undefined && input.input === undefined) ||
+        (input.structuredContent !== undefined &&
+          (input.input === undefined || input.resourceSelections === undefined)) ||
         input.input?.inputResources !== undefined
       ) {
         throw new SessionLifecycleError("session_invalid");
@@ -3085,7 +3098,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         const runInput =
           effectiveInput === undefined || inputResources.length === 0
             ? effectiveInput
-            : { ...effectiveInput, inputResources };
+            : {
+                ...effectiveInput,
+                inputResources,
+                ...(input.structuredContent === undefined
+                  ? {}
+                  : {
+                      userContent: materializeSessionUserContentV1({
+                        elements: input.structuredContent,
+                        occurrences: inputResources,
+                        userMessage: effectiveInput.text,
+                      }),
+                    }),
+              };
         const runtimeInputResources = [...visibleInputResources, ...inputResources];
         if (runtimeInputResources.length > inputResourceLimitsV1.maximumOccurrencesPerLineage) {
           throw new InputResourceError(
@@ -6011,9 +6036,7 @@ function createAgentResumeState(
           : record.sequence < run.sequence,
       ),
     ),
-    ...(checkpointIncludesCurrentRun
-      ? []
-      : [createInputResourceUserMessageV1(run.record.userMessage, run.record.inputResources)]),
+    ...(checkpointIncludesCurrentRun ? [] : [createLogicalRunUserMessageV1(run.record)]),
   ];
   const toolResults: Array<
     NonNullable<AgentSessionDurableContext["resume"]>["toolResults"][number]

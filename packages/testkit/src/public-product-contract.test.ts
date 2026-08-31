@@ -1145,13 +1145,18 @@ test("PresentationSession transcript projection has one package-internal owner",
 
   expect.soft(actualOwners).toEqual(expectedOwners);
   expect.soft(projectionConsumers).toEqual(["presentation-session.ts"]);
-  expect.soft(projectionRuntimeImports).toEqual([]);
   expect
     .soft(projectionTypeImports)
     .toEqual(["./agent-session-contracts.js", "./session-store.js", "@adam-agent/presentation"]);
+  expect.soft(projectionRuntimeImports).toEqual(["./structured-user-content.js"]);
   expect
     .soft(projectionDependencies)
-    .toEqual(["./agent-session-contracts.js", "./session-store.js", "@adam-agent/presentation"]);
+    .toEqual([
+      "./agent-session-contracts.js",
+      "./session-store.js",
+      "./structured-user-content.js",
+      "@adam-agent/presentation",
+    ]);
   const packageInternalSymbols = Object.keys(expectedOwners);
   for (const facadeSource of [publicFacadeSource, testingFacadeSource]) {
     expect

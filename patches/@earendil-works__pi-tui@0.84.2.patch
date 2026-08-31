@@ -1,3 +1,518 @@
+diff --git a/dist/components/editor.d.ts b/dist/components/editor.d.ts
+index a6fedc9e3b36d066e34860d040db6df47d88c432..fc00b23987ad376bcd60096ceff0e6d329404cd1 100644
+--- a/dist/components/editor.d.ts
++++ b/dist/components/editor.d.ts
+@@ -30,6 +30,37 @@ export interface EditorOptions {
+     paddingX?: number;
+     autocompleteMaxVisible?: number;
+ }
++export type EditorDocumentPart = {
++    readonly type: "text";
++    readonly id: string;
++    readonly text: string;
++} | {
++    readonly type: "atom";
++    readonly id: string;
++    readonly label: string;
++};
++export type EditorDocumentPoint = {
++    readonly partId: string;
++    readonly offset: number;
++} | {
++    readonly partId: string;
++    readonly edge: "before" | "after";
++};
++export type EditorEditIntent = {
++    readonly type: "replace";
++    readonly range: {
++        readonly anchor: EditorDocumentPoint;
++        readonly focus: EditorDocumentPoint;
++    };
++    readonly text: string;
++    readonly document: readonly EditorDocumentPart[];
++} | {
++    readonly type: "remove_atom";
++    readonly atomId: string;
++    readonly direction: "backward" | "forward";
++} | {
++    readonly type: "undo";
++};
+ export declare class Editor implements Component, Focusable {
+     private state;
+     /** Focusable interface - set by TUI when focus changes */
+@@ -68,6 +99,7 @@ export declare class Editor implements Component, Focusable {
+     private undoStack;
+     onSubmit?: (text: string) => void;
+     onChange?: (text: string) => void;
++    onEditIntent?: (intent: EditorEditIntent) => void;
+     disableSubmit: boolean;
+     constructor(tui: TUI, theme: EditorTheme, options?: EditorOptions);
+     /** Set of currently valid paste IDs, for marker-aware segmentation. */
+@@ -107,6 +139,8 @@ export declare class Editor implements Component, Focusable {
+         line: number;
+         col: number;
+     };
++    getDocumentCursor(): EditorDocumentPoint;
++    setDocument(parts: readonly EditorDocumentPart[], cursor?: EditorDocumentPoint): void;
+     setText(text: string): void;
+     /**
+      * Insert text at the current cursor position.
+diff --git a/dist/components/editor.js b/dist/components/editor.js
+index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f5f21f7b6 100644
+--- a/dist/components/editor.js
++++ b/dist/components/editor.js
+@@ -246,6 +246,11 @@ export class Editor {
+     undoStack = new UndoStack();
+     onSubmit;
+     onChange;
++    onEditIntent;
++    structuredDocument = null;
++    structuredAtoms = [];
++    structuredCursorPoint = null;
++    structuredPartCounter = 0;
+     disableSubmit = false;
+     constructor(tui, theme, options = {}) {
+         this.tui = tui;
+@@ -527,6 +532,26 @@ export class Editor {
+             this.undo();
+             return;
+         }
++        if (this.structuredDocument !== null &&
++            (kb.matches(data, "tui.input.tab") ||
++                kb.matches(data, "tui.editor.deleteToLineEnd") ||
++                kb.matches(data, "tui.editor.deleteToLineStart") ||
++                kb.matches(data, "tui.editor.deleteWordBackward") ||
++                kb.matches(data, "tui.editor.deleteWordForward") ||
++                kb.matches(data, "tui.editor.yank") ||
++                kb.matches(data, "tui.editor.yankPop") ||
++                kb.matches(data, "tui.editor.historyPrevious") ||
++                kb.matches(data, "tui.editor.historyNext") ||
++                kb.matches(data, "tui.editor.cursorWordLeft") ||
++                kb.matches(data, "tui.editor.cursorWordRight") ||
++                kb.matches(data, "tui.editor.cursorUp") ||
++                kb.matches(data, "tui.editor.cursorDown") ||
++                kb.matches(data, "tui.editor.pageUp") ||
++                kb.matches(data, "tui.editor.pageDown") ||
++                kb.matches(data, "tui.editor.jumpForward") ||
++                kb.matches(data, "tui.editor.jumpBackward"))) {
++            return;
++        }
+         // Handle autocomplete mode
+         if (this.autocompleteState && this.autocompleteList) {
+             if (kb.matches(data, "tui.select.cancel")) {
+@@ -847,6 +872,256 @@ export class Editor {
+     getCursor() {
+         return { line: this.state.cursorLine, col: this.state.cursorCol };
+     }
++    cursorOffset() {
++        let offset = 0;
++        for (let line = 0; line < this.state.cursorLine; line++) {
++            offset += (this.state.lines[line] || "").length + 1;
++        }
++        return offset + this.state.cursorCol;
++    }
++    setCursorFromOffset(offset) {
++        let remaining = offset;
++        for (let line = 0; line < this.state.lines.length; line++) {
++            const lineLength = (this.state.lines[line] || "").length;
++            if (remaining <= lineLength || line === this.state.lines.length - 1) {
++                this.state.cursorLine = line;
++                this.setCursorCol(Math.max(0, Math.min(remaining, lineLength)));
++                return;
++            }
++            remaining -= lineLength + 1;
++        }
++    }
++    resolveDocumentPoint(point) {
++        let offset = 0;
++        for (const part of this.structuredDocument || []) {
++            const content = part.type === "text" ? part.text : part.label;
++            if (part.id === point.partId) {
++                if (part.type === "text" && "offset" in point &&
++                    Number.isSafeInteger(point.offset) && point.offset >= 0 && point.offset <= content.length) {
++                    return offset + point.offset;
++                }
++                if (part.type === "atom" && "edge" in point) {
++                    return offset + (point.edge === "after" ? content.length : 0);
++                }
++                throw new RangeError("Editor document point does not match its part");
++            }
++            offset += content.length;
++        }
++        throw new RangeError("Editor document point names an unknown part");
++    }
++    documentPointAtOffset(targetOffset) {
++        let offset = 0;
++        for (const part of this.structuredDocument || []) {
++            const content = part.type === "text" ? part.text : part.label;
++            const end = offset + content.length;
++            if (part.type === "atom" && targetOffset === offset) {
++                return { partId: part.id, edge: "before" };
++            }
++            if (part.type === "atom" && targetOffset === end) {
++                return { partId: part.id, edge: "after" };
++            }
++            if (part.type === "text" && targetOffset >= offset && targetOffset <= end) {
++                return { partId: part.id, offset: targetOffset - offset };
++            }
++            offset = end;
++        }
++        throw new RangeError("Editor cursor is outside the structured document");
++    }
++    documentTextPointAtOffset(targetOffset) {
++        let offset = 0;
++        for (const part of this.structuredDocument || []) {
++            const content = part.type === "text" ? part.text : part.label;
++            const end = offset + content.length;
++            if (part.type === "text" && targetOffset >= offset && targetOffset <= end) {
++                return { partId: part.id, offset: targetOffset - offset };
++            }
++            offset = end;
++        }
++        throw new RangeError("Editor text point is outside the structured document");
++    }
++    getDocumentCursor() {
++        if (this.structuredDocument === null) {
++            throw new Error("Editor does not have a structured document");
++        }
++        if (this.structuredCursorPoint !== null &&
++            this.resolveDocumentPoint(this.structuredCursorPoint) === this.cursorOffset()) {
++            return { ...this.structuredCursorPoint };
++        }
++        return this.documentPointAtOffset(this.cursorOffset());
++    }
++    nextStructuredTextId() {
++        const existing = new Set((this.structuredDocument || []).map((part) => part.id));
++        let id;
++        do {
++            id = `pi-editor-text-${++this.structuredPartCounter}`;
++        } while (existing.has(id));
++        return id;
++    }
++    normalizeStructuredParts(parts) {
++        const normalized = [];
++        for (const part of parts) {
++            if (part.type === "text" && part.text.length === 0)
++                continue;
++            const previous = normalized.at(-1);
++            if (part.type === "text" && previous?.type === "text") {
++                normalized[normalized.length - 1] = { ...previous, text: previous.text + part.text };
++            }
++            else {
++                normalized.push({ ...part });
++            }
++        }
++        return normalized;
++    }
++    applyStructuredReplace(range, text) {
++        if (this.structuredDocument === null)
++            throw new Error("Editor does not have a structured document");
++        const parts = this.structuredDocument.map((part) => ({ ...part }));
++        let cursor;
++        if ("offset" in range.anchor && "offset" in range.focus && range.anchor.partId === range.focus.partId) {
++            const index = parts.findIndex((part) => part.id === range.anchor.partId);
++            const part = parts[index];
++            if (part?.type !== "text")
++                throw new RangeError("Editor text replacement names an unavailable text part");
++            const start = Math.min(range.anchor.offset, range.focus.offset);
++            const end = Math.max(range.anchor.offset, range.focus.offset);
++            if (start < 0 || end > part.text.length)
++                throw new RangeError("Editor text replacement is outside its text part");
++            parts[index] = { ...part, text: part.text.slice(0, start) + text + part.text.slice(end) };
++            cursor = { partId: part.id, offset: start + text.length };
++        }
++        else if ("edge" in range.anchor && "edge" in range.focus && range.anchor.partId === range.focus.partId && range.anchor.edge === range.focus.edge) {
++            const atomIndex = parts.findIndex((part) => part.id === range.anchor.partId);
++            if (parts[atomIndex]?.type !== "atom")
++                throw new RangeError("Editor insertion edge names an unavailable atom");
++            const insertIndex = range.anchor.edge === "before" ? atomIndex : atomIndex + 1;
++            const textPart = { type: "text", id: this.nextStructuredTextId(), text };
++            parts.splice(insertIndex, 0, textPart);
++            cursor = { partId: textPart.id, offset: text.length };
++            this.structuredDocument = parts;
++            this.setDocument(this.structuredDocument, cursor);
++            return { cursor, document: this.structuredDocument.map((part) => ({ ...part })) };
++        }
++        else {
++            throw new RangeError("Editor structured replacement must stay within one text part or atom edge");
++        }
++        let normalized = this.normalizeStructuredParts(parts);
++        if (!normalized.some((candidate) => candidate.id === cursor.partId)) {
++            const originalIndex = parts.findIndex((candidate) => candidate.id === cursor.partId);
++            const previous = normalized[originalIndex - 1];
++            const next = normalized[originalIndex];
++            if (previous?.type === "text")
++                cursor = { partId: previous.id, offset: previous.text.length };
++            else if (previous?.type === "atom")
++                cursor = { partId: previous.id, edge: "after" };
++            else if (next?.type === "text")
++                cursor = { partId: next.id, offset: 0 };
++            else if (next?.type === "atom")
++                cursor = { partId: next.id, edge: "before" };
++            else {
++                const empty = { type: "text", id: cursor.partId, text: "" };
++                normalized = [empty];
++                cursor = { partId: empty.id, offset: 0 };
++            }
++        }
++        this.structuredDocument = normalized;
++        this.setDocument(this.structuredDocument, cursor);
++        return { cursor, document: this.structuredDocument.map((part) => ({ ...part })) };
++    }
++    emitInsertionIntent(text) {
++        const point = this.getDocumentCursor();
++        const range = { anchor: point, focus: point };
++        const replacement = this.applyStructuredReplace(range, text);
++        this.onEditIntent?.({
++            type: "replace",
++            range,
++            text,
++            document: replacement.document,
++        });
++    }
++    emitAtomRemovalIntent(atomId, direction) {
++        if (this.structuredDocument === null)
++            throw new Error("Editor does not have a structured document");
++        const parts = this.structuredDocument.map((part) => ({ ...part }));
++        const atomIndex = parts.findIndex((part) => part.type === "atom" && part.id === atomId);
++        if (atomIndex < 0)
++            throw new RangeError("Editor atom removal names an unavailable atom");
++        parts.splice(atomIndex, 1);
++        let previous = parts[atomIndex - 1];
++        let next = parts[atomIndex];
++        if (parts.length === 0) {
++            const empty = { type: "text", id: this.nextStructuredTextId(), text: "" };
++            parts.push(empty);
++            previous = undefined;
++            next = empty;
++        }
++        const cursor = previous?.type === "text"
++            ? { partId: previous.id, offset: previous.text.length }
++            : previous?.type === "atom"
++                ? { partId: previous.id, edge: "after" }
++                : next?.type === "text"
++                    ? { partId: next.id, offset: 0 }
++                    : { partId: next.id, edge: "before" };
++        this.setDocument(parts, cursor);
++        this.onEditIntent?.({ type: "remove_atom", atomId, direction });
++    }
++    emitAdjacentReplaceIntent(direction) {
++        const cursor = this.cursorOffset();
++        const segments = [...graphemeSegmenter.segment(this.getText())];
++        const segment = direction === "backward"
++            ? segments.findLast((candidate) => candidate.index + candidate.segment.length === cursor)
++            : segments.find((candidate) => candidate.index === cursor);
++        if (segment === undefined)
++            return;
++        const range = {
++            anchor: this.documentTextPointAtOffset(segment.index),
++            focus: this.documentTextPointAtOffset(segment.index + segment.segment.length),
++        };
++        const replacement = this.applyStructuredReplace(range, "");
++        this.onEditIntent?.({
++            type: "replace",
++            range,
++            text: "",
++            document: replacement.document,
++        });
++    }
++    setDocument(parts, cursor) {
++        if (parts.length === 0) {
++            throw new TypeError("Editor structured documents require at least one identified part");
++        }
++        const ids = new Set();
++        const atoms = [];
++        let visibleText = "";
++        for (const part of parts) {
++            if (typeof part.id !== "string" || part.id.length === 0 || ids.has(part.id)) {
++                throw new TypeError("Editor document part IDs must be unique non-empty strings");
++            }
++            ids.add(part.id);
++            if (part.type === "text") {
++                visibleText += part.text;
++                continue;
++            }
++            if (part.type !== "atom" || part.label.length === 0 || /[\r\n]/.test(part.label)) {
++                throw new TypeError("Editor atoms require one non-empty visible line");
++            }
++            const start = visibleText.length;
++            visibleText += part.label;
++            atoms.push({ id: part.id, start, end: visibleText.length });
++        }
++        this.cancelAutocomplete();
++        this.lastAction = null;
++        this.exitHistoryBrowsing();
++        this.pastes.clear();
++        this.pasteCounter = 0;
++        this.structuredDocument = parts.map((part) => ({ ...part }));
++        this.structuredAtoms = atoms;
++        this.state.lines = visibleText.split("\n");
++        if (this.state.lines.length === 0)
++            this.state.lines = [""];
++        const cursorOffset = cursor === undefined ? visibleText.length : this.resolveDocumentPoint(cursor);
++        this.setCursorFromOffset(cursorOffset);
++        this.structuredCursorPoint = cursor === undefined ? this.documentPointAtOffset(cursorOffset) : { ...cursor };
++        this.scrollOffset = 0;
++    }
+     setText(text) {
+         this.cancelAutocomplete();
+         this.lastAction = null;
+@@ -858,6 +1133,9 @@ export class Editor {
+         }
+         this.pastes.clear();
+         this.pasteCounter = 0;
++        this.structuredDocument = null;
++        this.structuredAtoms = [];
++        this.structuredCursorPoint = null;
+         this.setTextInternal(normalized);
+     }
+     /**
+@@ -868,6 +1146,10 @@ export class Editor {
+     insertTextAtCursor(text) {
+         if (!text)
+             return;
++        if (this.structuredDocument !== null) {
++            this.emitInsertionIntent(this.normalizeText(text));
++            return;
++        }
+         this.cancelAutocomplete();
+         this.pushUndoSnapshot();
+         this.lastAction = null;
+@@ -890,6 +1172,10 @@ export class Editor {
+     insertTextAtCursorInternal(text) {
+         if (!text)
+             return;
++        if (this.structuredDocument !== null) {
++            this.emitInsertionIntent(this.normalizeText(text));
++            return;
++        }
+         // Normalize line endings and tabs
+         const normalized = this.normalizeText(text);
+         const insertedLines = normalized.split("\n");
+@@ -925,6 +1211,10 @@ export class Editor {
+     // All the editor methods from before...
+     insertCharacter(char, skipUndoCoalescing) {
+         this.exitHistoryBrowsing();
++        if (this.structuredDocument !== null) {
++            this.emitInsertionIntent(char);
++            return;
++        }
+         // Undo coalescing (fish-style):
+         // - Consecutive word chars coalesce into one undo unit
+         // - Space captures state before itself (so undo removes space+following word together)
+@@ -1011,6 +1301,10 @@ export class Editor {
+                 filteredText = ` ${filteredText}`;
+             }
+         }
++        if (this.structuredDocument !== null) {
++            this.emitInsertionIntent(filteredText);
++            return;
++        }
+         // Split into lines to check for large paste
+         const pastedLines = filteredText.split("\n");
+         // Check if this is a large paste (> 10 lines or > 1000 characters)
+@@ -1036,6 +1330,10 @@ export class Editor {
+         this.insertTextAtCursorInternal(filteredText);
+     }
+     addNewLine() {
++        if (this.structuredDocument !== null) {
++            this.emitInsertionIntent("\n");
++            return;
++        }
+         this.cancelAutocomplete();
+         this.exitHistoryBrowsing();
+         this.lastAction = null;
+@@ -1068,6 +1366,11 @@ export class Editor {
+     submitValue() {
+         this.cancelAutocomplete();
+         const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
++        if (this.structuredDocument !== null) {
++            if (this.onSubmit)
++                this.onSubmit(result);
++            return;
++        }
+         this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
+         this.pastes.clear();
+         this.pasteCounter = 0;
+@@ -1083,6 +1386,16 @@ export class Editor {
+     handleBackspace() {
+         this.exitHistoryBrowsing();
+         this.lastAction = null;
++        if (this.structuredDocument !== null) {
++            const atom = this.structuredAtoms.find((candidate) => candidate.end === this.cursorOffset());
++            if (atom !== undefined) {
++                this.emitAtomRemovalIntent(atom.id, "backward");
++            }
++            else {
++                this.emitAdjacentReplaceIntent("backward");
++            }
++            return;
++        }
+         if (this.state.cursorCol > 0) {
+             this.pushUndoSnapshot();
+             // Delete grapheme before cursor (handles emojis, combining characters, etc.)
+@@ -1157,6 +1470,7 @@ export class Editor {
+      */
+     setCursorCol(col) {
+         this.state.cursorCol = col;
++        this.structuredCursorPoint = null;
+         this.preferredVisualCol = null;
+         this.snappedFromCursorCol = null;
+     }
+@@ -1410,6 +1724,16 @@ export class Editor {
+     handleForwardDelete() {
+         this.exitHistoryBrowsing();
+         this.lastAction = null;
++        if (this.structuredDocument !== null) {
++            const atom = this.structuredAtoms.find((candidate) => candidate.start === this.cursorOffset());
++            if (atom !== undefined) {
++                this.emitAtomRemovalIntent(atom.id, "forward");
++            }
++            else {
++                this.emitAdjacentReplaceIntent("forward");
++            }
++            return;
++        }
+         const currentLine = this.state.lines[this.state.cursorLine] || "";
+         if (this.state.cursorCol < currentLine.length) {
+             this.pushUndoSnapshot();
+@@ -1520,6 +1844,12 @@ export class Editor {
+         if (deltaCol !== 0) {
+             const currentLine = this.state.lines[this.state.cursorLine] || "";
+             if (deltaCol > 0) {
++                const atom = this.structuredAtoms.find((candidate) => candidate.start === this.cursorOffset());
++                if (atom !== undefined) {
++                    this.setCursorFromOffset(atom.end);
++                    this.structuredCursorPoint = { partId: atom.id, edge: "after" };
++                    return;
++                }
+                 // Moving right - move by one grapheme (handles emojis, combining characters, etc.)
+                 if (this.state.cursorCol < currentLine.length) {
+                     const afterCursor = currentLine.slice(this.state.cursorCol);
+@@ -1541,6 +1871,12 @@ export class Editor {
+                 }
+             }
+             else {
++                const atom = this.structuredAtoms.find((candidate) => candidate.end === this.cursorOffset());
++                if (atom !== undefined) {
++                    this.setCursorFromOffset(atom.start);
++                    this.structuredCursorPoint = { partId: atom.id, edge: "before" };
++                    return;
++                }
+                 // Moving left - move by one grapheme (handles emojis, combining characters, etc.)
+                 if (this.state.cursorCol > 0) {
+                     const beforeCursor = currentLine.slice(0, this.state.cursorCol);
+@@ -1704,6 +2040,10 @@ export class Editor {
+     }
+     undo() {
+         this.exitHistoryBrowsing();
++        if (this.structuredDocument !== null) {
++            this.onEditIntent?.({ type: "undo" });
++            return;
++        }
+         const snapshot = this.undoStack.pop();
+         if (!snapshot)
+             return;
 diff --git a/dist/components/select-list.js b/dist/components/select-list.js
 index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..0b8964d09635714a7e5872c653883e064f59df14 100644
 --- a/dist/components/select-list.js
@@ -11,8 +526,48 @@ index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..0b8964d09635714a7e5872c653883e06
          const prefixWidth = visibleWidth(prefix);
          if (descriptionSingleLine && width > 40) {
              const effectivePrimaryColumnWidth = Math.max(1, Math.min(primaryColumnWidth, width - prefixWidth - 4));
+diff --git a/dist/editor-component.d.ts b/dist/editor-component.d.ts
+index b598c4d291ace5f04b83161252b3ab8cdd4ccbdf..4e776071dab430ab4dc18c589fd15d22c8858586 100644
+--- a/dist/editor-component.d.ts
++++ b/dist/editor-component.d.ts
+@@ -1,4 +1,5 @@
+ import type { AutocompleteProvider } from "./autocomplete.ts";
++import type { EditorDocumentPart, EditorDocumentPoint, EditorEditIntent } from "./components/editor.ts";
+ import type { Component } from "./tui.ts";
+ /**
+  * Interface for custom editor components.
+@@ -18,10 +19,16 @@ export interface EditorComponent extends Component {
+     onSubmit?: (text: string) => void;
+     /** Called when text changes */
+     onChange?: (text: string) => void;
++    /** Called instead of mutating a host-authoritative structured document. */
++    onEditIntent?: (intent: EditorEditIntent) => void;
+     /** Add text to history for up/down navigation */
+     addToHistory?(text: string): void;
+     /** Insert text at current cursor position */
+     insertTextAtCursor?(text: string): void;
++    /** Reconcile a host-authoritative structured document and optional cursor receipt. */
++    setDocument?(parts: readonly EditorDocumentPart[], cursor?: EditorDocumentPoint): void;
++    /** Return the exact structured cursor point, including shared atom/text edges. */
++    getDocumentCursor?(): EditorDocumentPoint;
+     /**
+      * Get text with any markers expanded (e.g., paste markers).
+      * Falls back to getText() if not implemented.
+diff --git a/dist/index.d.ts b/dist/index.d.ts
+index 50b5aeb61f12011642978bc2c31d8a2eb36d17d3..86a7fd77af0a5b812f0cb12cd62508b17b1d06d8 100644
+--- a/dist/index.d.ts
++++ b/dist/index.d.ts
+@@ -2,7 +2,7 @@ export { Marked, type Token, type Tokens } from "marked";
+ export { type AutocompleteItem, type AutocompleteProvider, type AutocompleteSuggestions, CombinedAutocompleteProvider, type SlashCommand, } from "./autocomplete.ts";
+ export { Box } from "./components/box.ts";
+ export { CancellableLoader } from "./components/cancellable-loader.ts";
+-export { Editor, type EditorOptions, type EditorTheme } from "./components/editor.ts";
++export { Editor, type EditorDocumentPart, type EditorDocumentPoint, type EditorEditIntent, type EditorOptions, type EditorTheme } from "./components/editor.ts";
+ export { HStack } from "./components/h-stack.ts";
+ export { Image, type ImageOptions, type ImageTheme } from "./components/image.ts";
+ export { Input } from "./components/input.ts";
 diff --git a/dist/tui-alt-screen.d.ts b/dist/tui-alt-screen.d.ts
-index 848119411c1ff2885b8d1efe97f2f297bd4cd470..9acf1cd67d25554e9e4986f5ac738f2dac1b10ea 100644
+index 848119411c1ff2885b8d1efe97f2f297bd4cd470..c49053c1e2060b5e2ebb11210debde0beb79f127 100644
 --- a/dist/tui-alt-screen.d.ts
 +++ b/dist/tui-alt-screen.d.ts
 @@ -5,6 +5,8 @@ export interface TuiAltScreenOptions {
@@ -33,7 +588,7 @@ index 848119411c1ff2885b8d1efe97f2f297bd4cd470..9acf1cd67d25554e9e4986f5ac738f2d
      private readonly searchCurrentMatchStyle;
      private readonly openUrl?;
 diff --git a/dist/tui-alt-screen.js b/dist/tui-alt-screen.js
-index 4edcf845ba7866782a8ec7219508a2dce0073a91..3aecee4ed79adc5a0586fb6d8a95364e31966f09 100644
+index 4edcf845ba7866782a8ec7219508a2dce0073a91..dfa6559c1ceb9f944cc9095bed75c86823ba67bd 100644
 --- a/dist/tui-alt-screen.js
 +++ b/dist/tui-alt-screen.js
 @@ -59,6 +59,7 @@ export class TuiAltScreen extends TuiBase {

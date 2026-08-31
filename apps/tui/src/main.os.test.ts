@@ -56,8 +56,9 @@ test("the real TUI process restores the terminal after staging one input resourc
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
+    const beforeAttach = fixture.output().length;
     fixture.write(`/attach ${selectedPath}\r`);
-    await fixture.waitFor("ready · process-notes.txt · 23 bytes");
+    await fixture.waitForCompleteFrameAfter("Input resource staged.", beforeAttach);
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -377,14 +378,14 @@ test.each([
       await fixture.terminate(signal);
       const result = await fixture.closed;
       expect(result).toMatchObject({ code, signal: null, stderr: "" });
-      await expect(readFile(join(controlRoot, "tui-fixture-closed"), "utf8")).resolves.toBe(
-        "closed\n",
-      );
       expect(result.stdout).toContain("\u001b[?2004l");
       expect(result.stdout).toContain("\u001b[?25h");
       const afterExit = outputAfterFinalAltScreenExit(result.stdout);
       expect(afterExit).toBe("\u001b[?25h\u001b[?2026l");
       expect(afterExit).not.toContain(privateDraftSentinel);
+      await expect(readFile(join(controlRoot, "tui-runtime-closed"), "utf8")).resolves.toBe(
+        "closed\n",
+      );
     } finally {
       await rm(testRoot, { recursive: true, force: true });
     }
