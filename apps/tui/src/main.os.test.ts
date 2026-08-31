@@ -242,6 +242,10 @@ test("tmux delivers Alt+V to the production Adam decoder and restores the termin
   const sourcePath = join(testRoot, "source.txt");
   const outputPath = join(testRoot, "tmux-output.bin");
   const detectorPath = join(testRoot, "tmux-output-detector.mjs");
+  const startPath = join(testRoot, "tmux-start.fifo");
+  const readyPath = join(testRoot, "tmux-ready.txt");
+  const pastedPath = join(testRoot, "tmux-pasted.txt");
+  const restoredPath = join(testRoot, "tmux-restored.txt");
   const socketPath = join(testRoot, "tmux.sock");
   await mkdir(workspaceRoot);
   await writeFile(sourcePath, "tmux clipboard text", "utf8");
@@ -253,22 +257,21 @@ test("tmux delivers Alt+V to the production Adam decoder and restores the termin
   );
   await writeFile(
     detectorPath,
-    `import { appendFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
-const [outputPath, socketPath] = process.argv.slice(2);
+    `import { appendFileSync, writeFileSync } from "node:fs";
+const [outputPath, readyPath, pastedPath, restoredPath] = process.argv.slice(2);
 const signalled = new Set();
 let observed = "";
-const signal = (channel) => {
-  if (signalled.has(channel)) return;
-  signalled.add(channel);
-  spawnSync("/usr/bin/tmux", ["-S", socketPath, "wait-for", "-S", channel]);
+const signal = (name, path) => {
+  if (signalled.has(name)) return;
+  signalled.add(name);
+  writeFileSync(path, name + "\\n", "utf8");
 };
 process.stdin.on("data", (chunk) => {
   appendFileSync(outputPath, chunk);
   observed += chunk.toString("utf8");
-  if (observed.includes("Adam · New session")) signal("adam-ready");
-  if (observed.includes("Clipboard text pasted.")) signal("adam-pasted");
-  if (observed.includes("\\u001b[?2004l")) signal("adam-restored");
+  if (observed.includes("Adam · New session")) signal("ready", readyPath);
+  if (observed.includes("Clipboard text pasted.")) signal("pasted", pastedPath);
+  if (observed.includes("\\u001b[?2004l")) signal("restored", restoredPath);
 });
 `,
     "utf8",
@@ -284,7 +287,7 @@ process.stdin.on("data", (chunk) => {
     XDG_CONFIG_HOME: configRoot,
   };
   const applicationCommand = [
-    `/usr/bin/tmux -S ${JSON.stringify(socketPath)} wait-for adam-start`,
+    `read adam_start < ${JSON.stringify(startPath)}`,
     `exec ${[
       process.execPath,
       productionPath,
@@ -296,13 +299,21 @@ process.stdin.on("data", (chunk) => {
       .map((value) => JSON.stringify(value))
       .join(" ")}`,
   ].join(" && ");
-  const detectorCommand = [process.execPath, detectorPath, outputPath, socketPath]
+  const detectorCommand = [
+    process.execPath,
+    detectorPath,
+    outputPath,
+    readyPath,
+    pastedPath,
+    restoredPath,
+  ]
     .map((value) => JSON.stringify(value))
     .join(" ");
   const tmuxFixture = { program: applicationCommand };
 
   try {
     await trustWorkspace(configRoot, workspaceRoot);
+    await execFile("/usr/bin/mkfifo", [startPath]);
     await execFile(
       "/usr/bin/tmux",
       ["-S", socketPath, "-f", "/dev/null", "new-session", "-d", tmuxFixture.program],
@@ -319,14 +330,14 @@ process.stdin.on("data", (chunk) => {
       "pane-exited",
       "wait-for -S adam-closed",
     ]);
-    const ready = execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-ready"]);
-    await execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "-S", "adam-start"]);
+    const ready = waitForFileContents(readyPath, "ready\n");
+    await writeFile(startPath, "start\n", "utf8");
     await ready;
-    const pasted = execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-pasted"]);
+    const pasted = waitForFileContents(pastedPath, "pasted\n");
     await execFile("/usr/bin/tmux", ["-S", socketPath, "send-keys", "-l", "\u001bv"]);
     await pasted;
     expect(await readFile(outputPath, "utf8")).toContain("tmux clipboard text");
-    const restored = execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-restored"]);
+    const restored = waitForFileContents(restoredPath, "restored\n");
     const closed = execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-closed"]);
     await execFile("/usr/bin/tmux", ["-S", socketPath, "send-keys", "C-q"]);
     await Promise.all([restored, closed]);
