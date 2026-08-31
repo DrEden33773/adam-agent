@@ -1,7 +1,8 @@
 import {
   type ArtifactChunk,
   type ArtifactReference,
-  type PresentationSession,
+  type CommandReceipt,
+  type PresentationCommand,
   presentationArtifactPageMaximumBytes,
 } from "@adam-agent/presentation";
 
@@ -106,17 +107,23 @@ export function largeReasoningPageAnchorId(reasoningId: string, offset: number):
 }
 
 export class LargeReasoningViewStore {
-  readonly #cache = new ByteLru(largeReasoningViewPolicy.cacheBytes);
+  readonly #cache: ByteLru;
   readonly #onChange: (focusAnchorId?: string) => void;
-  readonly #presentation: PresentationSession;
+  readonly #readArtifact: (
+    command: Extract<PresentationCommand, { readonly type: "read_artifact" }>,
+  ) => Promise<CommandReceipt>;
   readonly #states = new Map<string, LargeReasoningState>();
 
   constructor(options: {
+    readonly cacheBytes?: number;
     readonly onChange: (focusAnchorId?: string) => void;
-    readonly presentation: PresentationSession;
+    readonly readArtifact: (
+      command: Extract<PresentationCommand, { readonly type: "read_artifact" }>,
+    ) => Promise<CommandReceipt>;
   }) {
+    this.#cache = new ByteLru(options.cacheBytes ?? largeReasoningViewPolicy.cacheBytes);
     this.#onChange = options.onChange;
-    this.#presentation = options.presentation;
+    this.#readArtifact = options.readArtifact;
   }
 
   clear(): void {
@@ -338,61 +345,59 @@ export class LargeReasoningViewStore {
     const request = { offset, token: navigationToken };
     state.pending.set(direction, request);
     const generation = state.generation;
-    void this.#presentation
-      .dispatch({
-        type: "read_artifact",
-        artifact: state.artifact,
-        range: { offset, maximumBytes: largeReasoningViewPolicy.pageBytes },
-      })
-      .then(
-        (receipt) => {
-          const active = this.#states.get(state.id);
-          if (
-            active !== state ||
-            active.generation !== generation ||
-            active.pending.get(direction) !== request
-          ) {
-            return;
-          }
-          state.pending.delete(direction);
-          if (receipt.status === "rejected" || receipt.resource === null) {
-            state.failures.add(direction);
-            this.#onChange();
-            return;
-          }
-          const page = validateArtifactPage(state, receipt.resource, offset);
-          if (page === null) {
-            state.failures.add(direction);
-            this.#onChange();
-            return;
-          }
-          this.#cache.set(page);
-          if (page.nextOffset !== null) {
-            state.previousOffsets.set(page.nextOffset, page.offset);
-          }
-          if (state.navigationToken === request.token) {
-            state.currentOffset = page.offset;
-          }
-          this.#onChange(
-            direction === "initial" || state.currentOffset !== page.offset
-              ? undefined
-              : largeReasoningPageAnchorId(state.id, page.offset),
-          );
-        },
-        () => {
-          const active = this.#states.get(state.id);
-          if (
-            active !== state ||
-            active.generation !== generation ||
-            active.pending.get(direction) !== request
-          ) {
-            return;
-          }
-          state.pending.delete(direction);
+    void this.#readArtifact({
+      type: "read_artifact",
+      artifact: state.artifact,
+      range: { offset, maximumBytes: largeReasoningViewPolicy.pageBytes },
+    }).then(
+      (receipt) => {
+        const active = this.#states.get(state.id);
+        if (
+          active !== state ||
+          active.generation !== generation ||
+          active.pending.get(direction) !== request
+        ) {
+          return;
+        }
+        state.pending.delete(direction);
+        if (receipt.status === "rejected" || receipt.resource === null) {
           state.failures.add(direction);
           this.#onChange();
-        },
-      );
+          return;
+        }
+        const page = validateArtifactPage(state, receipt.resource, offset);
+        if (page === null) {
+          state.failures.add(direction);
+          this.#onChange();
+          return;
+        }
+        this.#cache.set(page);
+        if (page.nextOffset !== null) {
+          state.previousOffsets.set(page.nextOffset, page.offset);
+        }
+        if (state.navigationToken === request.token) {
+          state.currentOffset = page.offset;
+        }
+        this.#onChange(
+          direction === "initial" || state.currentOffset !== page.offset
+            ? undefined
+            : largeReasoningPageAnchorId(state.id, page.offset),
+        );
+      },
+      () => {
+        const active = this.#states.get(state.id);
+        if (
+          active !== state ||
+          active.generation !== generation ||
+          active.pending.get(direction) !== request
+        ) {
+          return;
+        }
+        state.pending.delete(direction);
+        state.failures.add(direction);
+        this.#onChange();
+      },
+    );
   }
 }
 
