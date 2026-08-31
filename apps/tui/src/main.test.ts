@@ -648,9 +648,9 @@ function expectSemanticCompletionRow(
     expect(output.slice(start, end)).toContain(input.description);
     return;
   }
-  const labelEnd = output.indexOf(`\u001b[38;2;166;227;161m${input.label}\u001b[39m`);
-  expect(labelEnd).toBeGreaterThanOrEqual(0);
-  const descriptionStart = output.indexOf("\u001b[38;2;108;112;134m", labelEnd);
+  const labelSpanStart = output.indexOf(`\u001b[38;2;166;227;161m${input.label}\u001b[39m`);
+  expect(labelSpanStart).toBeGreaterThanOrEqual(0);
+  const descriptionStart = output.indexOf("\u001b[38;2;108;112;134m", labelSpanStart);
   const descriptionEnd = output.indexOf("\u001b[39m", descriptionStart);
   expect(output.slice(descriptionStart, descriptionEnd)).toContain(input.description);
 }
