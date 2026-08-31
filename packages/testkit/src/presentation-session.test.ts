@@ -10930,7 +10930,12 @@ test("PresentationSession projects one live pending permission with its inline t
         (item) =>
           item.type === "tool_call" && item.callId === "pending-read" && item.status === "denied",
       );
-      if (active?.pendingInteractions.length === 0 && deniedTool !== undefined) {
+      if (
+        active?.pendingInteractions.length === 0 &&
+        deniedTool?.type === "tool_call" &&
+        deniedTool?.outcome?.status === "failed" &&
+        deniedTool.outcome.code === "permission_denied"
+      ) {
         deniedProjection = {
           pendingInteractionCount: active.pendingInteractions.length,
           tool: deniedTool,
