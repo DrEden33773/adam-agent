@@ -810,6 +810,7 @@ export type TurnComposerDisplay = {
     readonly lineCount: number;
     readonly scalarCount: number;
     readonly origin: "pasted_text";
+    readonly preview: string;
     readonly diagnostic: string | null;
   }[];
 };

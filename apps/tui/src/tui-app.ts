@@ -297,8 +297,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             description: skill.description,
             name: skill.name,
             qualifiedId: skill.qualifiedId,
+            source: skill.source,
           })),
-        keyword: theme.keyword,
+        keyword: theme.text,
+        path: theme.text,
+        skill: theme.green,
         registry: commandRegistry,
       }),
     );
@@ -719,13 +722,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         if (pastedText === undefined) {
           continue;
         }
-        resources.addChild(
-          new ResponsiveLine(
-            theme.toolOutput(
-              `${pastedText.token} · Pasted text · ${pastedText.state} · ${pastedText.lineCount} lines · ${pastedText.scalarCount} scalars · ${pastedText.byteCount} bytes`,
-            ),
-          ),
-        );
+        const pastedTextLine =
+          pastedText.state === "ready"
+            ? `${theme.reference(pastedText.token)} · ${theme.text("Pasted text")} · ${theme.green(pastedText.preview)} · ${theme.overlay(`${pastedText.lineCount} lines · ${pastedText.scalarCount} scalars · ${pastedText.byteCount} bytes`)}`
+            : theme.toolOutput(
+                `${pastedText.token} · Pasted text · ${pastedText.state} · ${pastedText.lineCount} lines · ${pastedText.scalarCount} scalars · ${pastedText.byteCount} bytes`,
+              );
+        resources.addChild(new ResponsiveLine(pastedTextLine));
         if (pastedText.diagnostic !== null) {
           resources.addChild(
             new ResponsiveLine(theme.muted(safeTerminalText(pastedText.diagnostic))),
@@ -750,11 +753,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             : "Selected file";
       resources.addChild(
         new ResponsiveLine(
-          theme.toolOutput(
+          `${theme.reference(resource.token)} · ${theme.text(origin)} · ${theme.overlay(
             safeTerminalText(
-              `${resource.token} · ${origin} · ${resource.state} · ${resource.displayName} · ${size} · ${media} · ${support}`,
+              `${resource.state} · ${resource.displayName} · ${size} · ${media} · ${support}`,
             ),
-          ),
+          )}`,
         ),
       );
       if (resource.diagnostic !== null) {

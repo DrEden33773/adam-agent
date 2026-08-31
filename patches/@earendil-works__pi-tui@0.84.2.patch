@@ -1,5 +1,5 @@
 diff --git a/dist/components/editor.d.ts b/dist/components/editor.d.ts
-index a6fedc9e3b36d066e34860d040db6df47d88c432..a6bdba4c8d7168d67210d280400b51bc893ac90f 100644
+index a6fedc9e3b36d066e34860d040db6df47d88c432..ced33ab6fef651b7c9d6fc8834af110f3c4ccae0 100644
 --- a/dist/components/editor.d.ts
 +++ b/dist/components/editor.d.ts
 @@ -1,4 +1,4 @@
@@ -8,7 +8,14 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..a6bdba4c8d7168d67210d280400b51bc
  import { type Component, type Focusable, type TUI } from "../tui.ts";
  import { type SelectListTheme } from "./select-list.ts";
  /**
-@@ -30,6 +30,65 @@ export interface EditorOptions {
+@@ -24,12 +24,72 @@ export interface TextChunk {
+ export declare function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl.SegmentData[]): TextChunk[];
+ export interface EditorTheme {
+     borderColor: (str: string) => string;
++    atom?: (str: string) => string;
+     selectList: SelectListTheme;
+ }
+ export interface EditorOptions {
      paddingX?: number;
      autocompleteMaxVisible?: number;
  }
@@ -74,7 +81,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..a6bdba4c8d7168d67210d280400b51bc
  export declare class Editor implements Component, Focusable {
      private state;
      /** Focusable interface - set by TUI when focus changes */
-@@ -53,6 +112,7 @@ export declare class Editor implements Component, Focusable {
+@@ -53,6 +113,7 @@ export declare class Editor implements Component, Focusable {
      private autocompleteRequestTask;
      private autocompleteStartToken;
      private autocompleteRequestId;
@@ -82,7 +89,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..a6bdba4c8d7168d67210d280400b51bc
      private pastes;
      private pasteCounter;
      private pasteBuffer;
-@@ -68,6 +128,8 @@ export declare class Editor implements Component, Focusable {
+@@ -68,6 +129,8 @@ export declare class Editor implements Component, Focusable {
      private undoStack;
      onSubmit?: (text: string) => void;
      onChange?: (text: string) => void;
@@ -91,7 +98,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..a6bdba4c8d7168d67210d280400b51bc
      disableSubmit: boolean;
      constructor(tui: TUI, theme: EditorTheme, options?: EditorOptions);
      /** Set of currently valid paste IDs, for marker-aware segmentation. */
-@@ -79,6 +141,8 @@ export declare class Editor implements Component, Focusable {
+@@ -79,6 +142,8 @@ export declare class Editor implements Component, Focusable {
      getAutocompleteMaxVisible(): number;
      setAutocompleteMaxVisible(maxVisible: number): void;
      setAutocompleteProvider(provider: AutocompleteProvider): void;
@@ -100,7 +107,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..a6bdba4c8d7168d67210d280400b51bc
      /**
       * Add a prompt to history for up/down arrow navigation.
       * Called after successful submission.
-@@ -107,7 +171,10 @@ export declare class Editor implements Component, Focusable {
+@@ -107,7 +172,10 @@ export declare class Editor implements Component, Focusable {
          line: number;
          col: number;
      };
@@ -112,7 +119,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..a6bdba4c8d7168d67210d280400b51bc
       * Insert text at the current cursor position.
       * Used for programmatic insertion (e.g., clipboard image markers).
 diff --git a/dist/components/editor.js b/dist/components/editor.js
-index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431ff9e50ba 100644
+index 4786b46932b65785cfbd2304610ca77ccead910a..9c6e2a056f300d598b693af3e55717bd2e0575c2 100644
 --- a/dist/components/editor.js
 +++ b/dist/components/editor.js
 @@ -219,6 +219,7 @@ export class Editor {
@@ -151,7 +158,39 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
      /**
       * Add a prompt to history for up/down arrow navigation.
       * Called after successful submission.
-@@ -527,6 +542,25 @@ export class Editor {
+@@ -418,22 +433,25 @@ export class Editor {
+         // autocomplete (e.g. slash-command menu) is visible.
+         const emitCursorMarker = this.focused;
+         for (const layoutLine of visibleLines) {
+-            let displayText = layoutLine.text;
++            let displayText = this.styleDocumentText(layoutLine.text, layoutLine.startOffset);
+             let lineVisibleWidth = visibleWidth(layoutLine.text);
+             let cursorInPadding = false;
+             // Add cursor if this line has it
+             if (layoutLine.hasCursor && layoutLine.cursorPos !== undefined) {
+-                const before = displayText.slice(0, layoutLine.cursorPos);
+-                const after = displayText.slice(layoutLine.cursorPos);
++                const beforeText = layoutLine.text.slice(0, layoutLine.cursorPos);
++                const afterText = layoutLine.text.slice(layoutLine.cursorPos);
++                const before = this.styleDocumentText(beforeText, layoutLine.startOffset);
++                const after = afterText;
+                 // Hardware cursor marker (zero-width, emitted before fake cursor for IME positioning)
+                 const marker = emitCursorMarker ? CURSOR_MARKER : "";
+                 if (after.length > 0) {
+                     // Cursor is on a character (grapheme) - replace it with highlighted version
+                     // Get the first grapheme from 'after'
+-                    const afterGraphemes = [...this.segment(after, "grapheme")];
++                    const afterGraphemes = [...this.segment(afterText, "grapheme")];
+                     const firstGrapheme = afterGraphemes[0]?.segment || "";
+-                    const restAfter = after.slice(firstGrapheme.length);
+-                    const cursor = `\x1b[7m${firstGrapheme}\x1b[0m`;
++                    const styledFirstGrapheme = this.styleDocumentText(firstGrapheme, layoutLine.startOffset + layoutLine.cursorPos);
++                    const restAfter = this.styleDocumentText(afterText.slice(firstGrapheme.length), layoutLine.startOffset + layoutLine.cursorPos + firstGrapheme.length);
++                    const cursor = `\x1b[7m${styledFirstGrapheme}\x1b[27m`;
+                     displayText = before + marker + cursor + restAfter;
+                     // lineVisibleWidth stays the same - we're replacing, not adding
+                 }
+@@ -527,6 +545,25 @@ export class Editor {
              this.undo();
              return;
          }
@@ -177,7 +216,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          // Handle autocomplete mode
          if (this.autocompleteState && this.autocompleteList) {
              if (kb.matches(data, "tui.select.cancel")) {
-@@ -540,35 +574,21 @@ export class Editor {
+@@ -540,35 +577,21 @@ export class Editor {
              if (kb.matches(data, "tui.input.tab")) {
                  const selected = this.autocompleteList.getSelectedItem();
                  if (selected && this.autocompleteProvider) {
@@ -215,7 +254,77 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
                          return;
                      }
                  }
-@@ -847,6 +867,261 @@ export class Editor {
+@@ -748,10 +771,12 @@ export class Editor {
+                 text: "",
+                 hasCursor: true,
+                 cursorPos: 0,
++                startOffset: 0,
+             });
+             return layoutLines;
+         }
+         // Process each logical line
++        let logicalOffset = 0;
+         for (let i = 0; i < this.state.lines.length; i++) {
+             const line = this.state.lines[i] || "";
+             const isCurrentLine = i === this.state.cursorLine;
+@@ -763,12 +788,14 @@ export class Editor {
+                         text: line,
+                         hasCursor: true,
+                         cursorPos: this.state.cursorCol,
++                        startOffset: logicalOffset,
+                     });
+                 }
+                 else {
+                     layoutLines.push({
+                         text: line,
+                         hasCursor: false,
++                        startOffset: logicalOffset,
+                     });
+                 }
+             }
+@@ -810,19 +837,41 @@ export class Editor {
+                             text: chunk.text,
+                             hasCursor: true,
+                             cursorPos: adjustedCursorPos,
++                            startOffset: logicalOffset + chunk.startIndex,
+                         });
+                     }
+                     else {
+                         layoutLines.push({
+                             text: chunk.text,
+                             hasCursor: false,
++                            startOffset: logicalOffset + chunk.startIndex,
+                         });
+                     }
+                 }
+             }
++            logicalOffset += line.length + 1;
+         }
+         return layoutLines;
+     }
++    styleDocumentText(text, startOffset) {
++        if (text.length === 0 || this.theme.atom === undefined || this.structuredAtoms.length === 0)
++            return text;
++        const endOffset = startOffset + text.length;
++        let output = "";
++        let localOffset = 0;
++        for (const atom of this.structuredAtoms) {
++            const overlapStart = Math.max(startOffset, atom.start);
++            const overlapEnd = Math.min(endOffset, atom.end);
++            if (overlapStart >= overlapEnd)
++                continue;
++            const localStart = overlapStart - startOffset;
++            const localEnd = overlapEnd - startOffset;
++            output += text.slice(localOffset, localStart);
++            output += this.theme.atom(text.slice(localStart, localEnd));
++            localOffset = localEnd;
++        }
++        return output + text.slice(localOffset);
++    }
+     getText() {
+         return this.state.lines.join("\n");
+     }
+@@ -847,6 +896,261 @@ export class Editor {
      getCursor() {
          return { line: this.state.cursorLine, col: this.state.cursorCol };
      }
@@ -477,7 +586,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
      setText(text) {
          this.cancelAutocomplete();
          this.lastAction = null;
-@@ -858,8 +1133,16 @@ export class Editor {
+@@ -858,8 +1162,16 @@ export class Editor {
          }
          this.pastes.clear();
          this.pasteCounter = 0;
@@ -494,7 +603,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
      /**
       * Insert text at the current cursor position.
       * Used for programmatic insertion (e.g., clipboard image markers).
-@@ -868,6 +1151,10 @@ export class Editor {
+@@ -868,6 +1180,10 @@ export class Editor {
      insertTextAtCursor(text) {
          if (!text)
              return;
@@ -505,7 +614,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          this.cancelAutocomplete();
          this.pushUndoSnapshot();
          this.lastAction = null;
-@@ -890,6 +1177,10 @@ export class Editor {
+@@ -890,6 +1206,10 @@ export class Editor {
      insertTextAtCursorInternal(text) {
          if (!text)
              return;
@@ -516,7 +625,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          // Normalize line endings and tabs
          const normalized = this.normalizeText(text);
          const insertedLines = normalized.split("\n");
-@@ -925,6 +1216,10 @@ export class Editor {
+@@ -925,6 +1245,10 @@ export class Editor {
      // All the editor methods from before...
      insertCharacter(char, skipUndoCoalescing) {
          this.exitHistoryBrowsing();
@@ -527,7 +636,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          // Undo coalescing (fish-style):
          // - Consecutive word chars coalesce into one undo unit
          // - Space captures state before itself (so undo removes space+following word together)
-@@ -1011,11 +1306,22 @@ export class Editor {
+@@ -1011,11 +1335,22 @@ export class Editor {
                  filteredText = ` ${filteredText}`;
              }
          }
@@ -551,7 +660,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
              // Store the paste and insert a marker
              this.pasteCounter++;
              const pasteId = this.pasteCounter;
-@@ -1036,6 +1342,10 @@ export class Editor {
+@@ -1036,6 +1371,10 @@ export class Editor {
          this.insertTextAtCursorInternal(filteredText);
      }
      addNewLine() {
@@ -562,7 +671,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          this.cancelAutocomplete();
          this.exitHistoryBrowsing();
          this.lastAction = null;
-@@ -1068,6 +1378,11 @@ export class Editor {
+@@ -1068,6 +1407,11 @@ export class Editor {
      submitValue() {
          this.cancelAutocomplete();
          const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
@@ -574,7 +683,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
          this.pastes.clear();
          this.pasteCounter = 0;
-@@ -1083,6 +1398,16 @@ export class Editor {
+@@ -1083,6 +1427,16 @@ export class Editor {
      handleBackspace() {
          this.exitHistoryBrowsing();
          this.lastAction = null;
@@ -591,7 +700,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          if (this.state.cursorCol > 0) {
              this.pushUndoSnapshot();
              // Delete grapheme before cursor (handles emojis, combining characters, etc.)
-@@ -1157,6 +1482,7 @@ export class Editor {
+@@ -1157,6 +1511,7 @@ export class Editor {
       */
      setCursorCol(col) {
          this.state.cursorCol = col;
@@ -599,7 +708,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          this.preferredVisualCol = null;
          this.snappedFromCursorCol = null;
      }
-@@ -1410,6 +1736,16 @@ export class Editor {
+@@ -1410,6 +1765,16 @@ export class Editor {
      handleForwardDelete() {
          this.exitHistoryBrowsing();
          this.lastAction = null;
@@ -616,7 +725,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          const currentLine = this.state.lines[this.state.cursorLine] || "";
          if (this.state.cursorCol < currentLine.length) {
              this.pushUndoSnapshot();
-@@ -1520,6 +1856,12 @@ export class Editor {
+@@ -1520,6 +1885,12 @@ export class Editor {
          if (deltaCol !== 0) {
              const currentLine = this.state.lines[this.state.cursorLine] || "";
              if (deltaCol > 0) {
@@ -629,7 +738,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
                  // Moving right - move by one grapheme (handles emojis, combining characters, etc.)
                  if (this.state.cursorCol < currentLine.length) {
                      const afterCursor = currentLine.slice(this.state.cursorCol);
-@@ -1541,6 +1883,12 @@ export class Editor {
+@@ -1541,6 +1912,12 @@ export class Editor {
                  }
              }
              else {
@@ -642,7 +751,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
                  // Moving left - move by one grapheme (handles emojis, combining characters, etc.)
                  if (this.state.cursorCol > 0) {
                      const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-@@ -1704,6 +2052,10 @@ export class Editor {
+@@ -1704,6 +2081,10 @@ export class Editor {
      }
      undo() {
          this.exitHistoryBrowsing();
@@ -653,7 +762,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          const snapshot = this.undoStack.pop();
          if (!snapshot)
              return;
-@@ -1806,14 +2158,67 @@ export class Editor {
+@@ -1806,14 +2187,67 @@ export class Editor {
          const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
          return new SelectList(items, this.autocompleteMaxVisible, this.theme.selectList, layout);
      }
@@ -723,7 +832,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          if (this.isInSlashCommandContext(beforeCursor) && !beforeCursor.trimStart().includes(" ")) {
              this.handleSlashCommandCompletion();
          }
-@@ -1830,9 +2235,12 @@ export class Editor {
+@@ -1830,9 +2264,12 @@ export class Editor {
      requestAutocomplete(options) {
          if (!this.autocompleteProvider)
              return;
@@ -737,7 +846,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
              if (!shouldTrigger) {
                  return;
              }
-@@ -1882,14 +2290,20 @@ export class Editor {
+@@ -1882,14 +2319,20 @@ export class Editor {
          if (options.explicitTab || options.force) {
              return 0;
          }
@@ -761,7 +870,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
          if (!this.isAutocompleteRequestCurrent(requestId, controller, snapshotText, snapshotLine, snapshotCol)) {
              return;
          }
-@@ -1901,14 +2315,7 @@ export class Editor {
+@@ -1901,14 +2344,7 @@ export class Editor {
          }
          if (options.force && options.explicitTab && suggestions.items.length === 1) {
              const item = suggestions.items[0];
@@ -778,9 +887,16 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..c52a3f9e2e9b73db91818142b60fe431
              return;
          }
 diff --git a/dist/components/select-list.js b/dist/components/select-list.js
-index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..0b8964d09635714a7e5872c653883e064f59df14 100644
+index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..7a00d54915cd1f58837c549e29ac30f38254d1c6 100644
 --- a/dist/components/select-list.js
 +++ b/dist/components/select-list.js
+@@ -1,5 +1,5 @@
+ import { getKeybindings } from "../keybindings.js";
+-import { truncateToWidth, visibleWidth } from "../utils.js";
++import { stripTerminalSequences, truncateToWidth, visibleWidth } from "../utils.js";
+ const DEFAULT_PRIMARY_COLUMN_WIDTH = 32;
+ const PRIMARY_COLUMN_GAP = 2;
+ const MIN_DESCRIPTION_WIDTH = 10;
 @@ -88,7 +88,7 @@ export class SelectList {
          }
      }
@@ -790,8 +906,26 @@ index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..0b8964d09635714a7e5872c653883e06
          const prefixWidth = visibleWidth(prefix);
          if (descriptionSingleLine && width > 40) {
              const effectivePrimaryColumnWidth = Math.max(1, Math.min(primaryColumnWidth, width - prefixWidth - 4));
+@@ -101,7 +101,7 @@ export class SelectList {
+             if (remainingWidth > MIN_DESCRIPTION_WIDTH) {
+                 const truncatedDesc = truncateToWidth(descriptionSingleLine, remainingWidth, "");
+                 if (isSelected) {
+-                    return this.theme.selectedText(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`);
++                    return this.theme.selectedText(stripTerminalSequences(`${prefix}${truncatedValue}${spacing}${truncatedDesc}`));
+                 }
+                 const descText = this.theme.description(spacing + truncatedDesc);
+                 return prefix + truncatedValue + descText;
+@@ -110,7 +110,7 @@ export class SelectList {
+         const maxWidth = width - prefixWidth - 2;
+         const truncatedValue = this.truncatePrimary(item, isSelected, maxWidth, maxWidth);
+         if (isSelected) {
+-            return this.theme.selectedText(`${prefix}${truncatedValue}`);
++            return this.theme.selectedText(stripTerminalSequences(`${prefix}${truncatedValue}`));
+         }
+         return prefix + truncatedValue;
+     }
 diff --git a/dist/editor-component.d.ts b/dist/editor-component.d.ts
-index b598c4d291ace5f04b83161252b3ab8cdd4ccbdf..b340488d9187e399681a005db69b54c1e2bcff0b 100644
+index b598c4d291ace5f04b83161252b3ab8cdd4ccbdf..72dbe3a909e3cd28ad21d2c956a783036033e7bf 100644
 --- a/dist/editor-component.d.ts
 +++ b/dist/editor-component.d.ts
 @@ -1,4 +1,5 @@

@@ -5264,7 +5264,7 @@ test("PresentationSession recovers the default new-session draft after a clean r
       ],
       renderedText: "before[File #1]after[Text #2]",
       resources: [{ displayName: "notes.txt", ordinal: 1, state: "ready" }],
-      pastedTexts: [{ ordinal: 2, state: "ready", lineCount: 11 }],
+      pastedTexts: [{ ordinal: 2, state: "ready", lineCount: 11, preview: "recovered..." }],
     });
     await expect(presentation.dispatch({ type: "read_expanded_draft" })).resolves.toMatchObject({
       draftText: `before[File #1]after${pasted}`,

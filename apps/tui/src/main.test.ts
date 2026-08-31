@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, expect, test } from "vitest";
 import { AppliedViewportTerminal } from "./applied-viewport-terminal.test-support.js";
 import { copySelectionToClipboard, selectionCopyMaximumBytes } from "./exit-policy.js";
@@ -509,6 +509,168 @@ test("a chunked large bracketed paste becomes one exact expandable Text atom", a
   }
 });
 
+test("a ready pasted Text presents one bounded content preview", async () => {
+  const { fixture, testRoot } = await startPastedTextAtomFixture({ slug: "ready-preview" });
+  try {
+    const screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("[Text #1] · Pasted text · structure... · 11 lines");
+    expect(screen).not.toContain("[Text #1] · Pasted text · ready ·");
+    expect(fixture.output().split("\u001b[38;2;137;220;235m[Text #1]\u001b[39m").length - 1).toBe(
+      2,
+    );
+    expect(fixture.output()).toContain("\u001b[38;2;166;227;161mstructure...\u001b[39m");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a ready pasted Text preview remains stable across responsive layouts", async () => {
+  const { fixture, testRoot } = await startPastedTextAtomFixture({ slug: "preview-responsive" });
+  try {
+    for (const columns of [40, 80, 120]) {
+      const beforeResize = fixture.output().length;
+      await fixture.resize(columns, 24);
+      const frame = latestSynchronizedFrame(fixture.output().slice(beforeResize));
+      expect(frame.every((line) => visibleWidth(line) <= columns)).toBe(true);
+    }
+    expect(stripTerminalSequences(fixture.output())).toContain(
+      "[Text #1] · Pasted text · structure... · 11 lines",
+    );
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a ready pasted Text preview is recomputed after a recoverable restart", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-preview-restart-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const pasted = Array.from({ length: 11 }, (_, index) => `restart line ${index + 1}`).join("\n");
+
+  try {
+    const first = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await first.waitFor("Select an exact model target");
+    first.write("\r");
+    await first.waitFor("Adam · New session");
+    first.write(`\u001b[200~${pasted}\u001b[201~`);
+    await first.waitFor("Pasted text staged.");
+    await first.waitFor("restart l...");
+    first.write("\u0011");
+    await expect(first.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    const restarted = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await restarted.waitFor("Select an exact model target");
+    restarted.write("\r");
+    await restarted.waitFor("restart l...");
+    expect(restarted.screen()?.join("\n") ?? "").not.toContain("Pasted text · ready");
+    restarted.write("\u0011");
+    await expect(restarted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("NO_COLOR preserves ready pasted Text structure and preview without SGR", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-preview-no-color-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const pasted = Array.from({ length: 11 }, (_, index) => `colorless line ${index + 1}`).join("\n");
+
+  try {
+    const fixture = startFixture({ noColor: true, stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    const beforePaste = fixture.output().length;
+    fixture.write(`\u001b[200~${pasted}\u001b[201~`);
+    await fixture.waitForCompleteFrameAfter("colorless...", beforePaste);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforePaste)).join("\n");
+    expect(frame).toContain("[Text #1] · Pasted text · colorless...");
+    expect(frame).not.toContain("\u001b[38;2;");
+    expect(frame).not.toContain("\u001b[48;2;");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a pasted Text preview removes terminal controls and normalizes whitespace before truncation", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-safe-text-preview-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const pasted = `\u001b[31m\t《红楼梦》\u3000第五回\u001b[0m\u202e\n${Array.from({ length: 10 }, (_, index) => `后文 ${index + 1}`).join("\n")}`;
+  const terminal = new VirtualTerminal();
+  const execution = runTuiFixture({
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        return { status: "text" as const, platform: "linux_x11" as const, text: pasted };
+      },
+    },
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    terminal.input("\u001bv");
+    await terminal.nextSynchronizedFrameContaining("Pasted text staged.");
+    const output = stripTerminalSequences(terminal.output());
+    const screen = terminal.lines().join("\n");
+    expect(output).toContain("[Text #1] · Pasted text · 《红楼梦》 第五回...");
+    expect(screen).not.toContain("[31m");
+    expect(screen).not.toContain("[0m");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a pasted Text containing only terminal strings presents the empty-safe preview", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-empty-text-preview-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const pasted = Array.from({ length: 11 }, () => "\u001b_PRIVATE\u001b\\").join("\n");
+  const terminal = new VirtualTerminal({ columns: 120, rows: 24 });
+  const execution = runTuiFixture({
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        return { status: "text" as const, platform: "linux_x11" as const, text: pasted };
+      },
+    },
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    terminal.input("\u001bv");
+    await terminal.nextSynchronizedFrameContaining("Pasted text staged.");
+    expect(stripTerminalSequences(terminal.output())).toContain(
+      "[Text #1] · Pasted text · (empty after sanitization)",
+    );
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("Skill completion remains available after one large pasted Text atom", async () => {
   const { fixture, testRoot } = await startPastedTextAtomFixture({
     prepare: prepareFirstStructuredCompletionSkill,
@@ -519,6 +681,10 @@ test("Skill completion remains available after one large pasted Text atom", asyn
     const beforeCompletion = fixture.output().length;
     fixture.write(" Use $fir");
     await fixture.waitForCompleteFrameAfter("$first", beforeCompletion);
+    const completionOutput = fixture.output().slice(beforeCompletion);
+    expect(completionOutput).toContain("\u001b[38;2;203;166;247m> $first");
+    expect(stripTerminalSequences(completionOutput)).toContain("project:. · First structured");
+    expect(completionOutput).not.toContain("skill:v1:project:.:first");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -4277,7 +4443,7 @@ test("slash completion exposes Registry usage as its argument hint", async () =>
     const beforeCompletion = fixture.output().length;
     fixture.write("/he");
     await fixture.waitForAfter("/help [topic]", beforeCompletion);
-    expect(fixture.output().slice(beforeCompletion)).toContain(keywordLabel("/help"));
+    expect(fixture.output().slice(beforeCompletion)).toContain("\u001b[38;2;203;166;247m> /help");
     fixture.write("\t\r");
     await fixture.waitForAfter("Adam Help", beforeCompletion);
     fixture.write("\u0011");
@@ -4896,7 +5062,7 @@ test("Tab completes a Help topic argument from the Registry", async () => {
     const beforeCompletion = fixture.output().length;
     fixture.write("/help hot");
     await fixture.waitForAfter("Fixed effective keyboard bindings", beforeCompletion);
-    expect(fixture.output().slice(beforeCompletion)).toContain(keywordLabel("hotkeys"));
+    expect(fixture.output().slice(beforeCompletion)).toContain("\u001b[38;2;203;166;247m> hotkeys");
     fixture.write("\t\r");
     const outcome = await Promise.race([
       fixture.waitForAfter("Effective Hotkeys", beforeCompletion).then(() => "hotkeys" as const),

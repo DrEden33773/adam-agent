@@ -70,6 +70,25 @@ test("Pi Editor treats one host-owned resource label as an atomic navigable part
   ]);
 });
 
+test("Pi Editor styles only structural atom ranges without changing visible text", () => {
+  const editor = new Editor(
+    { requestRender() {}, terminal: { rows: 24 } } as never,
+    createAdamTuiTheme(false).editor,
+  ) as AtomEditor;
+  editor.setDocument(
+    [
+      { type: "text", id: "literal", text: "literal [File #1] " },
+      { type: "atom", id: "resource", label: "[File #1]" },
+    ],
+    { partId: "resource", edge: "after" },
+  );
+
+  const rendered = editor.render(80).join("\n");
+  expect(rendered).toContain("literal [File #1] ");
+  expect(rendered.split("\u001b[38;2;137;220;235m[File #1]\u001b[39m").length - 1).toBe(1);
+  expect(editor.getText()).toBe("literal [File #1] [File #1]");
+});
+
 test("Pi Editor rejects unsupported structured mutations without changing its document", () => {
   const editor = new Editor(
     { requestRender() {} } as never,

@@ -11,6 +11,10 @@ type SkillCompletion = {
   readonly description: string;
   readonly name: string;
   readonly qualifiedId: string;
+  readonly source:
+    | { readonly type: "project"; readonly scope: string }
+    | { readonly type: "user" }
+    | { readonly type: "extension"; readonly extensionId: string; readonly packageVersion: string };
 };
 
 export class AdamAutocompleteProvider implements AutocompleteProvider {
@@ -21,6 +25,8 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
   readonly #getSkills: () => readonly SkillCompletion[];
   readonly #getThinkingLevelIds: () => readonly string[];
   readonly #keyword: (text: string) => string;
+  readonly #path: (text: string) => string;
+  readonly #skill: (text: string) => string;
   readonly #registry: AdamCommandRegistry;
 
   constructor(options: {
@@ -30,6 +36,8 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     readonly getSkills: () => readonly SkillCompletion[];
     readonly getThinkingLevelIds?: () => readonly string[];
     readonly keyword?: (text: string) => string;
+    readonly path?: (text: string) => string;
+    readonly skill?: (text: string) => string;
     readonly registry?: AdamCommandRegistry;
   }) {
     this.#getAttachmentsAvailable = options.getAttachmentsAvailable ?? (() => true);
@@ -38,6 +46,8 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     this.#getSkills = options.getSkills;
     this.#getThinkingLevelIds = options.getThinkingLevelIds ?? (() => []);
     this.#keyword = options.keyword ?? ((text) => text);
+    this.#path = options.path ?? ((text) => text);
+    this.#skill = options.skill ?? ((text) => text);
     this.#registry = options.registry ?? adamCommandRegistry;
   }
 
@@ -145,8 +155,8 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
         .filter((skill) => skill.name.startsWith(mentionNamePrefix))
         .map<AutocompleteItem>((skill) => ({
           value: `$${skill.name}`,
-          label: `$${skill.name}`,
-          description: safeTerminalText(`${skill.qualifiedId} · ${skill.description}`),
+          label: this.#skill(`$${skill.name}`),
+          description: safeTerminalText(`${skillSourceLabel(skill.source)} · ${skill.description}`),
         }));
       return Promise.resolve(
         skillItems.length === 0 ? null : { items: skillItems, prefix: mentionPrefix },
@@ -161,7 +171,7 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
       .filter((path) => path.toLocaleLowerCase().startsWith(normalizedPrefix))
       .map<AutocompleteItem>((path) => {
         const safePath = safeTerminalText(path);
-        return { value: safePath, label: safePath };
+        return { value: safePath, label: this.#path(safePath) };
       });
     return Promise.resolve(pathItems.length === 0 ? null : { items: pathItems, prefix });
   }
@@ -179,4 +189,14 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     completed[cursorLine] = `${line.slice(0, start)}${item.value}${line.slice(cursorCol)}`;
     return { lines: completed, cursorLine, cursorCol: start + item.value.length };
   }
+}
+
+function skillSourceLabel(source: SkillCompletion["source"]): string {
+  if (source.type === "user") {
+    return "user";
+  }
+  if (source.type === "project") {
+    return `project:${source.scope}`;
+  }
+  return `extension:${source.extensionId}@${source.packageVersion}`;
 }

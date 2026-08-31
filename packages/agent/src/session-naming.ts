@@ -23,7 +23,7 @@ export function normalizedSessionTitle(input: string): string | null {
     .trim();
 }
 
-function stripTerminalSequences(input: string): string {
+export function stripTerminalSequences(input: string): string {
   let output = "";
   for (let index = 0; index < input.length; index += 1) {
     const code = input.charCodeAt(index);
@@ -43,7 +43,7 @@ function stripTerminalSequences(input: string): string {
       }
       continue;
     }
-    if (introducer === 0x5d) {
+    if (introducer === 0x5d || introducer === 0x5f) {
       index += 2;
       while (index < input.length) {
         if (input.charCodeAt(index) === 0x07) {
