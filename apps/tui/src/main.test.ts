@@ -5201,10 +5201,12 @@ test("Delete immediately before a Skill atom removes the whole occurrence", asyn
   }
 });
 
-test("clipboard text paste carries no Skill identity authority", async () => {
+test("copying an accepted Skill atom and pasting those bytes loses identity authority", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-skill-atom-copy-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
+  const pastedStateRoot = join(testRoot, "pasted-state");
+  const controlRoot = join(testRoot, "control");
   const skillDirectory = join(workspaceRoot, ".agents", "skills", "first");
   await mkdir(skillDirectory, { recursive: true });
   await writeFile(
@@ -5212,24 +5214,42 @@ test("clipboard text paste carries no Skill identity authority", async () => {
     "---\nname: first\ndescription: Identity-loss copy procedure.\n---\nCopy body.\n",
     "utf8",
   );
+  await mkdir(controlRoot);
 
   try {
-    const fixture = startFixture({
-      clipboardReader: {
-        async close() {},
-        async readClipboard() {
-          return { status: "text" as const, platform: "linux_x11" as const, text: "$first" };
-        },
-      },
+    const source = startFixture({
+      controlRoot,
+      scenario: "clipboard-success",
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
-    fixture.write("\u001bv");
-    await fixture.waitFor("Clipboard text pasted.");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-    const pastedManifest = await readFilesRecursively(join(stateRoot, "drafts"));
+    await source.waitFor("Adam · New session");
+    source.write("$fir");
+    await source.waitFor("$first");
+    const beforeAccept = source.output().length;
+    source.write("\t");
+    await source.waitForCompleteFrameAfter("$first", beforeAccept);
+    source.write("\u0011");
+    await expect(source.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const copiedText = await readFile(join(controlRoot, "clipboard.txt"), "utf8");
+    expect(copiedText).toBe("$first");
+
+    const pasted = startFixture({
+      clipboardReader: {
+        async close() {},
+        async readClipboard() {
+          return { status: "text" as const, platform: "linux_x11" as const, text: copiedText };
+        },
+      },
+      stateRoot: pastedStateRoot,
+      workspaceRoot,
+    });
+    await pasted.waitFor("Adam · New session");
+    pasted.write("\u001bv");
+    await pasted.waitFor("Clipboard text pasted.");
+    pasted.write("\u0011");
+    await expect(pasted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const pastedManifest = await readFilesRecursively(join(pastedStateRoot, "drafts"));
     expect(pastedManifest).toContain('"type":"text","text":"$first"');
     expect(pastedManifest).not.toContain('"type":"skill"');
     expect(pastedManifest).not.toContain("skill:v1:project:.:first");

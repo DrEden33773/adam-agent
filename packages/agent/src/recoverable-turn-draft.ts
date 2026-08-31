@@ -145,6 +145,40 @@ const stagedPastedTextSelectionSchema: z.ZodType<StagedPastedTextSelectionV1> = 
   lineCount: z.number().int().positive().safe(),
   scalarCount: z.number().int().positive().safe(),
 });
+const textElementSchema = z.strictObject({
+  elementId: z.string().min(1).max(256),
+  type: z.literal("text"),
+  text: z
+    .string()
+    .min(1)
+    .max(512 * 1024),
+});
+const resourceElementSchema = z.strictObject({
+  elementId: z.string().min(1).max(256),
+  type: z.literal("resource"),
+  kind: z.enum(["file", "image"]),
+  ordinal: z.number().int().positive().safe(),
+  resourceId: z.string().min(1).max(256),
+});
+const pastedTextElementSchema = z.strictObject({
+  elementId: z.string().min(1).max(256),
+  type: z.literal("pasted_text"),
+  ordinal: z.number().int().positive().safe(),
+  pastedTextId: z.string().min(1).max(256),
+});
+const skillElementSchema = z.strictObject({
+  elementId: z.string().min(1).max(256),
+  type: z.literal("skill"),
+  name: z
+    .string()
+    .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u)
+    .max(64),
+  qualifiedId: z
+    .string()
+    .min(1)
+    .max(16_384)
+    .refine((value) => /^[\x20-\x7e]+$/u.test(value) && Buffer.byteLength(value, "utf8") <= 16_384),
+});
 const draftV1Schema = z
   .strictObject({
     schemaVersion: z.literal(1),
@@ -163,27 +197,9 @@ const draftV1Schema = z
     elements: z
       .array(
         z.discriminatedUnion("type", [
-          z.strictObject({
-            elementId: z.string().min(1).max(256),
-            type: z.literal("text"),
-            text: z
-              .string()
-              .min(1)
-              .max(512 * 1024),
-          }),
-          z.strictObject({
-            elementId: z.string().min(1).max(256),
-            type: z.literal("resource"),
-            kind: z.enum(["file", "image"]),
-            ordinal: z.number().int().positive().safe(),
-            resourceId: z.string().min(1).max(256),
-          }),
-          z.strictObject({
-            elementId: z.string().min(1).max(256),
-            type: z.literal("pasted_text"),
-            ordinal: z.number().int().positive().safe(),
-            pastedTextId: z.string().min(1).max(256),
-          }),
+          textElementSchema,
+          resourceElementSchema,
+          pastedTextElementSchema,
         ]),
       )
       .max(17),
@@ -241,43 +257,10 @@ const draftV2Schema = z
     elements: z
       .array(
         z.discriminatedUnion("type", [
-          z.strictObject({
-            elementId: z.string().min(1).max(256),
-            type: z.literal("text"),
-            text: z
-              .string()
-              .min(1)
-              .max(512 * 1024),
-          }),
-          z.strictObject({
-            elementId: z.string().min(1).max(256),
-            type: z.literal("resource"),
-            kind: z.enum(["file", "image"]),
-            ordinal: z.number().int().positive().safe(),
-            resourceId: z.string().min(1).max(256),
-          }),
-          z.strictObject({
-            elementId: z.string().min(1).max(256),
-            type: z.literal("pasted_text"),
-            ordinal: z.number().int().positive().safe(),
-            pastedTextId: z.string().min(1).max(256),
-          }),
-          z.strictObject({
-            elementId: z.string().min(1).max(256),
-            type: z.literal("skill"),
-            name: z
-              .string()
-              .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u)
-              .max(64),
-            qualifiedId: z
-              .string()
-              .min(1)
-              .max(16_384)
-              .refine(
-                (value) =>
-                  /^[\x20-\x7e]+$/u.test(value) && Buffer.byteLength(value, "utf8") <= 16_384,
-              ),
-          }),
+          textElementSchema,
+          resourceElementSchema,
+          pastedTextElementSchema,
+          skillElementSchema,
         ]),
       )
       .max(17),
@@ -314,7 +297,12 @@ function validateDraftGraph(draft: RecoverableTurnDraft, context: z.RefinementCt
     new Set(pastedTexts.map((pastedText) => pastedText.ordinal)).size !== pastedTexts.length ||
     draft.elements.reduce(
       (length, element) =>
-        length + (element.type === "text" ? Buffer.byteLength(element.text, "utf8") : 0),
+        length +
+        (element.type === "text"
+          ? Buffer.byteLength(element.text, "utf8")
+          : element.type === "skill"
+            ? Buffer.byteLength(`$${element.name}`, "utf8")
+            : 0),
       0,
     ) +
       pastedTexts.reduce((total, pastedText) => total + pastedText.byteCount, 0) >

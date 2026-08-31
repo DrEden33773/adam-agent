@@ -4486,14 +4486,16 @@ test("PresentationSession preserves duplicate and same-name exact Skill atom occ
   const workspaceRoot = join(testRoot, "workspace");
   const userHome = join(testRoot, "home");
   const previousHome = testEnvironment.HOME;
-  for (const directory of [
-    join(workspaceRoot, ".agents", "skills", "shared-name"),
-    join(userHome, ".agents", "skills", "shared-name"),
+  for (const [directory, name] of [
+    [join(workspaceRoot, ".agents", "skills", "shared-name"), "shared-name"] as const,
+    [join(userHome, ".agents", "skills", "shared-name"), "shared-name"] as const,
+    [join(workspaceRoot, ".agents", "skills", "manual-name"), "manual-name"] as const,
+    [join(userHome, ".agents", "skills", "manual-name"), "manual-name"] as const,
   ]) {
     await mkdir(directory, { recursive: true });
     await writeFile(
       join(directory, "SKILL.md"),
-      "---\nname: shared-name\ndescription: Exact atom collision procedure.\n---\nExact body.\n",
+      `---\nname: ${name}\ndescription: Exact atom collision procedure.\n---\nExact body.\n`,
       "utf8",
     );
   }
@@ -4542,6 +4544,12 @@ test("PresentationSession preserves duplicate and same-name exact Skill atom occ
             name: "shared-name",
             qualifiedId: "skill:v1:user:shared-name",
           },
+          {
+            type: "skill",
+            elementId: "manual-project-fourth",
+            name: "manual-name",
+            qualifiedId: "skill:v1:project:.:manual-name",
+          },
         ],
       }),
     ).resolves.toMatchObject({ status: "admitted" });
@@ -4549,6 +4557,7 @@ test("PresentationSession preserves duplicate and same-name exact Skill atom occ
       { type: "skill", elementId: "project-first", available: true },
       { type: "skill", elementId: "project-second", available: true },
       { type: "skill", elementId: "user-third", available: true },
+      { type: "skill", elementId: "manual-project-fourth", available: true },
     ]);
 
     const completed = Promise.withResolvers<void>();
@@ -4568,7 +4577,7 @@ test("PresentationSession preserves duplicate and same-name exact Skill atom occ
     try {
       const receipt = await presentation.dispatch({
         type: "submit_draft_prompt",
-        text: "",
+        text: "$manual-name",
         skills: [],
         thinkingSelection: null,
       });
@@ -4593,17 +4602,21 @@ test("PresentationSession preserves duplicate and same-name exact Skill atom occ
             outcomes: [
               expect.objectContaining({ qualifiedId: "skill:v1:project:.:shared-name" }),
               expect.objectContaining({ qualifiedId: "skill:v1:user:shared-name" }),
+              expect.objectContaining({ qualifiedId: "skill:v1:project:.:manual-name" }),
             ],
-          }),
-        }),
-        expect.objectContaining({
-          record: expect.objectContaining({
-            type: "logical_run_started",
-            userMessage: "$shared-name$shared-name$shared-name",
           }),
         }),
       ]),
     );
+    const logicalRun = records.find(
+      (entry) => "record" in entry && entry.record.type === "logical_run_started",
+    );
+    expect(
+      logicalRun !== undefined && "record" in logicalRun ? logicalRun.record : undefined,
+    ).toMatchObject({
+      type: "logical_run_started",
+      userMessage: "$shared-name$shared-name$shared-name$manual-name$manual-name",
+    });
     await presentation.close();
   } finally {
     await lifecycle.close();

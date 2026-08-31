@@ -85,6 +85,7 @@ import {
   ResponsiveLine,
   ResponsiveRoot,
   ResponsiveText,
+  ResponsiveWrappedText,
   terminalSizeIsSupported,
 } from "./responsive-root.js";
 import { RightEdgeGuardTerminal } from "./right-edge-guard-terminal.js";
@@ -754,12 +755,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       if (element.type === "skill") {
         if (!element.available) {
           resources.addChild(
-            new ResponsiveLine(
-              theme.statusError(`Skill $${safeTerminalText(element.name)} is unavailable;`),
+            new ResponsiveWrappedText(
+              theme.statusError(
+                `Skill $${safeTerminalText(element.name)} is unavailable; delete it or choose a current Skill.`,
+              ),
             ),
-          );
-          resources.addChild(
-            new ResponsiveLine(theme.statusError("delete it or choose a current Skill.")),
           );
         }
         continue;

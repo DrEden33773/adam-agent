@@ -2681,23 +2681,14 @@ export async function createPresentationSession(
             };
           }
         }
-        const unavailableSkill = state.composer.elements.find(
-          (element) => element.type === "skill" && !element.available,
-        );
-        if (unavailableSkill?.type === "skill") {
-          return {
-            status: "rejected",
-            code: "not_available",
-            message: `Skill $${unavailableSkill.name} is unavailable; delete it or choose a current Skill.`,
-          };
-        }
-        const manualSkillResolution = resolveSkillMentions({
+        const skillResolution = resolveSubmittedSkills({
           text: command.text,
           explicitQualifiedIds: command.skills,
           catalog: state.authoritative.active.skills,
+          elements: state.composer.elements,
         });
-        if (manualSkillResolution.status === "ambiguous") {
-          return ambiguousSkillMentionRejection(manualSkillResolution);
+        if (skillResolution.status === "rejected") {
+          return skillResolution.receipt;
         }
         if (!draftImagesFitExactTarget()) {
           return {
@@ -2750,12 +2741,7 @@ export async function createPresentationSession(
                 : "The current turn could not be sealed safely.",
           };
         }
-        const resolvedSkillIds = [
-          ...new Set([
-            ...sealedDraft.skillOccurrences.map((occurrence) => occurrence.qualifiedId),
-            ...manualSkillResolution.qualifiedIds,
-          ]),
-        ];
+        const resolvedSkillIds = skillResolution.qualifiedIds;
         const admission = Promise.withResolvers<void>();
         const admissionAfterSequence =
           state.authoritative.continuity.status === "current"
@@ -2887,23 +2873,14 @@ export async function createPresentationSession(
             message: "The exact draft target is no longer available.",
           };
         }
-        const unavailableSkill = state.composer.elements.find(
-          (element) => element.type === "skill" && !element.available,
-        );
-        if (unavailableSkill?.type === "skill") {
-          return {
-            status: "rejected",
-            code: "not_available",
-            message: `Skill $${unavailableSkill.name} is unavailable; delete it or choose a current Skill.`,
-          };
-        }
-        const manualSkillResolution = resolveSkillMentions({
+        const skillResolution = resolveSubmittedSkills({
           text: command.text,
           explicitQualifiedIds: command.skills,
           catalog: draft.skills,
+          elements: state.composer.elements,
         });
-        if (manualSkillResolution.status === "ambiguous") {
-          return ambiguousSkillMentionRejection(manualSkillResolution);
+        if (skillResolution.status === "rejected") {
+          return skillResolution.receipt;
         }
         if (!draftImagesFitExactTarget()) {
           return {
@@ -2956,12 +2933,7 @@ export async function createPresentationSession(
                 : "The current turn could not be sealed safely.",
           };
         }
-        const resolvedSkillIds = [
-          ...new Set([
-            ...sealedDraft.skillOccurrences.map((occurrence) => occurrence.qualifiedId),
-            ...manualSkillResolution.qualifiedIds,
-          ]),
-        ];
+        const resolvedSkillIds = skillResolution.qualifiedIds;
         const admission = Promise.withResolvers<string>();
         let admittedSessionId: string | null = null;
         const continuation = options.lifecycle.admit({
@@ -4649,6 +4621,43 @@ function ambiguousSkillMentionRejection(
     code: "invalid_command",
     message: `Skill $${resolution.name} is ambiguous. Select one exact qualified ID with /skills: ${candidates}`,
   };
+}
+
+function resolveSubmittedSkills(input: {
+  readonly text: string;
+  readonly explicitQualifiedIds: readonly string[];
+  readonly catalog: SkillCatalogDisplay | null;
+  readonly elements: PresentationDisplayState["composer"]["elements"];
+}):
+  | { readonly status: "resolved"; readonly qualifiedIds: readonly string[] }
+  | {
+      readonly status: "rejected";
+      readonly receipt: Extract<CommandReceipt, { readonly status: "rejected" }>;
+    } {
+  const unavailableSkill = input.elements.find(
+    (element) => element.type === "skill" && !element.available,
+  );
+  if (unavailableSkill?.type === "skill") {
+    return {
+      status: "rejected",
+      receipt: {
+        status: "rejected",
+        code: "not_available",
+        message: `Skill $${unavailableSkill.name} is unavailable; delete it or choose a current Skill.`,
+      },
+    };
+  }
+  const exactQualifiedIds = input.elements.flatMap((element) =>
+    element.type === "skill" ? [element.qualifiedId] : [],
+  );
+  const resolution = resolveSkillMentions({
+    text: input.text,
+    explicitQualifiedIds: [...exactQualifiedIds, ...input.explicitQualifiedIds],
+    catalog: input.catalog,
+  });
+  return resolution.status === "ambiguous"
+    ? { status: "rejected", receipt: ambiguousSkillMentionRejection(resolution) }
+    : { status: "resolved", qualifiedIds: resolution.qualifiedIds };
 }
 
 function draftAdmissionRejection(

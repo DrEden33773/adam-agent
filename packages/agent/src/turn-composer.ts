@@ -300,9 +300,12 @@ export async function createTurnComposer(options: {
   const literalText = (): string =>
     elements.flatMap((element) => (element.type === "text" ? [element.text] : [])).join("");
 
-  const textPayloadBytes = (literal = literalText()): number =>
+  const textPayloadBytes = (
+    literal = literalText(),
+    candidateElements: readonly TurnComposerElementSnapshot[] = elements,
+  ): number =>
     Buffer.byteLength(literal, "utf8") +
-    elements
+    candidateElements
       .filter((element) => element.type === "skill")
       .reduce((total, element) => total + Buffer.byteLength(`$${element.name}`, "utf8"), 0) +
     [...pastedTexts.values()]
@@ -767,7 +770,7 @@ export async function createTurnComposer(options: {
         .join("");
       if (
         nextText.length > 512 * 1024 ||
-        textPayloadBytes(nextText) > pastedTextLimitsV1.maximumTextBytesPerTurn
+        textPayloadBytes(nextText, nextElements) > pastedTextLimitsV1.maximumTextBytesPerTurn
       ) {
         throw new TurnComposerError(
           "limit_exceeded",

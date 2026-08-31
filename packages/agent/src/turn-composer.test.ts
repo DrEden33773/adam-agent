@@ -1,6 +1,7 @@
 import { expect, test } from "vitest";
 
 import type { TurnComposerResourceStager } from "./input-resource-staging.js";
+import { pastedTextLimitsV1 } from "./pasted-text.js";
 import type { RecoverableTurnDraftV1 } from "./recoverable-turn-draft.js";
 import { createTurnComposer } from "./turn-composer.js";
 
@@ -116,6 +117,36 @@ test("TurnComposer expands a Skill atom to visible text without copying identity
     ).resolves.toBe(true);
     expect(composer.readExpandedText()).toBe("$first");
     expect(composer.readExpandedText()).not.toContain("skill:v1:");
+  } finally {
+    await composer.close();
+  }
+});
+
+test("TurnComposer counts a candidate Skill atom against the structured text byte limit", async () => {
+  const composer = await createTurnComposer({ onChange() {}, stager: createPastedTextStager() });
+  try {
+    await composer.stagePastedText("x".repeat(pastedTextLimitsV1.maximumTextBytesPerTurn - 64));
+    const pastedText = composer
+      .snapshot()
+      .elements.find((element) => element.type === "pasted_text");
+    if (pastedText?.type !== "pasted_text") {
+      throw new Error("Expected one staged Text atom.");
+    }
+
+    await expect(
+      composer.replaceText({
+        baseRevision: composer.snapshot().revision,
+        document: [
+          { type: "pasted_text", elementId: pastedText.elementId },
+          {
+            type: "skill",
+            elementId: "maximum-name-skill",
+            name: "a".repeat(64),
+            qualifiedId: "skill:v1:project:.:maximum-name-skill",
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ code: "limit_exceeded" });
   } finally {
     await composer.close();
   }

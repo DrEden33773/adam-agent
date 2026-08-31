@@ -1,4 +1,10 @@
-import { type Component, Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+  type Component,
+  Container,
+  Text,
+  truncateToWidth,
+  wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 
 export const minimumTerminalColumns = 40;
 export const minimumTerminalRows = 12;
@@ -77,5 +83,19 @@ export class ResponsiveLine implements Component {
   render(width: number): string[] {
     const maximumWidth = width >= 112 ? width : Math.min(width, 52);
     return [truncateToWidth(this.#text, Math.max(0, maximumWidth))];
+  }
+}
+
+export class ResponsiveWrappedText implements Component {
+  readonly #text: string;
+
+  constructor(text: string) {
+    this.#text = text;
+  }
+
+  invalidate(): void {}
+
+  render(width: number): string[] {
+    return wrapTextWithAnsi(this.#text, Math.max(1, width));
   }
 }
