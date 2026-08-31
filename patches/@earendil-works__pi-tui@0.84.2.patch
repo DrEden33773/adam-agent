@@ -1,8 +1,8 @@
 diff --git a/dist/components/editor.d.ts b/dist/components/editor.d.ts
-index a6fedc9e3b36d066e34860d040db6df47d88c432..fc00b23987ad376bcd60096ceff0e6d329404cd1 100644
+index a6fedc9e3b36d066e34860d040db6df47d88c432..26b2fd69ac2dfdbea79ee24125ff5bf2d695d8af 100644
 --- a/dist/components/editor.d.ts
 +++ b/dist/components/editor.d.ts
-@@ -30,6 +30,37 @@ export interface EditorOptions {
+@@ -30,6 +30,47 @@ export interface EditorOptions {
      paddingX?: number;
      autocompleteMaxVisible?: number;
  }
@@ -37,18 +37,29 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..fc00b23987ad376bcd60096ceff0e6d3
 +} | {
 +    readonly type: "undo";
 +};
++export type EditorPasteIntent = {
++    readonly text: string;
++    readonly cursor: {
++        readonly type: "text";
++        readonly offset: number;
++    } | {
++        readonly type: "document";
++        readonly point: EditorDocumentPoint;
++    };
++};
  export declare class Editor implements Component, Focusable {
      private state;
      /** Focusable interface - set by TUI when focus changes */
-@@ -68,6 +99,7 @@ export declare class Editor implements Component, Focusable {
+@@ -68,6 +109,8 @@ export declare class Editor implements Component, Focusable {
      private undoStack;
      onSubmit?: (text: string) => void;
      onChange?: (text: string) => void;
 +    onEditIntent?: (intent: EditorEditIntent) => void;
++    onPaste?: (intent: EditorPasteIntent) => boolean;
      disableSubmit: boolean;
      constructor(tui: TUI, theme: EditorTheme, options?: EditorOptions);
      /** Set of currently valid paste IDs, for marker-aware segmentation. */
-@@ -107,6 +139,8 @@ export declare class Editor implements Component, Focusable {
+@@ -107,6 +150,8 @@ export declare class Editor implements Component, Focusable {
          line: number;
          col: number;
      };
@@ -58,14 +69,15 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..fc00b23987ad376bcd60096ceff0e6d3
      /**
       * Insert text at the current cursor position.
 diff --git a/dist/components/editor.js b/dist/components/editor.js
-index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f5f21f7b6 100644
+index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94d0456dcf 100644
 --- a/dist/components/editor.js
 +++ b/dist/components/editor.js
-@@ -246,6 +246,11 @@ export class Editor {
+@@ -246,6 +246,12 @@ export class Editor {
      undoStack = new UndoStack();
      onSubmit;
      onChange;
 +    onEditIntent;
++    onPaste;
 +    structuredDocument = null;
 +    structuredAtoms = [];
 +    structuredCursorPoint = null;
@@ -73,7 +85,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
      disableSubmit = false;
      constructor(tui, theme, options = {}) {
          this.tui = tui;
-@@ -527,6 +532,26 @@ export class Editor {
+@@ -527,6 +533,26 @@ export class Editor {
              this.undo();
              return;
          }
@@ -100,7 +112,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
          // Handle autocomplete mode
          if (this.autocompleteState && this.autocompleteList) {
              if (kb.matches(data, "tui.select.cancel")) {
-@@ -847,6 +872,256 @@ export class Editor {
+@@ -847,6 +873,256 @@ export class Editor {
      getCursor() {
          return { line: this.state.cursorLine, col: this.state.cursorCol };
      }
@@ -357,7 +369,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
      setText(text) {
          this.cancelAutocomplete();
          this.lastAction = null;
-@@ -858,6 +1133,9 @@ export class Editor {
+@@ -858,6 +1134,9 @@ export class Editor {
          }
          this.pastes.clear();
          this.pasteCounter = 0;
@@ -367,7 +379,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
          this.setTextInternal(normalized);
      }
      /**
-@@ -868,6 +1146,10 @@ export class Editor {
+@@ -868,6 +1147,10 @@ export class Editor {
      insertTextAtCursor(text) {
          if (!text)
              return;
@@ -378,7 +390,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
          this.cancelAutocomplete();
          this.pushUndoSnapshot();
          this.lastAction = null;
-@@ -890,6 +1172,10 @@ export class Editor {
+@@ -890,6 +1173,10 @@ export class Editor {
      insertTextAtCursorInternal(text) {
          if (!text)
              return;
@@ -389,7 +401,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
          // Normalize line endings and tabs
          const normalized = this.normalizeText(text);
          const insertedLines = normalized.split("\n");
-@@ -925,6 +1211,10 @@ export class Editor {
+@@ -925,6 +1212,10 @@ export class Editor {
      // All the editor methods from before...
      insertCharacter(char, skipUndoCoalescing) {
          this.exitHistoryBrowsing();
@@ -400,10 +412,17 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
          // Undo coalescing (fish-style):
          // - Consecutive word chars coalesce into one undo unit
          // - Space captures state before itself (so undo removes space+following word together)
-@@ -1011,6 +1301,10 @@ export class Editor {
+@@ -1011,11 +1302,22 @@ export class Editor {
                  filteredText = ` ${filteredText}`;
              }
          }
++        const pasteIntent = this.structuredDocument === null
++            ? { text: filteredText, cursor: { type: "text", offset: this.cursorOffset() } }
++            : { text: filteredText, cursor: { type: "document", point: this.getDocumentCursor() } };
++        const hostClassifiedPaste = this.onPaste !== undefined;
++        if (this.onPaste?.(pasteIntent) === true) {
++            return;
++        }
 +        if (this.structuredDocument !== null) {
 +            this.emitInsertionIntent(filteredText);
 +            return;
@@ -411,7 +430,13 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
          // Split into lines to check for large paste
          const pastedLines = filteredText.split("\n");
          // Check if this is a large paste (> 10 lines or > 1000 characters)
-@@ -1036,6 +1330,10 @@ export class Editor {
+         const totalChars = filteredText.length;
+-        if (pastedLines.length > 10 || totalChars > 1000) {
++        if (!hostClassifiedPaste && (pastedLines.length > 10 || totalChars > 1000)) {
+             // Store the paste and insert a marker
+             this.pasteCounter++;
+             const pasteId = this.pasteCounter;
+@@ -1036,6 +1338,10 @@ export class Editor {
          this.insertTextAtCursorInternal(filteredText);
      }
      addNewLine() {
@@ -422,7 +447,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
          this.cancelAutocomplete();
          this.exitHistoryBrowsing();
          this.lastAction = null;
-@@ -1068,6 +1366,11 @@ export class Editor {
+@@ -1068,6 +1374,11 @@ export class Editor {
      submitValue() {
          this.cancelAutocomplete();
          const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
@@ -434,7 +459,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
          this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
          this.pastes.clear();
          this.pasteCounter = 0;
-@@ -1083,6 +1386,16 @@ export class Editor {
+@@ -1083,6 +1394,16 @@ export class Editor {
      handleBackspace() {
          this.exitHistoryBrowsing();
          this.lastAction = null;
@@ -451,7 +476,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
          if (this.state.cursorCol > 0) {
              this.pushUndoSnapshot();
              // Delete grapheme before cursor (handles emojis, combining characters, etc.)
-@@ -1157,6 +1470,7 @@ export class Editor {
+@@ -1157,6 +1478,7 @@ export class Editor {
       */
      setCursorCol(col) {
          this.state.cursorCol = col;
@@ -459,7 +484,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
          this.preferredVisualCol = null;
          this.snappedFromCursorCol = null;
      }
-@@ -1410,6 +1724,16 @@ export class Editor {
+@@ -1410,6 +1732,16 @@ export class Editor {
      handleForwardDelete() {
          this.exitHistoryBrowsing();
          this.lastAction = null;
@@ -476,7 +501,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
          const currentLine = this.state.lines[this.state.cursorLine] || "";
          if (this.state.cursorCol < currentLine.length) {
              this.pushUndoSnapshot();
-@@ -1520,6 +1844,12 @@ export class Editor {
+@@ -1520,6 +1852,12 @@ export class Editor {
          if (deltaCol !== 0) {
              const currentLine = this.state.lines[this.state.cursorLine] || "";
              if (deltaCol > 0) {
@@ -489,7 +514,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
                  // Moving right - move by one grapheme (handles emojis, combining characters, etc.)
                  if (this.state.cursorCol < currentLine.length) {
                      const afterCursor = currentLine.slice(this.state.cursorCol);
-@@ -1541,6 +1871,12 @@ export class Editor {
+@@ -1541,6 +1879,12 @@ export class Editor {
                  }
              }
              else {
@@ -502,7 +527,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..e479acdeb9ff0800db1ee2e165f2174f
                  // Moving left - move by one grapheme (handles emojis, combining characters, etc.)
                  if (this.state.cursorCol > 0) {
                      const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-@@ -1704,6 +2040,10 @@ export class Editor {
+@@ -1704,6 +2048,10 @@ export class Editor {
      }
      undo() {
          this.exitHistoryBrowsing();
@@ -527,21 +552,22 @@ index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..0b8964d09635714a7e5872c653883e06
          if (descriptionSingleLine && width > 40) {
              const effectivePrimaryColumnWidth = Math.max(1, Math.min(primaryColumnWidth, width - prefixWidth - 4));
 diff --git a/dist/editor-component.d.ts b/dist/editor-component.d.ts
-index b598c4d291ace5f04b83161252b3ab8cdd4ccbdf..4e776071dab430ab4dc18c589fd15d22c8858586 100644
+index b598c4d291ace5f04b83161252b3ab8cdd4ccbdf..734cca4d88ec3615a564caadce0311b0ba20ee4a 100644
 --- a/dist/editor-component.d.ts
 +++ b/dist/editor-component.d.ts
 @@ -1,4 +1,5 @@
  import type { AutocompleteProvider } from "./autocomplete.ts";
-+import type { EditorDocumentPart, EditorDocumentPoint, EditorEditIntent } from "./components/editor.ts";
++import type { EditorDocumentPart, EditorDocumentPoint, EditorEditIntent, EditorPasteIntent } from "./components/editor.ts";
  import type { Component } from "./tui.ts";
  /**
   * Interface for custom editor components.
-@@ -18,10 +19,16 @@ export interface EditorComponent extends Component {
+@@ -18,10 +19,17 @@ export interface EditorComponent extends Component {
      onSubmit?: (text: string) => void;
      /** Called when text changes */
      onChange?: (text: string) => void;
 +    /** Called instead of mutating a host-authoritative structured document. */
 +    onEditIntent?: (intent: EditorEditIntent) => void;
++    onPaste?: (intent: EditorPasteIntent) => boolean;
      /** Add text to history for up/down navigation */
      addToHistory?(text: string): void;
      /** Insert text at current cursor position */
@@ -554,7 +580,7 @@ index b598c4d291ace5f04b83161252b3ab8cdd4ccbdf..4e776071dab430ab4dc18c589fd15d22
       * Get text with any markers expanded (e.g., paste markers).
       * Falls back to getText() if not implemented.
 diff --git a/dist/index.d.ts b/dist/index.d.ts
-index 50b5aeb61f12011642978bc2c31d8a2eb36d17d3..86a7fd77af0a5b812f0cb12cd62508b17b1d06d8 100644
+index 50b5aeb61f12011642978bc2c31d8a2eb36d17d3..5882d0e9bfd60ee3342083ea57fcffacf34e0ef1 100644
 --- a/dist/index.d.ts
 +++ b/dist/index.d.ts
 @@ -2,7 +2,7 @@ export { Marked, type Token, type Tokens } from "marked";
@@ -562,7 +588,7 @@ index 50b5aeb61f12011642978bc2c31d8a2eb36d17d3..86a7fd77af0a5b812f0cb12cd62508b1
  export { Box } from "./components/box.ts";
  export { CancellableLoader } from "./components/cancellable-loader.ts";
 -export { Editor, type EditorOptions, type EditorTheme } from "./components/editor.ts";
-+export { Editor, type EditorDocumentPart, type EditorDocumentPoint, type EditorEditIntent, type EditorOptions, type EditorTheme } from "./components/editor.ts";
++export { Editor, type EditorDocumentPart, type EditorDocumentPoint, type EditorEditIntent, type EditorOptions, type EditorPasteIntent, type EditorTheme } from "./components/editor.ts";
  export { HStack } from "./components/h-stack.ts";
  export { Image, type ImageOptions, type ImageTheme } from "./components/image.ts";
  export { Input } from "./components/input.ts";

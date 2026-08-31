@@ -1010,6 +1010,7 @@ test("PresentationSession opens an empty project catalog without creating a sess
         unavailableReason: "New session required for attachments",
         sealed: false,
         resources: [],
+        pastedTexts: [],
         revisionIntent: null,
       },
       transient: null,
@@ -2739,6 +2740,344 @@ test("PresentationSession stages one draft resource before sealing the admitted 
     });
   } finally {
     releaseCopy.resolve();
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession expands one pasted Text atom at its exact durable user position", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-pasted-text-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const selectedPath = join(testRoot, "mixed-notes.txt");
+  await writeFile(selectedPath, "mixed notes\n", "utf8");
+  const pasted = Array.from({ length: 11 }, (_, index) => `pasted line ${index + 1}`).join("\n");
+  const requests: Parameters<ModelDriver["stream"]>[0][] = [];
+  const driver = new FakeModelDriver((request) => {
+    requests.push(request);
+    return [
+      { type: "text_delta", text: "Pasted text answer." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    openProject: true,
+    projectLabel: "workspace",
+    stateRoot,
+    workspaceRoot,
+    [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+  });
+
+  try {
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    await presentation.dispatch({ type: "update_draft_text", text: "beforeafter" });
+    const draft = presentation.getState().composer;
+    const textElement = draft.elements[0];
+    if (textElement?.type !== "text") {
+      throw new Error("Expected one literal draft span.");
+    }
+    await expect(
+      presentation.dispatch({
+        type: "stage_pasted_text",
+        text: pasted,
+        mutation: {
+          at: { elementId: textElement.elementId, offset: 6 },
+          baseRevision: draft.draftRevision,
+        },
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer).toMatchObject({
+      elements: [
+        { type: "text", text: "before" },
+        { type: "pasted_text", ordinal: 1 },
+        { type: "text", text: "after" },
+      ],
+      renderedText: "before[Text #1]after",
+      pastedTexts: [{ ordinal: 1, state: "ready", lineCount: 11 }],
+    });
+    await expect(
+      presentation.dispatch({ type: "stage_input_resource", path: selectedPath }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer.renderedText).toBe("before[Text #1]after[File #2]");
+
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "beforeafter",
+        skills: [],
+        thinkingSelection: null,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    const ordinaryRequest = requests.find((request) =>
+      request.messages.some(
+        (message) =>
+          message.role === "user" &&
+          typeof message.content === "string" &&
+          message.content.startsWith(`before${pasted}after[File #2]`) &&
+          message.content.includes('"displayName":"mixed-notes.txt"'),
+      ),
+    );
+    expect(ordinaryRequest).toBeDefined();
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected an admitted pasted-text session.");
+    }
+    const logicalRun = (await readInMemoryPresentationRecords(harness.sessions)(sessionId)).find(
+      (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
+    );
+    expect(logicalRun).toMatchObject({
+      record: {
+        recordVersion: 3,
+        userMessage: "beforeafter",
+        pastedTexts: [{ byteCount: Buffer.byteLength(pasted, "utf8") }],
+        inputResources: [{ displayName: "mixed-notes.txt" }],
+        userContent: [
+          { type: "text", text: "before" },
+          { type: "pasted_text", occurrenceId: expect.any(String), draftOrdinal: 1 },
+          { type: "text", text: "after" },
+          { type: "input_resource", occurrenceId: expect.any(String), draftOrdinal: 2 },
+        ],
+      },
+    });
+    await waitForAssistantMessage(presentation, "Pasted text answer.");
+    await presentation.close();
+    await lifecycle.continue({
+      sessionId,
+      input: { text: "Continue after pasted text." },
+    });
+    const replayedRequest = requests.findLast((request) =>
+      request.messages.some(
+        (message) =>
+          message.role === "user" &&
+          typeof message.content === "string" &&
+          message.content.includes("Continue after pasted text."),
+      ),
+    );
+    expect(
+      replayedRequest?.messages.some(
+        (message) =>
+          message.role === "user" &&
+          typeof message.content === "string" &&
+          message.content.startsWith(`before${pasted}after[File #2]`) &&
+          message.content.includes('"displayName":"mixed-notes.txt"'),
+      ),
+    ).toBe(true);
+    const reopened = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      projectLabel: "workspace",
+      sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    expect(reopened.getState().authoritative.active?.transcript.items).toContainEqual(
+      expect.objectContaining({
+        type: "user_message",
+        text: "before[Text #1]after[File #2]",
+      }),
+    );
+    await reopened.close();
+  } finally {
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession accepts exactly 1 MiB of structured text and rejects one extra byte", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-pasted-text-limit-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const exact = "x".repeat(1_024 * 1_024);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    projectLabel: "workspace",
+    stateRoot,
+    targetIdentity,
+    workspaceRoot,
+  });
+
+  try {
+    await expect(
+      presentation.dispatch({ type: "stage_pasted_text", text: exact }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await expect(presentation.dispatch({ type: "read_expanded_draft" })).resolves.toMatchObject({
+      status: "admitted",
+      draftText: exact,
+    });
+    await expect(presentation.dispatch({ type: "update_draft_text", text: "x" })).resolves.toEqual({
+      status: "rejected",
+      code: "not_available",
+      message: "The structured text payload exceeds the v1 turn limit.",
+    });
+    expect(presentation.getState().composer.renderedText).toBe("[Text #1]");
+    await expect(
+      presentation.dispatch({
+        type: "clear_draft",
+        baseRevision: presentation.getState().composer.draftRevision,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await expect(
+      presentation.dispatch({ type: "stage_pasted_text", text: `${exact}x` }),
+    ).resolves.toMatchObject({ status: "rejected", code: "not_available" });
+    expect(presentation.getState().composer.pastedTexts).toEqual([]);
+  } finally {
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession rejects an oversized Text atom before durable admission or provider work", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-pasted-text-context-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let providerCalls = 0;
+  const constrainedProfile: ContextProfile = {
+    version: 1,
+    contextWindowTokens: 1_200,
+    maximumOutputTokens: 100,
+    compactAtTokens: 900,
+    postCompactTargetTokens: 400,
+    retainedTargetTokens: 100,
+    estimatorVersion: 1,
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: targetIdentity,
+        contextProfile: constrainedProfile,
+        driver: new FakeModelDriver(() => {
+          providerCalls += 1;
+          return [{ type: "finish", reason: "stop" }];
+        }),
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: constrainedProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    modelTargets,
+    openProject: true,
+    projectLabel: "workspace",
+    stateRoot,
+    workspaceRoot,
+  });
+
+  try {
+    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    await presentation.dispatch({ type: "stage_pasted_text", text: "x".repeat(5_000) });
+    await expect(
+      presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Send the paste.",
+        skills: [],
+        thinkingSelection: null,
+      }),
+    ).resolves.toEqual({
+      status: "rejected",
+      code: "not_available",
+      message:
+        "The expanded draft cannot fit the exact target context. Remove or split Text atoms, or switch targets.",
+    });
+    expect(providerCalls).toBe(0);
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
+    expect(presentation.getState().composer.renderedText).toBe("[Text #1]");
+  } finally {
+    await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession removes and undoes one whole Text atom without renumbering", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-pasted-text-undo-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const lifecycle = createSessionLifecycle({ stateRoot, workspaceRoot });
+  const presentation = await createPresentationSession({
+    lifecycle,
+    projectLabel: "workspace",
+    stateRoot,
+    targetIdentity,
+    workspaceRoot,
+  });
+
+  try {
+    await presentation.dispatch({
+      type: "stage_pasted_text",
+      text: Array.from({ length: 11 }, (_, index) => `undo line ${index + 1}`).join("\n"),
+    });
+    const staged = presentation.getState().composer;
+    const atom = staged.elements[0];
+    if (atom?.type !== "pasted_text") {
+      throw new Error("Expected one Text atom.");
+    }
+    await expect(
+      presentation.dispatch({
+        type: "remove_draft_element",
+        baseRevision: staged.draftRevision,
+        elementId: atom.elementId,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer).toMatchObject({
+      renderedText: "",
+      pastedTexts: [],
+    });
+    await expect(
+      presentation.dispatch({
+        type: "undo_draft",
+        baseRevision: presentation.getState().composer.draftRevision,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer).toMatchObject({
+      renderedText: "[Text #1]",
+      pastedTexts: [{ ordinal: 1, state: "ready" }],
+    });
+    await presentation.dispatch({
+      type: "stage_pasted_text",
+      text: "x".repeat(1_001),
+    });
+    expect(presentation.getState().composer.renderedText).toBe("[Text #1][Text #2]");
+  } finally {
     await presentation.close();
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -4770,6 +5109,7 @@ test("PresentationSession opens an exact target as a recoverable draft", async (
         unavailableReason: null,
         sealed: false,
         resources: [],
+        pastedTexts: [],
         revisionIntent: null,
       },
       transient: null,
@@ -4790,6 +5130,9 @@ test("PresentationSession recovers the default new-session draft after a clean r
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
   const selectedPath = join(workspaceRoot, "notes.txt");
+  const pasted = Array.from({ length: 11 }, (_, index) => `recovered paste ${index + 1}`).join(
+    "\n",
+  );
   await writeFile(selectedPath, "notes", "utf8");
   const modelTargets: ModelTargets = {
     async resolve() {
@@ -4837,6 +5180,9 @@ test("PresentationSession recovers the default new-session draft after a clean r
         },
       }),
     ).resolves.toMatchObject({ status: "admitted" });
+    await expect(
+      presentation.dispatch({ type: "stage_pasted_text", text: pasted }),
+    ).resolves.toMatchObject({ status: "admitted" });
     await presentation.close();
 
     presentation = await createProductPresentationSession({
@@ -4852,9 +5198,14 @@ test("PresentationSession recovers the default new-session draft after a clean r
         { type: "text", text: "before" },
         { type: "resource", kind: "file", ordinal: 1 },
         { type: "text", text: "after" },
+        { type: "pasted_text", ordinal: 2 },
       ],
-      renderedText: "before[File #1]after",
+      renderedText: "before[File #1]after[Text #2]",
       resources: [{ displayName: "notes.txt", ordinal: 1, state: "ready" }],
+      pastedTexts: [{ ordinal: 2, state: "ready", lineCount: 11 }],
+    });
+    await expect(presentation.dispatch({ type: "read_expanded_draft" })).resolves.toMatchObject({
+      draftText: `before[File #1]after${pasted}`,
     });
     await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
   } finally {
@@ -4886,6 +5237,9 @@ test("PresentationSession discards an explicit process-only draft on close", asy
     await expect(
       presentation.dispatch({ type: "update_draft_text", text: "do not recover me" }),
     ).resolves.toMatchObject({ status: "admitted" });
+    await expect(
+      presentation.dispatch({ type: "stage_pasted_text", text: "x".repeat(1_001) }),
+    ).resolves.toMatchObject({ status: "admitted" });
     await presentation.close();
 
     presentation = await createPresentationSession({
@@ -4901,6 +5255,7 @@ test("PresentationSession discards an explicit process-only draft on close", asy
       elements: [],
       renderedText: "",
       resources: [],
+      pastedTexts: [],
     });
   } finally {
     await presentation?.close();

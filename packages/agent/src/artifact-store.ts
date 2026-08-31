@@ -78,6 +78,16 @@ export type InputResourceArtifactSourceV1 = {
   readonly provenance: "user_local_file";
 };
 
+export type PastedTextArtifactSourceV1 = {
+  readonly type: "pasted_text";
+  readonly schemaVersion: 1;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly runId: string;
+  readonly occurrenceId: string;
+  readonly provenance: "user_paste";
+};
+
 export type PlanArtifactSourceV1 = {
   readonly type: "plan";
   readonly schemaVersion: 1;
@@ -95,6 +105,7 @@ export type ArtifactSource =
   | InputResourceArtifactSourceV1
   | McpToolResultArtifactSourceV1
   | ModelResponseArtifactSource
+  | PastedTextArtifactSourceV1
   | PlanArtifactSourceV1
   | SkillArtifactSource
   | ToolArtifactSource;
@@ -127,6 +138,7 @@ export type ArtifactStagingStore = {
     readonly bytes: Uint8Array;
     readonly mediaType: string;
   }): Promise<StagedArtifactReference>;
+  read(reference: StagedArtifactReference, maximumBytes: number): Promise<Uint8Array | undefined>;
   retain(reference: StagedArtifactReference): Promise<void>;
   discard(reference: StagedArtifactReference): Promise<void>;
   close(): Promise<void>;
@@ -161,6 +173,46 @@ export async function createFileArtifactStagingStore(options: {
         mediaType: input.mediaType,
         byteCount: bytes.byteLength,
       };
+    },
+    async read(reference, maximumBytes) {
+      requireStagingId(reference.stagingId);
+      if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 0) {
+        throw new TypeError("The provisional artifact read bound is invalid.");
+      }
+      let file: Awaited<ReturnType<typeof open>>;
+      try {
+        file = await open(
+          join(stagingRoot, reference.stagingId),
+          constants.O_RDONLY | constants.O_NOFOLLOW,
+        );
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") {
+          return undefined;
+        }
+        throw error;
+      }
+      try {
+        const stats = await file.stat();
+        if (
+          !stats.isFile() ||
+          stats.size !== reference.byteCount ||
+          stats.size > maximumBytes ||
+          (stats.mode & 0o077) !== 0 ||
+          (process.geteuid?.() !== undefined && stats.uid !== process.geteuid())
+        ) {
+          throw new Error("The provisional artifact is unsafe.");
+        }
+        const bytes = await file.readFile();
+        if (
+          bytes.byteLength !== reference.byteCount ||
+          `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== reference.id
+        ) {
+          throw new Error("The provisional artifact does not match its sealed digest.");
+        }
+        return bytes;
+      } finally {
+        await file.close();
+      }
     },
     async discard(reference) {
       requireStagingId(reference.stagingId);

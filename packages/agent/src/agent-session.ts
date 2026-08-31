@@ -68,6 +68,11 @@ import {
   projectedContentUsageV1,
 } from "./model-user-content.js";
 import {
+  isLargePastedTextV1,
+  pastedTextMetricsV1,
+  pastedTextOccurrenceV1Schema,
+} from "./pasted-text.js";
+import {
   downgradePlanCommandAssessmentV1,
   type PlanCommandAssessment,
 } from "./plan-command-assessment.js";
@@ -443,6 +448,8 @@ export class AgentSession {
             : createSessionUserContentMessageV1({
                 elements: input.userContent,
                 occurrences: input.inputResources ?? [],
+                pastedTexts: input.pastedTexts ?? [],
+                pastedTextContents: input.pastedTextContents,
                 userMessage: input.text,
               });
         const explicitSkills = (input.skills ?? []).map((selection, index) => ({
@@ -469,11 +476,18 @@ export class AgentSession {
                 ? input.inputResources === undefined || input.inputResources.length === 0
                   ? {}
                   : { recordVersion: 1 as const, inputResources: input.inputResources }
-                : {
-                    recordVersion: 2 as const,
-                    inputResources: input.inputResources ?? [],
-                    userContent: input.userContent,
-                  }),
+                : input.pastedTexts !== undefined && input.pastedTexts.length > 0
+                  ? {
+                      recordVersion: 3 as const,
+                      inputResources: input.inputResources ?? [],
+                      pastedTexts: input.pastedTexts,
+                      userContent: input.userContent,
+                    }
+                  : {
+                      recordVersion: 2 as const,
+                      inputResources: input.inputResources ?? [],
+                      userContent: input.userContent,
+                    }),
               runId: this.#activeRunId,
               userMessage: input.text,
               ...(this.#durableContext.planKickoff === undefined
@@ -4296,7 +4310,8 @@ function findRetainedFromSequence(
       record.type === "logical_run_started" &&
       record.runId === runId &&
       firstRetained.role === "user" &&
-      isDeepStrictEqual(createLogicalRunUserMessageV1(record), firstRetained)
+      (record.recordVersion === 3 ||
+        isDeepStrictEqual(createLogicalRunUserMessageV1(record), firstRetained))
     ) {
       return entry.sequence;
     }
@@ -4662,13 +4677,43 @@ function isStructuredUserContentValid(input: UserInput): boolean {
   if (input.userContent === undefined) {
     return true;
   }
-  if (input.inputResources === undefined || input.inputResources.length === 0) {
+  if (
+    (input.inputResources === undefined || input.inputResources.length === 0) &&
+    (input.pastedTexts === undefined || input.pastedTexts.length === 0)
+  ) {
+    return false;
+  }
+  if (
+    input.pastedTexts !== undefined &&
+    (!Array.isArray(input.pastedTexts) ||
+      input.pastedTexts.length > 8 ||
+      input.pastedTexts.some(
+        (occurrence) => !pastedTextOccurrenceV1Schema.safeParse(occurrence).success,
+      ) ||
+      input.pastedTextContents === undefined ||
+      input.pastedTexts.some((occurrence) => {
+        const text = input.pastedTextContents?.get(occurrence.occurrenceId);
+        if (text === undefined) {
+          return true;
+        }
+        const metrics = pastedTextMetricsV1(text);
+        return (
+          metrics.byteCount !== occurrence.byteCount ||
+          metrics.lineCount !== occurrence.lineCount ||
+          metrics.scalarCount !== occurrence.scalarCount ||
+          `sha256:${createHash("sha256").update(text, "utf8").digest("hex")}` !==
+            occurrence.digest ||
+          !isLargePastedTextV1(text)
+        );
+      }))
+  ) {
     return false;
   }
   try {
     validateSessionUserContentV1({
       elements: input.userContent,
-      occurrences: input.inputResources,
+      occurrences: input.inputResources ?? [],
+      pastedTexts: input.pastedTexts ?? [],
       userMessage: input.text,
     });
     return true;

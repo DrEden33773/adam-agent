@@ -10,7 +10,10 @@ import type {
   SessionModelResponseField,
   SessionRecord,
 } from "./session-store.js";
-import { createSessionUserContentMessageV1 } from "./structured-user-content.js";
+import {
+  createSessionUserContentMessageV1,
+  pastedTextProjectionContentsFromV1,
+} from "./structured-user-content.js";
 
 export function modelMessagesFromCompleteRecords(
   records: readonly SessionRecord[],
@@ -109,7 +112,15 @@ export function createLogicalRunUserMessageV1(
         occurrences: record.inputResources,
         userMessage: record.userMessage,
       })
-    : createInputResourceUserMessageV1(record.userMessage, record.inputResources);
+    : record.recordVersion === 3
+      ? createSessionUserContentMessageV1({
+          elements: record.userContent,
+          occurrences: record.inputResources,
+          pastedTexts: record.pastedTexts,
+          pastedTextContents: pastedTextProjectionContentsFromV1(record),
+          userMessage: record.userMessage,
+        })
+      : createInputResourceUserMessageV1(record.userMessage, record.inputResources);
 }
 
 export function inlineModelResponseField(field: string | SessionModelResponseField): string {

@@ -6,6 +6,11 @@ import {
   type StagedInputResourceSelectionV1,
   safeInputResourceDisplayNameV1,
 } from "./input-resources.js";
+import {
+  normalizePastedTextV1,
+  pastedTextLimitsV1,
+  type StagedPastedTextSelectionV1,
+} from "./pasted-text.js";
 import type { RecoverableTurnDraftV1 } from "./recoverable-turn-draft.js";
 import type { StagedUserContentElementV1 } from "./structured-user-content.js";
 
@@ -42,6 +47,12 @@ export type TurnComposerElementSnapshot =
       readonly kind: "file" | "image";
       readonly ordinal: number;
       readonly resourceId: string;
+    }
+  | {
+      readonly elementId: string;
+      readonly type: "pasted_text";
+      readonly ordinal: number;
+      readonly pastedTextId: string;
     };
 
 export type TurnComposerSealedElement =
@@ -52,7 +63,27 @@ export type TurnComposerSealedElement =
       readonly ordinal: number;
       readonly token: string;
       readonly selection: StagedInputResourceSelectionV1;
+    }
+  | {
+      readonly type: "pasted_text";
+      readonly ordinal: number;
+      readonly token: string;
+      readonly text: string;
+      readonly selection: StagedPastedTextSelectionV1;
     };
+
+export type TurnComposerPastedTextSnapshot = {
+  readonly id: string;
+  readonly elementId: string;
+  readonly ordinal: number;
+  readonly token: string;
+  readonly state: "copying" | "ready" | "failed" | "removed";
+  readonly byteCount: number;
+  readonly lineCount: number;
+  readonly scalarCount: number;
+  readonly origin: "pasted_text";
+  readonly diagnostic: string | null;
+};
 
 type TurnComposerResource = {
   readonly id: string;
@@ -68,6 +99,23 @@ type TurnComposerResource = {
   diagnostic: string | null;
   readonly controller: AbortController;
   staged: StagedInputResourceSelectionV1 | null;
+  retained: boolean;
+  settlement: Promise<void> | null;
+};
+
+type TurnComposerPastedText = {
+  readonly id: string;
+  readonly elementId: string;
+  readonly ordinal: number;
+  readonly origin: "pasted_text";
+  state: TurnComposerPastedTextSnapshot["state"];
+  byteCount: number;
+  lineCount: number;
+  scalarCount: number;
+  diagnostic: string | null;
+  readonly controller: AbortController;
+  staged: StagedPastedTextSelectionV1 | null;
+  text: string | null;
   retained: boolean;
   settlement: Promise<void> | null;
 };
@@ -88,12 +136,18 @@ export type TurnComposer = {
     mutation?: { readonly at: TurnComposerDraftPoint; readonly baseRevision: number },
     commit?: () => Promise<void>,
   ): Promise<string>;
+  stagePastedText(
+    text: string,
+    mutation?: { readonly at: TurnComposerDraftPoint; readonly baseRevision: number },
+    commit?: () => Promise<void>,
+  ): Promise<string>;
   replaceText(
     input: {
       readonly baseRevision: number;
       readonly document: readonly (
         | { readonly type: "text"; readonly text: string }
         | { readonly type: "resource"; readonly elementId: string }
+        | { readonly type: "pasted_text"; readonly elementId: string }
       )[];
     },
     commit?: () => Promise<void>,
@@ -103,6 +157,7 @@ export type TurnComposer = {
   undo(baseRevision: number, commit?: () => Promise<void>): Promise<boolean>;
   cancel(id: string): Promise<boolean>;
   remove(id: string, commit?: () => Promise<void>): Promise<boolean>;
+  removePastedText(id: string, commit?: () => Promise<void>): Promise<boolean>;
   setText(text: string): void;
   commitText(text: string, commit: () => Promise<void>): Promise<void>;
   seal(signal: AbortSignal): Promise<{
@@ -111,10 +166,12 @@ export type TurnComposer = {
     readonly structuredContent: readonly StagedUserContentElementV1[];
     readonly text: string;
     readonly selections: readonly StagedInputResourceSelectionV1[];
+    readonly pastedTextSelections: readonly StagedPastedTextSelectionV1[];
   }>;
   unseal(): void;
   reset(baseRevision: number, commit: () => Promise<void>): Promise<boolean>;
   clear(options?: { readonly preserveRetained?: boolean }): Promise<void>;
+  readExpandedText(): string;
   close(): Promise<void>;
   snapshot(): {
     readonly elements: readonly TurnComposerElementSnapshot[];
@@ -122,6 +179,7 @@ export type TurnComposer = {
     readonly revision: number;
     readonly sealed: boolean;
     readonly resources: readonly TurnComposerResourceSnapshot[];
+    readonly pastedTexts: readonly TurnComposerPastedTextSnapshot[];
   };
 };
 
@@ -130,12 +188,14 @@ export async function createTurnComposer(options: {
   readonly stager: TurnComposerResourceStager;
 }): Promise<TurnComposer> {
   const resources = new Map<string, TurnComposerResource>();
+  const pastedTexts = new Map<string, TurnComposerPastedText>();
   let elements: TurnComposerElementSnapshot[] = [];
   let nextOrdinal = 1;
   let revision = 0;
   const undoStack: Array<{
     readonly previousElements: readonly TurnComposerElementSnapshot[];
     readonly restoredResourceId?: string;
+    readonly restoredPastedTextId?: string;
   }> = [];
   const pushUndo = (entry: (typeof undoStack)[number]): void => {
     if (undoStack.length >= 100) {
@@ -161,25 +221,41 @@ export async function createTurnComposer(options: {
     }
   };
 
-  const resourceToken = (kind: "file" | "image", ordinal: number): string =>
-    `[${kind === "image" ? "Image" : "File"} #${ordinal}]`;
+  const discardPastedText = async (pastedText: TurnComposerPastedText): Promise<void> => {
+    if (pastedText.staged !== null) {
+      const staged = pastedText.staged;
+      pastedText.staged = null;
+      await options.stager.discard(staged);
+    }
+  };
+
+  const atomToken = (kind: "file" | "image" | "text", ordinal: number): string =>
+    `[${kind === "image" ? "Image" : kind === "text" ? "Text" : "File"} #${ordinal}]`;
 
   const renderedText = (): string =>
     elements
       .map((element) =>
-        element.type === "text" ? element.text : resourceToken(element.kind, element.ordinal),
+        element.type === "text"
+          ? element.text
+          : atomToken(element.type === "pasted_text" ? "text" : element.kind, element.ordinal),
       )
       .join("");
 
   const literalText = (): string =>
     elements.flatMap((element) => (element.type === "text" ? [element.text] : [])).join("");
 
+  const textPayloadBytes = (literal = literalText()): number =>
+    Buffer.byteLength(literal, "utf8") +
+    [...pastedTexts.values()]
+      .filter((pastedText) => pastedText.state !== "removed")
+      .reduce((total, pastedText) => total + pastedText.byteCount, 0);
+
   const resolvePoint = (
     point: TurnComposerDraftPoint,
   ): { readonly index: number; readonly offset: number } | undefined => {
     if ("elementId" in point && "edge" in point) {
       const index = elements.findIndex((element) => element.elementId === point.elementId);
-      if (index < 0 || elements[index]?.type !== "resource") {
+      if (index < 0 || elements[index]?.type === "text") {
         return undefined;
       }
       return { index: point.edge === "before" ? index : index + 1, offset: 0 };
@@ -236,7 +312,7 @@ export async function createTurnComposer(options: {
     const textElements = elements.flatMap((element, index) =>
       element.type === "text" ? [{ element, index }] : [],
     );
-    if (!elements.some((element) => element.type === "resource")) {
+    if (!elements.some((element) => element.type !== "text")) {
       elements =
         nextText.length === 0 ? [] : [{ elementId: randomUUID(), type: "text", text: nextText }];
       return;
@@ -265,8 +341,8 @@ export async function createTurnComposer(options: {
           );
   };
 
-  const insertResource = (
-    element: Extract<TurnComposerElementSnapshot, { readonly type: "resource" }>,
+  const insertAtomicElement = (
+    element: Exclude<TurnComposerElementSnapshot, { readonly type: "text" }>,
     mutation: { readonly at: TurnComposerDraftPoint; readonly baseRevision: number } | undefined,
   ): void => {
     if (mutation === undefined) {
@@ -322,6 +398,30 @@ export async function createTurnComposer(options: {
     return { element, previousElements };
   };
 
+  const removePastedTextElement = (
+    id: string,
+  ):
+    | {
+        readonly element: Extract<TurnComposerElementSnapshot, { readonly type: "pasted_text" }>;
+        readonly previousElements: readonly TurnComposerElementSnapshot[];
+      }
+    | undefined => {
+    const previousElements = elements;
+    const index = previousElements.findIndex(
+      (element) => element.type === "pasted_text" && element.pastedTextId === id,
+    );
+    const element = previousElements[index];
+    if (index < 0 || element?.type !== "pasted_text") {
+      return undefined;
+    }
+    elements = normalizeTextElements([
+      ...previousElements.slice(0, index),
+      ...previousElements.slice(index + 1),
+    ]);
+    revision += 1;
+    return { element, previousElements };
+  };
+
   return {
     async captureDraft(scope) {
       const orderedResources = elements.flatMap((element) => {
@@ -330,6 +430,13 @@ export async function createTurnComposer(options: {
         }
         const resource = resources.get(element.resourceId);
         return resource === undefined ? [] : [resource];
+      });
+      const orderedPastedTexts = elements.flatMap((element) => {
+        if (element.type !== "pasted_text") {
+          return [];
+        }
+        const pastedText = pastedTexts.get(element.pastedTextId);
+        return pastedText === undefined ? [] : [pastedText];
       });
       if (
         orderedResources.some(
@@ -341,10 +448,29 @@ export async function createTurnComposer(options: {
           "Only settled input resources can enter a recoverable draft.",
         );
       }
+      if (
+        orderedPastedTexts.some(
+          (pastedText) => pastedText.state !== "ready" && pastedText.state !== "failed",
+        )
+      ) {
+        throw new TurnComposerError(
+          "failed",
+          "Only settled Text atoms can enter a recoverable draft.",
+        );
+      }
       for (const resource of orderedResources) {
         if (resource.state === "ready" && resource.staged !== null && !resource.retained) {
           await options.stager.retain({ resourceId: resource.id, selection: resource.staged });
           resource.retained = true;
+        }
+      }
+      for (const pastedText of orderedPastedTexts) {
+        if (pastedText.state === "ready" && pastedText.staged !== null && !pastedText.retained) {
+          await options.stager.retain({
+            resourceId: pastedText.id,
+            selection: pastedText.staged,
+          });
+          pastedText.retained = true;
         }
       }
       return {
@@ -365,10 +491,23 @@ export async function createTurnComposer(options: {
           diagnostic: resource.diagnostic,
           ...(resource.staged === null ? {} : { selection: resource.staged }),
         })),
+        pastedTexts: orderedPastedTexts.map((pastedText) => ({
+          id: pastedText.id,
+          elementId: pastedText.elementId,
+          ordinal: pastedText.ordinal,
+          state: pastedText.state as "failed" | "ready",
+          byteCount: pastedText.byteCount,
+          lineCount: pastedText.lineCount,
+          scalarCount: pastedText.scalarCount,
+          diagnostic: pastedText.diagnostic,
+          ...(pastedText.state !== "ready" || pastedText.staged === null
+            ? {}
+            : { selection: pastedText.staged }),
+        })),
       };
     },
     async restoreDraft(draft) {
-      if (closed || sealed || elements.length > 0 || resources.size > 0) {
+      if (closed || sealed || elements.length > 0 || resources.size > 0 || pastedTexts.size > 0) {
         throw new TypeError("The turn composer cannot replace a nonempty draft.");
       }
       const recoveredResources = new Map(
@@ -380,6 +519,33 @@ export async function createTurnComposer(options: {
         )
       ) {
         throw new TypeError("The recoverable turn draft is incomplete.");
+      }
+      const recoveredPastedTexts = new Map(
+        (draft.pastedTexts ?? []).map((item) => [item.id, item]),
+      );
+      if (
+        draft.elements.some(
+          (element) =>
+            element.type === "pasted_text" && !recoveredPastedTexts.has(element.pastedTextId),
+        )
+      ) {
+        throw new TypeError("The recoverable turn draft has incomplete Text atoms.");
+      }
+      if ((draft.pastedTexts?.length ?? 0) > 0 && options.stager.readText === undefined) {
+        throw new TypeError("Recoverable Text atoms are unavailable.");
+      }
+      const recoveredPastedTextContents = new Map<string, string>();
+      for (const recovered of draft.pastedTexts ?? []) {
+        if (recovered.selection !== undefined) {
+          try {
+            recoveredPastedTextContents.set(
+              recovered.id,
+              (await options.stager.readText?.(recovered.selection)) as string,
+            );
+          } catch {
+            // Preserve the atom as failed so the caller can remove it without guessing content.
+          }
+        }
       }
       elements = draft.elements.map((element) => ({ ...element }));
       nextOrdinal = draft.nextOrdinal;
@@ -405,6 +571,28 @@ export async function createTurnComposer(options: {
           settlement: Promise.resolve(),
         });
       }
+      for (const recovered of draft.pastedTexts ?? []) {
+        const recoveredText = recoveredPastedTextContents.get(recovered.id) ?? null;
+        pastedTexts.set(recovered.id, {
+          id: recovered.id,
+          elementId: recovered.elementId,
+          ordinal: recovered.ordinal,
+          origin: "pasted_text",
+          state: recovered.state === "ready" && recoveredText === null ? "failed" : recovered.state,
+          byteCount: recovered.byteCount,
+          lineCount: recovered.lineCount,
+          scalarCount: recovered.scalarCount,
+          diagnostic:
+            recovered.state === "ready" && recoveredText === null
+              ? "The recoverable pasted-text bytes are unavailable."
+              : recovered.diagnostic,
+          controller: new AbortController(),
+          staged: recovered.selection ?? null,
+          text: recoveredText,
+          retained: recovered.selection !== undefined,
+          settlement: Promise.resolve(),
+        });
+      }
       revision += 1;
       publish();
     },
@@ -417,42 +605,38 @@ export async function createTurnComposer(options: {
       ) {
         return false;
       }
-      const currentResources = elements.filter(
-        (element): element is Extract<TurnComposerElementSnapshot, { readonly type: "resource" }> =>
-          element.type === "resource",
+      const currentAtoms = elements.filter(
+        (element): element is Exclude<TurnComposerElementSnapshot, { readonly type: "text" }> =>
+          element.type !== "text",
       );
-      const projectedResourceIds = input.document.flatMap((part) =>
-        part.type === "resource" ? [part.elementId] : [],
+      const projectedAtomIds = input.document.flatMap((part) =>
+        part.type === "text" ? [] : [part.elementId],
       );
       if (
-        projectedResourceIds.length !== currentResources.length ||
-        projectedResourceIds.some(
-          (elementId, index) => currentResources[index]?.elementId !== elementId,
-        )
+        projectedAtomIds.length !== currentAtoms.length ||
+        projectedAtomIds.some((elementId, index) => currentAtoms[index]?.elementId !== elementId)
       ) {
         return false;
       }
       const currentTextIdByGap = new Map<number, string>();
       let gap = 0;
       for (const element of elements) {
-        if (element.type === "resource") {
+        if (element.type !== "text") {
           gap += 1;
         } else if (!currentTextIdByGap.has(gap)) {
           currentTextIdByGap.set(gap, element.elementId);
         }
       }
-      const resourcesByElementId = new Map(
-        currentResources.map((resource) => [resource.elementId, resource]),
-      );
+      const atomsByElementId = new Map(currentAtoms.map((atom) => [atom.elementId, atom]));
       const nextElements: TurnComposerElementSnapshot[] = [];
       gap = 0;
       for (const part of input.document) {
-        if (part.type === "resource") {
-          const resource = resourcesByElementId.get(part.elementId);
-          if (resource === undefined) {
+        if (part.type !== "text") {
+          const atom = atomsByElementId.get(part.elementId);
+          if (atom === undefined || atom.type !== part.type) {
             return false;
           }
-          nextElements.push(resource);
+          nextElements.push(atom);
           gap += 1;
           continue;
         }
@@ -476,8 +660,14 @@ export async function createTurnComposer(options: {
       const nextText = nextElements
         .flatMap((element) => (element.type === "text" ? [element.text] : []))
         .join("");
-      if (nextText.length > 512 * 1024) {
-        throw new TypeError("The structured draft text exceeds the C0 limit.");
+      if (
+        nextText.length > 512 * 1024 ||
+        textPayloadBytes(nextText) > pastedTextLimitsV1.maximumTextBytesPerTurn
+      ) {
+        throw new TurnComposerError(
+          "limit_exceeded",
+          "The structured text payload exceeds the v1 turn limit.",
+        );
       }
       const previousElements = elements;
       const previousText = text;
@@ -565,6 +755,50 @@ export async function createTurnComposer(options: {
       publish();
       return true;
     },
+    async removePastedText(id, commit) {
+      if (closed || sealed) {
+        return false;
+      }
+      const pastedText = pastedTexts.get(id);
+      if (pastedText === undefined || pastedText.state === "removed") {
+        return false;
+      }
+      const previousElements = elements;
+      const previousText = text;
+      const previousRevision = revision;
+      const previousState = pastedText.state;
+      const previousDiagnostic = pastedText.diagnostic;
+      const previousUndoStack = [...undoStack];
+      pastedText.state = "removed";
+      pastedText.controller.abort();
+      await pastedText.settlement;
+      const removed = removePastedTextElement(id);
+      if (removed !== undefined && pastedText.staged !== null && pastedText.text !== null) {
+        pushUndo({
+          previousElements: removed.previousElements,
+          restoredPastedTextId: removed.element.pastedTextId,
+        });
+      }
+      text = literalText();
+      try {
+        await commit?.();
+      } catch (error) {
+        elements = previousElements;
+        text = previousText;
+        revision = previousRevision;
+        pastedText.state = previousState;
+        pastedText.diagnostic = previousDiagnostic;
+        undoStack.length = 0;
+        undoStack.push(...previousUndoStack);
+        throw error;
+      }
+      if (removed === undefined || pastedText.staged === null || pastedText.text === null) {
+        await discardPastedText(pastedText);
+        pastedTexts.delete(id);
+      }
+      publish();
+      return true;
+    },
     async undo(baseRevision, commit) {
       if (closed || sealed || baseRevision !== revision) {
         return false;
@@ -577,9 +811,20 @@ export async function createTurnComposer(options: {
         entry.restoredResourceId === undefined
           ? undefined
           : resources.get(entry.restoredResourceId);
+      const pastedText =
+        entry.restoredPastedTextId === undefined
+          ? undefined
+          : pastedTexts.get(entry.restoredPastedTextId);
       if (
         entry.restoredResourceId !== undefined &&
         (resource?.state !== "removed" || resource.staged === null)
+      ) {
+        undoStack.push(entry);
+        return false;
+      }
+      if (
+        entry.restoredPastedTextId !== undefined &&
+        (pastedText?.state !== "removed" || pastedText.staged === null)
       ) {
         undoStack.push(entry);
         return false;
@@ -592,6 +837,9 @@ export async function createTurnComposer(options: {
       if (resource !== undefined) {
         resource.state = "ready";
       }
+      if (pastedText !== undefined) {
+        pastedText.state = "ready";
+      }
       revision += 1;
       try {
         await commit?.();
@@ -601,6 +849,9 @@ export async function createTurnComposer(options: {
         revision = previousRevision;
         if (resource !== undefined) {
           resource.state = "removed";
+        }
+        if (pastedText !== undefined) {
+          pastedText.state = "removed";
         }
         undoStack.push(entry);
         throw error;
@@ -612,9 +863,11 @@ export async function createTurnComposer(options: {
       if (closed || sealed) {
         throw new TypeError("The turn composer is not accepting input resources.");
       }
-      const retainedCount = [...resources.values()].filter(
-        (resource) => resource.state !== "cancelled" && resource.state !== "removed",
-      ).length;
+      const retainedCount =
+        [...resources.values()].filter(
+          (resource) => resource.state !== "cancelled" && resource.state !== "removed",
+        ).length +
+        [...pastedTexts.values()].filter((candidate) => candidate.state !== "removed").length;
       if (retainedCount >= inputResourceLimitsV1.maximumOccurrencesPerRun) {
         throw new TypeError("The turn composer input-resource count exceeds the v1 run limit.");
       }
@@ -642,7 +895,7 @@ export async function createTurnComposer(options: {
         retained: false,
         settlement: null,
       };
-      insertResource(
+      insertAtomicElement(
         { elementId, type: "resource", kind: "file", ordinal, resourceId: id },
         mutation,
       );
@@ -716,6 +969,111 @@ export async function createTurnComposer(options: {
       await settlement;
       return id;
     },
+    async stagePastedText(pastedText, mutation, commit) {
+      if (closed || sealed) {
+        throw new TypeError("The turn composer is not accepting pasted text.");
+      }
+      const activeAtomCount =
+        [...resources.values()].filter(
+          (resource) => resource.state !== "cancelled" && resource.state !== "removed",
+        ).length +
+        [...pastedTexts.values()].filter((candidate) => candidate.state !== "removed").length;
+      if (activeAtomCount >= pastedTextLimitsV1.maximumAtomsPerTurn) {
+        throw new TypeError("The turn composer atom count exceeds the v1 run limit.");
+      }
+      const normalizedPastedText = normalizePastedTextV1(pastedText);
+      const pastedBytes = Buffer.byteLength(normalizedPastedText, "utf8");
+      if (textPayloadBytes() + pastedBytes > pastedTextLimitsV1.maximumTextBytesPerTurn) {
+        throw new TypeError("The structured text payload exceeds the v1 turn limit.");
+      }
+      const id = randomUUID();
+      const elementId = randomUUID();
+      const ordinal = nextOrdinal;
+      const previousElements = elements;
+      const previousNextOrdinal = nextOrdinal;
+      const previousRevision = revision;
+      const previousUndoStack = [...undoStack];
+      const atom: TurnComposerPastedText = {
+        id,
+        elementId,
+        ordinal,
+        origin: "pasted_text",
+        state: "copying",
+        byteCount: pastedBytes,
+        lineCount: normalizedPastedText.split("\n").length,
+        scalarCount: Array.from(normalizedPastedText).length,
+        diagnostic: null,
+        controller: new AbortController(),
+        staged: null,
+        text: normalizedPastedText,
+        retained: false,
+        settlement: null,
+      };
+      insertAtomicElement({ elementId, type: "pasted_text", ordinal, pastedTextId: id }, mutation);
+      nextOrdinal += 1;
+      revision += 1;
+      undoStack.length = 0;
+      pastedTexts.set(id, atom);
+      publish();
+      const settlement = (async () => {
+        let staged: StagedPastedTextSelectionV1;
+        try {
+          if (options.stager.stageText === undefined) {
+            throw new TypeError("Pasted-text staging is unavailable.");
+          }
+          staged = await options.stager.stageText({
+            id,
+            text: normalizedPastedText,
+            signal: atom.controller.signal,
+          });
+        } catch (error) {
+          if (closed || atom.state === "removed" || !pastedTexts.has(id)) {
+            return;
+          }
+          atom.state = "failed";
+          atom.diagnostic =
+            error instanceof Error ? error.message : "The pasted text failed to stage.";
+          try {
+            await commit?.();
+          } catch (commitError) {
+            elements = previousElements;
+            nextOrdinal = previousNextOrdinal;
+            revision = previousRevision;
+            undoStack.push(...previousUndoStack);
+            pastedTexts.delete(id);
+            publish();
+            throw commitError;
+          }
+          publish();
+          return;
+        }
+        if (closed || !pastedTexts.has(id)) {
+          await options.stager.discard(staged);
+          return;
+        }
+        atom.staged = staged;
+        atom.state = "ready";
+        atom.byteCount = staged.byteCount;
+        atom.lineCount = staged.lineCount;
+        atom.scalarCount = staged.scalarCount;
+        try {
+          await commit?.();
+        } catch (error) {
+          elements = previousElements;
+          nextOrdinal = previousNextOrdinal;
+          revision = previousRevision;
+          undoStack.push(...previousUndoStack);
+          pastedTexts.delete(id);
+          await discardPastedText(atom);
+          publish();
+          throw error;
+        }
+        publish();
+      })();
+      atom.settlement = settlement;
+      await settlement;
+      return id;
+    },
     async reset(baseRevision, commit) {
       if (
         closed ||
@@ -723,7 +1081,8 @@ export async function createTurnComposer(options: {
         baseRevision !== revision ||
         [...resources.values()].some(
           (resource) => resource.state === "queued" || resource.state === "copying",
-        )
+        ) ||
+        [...pastedTexts.values()].some((pastedText) => pastedText.state === "copying")
       ) {
         return false;
       }
@@ -735,12 +1094,18 @@ export async function createTurnComposer(options: {
       const previousResourceStates = new Map(
         [...resources].map(([id, resource]) => [id, resource.state] as const),
       );
+      const previousPastedTextStates = new Map(
+        [...pastedTexts].map(([id, pastedText]) => [id, pastedText.state] as const),
+      );
       elements = [];
       nextOrdinal = 1;
       text = "";
       undoStack.length = 0;
       for (const resource of resources.values()) {
         resource.state = "removed";
+      }
+      for (const pastedText of pastedTexts.values()) {
+        pastedText.state = "removed";
       }
       revision += 1;
       try {
@@ -757,11 +1122,22 @@ export async function createTurnComposer(options: {
             resource.state = state;
           }
         }
+        for (const [id, state] of previousPastedTextStates) {
+          const pastedText = pastedTexts.get(id);
+          if (pastedText !== undefined) {
+            pastedText.state = state;
+          }
+        }
         throw error;
       }
       const retained = [...resources.values()];
+      const retainedPastedTexts = [...pastedTexts.values()];
       resources.clear();
-      await Promise.allSettled(retained.map(discardStaging));
+      pastedTexts.clear();
+      await Promise.allSettled([
+        ...retained.map(discardStaging),
+        ...retainedPastedTexts.map(discardPastedText),
+      ]);
       publish();
       return true;
     },
@@ -779,11 +1155,19 @@ export async function createTurnComposer(options: {
             resource.controller.abort();
           }
         }
+        for (const pastedText of pastedTexts.values()) {
+          if (pastedText.state === "copying") {
+            pastedText.controller.abort();
+          }
+        }
         publish();
       };
       signal.addEventListener("abort", cancelStaging, { once: true });
       try {
-        await Promise.all([...resources.values()].map((resource) => resource.settlement));
+        await Promise.all([
+          ...[...resources.values()].map((resource) => resource.settlement),
+          ...[...pastedTexts.values()].map((pastedText) => pastedText.settlement),
+        ]);
       } finally {
         signal.removeEventListener("abort", cancelStaging);
       }
@@ -828,7 +1212,33 @@ export async function createTurnComposer(options: {
           "Every retained input resource must have supported immutable content.",
         );
       }
+      const retainedPastedTexts = [...pastedTexts.values()].filter(
+        (pastedText) => pastedText.state !== "removed",
+      );
+      const failedPastedText = retainedPastedTexts.find(
+        (pastedText) =>
+          pastedText.state !== "ready" || pastedText.staged === null || pastedText.text === null,
+      );
+      if (failedPastedText !== undefined) {
+        sealed = false;
+        publish();
+        throw new TurnComposerError(
+          "failed",
+          "Every retained Text atom must be ready before send.",
+        );
+      }
+      if (textPayloadBytes() > pastedTextLimitsV1.maximumTextBytesPerTurn) {
+        sealed = false;
+        publish();
+        throw new TurnComposerError(
+          "limit_exceeded",
+          "The structured text payload exceeds the v1 turn limit.",
+        );
+      }
       const resourceById = new Map(retained.map((resource) => [resource.id, resource]));
+      const pastedTextById = new Map(
+        retainedPastedTexts.map((pastedText) => [pastedText.id, pastedText]),
+      );
       const selectionIndexById = new Map(
         retained.map((resource, index) => [resource.id, index] as const),
       );
@@ -836,6 +1246,26 @@ export async function createTurnComposer(options: {
         elements: elements.map((element): TurnComposerSealedElement => {
           if (element.type === "text") {
             return { type: "text", text: element.text };
+          }
+          if (element.type === "pasted_text") {
+            const pastedText = pastedTextById.get(element.pastedTextId);
+            if (
+              pastedText?.staged === null ||
+              pastedText?.staged === undefined ||
+              pastedText.text === null
+            ) {
+              throw new TurnComposerError(
+                "failed",
+                "Every retained Text atom must be ready before send.",
+              );
+            }
+            return {
+              type: "pasted_text",
+              ordinal: element.ordinal,
+              token: atomToken("text", element.ordinal),
+              text: pastedText.text,
+              selection: pastedText.staged,
+            };
           }
           const resource = resourceById.get(element.resourceId);
           if (resource?.staged === null || resource?.staged === undefined) {
@@ -848,7 +1278,7 @@ export async function createTurnComposer(options: {
             type: "resource",
             kind: element.kind,
             ordinal: element.ordinal,
-            token: resourceToken(element.kind, element.ordinal),
+            token: atomToken(element.kind, element.ordinal),
             selection: resource.staged,
           };
         }),
@@ -856,6 +1286,22 @@ export async function createTurnComposer(options: {
         structuredContent: elements.map((element): StagedUserContentElementV1 => {
           if (element.type === "text") {
             return { type: "text", text: element.text };
+          }
+          if (element.type === "pasted_text") {
+            const selectionIndex = retainedPastedTexts.findIndex(
+              (pastedText) => pastedText.id === element.pastedTextId,
+            );
+            if (selectionIndex < 0) {
+              throw new TurnComposerError(
+                "failed",
+                "Every retained Text atom must be ready before send.",
+              );
+            }
+            return {
+              type: "pasted_text",
+              selectionIndex,
+              draftOrdinal: element.ordinal,
+            };
           }
           const selectionIndex = selectionIndexById.get(element.resourceId);
           if (selectionIndex === undefined) {
@@ -872,10 +1318,14 @@ export async function createTurnComposer(options: {
         }),
         text,
         selections: retained.map((resource) => resource.staged as StagedInputResourceSelectionV1),
+        pastedTextSelections: retainedPastedTexts.map(
+          (pastedText) => pastedText.staged as StagedPastedTextSelectionV1,
+        ),
       };
     },
     async clear(options = {}) {
       const retained = [...resources.values()];
+      const retainedPastedTexts = [...pastedTexts.values()];
       sealed = false;
       for (const resource of retained) {
         if (resource.state === "queued" || resource.state === "copying") {
@@ -884,13 +1334,30 @@ export async function createTurnComposer(options: {
           resource.controller.abort();
         }
       }
-      await Promise.allSettled(retained.map((resource) => resource.settlement));
+      for (const pastedText of retainedPastedTexts) {
+        if (pastedText.state === "copying") {
+          pastedText.state = "removed";
+          pastedText.controller.abort();
+        }
+      }
+      await Promise.allSettled([
+        ...retained.map((resource) => resource.settlement),
+        ...retainedPastedTexts.map((pastedText) => pastedText.settlement),
+      ]);
       resources.clear();
+      pastedTexts.clear();
       await Promise.all(
         retained.map((resource) =>
-          options.preserveRetained === true && resource.retained
+          options.preserveRetained === true && resource.retained && resource.state !== "removed"
             ? Promise.resolve()
             : discardStaging(resource),
+        ),
+      );
+      await Promise.all(
+        retainedPastedTexts.map((pastedText) =>
+          options.preserveRetained === true && pastedText.retained && pastedText.state !== "removed"
+            ? Promise.resolve()
+            : discardPastedText(pastedText),
         ),
       );
       text = "";
@@ -900,9 +1367,38 @@ export async function createTurnComposer(options: {
       revision += 1;
       publish();
     },
+    readExpandedText() {
+      return elements
+        .map((element) => {
+          if (element.type === "text") {
+            return element.text;
+          }
+          if (element.type === "resource") {
+            return atomToken(element.kind, element.ordinal);
+          }
+          const pastedText = pastedTexts.get(element.pastedTextId);
+          if (pastedText?.state !== "ready" || pastedText.text === null) {
+            throw new TurnComposerError(
+              "failed",
+              "Every retained Text atom must be ready before copy.",
+            );
+          }
+          return pastedText.text;
+        })
+        .join("");
+    },
     async commitText(nextText, commit) {
       if (closed || sealed) {
         throw new TypeError("The sealed turn composer cannot change draft text.");
+      }
+      if (
+        nextText.length > 512 * 1024 ||
+        textPayloadBytes(nextText) > pastedTextLimitsV1.maximumTextBytesPerTurn
+      ) {
+        throw new TurnComposerError(
+          "limit_exceeded",
+          "The structured text payload exceeds the v1 turn limit.",
+        );
       }
       if (text !== nextText) {
         const previousText = text;
@@ -929,6 +1425,15 @@ export async function createTurnComposer(options: {
       if (closed || sealed) {
         throw new TypeError("The sealed turn composer cannot change draft text.");
       }
+      if (
+        nextText.length > 512 * 1024 ||
+        textPayloadBytes(nextText) > pastedTextLimitsV1.maximumTextBytesPerTurn
+      ) {
+        throw new TurnComposerError(
+          "limit_exceeded",
+          "The structured text payload exceeds the v1 turn limit.",
+        );
+      }
       if (text !== nextText) {
         text = nextText;
         replaceAggregateText(nextText);
@@ -951,9 +1456,24 @@ export async function createTurnComposer(options: {
       for (const resource of resources.values()) {
         resource.controller.abort();
       }
-      await Promise.allSettled([...resources.values()].map((resource) => resource.settlement));
+      for (const pastedText of pastedTexts.values()) {
+        pastedText.controller.abort();
+      }
+      await Promise.allSettled([
+        ...[...resources.values()].map((resource) => resource.settlement),
+        ...[...pastedTexts.values()].map((pastedText) => pastedText.settlement),
+      ]);
+      await Promise.all([
+        ...[...resources.values()]
+          .filter((resource) => resource.state === "removed")
+          .map(discardStaging),
+        ...[...pastedTexts.values()]
+          .filter((pastedText) => pastedText.state === "removed")
+          .map(discardPastedText),
+      ]);
       await options.stager.close();
       resources.clear();
+      pastedTexts.clear();
     },
     snapshot() {
       return {
@@ -972,8 +1492,20 @@ export async function createTurnComposer(options: {
               ...item
             }) => ({
               ...item,
-              token: resourceToken(item.kind, item.ordinal),
+              token: atomToken(item.kind, item.ordinal),
             }),
+          ),
+        pastedTexts: [...pastedTexts.values()]
+          .filter((pastedText) => pastedText.state !== "removed")
+          .map(
+            ({
+              controller: _controller,
+              retained: _retained,
+              settlement: _settlement,
+              staged: _staged,
+              text: _text,
+              ...item
+            }) => ({ ...item, token: atomToken("text", item.ordinal) }),
           ),
       };
     },

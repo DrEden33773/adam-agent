@@ -279,8 +279,8 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     availability: "always",
     id: "copy",
     name: "copy",
-    summary: "Copy the last assistant response.",
-    usage: "/copy",
+    summary: "Copy the last assistant response or the expanded current draft.",
+    usage: "/copy [draft]",
   },
   {
     aliases: [],

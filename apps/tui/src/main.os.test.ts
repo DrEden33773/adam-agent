@@ -1535,7 +1535,7 @@ test("the real terminal delivers Ctrl+C interruption without arming exit", async
     await rm(testRoot, { recursive: true, force: true });
   }
 });
-test("the real terminal preserves one large bracketed multiline paste as editor input", async () => {
+test("the real terminal promotes one large bracketed multiline paste to a Text atom", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-bracketed-paste-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -1556,11 +1556,13 @@ test("the real terminal preserves one large bracketed multiline paste as editor 
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
+    const beforePaste = fixture.output().length;
     fixture.write(`\u001b[200~${pasted}\u001b[201~`);
-    await fixture.waitFor("[paste #1 +24 lines]");
+    await fixture.waitForCompleteFrameAfter("Pasted text staged.", beforePaste);
+    await fixture.waitForCompleteFrameAfter("[Text #1]", beforePaste);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(pasted);
+    await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe("[Text #1]");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
