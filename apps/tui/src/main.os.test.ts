@@ -129,6 +129,215 @@ test("the production WSL paste-image path stages one image and restores the term
   }
 });
 
+test.each([
+  { name: "legacy Alt+V", input: "\u001bv" },
+  { name: "Kitty Alt+V", input: "\u001b[118;3u" },
+])("the production PTY decodes $name and restores the terminal", async (key) => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-key-process-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const sourcePath = join(testRoot, "source.png");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    sourcePath,
+    Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    ),
+  );
+  await writeFile(
+    join(testRoot, "powershell.exe"),
+    '#!/bin/sh\n/bin/cat "$ADAM_TEST_IMAGE_SOURCE"\n',
+    { mode: 0o755 },
+  );
+  const inheritedProcessPath = Reflect.get(process.env, "PATH");
+
+  try {
+    await trustWorkspace(configRoot, workspaceRoot);
+    const fixture = startFixture({
+      program: {
+        arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
+        cwd: workspaceRoot,
+        entrypoint: productionPath,
+        environment: {
+          ADAM_TEST_IMAGE_SOURCE: sourcePath,
+          DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+          PATH: `${testRoot}:${typeof inheritedProcessPath === "string" ? inheritedProcessPath : ""}`,
+          WSL_DISTRO_NAME: "Ubuntu",
+          XDG_CONFIG_HOME: configRoot,
+        },
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitForCompleteFrameAfter("Adam · New session", 0);
+    const beforePaste = fixture.output().length;
+    fixture.write(key.input);
+    await fixture.waitForCompleteFrameAfter("Clipboard image staged.", beforePaste);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("[Image #1]");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout.indexOf("\u001b[?2004h")).toBeLessThan(
+      result.stdout.lastIndexOf("\u001b[?2004l"),
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production unified paste command falls back from WSL image to Unicode text", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-text-process-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const sourcePath = join(testRoot, "source.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(sourcePath, "剪贴板 e\u0301", "utf8");
+  await writeFile(
+    join(testRoot, "powershell.exe"),
+    '#!/bin/sh\ncase "$*" in *GetImage*) exit 3 ;; *GetText*) /bin/cat "$ADAM_TEST_TEXT_SOURCE" ;; *) exit 5 ;; esac\n',
+    { mode: 0o755 },
+  );
+  const inheritedProcessPath = Reflect.get(process.env, "PATH");
+
+  try {
+    await trustWorkspace(configRoot, workspaceRoot);
+    const fixture = startFixture({
+      program: {
+        arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
+        cwd: workspaceRoot,
+        entrypoint: productionPath,
+        environment: {
+          ADAM_TEST_TEXT_SOURCE: sourcePath,
+          DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+          PATH: `${testRoot}:${typeof inheritedProcessPath === "string" ? inheritedProcessPath : ""}`,
+          WSL_DISTRO_NAME: "Ubuntu",
+          XDG_CONFIG_HOME: configRoot,
+        },
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforePaste = fixture.output().length;
+    fixture.write("/paste\r");
+    await fixture.waitForAfter("Clipboard text pasted.", beforePaste);
+    expect(fixture.output().slice(beforePaste)).toContain("剪贴板");
+    fixture.write("\u0015\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("\u001b[?2004l");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("tmux delivers Alt+V to the production Adam decoder and restores the terminal", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-tmux-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const sourcePath = join(testRoot, "source.txt");
+  const outputPath = join(testRoot, "tmux-output.bin");
+  const detectorPath = join(testRoot, "tmux-output-detector.mjs");
+  const socketPath = join(testRoot, "tmux.sock");
+  await mkdir(workspaceRoot);
+  await writeFile(sourcePath, "tmux clipboard text", "utf8");
+  await writeFile(outputPath, "", "utf8");
+  await writeFile(
+    join(testRoot, "powershell.exe"),
+    '#!/bin/sh\ncase "$*" in *GetImage*) exit 3 ;; *GetText*) /bin/cat "$ADAM_TEST_TEXT_SOURCE" ;; *) exit 5 ;; esac\n',
+    { mode: 0o755 },
+  );
+  await writeFile(
+    detectorPath,
+    `import { appendFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const [outputPath, socketPath] = process.argv.slice(2);
+const signalled = new Set();
+let observed = "";
+const signal = (channel) => {
+  if (signalled.has(channel)) return;
+  signalled.add(channel);
+  spawnSync("/usr/bin/tmux", ["-S", socketPath, "wait-for", "-S", channel]);
+};
+process.stdin.on("data", (chunk) => {
+  appendFileSync(outputPath, chunk);
+  observed += chunk.toString("utf8");
+  if (observed.includes("Adam · New session")) signal("adam-ready");
+  if (observed.includes("Clipboard text pasted.")) signal("adam-pasted");
+  if (observed.includes("\\u001b[?2004l")) signal("adam-restored");
+});
+`,
+    "utf8",
+  );
+  const inheritedProcessPath = Reflect.get(process.env, "PATH");
+  const environment = {
+    ...process.env,
+    ADAM_TEST_TEXT_SOURCE: sourcePath,
+    DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+    PATH: `${testRoot}:${typeof inheritedProcessPath === "string" ? inheritedProcessPath : ""}`,
+    TERM: "xterm-256color",
+    WSL_DISTRO_NAME: "Ubuntu",
+    XDG_CONFIG_HOME: configRoot,
+  };
+  const applicationCommand = [
+    `/usr/bin/tmux -S ${JSON.stringify(socketPath)} wait-for adam-start`,
+    `exec ${[
+      process.execPath,
+      productionPath,
+      "--target",
+      "deepseek-v4-flash.direct",
+      "--state-root",
+      stateRoot,
+    ]
+      .map((value) => JSON.stringify(value))
+      .join(" ")}`,
+  ].join(" && ");
+  const detectorCommand = [process.execPath, detectorPath, outputPath, socketPath]
+    .map((value) => JSON.stringify(value))
+    .join(" ");
+
+  try {
+    await trustWorkspace(configRoot, workspaceRoot);
+    await execFile(
+      "/usr/bin/tmux",
+      ["-S", socketPath, "-f", "/dev/null", "new-session", "-d", applicationCommand],
+      { cwd: workspaceRoot, env: environment },
+    );
+    await execFile("/usr/bin/tmux", ["-S", socketPath, "pipe-pane", "-o", detectorCommand], {
+      env: environment,
+    });
+    await execFile("/usr/bin/tmux", [
+      "-S",
+      socketPath,
+      "set-hook",
+      "-g",
+      "pane-exited",
+      "wait-for -S adam-closed",
+    ]);
+    await execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "-S", "adam-start"]);
+    await execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-ready"]);
+    await execFile("/usr/bin/tmux", ["-S", socketPath, "send-keys", "-l", "\u001bv"]);
+    await execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-pasted"]);
+    expect(await readFile(outputPath, "utf8")).toContain("tmux clipboard text");
+    await execFile("/usr/bin/tmux", ["-S", socketPath, "send-keys", "C-q"]);
+    await execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-restored"]);
+    await execFile("/usr/bin/tmux", ["-S", socketPath, "wait-for", "adam-closed"]);
+    expect(await readFile(outputPath, "utf8")).toContain("\u001b[?2004l");
+    await expect(
+      execFile("/usr/bin/tmux", ["-S", socketPath, "has-session"]),
+    ).rejects.toMatchObject({
+      code: 1,
+    });
+  } finally {
+    await execFile("/usr/bin/tmux", ["-S", socketPath, "kill-server"]).catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 async function trustWorkspace(configRoot: string, workspaceRoot: string): Promise<void> {
   const workspaceTrust = createWorkspaceTrust({
     environment: { XDG_CONFIG_HOME: configRoot },

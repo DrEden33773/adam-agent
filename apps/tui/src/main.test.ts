@@ -348,7 +348,7 @@ test("the 40, 80, and 120 column layouts expose progressively bounded footer fac
     let frameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
     let frame = frameLines.join("\n");
     expect(frame).toContain("workspace · context unavailable · idle");
-    expect(frame).toContain("/help [topic] · /hotkeys · Tab complete");
+    expect(frame).toContain("/help [topic] · /hotkeys · Tab complete · Alt+V paste");
     expect(frameLines.every((line) => visibleWidth(line) <= 120)).toBe(true);
 
     beforeResize = fixture.output().length;
@@ -356,7 +356,7 @@ test("the 40, 80, and 120 column layouts expose progressively bounded footer fac
     frameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
     frame = frameLines.join("\n");
     expect(frame).toContain("workspace · context unavailable · idle");
-    expect(frame).toContain("fake.local · Certified · /help · Tab complete");
+    expect(frame).toContain("fake.local · Certified · /help · Tab complete · Alt+V paste");
     expect(frameLines.every((line) => visibleWidth(line) <= 80)).toBe(true);
 
     beforeResize = fixture.output().length;
@@ -366,6 +366,7 @@ test("the 40, 80, and 120 column layouts expose progressively bounded footer fac
     expect(frame).toContain("idle · ctx unavailable");
     expect(frame).toContain("fake.local · Certified");
     expect(frame).toContain("/help · Tab complete");
+    expect(frame).not.toContain("Alt+V paste");
     expect(frame).not.toContain("workspace");
     expect(frameLines.every((line) => visibleWidth(line) <= 40)).toBe(true);
     fixture.write("\u0011");
@@ -732,6 +733,660 @@ test("the explicit paste-image command stages one injected clipboard image throu
       terminal.input("\u0011");
     }
     await execution.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Alt+V stages one injected clipboard image from an idle focused composer", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-image-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  const readStarted = Promise.withResolvers<void>();
+  let readCount = 0;
+  const execution = runTuiFixture({
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        readCount += 1;
+        readStarted.resolve();
+        return {
+          status: "image" as const,
+          bytes: Buffer.from(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            "base64",
+          ),
+          platform: "wsl_bridge" as const,
+        };
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    const beforePaste = terminal.output().length;
+    terminal.input("\u001bv");
+    await readStarted.promise;
+    expect(readCount).toBe(1);
+    await terminal.nextSynchronizedFrameContaining("Clipboard image staged.", beforePaste);
+    expect(terminal.lines().join("\n")).toContain("[Image #1]");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("repeated Alt+V while one clipboard read is pending starts no second acquisition", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-single-flight-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  const releaseRead = Promise.withResolvers<void>();
+  const readStarted = Promise.withResolvers<void>();
+  let readCount = 0;
+  const execution = runTuiFixture({
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        readCount += 1;
+        readStarted.resolve();
+        await releaseRead.promise;
+        return {
+          status: "image" as const,
+          bytes: Buffer.from(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            "base64",
+          ),
+          platform: "linux_x11" as const,
+        };
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    terminal.input("\u001bv");
+    terminal.input("\u001bv");
+    await readStarted.promise;
+    expect(readCount).toBe(1);
+    releaseRead.resolve();
+    await terminal.nextSynchronizedFrameContaining("Clipboard image staged.");
+    expect(
+      terminal
+        .lines()
+        .join("\n")
+        .match(/\[Image #1\]/gu),
+    ).toHaveLength(2);
+  } finally {
+    releaseRead.resolve();
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Escape cancels the exact pending unified clipboard acquisition", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-cancel-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  const releaseRead = Promise.withResolvers<{
+    readonly status: "failed";
+    readonly message: string;
+  }>();
+  const readStarted = Promise.withResolvers<void>();
+  let abortObserved = false;
+  let capturedSignal: AbortSignal | undefined;
+  const execution = runTuiFixture({
+    clipboardReader: {
+      async close() {},
+      readClipboard(signal?: AbortSignal) {
+        capturedSignal = signal;
+        readStarted.resolve();
+        signal?.addEventListener(
+          "abort",
+          () => {
+            abortObserved = true;
+            releaseRead.resolve({
+              status: "failed",
+              message: "Clipboard acquisition cancelled.",
+            });
+          },
+          { once: true },
+        );
+        return releaseRead.promise;
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    terminal.input("\u001bv");
+    await readStarted.promise;
+    expect(capturedSignal).toBeDefined();
+    const beforeCancellation = terminal.output().length;
+    const cancellationRendered = terminal.nextSynchronizedFrameContaining(
+      "Clipboard acquisition cancelled.",
+      beforeCancellation,
+    );
+    terminal.input("\u001b[27;1;27~");
+    expect(abortObserved).toBe(true);
+    expect(capturedSignal?.aborted).toBe(true);
+    expect(terminal.lines().join("\n")).not.toContain("[Image #");
+    await cancellationRendered;
+    terminal.input("\u0011");
+    await execution;
+  } finally {
+    releaseRead.resolve({ status: "failed", message: "Clipboard acquisition cancelled." });
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a unified clipboard result rejects when the captured draft changes while reading", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-stale-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  const releaseRead = Promise.withResolvers<void>();
+  let copiedDraft = "";
+  const execution = runTuiFixture({
+    clipboard: {
+      async writeText(text) {
+        copiedDraft = text;
+        return "copied";
+      },
+    },
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        await releaseRead.promise;
+        return { status: "text" as const, platform: "linux_wayland" as const, text: "clip" };
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    terminal.input("before");
+    terminal.input("\u001bv");
+    terminal.input("x");
+    const beforeSettlement = terminal.output().length;
+    releaseRead.resolve();
+    const outcome = await Promise.race([
+      terminal
+        .nextSynchronizedFrameContaining(
+          "Draft changed while reading the clipboard; press Alt+V to retry.",
+          beforeSettlement,
+        )
+        .then(() => "stale" as const),
+      terminal
+        .nextSynchronizedFrameContaining("Clipboard text pasted.", beforeSettlement)
+        .then(() => "pasted" as const),
+    ]);
+    expect(outcome).toBe("stale");
+    terminal.input("\u0011");
+    await execution;
+    expect(copiedDraft).toBe("beforex");
+  } finally {
+    releaseRead.resolve();
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a unified clipboard result uses the invocation cursor after later cursor movement", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-cursor-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  const releaseRead = Promise.withResolvers<void>();
+  let copiedDraft = "";
+  const execution = runTuiFixture({
+    clipboard: {
+      async writeText(text) {
+        copiedDraft = text;
+        return "copied";
+      },
+    },
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        await releaseRead.promise;
+        return { status: "text" as const, platform: "linux_x11" as const, text: "X" };
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    terminal.input("beforeafter");
+    terminal.input("\u001b[D".repeat(5));
+    terminal.input("\u001bv");
+    terminal.input("\u001b[C".repeat(2));
+    releaseRead.resolve();
+    await terminal.nextSynchronizedFrameContaining("Clipboard text pasted.");
+    terminal.input("Y");
+    terminal.input("\u0011");
+    await execution;
+    expect(copiedDraft).toBe("beforeXYafter");
+  } finally {
+    releaseRead.resolve();
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Alt+V stages an image at the exact invocation cursor", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-image-cursor-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  let copiedDraft = "";
+  const execution = runTuiFixture({
+    clipboard: {
+      async writeText(text) {
+        copiedDraft = text;
+        return "copied";
+      },
+    },
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        return {
+          status: "image" as const,
+          bytes: Buffer.from(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            "base64",
+          ),
+          platform: "wsl_bridge" as const,
+        };
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    terminal.input("beforeafter");
+    terminal.input("\u001b[D".repeat(5));
+    terminal.input("\u001bv");
+    await terminal.nextSynchronizedFrameContaining("Clipboard image staged.");
+    terminal.input("\u0011");
+    await execution;
+    expect(copiedDraft).toBe("before[Image #1]after");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Alt+V never reads the clipboard while one run is active", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-active-run-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  let readCount = 0;
+
+  try {
+    const fixture = startFixture({
+      clipboardReader: {
+        async close() {},
+        async readClipboard() {
+          readCount += 1;
+          return { status: "empty" as const, message: "empty" };
+        },
+      },
+      controlRoot,
+      scenario: "cancellation",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Keep this run active\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("Alt+V paste");
+    fixture.write("\u001bv");
+    expect(readCount).toBe(0);
+    fixture.write("\u0003");
+    await fixture.waitFor("cancelled");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Alt+V never reads under an overlay or minimum-size ownership", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-ownership-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  let readCount = 0;
+
+  try {
+    const fixture = startFixture({
+      clipboardReader: {
+        async close() {},
+        async readClipboard() {
+          readCount += 1;
+          return { status: "empty" as const, message: "empty" };
+        },
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/help\r");
+    await fixture.waitFor("Adam Help");
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("Alt+V paste");
+    fixture.write("\u001bv");
+    expect(readCount).toBe(0);
+    fixture.write("\u001b[27;1;27~");
+    await fixture.resize(39, 11);
+    fixture.write("\u001bv");
+    expect(readCount).toBe(0);
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the unified paste command routes through the same clipboard image action", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-command-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  let readCount = 0;
+  const execution = runTuiFixture({
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        readCount += 1;
+        return {
+          status: "image" as const,
+          bytes: Buffer.from(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+            "base64",
+          ),
+          platform: "linux_wayland" as const,
+        };
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    const beforePaste = terminal.output().length;
+    terminal.input("/paste\r");
+    const outcome = await Promise.race([
+      terminal
+        .nextSynchronizedFrameContaining("Clipboard image staged.", beforePaste)
+        .then(() => "staged" as const),
+      terminal
+        .nextSynchronizedFrameContaining("Usage: /paste", beforePaste)
+        .then(() => "usage" as const),
+    ]);
+    expect(outcome).toBe("staged");
+    expect(readCount).toBe(1);
+    expect(terminal.lines().join("\n")).toContain("[Image #1]");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Alt+V inserts small Unicode clipboard text at the exact editor cursor", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-text-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  let copiedDraft = "";
+  const execution = runTuiFixture({
+    clipboard: {
+      async writeText(text) {
+        copiedDraft = text;
+        return "copied";
+      },
+    },
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        return { status: "text" as const, platform: "wsl_bridge" as const, text: "界e\u0301" };
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    terminal.input("beforeafter");
+    terminal.input("\u001b[D".repeat(5));
+    const beforePaste = terminal.output().length;
+    terminal.input("\u001bv");
+    const outcome = await Promise.race([
+      terminal
+        .nextSynchronizedFrameContaining("Clipboard text pasted.", beforePaste)
+        .then(() => "pasted" as const),
+      terminal
+        .nextSynchronizedFrameContaining("Clipboard text is not available yet.", beforePaste)
+        .then(() => "unavailable" as const),
+    ]);
+    expect(outcome).toBe("pasted");
+    expect(terminal.lines().join("\n")).toContain("before界");
+    expect(terminal.lines().join("\n")).toContain("éafter");
+    terminal.input("\u0011");
+    await execution;
+    expect(copiedDraft).toBe("before界éafter");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Alt+V recomputes autocomplete from the admitted clipboard text", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-autocomplete-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "first");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: first\ndescription: First clipboard completion procedure.\n---\nFirst body.\n",
+    "utf8",
+  );
+  const terminal = new VirtualTerminal();
+  const execution = runTuiFixture({
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        return { status: "text" as const, platform: "linux_x11" as const, text: "r" };
+      },
+    },
+    scenario: "skill-selection",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    terminal.input("Use $fi");
+    await terminal.nextSynchronizedFrameContaining("$first");
+    const beforePaste = terminal.output().length;
+    terminal.input("\u001bv");
+    await terminal.nextSynchronizedFrameContaining("Clipboard text pasted.", beforePaste);
+    await terminal.nextSynchronizedFrameContaining("$first", beforePaste);
+    const screen = terminal.lines().join("\n");
+    expect(screen).toContain("Use $fir");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("Alt+V promotes large clipboard text through the existing Text atom classifier", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-large-text-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  const pasted = Array.from({ length: 11 }, (_, index) => `clipboard line ${index + 1}`).join("\n");
+  const execution = runTuiFixture({
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        return { status: "text" as const, platform: "linux_x11" as const, text: pasted };
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    const beforePaste = terminal.output().length;
+    terminal.input("\u001bv");
+    const outcome = await Promise.race([
+      terminal
+        .nextSynchronizedFrameContaining("Pasted text staged.", beforePaste)
+        .then(() => "staged" as const),
+      terminal
+        .nextSynchronizedFrameContaining("Clipboard text is not available yet.", beforePaste)
+        .then(() => "unavailable" as const),
+    ]);
+    expect(outcome).toBe("staged");
+    expect(terminal.lines().join("\n")).toContain("[Text #1]");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  {
+    name: "FileDrop",
+    result: {
+      status: "file_drop" as const,
+      message: "Clipboard files are not supported; attach an admitted project file explicitly.",
+    },
+    expected: "Clipboard files are not supported",
+  },
+  {
+    name: "malformed image",
+    result: {
+      status: "image" as const,
+      bytes: Buffer.from("not an image"),
+      platform: "linux_x11" as const,
+    },
+    expected: "The clipboard image is not a complete valid PNG or JPEG.",
+  },
+])("Alt+V rejects $name without a fallback draft mutation", async (fixture) => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-unified-paste-rejected-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const terminal = new VirtualTerminal();
+  let readCount = 0;
+  const execution = runTuiFixture({
+    clipboardReader: {
+      async close() {},
+      async readClipboard() {
+        readCount += 1;
+        return fixture.result;
+      },
+    },
+    scenario: "provider-no-usage",
+    stateRoot,
+    terminal,
+    workspaceRoot,
+  });
+
+  try {
+    await terminal.whenStarted();
+    const beforePaste = terminal.output().length;
+    terminal.input("\u001bv");
+    await terminal.nextSynchronizedFrameContaining(fixture.expected, beforePaste);
+    expect(readCount).toBe(1);
+    expect(terminal.lines().join("\n")).not.toContain("[Image #");
+    expect(terminal.lines().join("\n")).not.toContain("[Text #");
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution;
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -3268,6 +3923,9 @@ test("slash Hotkeys opens the shared local Help navigator", async () => {
     expect(fixture.output().slice(beforeHotkeys)).toContain("Ctrl+N");
     expect(fixture.output().slice(beforeHotkeys)).toContain("Ctrl+F");
     expect(fixture.output().slice(beforeHotkeys)).toContain("Ctrl+S");
+    expect(fixture.screen()?.join("\n") ?? "").toContain(
+      "Alt+V — Paste supported image or text from clipboard",
+    );
     expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/hotkeys"');
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -3639,7 +4297,7 @@ test("the idle footer exposes Registry-driven interaction hints", async () => {
     const fixture = startFixture({ stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     await fixture.resize(120, 40);
-    await fixture.waitFor("/help [topic] · /hotkeys · Tab complete");
+    await fixture.waitFor("/help [topic] · /hotkeys · Tab complete · Alt+V paste");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -4328,11 +4986,13 @@ test("Help exposes the effective Pi Editor hotkeys on a dedicated topic", async 
       fixture.waitForAfter("Editor Hotkeys", beforeTopic).then(() => "editor" as const),
       fixture.waitForAfter("Unknown Help topic editor", beforeTopic).then(() => "unknown" as const),
     ]);
+    const editorHelp = fixture.screen()?.join("\n") ?? "";
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(outcome).toBe("editor");
     expect(result.stdout).toContain("Ctrl+W / Alt+Backspace");
+    expect(editorHelp).toContain("Alt+V — Paste supported image or text from clipboard");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

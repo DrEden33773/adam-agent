@@ -296,6 +296,27 @@ test("a WSL deadline is terminal and never falls back to another clipboard selec
   await reader.close();
 });
 
+test("aborting one clipboard image read terminates and joins its exact helper", async () => {
+  const child = new FakeImageChild();
+  const controller = new AbortController();
+  const reader = createLinuxClipboardImageReader({
+    environment: { WSL_DISTRO_NAME: "Ubuntu" },
+    [linuxClipboardImageSpawn]() {
+      return child as LinuxClipboardImageChild;
+    },
+  });
+
+  const result = reader.readImage(controller.signal);
+  controller.abort();
+  expect(child.kill).toHaveBeenLastCalledWith("SIGTERM");
+  child.emit("close", null);
+  await expect(result).resolves.toEqual({
+    status: "failed",
+    message: "Clipboard image acquisition cancelled.",
+  });
+  await reader.close();
+});
+
 test("the Linux clipboard image reader terminates and joins a helper after its deadline", async () => {
   const scheduler = controlledScheduler();
   const child = new FakeImageChild();

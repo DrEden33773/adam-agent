@@ -20,7 +20,7 @@ export type ClipboardImageReadResult =
     };
 
 export type ClipboardImageReader = {
-  readImage(): Promise<ClipboardImageReadResult>;
+  readImage(signal?: AbortSignal): Promise<ClipboardImageReadResult>;
   close(): Promise<void>;
 };
 
@@ -102,9 +102,12 @@ export function createLinuxClipboardImageReader({
         throw new AggregateError(failures, "Clipboard image helper reclamation was not confirmed.");
       }
     },
-    async readImage() {
+    async readImage(signal = new AbortController().signal) {
       if (closing) {
         return { status: "failed", message: "Clipboard image reader is closing." };
+      }
+      if (signal.aborted) {
+        return { status: "failed", message: "Clipboard image acquisition cancelled." };
       }
       const candidates = imageReaderCandidates(environment);
       if (candidates.length === 0) {
@@ -117,7 +120,10 @@ export function createLinuxClipboardImageReader({
       let sawDeadline = false;
       let sawFailure = false;
       for (const candidate of candidates) {
-        if (closing) {
+        if (closing || signal.aborted) {
+          if (signal.aborted) {
+            return { status: "failed", message: "Clipboard image acquisition cancelled." };
+          }
           return { status: "failed", message: "Clipboard image reader is closing." };
         }
         const current = startImageHelper({
@@ -131,6 +137,8 @@ export function createLinuxClipboardImageReader({
         });
         active.add(current);
         let deadlineExpired = false;
+        const onAbort = () => current.beginTermination();
+        signal.addEventListener("abort", onAbort, { once: true });
         const deadline = scheduler.schedule(candidateDeadlineMilliseconds, () => {
           deadlineExpired = true;
           current.beginTermination();
@@ -140,6 +148,10 @@ export function createLinuxClipboardImageReader({
           result = await current.settlement;
         } finally {
           deadline.cancel();
+          signal.removeEventListener("abort", onAbort);
+        }
+        if (signal.aborted) {
+          return { status: "failed", message: "Clipboard image acquisition cancelled." };
         }
         if (closing) {
           return { status: "failed", message: "Clipboard image reader is closing." };

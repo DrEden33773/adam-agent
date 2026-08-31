@@ -1,16 +1,9 @@
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import { expect, test } from "vitest";
-
-import { createLinuxClipboardImageReader } from "./linux-clipboard-image.js";
+import { createLinuxClipboardTextReader } from "./linux-clipboard-text.js";
 import { removeTuiFixtureRoot as rm, waitForFileContents } from "./tui-filesystem.test-support.js";
-
-const onePixelPng = Buffer.from(
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-  "base64",
-);
 
 const readerFixtures = [
   {
@@ -41,43 +34,34 @@ type ReaderEnvironment = {
 };
 
 test.each(readerFixtures)(
-  "the $name reader returns exact bytes through a real child process",
+  "the $name text reader returns exact UTF-8 through a real child",
   async (fixture) => {
-    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-image-process-"));
-    const helperPath = join(testRoot, fixture.helper);
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-text-process-"));
+    const sourcePath = join(testRoot, "source.txt");
     const argumentsPath = join(testRoot, "arguments.txt");
-    const sourcePath = join(testRoot, "source.png");
+    await writeFile(sourcePath, "剪贴板 e\u0301", "utf8");
     await writeFile(
-      helperPath,
-      '#!/bin/sh\nif [ -n "$ADAM_TEST_ARGUMENTS" ]; then printf "%s\\n" "$@" > "$ADAM_TEST_ARGUMENTS"; fi\n/bin/cat "$ADAM_TEST_IMAGE_SOURCE"\n',
+      join(testRoot, fixture.helper),
+      '#!/bin/sh\nif [ -n "$ADAM_TEST_ARGUMENTS" ]; then printf "%s\\n" "$@" > "$ADAM_TEST_ARGUMENTS"; fi\n/bin/cat "$ADAM_TEST_TEXT_SOURCE"\n',
       { mode: 0o755 },
     );
-    await writeFile(sourcePath, onePixelPng);
 
     try {
-      const fixtureEnvironment: ReaderEnvironment = fixture.environment;
-      const reader = createLinuxClipboardImageReader({
-        environment: {
-          ...process.env,
-          ...fixtureEnvironment,
+      const reader = createLinuxClipboardTextReader({
+        environment: readerEnvironment(testRoot, fixture.environment, {
           ADAM_TEST_ARGUMENTS: argumentsPath,
-          ADAM_TEST_IMAGE_SOURCE: sourcePath,
-          DISPLAY: fixtureEnvironment.DISPLAY,
-          PATH: testRoot,
-          WAYLAND_DISPLAY: fixtureEnvironment.WAYLAND_DISPLAY,
-          WSL_DISTRO_NAME: fixtureEnvironment.WSL_DISTRO_NAME,
-          WSL_INTEROP: fixtureEnvironment.WSL_INTEROP,
-        },
+          ADAM_TEST_TEXT_SOURCE: sourcePath,
+        }),
       });
-      await expect(reader.readImage()).resolves.toEqual({
+      await expect(reader.readText(new AbortController().signal)).resolves.toEqual({
         status: "read",
-        bytes: onePixelPng,
         platform: fixture.expectedPlatform,
+        text: "剪贴板 é",
       });
       if (fixture.expectedPlatform === "wsl_bridge") {
         await expect(readFile(argumentsPath, "utf8")).resolves.toContain("-STA");
       }
-      await expect(reader.close()).resolves.toBeUndefined();
+      await reader.close();
     } finally {
       await rm(testRoot, { recursive: true, force: true });
     }
@@ -85,17 +69,18 @@ test.each(readerFixtures)(
 );
 
 test.each(readerFixtures)(
-  "the $name reader reports typed failure through real child close",
+  "the $name text reader reports typed failure through real close",
   async (fixture) => {
-    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-image-failure-"));
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-text-failure-"));
     await writeFile(join(testRoot, fixture.helper), "#!/bin/sh\nexit 2\n", { mode: 0o755 });
-
     try {
-      const reader = createLinuxClipboardImageReader({
+      const reader = createLinuxClipboardTextReader({
         environment: readerEnvironment(testRoot, fixture.environment),
       });
-      await expect(reader.readImage()).resolves.toMatchObject({ status: "unsupported" });
-      await expect(reader.close()).resolves.toBeUndefined();
+      await expect(reader.readText(new AbortController().signal)).resolves.toMatchObject({
+        status: "unsupported",
+      });
+      await reader.close();
     } finally {
       await rm(testRoot, { recursive: true, force: true });
     }
@@ -103,21 +88,22 @@ test.each(readerFixtures)(
 );
 
 test.each(readerFixtures)(
-  "the $name reader bounds real helper output and confirms child close",
+  "the $name text reader bounds output and confirms real close",
   async (fixture) => {
-    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-image-output-bound-"));
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-text-bound-"));
     await writeFile(
       join(testRoot, fixture.helper),
-      "#!/bin/sh\n/usr/bin/head -c 8388609 /dev/zero\n",
+      "#!/bin/sh\n/usr/bin/head -c 1048577 /dev/zero\n",
       { mode: 0o755 },
     );
-
     try {
-      const reader = createLinuxClipboardImageReader({
+      const reader = createLinuxClipboardTextReader({
         environment: readerEnvironment(testRoot, fixture.environment),
       });
-      await expect(reader.readImage()).resolves.toMatchObject({ status: "failed" });
-      await expect(reader.close()).resolves.toBeUndefined();
+      await expect(reader.readText(new AbortController().signal)).resolves.toMatchObject({
+        status: "failed",
+      });
+      await reader.close();
     } finally {
       await rm(testRoot, { recursive: true, force: true });
     }
@@ -125,9 +111,9 @@ test.each(readerFixtures)(
 );
 
 test.each(readerFixtures)(
-  "aborting the $name image reader terminates and joins its real child",
+  "aborting the $name text reader terminates and joins its real child",
   async (fixture) => {
-    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-image-cancel-"));
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-text-cancel-"));
     const signalPath = join(testRoot, "signals.txt");
     const startedPath = join(testRoot, "started.txt");
     await writeFile(
@@ -135,25 +121,24 @@ test.each(readerFixtures)(
       '#!/bin/sh\nprintf "started\\n" >> "$ADAM_TEST_STARTED"\ntrap \'printf "term\\n" >> "$ADAM_TEST_SIGNALS"\' TERM\nwhile :; do :; done\n',
       { mode: 0o755 },
     );
-
     try {
       const controller = new AbortController();
-      const reader = createLinuxClipboardImageReader({
+      const reader = createLinuxClipboardTextReader({
         environment: readerEnvironment(testRoot, fixture.environment, {
           ADAM_TEST_SIGNALS: signalPath,
           ADAM_TEST_STARTED: startedPath,
         }),
         terminationGraceMilliseconds: 25,
       });
-      const result = reader.readImage(controller.signal);
+      const result = reader.readText(controller.signal);
       await waitForFileContents(startedPath, "started\n");
       controller.abort();
       await expect(result).resolves.toEqual({
         status: "failed",
-        message: "Clipboard image acquisition cancelled.",
+        message: "Clipboard acquisition cancelled.",
       });
       expect(await readFile(signalPath, "utf8")).toContain("term");
-      await expect(reader.close()).resolves.toBeUndefined();
+      await reader.close();
     } finally {
       await rm(testRoot, { recursive: true, force: true });
     }
@@ -161,38 +146,29 @@ test.each(readerFixtures)(
 );
 
 test.each(readerFixtures)(
-  "the $name reader escalates TERM to KILL and confirms real child close",
+  "the $name text reader escalates TERM to KILL and confirms real close",
   async (fixture) => {
-    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-image-deadline-"));
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-text-deadline-"));
     const signalPath = join(testRoot, "signals.txt");
-    const startedPath = join(testRoot, "started.txt");
     await writeFile(
       join(testRoot, fixture.helper),
-      '#!/bin/sh\nprintf "started\\n" >> "$ADAM_TEST_STARTED"\ntrap \'printf "term\\n" >> "$ADAM_TEST_SIGNALS"\' TERM\nwhile :; do :; done\n',
+      '#!/bin/sh\ntrap \'printf "term\\n" >> "$ADAM_TEST_SIGNALS"\' TERM\nwhile :; do :; done\n',
       { mode: 0o755 },
     );
-
     try {
-      const reader = createLinuxClipboardImageReader({
+      const reader = createLinuxClipboardTextReader({
         candidateDeadlineMilliseconds: 50,
         environment: readerEnvironment(testRoot, fixture.environment, {
           ADAM_TEST_SIGNALS: signalPath,
-          ADAM_TEST_STARTED: startedPath,
         }),
         terminationGraceMilliseconds: 25,
       });
-      await expect(reader.readImage()).resolves.toEqual({
+      await expect(reader.readText(new AbortController().signal)).resolves.toEqual({
         status: "failed",
-        message: "Clipboard image acquisition reached its deadline.",
+        message: "Clipboard text acquisition reached its deadline.",
       });
-      const expectedAttempts = fixture.expectedPlatform === "wsl_bridge" ? 1 : 2;
-      expect((await readFile(startedPath, "utf8")).trim().split("\n")).toHaveLength(
-        expectedAttempts,
-      );
-      expect((await readFile(signalPath, "utf8")).trim().split("\n")).toHaveLength(
-        expectedAttempts,
-      );
-      await expect(reader.close()).resolves.toBeUndefined();
+      expect(await readFile(signalPath, "utf8")).toContain("term");
+      await reader.close();
     } finally {
       await rm(testRoot, { recursive: true, force: true });
     }

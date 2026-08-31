@@ -24,6 +24,28 @@ export const adamStructuredEditorCompletion: EditorStructuredCompletion = {
   accept(document, cursor, item, prefix) {
     const textCursor = textPartAtCursor(document, cursor);
     if (textCursor === null) {
+      if (prefix.length === 0 && "edge" in cursor && item.value.length > 0) {
+        const atomIndex = document.findIndex(
+          (part) => part.type === "atom" && part.id === cursor.partId,
+        );
+        if (atomIndex < 0) {
+          return null;
+        }
+        const textPart = {
+          type: "text" as const,
+          id: nextTextPartId(document),
+          text: item.value,
+        };
+        const insertIndex = cursor.edge === "before" ? atomIndex : atomIndex + 1;
+        const nextDocument = [...document];
+        nextDocument.splice(insertIndex, 0, textPart);
+        return {
+          cursor: { partId: textPart.id, offset: item.value.length },
+          document: nextDocument,
+          range: { anchor: cursor, focus: cursor },
+          text: item.value,
+        };
+      }
       return null;
     }
     const start = textCursor.offset - prefix.length;
@@ -46,6 +68,15 @@ export const adamStructuredEditorCompletion: EditorStructuredCompletion = {
     };
   },
 };
+
+function nextTextPartId(document: readonly EditorDocumentPart[]): string {
+  const ids = new Set(document.map((part) => part.id));
+  let ordinal = 1;
+  while (ids.has(`adam-editor-text-${ordinal}`)) {
+    ordinal += 1;
+  }
+  return `adam-editor-text-${ordinal}`;
+}
 
 function textPartAtCursor(
   document: readonly EditorDocumentPart[],

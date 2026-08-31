@@ -133,7 +133,7 @@ function helpContent(
       "",
       ...keybindings
         .filter((binding) => binding.section === "editor")
-        .map((binding) => `${theme.toolTitle(binding.keys)}  ${binding.description}`),
+        .map((binding) => formatKeybinding(binding, theme)),
       "",
       theme.muted("Esc back"),
     ];
@@ -159,11 +159,19 @@ function helpContent(
     theme.toolTitle("Effective Hotkeys"),
     "",
     ...keybindings
-      .filter((binding) => binding.section === "application")
-      .map((binding) => `${theme.toolTitle(binding.keys)}  ${binding.description}`),
+      .filter(
+        (binding) => binding.section === "application" || binding.action === "paste_clipboard",
+      )
+      .map((binding) => formatKeybinding(binding, theme)),
     "",
     "Editor bindings  /help editor",
     "",
     theme.muted("Esc back"),
   ];
+}
+
+function formatKeybinding(binding: AdamKeybindingDefinition, theme: AdamTuiTheme): string {
+  return binding.action === "paste_clipboard"
+    ? `${theme.toolTitle(binding.keys)} — ${binding.description}`
+    : `${theme.toolTitle(binding.keys)}  ${binding.description}`;
 }
