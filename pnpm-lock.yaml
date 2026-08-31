@@ -5,7 +5,7 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
-  '@earendil-works/pi-tui@0.84.2': 18a5c3b8651757b10d3ad14bbe6db95f4506c3974331a7543d4340af77d48999
+  '@earendil-works/pi-tui@0.84.2': 923877ec5b8c46ce6c8d651ac110b49d4560a45868910caf7a24c846a0196595
 
 importers:
 
@@ -52,10 +52,13 @@ importers:
         version: link:../../packages/presentation
       '@earendil-works/pi-tui':
         specifier: 0.84.2
-        version: 0.84.2(patch_hash=18a5c3b8651757b10d3ad14bbe6db95f4506c3974331a7543d4340af77d48999)
+        version: 0.84.2(patch_hash=923877ec5b8c46ce6c8d651ac110b49d4560a45868910caf7a24c846a0196595)
       highlight.js:
         specifier: 11.11.1
         version: 11.11.1
+      p-queue:
+        specifier: 9.3.3
+        version: 9.3.3
 
   packages/agent:
     dependencies:
@@ -685,6 +688,9 @@ packages:
   estree-walker@3.0.3:
     resolution: {integrity: sha512-7RUKfXgSMMkzt6ZuXmqapOurLGPPfgj6l9uRZ7lRGolvk0y2yocc35LdcxKC5PQZdn2DMqioAQ2NoWcrTKmm6g==}
 
+  eventemitter3@5.0.4:
+    resolution: {integrity: sha512-mlsTRyGaPBjPedk6Bvw+aqbsXDtoAyAzm5MO7JgU+yVRyMQ5O8bD4Kcci7BS85f93veegeCPkL8R4GLClnjLFw==}
+
   eventsource-parser@3.1.1:
     resolution: {integrity: sha512-EKN1vKAMcZ8MlYMpaNuxN6R9yakzH6uajHcHVTqWJzvu5pWw9DyhbP35HH8MVBQ+dZjAfDxk+A8NiR9KWaXiyQ==}
     engines: {node: '>=18.0.0'}
@@ -1090,6 +1096,14 @@ packages:
       zod:
         optional: true
 
+  p-queue@9.3.3:
+    resolution: {integrity: sha512-NXAOdnEe5FsZJfT4oK84lE1Y5cFFdWlRuOo5tww8DyNMxyRXwn39fIkUtNLKppcPC+UYU/bXujNCUGDv01y7CA==}
+    engines: {node: '>=20'}
+
+  p-timeout@7.0.1:
+    resolution: {integrity: sha512-AxTM2wDGORHGEkPCt8yqxOTMgpfbEHqF51f/5fJCmwFC3C/zNcGT63SymH2ttOAaiIws2zVg4+izQCjrakcwHg==}
+    engines: {node: '>=20'}
+
   parse-entities@4.0.2:
     resolution: {integrity: sha512-GG2AQYWoLgL877gQIKeRPGO1xF9+eG1ujIb5soS5gPvLQ1y2o8FL90w2QWNdf9I361Mpp7726c+lj3U0qK1uGw==}
 
@@ -1404,7 +1418,7 @@ snapshots:
   '@biomejs/cli-win32-x64@2.5.8':
     optional: true
 
-  '@earendil-works/pi-tui@0.84.2(patch_hash=18a5c3b8651757b10d3ad14bbe6db95f4506c3974331a7543d4340af77d48999)':
+  '@earendil-works/pi-tui@0.84.2(patch_hash=923877ec5b8c46ce6c8d651ac110b49d4560a45868910caf7a24c846a0196595)':
     dependencies:
       get-east-asian-width: 1.6.0
       marked: 18.0.5
@@ -1735,6 +1749,8 @@ snapshots:
   estree-walker@3.0.3:
     dependencies:
       '@types/estree': 1.0.9
+
+  eventemitter3@5.0.4: {}
 
   eventsource-parser@3.1.1: {}
 
@@ -2119,6 +2135,13 @@ snapshots:
   openai@7.4.0(zod@4.4.3):
     optionalDependencies:
       zod: 4.4.3
+
+  p-queue@9.3.3:
+    dependencies:
+      eventemitter3: 5.0.4
+      p-timeout: 7.0.1
+
+  p-timeout@7.0.1: {}
 
   parse-entities@4.0.2:
     dependencies:

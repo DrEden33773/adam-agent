@@ -106,6 +106,7 @@ import {
   sessionDurableContext,
   sessionDurableOutputLimits,
 } from "./session-durable-context.js";
+import { createLogicalRunUserMessageV1 } from "./session-history-replay.js";
 import { sessionTitleFallback } from "./session-naming.js";
 import {
   type CanonicalRuntimeEvent,
@@ -126,6 +127,10 @@ import {
   SkillResourceError,
   SkillsError,
 } from "./skills.js";
+import {
+  createSessionUserContentMessageV1,
+  validateSessionUserContentV1,
+} from "./structured-user-content.js";
 import {
   createTodoInputV1Schema,
   createTodoMutationV1,
@@ -401,6 +406,15 @@ export class AgentSession {
         },
       };
     }
+    if (!isStructuredUserContentValid(input)) {
+      return {
+        status: "failed",
+        error: {
+          code: "input_resource_invalid",
+          message: "Structured user content must exactly reference its immutable input resources.",
+        },
+      };
+    }
     if (this.#activeAbortController !== undefined) {
       return {
         status: "failed",
@@ -423,6 +437,14 @@ export class AgentSession {
     this.#activeAbortController = abortController;
     try {
       try {
+        const projectedUserMessage =
+          input.userContent === undefined
+            ? createInputResourceUserMessageV1(input.text, input.inputResources)
+            : createSessionUserContentMessageV1({
+                elements: input.userContent,
+                occurrences: input.inputResources ?? [],
+                userMessage: input.text,
+              });
         const explicitSkills = (input.skills ?? []).map((selection, index) => ({
           selection,
           requestId: `${this.#activeRunId}:skill:${index + 1}`,
@@ -443,9 +465,15 @@ export class AgentSession {
             sequence: logicalRunStartedSequence,
             record: {
               type: "logical_run_started",
-              ...(input.inputResources === undefined || input.inputResources.length === 0
-                ? {}
-                : { recordVersion: 1 as const, inputResources: input.inputResources }),
+              ...(input.userContent === undefined
+                ? input.inputResources === undefined || input.inputResources.length === 0
+                  ? {}
+                  : { recordVersion: 1 as const, inputResources: input.inputResources }
+                : {
+                    recordVersion: 2 as const,
+                    inputResources: input.inputResources ?? [],
+                    userContent: input.userContent,
+                  }),
               runId: this.#activeRunId,
               userMessage: input.text,
               ...(this.#durableContext.planKickoff === undefined
@@ -478,7 +506,13 @@ export class AgentSession {
             });
           }
         }
-        return await this.#run(input, abortController.signal, options.limits, explicitSkills);
+        return await this.#run(
+          input,
+          abortController.signal,
+          options.limits,
+          explicitSkills,
+          projectedUserMessage,
+        );
       } catch (error) {
         if (abortController.signal.aborted && this.#terminalResult === undefined) {
           return await this.#settleCancelled();
@@ -519,9 +553,9 @@ export class AgentSession {
     signal: AbortSignal,
     limits: RunOptions["limits"],
     explicitSkills: readonly { readonly selection: string; readonly requestId: string }[],
+    projectedUserMessage: ModelMessage,
   ): Promise<RunResult> {
     const resume = this.#durableContext?.resume;
-    const projectedUserMessage = createInputResourceUserMessageV1(input.text, input.inputResources);
     if (resume === undefined) {
       await this.#emit({ type: "user_message", text: input.text });
       if (signal.aborted) {
@@ -4262,7 +4296,7 @@ function findRetainedFromSequence(
       record.type === "logical_run_started" &&
       record.runId === runId &&
       firstRetained.role === "user" &&
-      record.userMessage === firstRetained.content
+      isDeepStrictEqual(createLogicalRunUserMessageV1(record), firstRetained)
     ) {
       return entry.sequence;
     }
@@ -4622,6 +4656,25 @@ function areInputResourcesValid(resources: UserInput["inputResources"]): boolean
       resources.every((resource) => inputResourceOccurrenceV1Schema.safeParse(resource).success) &&
       new Set(resources.map((resource) => resource.occurrenceId)).size === resources.length)
   );
+}
+
+function isStructuredUserContentValid(input: UserInput): boolean {
+  if (input.userContent === undefined) {
+    return true;
+  }
+  if (input.inputResources === undefined || input.inputResources.length === 0) {
+    return false;
+  }
+  try {
+    validateSessionUserContentV1({
+      elements: input.userContent,
+      occurrences: input.inputResources,
+      userMessage: input.text,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function skillActivationFailure(

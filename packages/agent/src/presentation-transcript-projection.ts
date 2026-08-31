@@ -7,6 +7,7 @@ import type {
 } from "@adam-agent/presentation";
 import type { RunResult, RuntimeEvent } from "./agent-session-contracts.js";
 import type { SessionRecord } from "./session-store.js";
+import { projectSessionUserContentTextV1 } from "./structured-user-content.js";
 
 type PresentationTranscriptHistoryRecord = {
   readonly sessionId: string;
@@ -117,7 +118,13 @@ export function projectTranscript(
         sequence: entry.sequence,
         sourceSessionId: sessionId,
         branchBoundary: null,
-        text: entry.record.userMessage,
+        text:
+          entry.record.recordVersion === 2
+            ? projectSessionUserContentTextV1({
+                elements: entry.record.userContent,
+                occurrences: entry.record.inputResources,
+              })
+            : entry.record.userMessage,
       });
       continue;
     }

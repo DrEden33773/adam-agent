@@ -1617,26 +1617,34 @@ test("the production target picker repairs an absent saved default through the f
   }
 });
 
-test("the production TUI keeps an edited new-session draft out of persistence until submit", async () => {
+test("the production TUI recovers an edited new-session draft without creating session identity", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-main-session-draft-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
 
   try {
-    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
-    const beforeTarget = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForAfter("Adam · New session", beforeTarget);
-    fixture.write("temporary unsent draft");
-    await fixture.waitForAfter("temporary unsent draft", beforeTarget);
-    fixture.write("\u0011");
-    const result = await fixture.closed;
+    const first = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await first.waitFor("Select an exact model target");
+    const beforeTarget = first.output().length;
+    first.write("\r");
+    await first.waitForAfter("Adam · New session", beforeTarget);
+    first.write("temporary unsent draft");
+    await first.waitForAfter("temporary unsent draft", beforeTarget);
+    first.write("\u0011");
+    const result = await first.closed;
 
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).toContain("deepseek-v4-flash.direct · Certified");
     expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+
+    const restarted = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await restarted.waitFor("Select an exact model target");
+    restarted.write("\r");
+    await restarted.waitFor("temporary unsent draft");
+    expect(restarted.screen()?.join("\n") ?? "").toContain("temporary unsent draft");
+    restarted.write("\u0011");
+    await expect(restarted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -1665,7 +1673,7 @@ test("the production TUI stages and sends one linked input resource", async () =
     await expect(
       Promise.race([
         fixture
-          .waitForCompleteFrameAfter("ready · outside-notes.txt · 17 bytes", beforeAttach)
+          .waitForCompleteFrameAfter("Input resource staged.", beforeAttach)
           .then(() => "ready" as const),
         fixture
           .waitForAfter("Unknown command /attach", beforeAttach)
@@ -1680,7 +1688,103 @@ test("the production TUI stages and sends one linked input resource", async () =
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     const durable = await readFilesRecursively(stateRoot);
     expect(durable).toContain('"displayName":"outside-notes.txt"');
+    expect(durable).toContain('"recordVersion":2');
+    expect(durable).toContain('"userMessage":"Use the linked notes if needed."');
+    expect(durable).toMatch(
+      /"userContent":\[\{"type":"input_resource","occurrenceId":"[^"]+","draftOrdinal":1\},\{"type":"text","text":"Use the linked notes if needed\."\}\]/u,
+    );
+    expect(durable).not.toContain('"userMessage":"[File #1]');
     expect(durable).not.toContain(selectedPath);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI keeps one staged file token and its Draft inputs rail beside the editor", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-structured-file-token-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const selectedPath = join(testRoot, "ordered-notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "ordered TUI bytes\n", "utf8");
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write(`/attach ${selectedPath}\r`);
+    await fixture.waitFor("Input resource staged.");
+
+    const screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("[File #1]");
+    expect(screen).toContain("Draft inputs");
+    expect(screen).not.toContain("Linked input resources");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI inserts ordinary text after one staged file atom", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-structured-file-edit-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const selectedPath = join(testRoot, "ordered-notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "ordered TUI bytes\n", "utf8");
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write(`/attach ${selectedPath}\r`);
+    await fixture.waitFor("Input resource staged.");
+
+    fixture.write("after");
+    await fixture.waitFor("[File #1]after");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("[File #1]after");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI deletes and undoes one whole staged file atom", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-structured-file-undo-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const selectedPath = join(testRoot, "ordered-notes.txt");
+  await mkdir(workspaceRoot);
+  await writeFile(selectedPath, "ordered TUI bytes\n", "utf8");
+
+  try {
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write(`/attach ${selectedPath}\r`);
+    await fixture.waitFor("Input resource staged.");
+    fixture.write("after");
+    await fixture.waitFor("[File #1]after");
+
+    fixture.write(`${"\u001b[D".repeat(6)}\u001b[3~`);
+    await fixture.waitFor("Input resource removed.");
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("[File #1]");
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("Draft inputs");
+
+    fixture.write(String.fromCharCode(31));
+    await fixture.waitFor("Draft edit undone.");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("[File #1]after");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("Draft inputs");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -1749,7 +1853,7 @@ test("the production TUI removes a ready linked input resource by its visible in
     fixture.write("\r");
     await fixture.waitFor("Adam · New session");
     fixture.write(`/attach ${selectedPath}\r`);
-    await fixture.waitFor("ready · discard-notes.txt · 20 bytes");
+    await fixture.waitFor("Input resource staged.");
 
     const beforeRemove = fixture.output().length;
     fixture.write("/detach 1\r");
@@ -1764,58 +1868,10 @@ test("the production TUI removes a ready linked input resource by its visible in
       ]),
     ).resolves.toBe("removed");
     expect(fixture.screen()?.join("\n") ?? "").not.toContain("discard-notes.txt");
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("/detach 1");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI cancels a copying input resource by its visible index", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-cancel-input-resource-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  const controlRoot = join(testRoot, "control");
-  const selectedPath = join(testRoot, "slow-notes.txt");
-  await mkdir(workspaceRoot);
-  await mkdir(controlRoot);
-  await writeFile(selectedPath, "slow linked bytes\n", "utf8");
-
-  try {
-    const fixture = startFixture({
-      controlRoot,
-      launch: {},
-      scenario: "input-resource-copying",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Select an exact model target");
-    fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
-    fixture.write(`/attach ${selectedPath}\r`);
-    await waitForPath(join(controlRoot, "input-resource-copying"));
-    await fixture.waitFor("copying · slow-notes.txt · size pending");
-
-    const beforeCancel = fixture.output().length;
-    fixture.write("/cancelattach 1\r");
-    await expect(
-      Promise.race([
-        fixture
-          .waitForAfter("cancelled · slow-notes.txt", beforeCancel)
-          .then(() => "cancelled" as const),
-        fixture
-          .waitForAfter("Unknown command /cancelattach", beforeCancel)
-          .then(() => "unknown" as const),
-      ]),
-    ).resolves.toBe("cancelled");
-    await writeFile(join(controlRoot, "release-input-resource-copy"), "release\n", "utf8");
-    await fixture.waitFor("Input resource cancelled.");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await writeFile(join(controlRoot, "release-input-resource-copy"), "release\n", "utf8").catch(
-      () => undefined,
-    );
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -1840,13 +1896,13 @@ test("linked input resources stay sanitized, colorless, and bounded at supported
     fixture.write("\r");
     await fixture.waitFor("Adam · New session");
     fixture.write(`/attach ${selectedPath}\r`);
-    await fixture.waitFor("ready · unsafe�name.txt · 19 bytes");
+    await fixture.waitFor("Input resource staged.");
 
     for (const columns of [40, 80, 120]) {
       const beforeResize = fixture.output().length;
       await fixture.resize(columns, 40);
       const frame = latestSynchronizedFrame(fixture.output().slice(beforeResize));
-      expect(frame.join("\n")).toContain("Linked input resources");
+      expect(frame.join("\n")).toContain("Draft inputs");
       expect(frame.join("\n")).not.toContain("\u0085");
       expect(frame.join("\n")).not.toContain("\u001b[38;2;");
       expect(frame.join("\n")).not.toContain("\u001b[48;2;");
@@ -6217,7 +6273,7 @@ test("the real TUI fuzzy-selects and quotes a normalized project path without re
     await fixture.closed;
 
     const durableState = await readFilesRecursively(stateRoot);
-    expect(durableState).not.toContain("src/alpha.ts");
+    expect(durableState).toContain("Inspect `src/alpha.ts`");
     expect(durableState).not.toContain("PRIVATE_ALPHA_BYTES");
     expect(fixture.output()).not.toContain("PRIVATE_ALPHA_BYTES");
   } finally {

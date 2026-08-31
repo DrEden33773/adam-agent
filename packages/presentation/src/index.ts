@@ -747,8 +747,29 @@ export type NewSessionDraftDisplay = {
   readonly projectPaths: ProjectPathCatalogDisplay;
 };
 
+export type DraftPoint =
+  | { readonly edge: "start" | "end" }
+  | { readonly elementId: string; readonly edge: "before" | "after" }
+  | { readonly elementId: string; readonly offset: number };
+
+export type DraftTextDocumentPart =
+  | { readonly type: "text"; readonly text: string }
+  | { readonly type: "resource"; readonly elementId: string };
+
 export type TurnComposerDisplay = {
   readonly attachmentAvailable: boolean;
+  readonly draftRevision: number;
+  readonly elements: readonly (
+    | { readonly elementId: string; readonly type: "text"; readonly text: string }
+    | {
+        readonly elementId: string;
+        readonly type: "resource";
+        readonly kind: "file" | "image";
+        readonly ordinal: number;
+        readonly resourceId: string;
+      }
+  )[];
+  readonly renderedText: string;
   readonly unavailableReason: string | null;
   readonly sealed: boolean;
   readonly revisionIntent: {
@@ -760,11 +781,17 @@ export type TurnComposerDisplay = {
   } | null;
   readonly resources: readonly {
     readonly id: string;
+    readonly elementId: string;
     readonly displayName: string;
     readonly state: "queued" | "copying" | "ready" | "failed" | "cancelled" | "removed";
     readonly byteCount: number | null;
+    readonly kind: "file" | "image";
+    readonly mediaHint: "binary" | "image" | "text" | null;
+    readonly ordinal: number;
+    readonly origin: "selected_file";
     readonly support: "image" | "unsupported_binary" | "utf8_text" | null;
     readonly diagnostic: string | null;
+    readonly token: string;
   }[];
 };
 
@@ -1064,6 +1091,28 @@ export type PresentationCommand =
   | {
       readonly type: "stage_input_resource";
       readonly path: string;
+      readonly mutation?: {
+        readonly at: DraftPoint;
+        readonly baseRevision: number;
+      };
+    }
+  | {
+      readonly type: "replace_draft_text";
+      readonly baseRevision: number;
+      readonly document: readonly DraftTextDocumentPart[];
+    }
+  | {
+      readonly type: "remove_draft_element";
+      readonly baseRevision: number;
+      readonly elementId: string;
+    }
+  | {
+      readonly type: "undo_draft";
+      readonly baseRevision: number;
+    }
+  | {
+      readonly type: "clear_draft";
+      readonly baseRevision: number;
     }
   | {
       readonly type: "update_draft_text";

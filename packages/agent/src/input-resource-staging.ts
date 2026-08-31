@@ -20,6 +20,10 @@ export type TurnComposerResourceStager = {
     readonly path: string;
     readonly signal: AbortSignal;
   }): Promise<StagedInputResourceSelectionV1>;
+  retain(input: {
+    readonly resourceId: string;
+    readonly selection: StagedInputResourceSelectionV1;
+  }): Promise<void>;
   discard(selection: StagedInputResourceSelectionV1): Promise<void>;
   close(): Promise<void>;
 };
@@ -75,6 +79,9 @@ export async function createFileTurnComposerResourceStager(options: {
         }
         throw error;
       }
+    },
+    async retain(input) {
+      await staging.retain(input.selection.staged);
     },
     discard(selection) {
       return staging.discard(selection.staged);

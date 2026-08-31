@@ -1004,6 +1004,9 @@ test("PresentationSession opens an empty project catalog without creating a sess
       draft: null,
       composer: {
         attachmentAvailable: false,
+        draftRevision: 0,
+        elements: [],
+        renderedText: "",
         unavailableReason: "New session required for attachments",
         sealed: false,
         resources: [],
@@ -1212,6 +1215,16 @@ test("PresentationSession creates Plan revision intent without changing durable 
       planId: submitted.plan.submission.planId,
       contentDigest: submitted.plan.submission.contentDigest,
     });
+    await expect(
+      presentation.dispatch({
+        type: "replace_draft_text",
+        baseRevision: presentation.getState().composer.draftRevision,
+        document: [{ type: "text", text: "Keep the first step and add rollback verification." }],
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer.renderedText).toBe(
+      "Keep the first step and add rollback verification.",
+    );
     await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toEqual(before);
     await expect(
       presentation.dispatch({
@@ -2259,9 +2272,10 @@ test("PresentationSession publishes Reachable after one successful target connec
   };
   const harness = createInMemorySessionLifecycleHarness();
   const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
 
   try {
-    const presentation = await createPresentationSession({
+    presentation = await createPresentationSession({
       lifecycle,
       modelTargets,
       openProject: true,
@@ -2557,7 +2571,7 @@ test("PresentationSession stages one draft resource before sealing the admitted 
       },
     },
   });
-  const presentation = await createPresentationSession({
+  let presentation = await createPresentationSession({
     lifecycle,
     modelTargets,
     openProject: true,
@@ -2575,7 +2589,20 @@ test("PresentationSession stages one draft resource before sealing the admitted 
 
   try {
     await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
-    const stage = presentation.dispatch({ type: "stage_input_resource", path: selectedPath });
+    await presentation.dispatch({ type: "update_draft_text", text: "beforeafter" });
+    const initialDraft = presentation.getState().composer;
+    const initialText = initialDraft.elements[0];
+    if (initialText?.type !== "text") {
+      throw new Error("Expected one canonical Presentation draft text element.");
+    }
+    const stage = presentation.dispatch({
+      type: "stage_input_resource",
+      path: selectedPath,
+      mutation: {
+        at: { elementId: initialText.elementId, offset: 6 },
+        baseRevision: initialDraft.draftRevision,
+      },
+    });
     await expect(
       Promise.race([
         copying.promise.then(() => "copying" as const),
@@ -2584,9 +2611,23 @@ test("PresentationSession stages one draft resource before sealing the admitted 
     ).resolves.toBe("copying");
     expect(presentation.getState().composer).toMatchObject({
       attachmentAvailable: true,
+      elements: [
+        { elementId: initialText.elementId, type: "text", text: "before" },
+        { type: "resource", kind: "file", ordinal: 1 },
+        { type: "text", text: "after" },
+      ],
+      renderedText: "before[File #1]after",
       sealed: false,
-      resources: [{ displayName: "outside notes.txt", state: "copying" }],
+      resources: [
+        {
+          displayName: "outside notes.txt",
+          ordinal: 1,
+          state: "copying",
+          token: "[File #1]",
+        },
+      ],
     });
+    expect(presentation.getState().composer.resources[0]).not.toHaveProperty("retained");
 
     releaseCopy.resolve();
     await expect(stage).resolves.toMatchObject({ status: "admitted" });
@@ -2607,7 +2648,7 @@ test("PresentationSession stages one draft resource before sealing the admitted 
     await expect(
       presentation.dispatch({
         type: "submit_draft_prompt",
-        text: "Read the linked notes only if needed.",
+        text: "beforeafter",
         skills: [],
         thinkingSelection: null,
       }),
@@ -2617,11 +2658,85 @@ test("PresentationSession stages one draft resource before sealing the admitted 
       expect.arrayContaining([
         expect.objectContaining({
           role: "user",
-          content: expect.stringContaining('"displayName":"outside notes.txt"'),
+          content: expect.stringMatching(
+            /^before\[File #1\]after[\s\S]*"displayName":"outside notes.txt"/u,
+          ),
         }),
       ]),
     );
+    const sessionId = presentation.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) {
+      throw new Error("Expected one admitted session for the structured draft.");
+    }
+    const logicalRun = (await readInMemoryPresentationRecords(harness.sessions)(sessionId)).find(
+      (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
+    );
+    expect(logicalRun).toMatchObject({
+      record: {
+        recordVersion: 2,
+        userMessage: "beforeafter",
+        userContent: [
+          { type: "text", text: "before" },
+          { type: "input_resource", occurrenceId: expect.any(String), draftOrdinal: 1 },
+          { type: "text", text: "after" },
+        ],
+      },
+    });
     expect(presentation.getState().composer.resources).toEqual([]);
+    await waitForAssistantMessage(presentation, "Composer fixture answer.");
+    await presentation.close();
+    await lifecycle.continue({
+      sessionId,
+      input: { text: "Continue from the structured history." },
+    });
+    const replayedRequest = requests.findLast((request) =>
+      request.messages.some(
+        (message) =>
+          message.role === "user" &&
+          typeof message.content === "string" &&
+          message.content.includes("Continue from the structured history."),
+      ),
+    );
+    expect(replayedRequest?.messages).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          role: "user",
+          content: expect.stringMatching(
+            /^before\[File #1\]after[\s\S]*"displayName":"outside notes.txt"/u,
+          ),
+        }),
+      ]),
+    );
+    presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      projectLabel: "workspace",
+      sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    expect(presentation.getState().authoritative.active?.transcript.items).toContainEqual(
+      expect.objectContaining({ type: "user_message", text: "before[File #1]after" }),
+    );
+    await presentation.close();
+    presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    await expect(
+      presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId }),
+    ).resolves.toEqual({ status: "admitted", commandId: expect.any(String), resource: null });
+    expect(presentation.getState().composer).toMatchObject({
+      elements: [],
+      renderedText: "",
+      resources: [],
+    });
   } finally {
     releaseCopy.resolve();
     await presentation.close();
@@ -2676,17 +2791,75 @@ test("PresentationSession removes a ready resource before sealing the draft", as
   try {
     await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
     await expect(
-      presentation.dispatch({ type: "stage_input_resource", path: selectedPath }),
+      presentation.dispatch({
+        type: "replace_draft_text",
+        baseRevision: presentation.getState().composer.draftRevision,
+        document: [{ type: "text", text: "draft text" }],
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await expect(
+      presentation.dispatch({
+        type: "stage_input_resource",
+        path: selectedPath,
+        mutation: {
+          at: { edge: "end" },
+          baseRevision: presentation.getState().composer.draftRevision,
+        },
+      }),
     ).resolves.toMatchObject({ status: "admitted" });
     const resourceId = presentation.getState().composer.resources[0]?.id;
-    if (resourceId === undefined) {
+    const resourceElement = presentation
+      .getState()
+      .composer.elements.find((element) => element.type === "resource");
+    if (resourceId === undefined || resourceElement?.type !== "resource") {
       throw new Error("Expected one ready resource in the composer.");
     }
 
     await expect(
-      presentation.dispatch({ type: "remove_input_resource", resourceId }),
+      presentation.dispatch({
+        type: "remove_draft_element",
+        baseRevision: presentation.getState().composer.draftRevision,
+        elementId: resourceElement.elementId,
+      }),
     ).resolves.toMatchObject({ status: "admitted" });
     expect(presentation.getState().composer.resources).toEqual([]);
+
+    await expect(
+      presentation.dispatch({
+        type: "undo_draft",
+        baseRevision: presentation.getState().composer.draftRevision,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer).toMatchObject({
+      renderedText: "draft text[File #1]",
+      resources: [{ id: resourceId, ordinal: 1, state: "ready" }],
+    });
+
+    await expect(
+      presentation.dispatch({ type: "remove_input_resource", resourceId }),
+    ).resolves.toMatchObject({ status: "admitted" });
+
+    await expect(
+      presentation.dispatch({
+        type: "clear_draft",
+        baseRevision: presentation.getState().composer.draftRevision,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer).toMatchObject({
+      elements: [],
+      renderedText: "",
+      resources: [],
+    });
+
+    await expect(
+      presentation.dispatch({ type: "stage_input_resource", path: selectedPath }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    const freshResource = presentation.getState().composer.resources[0];
+    expect(freshResource).toMatchObject({ ordinal: 1, token: "[File #1]" });
+    if (freshResource === undefined) {
+      throw new Error("Expected one fresh resource after clearing the draft.");
+    }
+    await presentation.dispatch({ type: "remove_input_resource", resourceId: freshResource.id });
 
     await presentation.dispatch({
       type: "submit_draft_prompt",
@@ -2753,6 +2926,7 @@ test("PresentationSession cancels a copying resource and excludes it from seal",
     releaseCopy.resolve();
     await expect(cancellation).resolves.toMatchObject({ status: "admitted" });
     await stage;
+    expect(presentation.getState().composer.resources).toEqual([]);
 
     await expect(
       presentation.dispatch({
@@ -3096,7 +3270,7 @@ test("PresentationSession cancels resource staging while a turn is sealing", asy
   }
 });
 
-test("PresentationSession clears staged resources when selecting another session", async () => {
+test("PresentationSession scopes recoverable resources to their selected session", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-select-resource-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -3134,6 +3308,23 @@ test("PresentationSession clears staged resources when selecting another session
       presentation.dispatch({ type: "select_session", sessionId: second.sessionId }),
     ).resolves.toMatchObject({ status: "admitted" });
     expect(presentation.getState().composer.resources).toEqual([]);
+
+    await expect(
+      presentation.dispatch({ type: "select_session", sessionId: first.sessionId }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().composer).toMatchObject({
+      renderedText: "[File #1]",
+      resources: [{ displayName: "session-local-notes.txt", ordinal: 1, state: "ready" }],
+    });
+    await expect(
+      presentation.dispatch({
+        type: "submit_prompt",
+        sessionId: first.sessionId,
+        text: "Use the recovered session-local notes.",
+        skills: [],
+        thinkingSelection: null,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
   } finally {
     await presentation.close();
     await lifecycle.close();
@@ -3956,9 +4147,10 @@ test("PresentationSession admits the first non-empty draft prompt as one durable
   };
   const harness = createInMemorySessionLifecycleHarness();
   const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
 
   try {
-    const presentation = await createPresentationSession({
+    presentation = await createPresentationSession({
       lifecycle,
       modelTargets,
       openProject: true,
@@ -3970,7 +4162,7 @@ test("PresentationSession admits the first non-empty draft prompt as one durable
     await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
     const completed = Promise.withResolvers<void>();
     const unsubscribe = presentation.subscribe(() => {
-      const items = presentation.getState().authoritative.active?.transcript.items ?? [];
+      const items = presentation?.getState().authoritative.active?.transcript.items ?? [];
       if (
         items.some((item) => item.type === "assistant_message" && item.text === "Draft admitted.")
       ) {
@@ -4010,7 +4202,22 @@ test("PresentationSession admits the first non-empty draft prompt as one durable
     });
 
     await presentation.close();
+    presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    expect(presentation.getState().composer).toMatchObject({
+      elements: [],
+      renderedText: "",
+      resources: [],
+    });
   } finally {
+    await presentation?.close();
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -4494,7 +4701,7 @@ test("PresentationSession begins a draft only from an exact available launch tar
   }
 });
 
-test("PresentationSession opens an exact target as a process-local draft", async () => {
+test("PresentationSession opens an exact target as a recoverable draft", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-open-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -4557,6 +4764,9 @@ test("PresentationSession opens an exact target as a process-local draft", async
       },
       composer: {
         attachmentAvailable: true,
+        draftRevision: 0,
+        elements: [],
+        renderedText: "",
         unavailableReason: null,
         sealed: false,
         resources: [],
@@ -4569,6 +4779,131 @@ test("PresentationSession opens an exact target as a process-local draft", async
 
     await presentation.close();
   } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession recovers the default new-session draft after a clean restart", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-recovery-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const selectedPath = join(workspaceRoot, "notes.txt");
+  await writeFile(selectedPath, "notes", "utf8");
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      throw new Error("Draft recovery must not resolve a model driver.");
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  let presentation: Awaited<ReturnType<typeof createProductPresentationSession>> | undefined;
+
+  try {
+    presentation = await createProductPresentationSession({
+      lifecycle,
+      modelTargets,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    await expect(
+      presentation.dispatch({ type: "update_draft_text", text: "beforeafter" }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    const beforeStage = presentation.getState().composer;
+    const textElement = beforeStage.elements[0];
+    if (textElement?.type !== "text") {
+      throw new Error("Expected one recoverable text element before staging.");
+    }
+    await expect(
+      presentation.dispatch({
+        type: "stage_input_resource",
+        path: selectedPath,
+        mutation: {
+          at: { elementId: textElement.elementId, offset: 6 },
+          baseRevision: beforeStage.draftRevision,
+        },
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await presentation.close();
+
+    presentation = await createProductPresentationSession({
+      lifecycle,
+      modelTargets,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    expect(presentation.getState().composer).toMatchObject({
+      elements: [
+        { type: "text", text: "before" },
+        { type: "resource", kind: "file", ordinal: 1 },
+        { type: "text", text: "after" },
+      ],
+      renderedText: "before[File #1]after",
+      resources: [{ displayName: "notes.txt", ordinal: 1, state: "ready" }],
+    });
+    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
+  } finally {
+    await presentation?.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession discards an explicit process-only draft on close", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-process-only-draft-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelTargets = settledModelTargets("Process-only drafts do not reach the model.");
+  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+
+  try {
+    presentation = await createPresentationSession({
+      draftPersistencePolicy: "process_only",
+      lifecycle,
+      modelTargets,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    await expect(
+      presentation.dispatch({ type: "update_draft_text", text: "do not recover me" }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await presentation.close();
+
+    presentation = await createPresentationSession({
+      draftPersistencePolicy: "process_only",
+      lifecycle,
+      modelTargets,
+      projectLabel: "workspace",
+      stateRoot,
+      targetIdentity,
+      workspaceRoot,
+    });
+    expect(presentation.getState().composer).toMatchObject({
+      elements: [],
+      renderedText: "",
+      resources: [],
+    });
+  } finally {
+    await presentation?.close();
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }
