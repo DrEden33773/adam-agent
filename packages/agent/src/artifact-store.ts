@@ -75,7 +75,7 @@ export type InputResourceArtifactSourceV1 = {
   readonly schemaVersion: 1;
   readonly occurrenceId: string;
   readonly runId: string;
-  readonly provenance: "user_local_file";
+  readonly provenance: "user_clipboard_image" | "user_local_file";
 };
 
 export type PastedTextArtifactSourceV1 = {

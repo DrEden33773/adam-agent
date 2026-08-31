@@ -795,7 +795,7 @@ export type TurnComposerDisplay = {
     readonly kind: "file" | "image";
     readonly mediaHint: "binary" | "image" | "text" | null;
     readonly ordinal: number;
-    readonly origin: "selected_file";
+    readonly origin: "pasted_image" | "selected_file";
     readonly support: "image" | "unsupported_binary" | "utf8_text" | null;
     readonly diagnostic: string | null;
     readonly token: string;
@@ -1119,6 +1119,14 @@ export type PresentationCommand =
   | {
       readonly type: "stage_pasted_text";
       readonly text: string;
+      readonly mutation?: {
+        readonly at: DraftPoint;
+        readonly baseRevision: number;
+      };
+    }
+  | {
+      readonly type: "stage_pasted_image";
+      readonly bytes: Uint8Array;
       readonly mutation?: {
         readonly at: DraftPoint;
         readonly baseRevision: number;

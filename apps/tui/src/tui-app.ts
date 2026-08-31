@@ -67,6 +67,7 @@ import {
   LargeReasoningViewStore,
   largeReasoningBoundaryAnchorId,
 } from "./large-reasoning-view.js";
+import type { ClipboardImageReader } from "./linux-clipboard-image.js";
 import { mcpAdvanceCommand } from "./mcp-advance.js";
 import { McpWizard } from "./mcp-wizard.js";
 import { OverlayFrame } from "./overlay-frame.js";
@@ -116,6 +117,7 @@ export type RunTuiOptions = {
   readonly targetStatus?: TuiTargetStatus;
   readonly terminal?: Terminal;
   readonly clipboard?: ClipboardAdapter;
+  readonly clipboardImageReader?: ClipboardImageReader;
   readonly deadlineScheduler?: DeadlineScheduler;
   readonly mouse?: boolean;
 };
@@ -720,11 +722,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       const size = resource.byteCount === null ? "size pending" : `${resource.byteCount} bytes`;
       const media = resource.mediaHint === null ? "media pending" : resource.mediaHint;
       const support = resource.support === null ? "support pending" : resource.support;
+      const origin =
+        resource.origin === "pasted_image"
+          ? "Pasted image"
+          : resource.kind === "image"
+            ? "Selected image"
+            : "Selected file";
       resources.addChild(
         new ResponsiveLine(
           theme.toolOutput(
             safeTerminalText(
-              `${resource.token} · Selected file · ${resource.state} · ${resource.displayName} · ${size} · ${media} · ${support}`,
+              `${resource.token} · ${origin} · ${resource.state} · ${resource.displayName} · ${size} · ${media} · ${support}`,
             ),
           ),
         ),
@@ -3336,6 +3344,66 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       usage: "Usage: /cancelattach <visible-index>",
     });
   };
+  const handlePasteImageCommand = (argumentsText: string, sessionId?: string): void => {
+    if (argumentsText.length > 0) {
+      showNotice("warning", "Usage: /paste-image", "until_edit", sessionId);
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    if (options.clipboardImageReader === undefined) {
+      showNotice(
+        "warning",
+        "Clipboard image acquisition is unavailable on this platform.",
+        "until_edit",
+        sessionId,
+      );
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    editor.disableSubmit = true;
+    const actionId = showNotice(
+      "progress",
+      "Reading clipboard image…",
+      "until_replaced",
+      sessionId,
+    );
+    renderState();
+    void options.clipboardImageReader
+      .readImage()
+      .then((result) =>
+        result.status === "read"
+          ? options.presentation.dispatch({ type: "stage_pasted_image", bytes: result.bytes })
+          : Promise.resolve({
+              status: "rejected" as const,
+              code: "not_available" as const,
+              message: result.message,
+            }),
+      )
+      .then((receipt) => {
+        settleNotice(
+          actionId,
+          receipt.status === "admitted" ? "success" : "error",
+          receipt.status === "admitted" ? "Clipboard image staged." : receipt.message,
+          receipt.status === "admitted" ? "until_next_action" : "until_edit",
+          sessionId,
+        );
+      })
+      .catch(() => {
+        settleNotice(
+          actionId,
+          "error",
+          "Clipboard image acquisition failed.",
+          "until_edit",
+          sessionId,
+        );
+      })
+      .finally(() => {
+        editor.disableSubmit = false;
+        renderState();
+      });
+  };
   const handleAttachmentCommand = (parsed: AdamCommandParseResult, sessionId?: string): boolean => {
     if (parsed.kind !== "known") {
       return false;
@@ -3473,6 +3541,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       if (parsedDraft.kind === "known" && parsedDraft.command.id === "connection") {
         handleConnectionCommand(parsedDraft.argumentsText, state.draft.targetId);
+        return;
+      }
+      if (parsedDraft.kind === "known" && parsedDraft.command.id === "paste-image") {
+        handlePasteImageCommand(parsedDraft.argumentsText);
         return;
       }
       if (
@@ -3869,6 +3941,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       parsedCommand.argumentsText === "draft"
     ) {
       copyExpandedDraft(active.session.id);
+      return;
+    }
+    if (parsedCommand.kind === "known" && parsedCommand.command.id === "paste-image") {
+      handlePasteImageCommand(parsedCommand.argumentsText, active.session.id);
       return;
     }
     if (
@@ -4773,6 +4849,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     try {
       await options.clipboard?.close?.();
+    } catch (error) {
+      failures.push(error);
+    }
+    try {
+      await options.clipboardImageReader?.close();
     } catch (error) {
       failures.push(error);
     }

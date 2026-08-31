@@ -379,7 +379,9 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
     new Set(extensionIds).size !== extensionIds.length ||
     new Set(capabilityIds).size !== capabilityIds.length ||
     reservedCommandNames.size !== reservedCommandNameValues.length ||
-    reservedCommandNameValues.some((name) => !/^[a-z]+$/u.test(name) || name.length > 64) ||
+    reservedCommandNameValues.some(
+      (name) => !/^[a-z]+(?:-[a-z]+)*$/u.test(name) || name.length > 64,
+    ) ||
     options.extensions.some(
       (extension) =>
         extension.extensionId.length === 0 ||

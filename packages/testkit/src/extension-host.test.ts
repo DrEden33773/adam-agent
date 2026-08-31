@@ -798,6 +798,16 @@ export async function activate() {}
   await expect(readFile(markerPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
 });
 
+test("a kebab-case built-in command remains a valid extension reservation", async () => {
+  const host = createExtensionHost({
+    capabilities: [],
+    extensions: [],
+    reservedCommandNames: ["paste-image"],
+  });
+
+  await expect(host.loadConfiguredExtensions()).resolves.toEqual({ extensions: [] });
+});
+
 test("a command descriptor colliding with an active command rejects before runtime import", async () => {
   const firstRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));
   const secondRoot = await mkdtemp(join(tmpdir(), "adam-extension-host-"));

@@ -36,6 +36,17 @@ test("the TUI Registry exposes the read-only Todo navigator", () => {
   });
 });
 
+test("the TUI Registry parses the explicit clipboard image action", () => {
+  expect(adamCommandRegistry.parse("/paste-image")).toMatchObject({
+    kind: "known",
+    argumentsText: "",
+    command: {
+      id: "paste-image",
+      usage: "/paste-image",
+    },
+  });
+});
+
 test("the TUI Registry exposes only descriptor commands backed by project changes", () => {
   const registry = createAdamCommandRegistryFromContributions([
     {

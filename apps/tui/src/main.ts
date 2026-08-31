@@ -15,6 +15,7 @@ import {
   createAdamCommandRegistryFromContributions,
 } from "./command-registry.js";
 import { createLinuxClipboardAdapter } from "./linux-clipboard.js";
+import { createLinuxClipboardImageReader } from "./linux-clipboard-image.js";
 import { createProductionProjectRuntime } from "./project-runtime.js";
 import { runTui } from "./tui-app.js";
 import { TuiConfigurationError, tuiProcessFailureMessage } from "./tui-process-failure.js";
@@ -48,6 +49,7 @@ try {
       workspaceRoot,
     });
     const clipboard = createLinuxClipboardAdapter();
+    const clipboardImageReader = createLinuxClipboardImageReader();
     const permissions = createPermissionPolicy({
       allowedEffects: ["read"],
       askedEffects: ["write", "execute", "network", "delegate", "administrative"],
@@ -92,6 +94,7 @@ try {
         });
         await runTui({
           clipboard,
+          clipboardImageReader,
           closeRuntime,
           commandRegistry,
           mouse: command.mouse,
@@ -122,6 +125,7 @@ try {
         });
         await runTui({
           clipboard,
+          clipboardImageReader,
           closeRuntime,
           commandRegistry,
           mouse: command.mouse,

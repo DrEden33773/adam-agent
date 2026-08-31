@@ -43,6 +43,7 @@ export type StagedInputResourceSelectionV1 = {
   readonly digest: `sha256:${string}`;
   readonly mediaHint: "binary" | "image" | "text";
   readonly support: "image" | "unsupported_binary" | "utf8_text";
+  readonly origin?: "pasted_image" | "selected_file" | undefined;
 };
 
 export type InputResourceSelectionV1 =
@@ -63,7 +64,7 @@ export type InputResourceOccurrenceV1 = {
   };
   readonly digest: `sha256:${string}`;
   readonly mediaHint: "binary" | "image" | "text";
-  readonly provenance: "user_local_file";
+  readonly provenance: "user_clipboard_image" | "user_local_file";
   readonly support: "image" | "unsupported_binary" | "utf8_text";
   readonly mode: "link";
 };
@@ -106,7 +107,7 @@ export const inputResourceOccurrenceV1Schema: z.ZodType<InputResourceOccurrenceV
     }),
     digest: digestSchema,
     mediaHint: z.enum(["binary", "image", "text"]),
-    provenance: z.literal("user_local_file"),
+    provenance: z.enum(["user_clipboard_image", "user_local_file"]),
     support: z.enum(["image", "unsupported_binary", "utf8_text"]),
     mode: z.literal("link"),
   },
@@ -268,7 +269,7 @@ async function promoteStagedInputResource(input: {
     schemaVersion: 1,
     occurrenceId: input.occurrenceId,
     runId: input.runId,
-    provenance: "user_local_file",
+    provenance: selection.origin === "pasted_image" ? "user_clipboard_image" : "user_local_file",
   };
   try {
     await publishFileArtifactStage({
@@ -294,7 +295,7 @@ async function promoteStagedInputResource(input: {
     },
     digest: selection.digest,
     mediaHint: selection.mediaHint,
-    provenance: "user_local_file",
+    provenance: selection.origin === "pasted_image" ? "user_clipboard_image" : "user_local_file",
     support: selection.support,
     mode: "link",
   };
