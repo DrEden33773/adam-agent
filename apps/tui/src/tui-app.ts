@@ -507,7 +507,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       requestPolicyRender();
     },
-    presentation: options.presentation,
+    readArtifact: (command) => options.presentation.dispatch(command),
   });
   transcriptViewport.setScrollListener((direction) => {
     largeReasoningViews.noteViewportMovement(direction);
