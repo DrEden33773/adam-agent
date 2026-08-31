@@ -20,6 +20,18 @@ export function stripTerminalSequences(input: string): string {
   return output;
 }
 
+export function isUnsafePresentationControl(codePoint: number): boolean {
+  return (
+    codePoint < 0x20 ||
+    (codePoint >= 0x7f && codePoint <= 0x9f) ||
+    codePoint === 0x061c ||
+    codePoint === 0x200e ||
+    codePoint === 0x200f ||
+    (codePoint >= 0x202a && codePoint <= 0x202e) ||
+    (codePoint >= 0x2066 && codePoint <= 0x2069)
+  );
+}
+
 function terminalSequenceLength(input: string, index: number): number {
   if (input[index] !== "\u001b") {
     return 0;

@@ -603,7 +603,16 @@ test("Skill completion restores Green and Overlay roles when Mauve selection mov
     let output = fixture.output().slice(beforeCompletion);
     expect(output).toContain("\u001b[38;2;203;166;247m> $alpha");
     expect(output).toContain("\u001b[38;2;166;227;161m$beta\u001b[39m");
-    expect(stripTerminalSequences(output)).toContain("project:. · beta completion procedure.");
+    expectSemanticCompletionRow(output, {
+      description: "project:. · alpha completion procedure.",
+      label: "$alpha",
+      selected: true,
+    });
+    expectSemanticCompletionRow(output, {
+      description: "project:. · beta completion procedure.",
+      label: "$beta",
+      selected: false,
+    });
 
     const beforeMove = fixture.output().length;
     fixture.write("\u001b[B");
@@ -611,12 +620,40 @@ test("Skill completion restores Green and Overlay roles when Mauve selection mov
     output = fixture.output().slice(beforeMove);
     expect(output).toContain("\u001b[38;2;166;227;161m$alpha\u001b[39m");
     expect(output).toContain("\u001b[38;2;203;166;247m> $beta");
+    expectSemanticCompletionRow(output, {
+      description: "project:. · alpha completion procedure.",
+      label: "$alpha",
+      selected: false,
+    });
+    expectSemanticCompletionRow(output, {
+      description: "project:. · beta completion procedure.",
+      label: "$beta",
+      selected: true,
+    });
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
 });
+
+function expectSemanticCompletionRow(
+  output: string,
+  input: { readonly description: string; readonly label: string; readonly selected: boolean },
+): void {
+  if (input.selected) {
+    const start = output.indexOf(`\u001b[38;2;203;166;247m> ${input.label}`);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = output.indexOf("\u001b[39m", start);
+    expect(output.slice(start, end)).toContain(input.description);
+    return;
+  }
+  const labelEnd = output.indexOf(`\u001b[38;2;166;227;161m${input.label}\u001b[39m`);
+  expect(labelEnd).toBeGreaterThanOrEqual(0);
+  const descriptionStart = output.indexOf("\u001b[38;2;108;112;134m", labelEnd);
+  const descriptionEnd = output.indexOf("\u001b[39m", descriptionStart);
+  expect(output.slice(descriptionStart, descriptionEnd)).toContain(input.description);
+}
 
 test("NO_COLOR Skill completion retains marker, order, columns, and source labels", async () => {
   const { fixture, testRoot } = await startPastedTextAtomFixture({

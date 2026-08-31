@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { stripTerminalSequences } from "@adam-agent/presentation";
+import { isUnsafePresentationControl, stripTerminalSequences } from "@adam-agent/presentation";
 import { normalizeExplicitUserImageToPngV1 } from "./image-input.js";
 import type { TurnComposerResourceStager } from "./input-resource-staging.js";
 import {
@@ -223,15 +223,7 @@ export async function createTurnComposer(options: {
       const codePoint = character.codePointAt(0) as number;
       if (/\p{White_Space}/u.test(character)) {
         safe += " ";
-      } else if (
-        codePoint < 0x20 ||
-        (codePoint >= 0x7f && codePoint <= 0x9f) ||
-        codePoint === 0x061c ||
-        codePoint === 0x200e ||
-        codePoint === 0x200f ||
-        (codePoint >= 0x202a && codePoint <= 0x202e) ||
-        (codePoint >= 0x2066 && codePoint <= 0x2069)
-      ) {
+      } else if (isUnsafePresentationControl(codePoint)) {
       } else {
         safe += character;
       }
