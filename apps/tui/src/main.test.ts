@@ -762,6 +762,15 @@ test.each([
     expected: "Clipboard image acquisition reached its deadline.",
   },
   {
+    name: "FileDrop clipboard",
+    result: {
+      status: "file_drop",
+      message: "Clipboard files are not supported; attach an admitted project file explicitly.",
+    } as const,
+    expected: "Clipboard files are not supported",
+    expectedTail: "explicitly.",
+  },
+  {
     name: "malformed bytes",
     result: {
       status: "read",
@@ -798,6 +807,9 @@ test.each([
     const beforePasteImage = terminal.output().length;
     terminal.input("/paste-image\r");
     await terminal.nextSynchronizedFrameContaining(fixture.expected, beforePasteImage);
+    if ("expectedTail" in fixture) {
+      expect(terminal.lines().join("\n")).toContain(fixture.expectedTail);
+    }
     expect(terminal.lines().join("\n")).not.toContain("[Image #");
     terminal.input("\u0011");
     await expect(execution).resolves.toBeUndefined();

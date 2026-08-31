@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -12,7 +12,7 @@ const onePixelPng = Buffer.from(
   "base64",
 );
 
-test.each([
+const readerFixtures = [
   {
     name: "Wayland wl-paste",
     helper: "wl-paste",
@@ -31,54 +31,148 @@ test.each([
     environment: { WSL_DISTRO_NAME: "Ubuntu" },
     expectedPlatform: "wsl_bridge",
   },
-])("the $name reader returns exact bytes through a real child process", async (fixture) => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-image-process-"));
-  const helperPath = join(testRoot, fixture.helper);
-  const sourcePath = join(testRoot, "source.png");
-  await writeFile(helperPath, '#!/bin/sh\n/bin/cat "$ADAM_TEST_IMAGE_SOURCE"\n', {
-    mode: 0o755,
-  });
-  await writeFile(sourcePath, onePixelPng);
+] as const;
 
-  try {
-    const reader = createLinuxClipboardImageReader({
-      environment: {
-        ...process.env,
-        ...fixture.environment,
-        ADAM_TEST_IMAGE_SOURCE: sourcePath,
-        DISPLAY: fixture.environment.DISPLAY,
-        PATH: testRoot,
-        WAYLAND_DISPLAY: fixture.environment.WAYLAND_DISPLAY,
-        WSL_DISTRO_NAME: fixture.environment.WSL_DISTRO_NAME,
-      },
-    });
-    await expect(reader.readImage()).resolves.toEqual({
-      status: "read",
-      bytes: onePixelPng,
-      platform: fixture.expectedPlatform,
-    });
-    await expect(reader.close()).resolves.toBeUndefined();
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
+type ReaderEnvironment = {
+  readonly DISPLAY?: string;
+  readonly WAYLAND_DISPLAY?: string;
+  readonly WSL_DISTRO_NAME?: string;
+};
 
-test("the real clipboard image reader terminates a non-closing helper at its deadline", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-image-deadline-"));
-  const helperPath = join(testRoot, "wl-paste");
-  await writeFile(helperPath, "#!/bin/sh\nwhile :; do :; done\n", { mode: 0o755 });
+test.each(readerFixtures)(
+  "the $name reader returns exact bytes through a real child process",
+  async (fixture) => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-image-process-"));
+    const helperPath = join(testRoot, fixture.helper);
+    const argumentsPath = join(testRoot, "arguments.txt");
+    const sourcePath = join(testRoot, "source.png");
+    await writeFile(
+      helperPath,
+      '#!/bin/sh\nif [ -n "$ADAM_TEST_ARGUMENTS" ]; then printf "%s\\n" "$@" > "$ADAM_TEST_ARGUMENTS"; fi\n/bin/cat "$ADAM_TEST_IMAGE_SOURCE"\n',
+      { mode: 0o755 },
+    );
+    await writeFile(sourcePath, onePixelPng);
 
-  try {
-    const reader = createLinuxClipboardImageReader({
-      deadlineMilliseconds: 50,
-      environment: { ...process.env, PATH: testRoot, WAYLAND_DISPLAY: "wayland-0" },
-    });
-    await expect(reader.readImage()).resolves.toEqual({
-      status: "failed",
-      message: "Clipboard image acquisition reached its deadline.",
-    });
-    await expect(reader.close()).resolves.toBeUndefined();
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
+    try {
+      const fixtureEnvironment: ReaderEnvironment = fixture.environment;
+      const reader = createLinuxClipboardImageReader({
+        environment: {
+          ...process.env,
+          ...fixtureEnvironment,
+          ADAM_TEST_ARGUMENTS: argumentsPath,
+          ADAM_TEST_IMAGE_SOURCE: sourcePath,
+          DISPLAY: fixtureEnvironment.DISPLAY,
+          PATH: testRoot,
+          WAYLAND_DISPLAY: fixtureEnvironment.WAYLAND_DISPLAY,
+          WSL_DISTRO_NAME: fixtureEnvironment.WSL_DISTRO_NAME,
+        },
+      });
+      await expect(reader.readImage()).resolves.toEqual({
+        status: "read",
+        bytes: onePixelPng,
+        platform: fixture.expectedPlatform,
+      });
+      if (fixture.expectedPlatform === "wsl_bridge") {
+        await expect(readFile(argumentsPath, "utf8")).resolves.toContain("-STA");
+      }
+      await expect(reader.close()).resolves.toBeUndefined();
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(readerFixtures)(
+  "the $name reader reports typed failure through real child close",
+  async (fixture) => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-image-failure-"));
+    await writeFile(join(testRoot, fixture.helper), "#!/bin/sh\nexit 2\n", { mode: 0o755 });
+
+    try {
+      const reader = createLinuxClipboardImageReader({
+        environment: readerEnvironment(testRoot, fixture.environment),
+      });
+      await expect(reader.readImage()).resolves.toMatchObject({ status: "unsupported" });
+      await expect(reader.close()).resolves.toBeUndefined();
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(readerFixtures)(
+  "the $name reader bounds real helper output and confirms child close",
+  async (fixture) => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-image-output-bound-"));
+    await writeFile(
+      join(testRoot, fixture.helper),
+      "#!/bin/sh\n/usr/bin/head -c 8388609 /dev/zero\n",
+      { mode: 0o755 },
+    );
+
+    try {
+      const reader = createLinuxClipboardImageReader({
+        environment: readerEnvironment(testRoot, fixture.environment),
+      });
+      await expect(reader.readImage()).resolves.toMatchObject({ status: "failed" });
+      await expect(reader.close()).resolves.toBeUndefined();
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(readerFixtures)(
+  "the $name reader escalates TERM to KILL and confirms real child close",
+  async (fixture) => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-clipboard-image-deadline-"));
+    const signalPath = join(testRoot, "signals.txt");
+    const startedPath = join(testRoot, "started.txt");
+    await writeFile(
+      join(testRoot, fixture.helper),
+      '#!/bin/sh\nprintf "started\\n" >> "$ADAM_TEST_STARTED"\ntrap \'printf "term\\n" >> "$ADAM_TEST_SIGNALS"\' TERM\nwhile :; do :; done\n',
+      { mode: 0o755 },
+    );
+
+    try {
+      const reader = createLinuxClipboardImageReader({
+        candidateDeadlineMilliseconds: 50,
+        environment: readerEnvironment(testRoot, fixture.environment, {
+          ADAM_TEST_SIGNALS: signalPath,
+          ADAM_TEST_STARTED: startedPath,
+        }),
+        terminationGraceMilliseconds: 25,
+      });
+      await expect(reader.readImage()).resolves.toEqual({
+        status: "failed",
+        message: "Clipboard image acquisition reached its deadline.",
+      });
+      const expectedAttempts = fixture.expectedPlatform === "wsl_bridge" ? 1 : 2;
+      expect((await readFile(startedPath, "utf8")).trim().split("\n")).toHaveLength(
+        expectedAttempts,
+      );
+      expect((await readFile(signalPath, "utf8")).trim().split("\n")).toHaveLength(
+        expectedAttempts,
+      );
+      await expect(reader.close()).resolves.toBeUndefined();
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+function readerEnvironment(
+  testRoot: string,
+  fixtureEnvironment: ReaderEnvironment,
+  extra: NodeJS.ProcessEnv = {},
+): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    ...fixtureEnvironment,
+    ...extra,
+    DISPLAY: fixtureEnvironment.DISPLAY,
+    PATH: testRoot,
+    WAYLAND_DISPLAY: fixtureEnvironment.WAYLAND_DISPLAY,
+    WSL_DISTRO_NAME: fixtureEnvironment.WSL_DISTRO_NAME,
+  };
+}

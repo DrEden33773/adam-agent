@@ -72,6 +72,63 @@ test("the real TUI process restores the terminal after staging one input resourc
   }
 });
 
+test("the production WSL paste-image path stages one image and restores the terminal", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-wsl-paste-image-process-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const sourcePath = join(testRoot, "source.png");
+  await mkdir(workspaceRoot);
+  await writeFile(
+    sourcePath,
+    Buffer.from(
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+      "base64",
+    ),
+  );
+  await writeFile(
+    join(testRoot, "powershell.exe"),
+    '#!/bin/sh\n/bin/cat "$ADAM_TEST_IMAGE_SOURCE"\n',
+    { mode: 0o755 },
+  );
+  const inheritedProcessPath = Reflect.get(process.env, "PATH");
+
+  try {
+    await trustWorkspace(configRoot, workspaceRoot);
+    const fixture = startFixture({
+      program: {
+        arguments: ["--target", "deepseek-v4-flash.direct", "--state-root", stateRoot],
+        cwd: workspaceRoot,
+        entrypoint: productionPath,
+        environment: {
+          ADAM_TEST_IMAGE_SOURCE: sourcePath,
+          DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+          PATH: `${testRoot}:${typeof inheritedProcessPath === "string" ? inheritedProcessPath : ""}`,
+          WSL_DISTRO_NAME: "Ubuntu",
+          XDG_CONFIG_HOME: configRoot,
+        },
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitForCompleteFrameAfter("Adam · New session", 0);
+    const beforePaste = fixture.output().length;
+    fixture.write("/paste-image\r");
+    await fixture.waitForCompleteFrameAfter("Clipboard image staged.", beforePaste);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("[Image #1]");
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).toContain("\u001b[?2004h");
+    expect(result.stdout).toContain("\u001b[?2004l");
+    expect(result.stdout.indexOf("\u001b[?2004h")).toBeLessThan(
+      result.stdout.lastIndexOf("\u001b[?2004l"),
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 async function trustWorkspace(configRoot: string, workspaceRoot: string): Promise<void> {
   const workspaceTrust = createWorkspaceTrust({
     environment: { XDG_CONFIG_HOME: configRoot },
