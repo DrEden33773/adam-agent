@@ -15,7 +15,7 @@ export type ClipboardImageReadResult =
       readonly platform: "linux_wayland" | "linux_x11" | "wsl_bridge";
     }
   | {
-      readonly status: "empty" | "failed" | "unsupported";
+      readonly status: "empty" | "failed" | "file_drop" | "unsupported";
       readonly message: string;
     };
 
@@ -44,18 +44,38 @@ type ActiveImageHelper = {
   readonly settlement: Promise<ClipboardImageReadResult>;
 };
 
-const powershellImageScript =
-  "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $image=[System.Windows.Forms.Clipboard]::GetImage(); if ($null -eq $image) { exit 3 }; $stream=[Console]::OpenStandardOutput(); try { $image.Save($stream,[System.Drawing.Imaging.ImageFormat]::Png) } finally { $stream.Dispose(); $image.Dispose() }";
+const wslClipboardExit = {
+  empty: 3,
+  fileDrop: 4,
+  unsupported: 5,
+} as const;
+
+const powershellImageScript = [
+  "Add-Type -AssemblyName System.Windows.Forms",
+  "Add-Type -AssemblyName System.Drawing",
+  "$data=[System.Windows.Forms.Clipboard]::GetDataObject()",
+  `if ($null -eq $data) { exit ${wslClipboardExit.empty} }`,
+  `if ([System.Windows.Forms.Clipboard]::ContainsFileDropList()) { exit ${wslClipboardExit.fileDrop} }`,
+  "$registered=$null",
+  "foreach ($format in @('PNG','image/png','JFIF','image/jpeg')) { if ($data.GetDataPresent($format,$false)) { $registered=$data.GetData($format,$false); break } }",
+  `if ($null -ne $registered) { $stream=[Console]::OpenStandardOutput(); try { if ($registered -is [byte[]]) { $stream.Write($registered,0,$registered.Length) } elseif ($registered -is [System.IO.Stream]) { $registered.CopyTo($stream) } else { exit ${wslClipboardExit.unsupported} } } finally { $stream.Dispose(); if ($registered -is [System.IDisposable]) { $registered.Dispose() } }; exit 0 }`,
+  "$image=[System.Windows.Forms.Clipboard]::GetImage()",
+  `if ($null -eq $image) { $formats=$data.GetFormats(); if ($null -eq $formats -or $formats.Length -eq 0) { exit ${wslClipboardExit.empty} }; exit ${wslClipboardExit.unsupported} }`,
+  "$stream=[Console]::OpenStandardOutput()",
+  "$image.Save($stream,[System.Drawing.Imaging.ImageFormat]::Png)",
+  "$stream.Dispose()",
+  "$image.Dispose()",
+].join("; ");
 
 export function createLinuxClipboardImageReader({
-  deadlineMilliseconds = 2_000,
+  candidateDeadlineMilliseconds = 2_000,
   environment = process.env,
   reclamationMilliseconds = 100,
   scheduler = nodeDeadlineScheduler,
   terminationGraceMilliseconds = 50,
   [linuxClipboardImageSpawn]: spawnProcess = nodeImageSpawn,
 }: {
-  readonly deadlineMilliseconds?: number;
+  readonly candidateDeadlineMilliseconds?: number;
   readonly environment?: NodeJS.ProcessEnv;
   readonly reclamationMilliseconds?: number;
   readonly scheduler?: DeadlineScheduler;
@@ -93,41 +113,55 @@ export function createLinuxClipboardImageReader({
           message: "No supported Linux, Wayland, X11, or WSL clipboard image reader is available.",
         };
       }
-      let deadlineExpired = false;
-      let current: ActiveImageHelper | undefined;
-      const deadline = scheduler.schedule(deadlineMilliseconds, () => {
-        deadlineExpired = true;
-        current?.beginTermination();
-      });
       let sawEmpty = false;
+      let sawDeadline = false;
       let sawFailure = false;
-      try {
-        for (const candidate of candidates) {
-          if (closing || deadlineExpired) {
-            return {
-              status: "failed",
-              message: "Clipboard image acquisition reached its deadline.",
-            };
-          }
-          current = startImageHelper({
-            active,
-            candidate,
-            environment,
-            reclamationMilliseconds,
-            scheduler,
-            spawnProcess,
-            terminationGraceMilliseconds,
-          });
-          active.add(current);
-          const result = await current.settlement;
-          current = undefined;
-          if (result.status === "read") {
-            return result;
-          }
-          sawEmpty ||= result.status === "empty";
-          sawFailure ||= result.status === "failed";
+      for (const candidate of candidates) {
+        if (closing) {
+          return { status: "failed", message: "Clipboard image reader is closing." };
         }
-        return sawFailure
+        const current = startImageHelper({
+          active,
+          candidate,
+          environment,
+          reclamationMilliseconds,
+          scheduler,
+          spawnProcess,
+          terminationGraceMilliseconds,
+        });
+        active.add(current);
+        let deadlineExpired = false;
+        const deadline = scheduler.schedule(candidateDeadlineMilliseconds, () => {
+          deadlineExpired = true;
+          current.beginTermination();
+        });
+        let result: ClipboardImageReadResult;
+        try {
+          result = await current.settlement;
+        } finally {
+          deadline.cancel();
+        }
+        if (closing) {
+          return { status: "failed", message: "Clipboard image reader is closing." };
+        }
+        if (result.status === "read") {
+          return result;
+        }
+        if (result.status === "file_drop") {
+          return result;
+        }
+        if (candidate.platform === "wsl_bridge" && result.status === "failed") {
+          return deadlineExpired
+            ? { status: "failed", message: "Clipboard image acquisition reached its deadline." }
+            : result;
+        }
+        sawDeadline ||= deadlineExpired;
+        sawEmpty ||= result.status === "empty";
+        sawFailure ||= result.status === "failed";
+      }
+      return sawDeadline
+        ? { status: "failed", message: "Clipboard image acquisition reached its deadline." }
+        : sawFailure
           ? { status: "failed", message: "Clipboard image acquisition failed." }
           : sawEmpty
             ? { status: "empty", message: "The clipboard does not contain image bytes." }
@@ -135,9 +169,6 @@ export function createLinuxClipboardImageReader({
                 status: "unsupported",
                 message: "The clipboard does not expose PNG or JPEG image bytes.",
               };
-      } finally {
-        deadline.cancel();
-      }
     },
   };
 }
@@ -150,6 +181,16 @@ type ImageReaderCandidate = {
 
 function imageReaderCandidates(environment: NodeJS.ProcessEnv): readonly ImageReaderCandidate[] {
   const candidates: ImageReaderCandidate[] = [];
+  if (
+    hasEnvironmentValue(environment, "WSL_DISTRO_NAME") ||
+    hasEnvironmentValue(environment, "WSL_INTEROP")
+  ) {
+    candidates.push({
+      command: "powershell.exe",
+      arguments_: ["-NoProfile", "-NonInteractive", "-STA", "-Command", powershellImageScript],
+      platform: "wsl_bridge",
+    });
+  }
   if (hasEnvironmentValue(environment, "WAYLAND_DISPLAY")) {
     candidates.push(
       {
@@ -177,16 +218,6 @@ function imageReaderCandidates(environment: NodeJS.ProcessEnv): readonly ImageRe
         platform: "linux_x11",
       },
     );
-  }
-  if (
-    hasEnvironmentValue(environment, "WSL_DISTRO_NAME") ||
-    hasEnvironmentValue(environment, "WSL_INTEROP")
-  ) {
-    candidates.push({
-      command: "powershell.exe",
-      arguments_: ["-NoProfile", "-NonInteractive", "-Command", powershellImageScript],
-      platform: "wsl_bridge",
-    });
   }
   return candidates;
 }
@@ -291,6 +322,17 @@ function startImageHelper(options: {
       return;
     }
     if (code !== 0) {
+      if (options.candidate.platform === "wsl_bridge" && code === wslClipboardExit.empty) {
+        resolveSettlement?.({ status: "empty", message: "The clipboard image is empty." });
+        return;
+      }
+      if (options.candidate.platform === "wsl_bridge" && code === wslClipboardExit.fileDrop) {
+        resolveSettlement?.({
+          status: "file_drop",
+          message: "Clipboard files are not supported; attach an admitted project file explicitly.",
+        });
+        return;
+      }
       resolveSettlement?.({
         status: "unsupported",
         message: "Clipboard image MIME is unavailable.",
