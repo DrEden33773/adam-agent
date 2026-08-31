@@ -1,8 +1,14 @@
 diff --git a/dist/components/editor.d.ts b/dist/components/editor.d.ts
-index a6fedc9e3b36d066e34860d040db6df47d88c432..26b2fd69ac2dfdbea79ee24125ff5bf2d695d8af 100644
+index a6fedc9e3b36d066e34860d040db6df47d88c432..8964a0abe9223c856910e1355931300567c6251a 100644
 --- a/dist/components/editor.d.ts
 +++ b/dist/components/editor.d.ts
-@@ -30,6 +30,47 @@ export interface EditorOptions {
+@@ -1,4 +1,4 @@
+-import type { AutocompleteProvider } from "../autocomplete.ts";
++import type { AutocompleteItem, AutocompleteProvider } from "../autocomplete.ts";
+ import { type Component, type Focusable, type TUI } from "../tui.ts";
+ import { type SelectListTheme } from "./select-list.ts";
+ /**
+@@ -30,6 +30,65 @@ export interface EditorOptions {
      paddingX?: number;
      autocompleteMaxVisible?: number;
  }
@@ -47,10 +53,36 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..26b2fd69ac2dfdbea79ee24125ff5bf2
 +        readonly point: EditorDocumentPoint;
 +    };
 +};
++export type EditorStructuredCompletionProjection = {
++    readonly lines: readonly string[];
++    readonly cursorLine: number;
++    readonly cursorCol: number;
++};
++export type EditorStructuredCompletionEdit = {
++    readonly range: {
++        readonly anchor: EditorDocumentPoint;
++        readonly focus: EditorDocumentPoint;
++    };
++    readonly text: string;
++    readonly document: readonly EditorDocumentPart[];
++    readonly cursor: EditorDocumentPoint;
++};
++export interface EditorStructuredCompletion {
++    project(document: readonly EditorDocumentPart[], cursor: EditorDocumentPoint): EditorStructuredCompletionProjection | null;
++    accept(document: readonly EditorDocumentPart[], cursor: EditorDocumentPoint, item: AutocompleteItem, prefix: string): EditorStructuredCompletionEdit | null;
++}
  export declare class Editor implements Component, Focusable {
      private state;
      /** Focusable interface - set by TUI when focus changes */
-@@ -68,6 +109,8 @@ export declare class Editor implements Component, Focusable {
+@@ -53,6 +112,7 @@ export declare class Editor implements Component, Focusable {
+     private autocompleteRequestTask;
+     private autocompleteStartToken;
+     private autocompleteRequestId;
++    private structuredCompletion?;
+     private pastes;
+     private pasteCounter;
+     private pasteBuffer;
+@@ -68,6 +128,8 @@ export declare class Editor implements Component, Focusable {
      private undoStack;
      onSubmit?: (text: string) => void;
      onChange?: (text: string) => void;
@@ -59,7 +91,15 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..26b2fd69ac2dfdbea79ee24125ff5bf2
      disableSubmit: boolean;
      constructor(tui: TUI, theme: EditorTheme, options?: EditorOptions);
      /** Set of currently valid paste IDs, for marker-aware segmentation. */
-@@ -107,6 +150,8 @@ export declare class Editor implements Component, Focusable {
+@@ -79,6 +141,7 @@ export declare class Editor implements Component, Focusable {
+     getAutocompleteMaxVisible(): number;
+     setAutocompleteMaxVisible(maxVisible: number): void;
+     setAutocompleteProvider(provider: AutocompleteProvider): void;
++    setStructuredCompletion(completion: EditorStructuredCompletion): void;
+     /**
+      * Add a prompt to history for up/down arrow navigation.
+      * Called after successful submission.
+@@ -107,6 +170,8 @@ export declare class Editor implements Component, Focusable {
          line: number;
          col: number;
      };
@@ -69,10 +109,18 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..26b2fd69ac2dfdbea79ee24125ff5bf2
      /**
       * Insert text at the current cursor position.
 diff --git a/dist/components/editor.js b/dist/components/editor.js
-index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94d0456dcf 100644
+index 4786b46932b65785cfbd2304610ca77ccead910a..242b66932e24571f55034c1b876ad7a40f876ce9 100644
 --- a/dist/components/editor.js
 +++ b/dist/components/editor.js
-@@ -246,6 +246,12 @@ export class Editor {
+@@ -219,6 +219,7 @@ export class Editor {
+     autocompleteRequestTask = Promise.resolve();
+     autocompleteStartToken = 0;
+     autocompleteRequestId = 0;
++    structuredCompletion;
+     // Paste tracking for large pastes
+     pastes = new Map();
+     pasteCounter = 0;
+@@ -246,6 +247,12 @@ export class Editor {
      undoStack = new UndoStack();
      onSubmit;
      onChange;
@@ -85,13 +133,23 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
      disableSubmit = false;
      constructor(tui, theme, options = {}) {
          this.tui = tui;
-@@ -527,6 +533,26 @@ export class Editor {
+@@ -289,6 +296,10 @@ export class Editor {
+         this.autocompleteProvider = provider;
+         this.setAutocompleteTriggerCharacters(provider.triggerCharacters ?? []);
+     }
++    setStructuredCompletion(completion) {
++        this.cancelAutocomplete();
++        this.structuredCompletion = completion;
++    }
+     /**
+      * Add a prompt to history for up/down arrow navigation.
+      * Called after successful submission.
+@@ -527,6 +538,25 @@ export class Editor {
              this.undo();
              return;
          }
 +        if (this.structuredDocument !== null &&
-+            (kb.matches(data, "tui.input.tab") ||
-+                kb.matches(data, "tui.editor.deleteToLineEnd") ||
++            (kb.matches(data, "tui.editor.deleteToLineEnd") ||
 +                kb.matches(data, "tui.editor.deleteToLineStart") ||
 +                kb.matches(data, "tui.editor.deleteWordBackward") ||
 +                kb.matches(data, "tui.editor.deleteWordForward") ||
@@ -112,7 +170,45 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
          // Handle autocomplete mode
          if (this.autocompleteState && this.autocompleteList) {
              if (kb.matches(data, "tui.select.cancel")) {
-@@ -847,6 +873,256 @@ export class Editor {
+@@ -540,35 +570,21 @@ export class Editor {
+             if (kb.matches(data, "tui.input.tab")) {
+                 const selected = this.autocompleteList.getSelectedItem();
+                 if (selected && this.autocompleteProvider) {
+-                    this.pushUndoSnapshot();
+-                    this.lastAction = null;
+-                    const result = this.autocompleteProvider.applyCompletion(this.state.lines, this.state.cursorLine, this.state.cursorCol, selected, this.autocompletePrefix);
+-                    this.state.lines = result.lines;
+-                    this.state.cursorLine = result.cursorLine;
+-                    this.setCursorCol(result.cursorCol);
++                    this.applyAutocompleteItem(selected, this.autocompletePrefix);
+                     this.cancelAutocomplete();
+-                    if (this.onChange)
+-                        this.onChange(this.getText());
+                 }
+                 return;
+             }
+             if (kb.matches(data, "tui.select.confirm")) {
+                 const selected = this.autocompleteList.getSelectedItem();
+                 if (selected && this.autocompleteProvider) {
+-                    this.pushUndoSnapshot();
+-                    this.lastAction = null;
+-                    const result = this.autocompleteProvider.applyCompletion(this.state.lines, this.state.cursorLine, this.state.cursorCol, selected, this.autocompletePrefix);
+-                    this.state.lines = result.lines;
+-                    this.state.cursorLine = result.cursorLine;
+-                    this.setCursorCol(result.cursorCol);
++                    this.applyAutocompleteItem(selected, this.autocompletePrefix);
+                     if (this.autocompletePrefix.startsWith("/")) {
+                         this.cancelAutocomplete();
+                         // Fall through to submit
+                     }
+                     else {
+                         this.cancelAutocomplete();
+-                        if (this.onChange)
+-                            this.onChange(this.getText());
+                         return;
+                     }
+                 }
+@@ -847,6 +863,261 @@ export class Editor {
      getCursor() {
          return { line: this.state.cursorLine, col: this.state.cursorCol };
      }
@@ -281,6 +377,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
 +            text,
 +            document: replacement.document,
 +        });
++        this.refreshStructuredAutocomplete();
 +    }
 +    emitAtomRemovalIntent(atomId, direction) {
 +        if (this.structuredDocument === null)
@@ -351,7 +448,11 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
 +            visibleText += part.label;
 +            atoms.push({ id: part.id, start, end: visibleText.length });
 +        }
-+        this.cancelAutocomplete();
++        const preserveAutocomplete = this.structuredDocument !== null &&
++            this.structuredCompletion !== undefined &&
++            this.getText() === visibleText;
++        if (!preserveAutocomplete)
++            this.cancelAutocomplete();
 +        this.lastAction = null;
 +        this.exitHistoryBrowsing();
 +        this.pastes.clear();
@@ -369,7 +470,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
      setText(text) {
          this.cancelAutocomplete();
          this.lastAction = null;
-@@ -858,6 +1134,9 @@ export class Editor {
+@@ -858,6 +1129,9 @@ export class Editor {
          }
          this.pastes.clear();
          this.pasteCounter = 0;
@@ -379,7 +480,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
          this.setTextInternal(normalized);
      }
      /**
-@@ -868,6 +1147,10 @@ export class Editor {
+@@ -868,6 +1142,10 @@ export class Editor {
      insertTextAtCursor(text) {
          if (!text)
              return;
@@ -390,7 +491,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
          this.cancelAutocomplete();
          this.pushUndoSnapshot();
          this.lastAction = null;
-@@ -890,6 +1173,10 @@ export class Editor {
+@@ -890,6 +1168,10 @@ export class Editor {
      insertTextAtCursorInternal(text) {
          if (!text)
              return;
@@ -401,7 +502,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
          // Normalize line endings and tabs
          const normalized = this.normalizeText(text);
          const insertedLines = normalized.split("\n");
-@@ -925,6 +1212,10 @@ export class Editor {
+@@ -925,6 +1207,10 @@ export class Editor {
      // All the editor methods from before...
      insertCharacter(char, skipUndoCoalescing) {
          this.exitHistoryBrowsing();
@@ -412,7 +513,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
          // Undo coalescing (fish-style):
          // - Consecutive word chars coalesce into one undo unit
          // - Space captures state before itself (so undo removes space+following word together)
-@@ -1011,11 +1302,22 @@ export class Editor {
+@@ -1011,11 +1297,22 @@ export class Editor {
                  filteredText = ` ${filteredText}`;
              }
          }
@@ -436,7 +537,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
              // Store the paste and insert a marker
              this.pasteCounter++;
              const pasteId = this.pasteCounter;
-@@ -1036,6 +1338,10 @@ export class Editor {
+@@ -1036,6 +1333,10 @@ export class Editor {
          this.insertTextAtCursorInternal(filteredText);
      }
      addNewLine() {
@@ -447,7 +548,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
          this.cancelAutocomplete();
          this.exitHistoryBrowsing();
          this.lastAction = null;
-@@ -1068,6 +1374,11 @@ export class Editor {
+@@ -1068,6 +1369,11 @@ export class Editor {
      submitValue() {
          this.cancelAutocomplete();
          const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();
@@ -459,7 +560,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
          this.state = { lines: [""], cursorLine: 0, cursorCol: 0 };
          this.pastes.clear();
          this.pasteCounter = 0;
-@@ -1083,6 +1394,16 @@ export class Editor {
+@@ -1083,6 +1389,16 @@ export class Editor {
      handleBackspace() {
          this.exitHistoryBrowsing();
          this.lastAction = null;
@@ -476,7 +577,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
          if (this.state.cursorCol > 0) {
              this.pushUndoSnapshot();
              // Delete grapheme before cursor (handles emojis, combining characters, etc.)
-@@ -1157,6 +1478,7 @@ export class Editor {
+@@ -1157,6 +1473,7 @@ export class Editor {
       */
      setCursorCol(col) {
          this.state.cursorCol = col;
@@ -484,7 +585,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
          this.preferredVisualCol = null;
          this.snappedFromCursorCol = null;
      }
-@@ -1410,6 +1732,16 @@ export class Editor {
+@@ -1410,6 +1727,16 @@ export class Editor {
      handleForwardDelete() {
          this.exitHistoryBrowsing();
          this.lastAction = null;
@@ -501,7 +602,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
          const currentLine = this.state.lines[this.state.cursorLine] || "";
          if (this.state.cursorCol < currentLine.length) {
              this.pushUndoSnapshot();
-@@ -1520,6 +1852,12 @@ export class Editor {
+@@ -1520,6 +1847,12 @@ export class Editor {
          if (deltaCol !== 0) {
              const currentLine = this.state.lines[this.state.cursorLine] || "";
              if (deltaCol > 0) {
@@ -514,7 +615,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
                  // Moving right - move by one grapheme (handles emojis, combining characters, etc.)
                  if (this.state.cursorCol < currentLine.length) {
                      const afterCursor = currentLine.slice(this.state.cursorCol);
-@@ -1541,6 +1879,12 @@ export class Editor {
+@@ -1541,6 +1874,12 @@ export class Editor {
                  }
              }
              else {
@@ -527,7 +628,7 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
                  // Moving left - move by one grapheme (handles emojis, combining characters, etc.)
                  if (this.state.cursorCol > 0) {
                      const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-@@ -1704,6 +2048,10 @@ export class Editor {
+@@ -1704,6 +2043,10 @@ export class Editor {
      }
      undo() {
          this.exitHistoryBrowsing();
@@ -538,6 +639,130 @@ index 4786b46932b65785cfbd2304610ca77ccead910a..ac2dbd79b7219b33cf1751ff8bb45f94
          const snapshot = this.undoStack.pop();
          if (!snapshot)
              return;
+@@ -1806,14 +2149,67 @@ export class Editor {
+         const layout = prefix.startsWith("/") ? SLASH_COMMAND_SELECT_LIST_LAYOUT : undefined;
+         return new SelectList(items, this.autocompleteMaxVisible, this.theme.selectList, layout);
+     }
++    autocompleteInput() {
++        if (this.structuredDocument !== null && this.structuredCompletion !== undefined) {
++            return this.structuredCompletion.project(this.structuredDocument, this.getDocumentCursor());
++        }
++        return {
++            lines: this.state.lines,
++            cursorLine: this.state.cursorLine,
++            cursorCol: this.state.cursorCol,
++        };
++    }
++    applyAutocompleteItem(item, prefix) {
++        if (!this.autocompleteProvider)
++            return false;
++        if (this.structuredDocument !== null && this.structuredCompletion !== undefined) {
++            const edit = this.structuredCompletion.accept(this.structuredDocument, this.getDocumentCursor(), item, prefix);
++            if (edit === null)
++                return false;
++            this.setDocument(edit.document, edit.cursor);
++            this.onEditIntent?.({
++                type: "replace",
++                range: edit.range,
++                text: edit.text,
++                document: edit.document,
++            });
++            return true;
++        }
++        this.pushUndoSnapshot();
++        this.lastAction = null;
++        const result = this.autocompleteProvider.applyCompletion(this.state.lines, this.state.cursorLine, this.state.cursorCol, item, prefix);
++        this.state.lines = result.lines;
++        this.state.cursorLine = result.cursorLine;
++        this.setCursorCol(result.cursorCol);
++        if (this.onChange)
++            this.onChange(this.getText());
++        return true;
++    }
++    refreshStructuredAutocomplete() {
++        const input = this.autocompleteInput();
++        if (input === null)
++            return;
++        if (this.autocompleteState) {
++            this.updateAutocomplete();
++            return;
++        }
++        const currentLine = input.lines[input.cursorLine] || "";
++        const beforeCursor = currentLine.slice(0, input.cursorCol);
++        if (this.isInSlashCommandContext(beforeCursor) || this.autocompleteTriggerPattern.test(beforeCursor)) {
++            this.tryTriggerAutocomplete();
++        }
++    }
+     tryTriggerAutocomplete(explicitTab = false) {
+         this.requestAutocomplete({ force: false, explicitTab });
+     }
+     handleTabCompletion() {
+         if (!this.autocompleteProvider)
+             return;
+-        const currentLine = this.state.lines[this.state.cursorLine] || "";
+-        const beforeCursor = currentLine.slice(0, this.state.cursorCol);
++        const input = this.autocompleteInput();
++        if (input === null)
++            return;
++        const currentLine = input.lines[input.cursorLine] || "";
++        const beforeCursor = currentLine.slice(0, input.cursorCol);
+         if (this.isInSlashCommandContext(beforeCursor) && !beforeCursor.trimStart().includes(" ")) {
+             this.handleSlashCommandCompletion();
+         }
+@@ -1830,9 +2226,12 @@ export class Editor {
+     requestAutocomplete(options) {
+         if (!this.autocompleteProvider)
+             return;
++        const input = this.autocompleteInput();
++        if (input === null)
++            return;
+         if (options.force) {
+             const shouldTrigger = !this.autocompleteProvider.shouldTriggerFileCompletion ||
+-                this.autocompleteProvider.shouldTriggerFileCompletion(this.state.lines, this.state.cursorLine, this.state.cursorCol);
++                this.autocompleteProvider.shouldTriggerFileCompletion([...input.lines], input.cursorLine, input.cursorCol);
+             if (!shouldTrigger) {
+                 return;
+             }
+@@ -1882,14 +2281,20 @@ export class Editor {
+         if (options.explicitTab || options.force) {
+             return 0;
+         }
+-        const currentLine = this.state.lines[this.state.cursorLine] || "";
+-        const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
++        const input = this.autocompleteInput();
++        if (input === null)
++            return 0;
++        const currentLine = input.lines[input.cursorLine] || "";
++        const textBeforeCursor = currentLine.slice(0, input.cursorCol);
+         return this.autocompleteDebouncePattern.test(textBeforeCursor) ? ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS : 0;
+     }
+     async runAutocompleteRequest(requestId, controller, snapshotText, snapshotLine, snapshotCol, options) {
+         if (!this.autocompleteProvider)
+             return;
+-        const suggestions = await this.autocompleteProvider.getSuggestions(this.state.lines, this.state.cursorLine, this.state.cursorCol, { signal: controller.signal, force: options.force });
++        const input = this.autocompleteInput();
++        if (input === null)
++            return;
++        const suggestions = await this.autocompleteProvider.getSuggestions([...input.lines], input.cursorLine, input.cursorCol, { signal: controller.signal, force: options.force });
+         if (!this.isAutocompleteRequestCurrent(requestId, controller, snapshotText, snapshotLine, snapshotCol)) {
+             return;
+         }
+@@ -1901,14 +2306,7 @@ export class Editor {
+         }
+         if (options.force && options.explicitTab && suggestions.items.length === 1) {
+             const item = suggestions.items[0];
+-            this.pushUndoSnapshot();
+-            this.lastAction = null;
+-            const result = this.autocompleteProvider.applyCompletion(this.state.lines, this.state.cursorLine, this.state.cursorCol, item, suggestions.prefix);
+-            this.state.lines = result.lines;
+-            this.state.cursorLine = result.cursorLine;
+-            this.setCursorCol(result.cursorCol);
+-            if (this.onChange)
+-                this.onChange(this.getText());
++            this.applyAutocompleteItem(item, suggestions.prefix);
+             this.tui.requestRender();
+             return;
+         }
 diff --git a/dist/components/select-list.js b/dist/components/select-list.js
 index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..0b8964d09635714a7e5872c653883e064f59df14 100644
 --- a/dist/components/select-list.js
@@ -552,12 +777,12 @@ index 2e9231150951c3d3f3e13ac8ae8d623f06d38d5d..0b8964d09635714a7e5872c653883e06
          if (descriptionSingleLine && width > 40) {
              const effectivePrimaryColumnWidth = Math.max(1, Math.min(primaryColumnWidth, width - prefixWidth - 4));
 diff --git a/dist/editor-component.d.ts b/dist/editor-component.d.ts
-index b598c4d291ace5f04b83161252b3ab8cdd4ccbdf..734cca4d88ec3615a564caadce0311b0ba20ee4a 100644
+index b598c4d291ace5f04b83161252b3ab8cdd4ccbdf..fc589d63de74ce745b5d6d9ac6c1fa96fb397003 100644
 --- a/dist/editor-component.d.ts
 +++ b/dist/editor-component.d.ts
 @@ -1,4 +1,5 @@
  import type { AutocompleteProvider } from "./autocomplete.ts";
-+import type { EditorDocumentPart, EditorDocumentPoint, EditorEditIntent, EditorPasteIntent } from "./components/editor.ts";
++import type { EditorDocumentPart, EditorDocumentPoint, EditorEditIntent, EditorPasteIntent, EditorStructuredCompletion } from "./components/editor.ts";
  import type { Component } from "./tui.ts";
  /**
   * Interface for custom editor components.
@@ -579,8 +804,17 @@ index b598c4d291ace5f04b83161252b3ab8cdd4ccbdf..734cca4d88ec3615a564caadce0311b0
      /**
       * Get text with any markers expanded (e.g., paste markers).
       * Falls back to getText() if not implemented.
+@@ -29,6 +37,8 @@ export interface EditorComponent extends Component {
+     getExpandedText?(): string;
+     /** Set the autocomplete provider */
+     setAutocompleteProvider?(provider: AutocompleteProvider): void;
++    /** Supply host-owned structured completion semantics. */
++    setStructuredCompletion?(completion: EditorStructuredCompletion): void;
+     /** Border color function */
+     borderColor?: (str: string) => string;
+     /** Set horizontal padding */
 diff --git a/dist/index.d.ts b/dist/index.d.ts
-index 50b5aeb61f12011642978bc2c31d8a2eb36d17d3..5882d0e9bfd60ee3342083ea57fcffacf34e0ef1 100644
+index 50b5aeb61f12011642978bc2c31d8a2eb36d17d3..cd3ec6f74896a543f4e522a5d86d83da44e64e9e 100644
 --- a/dist/index.d.ts
 +++ b/dist/index.d.ts
 @@ -2,7 +2,7 @@ export { Marked, type Token, type Tokens } from "marked";
@@ -588,7 +822,7 @@ index 50b5aeb61f12011642978bc2c31d8a2eb36d17d3..5882d0e9bfd60ee3342083ea57fcffac
  export { Box } from "./components/box.ts";
  export { CancellableLoader } from "./components/cancellable-loader.ts";
 -export { Editor, type EditorOptions, type EditorTheme } from "./components/editor.ts";
-+export { Editor, type EditorDocumentPart, type EditorDocumentPoint, type EditorEditIntent, type EditorOptions, type EditorPasteIntent, type EditorTheme } from "./components/editor.ts";
++export { Editor, type EditorDocumentPart, type EditorDocumentPoint, type EditorEditIntent, type EditorOptions, type EditorPasteIntent, type EditorStructuredCompletion, type EditorStructuredCompletionEdit, type EditorStructuredCompletionProjection, type EditorTheme } from "./components/editor.ts";
  export { HStack } from "./components/h-stack.ts";
  export { Image, type ImageOptions, type ImageTheme } from "./components/image.ts";
  export { Input } from "./components/input.ts";
