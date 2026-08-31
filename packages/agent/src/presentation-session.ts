@@ -2681,7 +2681,7 @@ export async function createPresentationSession(
             };
           }
         }
-        const skillResolution = resolveSubmittedSkills({
+        const skillResolution = preflightSubmittedSkills({
           text: command.text,
           explicitQualifiedIds: command.skills,
           catalog: state.authoritative.active.skills,
@@ -2741,7 +2741,12 @@ export async function createPresentationSession(
                 : "The current turn could not be sealed safely.",
           };
         }
-        const resolvedSkillIds = skillResolution.qualifiedIds;
+        const resolvedSkillIds = [
+          ...new Set([
+            ...sealedDraft.skillOccurrences.map((occurrence) => occurrence.qualifiedId),
+            ...skillResolution.compatibilityQualifiedIds,
+          ]),
+        ];
         const admission = Promise.withResolvers<void>();
         const admissionAfterSequence =
           state.authoritative.continuity.status === "current"
@@ -2873,7 +2878,7 @@ export async function createPresentationSession(
             message: "The exact draft target is no longer available.",
           };
         }
-        const skillResolution = resolveSubmittedSkills({
+        const skillResolution = preflightSubmittedSkills({
           text: command.text,
           explicitQualifiedIds: command.skills,
           catalog: draft.skills,
@@ -2933,7 +2938,12 @@ export async function createPresentationSession(
                 : "The current turn could not be sealed safely.",
           };
         }
-        const resolvedSkillIds = skillResolution.qualifiedIds;
+        const resolvedSkillIds = [
+          ...new Set([
+            ...sealedDraft.skillOccurrences.map((occurrence) => occurrence.qualifiedId),
+            ...skillResolution.compatibilityQualifiedIds,
+          ]),
+        ];
         const admission = Promise.withResolvers<string>();
         let admittedSessionId: string | null = null;
         const continuation = options.lifecycle.admit({
@@ -4623,13 +4633,13 @@ function ambiguousSkillMentionRejection(
   };
 }
 
-function resolveSubmittedSkills(input: {
+function preflightSubmittedSkills(input: {
   readonly text: string;
   readonly explicitQualifiedIds: readonly string[];
   readonly catalog: SkillCatalogDisplay | null;
   readonly elements: PresentationDisplayState["composer"]["elements"];
 }):
-  | { readonly status: "resolved"; readonly qualifiedIds: readonly string[] }
+  | { readonly status: "resolved"; readonly compatibilityQualifiedIds: readonly string[] }
   | {
       readonly status: "rejected";
       readonly receipt: Extract<CommandReceipt, { readonly status: "rejected" }>;
@@ -4657,7 +4667,12 @@ function resolveSubmittedSkills(input: {
   });
   return resolution.status === "ambiguous"
     ? { status: "rejected", receipt: ambiguousSkillMentionRejection(resolution) }
-    : { status: "resolved", qualifiedIds: resolution.qualifiedIds };
+    : {
+        status: "resolved",
+        compatibilityQualifiedIds: resolution.qualifiedIds.filter(
+          (qualifiedId) => !exactQualifiedIds.includes(qualifiedId),
+        ),
+      };
 }
 
 function draftAdmissionRejection(

@@ -117,6 +117,15 @@ test("TurnComposer expands a Skill atom to visible text without copying identity
     ).resolves.toBe(true);
     expect(composer.readExpandedText()).toBe("$first");
     expect(composer.readExpandedText()).not.toContain("skill:v1:");
+    await expect(composer.seal(new AbortController().signal)).resolves.toMatchObject({
+      text: "$first",
+      skillOccurrences: [
+        {
+          elementId: "skill-occurrence",
+          qualifiedId: "skill:v1:project:.:first",
+        },
+      ],
+    });
   } finally {
     await composer.close();
   }
