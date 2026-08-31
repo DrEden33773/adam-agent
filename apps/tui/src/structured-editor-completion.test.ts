@@ -69,3 +69,25 @@ test("structured completion acceptance preserves every atom identity and order",
     text: "$first",
   });
 });
+
+test("structured insertion creates one text part at an exact captured atom edge", () => {
+  expect(
+    adamStructuredEditorCompletion.accept(
+      [{ type: "atom", id: "resource", label: "[Text #1]" }],
+      { partId: "resource", edge: "after" },
+      { label: "clip", value: "clip" },
+      "",
+    ),
+  ).toEqual({
+    cursor: { partId: "adam-editor-text-1", offset: 4 },
+    document: [
+      { type: "atom", id: "resource", label: "[Text #1]" },
+      { type: "text", id: "adam-editor-text-1", text: "clip" },
+    ],
+    range: {
+      anchor: { partId: "resource", edge: "after" },
+      focus: { partId: "resource", edge: "after" },
+    },
+    text: "clip",
+  });
+});

@@ -43,6 +43,7 @@ import {
   activeChronologyDiffs,
 } from "./artifact-navigator.js";
 import { ChronologyPicker, completeChronologyBoundaries } from "./chronology-picker.js";
+import type { ClipboardReader } from "./clipboard-reader.js";
 import { AdamAutocompleteProvider } from "./command-autocomplete.js";
 import {
   type AdamCommandParseResult,
@@ -118,6 +119,7 @@ export type RunTuiOptions = {
   readonly targetStatus?: TuiTargetStatus;
   readonly terminal?: Terminal;
   readonly clipboard?: ClipboardAdapter;
+  readonly clipboardReader?: ClipboardReader;
   readonly clipboardImageReader?: ClipboardImageReader;
   readonly deadlineScheduler?: DeadlineScheduler;
   readonly mouse?: boolean;
@@ -2046,12 +2048,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         selectedSkills.size === 0
           ? ""
           : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`;
+      const pasteHint =
+        editor.focused && focusedCloseableOverlay() === undefined ? " · Alt+V paste" : "";
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
+          `${safeTerminalText(state.authoritative.project.label)} · New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete${pasteHint}`,
         ),
         standard: theme.muted(
-          `New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
+          `New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete${pasteHint}`,
         ),
         narrow: theme.muted(
           `draft · idle\n${safeTerminalText(draft.targetId)}\n/help · Tab complete`,
@@ -2109,12 +2113,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         active.todo === undefined
           ? ""
           : ` · todo ${active.todo.counts.pending}/${active.todo.counts.inProgress}/${active.todo.counts.completed} · ${active.todo.blockedCount} blocked`;
+      const pasteHint =
+        runStatus === "idle" && editor.focused && focusedCloseableOverlay() === undefined
+          ? " · Alt+V paste"
+          : "";
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}${pasteHint}`,
         ),
         standard: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete${pasteHint}`,
         ),
         narrow: theme.muted(
           `${runStatus}${compactPlanSummary} · ${footerContextCompactText(active)}${compactTodoSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}\n/help · Tab complete`,
@@ -2247,6 +2255,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         renderState();
       });
   };
+  let draftEditGeneration = 0;
   let emptyDraftChangeGeneration = 0;
   const showProjectPathPicker = (): void => {
     const state = options.presentation.getState();
@@ -2308,6 +2317,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     pathPicker = { close, hide: () => handle?.hide() };
   };
   editor.onChange = () => {
+    draftEditGeneration += 1;
     const text = editor.getExpandedText();
     emptyDraftChangeGeneration += 1;
     if (text.length === 0) {
@@ -2334,52 +2344,84 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     showProjectPathPicker();
   };
+  const prepareDraftInsertion = async (
+    intent: EditorPasteIntent,
+    visibleTextBeforePaste: string,
+  ) => {
+    if (intent.cursor.type === "text") {
+      const persisted = await options.presentation.dispatch({
+        type: "update_draft_text",
+        text: visibleTextBeforePaste,
+      });
+      if (persisted.status === "rejected") {
+        return persisted;
+      }
+    }
+    const composer = options.presentation.getState().composer;
+    let at: DraftPoint;
+    if (intent.cursor.type === "document") {
+      at =
+        "offset" in intent.cursor.point
+          ? {
+              elementId: intent.cursor.point.partId,
+              offset: intent.cursor.point.offset,
+            }
+          : {
+              elementId: intent.cursor.point.partId,
+              edge: intent.cursor.point.edge,
+            };
+    } else {
+      const textElement = composer.elements.find((element) => element.type === "text");
+      at =
+        textElement === undefined
+          ? { edge: "start" }
+          : {
+              elementId: textElement.elementId,
+              offset: Math.min(intent.cursor.offset, textElement.text.length),
+            };
+    }
+    return { at, baseRevision: composer.draftRevision };
+  };
+  type CapturedDraftInsertion = { readonly at: DraftPoint; readonly baseRevision: number };
+  const stagePastedText = (intent: EditorPasteIntent, visibleTextBeforePaste: string) =>
+    draftMutationQueue.add(async () => {
+      const mutation = await prepareDraftInsertion(intent, visibleTextBeforePaste);
+      if ("status" in mutation) {
+        return mutation;
+      }
+      return options.presentation.dispatch({
+        type: "stage_pasted_text",
+        text: intent.text,
+        mutation,
+      });
+    });
+  const stageClipboardText = (text: string, mutation: CapturedDraftInsertion) =>
+    draftMutationQueue.add(() =>
+      options.presentation.dispatch({ type: "stage_pasted_text", text, mutation }),
+    );
+  const stageClipboardImage = (bytes: Uint8Array, mutation: CapturedDraftInsertion) =>
+    draftMutationQueue.add(() =>
+      options.presentation.dispatch({ type: "stage_pasted_image", bytes, mutation }),
+    );
+  const capturePasteIntent = (text: string): EditorPasteIntent => {
+    if (structuredEditorActive) {
+      return { text, cursor: { type: "document", point: editor.getDocumentCursor() } };
+    }
+    const cursor = editor.getCursor();
+    const offset =
+      editor
+        .getLines()
+        .slice(0, cursor.line)
+        .reduce((total, line) => total + line.length + 1, 0) + cursor.col;
+    return { text, cursor: { type: "text", offset } };
+  };
   editor.onPaste = (intent: EditorPasteIntent) => {
     if (!isLargePastedTextV1(intent.text)) {
       return false;
     }
     const visibleTextBeforePaste = editor.getExpandedText();
     const actionId = showNotice("progress", "Staging pasted text…", "until_replaced");
-    void draftMutationQueue
-      .add(async () => {
-        if (intent.cursor.type === "text") {
-          const persisted = await options.presentation.dispatch({
-            type: "update_draft_text",
-            text: visibleTextBeforePaste,
-          });
-          if (persisted.status === "rejected") {
-            return persisted;
-          }
-        }
-        const composer = options.presentation.getState().composer;
-        let at: DraftPoint;
-        if (intent.cursor.type === "document") {
-          at =
-            "offset" in intent.cursor.point
-              ? {
-                  elementId: intent.cursor.point.partId,
-                  offset: intent.cursor.point.offset,
-                }
-              : {
-                  elementId: intent.cursor.point.partId,
-                  edge: intent.cursor.point.edge,
-                };
-        } else {
-          const textElement = composer.elements.find((element) => element.type === "text");
-          at =
-            textElement === undefined
-              ? { edge: "start" }
-              : {
-                  elementId: textElement.elementId,
-                  offset: Math.min(intent.cursor.offset, textElement.text.length),
-                };
-        }
-        return options.presentation.dispatch({
-          type: "stage_pasted_text",
-          text: intent.text,
-          mutation: { at, baseRevision: composer.draftRevision },
-        });
-      })
+    void stagePastedText(intent, visibleTextBeforePaste)
       .then((receipt) => {
         settleNotice(
           actionId,
@@ -2399,6 +2441,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     return true;
   };
   editor.onEditIntent = (intent) => {
+    draftEditGeneration += 1;
     if (intent.type === "remove_atom") {
       void draftMutationQueue
         .add(() => {
@@ -2887,7 +2930,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       handle?.hide();
       helpNavigator = undefined;
       tui.setFocus(editor);
-      tui.requestRender();
+      renderState();
     };
     const navigator = new HelpNavigator({
       commands: commandRegistry.entries(),
@@ -2904,7 +2947,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       margin: 1,
     });
     helpNavigator = { close, hide: () => handle?.hide(), navigator };
-    tui.requestRender();
+    renderState();
   };
   const applyConfigurationMutation = (
     field: ConfigurationField,
@@ -3444,6 +3487,150 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         renderState();
       });
   };
+  let clipboardPastePending = false;
+  let clipboardPasteController: AbortController | undefined;
+  const handleClipboardPaste = (argumentsText = "", sessionId?: string): void => {
+    if (argumentsText.length > 0) {
+      showNotice("warning", "Usage: /paste", "until_edit", sessionId);
+      editor.disableSubmit = false;
+      renderState();
+      return;
+    }
+    const state = options.presentation.getState();
+    const clipboardReader = options.clipboardReader;
+    if (
+      clipboardReader === undefined ||
+      !editor.focused ||
+      clipboardPastePending ||
+      state.transient !== null ||
+      (state.authoritative.active?.pendingInteractions.length ?? 0) > 0 ||
+      state.composer.sealed ||
+      focusedCloseableOverlay() !== undefined
+    ) {
+      return;
+    }
+    clipboardPastePending = true;
+    const controller = new AbortController();
+    clipboardPasteController = controller;
+    const capturedDraft = {
+      document: localStructuredDocument?.map((part) => ({ ...part })) ?? null,
+      editGeneration: draftEditGeneration,
+      intent: capturePasteIntent(""),
+      scope: projectedComposerScope,
+      text: editor.getExpandedText(),
+    };
+    editor.disableSubmit = true;
+    const actionId = showNotice("progress", "Reading clipboard…", "until_replaced", sessionId);
+    renderState();
+    void (async () => {
+      const mutation = await draftMutationQueue.add(() =>
+        prepareDraftInsertion(capturedDraft.intent, capturedDraft.text),
+      );
+      if ("status" in mutation) {
+        return mutation;
+      }
+      const clipboardResult = await clipboardReader.readClipboard(controller.signal);
+      {
+        const currentComposer = options.presentation.getState().composer;
+        if (currentComposer.draftRevision !== mutation.baseRevision) {
+          return {
+            status: "rejected" as const,
+            message: "Draft changed while reading the clipboard; press Alt+V to retry.",
+          };
+        }
+      }
+      if (
+        capturedDraft.editGeneration !== draftEditGeneration ||
+        capturedDraft.scope !== projectedComposerScope ||
+        capturedDraft.text !== editor.getExpandedText()
+      ) {
+        return {
+          status: "rejected" as const,
+          message: "Draft changed while reading the clipboard; press Alt+V to retry.",
+        };
+      }
+      if (clipboardResult.status === "image") {
+        const receipt = await stageClipboardImage(clipboardResult.bytes, mutation);
+        return {
+          status: receipt?.status ?? "rejected",
+          message:
+            receipt?.status === "admitted"
+              ? "Clipboard image staged."
+              : (receipt?.message ?? "The clipboard image could not be staged."),
+        };
+      }
+      if (clipboardResult.status === "text" && isLargePastedTextV1(clipboardResult.text)) {
+        const receipt = await stageClipboardText(clipboardResult.text, mutation);
+        return {
+          status: receipt?.status ?? "rejected",
+          message:
+            receipt?.status === "admitted"
+              ? "Pasted text staged."
+              : (receipt?.message ?? "The pasted text could not be staged."),
+        };
+      }
+      if (clipboardResult.status === "text" && !isLargePastedTextV1(clipboardResult.text)) {
+        if (capturedDraft.intent.cursor.type === "text") {
+          const offset = capturedDraft.intent.cursor.offset;
+          const text = `${capturedDraft.text.slice(0, offset)}${clipboardResult.text}${capturedDraft.text.slice(offset)}`;
+          editor.setTextWithCursor(text, offset + clipboardResult.text.length);
+          editor.refreshAutocomplete();
+        } else {
+          const edit =
+            capturedDraft.document === null
+              ? null
+              : adamStructuredEditorCompletion.accept(
+                  capturedDraft.document,
+                  capturedDraft.intent.cursor.point,
+                  { label: clipboardResult.text, value: clipboardResult.text },
+                  "",
+                );
+          if (edit === null) {
+            return {
+              status: "rejected" as const,
+              message: "The clipboard text could not be inserted at the captured cursor.",
+            };
+          }
+          editor.setDocument(edit.document, edit.cursor);
+          editor.onEditIntent?.({
+            type: "replace",
+            document: edit.document,
+            range: edit.range,
+            text: edit.text,
+          });
+          editor.refreshAutocomplete();
+        }
+        return { status: "admitted" as const, message: "Clipboard text pasted." };
+      }
+      return {
+        status: "rejected" as const,
+        message:
+          clipboardResult.status === "text"
+            ? "Clipboard text is not available yet."
+            : clipboardResult.message,
+      };
+    })()
+      .then((outcome) => {
+        settleNotice(
+          actionId,
+          outcome.status === "admitted" ? "success" : "error",
+          outcome.message,
+          outcome.status === "admitted" ? "until_next_action" : "until_edit",
+          sessionId,
+        );
+      })
+      .catch(() => {
+        settleNotice(actionId, "error", "Clipboard acquisition failed.", "until_edit", sessionId);
+      })
+      .finally(() => {
+        clipboardPastePending = false;
+        if (clipboardPasteController === controller) {
+          clipboardPasteController = undefined;
+        }
+        editor.disableSubmit = false;
+        renderState();
+      });
+  };
   const handleAttachmentCommand = (parsed: AdamCommandParseResult, sessionId?: string): boolean => {
     if (parsed.kind !== "known") {
       return false;
@@ -3585,6 +3772,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       if (parsedDraft.kind === "known" && parsedDraft.command.id === "paste-image") {
         handlePasteImageCommand(parsedDraft.argumentsText);
+        return;
+      }
+      if (parsedDraft.kind === "known" && parsedDraft.command.id === "paste") {
+        handleClipboardPaste(parsedDraft.argumentsText);
         return;
       }
       if (
@@ -3985,6 +4176,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     if (parsedCommand.kind === "known" && parsedCommand.command.id === "paste-image") {
       handlePasteImageCommand(parsedCommand.argumentsText, active.session.id);
+      return;
+    }
+    if (parsedCommand.kind === "known" && parsedCommand.command.id === "paste") {
+      handleClipboardPaste(parsedCommand.argumentsText, active.session.id);
       return;
     }
     if (
@@ -4893,7 +5088,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       failures.push(error);
     }
     try {
-      await options.clipboardImageReader?.close();
+      clipboardPasteController?.abort();
+      if (options.clipboardReader !== undefined) {
+        await options.clipboardReader.close();
+      } else {
+        await options.clipboardImageReader?.close();
+      }
     } catch (error) {
       failures.push(error);
     }
@@ -4951,6 +5151,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           focusedCloseableOverlay()?.close();
         }
       }
+      return { consume: true };
+    }
+    if (commandRegistry.matchesInput(data, "paste_clipboard")) {
+      if (!isKeyRepeat(data) && !isKeyRelease(data)) {
+        handleClipboardPaste("", options.presentation.getState().authoritative.active?.session.id);
+      }
+      return { consume: true };
+    }
+    if (clipboardPastePending && commandRegistry.matchesInput(data, "back")) {
+      clipboardPasteController?.abort();
       return { consume: true };
     }
     if (commandRegistry.matchesInput(data, "toggle_tool_details")) {
