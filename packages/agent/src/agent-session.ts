@@ -181,6 +181,16 @@ type AgentSessionBaseDependencies = {
 
 export const sessionToolProfileNames = Symbol("adam-agent.session-tool-profile-names");
 export const managedAgentPromptSummary = Symbol("adam-agent.managed-agent-prompt-summary");
+export const managedAgentRequestBoundary = Symbol("adam-agent.managed-agent-request-boundary");
+
+export type ManagedAgentRequestBoundary = () => Promise<{
+  readonly messages: readonly { readonly id: `sha256:${string}`; readonly text: string }[];
+  readonly deliveries: readonly {
+    readonly id: `sha256:${string}`;
+    readonly digest: `sha256:${string}`;
+  }[];
+  acknowledge(): Promise<void>;
+}>;
 
 export type AgentSessionDependencies = AgentSessionBaseDependencies &
   (
@@ -210,6 +220,7 @@ export class AgentSession {
   #planGitAttestation: PlanGitAttestationV1 | undefined;
   readonly #permissions: PermissionPolicy | undefined;
   readonly #managedAgentPromptSummary: (() => string) | undefined;
+  readonly #managedAgentRequestBoundary: ManagedAgentRequestBoundary | undefined;
   #lastManagedAgentPromptSummary: string | undefined;
   #promptContext: PromptContextRecord | undefined;
   #skillContext: SkillContextRecordV1 | undefined;
@@ -339,6 +350,11 @@ export class AgentSession {
         readonly [managedAgentPromptSummary]?: () => string;
       }
     )[managedAgentPromptSummary];
+    this.#managedAgentRequestBoundary = (
+      dependencies as AgentSessionDependencies & {
+        readonly [managedAgentRequestBoundary]?: ManagedAgentRequestBoundary;
+      }
+    )[managedAgentRequestBoundary];
     this.#promptContext =
       this.#durableContext === undefined
         ? createPromptContextV1(this.#tools)
@@ -746,6 +762,20 @@ export class AgentSession {
         });
       }
       skipProactiveCompaction = false;
+      const managedDelivery = await this.#managedAgentRequestBoundary?.();
+      for (const message of managedDelivery?.messages ?? []) {
+        const text = `Parent message (${message.id}): ${message.text}`;
+        await this.#emit({ type: "user_message", text });
+        messages.push({ role: "user", content: text });
+      }
+      if ((managedDelivery?.deliveries.length ?? 0) > 0) {
+        activeProviderSample = undefined;
+        requestMessages = this.#assemblePromptMessages(messages);
+        activeEstimate =
+          this.#contextProfile === undefined
+            ? undefined
+            : this.#estimatePromptTokens(requestMessages, requestTools);
+      }
       const maximumOutputTokens =
         this.#contextProfile === undefined
           ? this.#maximumOutputTokens
@@ -796,6 +826,9 @@ export class AgentSession {
               turn: modelTurns,
               attempt: attemptNumber,
               targetIdentity,
+              ...(managedDelivery === undefined || managedDelivery.deliveries.length === 0
+                ? {}
+                : { managedAgentDeliveries: managedDelivery.deliveries }),
               ...(projectedContent === undefined ? {} : { projectedContent }),
               ...(this.#promptContext === undefined
                 ? {}
@@ -837,6 +870,7 @@ export class AgentSession {
           );
         }
       }
+      await managedDelivery?.acknowledge();
       await this.#emit({ type: "model_message_started" });
       if (signal.aborted) {
         return this.#settleCancelled();
@@ -1295,6 +1329,11 @@ export class AgentSession {
           messages,
           signal,
           toolResultsById,
+          sourceModelAttempt: {
+            runId: this.#activeRunId as string,
+            turn: modelTurns,
+            attempt: attemptNumber,
+          },
         });
         if (terminal !== undefined) {
           return terminal;
@@ -2072,6 +2111,11 @@ export class AgentSession {
     readonly repositoryDisposition?: "mutation_retry_required" | "read_continue" | "unavailable";
     readonly reusablePermission?: PermissionPolicyInput | undefined;
     readonly signal: AbortSignal;
+    readonly sourceModelAttempt?: {
+      readonly runId: string;
+      readonly turn: number;
+      readonly attempt: number;
+    };
     readonly toolResultsById: Map<string, { readonly call: ToolCall; readonly result: ToolResult }>;
   }): Promise<RunResult | undefined> {
     const { call, messages, signal, toolResultsById } = options;
@@ -2157,7 +2201,18 @@ export class AgentSession {
       await this.#appendToolResult(messages, call, result);
       return undefined;
     }
-    const preparedCall = adapter.prepare(call.argumentsJson);
+    const preparedCall = adapter.prepare(call.argumentsJson, {
+      callId: call.id,
+      sessionId: this.#durableContext?.sessionId ?? this.#runtimeSessionId,
+      toolName: call.name,
+      ...(options.sourceModelAttempt === undefined
+        ? {}
+        : {
+            runId: options.sourceModelAttempt.runId,
+            turn: options.sourceModelAttempt.turn,
+            attempt: options.sourceModelAttempt.attempt,
+          }),
+    });
     if (preparedCall.status === "failed") {
       toolResultsById.set(call.id, { call, result: preparedCall });
       await this.#appendToolResult(messages, call, preparedCall);
@@ -2419,6 +2474,13 @@ export class AgentSession {
       toolName: call.name,
       sessionId: this.#durableContext?.sessionId ?? this.#runtimeSessionId,
       toolProfileDigest: this.#promptContext?.toolProfile.digest ?? "prompt-profile-v0",
+      ...(options.sourceModelAttempt === undefined
+        ? {}
+        : {
+            sourceRunId: options.sourceModelAttempt.runId,
+            sourceTurn: options.sourceModelAttempt.turn,
+            sourceProviderAttempt: options.sourceModelAttempt.attempt,
+          }),
       ...(call.name === "run_shell" && this.#plan?.shellEnvironment !== undefined
         ? { planShellEnvironment: this.#plan.shellEnvironment }
         : {}),

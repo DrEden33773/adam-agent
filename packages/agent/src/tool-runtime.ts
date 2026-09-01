@@ -183,7 +183,17 @@ export type ToolAdapter = {
   readonly replay: ToolReplayClass;
   readonly cancellation: "unsupported" | "abort_signal";
   readonly maximumResult: ToolMaximumResultPolicy;
-  prepare(argumentsJson: string): PreparedToolCall | FailedToolResult;
+  prepare(
+    argumentsJson: string,
+    identity?: {
+      readonly callId: string;
+      readonly sessionId: string;
+      readonly toolName: string;
+      readonly runId?: string;
+      readonly turn?: number;
+      readonly attempt?: number;
+    },
+  ): PreparedToolCall | FailedToolResult;
 };
 
 function identifyToolAdapter(
@@ -262,6 +272,9 @@ type ToolExecutionContext = {
   readonly toolName: string;
   readonly sessionId: string;
   readonly toolProfileDigest: string;
+  readonly sourceRunId?: string;
+  readonly sourceTurn?: number;
+  readonly sourceProviderAttempt?: number;
   readonly planShellEnvironment?: PlanShellEnvironmentV1;
   readonly planCommandAssessment?: PlanCommandAssessment;
   readonly planGitAttestation?: PlanGitAttestationV1;
@@ -356,9 +369,19 @@ export type PermissionSubject =
       readonly type: "managed_agent_spawn";
       readonly parentRootId: string;
       readonly parentSessionId: string;
-      readonly profile: "scout.v1";
+      readonly profile: "scout.v1" | "research.v1";
       readonly mode?: "foreground" | "background";
       readonly profileDigest: `sha256:${string}`;
+      readonly selectedSkills?: readonly {
+        readonly qualifiedId: string;
+        readonly digest: `sha256:${string}`;
+      }[];
+      readonly parentCoordination?: {
+        readonly reportToParent: true;
+        readonly requestParentInput: boolean;
+        readonly maximumMessageBytes: 8192;
+        readonly maximumPendingMessages: 4;
+      };
       readonly targetIdentity: {
         readonly targetId: string;
         readonly vendor: string;
@@ -398,12 +421,43 @@ export type PermissionSubject =
     }
   | {
       readonly type: "managed_agent_control";
-      readonly action: "list" | "wait" | "follow_up" | "cancel";
+      readonly action: "list" | "wait" | "send" | "follow_up" | "cancel";
       readonly parentRootId: string;
       readonly parentSessionId: string;
       readonly agentId?: string;
       readonly expectedRevision?: number;
       readonly taskDigest?: `sha256:${string}`;
+      readonly messageDigest?: `sha256:${string}`;
+      readonly sourceRunId?: string;
+      readonly sourceTurn?: number;
+      readonly sourceProviderAttempt?: number;
+    }
+  | {
+      readonly type: "parent_coordination";
+      readonly operation: "report" | "request_input";
+      readonly parentRootId: string;
+      readonly parentSessionId: string;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+      readonly childToolCallId: string;
+      readonly sourceRunId: string;
+      readonly sourceTurn: number;
+      readonly sourceProviderAttempt: number;
+      readonly messageDigest: `sha256:${string}`;
+    }
+  | {
+      readonly type: "managed_agent_web_request";
+      readonly operation: "fetch" | "search";
+      readonly parentRootId: string;
+      readonly parentSessionId: string;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+      readonly profile: "research.v1";
+      readonly providerOrigin: string;
+      readonly queryOrUrl: string;
+      readonly argumentsDigest: `sha256:${string}`;
     }
   | {
       readonly type: "web_request";

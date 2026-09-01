@@ -19,7 +19,10 @@ export {
   ManagedAgentStoreError,
   recoverInterruptedManagedAgents,
 } from "./managed-agent.js";
-export { scoutManagedAgentProfileV1 } from "./managed-agent-profiles.js";
+export {
+  researchManagedAgentProfileV1,
+  scoutManagedAgentProfileV1,
+} from "./managed-agent-profiles.js";
 export {
   createInMemoryManagedAgentStore,
   createJsonlManagedAgentStore,

@@ -451,6 +451,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly hide: () => void;
       }
     | undefined;
+  let pendingAgentReply:
+    | {
+        readonly sessionId: string;
+        readonly agentId: string;
+        readonly expectedRevision: number;
+        readonly attentionId: string;
+      }
+    | undefined;
   let todoNavigatorGeneration = 0;
   let planActionOverlay:
     | {
@@ -2895,6 +2903,18 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                 renderState();
               });
           },
+          onReply(input) {
+            close();
+            pendingAgentReply = { sessionId: expectedSessionId, ...input };
+            editor.setText("");
+            showNotice(
+              "info",
+              "Enter one bounded reply for the exact managed-child attention request.",
+              "until_next_action",
+              expectedSessionId,
+            );
+            renderState();
+          },
           onChange: () => tui.requestRender(),
           onClose: close,
           theme,
@@ -3973,6 +3993,59 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       state.composer.pastedTexts.length === 0 &&
       !state.composer.elements.some((element) => element.type === "skill")
     ) {
+      return;
+    }
+    if (pendingAgentReply !== undefined) {
+      const reply = pendingAgentReply;
+      if (active === null || active.session.id !== reply.sessionId) {
+        pendingAgentReply = undefined;
+        editor.disableSubmit = false;
+        showNotice("error", "The managed-child reply target is no longer active.", "until_edit");
+        renderState();
+        return;
+      }
+      const replyActionId = showNotice(
+        "progress",
+        "Sending the exact managed-child reply…",
+        "until_replaced",
+        active.session.id,
+      );
+      void options.presentation
+        .dispatch({
+          type: "send_managed_agent_message",
+          sessionId: active.session.id,
+          agentId: reply.agentId,
+          expectedRevision: reply.expectedRevision,
+          attentionId: reply.attentionId,
+          message: text,
+        })
+        .then((receipt) => {
+          if (receipt.status === "admitted") {
+            pendingAgentReply = undefined;
+            editor.setText("");
+            settleNotice(
+              replyActionId,
+              "success",
+              "Managed-child reply enqueued for exact delivery.",
+              "until_next_action",
+              active.session.id,
+            );
+          } else {
+            editor.disableSubmit = false;
+            settleNotice(replyActionId, "error", receipt.message, "until_edit", active.session.id);
+          }
+        })
+        .catch(() => {
+          editor.disableSubmit = false;
+          settleNotice(
+            replyActionId,
+            "error",
+            "The managed-child reply could not be admitted safely.",
+            "until_edit",
+            active.session.id,
+          );
+        })
+        .finally(() => tui.requestRender());
       return;
     }
     const earlyParsed = commandRegistry.parse(text);

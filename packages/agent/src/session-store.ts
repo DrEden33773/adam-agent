@@ -68,6 +68,8 @@ type V1PermissionSubject = Exclude<
       | "extension_capability"
       | "managed_agent_control"
       | "managed_agent_spawn"
+      | "managed_agent_web_request"
+      | "parent_coordination"
       | "mcp_tool"
       | "patch"
       | "plan_command"
@@ -138,7 +140,8 @@ export type SessionGenesisRecord = {
     readonly targetIdentity: ModelTargetIdentity;
     readonly managedAgentTools?:
       | "managed-agent-tools.a1.v1"
-      | "managed-agent-tools.a2-long-lived.v1";
+      | "managed-agent-tools.a2-long-lived.v1"
+      | "managed-agent-tools.a3-long-lived.v1";
     readonly webEvidence?: {
       readonly version: 1;
       readonly searchProvider: null | {
@@ -758,6 +761,10 @@ export type SessionProviderAttemptStartedRecord = {
     readonly turn: number;
     readonly attempt: number;
     readonly targetIdentity: ModelTargetIdentity;
+    readonly managedAgentDeliveries?: readonly {
+      readonly id: Sha256Digest;
+      readonly digest: Sha256Digest;
+    }[];
     readonly promptProjection?: {
       readonly version: 1;
       readonly assemblyIdentityDigest: Sha256Digest;
@@ -1426,9 +1433,26 @@ const managedAgentSpawnPermissionSubjectSchema = z.strictObject({
   type: z.literal("managed_agent_spawn"),
   parentRootId: z.string().min(1).max(256),
   parentSessionId: z.uuid(),
-  profile: z.literal("scout.v1"),
+  profile: z.enum(["scout.v1", "research.v1"]),
   mode: z.enum(["foreground", "background"]).optional(),
   profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  selectedSkills: z
+    .array(
+      z.strictObject({
+        qualifiedId: z.string().min(1).max(512),
+        digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+      }),
+    )
+    .max(8)
+    .optional(),
+  parentCoordination: z
+    .strictObject({
+      reportToParent: z.literal(true),
+      requestParentInput: z.boolean(),
+      maximumMessageBytes: z.literal(8_192),
+      maximumPendingMessages: z.literal(4),
+    })
+    .optional(),
   targetIdentity: z.strictObject({
     targetId: z.string().min(1).max(256),
     vendor: z.string().min(1).max(128),
@@ -1472,7 +1496,7 @@ const managedAgentSpawnPermissionSubjectSchema = z.strictObject({
 const managedAgentControlPermissionSubjectSchema = z
   .strictObject({
     type: z.literal("managed_agent_control"),
-    action: z.enum(["list", "wait", "follow_up", "cancel"]),
+    action: z.enum(["list", "wait", "send", "follow_up", "cancel"]),
     parentRootId: z.string().min(1).max(256),
     parentSessionId: z.uuid(),
     agentId: z.uuid().optional(),
@@ -1481,25 +1505,79 @@ const managedAgentControlPermissionSubjectSchema = z
       .string()
       .regex(/^sha256:[0-9a-f]{64}$/u)
       .optional(),
+    messageDigest: z
+      .string()
+      .regex(/^sha256:[0-9a-f]{64}$/u)
+      .optional(),
+    sourceRunId: z.uuid().optional(),
+    sourceTurn: z.number().int().positive().optional(),
+    sourceProviderAttempt: z.number().int().positive().optional(),
   })
   .superRefine((subject, context) => {
     if (
       (subject.action === "cancel" &&
         (subject.agentId === undefined ||
           subject.expectedRevision === undefined ||
-          subject.taskDigest !== undefined)) ||
+          subject.taskDigest !== undefined ||
+          subject.messageDigest !== undefined ||
+          subject.sourceRunId !== undefined ||
+          subject.sourceTurn !== undefined ||
+          subject.sourceProviderAttempt !== undefined)) ||
       (subject.action === "follow_up" &&
         (subject.agentId === undefined ||
           subject.expectedRevision === undefined ||
-          subject.taskDigest === undefined)) ||
+          subject.taskDigest === undefined ||
+          subject.messageDigest !== undefined ||
+          subject.sourceRunId !== undefined ||
+          subject.sourceTurn !== undefined ||
+          subject.sourceProviderAttempt !== undefined)) ||
+      (subject.action === "send" &&
+        (subject.agentId === undefined ||
+          subject.expectedRevision === undefined ||
+          subject.taskDigest !== undefined ||
+          subject.messageDigest === undefined ||
+          subject.sourceRunId === undefined ||
+          subject.sourceTurn === undefined ||
+          subject.sourceProviderAttempt === undefined)) ||
       ((subject.action === "list" || subject.action === "wait") &&
         (subject.agentId !== undefined ||
           subject.expectedRevision !== undefined ||
-          subject.taskDigest !== undefined))
+          subject.taskDigest !== undefined ||
+          subject.messageDigest !== undefined ||
+          subject.sourceRunId !== undefined ||
+          subject.sourceTurn !== undefined ||
+          subject.sourceProviderAttempt !== undefined))
     ) {
       context.addIssue({ code: "custom", message: "Invalid managed-agent control authority." });
     }
   });
+const parentCoordinationPermissionSubjectSchema = z.strictObject({
+  type: z.literal("parent_coordination"),
+  operation: z.enum(["report", "request_input"]),
+  parentRootId: z.string().min(1).max(256),
+  parentSessionId: z.uuid(),
+  agentId: z.uuid(),
+  attemptId: z.uuid(),
+  childSessionId: z.uuid(),
+  childToolCallId: z.string().min(1).max(256),
+  sourceRunId: z.uuid(),
+  sourceTurn: z.number().int().positive(),
+  sourceProviderAttempt: z.number().int().positive(),
+  messageDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+});
+const managedAgentWebRequestPermissionSubjectSchema = z.strictObject({
+  type: z.literal("managed_agent_web_request"),
+  operation: z.enum(["fetch", "search"]),
+  parentRootId: z.string().min(1).max(256),
+  parentSessionId: z.uuid(),
+  agentId: z.uuid(),
+  attemptId: z.uuid(),
+  childSessionId: z.uuid(),
+  profile: z.literal("research.v1"),
+  providerOrigin: z.url(),
+  queryOrUrl: z.string().min(1).max(4_096),
+  argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+});
 const webPermissionUrlSchema = z
   .url()
   .refine((value) => Buffer.byteLength(value, "utf8") <= 4 * 1024);
@@ -1540,6 +1618,8 @@ const v2PermissionSubjectSchema = z.discriminatedUnion("type", [
   patchPermissionSubjectSchema,
   skillPermissionSubjectSchema,
   managedAgentControlPermissionSubjectSchema,
+  parentCoordinationPermissionSubjectSchema,
+  managedAgentWebRequestPermissionSubjectSchema,
   managedAgentSpawnPermissionSubjectSchema,
   webArtifactPermissionSubjectSchema,
   webRequestPermissionSubjectSchema,
@@ -1621,6 +1701,8 @@ const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
   mcpPermissionSubjectSchema,
   inputResourcePermissionSubjectSchema,
   managedAgentControlPermissionSubjectSchema,
+  parentCoordinationPermissionSubjectSchema,
+  managedAgentWebRequestPermissionSubjectSchema,
   managedAgentSpawnPermissionSubjectSchema,
   planCommandPermissionSubjectSchema,
   webArtifactPermissionSubjectSchema,
@@ -2007,7 +2089,11 @@ const sessionGenesisV1RecordSchema = z.strictObject({
   projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   targetIdentity: modelTargetIdentitySchema,
   managedAgentTools: z
-    .enum(["managed-agent-tools.a1.v1", "managed-agent-tools.a2-long-lived.v1"])
+    .enum([
+      "managed-agent-tools.a1.v1",
+      "managed-agent-tools.a2-long-lived.v1",
+      "managed-agent-tools.a3-long-lived.v1",
+    ])
     .optional(),
   webEvidence: z
     .strictObject({
@@ -2833,6 +2919,15 @@ const sessionV3RecordSchema = z.union([
     turn: z.number().int().positive(),
     attempt: z.number().int().positive(),
     targetIdentity: modelTargetIdentitySchema,
+    managedAgentDeliveries: z
+      .array(
+        z.strictObject({
+          id: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+          digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+        }),
+      )
+      .max(5)
+      .optional(),
     promptProjection: z
       .strictObject({
         version: z.literal(1),

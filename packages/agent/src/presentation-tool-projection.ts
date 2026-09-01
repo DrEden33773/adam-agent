@@ -210,13 +210,19 @@ export function projectPendingPermissionCandidates(
               warning:
                 "Plan parsing is not a sandbox. Approval may run project code, write cache or artifacts, read accessible data, or use network.",
             }
-          : entry.record.event.subject?.type === "web_request"
+          : entry.record.event.subject?.type === "managed_agent_web_request"
             ? {
-                warning: isLiteralLoopbackProviderOrigin(entry.record.event.subject.providerOrigin)
-                  ? "Adam will connect only to the exact configured loopback SearXNG endpoint. Adam does not install, start, monitor, or recover that service."
-                  : "This public operator can receive this exact Web request and network address. Adam will not verify, replace, or fall back from this endpoint.",
+                warning: `Allow ${entry.record.event.subject.agentId} (research.v1) to send this exact Web request to ${entry.record.event.subject.providerOrigin}: ${entry.record.event.subject.queryOrUrl}?`,
               }
-            : {}),
+            : entry.record.event.subject?.type === "web_request"
+              ? {
+                  warning: isLiteralLoopbackProviderOrigin(
+                    entry.record.event.subject.providerOrigin,
+                  )
+                    ? "Adam will connect only to the exact configured loopback SearXNG endpoint. Adam does not install, start, monitor, or recover that service."
+                    : "This public operator can receive this exact Web request and network address. Adam will not verify, replace, or fall back from this endpoint.",
+                }
+              : {}),
         canAllow: entry.record.event.effect !== "write",
         changePreviewRef,
       },
@@ -436,6 +442,12 @@ function safeToolSubject(
         subject.operation === "fetch"
           ? `${subject.providerOrigin} · ${subject.url}`
           : `${subject.providerOrigin} · query ${JSON.stringify(subject.query)} · limit ${subject.limit}${subject.language === undefined ? "" : ` · language ${JSON.stringify(subject.language)}`}${subject.timeRange === undefined ? "" : ` · time range ${subject.timeRange}`}`,
+    };
+  }
+  if (subject?.type === "managed_agent_web_request") {
+    return {
+      type: "generic",
+      value: `${subject.agentId} (research.v1) · ${subject.providerOrigin} · ${subject.operation} ${JSON.stringify(subject.queryOrUrl)}`,
     };
   }
   if (subject?.type === "web_artifact") {

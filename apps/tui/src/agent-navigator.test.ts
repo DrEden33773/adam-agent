@@ -33,6 +33,7 @@ test("AgentNavigator renders responsive NO_COLOR list, detail and exact cancel i
     onCancel,
     onChange: vi.fn(),
     onClose: vi.fn(),
+    onReply: vi.fn(),
     theme: createAdamTuiTheme(true),
   });
 
@@ -49,5 +50,52 @@ test("AgentNavigator renders responsive NO_COLOR list, detail and exact cancel i
   expect(onCancel).toHaveBeenCalledWith({
     agentId: "123e4567-e89b-42d3-a456-426614174201",
     expectedRevision: 1,
+  });
+});
+
+test("AgentNavigator renders one bounded attention question and emits its exact reply intent", () => {
+  const onReply = vi.fn();
+  const onCancel = vi.fn();
+  const navigator = new AgentNavigator({
+    managedAgents: {
+      counts: { active: 1, completed: 0, attention: 1 },
+      agents: [
+        {
+          agentId: "123e4567-e89b-42d3-a456-426614174211",
+          attemptId: "123e4567-e89b-42d3-a456-426614174212",
+          profile: "research.v1",
+          mode: "background",
+          status: "waiting_for_parent",
+          revision: 3,
+          attention: {
+            attentionId: "123e4567-e89b-42d3-a456-426614174213",
+            question: "Which exact source should I prioritize?",
+            status: "waiting",
+          },
+        },
+      ],
+    },
+    onCancel,
+    onChange: vi.fn(),
+    onClose: vi.fn(),
+    onReply,
+    theme: createAdamTuiTheme(true),
+  });
+
+  navigator.handleInput("\r");
+  const detail = navigator.render(48).join("\n");
+  expect(detail).toContain("Parent input requested · Which exact source");
+  expect(detail).toContain("r reply exact attention");
+  expect(navigator.render(40).every((line) => visibleWidth(line) <= 40)).toBe(true);
+  navigator.handleInput("r");
+  expect(onReply).toHaveBeenCalledWith({
+    agentId: "123e4567-e89b-42d3-a456-426614174211",
+    expectedRevision: 3,
+    attentionId: "123e4567-e89b-42d3-a456-426614174213",
+  });
+  navigator.handleInput("c");
+  expect(onCancel).toHaveBeenCalledWith({
+    agentId: "123e4567-e89b-42d3-a456-426614174211",
+    expectedRevision: 3,
   });
 });

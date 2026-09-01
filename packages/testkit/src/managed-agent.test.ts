@@ -7,6 +7,8 @@ import {
   AgentSession,
   type AgentSessionDependencies,
   type ArtifactStore,
+  createCodingToolRegistry,
+  createExtensionHost,
   createPermissionPolicy,
   createPresentationSession,
   createReadToolRegistry,
@@ -14,6 +16,7 @@ import {
   type ModelDriver,
   type ModelRequest,
   type ModelTargets,
+  type RuntimeEvent,
 } from "@adam-agent/agent";
 import {
   createAgentManager,
@@ -24,11 +27,13 @@ import {
   createProjectExecutionDomain,
   createPromptContextV1,
   createTrustedWorkspaceTrustForTesting,
+  createWebEvidenceToolRegistry,
   type ManagedAgentDeadlineScheduler,
   ManagedAgentStoreError,
   managedAgentPromptSummary,
   type ProjectLifecycleOwner,
   recoverInterruptedManagedAgents,
+  researchManagedAgentProfileV1,
   type SessionRecord,
   type SessionStore,
   type SessionStoreDirectory,
@@ -1069,6 +1074,88 @@ test("ManagedAgentStore folds an admitted restart window without child provider 
   ]);
 });
 
+test("ManagedAgentStore recovers an interrupted research profile without provider replay", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-research-recovery-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const childEntered = Promise.withResolvers<void>();
+  const releaseChild = Promise.withResolvers<void>();
+  let providerCalls = 0;
+  const childModel: ModelDriver = {
+    async *stream() {
+      providerCalls += 1;
+      childEntered.resolve();
+      await releaseChild.promise;
+      yield { type: "text_delta", text: "Original process result." };
+      yield { type: "usage", inputTokens: 10, outputTokens: 4 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentSessionId = "123e4567-e89b-42d3-a456-426614174301";
+  const parentRoot = await domain.claimRoot({ rootId: `session:${parentSessionId}` });
+  const liveStore = createInMemoryManagedAgentStore();
+  const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  const manager = createAgentManager({
+    childContextProfile: contextProfile,
+    childModel,
+    childSessionStores,
+    managedStore: liveStore,
+    parentCoordination: { interactive: true },
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+    parentRoot,
+    parentSessionId,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+  });
+
+  try {
+    await manager.spawnBackground({
+      callId: "spawn-research-recovery",
+      parentSessionId,
+      profile: "research.v1",
+      signal: new AbortController().signal,
+      task: "Remain at one interrupted research request.",
+    });
+    await childEntered.promise;
+    const admission = (await liveStore.read()).find(
+      (record) => record.type === "managed_agent_admitted",
+    );
+    if (admission?.type !== "managed_agent_admitted") {
+      throw new Error("The research admission was not durable.");
+    }
+    const recoveredStore = createInMemoryManagedAgentStore();
+    await recoveredStore.append(admission);
+    await recoverInterruptedManagedAgents(recoveredStore, childSessionStores);
+    expect(providerCalls).toBe(1);
+    expect(await recoveredStore.read()).toMatchObject([
+      {
+        type: "managed_agent_admitted",
+        profile: "research.v1",
+        effectiveToolProfileDigest: expect.stringMatching(/^sha256:/u),
+      },
+      { type: "managed_agent_terminal", status: "recovery_required" },
+    ]);
+  } finally {
+    releaseChild.resolve();
+    await manager.waitForIdle();
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("AgentManager starts an explicit post-restart attempt from recovery-required truth", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-recovery-attempt-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -1933,6 +2020,2320 @@ test("AgentSession controls two background scouts across turns while their claim
   }
 });
 
+test("AgentSession delivers one durable parent message only at the child next model request", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-mailbox-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "evidence.txt"), "mailbox evidence\n", "utf8");
+  const firstChildRequestEntered = Promise.withResolvers<void>();
+  const releaseFirstChildRequest = Promise.withResolvers<void>();
+  const secondChildRequestEntered = Promise.withResolvers<void>();
+  const childRequests: ModelRequest[] = [];
+  const deliveryOrder: string[] = [];
+  const childModel: ModelDriver = {
+    async *stream(request) {
+      childRequests.push(request);
+      if (childRequests.length === 1) {
+        firstChildRequestEntered.resolve();
+        await releaseFirstChildRequest.promise;
+        yield { type: "tool_call_start", id: "child-read", name: "read_file" };
+        yield { type: "tool_call_delta", id: "child-read", json: '{"path":"evidence.txt"}' };
+        yield { type: "tool_call_end", id: "child-read" };
+        yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      deliveryOrder.push("provider-dispatch");
+      secondChildRequestEntered.resolve();
+      yield { type: "text_delta", text: "Parent message observed on the next request." };
+      yield { type: "usage", inputTokens: 12, outputTokens: 5 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  let parentCall = 0;
+  let agentId = "";
+  let parentSendResult: unknown;
+  const parentRequests: ModelRequest[] = [];
+  const parentModel: ModelDriver = {
+    async *stream(request) {
+      parentRequests.push(request);
+      parentCall += 1;
+      if (parentCall === 1) {
+        yield { type: "tool_call_start", id: "send-mailbox-message", name: "send_agent_message" };
+        yield {
+          type: "tool_call_delta",
+          id: "send-mailbox-message",
+          json: JSON.stringify({
+            agentId,
+            expectedRevision: 1,
+            message: "Use the exact parent mailbox evidence.",
+          }),
+        };
+        yield { type: "tool_call_end", id: "send-mailbox-message" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      parentSendResult = request.messages.findLast((message) => message.role === "tool");
+      yield { type: "text_delta", text: "The message was durably queued." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const owner: ProjectLifecycleOwner = {
+    async acquire() {
+      return { async release() {} };
+    },
+    async run(operation) {
+      return operation();
+    },
+  };
+  const domain = createProjectExecutionDomain({ lifecycleOwner: owner });
+  const parentSessionId = "123e4567-e89b-42d3-a456-426614174421";
+  const parentRoot = await domain.claimRoot({ rootId: `session:${parentSessionId}` });
+  const durableManagedStore = createInMemoryManagedAgentStore();
+  const managedStore = {
+    async append(record: Parameters<typeof durableManagedStore.append>[0]) {
+      await durableManagedStore.append(record);
+      if (record.type === "managed_agent_parent_message_delivered") {
+        deliveryOrder.push("delivered-ack");
+      }
+    },
+    read: () => durableManagedStore.read(),
+  };
+  const durableChildStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  const instrumentedChildStores = new Map<string, SessionStore<SessionRecord>>();
+  const instrumentChildStore = (
+    store: SessionStore<SessionRecord>,
+  ): SessionStore<SessionRecord> => ({
+    async append(record) {
+      await store.append(record);
+      if (
+        record.schemaVersion === 3 &&
+        record.record.type === "provider_attempt_started" &&
+        (record.record.managedAgentDeliveries?.length ?? 0) > 0
+      ) {
+        deliveryOrder.push("request-start");
+      }
+    },
+    async appendBatch(records) {
+      await store.appendBatch(records);
+      for (const record of records) {
+        if (
+          record.schemaVersion === 3 &&
+          record.record.type === "provider_attempt_started" &&
+          (record.record.managedAgentDeliveries?.length ?? 0) > 0
+        ) {
+          deliveryOrder.push("request-start");
+        }
+      }
+    },
+    read: () => store.read(),
+  });
+  const childSessionStores: SessionStoreDirectory<SessionRecord> = {
+    async create(sessionId) {
+      const store = instrumentChildStore(await durableChildStores.create(sessionId));
+      instrumentedChildStores.set(sessionId, store);
+      return store;
+    },
+    listSessionEntries: () => durableChildStores.listSessionEntries(),
+    listSessionIds: () => durableChildStores.listSessionIds(),
+    async open(sessionId) {
+      const existing = instrumentedChildStores.get(sessionId);
+      if (existing !== undefined) {
+        return existing;
+      }
+      const opened = await durableChildStores.open(sessionId);
+      if (opened === undefined) {
+        return undefined;
+      }
+      const store = instrumentChildStore(opened);
+      instrumentedChildStores.set(sessionId, store);
+      return store;
+    },
+  };
+  const manager = createAgentManager({
+    childContextProfile: contextProfile,
+    childModel,
+    childSessionStores,
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    parentSessionId,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+  });
+  const parentStore = createInMemorySessionStore();
+  const parentDependencies: AgentSessionDependencies & {
+    readonly [sessionToolProfileNames]: readonly string[];
+  } = {
+    contextProfile,
+    model: parentModel,
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+    store: parentStore,
+    tools: createManagedAgentToolRegistry({
+      manager,
+      profile: "managed-agent-tools.a3-long-lived.v1",
+    }),
+    [sessionToolProfileNames]: [
+      "spawn_agent",
+      "list_agents",
+      "wait_agents",
+      "follow_up_agent",
+      "cancel_agent",
+      "send_agent_message",
+    ],
+  };
+  const parent = new AgentSession(parentDependencies);
+
+  try {
+    const admission = await manager.spawnBackground({
+      callId: "spawn-mailbox-child",
+      parentSessionId: manager.parentSessionId,
+      signal: new AbortController().signal,
+      task: "Read evidence.txt after the first request.",
+    });
+    if (
+      admission.status !== "completed" ||
+      admission.output === null ||
+      typeof admission.output !== "object" ||
+      !("agentId" in admission.output)
+    ) {
+      throw new Error("The background child identity was not returned.");
+    }
+    // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+    agentId = String(admission.output["agentId"]);
+    await firstChildRequestEntered.promise;
+    expect(JSON.stringify(childRequests[0]?.messages)).not.toContain(
+      "Use the exact parent mailbox evidence.",
+    );
+    await expect(
+      parent.run({ text: "Send the active child one bounded message." }),
+    ).resolves.toMatchObject({ status: "completed" });
+    expect(parentRequests[0]?.tools.map((tool) => tool.name)).toEqual([
+      "spawn_agent",
+      "list_agents",
+      "wait_agents",
+      "follow_up_agent",
+      "cancel_agent",
+      "send_agent_message",
+    ]);
+    const waitDefinition = parentRequests[0]?.tools.find((tool) => tool.name === "wait_agents");
+    const spawnDefinition = parentRequests[0]?.tools.find((tool) => tool.name === "spawn_agent");
+    expect(JSON.stringify(spawnDefinition?.inputSchema)).toContain("research.v1");
+    expect(JSON.stringify(spawnDefinition?.inputSchema)).toContain("skills");
+    expect(waitDefinition).toMatchObject({
+      description:
+        "Wait causally for selected managed children to reach terminal state or request parent attention. Cancelling this wait does not cancel a child.",
+    });
+    expect(JSON.stringify(waitDefinition?.inputSchema)).toContain("attention");
+    expect(parentSendResult, JSON.stringify(parentSendResult)).toMatchObject({
+      role: "tool",
+      result: { status: "completed", output: { delivery: "enqueued" } },
+    });
+    const concurrent = await Promise.all([
+      manager.send({
+        agentId,
+        expectedRevision: 2,
+        callId: "send-mailbox-concurrent-a",
+        message: "Second queued message.",
+      }),
+      manager.send({
+        agentId,
+        expectedRevision: 2,
+        callId: "send-mailbox-concurrent-b",
+        message: "Only one concurrent message may become durable.",
+      }),
+    ]);
+    expect(concurrent.filter((result) => result.status === "completed")).toHaveLength(1);
+    expect(concurrent.filter((result) => result.status === "failed")).toMatchObject([
+      { error: { code: "invalid_tool_input" } },
+    ]);
+    for (const [index, message] of ["Third queued message.", "Fourth queued message."].entries()) {
+      await expect(
+        manager.send({
+          agentId,
+          expectedRevision: index + 3,
+          callId: `send-mailbox-${index + 3}`,
+          message,
+        }),
+      ).resolves.toMatchObject({
+        status: "completed",
+        output: { delivery: "enqueued", revision: index + 4 },
+      });
+    }
+    await expect(
+      manager.send({
+        agentId,
+        expectedRevision: 5,
+        callId: "send-mailbox-overflow",
+        message: "This fifth ordinary message must not be dropped or admitted.",
+      }),
+    ).resolves.toMatchObject({ status: "failed", error: { code: "invalid_tool_input" } });
+    expect(
+      (await managedStore.read()).filter(
+        (record) => record.type === "managed_agent_parent_message_enqueued",
+      ),
+    ).toHaveLength(4);
+    releaseFirstChildRequest.resolve();
+    await secondChildRequestEntered.promise;
+    expect(JSON.stringify(childRequests[1]?.messages)).toContain(
+      "Use the exact parent mailbox evidence.",
+    );
+    expect(JSON.stringify(childRequests[1]?.messages)).toContain("Fourth queued message.");
+    const requestStartIndex = deliveryOrder.indexOf("request-start");
+    const providerDispatchIndex = deliveryOrder.indexOf("provider-dispatch");
+    const deliveredIndexes = deliveryOrder.flatMap((event, index) =>
+      event === "delivered-ack" ? [index] : [],
+    );
+    expect(requestStartIndex).toBeGreaterThanOrEqual(0);
+    expect(deliveredIndexes).toHaveLength(4);
+    expect(deliveredIndexes.every((index) => index > requestStartIndex)).toBe(true);
+    expect(deliveredIndexes.every((index) => index < providerDispatchIndex)).toBe(true);
+    const originalMessage = (await durableManagedStore.read()).find(
+      (record) =>
+        record.type === "managed_agent_parent_message_enqueued" &&
+        record.parentToolCallId === "send-mailbox-message",
+    );
+    if (
+      originalMessage?.type !== "managed_agent_parent_message_enqueued" ||
+      originalMessage.sourceRunId === undefined ||
+      originalMessage.sourceTurn === undefined ||
+      originalMessage.sourceProviderAttempt === undefined
+    ) {
+      throw new Error("The exact parent message identity was unavailable.");
+    }
+    await expect(
+      manager.send({
+        agentId,
+        expectedRevision: 1,
+        callId: "send-mailbox-message",
+        message: "Use the exact parent mailbox evidence.",
+        sourceRunId: originalMessage.sourceRunId,
+        sourceTurn: originalMessage.sourceTurn,
+        sourceProviderAttempt: originalMessage.sourceProviderAttempt,
+      }),
+    ).resolves.toMatchObject({ status: "completed", output: { delivery: "delivered" } });
+    await expect(
+      manager.send({
+        agentId,
+        expectedRevision: 1,
+        callId: "send-mailbox-message",
+        message: "Reusing one effect identity with different bytes must fail closed.",
+        sourceRunId: originalMessage.sourceRunId,
+        sourceTurn: originalMessage.sourceTurn,
+        sourceProviderAttempt: originalMessage.sourceProviderAttempt,
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "managed_agent_unavailable" },
+    });
+    await manager.waitForIdle();
+    const managerRecords = await durableManagedStore.read();
+    const parentRecords = await parentStore.read();
+    const corruptedParentJson = JSON.stringify(parentRecords).replace(
+      `"output":{"agentId":"${agentId}","attemptId"`,
+      '"output":{"attemptId"',
+    );
+    expect(corruptedParentJson).not.toBe(JSON.stringify(parentRecords));
+    const corruptedParentRecords = JSON.parse(corruptedParentJson) as SessionRecord[];
+    const recoveryStore = createInMemoryManagedAgentStore();
+    for (const record of managerRecords) {
+      await recoveryStore.append(record);
+    }
+    await recoverInterruptedManagedAgents(
+      recoveryStore,
+      durableChildStores,
+      undefined,
+      parentSessionId,
+      Date.now,
+      corruptedParentRecords,
+    );
+    expect(await recoveryStore.read()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "managed_agent_inspection_required" }),
+      ]),
+    );
+  } finally {
+    releaseFirstChildRequest.resolve();
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentManager distinguishes one reused parent tool-call ID across source model attempts", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-source-attempt-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const childEntered = Promise.withResolvers<void>();
+  const childModel: ModelDriver = {
+    async *stream(request) {
+      childEntered.resolve();
+      await new Promise<void>((resolve) => {
+        request.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+    },
+  };
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentRoot = await domain.claimRoot({ rootId: "source-attempt-parent" });
+  const manager = createAgentManager({
+    childContextProfile: contextProfile,
+    childModel,
+    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    managedStore: createInMemoryManagedAgentStore(),
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+  });
+
+  try {
+    const spawned = await manager.spawnBackground({
+      callId: "spawn-source-attempt-child",
+      parentSessionId: manager.parentSessionId,
+      signal: new AbortController().signal,
+      task: "Hold one source-attempt child.",
+    });
+    const agentId =
+      spawned.status === "completed" &&
+      spawned.output !== null &&
+      typeof spawned.output === "object" &&
+      "agentId" in spawned.output
+        ? // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+          String(spawned.output["agentId"])
+        : "";
+    await childEntered.promise;
+    const first = await manager.send({
+      agentId,
+      expectedRevision: 1,
+      callId: "reused-provider-call",
+      message: "First source model attempt.",
+      sourceRunId: "123e4567-e89b-42d3-a456-426614174431",
+      sourceTurn: 1,
+      sourceProviderAttempt: 1,
+    });
+    const second = await manager.send({
+      agentId,
+      expectedRevision: 2,
+      callId: "reused-provider-call",
+      message: "Second source model attempt.",
+      sourceRunId: "123e4567-e89b-42d3-a456-426614174432",
+      sourceTurn: 1,
+      sourceProviderAttempt: 1,
+    });
+    expect(first).toMatchObject({ status: "completed", output: { delivery: "enqueued" } });
+    expect(second).toMatchObject({ status: "completed", output: { delivery: "enqueued" } });
+    if (first.status !== "completed" || second.status !== "completed") {
+      throw new Error("Both distinct source attempts must be admitted.");
+    }
+    const firstMessageId =
+      first.output !== null && typeof first.output === "object" && "messageId" in first.output
+        ? // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+          first.output["messageId"]
+        : undefined;
+    const secondMessageId =
+      second.output !== null && typeof second.output === "object" && "messageId" in second.output
+        ? // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+          second.output["messageId"]
+        : undefined;
+    expect(firstMessageId).toMatch(/^sha256:/u);
+    expect(secondMessageId).toMatch(/^sha256:/u);
+    expect(firstMessageId).not.toBe(secondMessageId);
+  } finally {
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession holds one attention barrier until the exact parent reply", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-attention-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const secondRequestEntered = Promise.withResolvers<void>();
+  const childRequests: ModelRequest[] = [];
+  const childModel: ModelDriver = {
+    async *stream(request) {
+      childRequests.push(request);
+      if (childRequests.length === 1) {
+        expect(request.tools.map((tool) => tool.name)).toEqual([
+          "read_file",
+          "search_repository",
+          "report_to_parent",
+          "request_parent_input",
+        ]);
+        yield { type: "tool_call_start", id: "report-progress", name: "report_to_parent" };
+        yield {
+          type: "tool_call_delta",
+          id: "report-progress",
+          json: '{"kind":"finding","message":"Durable evidence located."}',
+        };
+        yield { type: "tool_call_end", id: "report-progress" };
+        yield { type: "tool_call_start", id: "request-parent", name: "request_parent_input" };
+        yield {
+          type: "tool_call_delta",
+          id: "request-parent",
+          json: '{"question":"Which exact evidence should I prioritize?"}',
+        };
+        yield { type: "tool_call_end", id: "request-parent" };
+        yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      secondRequestEntered.resolve();
+      expect(
+        request.messages.find(
+          (message) => message.role === "tool" && message.callId === "report-progress",
+        ),
+      ).toMatchObject({
+        role: "tool",
+        result: { status: "completed", output: { status: "reported" } },
+      });
+      expect(request.messages.findLast((message) => message.role === "tool")).toMatchObject({
+        role: "tool",
+        callId: "request-parent",
+        result: {
+          status: "completed",
+          output: { reply: "Prioritize the durable mailbox evidence.", revision: 4 },
+        },
+      });
+      yield { type: "text_delta", text: "Exact parent reply applied." };
+      yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentSessionId = "123e4567-e89b-42d3-a456-426614174401";
+  const parentRoot = await domain.claimRoot({ rootId: `session:${parentSessionId}` });
+  const durableManagedStore = createInMemoryManagedAgentStore();
+  const reportAppendDurable = Promise.withResolvers<void>();
+  const releaseReportAppend = Promise.withResolvers<void>();
+  let failReplyNotificationRead = false;
+  const managedStore = {
+    async append(record: Parameters<typeof durableManagedStore.append>[0]) {
+      await durableManagedStore.append(record);
+      if (record.type === "managed_agent_child_reported") {
+        reportAppendDurable.resolve();
+        await releaseReportAppend.promise;
+      }
+      if (record.type === "managed_agent_parent_reply_enqueued") {
+        failReplyNotificationRead = true;
+      }
+    },
+    async read() {
+      if (failReplyNotificationRead) {
+        failReplyNotificationRead = false;
+        throw new Error("Injected failure after the reply became durable.");
+      }
+      return durableManagedStore.read();
+    },
+  };
+  const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  const manager = createAgentManager({
+    childContextProfile: contextProfile,
+    childModel,
+    childSessionStores,
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+    parentCoordination: { interactive: true },
+    parentRoot,
+    parentSessionId,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+  });
+
+  try {
+    const spawned = await manager.spawnBackground({
+      callId: "spawn-attention-child",
+      parentSessionId: manager.parentSessionId,
+      signal: new AbortController().signal,
+      task: "Request one exact parent decision.",
+    });
+    expect(spawned).toMatchObject({ status: "completed", output: { status: "running" } });
+    const agentId =
+      spawned.status === "completed" &&
+      spawned.output !== null &&
+      typeof spawned.output === "object" &&
+      "agentId" in spawned.output
+        ? // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+          String(spawned.output["agentId"])
+        : "";
+    const childSessionId =
+      spawned.status === "completed" &&
+      spawned.output !== null &&
+      typeof spawned.output === "object" &&
+      "childSessionId" in spawned.output
+        ? // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+          String(spawned.output["childSessionId"])
+        : "";
+    await reportAppendDurable.promise;
+    const sourceCrashStore = createInMemoryManagedAgentStore();
+    for (const record of await durableManagedStore.read()) {
+      await sourceCrashStore.append(record);
+    }
+    await recoverInterruptedManagedAgents(sourceCrashStore, childSessionStores);
+    expect(await sourceCrashStore.read()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "managed_agent_child_reported" }),
+        expect.objectContaining({ type: "managed_agent_terminal", status: "recovery_required" }),
+      ]),
+    );
+    expect(childRequests).toHaveLength(1);
+    releaseReportAppend.resolve();
+    const attention = await manager.wait({
+      agentIds: [agentId],
+      until: "attention",
+      signal: new AbortController().signal,
+    });
+    expect(attention).toMatchObject({
+      status: "completed",
+      output: {
+        counts: { active: 1, completed: 0, attention: 1 },
+        agents: [
+          {
+            agentId,
+            status: "waiting_for_parent",
+            revision: 3,
+            attention: { question: "Which exact evidence should I prioritize?" },
+          },
+        ],
+      },
+    });
+    expect(manager.promptSummary()).toContain("1 need attention");
+    const stoppedTerminalWait = new AbortController();
+    stoppedTerminalWait.abort(new Error("Stop only this terminal wait."));
+    await expect(
+      manager.wait({
+        agentIds: [agentId],
+        until: "all_terminal",
+        signal: stoppedTerminalWait.signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "managed_agent_cancelled" },
+    });
+    await expect(manager.snapshot()).resolves.toMatchObject({
+      agents: [
+        {
+          agentId,
+          status: "waiting_for_parent",
+          reports: [
+            {
+              kind: "finding",
+              message: "Durable evidence located.",
+              messageTruncated: false,
+            },
+          ],
+        },
+      ],
+    });
+    const snapshot = await manager.snapshot();
+    const attentionId = snapshot.agents[0]?.attention?.attentionId ?? "";
+    await expect(
+      manager.send({
+        agentId,
+        expectedRevision: 3,
+        callId: "ordinary-while-waiting",
+        message: "An ordinary message cannot consume the reserved reply slot.",
+      }),
+    ).resolves.toMatchObject({ status: "failed", error: { code: "invalid_tool_input" } });
+    await expect(
+      manager.send({
+        agentId,
+        expectedRevision: 3,
+        callId: "wrong-attention-reply",
+        attentionId: "00000000-0000-4000-8000-000000000099",
+        message: "This stale reply must resolve nothing.",
+      }),
+    ).resolves.toMatchObject({ status: "failed", error: { code: "invalid_tool_input" } });
+    expect(childRequests).toHaveLength(1);
+    const unrelatedAgentId = "123e4567-e89b-42d3-a456-426614174411";
+    const unrelatedAttemptId = "123e4567-e89b-42d3-a456-426614174412";
+    const unrelatedChildSessionId = "123e4567-e89b-42d3-a456-426614174413";
+    const unrelatedSequence = (await durableManagedStore.read()).length + 1;
+    await durableManagedStore.append({
+      schemaVersion: 1,
+      type: "managed_agent_admitted",
+      sequence: unrelatedSequence,
+      agentId: unrelatedAgentId,
+      attemptId: unrelatedAttemptId,
+      childSessionId: unrelatedChildSessionId,
+      parentSessionId,
+      parentToolCallId: "unrelated-interleaved-admission",
+      parentRootId: `session:${parentSessionId}`,
+      projectId,
+      profile: "scout.v1",
+      mode: "background",
+      profileDigest: scoutManagedAgentProfileV1.digest,
+      limits: managedLimits,
+      deadlineAtUnixMilliseconds: 1_900_000_600_000,
+      admittedAtUnixMilliseconds: 1_900_000_000_000,
+      taskDigest: testTaskDigest("Unrelated interleaved child."),
+      childInputDigest: testTaskDigest(
+        `Unrelated interleaved child.\n\n${childLiveWorkspaceNotice}`,
+      ),
+      targetIdentity,
+    });
+    await durableManagedStore.append({
+      schemaVersion: 1,
+      type: "managed_agent_terminal",
+      sequence: unrelatedSequence + 1,
+      agentId: unrelatedAgentId,
+      attemptId: unrelatedAttemptId,
+      childSessionId: unrelatedChildSessionId,
+      status: "cancelled",
+      reason: "caller",
+      transcriptDigest: testTaskDigest("unrelated transcript"),
+      throughSequence: 1,
+    });
+    await expect(
+      manager.send({
+        agentId,
+        expectedRevision: 3,
+        callId: "exact-attention-reply",
+        attentionId,
+        message: "Prioritize the durable mailbox evidence.",
+      }),
+    ).rejects.toThrow("Injected failure after the reply became durable.");
+    expect(childRequests).toHaveLength(1);
+    await expect(
+      manager.send({
+        agentId,
+        expectedRevision: 3,
+        callId: "exact-attention-reply",
+        attentionId,
+        message: "Prioritize the durable mailbox evidence.",
+      }),
+    ).resolves.toMatchObject({
+      status: "completed",
+      output: { attentionId, delivery: "enqueued", revision: 4 },
+    });
+    await secondRequestEntered.promise;
+    await manager.waitForIdle();
+    const terminalAttentionWait = await manager.wait({
+      agentIds: [agentId],
+      until: "attention",
+      signal: new AbortController().signal,
+    });
+    expect(terminalAttentionWait).toMatchObject({ status: "completed" });
+    const terminalAgents =
+      terminalAttentionWait.status === "completed" &&
+      terminalAttentionWait.output !== null &&
+      typeof terminalAttentionWait.output === "object" &&
+      "agents" in terminalAttentionWait.output
+        ? // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+          terminalAttentionWait.output["agents"]
+        : undefined;
+    expect(terminalAgents).toEqual(
+      expect.arrayContaining([expect.objectContaining({ agentId, status: "completed" })]),
+    );
+    await expect(
+      manager.send({
+        agentId,
+        expectedRevision: 3,
+        callId: "exact-attention-reply",
+        attentionId,
+        message: "Prioritize the durable mailbox evidence.",
+      }),
+    ).resolves.toMatchObject({
+      status: "completed",
+      output: { attentionId, delivery: "delivered" },
+    });
+    expect(childRequests).toHaveLength(2);
+    const managerRecords = await durableManagedStore.read();
+    const reportRecord = managerRecords.find(
+      (record) => record.type === "managed_agent_child_reported",
+    );
+    const replyRecord = managerRecords.find(
+      (record) => record.type === "managed_agent_parent_reply_enqueued",
+    );
+    const childStore = await childSessionStores.open(childSessionId);
+    const childRecords = await childStore?.read();
+    if (
+      reportRecord?.type !== "managed_agent_child_reported" ||
+      replyRecord?.type !== "managed_agent_parent_reply_enqueued" ||
+      childRecords === undefined
+    ) {
+      throw new Error("The exact coordination recovery fixtures were unavailable.");
+    }
+    const coordinationSubjects = childRecords.flatMap((record) => {
+      const event =
+        record.schemaVersion === 1 || record.schemaVersion === 2
+          ? record.event
+          : record.record.type === "runtime_event"
+            ? record.record.event
+            : undefined;
+      return event?.type === "tool_permission_decided" &&
+        event.subject?.type === "parent_coordination"
+        ? [event.subject]
+        : [];
+    });
+    expect(coordinationSubjects).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          childToolCallId: "report-progress",
+          operation: "report",
+          sourceRunId: expect.any(String),
+          sourceTurn: 1,
+          sourceProviderAttempt: 1,
+        }),
+        expect.objectContaining({
+          childToolCallId: "request-parent",
+          operation: "request_input",
+          sourceRunId: expect.any(String),
+          sourceTurn: 1,
+          sourceProviderAttempt: 1,
+        }),
+      ]),
+    );
+    const corruptions = [
+      {
+        name: "source receipt digest",
+        original: JSON.stringify({
+          id: reportRecord.reportId,
+          revision: reportRecord.sequence,
+          digest: testTaskDigest(JSON.stringify(reportRecord)),
+        }),
+        corrupted: JSON.stringify({
+          id: reportRecord.reportId,
+          revision: reportRecord.sequence,
+          digest: `sha256:${"0".repeat(64)}`,
+        }),
+      },
+      {
+        name: "request delivery digest",
+        original: JSON.stringify({
+          id: replyRecord.messageId,
+          digest: testTaskDigest(JSON.stringify(replyRecord)),
+        }),
+        corrupted: JSON.stringify({
+          id: replyRecord.messageId,
+          digest: `sha256:${"0".repeat(64)}`,
+        }),
+      },
+    ];
+    for (const corruption of corruptions) {
+      const serialized = JSON.stringify(childRecords);
+      const corruptedSerialized = serialized.replace(corruption.original, corruption.corrupted);
+      expect(corruptedSerialized, corruption.name).not.toBe(serialized);
+      const corruptedRecords = JSON.parse(corruptedSerialized) as SessionRecord[];
+      const recoveryStore = createInMemoryManagedAgentStore();
+      for (const record of managerRecords) {
+        await recoveryStore.append(record);
+      }
+      const recoverySessions = createInMemorySessionStoreDirectory<SessionRecord>();
+      const recoveryChildStore = await recoverySessions.create(childSessionId);
+      for (const record of corruptedRecords) {
+        await recoveryChildStore.append(record);
+      }
+      await recoverInterruptedManagedAgents(recoveryStore, recoverySessions);
+      expect(await recoveryStore.read()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            type: "managed_agent_inspection_required",
+            attemptId: reportRecord.attemptId,
+          }),
+        ]),
+      );
+      await recoverInterruptedManagedAgents(recoveryStore, recoverySessions);
+      expect(
+        (await recoveryStore.read()).filter(
+          (record) => record.type === "managed_agent_inspection_required",
+        ),
+      ).toHaveLength(1);
+    }
+  } finally {
+    releaseReportAppend.resolve();
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentSession keeps the aggregate deadline active while waiting for parent input", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-attention-deadline-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let expireDeadline = () => {};
+  const deadlineScheduler: ManagedAgentDeadlineScheduler = {
+    schedule(_delayMilliseconds, onDeadline) {
+      expireDeadline = onDeadline;
+      return { cancel() {} };
+    },
+  };
+  let providerCalls = 0;
+  const childModel: ModelDriver = {
+    async *stream() {
+      providerCalls += 1;
+      yield { type: "tool_call_start", id: "deadline-attention", name: "request_parent_input" };
+      yield {
+        type: "tool_call_delta",
+        id: "deadline-attention",
+        json: '{"question":"Will the aggregate deadline remain active?"}',
+      };
+      yield { type: "tool_call_end", id: "deadline-attention" };
+      yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+      yield { type: "finish", reason: "tool_calls" };
+    },
+  };
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentRoot = await domain.claimRoot({ rootId: "attention-deadline-parent" });
+  const manager = createAgentManager({
+    childContextProfile: contextProfile,
+    childModel,
+    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    deadlineScheduler,
+    managedStore: createInMemoryManagedAgentStore(),
+    parentCoordination: { interactive: true },
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+    parentRoot,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+  });
+
+  try {
+    const spawned = await manager.spawnBackground({
+      callId: "spawn-attention-deadline",
+      parentSessionId: manager.parentSessionId,
+      signal: new AbortController().signal,
+      task: "Wait for parent input until the aggregate deadline.",
+    });
+    const agentId =
+      spawned.status === "completed" &&
+      spawned.output !== null &&
+      typeof spawned.output === "object" &&
+      "agentId" in spawned.output
+        ? // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+          String(spawned.output["agentId"])
+        : "";
+    await manager.wait({
+      agentIds: [agentId],
+      until: "attention",
+      signal: new AbortController().signal,
+    });
+    expireDeadline();
+    await manager.waitForIdle();
+    expect(providerCalls).toBe(1);
+    await expect(manager.snapshot()).resolves.toMatchObject({
+      counts: { active: 0, completed: 1, attention: 0 },
+      agents: [
+        {
+          agentId,
+          status: "failed",
+          error: { code: "managed_agent_deadline_exceeded" },
+          attention: { status: "orphaned" },
+        },
+      ],
+    });
+    expect(manager.promptSummary()).toContain("0 need attention");
+  } finally {
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle spawns an unconfigured research child with its exact non-mutating tools", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-research-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const childRequests: ModelRequest[] = [];
+  let parentCalls = 0;
+  const driver: ModelDriver = {
+    async *stream(request) {
+      if (request.purpose !== "ordinary") {
+        yield { type: "text_delta", text: "Configured research Web" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      const child = request.messages.some(
+        (message) =>
+          message.role === "developer" &&
+          message.content.startsWith("Managed child profile research.v1"),
+      );
+      if (child) {
+        childRequests.push(request);
+        yield { type: "text_delta", text: "Research profile inspected." };
+        yield { type: "usage", inputTokens: 10, outputTokens: 4 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      parentCalls += 1;
+      if (parentCalls === 1) {
+        yield { type: "tool_call_start", id: "spawn-research", name: "spawn_agent" };
+        yield {
+          type: "tool_call_delta",
+          id: "spawn-research",
+          json: '{"task":"Inspect exact research tools.","profile":"research.v1","mode":"foreground"}',
+        };
+        yield { type: "tool_call_end", id: "spawn-research" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Research child completed." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const workspaceTrust = createTrustedWorkspaceTrustForTesting(workspaceRoot);
+  const lifecycle = createSessionLifecycle({
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate", "network"] }),
+    stateRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    webHttp: {
+      async fetch() {
+        throw new Error("Profile construction must not perform network access.");
+      },
+    },
+    webSearchConfiguration: {
+      async load() {
+        return { status: "unconfigured", provider: null, diagnostic: null };
+      },
+    },
+    workspaceRoot,
+    workspaceTrust,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Start one unconfigured research child." },
+      }),
+    ).resolves.toMatchObject({ result: { status: "completed" } });
+    expect(childRequests).toHaveLength(1);
+    expect(childRequests[0]?.tools.map((tool) => tool.name)).toEqual([
+      "read_file",
+      "search_repository",
+      "web_fetch",
+      "web_open",
+      "web_find",
+      "report_to_parent",
+    ]);
+    expect(JSON.stringify(childRequests[0]?.tools)).not.toMatch(
+      /web_search|read_skill_resource|activate_skill|write_file|edit_file|run_shell|spawn_agent|list_agents|wait_agents|send_agent_message|follow_up_agent|cancel_agent/u,
+    );
+    await lifecycle.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle delivers configured Web evidence through a child-labeled research permission", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-research-web-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const endpoint = "https://search.example.test/search";
+  const permissionSubjects: unknown[] = [];
+  const childRequests: ModelRequest[] = [];
+  let childWebAllowed = true;
+  let webHttpCalls = 0;
+  let parentCalls = 0;
+  let configuredSpawnResult: unknown;
+  const driver: ModelDriver = {
+    async *stream(request) {
+      if (request.purpose !== "ordinary") {
+        yield { type: "text_delta", text: "Configured research Web" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      const child = request.messages.some(
+        (message) =>
+          message.role === "developer" &&
+          message.content.startsWith("Managed child profile research.v1"),
+      );
+      if (child) {
+        childRequests.push(request);
+        if (childRequests.length === 1) {
+          expect(request.tools.map((tool) => tool.name)).toContain("web_search");
+          yield { type: "tool_call_start", id: "child-web-search", name: "web_search" };
+          yield {
+            type: "tool_call_delta",
+            id: "child-web-search",
+            json: '{"query":"Adam durable evidence","limit":1}',
+          };
+          yield { type: "tool_call_end", id: "child-web-search" };
+          yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        if (childRequests.length === 2) {
+          expect(request.messages.findLast((message) => message.role === "tool")).toMatchObject({
+            role: "tool",
+            callId: "child-web-search",
+            result: { status: "completed" },
+          });
+          expect(JSON.stringify(request.messages)).toContain("https://example.com/evidence");
+          childWebAllowed = false;
+          yield { type: "tool_call_start", id: "child-web-revoked", name: "web_search" };
+          yield {
+            type: "tool_call_delta",
+            id: "child-web-revoked",
+            json: '{"query":"Revoked exact query","limit":1}',
+          };
+          yield { type: "tool_call_end", id: "child-web-revoked" };
+          yield { type: "usage", inputTokens: 12, outputTokens: 3 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        expect(request.messages.findLast((message) => message.role === "tool")).toMatchObject({
+          role: "tool",
+          callId: "child-web-revoked",
+          result: { status: "failed", error: { code: "permission_denied" } },
+        });
+        yield { type: "text_delta", text: "Configured Web evidence received." };
+        yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      parentCalls += 1;
+      if (parentCalls === 1) {
+        yield { type: "tool_call_start", id: "spawn-web-research", name: "spawn_agent" };
+        yield {
+          type: "tool_call_delta",
+          id: "spawn-web-research",
+          json: '{"task":"Search exact Web evidence.","profile":"research.v1","mode":"foreground"}',
+        };
+        yield { type: "tool_call_end", id: "spawn-web-research" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      configuredSpawnResult = request.messages.findLast(
+        (message) => message.role === "tool" && message.callId === "spawn-web-research",
+      );
+      yield { type: "text_delta", text: "Research child completed." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+    modelTargets,
+    permissions: {
+      decide(input) {
+        permissionSubjects.push(input.subject);
+        return input.subject.type === "managed_agent_web_request" && !childWebAllowed
+          ? "deny"
+          : "allow";
+      },
+    },
+    stateRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    webHttp: {
+      async fetch(input) {
+        webHttpCalls += 1;
+        expect(input.url).toContain("Adam+durable+evidence");
+        return {
+          status: 200,
+          url: input.url,
+          mediaType: "application/json",
+          body: Buffer.from(
+            '{"results":[{"url":"https://example.com/evidence","title":"Durable Evidence","content":"Exact result"}]}',
+            "utf8",
+          ),
+        };
+      },
+    },
+    webSearchConfiguration: {
+      async load() {
+        return {
+          status: "configured",
+          provider: {
+            kind: "searxng",
+            endpoint,
+            activation: { protocol: "searxng-json.v1", endpointDigest: testTaskDigest(endpoint) },
+          },
+          diagnostic: null,
+        };
+      },
+    },
+    workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Start configured research." },
+      }),
+    ).resolves.toMatchObject({ result: { status: "completed" } });
+    expect(permissionSubjects).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "managed_agent_web_request",
+          operation: "search",
+          profile: "research.v1",
+          providerOrigin: "https://search.example.test",
+          queryOrUrl: "Adam durable evidence",
+        }),
+      ]),
+    );
+    expect(childRequests).toHaveLength(3);
+    expect(webHttpCalls).toBe(1);
+    expect(configuredSpawnResult).toMatchObject({
+      role: "tool",
+      result: {
+        status: "completed",
+        output: {
+          profile: "research.v1",
+          effectiveToolProfileDigest: expect.stringMatching(/^sha256:/u),
+          transcript: { sessionId: expect.any(String) },
+        },
+      },
+    });
+    if (
+      configuredSpawnResult === null ||
+      typeof configuredSpawnResult !== "object" ||
+      !("result" in configuredSpawnResult) ||
+      configuredSpawnResult.result === null ||
+      typeof configuredSpawnResult.result !== "object" ||
+      !("output" in configuredSpawnResult.result) ||
+      configuredSpawnResult.result.output === null ||
+      typeof configuredSpawnResult.result.output !== "object" ||
+      !("effectiveToolProfileDigest" in configuredSpawnResult.result.output) ||
+      !("transcript" in configuredSpawnResult.result.output)
+    ) {
+      throw new Error("The configured research profile receipt was unavailable.");
+    }
+    const configuredOutput = configuredSpawnResult.result.output as {
+      readonly effectiveToolProfileDigest: string;
+      readonly transcript: { readonly sessionId: string };
+    };
+    const configuredChildLog = await readFile(
+      join(
+        stateRoot,
+        "managed-child-sessions",
+        "projects",
+        created.projectId.replace(/^sha256:/u, ""),
+        "sessions",
+        `${configuredOutput.transcript.sessionId}.jsonl`,
+      ),
+      "utf8",
+    );
+    expect(JSON.parse(configuredChildLog.split("\n")[0] ?? "null")).toMatchObject({
+      record: {
+        promptContext: {
+          toolProfile: { digest: configuredOutput.effectiveToolProfileDigest },
+        },
+      },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentManager denies a non-interactive research Web ask before the HTTP Adapter", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-web-noninteractive-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let httpCalls = 0;
+  const researchTools = await createWebEvidenceToolRegistry({
+    artifactStore: {
+      async write() {
+        throw new Error("A denied non-interactive request must not write an artifact.");
+      },
+      async read() {
+        return undefined;
+      },
+    },
+    http: {
+      async fetch() {
+        httpCalls += 1;
+        throw new Error("A denied non-interactive request must not reach HTTP.");
+      },
+    },
+  });
+  const childRequests: ModelRequest[] = [];
+  const childModel: ModelDriver = {
+    async *stream(request) {
+      childRequests.push(request);
+      if (childRequests.length === 1) {
+        yield { type: "tool_call_start", id: "noninteractive-web", name: "web_fetch" };
+        yield {
+          type: "tool_call_delta",
+          id: "noninteractive-web",
+          json: '{"url":"https://example.com/evidence"}',
+        };
+        yield { type: "tool_call_end", id: "noninteractive-web" };
+        yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      expect(request.messages.findLast((message) => message.role === "tool")).toMatchObject({
+        role: "tool",
+        callId: "noninteractive-web",
+        result: { status: "failed", error: { code: "permission_denied" } },
+      });
+      yield { type: "text_delta", text: "Non-interactive Web ask denied." };
+      yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentRoot = await domain.claimRoot({ rootId: "noninteractive-web-parent" });
+  const manager = createAgentManager({
+    childContextProfile: contextProfile,
+    childModel,
+    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    managedStore: createInMemoryManagedAgentStore(),
+    parentPermissions: createPermissionPolicy({
+      allowedEffects: ["read"],
+      askedEffects: ["network"],
+    }),
+    parentRoot,
+    projectId,
+    researchTools,
+    targetIdentity,
+    workspaceRoot,
+  });
+
+  try {
+    await expect(
+      manager.spawnForeground({
+        callId: "spawn-noninteractive-web",
+        parentSessionId: manager.parentSessionId,
+        profile: "research.v1",
+        signal: new AbortController().signal,
+        task: "Attempt one non-interactive Web request.",
+      }),
+    ).resolves.toMatchObject({ status: "completed", output: { profile: "research.v1" } });
+    expect(httpCalls).toBe(0);
+    expect(childRequests).toHaveLength(2);
+  } finally {
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle denies a research Web ask when no Presentation sink is registered", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-web-no-presentation-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  let httpCalls = 0;
+  let parentCalls = 0;
+  const childRequests: ModelRequest[] = [];
+  const driver: ModelDriver = {
+    async *stream(request) {
+      if (request.purpose !== "ordinary") {
+        yield { type: "text_delta", text: "No Presentation sink" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      const child = request.messages.some(
+        (message) =>
+          message.role === "developer" &&
+          message.content.startsWith("Managed child profile research.v1"),
+      );
+      if (child) {
+        childRequests.push(request);
+        if (childRequests.length === 1) {
+          yield { type: "tool_call_start", id: "lifecycle-no-sink-web", name: "web_fetch" };
+          yield {
+            type: "tool_call_delta",
+            id: "lifecycle-no-sink-web",
+            json: '{"url":"https://example.com/no-sink"}',
+          };
+          yield { type: "tool_call_end", id: "lifecycle-no-sink-web" };
+          yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        expect(request.messages.findLast((message) => message.role === "tool")).toMatchObject({
+          role: "tool",
+          callId: "lifecycle-no-sink-web",
+          result: { status: "failed", error: { code: "permission_denied" } },
+        });
+        yield { type: "text_delta", text: "Lifecycle Web ask denied without a sink." };
+        yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      parentCalls += 1;
+      if (parentCalls === 1) {
+        yield { type: "tool_call_start", id: "spawn-no-sink-research", name: "spawn_agent" };
+        yield {
+          type: "tool_call_delta",
+          id: "spawn-no-sink-research",
+          json: '{"task":"Try Web without a Presentation sink.","profile":"research.v1","mode":"foreground"}',
+        };
+        yield { type: "tool_call_end", id: "spawn-no-sink-research" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Non-interactive lifecycle completed." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+    modelTargets,
+    permissions: {
+      decide(input) {
+        return input.subject.type === "managed_agent_web_request" ? "ask" : "allow";
+      },
+    },
+    stateRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    webHttp: {
+      async fetch() {
+        httpCalls += 1;
+        throw new Error("A no-sink Web ask must not reach HTTP.");
+      },
+    },
+    webSearchConfiguration: {
+      async load() {
+        return { status: "unconfigured", provider: null, diagnostic: null };
+      },
+    },
+    workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Start no-sink research." },
+      }),
+    ).resolves.toMatchObject({ result: { status: "completed" } });
+    expect(httpCalls).toBe(0);
+    expect(childRequests).toHaveLength(2);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle serializes child Web permission overlays without granting a standing effect", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-web-permissions-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const endpoint = "https://search.example.test/search";
+  const permissionEvents: Extract<
+    Parameters<Parameters<ReturnType<typeof createSessionLifecycle>["subscribe"]>[0]>[0],
+    { readonly type: "tool_permission_requested" }
+  >[] = [];
+  const permissionDecisionEvents: RuntimeEvent[] = [];
+  const firstPermission = Promise.withResolvers<string>();
+  const secondPermission = Promise.withResolvers<string>();
+  const thirdPermission = Promise.withResolvers<string>();
+  let expectedThirdRequestId: string | undefined;
+  const bothChildrenCompleted = Promise.withResolvers<void>();
+  let completedChildren = 0;
+  let parentCalls = 0;
+  let activeAgentIds: string[] = [];
+  const childCalls = new Map<string, number>();
+  const driver: ModelDriver = {
+    async *stream(request) {
+      if (request.purpose !== "ordinary") {
+        yield { type: "text_delta", text: "Child Web permissions" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      const childTask = request.messages.findLast((message) => message.role === "user")?.content;
+      const childId =
+        typeof childTask === "string" && childTask.startsWith("permission-child-")
+          ? childTask.slice(0, "permission-child-1".length)
+          : undefined;
+      if (childId !== undefined) {
+        const call = (childCalls.get(childId) ?? 0) + 1;
+        childCalls.set(childId, call);
+        if (call === 1) {
+          yield { type: "tool_call_start", id: `${childId}-search`, name: "web_search" };
+          yield {
+            type: "tool_call_delta",
+            id: `${childId}-search`,
+            json: JSON.stringify({ query: `${childId} exact query`, limit: 1 }),
+          };
+          yield { type: "tool_call_end", id: `${childId}-search` };
+          yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        completedChildren += 1;
+        if (completedChildren === 2) {
+          bothChildrenCompleted.resolve();
+        }
+        yield { type: "text_delta", text: `${childId} complete` };
+        yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      parentCalls += 1;
+      if (parentCalls === 1) {
+        for (const child of ["permission-child-1", "permission-child-2"]) {
+          yield { type: "tool_call_start", id: `spawn-${child}`, name: "spawn_agent" };
+          yield {
+            type: "tool_call_delta",
+            id: `spawn-${child}`,
+            json: JSON.stringify({ task: child, profile: "research.v1", mode: "background" }),
+          };
+          yield { type: "tool_call_end", id: `spawn-${child}` };
+        }
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      if (parentCalls === 2) {
+        activeAgentIds = request.messages.flatMap((message) => {
+          if (
+            message.role !== "tool" ||
+            message.name !== "spawn_agent" ||
+            message.result.status !== "completed" ||
+            message.result.output === null ||
+            typeof message.result.output !== "object" ||
+            !("agentId" in message.result.output)
+          ) {
+            return [];
+          }
+          // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+          return [String(message.result.output["agentId"])];
+        });
+        yield { type: "text_delta", text: "Both research children started." };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      if (parentCalls === 3) {
+        yield { type: "tool_call_start", id: "wait-permission-children", name: "wait_agents" };
+        yield {
+          type: "tool_call_delta",
+          id: "wait-permission-children",
+          json: JSON.stringify({ agentIds: activeAgentIds, until: "all_terminal" }),
+        };
+        yield { type: "tool_call_end", id: "wait-permission-children" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      if (parentCalls === 5) {
+        yield { type: "tool_call_start", id: "spawn-permission-child-3", name: "spawn_agent" };
+        yield {
+          type: "tool_call_delta",
+          id: "spawn-permission-child-3",
+          json: JSON.stringify({
+            task: "permission-child-3",
+            profile: "research.v1",
+            mode: "background",
+          }),
+        };
+        yield { type: "tool_call_end", id: "spawn-permission-child-3" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Both research children started." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+    modelTargets,
+    permissions: {
+      decide(input) {
+        return input.subject.type === "managed_agent_web_request" ? "ask" : "allow";
+      },
+    },
+    stateRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    webHttp: {
+      async fetch(input) {
+        return {
+          status: 200,
+          url: input.url,
+          mediaType: "application/json",
+          body: Buffer.from('{"results":[]}', "utf8"),
+        };
+      },
+    },
+    webSearchConfiguration: {
+      async load() {
+        return {
+          status: "configured",
+          provider: {
+            kind: "searxng",
+            endpoint,
+            activation: { protocol: "searxng-json.v1", endpointDigest: testTaskDigest(endpoint) },
+          },
+          diagnostic: null,
+        };
+      },
+    },
+    workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+  });
+  lifecycle.subscribe((event) => {
+    if (event.type === "tool_permission_decided") {
+      permissionDecisionEvents.push(event);
+    }
+    if (
+      event.type !== "tool_permission_requested" ||
+      event.subject.type !== "managed_agent_web_request"
+    ) {
+      return;
+    }
+    permissionEvents.push(event);
+    if (permissionEvents.length === 3) {
+      expectedThirdRequestId = event.requestId;
+    }
+    (permissionEvents.length === 1
+      ? firstPermission
+      : permissionEvents.length === 2
+        ? secondPermission
+        : thirdPermission
+    ).resolve(event.requestId);
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "child-web-permissions",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Start both permission children." },
+    });
+    const firstRequestId = await firstPermission.promise;
+    expect(permissionEvents).toHaveLength(1);
+    expect(presentation.getState().authoritative.active?.pendingInteractions).toMatchObject([
+      {
+        requestId: firstRequestId,
+        effect: "network",
+        warning: expect.stringContaining("research.v1"),
+      },
+    ]);
+    await expect(
+      presentation.dispatch({
+        type: "decide_permission",
+        requestId: firstRequestId,
+        decision: "allow",
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    const secondRequestId = await secondPermission.promise;
+    expect(permissionEvents).toHaveLength(2);
+    expect(presentation.getState().authoritative.active?.pendingInteractions).toMatchObject([
+      { requestId: secondRequestId },
+    ]);
+    await expect(
+      presentation.dispatch({
+        type: "decide_permission",
+        requestId: secondRequestId,
+        decision: "allow",
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await bothChildrenCompleted.promise;
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Wait causally for both research children." },
+    });
+    await expect(
+      lifecycle.inspectManagedAgents({ sessionId: created.sessionId }),
+    ).resolves.toMatchObject({
+      counts: { active: 0, completed: 2, attention: 0 },
+    });
+    const thirdOverlayVisible = Promise.withResolvers<void>();
+    const unsubscribeThirdOverlay = presentation.subscribe(() => {
+      if (
+        presentation
+          .getState()
+          .authoritative.active?.pendingInteractions.some(
+            (interaction) =>
+              expectedThirdRequestId !== undefined &&
+              interaction.requestId === expectedThirdRequestId,
+          )
+      ) {
+        thirdOverlayVisible.resolve();
+      }
+    });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Start one permission-cleanup child." },
+    });
+    const thirdRequestId = await thirdPermission.promise;
+    await thirdOverlayVisible.promise;
+    unsubscribeThirdOverlay();
+    expect(thirdRequestId).toBe(expectedThirdRequestId);
+    expect(
+      permissionDecisionEvents.filter(
+        (event) => event.type === "tool_permission_decided" && event.requestId === thirdRequestId,
+      ),
+    ).toEqual([]);
+    const thirdSubject = permissionEvents[2]?.subject;
+    const thirdAgentId =
+      thirdSubject?.type === "managed_agent_web_request" ? thirdSubject.agentId : "";
+    const beforeCancel = await lifecycle.inspectManagedAgents({ sessionId: created.sessionId });
+    const thirdAgent = beforeCancel.agents.find((agent) => agent.agentId === thirdAgentId);
+    if (thirdAgent === undefined) {
+      throw new Error("The pending-permission child was unavailable for cancellation.");
+    }
+    await lifecycle.cancelManagedAgent({
+      sessionId: created.sessionId,
+      agentId: thirdAgent.agentId,
+      expectedRevision: thirdAgent.revision,
+    });
+    expect(presentation.getState().authoritative.active?.pendingInteractions).toEqual([]);
+    await expect(
+      lifecycle.inspectManagedAgents({ sessionId: created.sessionId }),
+    ).resolves.toMatchObject({
+      counts: { active: 0, completed: 3, attention: 0 },
+      agents: expect.arrayContaining([
+        expect.objectContaining({ agentId: thirdAgentId, status: "cancelled" }),
+      ]),
+    });
+    await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle freezes one exact selected Skill and pages its research resource", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-research-skill-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const skillDirectory = join(workspaceRoot, ".agents", "skills", "research-guide");
+  await mkdir(skillDirectory, { recursive: true });
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: research-guide\ndescription: Supplies exact research guidance.\n---\nSELECTED_RESEARCH_SKILL_BODY\n",
+    "utf8",
+  );
+  await writeFile(join(skillDirectory, "guide.txt"), "paged research resource evidence\n", "utf8");
+  const childRequests: ModelRequest[] = [];
+  let parentCalls = 0;
+  let skilledSpawnResult: unknown;
+  let changedSkillSpawnResult: unknown;
+  let revokedSkillSpawnResult: unknown;
+  let unavailableSkillResourceResult: unknown;
+  let skilledAgentId = "";
+  const thirdSkillRequestEntered = Promise.withResolvers<void>();
+  const releaseThirdSkillRequest = Promise.withResolvers<void>();
+  const skilledPermissionSubjects: unknown[] = [];
+  const workspaceTrust = createTrustedWorkspaceTrustForTesting(workspaceRoot);
+  const driver: ModelDriver = {
+    async *stream(request) {
+      const child = request.messages.some(
+        (message) =>
+          message.role === "developer" &&
+          message.content.startsWith("Managed child profile research.v1"),
+      );
+      if (child) {
+        childRequests.push(request);
+        if (childRequests.length === 1) {
+          expect(JSON.stringify(request.messages)).toContain("SELECTED_RESEARCH_SKILL_BODY");
+          expect(request.tools.map((tool) => tool.name)).toContain("read_skill_resource");
+          yield { type: "tool_call_start", id: "read-research-guide", name: "read_skill_resource" };
+          yield {
+            type: "tool_call_delta",
+            id: "read-research-guide",
+            json: '{"qualifiedId":"skill:v1:project:.:research-guide","path":"guide.txt","maxByteCount":8}',
+          };
+          yield { type: "tool_call_end", id: "read-research-guide" };
+          yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        if (childRequests.length === 2) {
+          expect(JSON.stringify(request.messages)).toContain("paged re");
+          yield {
+            type: "tool_call_start",
+            id: "read-research-guide-next",
+            name: "read_skill_resource",
+          };
+          yield {
+            type: "tool_call_delta",
+            id: "read-research-guide-next",
+            json: '{"qualifiedId":"skill:v1:project:.:research-guide","path":"guide.txt","offset":8,"maxByteCount":64}',
+          };
+          yield { type: "tool_call_end", id: "read-research-guide-next" };
+          yield { type: "usage", inputTokens: 12, outputTokens: 3 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        if (childRequests.length === 3) {
+          expect(JSON.stringify(request.messages)).toContain("search resource evidence");
+          thirdSkillRequestEntered.resolve();
+          await releaseThirdSkillRequest.promise;
+          yield {
+            type: "tool_call_start",
+            id: "read-revoked-resource",
+            name: "read_skill_resource",
+          };
+          yield {
+            type: "tool_call_delta",
+            id: "read-revoked-resource",
+            json: '{"qualifiedId":"skill:v1:project:.:research-guide","path":"guide.txt"}',
+          };
+          yield { type: "tool_call_end", id: "read-revoked-resource" };
+          yield { type: "usage", inputTokens: 14, outputTokens: 3 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        unavailableSkillResourceResult = request.messages.findLast(
+          (message) => message.role === "tool" && message.callId === "read-revoked-resource",
+        );
+        yield { type: "text_delta", text: "Selected Skill resource observed." };
+        yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      if (request.purpose !== "ordinary") {
+        yield { type: "text_delta", text: "Research skill session" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      parentCalls += 1;
+      if (parentCalls === 1) {
+        yield { type: "tool_call_start", id: "spawn-skilled-research", name: "spawn_agent" };
+        yield {
+          type: "tool_call_delta",
+          id: "spawn-skilled-research",
+          json: '{"task":"Use selected research guidance.","profile":"research.v1","skills":["skill:v1:project:.:research-guide"],"mode":"background"}',
+        };
+        yield { type: "tool_call_end", id: "spawn-skilled-research" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      if (parentCalls === 2) {
+        const spawn = request.messages.findLast(
+          (message) => message.role === "tool" && message.callId === "spawn-skilled-research",
+        );
+        if (
+          spawn?.role !== "tool" ||
+          spawn.result.status !== "completed" ||
+          spawn.result.output === null ||
+          typeof spawn.result.output !== "object" ||
+          !("agentId" in spawn.result.output)
+        ) {
+          throw new Error("The skilled child identity was unavailable.");
+        }
+        skilledSpawnResult = spawn;
+        // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+        skilledAgentId = String(spawn.result.output["agentId"]);
+        yield { type: "text_delta", text: "Skilled research started." };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      if (parentCalls === 3) {
+        yield { type: "tool_call_start", id: "wait-skilled-research", name: "wait_agents" };
+        yield {
+          type: "tool_call_delta",
+          id: "wait-skilled-research",
+          json: JSON.stringify({ agentIds: [skilledAgentId], until: "all_terminal" }),
+        };
+        yield { type: "tool_call_end", id: "wait-skilled-research" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      if (parentCalls === 5) {
+        yield { type: "tool_call_start", id: "spawn-changed-research", name: "spawn_agent" };
+        yield {
+          type: "tool_call_delta",
+          id: "spawn-changed-research",
+          json: '{"task":"Use changed research guidance.","profile":"research.v1","skills":["skill:v1:project:.:research-guide"],"mode":"foreground"}',
+        };
+        yield { type: "tool_call_end", id: "spawn-changed-research" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      if (parentCalls === 6) {
+        changedSkillSpawnResult = request.messages.findLast(
+          (message) => message.role === "tool" && message.callId === "spawn-changed-research",
+        );
+      }
+      if (parentCalls === 7) {
+        yield { type: "tool_call_start", id: "spawn-revoked-research", name: "spawn_agent" };
+        yield {
+          type: "tool_call_delta",
+          id: "spawn-revoked-research",
+          json: '{"task":"Use revoked research guidance.","profile":"research.v1","skills":["skill:v1:project:.:research-guide"],"mode":"foreground"}',
+        };
+        yield { type: "tool_call_end", id: "spawn-revoked-research" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      if (parentCalls === 8) {
+        revokedSkillSpawnResult = request.messages.findLast(
+          (message) => message.role === "tool" && message.callId === "spawn-revoked-research",
+        );
+      }
+      yield { type: "text_delta", text: "Skilled research completed." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+    modelTargets,
+    permissions: {
+      decide(input) {
+        skilledPermissionSubjects.push(input.subject);
+        return "allow";
+      },
+    },
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    workspaceTrust,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Start selected-Skill research." },
+      }),
+    ).resolves.toMatchObject({ result: { status: "completed" } });
+    await thirdSkillRequestEntered.promise;
+    await workspaceTrust.setTrusted({ projectId: created.projectId, trusted: false });
+    releaseThirdSkillRequest.resolve();
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Wait for the trust-narrowed child." },
+    });
+    expect(childRequests, JSON.stringify(skilledSpawnResult)).toHaveLength(4);
+    expect(unavailableSkillResourceResult).toMatchObject({
+      role: "tool",
+      callId: "read-revoked-resource",
+      result: { status: "failed", error: { code: "skill_resource_unavailable" } },
+    });
+    expect(skilledSpawnResult, JSON.stringify(skilledSpawnResult)).toMatchObject({
+      role: "tool",
+      result: {
+        status: "completed",
+        output: {
+          profile: "research.v1",
+          profileDigest: researchManagedAgentProfileV1.digest,
+          effectiveToolProfileDigest: expect.stringMatching(/^sha256:/u),
+          skillActivationDigest: expect.stringMatching(/^sha256:/u),
+        },
+      },
+    });
+    if (
+      skilledSpawnResult === null ||
+      typeof skilledSpawnResult !== "object" ||
+      !("result" in skilledSpawnResult) ||
+      skilledSpawnResult.result === null ||
+      typeof skilledSpawnResult.result !== "object" ||
+      !("output" in skilledSpawnResult.result) ||
+      skilledSpawnResult.result.output === null ||
+      typeof skilledSpawnResult.result.output !== "object" ||
+      !("childSessionId" in skilledSpawnResult.result.output) ||
+      !("effectiveToolProfileDigest" in skilledSpawnResult.result.output) ||
+      !("skillActivationDigest" in skilledSpawnResult.result.output)
+    ) {
+      throw new Error("The exact skilled child profile receipt was unavailable.");
+    }
+    const skilledOutput = skilledSpawnResult.result.output as {
+      readonly childSessionId: string;
+      readonly effectiveToolProfileDigest: string;
+      readonly skillActivationDigest: string;
+    };
+    const childSessionLog = await readFile(
+      join(
+        stateRoot,
+        "managed-child-sessions",
+        "projects",
+        created.projectId.replace(/^sha256:/u, ""),
+        "sessions",
+        `${skilledOutput.childSessionId}.jsonl`,
+      ),
+      "utf8",
+    );
+    const childGenesis = JSON.parse(childSessionLog.split("\n")[0] ?? "null") as SessionRecord;
+    expect(childGenesis).toMatchObject({
+      schemaVersion: 3,
+      record: {
+        type: "session_genesis",
+        promptContext: {
+          toolProfile: { digest: skilledOutput.effectiveToolProfileDigest },
+        },
+        skillContext: { activationDigest: skilledOutput.skillActivationDigest },
+      },
+    });
+    expect(skilledPermissionSubjects).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "managed_agent_spawn",
+          profile: "research.v1",
+          selectedSkills: [
+            {
+              qualifiedId: "skill:v1:project:.:research-guide",
+              digest: expect.stringMatching(/^sha256:/u),
+            },
+          ],
+        }),
+      ]),
+    );
+    expect(JSON.stringify(childRequests[0]?.tools)).not.toMatch(
+      /activate_skill|write_file|edit_file|run_shell|spawn_agent|mcp/u,
+    );
+    await workspaceTrust.setTrusted({ projectId: created.projectId, trusted: true });
+    await writeFile(
+      join(skillDirectory, "SKILL.md"),
+      "---\nname: research-guide\ndescription: Supplies exact research guidance.\n---\nCHANGED_AFTER_APPROVAL\n",
+      "utf8",
+    );
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Try the changed selected Skill." },
+    });
+    expect(changedSkillSpawnResult).toMatchObject({
+      role: "tool",
+      result: { status: "failed", error: { code: "invalid_tool_input" } },
+    });
+    expect(childRequests).toHaveLength(4);
+    await writeFile(
+      join(skillDirectory, "SKILL.md"),
+      "---\nname: research-guide\ndescription: Supplies exact research guidance.\n---\nSELECTED_RESEARCH_SKILL_BODY\n",
+      "utf8",
+    );
+    await workspaceTrust.setTrusted({ projectId: created.projectId, trusted: false });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Try the workspace-trust-revoked Skill." },
+    });
+    expect(revokedSkillSpawnResult).toMatchObject({
+      role: "tool",
+      result: { status: "failed", error: { code: "invalid_tool_input" } },
+    });
+    expect(childRequests).toHaveLength(4);
+  } finally {
+    releaseThirdSkillRequest.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle narrows an admitted extension Skill after extension disable", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-extension-skill-revoke-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const packageRoot = join(testRoot, "extension-package");
+  const skillDirectory = join(packageRoot, "skills", "managed-extension-guide");
+  const references = join(skillDirectory, "references");
+  await mkdir(workspaceRoot, { recursive: true });
+  await mkdir(references, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/managed-extension-skill",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.managed-extension-skill",
+        apiVersion: "^0.3.0",
+        runtime: { entry: "./extension.js" },
+        capabilities: { required: [], optional: [] },
+        contributions: [],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "extension.js"),
+    "export async function activate() {}\n",
+    "utf8",
+  );
+  await writeFile(
+    join(skillDirectory, "SKILL.md"),
+    "---\nname: managed-extension-guide\ndescription: Supplies revocable managed guidance.\n---\nMANAGED_EXTENSION_SKILL_BODY\n",
+    "utf8",
+  );
+  await writeFile(join(references, "guide.txt"), "REVOCABLE_EXTENSION_RESOURCE\n", "utf8");
+  const qualifiedId =
+    "skill:v1:extension:fixture.managed-extension-skill:%40fixture%2Fmanaged-extension-skill:1.0.0:managed-extension-guide";
+  const childModelEntered = Promise.withResolvers<void>();
+  const releaseChildModel = Promise.withResolvers<void>();
+  const childRequests: ModelRequest[] = [];
+  let parentCalls = 0;
+  let childAgentId = "";
+  const driver: ModelDriver = {
+    async *stream(request) {
+      if (request.purpose !== "ordinary") {
+        yield { type: "text_delta", text: "Managed extension Skill" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      const child = request.messages.some(
+        (message) =>
+          message.role === "developer" &&
+          message.content.startsWith("Managed child profile research.v1"),
+      );
+      if (child) {
+        childRequests.push(request);
+        childModelEntered.resolve();
+        await releaseChildModel.promise;
+        yield {
+          type: "tool_call_start",
+          id: "read-revoked-extension",
+          name: "read_skill_resource",
+        };
+        yield {
+          type: "tool_call_delta",
+          id: "read-revoked-extension",
+          json: JSON.stringify({ qualifiedId, path: "references/guide.txt" }),
+        };
+        yield { type: "tool_call_end", id: "read-revoked-extension" };
+        yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      parentCalls += 1;
+      if (parentCalls === 1) {
+        yield { type: "tool_call_start", id: "spawn-extension-research", name: "spawn_agent" };
+        yield {
+          type: "tool_call_delta",
+          id: "spawn-extension-research",
+          json: JSON.stringify({
+            task: "Use the exact extension Skill.",
+            profile: "research.v1",
+            skills: [qualifiedId],
+            mode: "background",
+          }),
+        };
+        yield { type: "tool_call_end", id: "spawn-extension-research" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      if (parentCalls === 2) {
+        const spawn = request.messages.findLast(
+          (message) => message.role === "tool" && message.callId === "spawn-extension-research",
+        );
+        if (
+          spawn?.role !== "tool" ||
+          spawn.result.status !== "completed" ||
+          spawn.result.output === null ||
+          typeof spawn.result.output !== "object" ||
+          !("agentId" in spawn.result.output)
+        ) {
+          throw new Error("The extension research child identity was unavailable.");
+        }
+        // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+        childAgentId = String(spawn.result.output["agentId"]);
+        yield { type: "text_delta", text: "Extension research child started." };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      if (parentCalls === 3) {
+        yield { type: "tool_call_start", id: "wait-extension-research", name: "wait_agents" };
+        yield {
+          type: "tool_call_delta",
+          id: "wait-extension-research",
+          json: JSON.stringify({ agentIds: [childAgentId], until: "all_terminal" }),
+        };
+        yield { type: "tool_call_end", id: "wait-extension-research" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Extension research child settled." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const extensionHost = createExtensionHost({
+    capabilities: [],
+    extensions: [
+      {
+        enabled: true,
+        extensionId: "fixture.managed-extension-skill",
+        grants: [],
+        packageName: "@fixture/managed-extension-skill",
+        packageRoot,
+        packageVersion: "1.0.0",
+      },
+    ],
+    projectRoot: workspaceRoot,
+    stateRoot,
+  });
+  const lifecycle = createSessionLifecycle({
+    extensionHost,
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Start extension-Skill research." },
+    });
+    await childModelEntered.promise;
+    await extensionHost.disableExtension("fixture.managed-extension-skill");
+    releaseChildModel.resolve();
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Wait for extension revocation settlement." },
+    });
+    expect(childRequests).toHaveLength(1);
+    const managed = await lifecycle.inspectManagedAgents({ sessionId: created.sessionId });
+    expect(managed.agents.find((agent) => agent.agentId === childAgentId)).toMatchObject({
+      agentId: childAgentId,
+      status: "failed",
+      error: { code: "skill_activation_failed" },
+    });
+  } finally {
+    releaseChildModel.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("AgentManager waits causally for any or all selected background terminals without cancelling on wait abort", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-wait-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -2685,6 +5086,15 @@ test("PresentationSession refreshes agent cards and cancels one exact active chi
       counts: { active: 1 },
       agents: [{ status: "running" }],
     });
+    await expect(
+      lifecycle.sendManagedAgentMessage({
+        sessionId: created.sessionId,
+        agentId: active.agentId,
+        expectedRevision: active.revision,
+        callId: "a2-send-must-stay-unavailable",
+        message: "Historical A2 must not gain a mailbox.",
+      }),
+    ).rejects.toMatchObject({ code: "session_invalid" });
     await expect(lifecycle.create({ targetIdentity })).rejects.toMatchObject({
       code: "project_in_use",
     });
@@ -2706,6 +5116,229 @@ test("PresentationSession refreshes agent cards and cancels one exact active chi
   } finally {
     await observerLifecycle.close();
     await presentation.close();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession replies to one exact attention without waking a parent turn", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-presentation-reply-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  let parentCalls = 0;
+  let agentId = "";
+  let attentionId = "";
+  let attentionRevision = 0;
+  const childReplyObserved = Promise.withResolvers<void>();
+  const childRequests: ModelRequest[] = [];
+  const driver: ModelDriver = {
+    async *stream(request) {
+      if (request.purpose !== "ordinary") {
+        yield { type: "text_delta", text: "Managed attention" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      const child = request.messages.some(
+        (message) =>
+          message.role === "developer" &&
+          message.content.startsWith("Managed child profile research.v1"),
+      );
+      if (child) {
+        childRequests.push(request);
+        if (childRequests.length === 1) {
+          yield {
+            type: "tool_call_start",
+            id: "presentation-attention",
+            name: "request_parent_input",
+          };
+          yield {
+            type: "tool_call_delta",
+            id: "presentation-attention",
+            json: '{"question":"Which exact Presentation source should I use?"}',
+          };
+          yield { type: "tool_call_end", id: "presentation-attention" };
+          yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        expect(request.messages.findLast((message) => message.role === "tool")).toMatchObject({
+          role: "tool",
+          callId: "presentation-attention",
+          result: {
+            status: "completed",
+            output: { reply: "Use the immutable Presentation source." },
+          },
+        });
+        childReplyObserved.resolve();
+        yield { type: "text_delta", text: "Presentation reply observed." };
+        yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      parentCalls += 1;
+      if (parentCalls === 1) {
+        yield { type: "tool_call_start", id: "spawn-presentation-attention", name: "spawn_agent" };
+        yield {
+          type: "tool_call_delta",
+          id: "spawn-presentation-attention",
+          json: '{"task":"Request Presentation input.","profile":"research.v1","mode":"background"}',
+        };
+        yield { type: "tool_call_end", id: "spawn-presentation-attention" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      if (parentCalls === 2) {
+        const spawn = request.messages.findLast(
+          (message) => message.role === "tool" && message.name === "spawn_agent",
+        );
+        if (
+          spawn?.role !== "tool" ||
+          spawn.result.status !== "completed" ||
+          spawn.result.output === null ||
+          typeof spawn.result.output !== "object" ||
+          !("agentId" in spawn.result.output)
+        ) {
+          throw new Error("The Presentation child identity was unavailable.");
+        }
+        // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+        agentId = String(spawn.result.output["agentId"]);
+        yield { type: "tool_call_start", id: "wait-presentation-attention", name: "wait_agents" };
+        yield {
+          type: "tool_call_delta",
+          id: "wait-presentation-attention",
+          json: JSON.stringify({ agentIds: [agentId], until: "attention" }),
+        };
+        yield { type: "tool_call_end", id: "wait-presentation-attention" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      if (parentCalls === 3) {
+        const wait = request.messages.findLast(
+          (message) => message.role === "tool" && message.name === "wait_agents",
+        );
+        const output =
+          wait?.role === "tool" && wait.result.status === "completed" ? wait.result.output : null;
+        const agents =
+          output !== null && typeof output === "object" && "agents" in output
+            ? // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+              output["agents"]
+            : undefined;
+        const attention = Array.isArray(agents) ? agents[0] : undefined;
+        if (attention === null || typeof attention !== "object" || !("attention" in attention)) {
+          throw new Error("The exact attention snapshot was unavailable.");
+        }
+        // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+        const attentionValue = attention["attention"];
+        if (
+          attentionValue === null ||
+          typeof attentionValue !== "object" ||
+          !("attentionId" in attentionValue) ||
+          !("revision" in attention)
+        ) {
+          throw new Error("The exact attention identity was unavailable.");
+        }
+        // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+        attentionId = String(attentionValue["attentionId"]);
+        // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+        attentionRevision = Number(attention["revision"]);
+        yield { type: "text_delta", text: "The child needs exact parent input." };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      if (parentCalls === 4) {
+        yield { type: "tool_call_start", id: "wait-presentation-terminal", name: "wait_agents" };
+        yield {
+          type: "tool_call_delta",
+          id: "wait-presentation-terminal",
+          json: JSON.stringify({ agentIds: [agentId], until: "all_terminal" }),
+        };
+        yield { type: "tool_call_end", id: "wait-presentation-terminal" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "The child reached terminal state." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+    stateRoot,
+    tools: createReadToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "attention-presentation",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Start and wait for one attention request." },
+    });
+    expect(parentCalls).toBe(3);
+    await presentation.dispatch({ type: "refresh_managed_agents", sessionId: created.sessionId });
+    expect(presentation.getState().authoritative.managedAgents).toMatchObject({
+      counts: { active: 1, completed: 0, attention: 1 },
+      agents: [
+        {
+          agentId,
+          status: "waiting_for_parent",
+          revision: attentionRevision,
+          attention: {
+            attentionId,
+            question: "Which exact Presentation source should I use?",
+          },
+        },
+      ],
+    });
+    await expect(
+      presentation.dispatch({
+        type: "send_managed_agent_message",
+        sessionId: created.sessionId,
+        agentId,
+        expectedRevision: attentionRevision,
+        attentionId,
+        message: "Use the immutable Presentation source.",
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    await childReplyObserved.promise;
+    expect(parentCalls).toBe(3);
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Now wait for the replied child to finish." },
+    });
+    await presentation.dispatch({ type: "refresh_managed_agents", sessionId: created.sessionId });
+    expect(presentation.getState().authoritative.managedAgents).toMatchObject({
+      counts: { active: 0, completed: 1, attention: 0 },
+      agents: [{ agentId, status: "completed" }],
+    });
+    await presentation.close();
+  } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }

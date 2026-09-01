@@ -16,6 +16,11 @@ export class AgentNavigator implements Component {
   }) => void;
   readonly #onChange: () => void;
   readonly #onClose: () => void;
+  readonly #onReply: (input: {
+    readonly agentId: string;
+    readonly expectedRevision: number;
+    readonly attentionId: string;
+  }) => void;
   readonly #theme: AdamTuiTheme;
   #detail: ManagedAgent | null = null;
   readonly #list: SearchableSelectList;
@@ -28,12 +33,18 @@ export class AgentNavigator implements Component {
     }) => void;
     readonly onChange: () => void;
     readonly onClose: () => void;
+    readonly onReply: (input: {
+      readonly agentId: string;
+      readonly expectedRevision: number;
+      readonly attentionId: string;
+    }) => void;
     readonly theme: AdamTuiTheme;
   }) {
     this.#managedAgents = options.managedAgents;
     this.#onCancel = options.onCancel;
     this.#onChange = options.onChange;
     this.#onClose = options.onClose;
+    this.#onReply = options.onReply;
     this.#theme = options.theme;
     const items: SearchableSelectItem[] = options.managedAgents.agents.map((agent) => ({
       item: {
@@ -63,10 +74,24 @@ export class AgentNavigator implements Component {
       return;
     }
     if (this.#detail !== null) {
-      if (data === "c" && this.#detail.status === "running") {
+      if (
+        data === "c" &&
+        (this.#detail.status === "running" || this.#detail.status === "waiting_for_parent")
+      ) {
         this.#onCancel({
           agentId: this.#detail.agentId,
           expectedRevision: this.#detail.revision,
+        });
+      }
+      if (
+        data === "r" &&
+        this.#detail.status === "waiting_for_parent" &&
+        this.#detail.attention !== undefined
+      ) {
+        this.#onReply({
+          agentId: this.#detail.agentId,
+          expectedRevision: this.#detail.revision,
+          attentionId: this.#detail.attention.attentionId,
         });
       }
       return;
@@ -99,11 +124,23 @@ export class AgentNavigator implements Component {
               "",
               `${safeTerminalText(this.#detail.error.code)} · ${safeTerminalText(this.#detail.error.message)}`,
             ]),
+        ...(this.#detail.attention === undefined
+          ? []
+          : [
+              "",
+              `${this.#detail.attention.status === "waiting" ? "Parent input requested" : "Parent input orphaned"} · ${safeTerminalText(this.#detail.attention.question)}`,
+            ]),
+        ...(this.#detail.reports ?? []).flatMap((report) => [
+          "",
+          `${report.kind} r${report.revision} · ${safeTerminalText(report.message)}${report.messageTruncated ? ` · ${report.messageByteCount} bytes total` : ""}`,
+        ]),
         "",
         this.#theme.muted(
           this.#detail.status === "running"
             ? "c cancel exact revision · Esc back · Ctrl+Q exit"
-            : "Terminal child · Esc back · Ctrl+Q exit",
+            : this.#detail.status === "waiting_for_parent"
+              ? "r reply exact attention · c cancel exact revision · Esc back · Ctrl+Q exit"
+              : "Terminal child · Esc back · Ctrl+Q exit",
         ),
       ].map((line) => boundedLine(line, width));
     }
