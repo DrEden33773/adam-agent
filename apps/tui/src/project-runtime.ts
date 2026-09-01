@@ -4,16 +4,20 @@ import {
   createBiomeExecutionAdapter,
   createExtensionHost,
   createFileArtifactStore,
+  createJsonlManagedAgentStore,
   createJsonlOperationStore,
+  createJsonlSessionStoreDirectory,
   createPresentationSession,
   createSessionLifecycle,
   createWebSearchConfiguration,
   ExtensionConfigurationError,
   type ExtensionContributionSummary,
   loadExtensionConfiguration,
+  type ManagedAgentStore,
   type ModelTargets,
   type PermissionPolicy,
   type PresentationPreferences,
+  type SessionRecord,
   type SessionSnapshot,
   type WorkspaceTrustController,
 } from "@adam-agent/agent";
@@ -69,6 +73,22 @@ export async function createProductionProjectRuntime(
     stateRoot: options.stateRoot,
     workspaceRoot: options.workspaceRoot,
   });
+  const managedStorePromise = createJsonlManagedAgentStore({
+    stateRoot: options.stateRoot,
+    workspaceRoot: options.workspaceRoot,
+  });
+  const managedStore: ManagedAgentStore = {
+    async append(record) {
+      return (await managedStorePromise).append(record);
+    },
+    async read() {
+      return (await managedStorePromise).read();
+    },
+  };
+  const managedChildSessionStores = createJsonlSessionStoreDirectory<SessionRecord>({
+    workspaceRoot: options.workspaceRoot,
+    stateRoot: join(options.stateRoot, "managed-review-sessions"),
+  });
   let lifecycle: ReturnType<typeof createSessionLifecycle> | undefined;
   const host = createExtensionHost({
     artifactStore,
@@ -77,8 +97,31 @@ export async function createProductionProjectRuntime(
       { id: "adam.analyzer-execution.biome@1", version: "1.0.0" },
       { id: "adam.artifact.publish@1", version: "1.0.0" },
       { id: "adam.storage.records@1", version: "1.0.0" },
+      { id: "adam.managed-session@1", version: "1.0.0" },
     ],
     extensions,
+    managedSession: {
+      childSessionStores: managedChildSessionStores,
+      managedStore,
+      parentPermissions: options.permissions,
+      async resolveOrigin({ origin, signal }) {
+        if (lifecycle === undefined) throw new Error("The session lifecycle is unavailable.");
+        const snapshot = await lifecycle.inspect({ sessionId: origin.sessionId });
+        if (snapshot.schemaVersion !== 3) throw new Error("The origin session is unavailable.");
+        const resolved = await options.modelTargets.resolve({
+          allowExperimental: true,
+          signal,
+          targetId: snapshot.targetIdentity.targetId,
+          targetIdentity: snapshot.targetIdentity,
+        });
+        return {
+          childContextProfile: resolved.contextProfile,
+          childModel: resolved.driver,
+          targetIdentity: resolved.identity,
+        };
+      },
+      workspaceRoot: options.workspaceRoot,
+    },
     operationOriginAuthority: {
       async validateBoundary({ origin, projectId }) {
         if (lifecycle === undefined) {

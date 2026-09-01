@@ -60,6 +60,8 @@ export {
   type LocalInputResourceSelectionV1,
   type StagedInputResourceSelectionV1,
 } from "./input-resources.js";
+export type { ManagedAgentStore } from "./managed-agent.js";
+export { createJsonlManagedAgentStore } from "./managed-agent-store.js";
 export {
   type ModelDriverDiagnosticCode,
   ModelDriverError,
@@ -164,7 +166,9 @@ export {
   type CanonicalRuntimeEvent,
   createInMemorySessionStore,
   createJsonlSessionStore,
+  createJsonlSessionStoreDirectory,
   type SessionEventRecord,
+  type SessionRecord,
   type SessionStore,
   SessionStoreError,
 } from "./session-store.js";
