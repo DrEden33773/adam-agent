@@ -181,7 +181,6 @@ type AgentSessionBaseDependencies = {
 
 export const sessionToolProfileNames = Symbol("adam-agent.session-tool-profile-names");
 export const sessionInitialThinkingPolicy = Symbol("adam-agent.session-initial-thinking-policy");
-export const sessionInitialMessages = Symbol("adam-agent.session-initial-messages");
 
 export type AgentSessionDependencies = AgentSessionBaseDependencies &
   (
@@ -220,7 +219,6 @@ export class AgentSession {
   readonly #contextProfile: ContextProfile | undefined;
   readonly #maximumOutputTokens: number;
   readonly #thinkingPolicy: ThinkingPolicySnapshotV1 | undefined;
-  readonly #initialMessages: readonly ModelMessage[];
   readonly #store: SessionStore<SessionRecord>;
   #activeAbortController: AbortController | undefined;
   #activeProviderAttempt:
@@ -293,14 +291,6 @@ export class AgentSession {
           readonly [sessionInitialThinkingPolicy]?: ThinkingPolicySnapshotV1;
         }
       )[sessionInitialThinkingPolicy];
-    this.#initialMessages =
-      this.#durableContext?.initialMessages ??
-      (
-        dependencies as AgentSessionDependencies & {
-          readonly [sessionInitialMessages]?: readonly ModelMessage[];
-        }
-      )[sessionInitialMessages] ??
-      [];
     this.#model = dependencies.model;
     this.#modalityProfile = dependencies.modalityProfile;
     const durablePromptContext = this.#durableContext?.promptContext;
@@ -626,7 +616,7 @@ export class AgentSession {
     }
     const messages: ModelMessage[] =
       resume === undefined
-        ? [...this.#initialMessages, projectedUserMessage]
+        ? [...(this.#durableContext?.initialMessages ?? []), projectedUserMessage]
         : resume.messages.map((message) => ({ ...message }));
     const toolResultsById = new Map<
       string,

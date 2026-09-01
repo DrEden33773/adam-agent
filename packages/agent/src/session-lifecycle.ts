@@ -972,7 +972,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       return base;
     }
     const managerRouter: AgentManager = {
-      parentRootId: projectRuntimeRootId,
+      parentRootId: `session:${sessionId}`,
       targetIdentity,
       ...(thinkingPolicy === undefined ? {} : { thinkingPolicy }),
       async spawnForeground(input) {
@@ -1099,20 +1099,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   const executeWithOwner = async <T>(
     kind: "ordinary" | "title",
     operation: (rootClaim: ProjectExecutionRootClaim) => Promise<T>,
+    rootId = projectRuntimeRootId,
   ): Promise<T> => {
     const active = coordinatingOwnerOperation;
     if (active !== undefined && (kind === "title" || active.kind === "title")) {
       await active.settlement;
     }
-    const operationPromise = executionDomain
-      .claimRoot({ rootId: projectRuntimeRootId })
-      .then(async (rootClaim) => {
-        try {
-          return await operation(rootClaim);
-        } finally {
-          await rootClaim.release();
-        }
-      });
+    const operationPromise = executionDomain.claimRoot({ rootId }).then(async (rootClaim) => {
+      try {
+        return await operation(rootClaim);
+      } finally {
+        await rootClaim.release();
+      }
+    });
     const tracked = {
       kind,
       settlement: operationPromise.then(
@@ -1142,17 +1141,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   };
   const runWithOwner = <T>(
     operation: (rootClaim: ProjectExecutionRootClaim) => Promise<T>,
-  ): Promise<T> => executeWithOwner("ordinary", operation);
+    rootId?: string,
+  ): Promise<T> => executeWithOwner("ordinary", operation, rootId);
   const runTitleWithOwner = <T>(
     operation: (rootClaim: ProjectExecutionRootClaim) => Promise<T>,
   ): Promise<T> => executeWithOwner("title", operation);
   const withOwner = async <T>(
     operation: (rootClaim: ProjectExecutionRootClaim) => Promise<T>,
+    rootId?: string,
   ): Promise<T> => {
     if (lifecycleClosing) {
       throw new SessionLifecycleError("session_invalid");
     }
-    return runWithOwner(operation);
+    return runWithOwner(operation, rootId);
   };
   const drainOwnerOperations = async (): Promise<void> => {
     while (trackedOwnerOperations.size > 0) {
@@ -3500,7 +3501,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             armMcpIdle(input.sessionId, live.activation.generationId);
           }
         }
-      });
+      }, `session:${input.sessionId}`);
       const titleSnapshot = await startAutomaticTitle(
         input.sessionId,
         continued.snapshot,

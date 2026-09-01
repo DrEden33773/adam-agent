@@ -35,22 +35,22 @@ const managedAgentTaskSchema = z.strictObject({
     .refine((task) => Buffer.byteLength(task, "utf8") <= maximumManagedAgentTaskBytes),
 });
 const targetIdentitySchema = z.strictObject({
-  targetId: z.string(),
-  vendor: z.string(),
-  modelId: z.string(),
+  targetId: z.string().min(1).max(256),
+  vendor: z.string().min(1).max(128),
+  modelId: z.string().min(1).max(256),
   route: z.enum(["direct", "vercel-ai-gateway"]),
-  upstreamProviderId: z.string().optional(),
+  upstreamProviderId: z.string().min(1).max(128).optional(),
   profileVersion: z.number().int().positive(),
   certification: z.enum(["certified", "experimental"]),
 });
 const thinkingPolicySchema = z.strictObject({
   schemaVersion: z.literal(1),
-  requestedLevelId: z.string(),
-  effectiveLevelId: z.string(),
+  requestedLevelId: z.string().min(1).max(128),
+  effectiveLevelId: z.string().min(1).max(128),
   capability: z.strictObject({
-    id: z.string(),
+    id: z.string().min(1).max(256),
     version: z.literal(1),
-    digest: z.string().startsWith("sha256:"),
+    digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   }),
   mapping: z.discriminatedUnion("thinkingType", [
     z.strictObject({
@@ -74,7 +74,7 @@ const managedAgentTerminalOutputSchema = z.strictObject({
     z.strictObject({ text: z.string() }),
     z.strictObject({
       artifact: z.strictObject({
-        id: z.string().startsWith("sha256:"),
+        id: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
         mediaType: z.literal("text/plain; charset=utf-8"),
         byteCount: z.number().int().positive(),
       }),
@@ -90,7 +90,7 @@ const managedAgentTerminalOutputSchema = z.strictObject({
   cost: z.strictObject({ status: z.literal("unavailable") }),
   transcript: z.strictObject({
     sessionId: z.string().uuid(),
-    digest: z.string().startsWith("sha256:"),
+    digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
     throughSequence: z.number().int().nonnegative(),
   }),
 });
@@ -238,7 +238,7 @@ const managedAgentRecordSchema = z.union([
       }),
       z.strictObject({
         artifact: z.strictObject({
-          id: z.string().startsWith("sha256:"),
+          id: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
           mediaType: z.literal("text/plain; charset=utf-8"),
           byteCount: z.number().int().positive(),
         }),
