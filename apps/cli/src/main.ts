@@ -312,6 +312,9 @@ function formatPermissionPrompt(
   if (event.subject.type === "input_resource") {
     return `Allow ${event.name} for linked input resource ${quoteForTerminal(event.subject.occurrenceId)} [y/N] `;
   }
+  if (event.subject.type === "managed_agent_spawn") {
+    return `Allow ${event.subject.profile} foreground scout for this exact task (${event.subject.taskDigest}) [y/N] `;
+  }
   return `Allow ${event.name} for ${quoteForTerminal(event.subject.path)} [y/N] `;
 }
 
@@ -549,6 +552,7 @@ async function runCliCommand(activeCommand: CliCommand): Promise<void> {
 async function createRunLifecycle(modelTargets: ModelTargets): Promise<SessionLifecycle> {
   const artifactStore = createLazyFileArtifactStore(join(stateRoot, "artifacts"));
   return createSessionLifecycle({
+    managedAgentTools: "managed-agent-tools.a1.v1",
     modelTargets,
     preferences: createPresentationPreferences({ environment: userConfigurationEnvironment }),
     workspaceTrust: createWorkspaceTrust({
@@ -560,7 +564,7 @@ async function createRunLifecycle(modelTargets: ModelTargets): Promise<SessionLi
     tools: createCodingToolRegistry({ workspaceRoot, stateRoot, artifactStore }),
     permissions: createPermissionPolicy({
       allowedEffects: ["read"],
-      askedEffects: ["write", "execute"],
+      askedEffects: ["write", "execute", "delegate"],
     }),
   });
 }

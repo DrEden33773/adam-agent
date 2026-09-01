@@ -1,5 +1,6 @@
 /** Tests only. This internal fault-injection surface has no compatibility promise. */
 
+export { sessionToolProfileNames } from "./agent-session.js";
 export { AiSdkModelDriver as AiSdkModelDriverForTesting } from "./ai-sdk-model-driver.js";
 export {
   createObservedBiomeExecutionAdapter,
@@ -9,6 +10,20 @@ export type { ContextProfile } from "./context-profile.js";
 export { DirectDeepSeekResponsesModelDriver as DirectDeepSeekResponsesModelDriverForTesting } from "./deepseek-responses-model-driver.js";
 export { digestContextRecordPrefix } from "./durable-context.js";
 export { createInputResourceUserMessageV1 } from "./input-resources.js";
+export {
+  createAgentManager,
+  createManagedAgentToolRegistry,
+  type ManagedAgentDeadlineScheduler,
+  type ManagedAgentRecord,
+  type ManagedAgentStore,
+  ManagedAgentStoreError,
+  recoverInterruptedManagedAgents,
+} from "./managed-agent.js";
+export { scoutManagedAgentProfileV1 } from "./managed-agent-profiles.js";
+export {
+  createInMemoryManagedAgentStore,
+  createJsonlManagedAgentStore,
+} from "./managed-agent-store.js";
 export type {
   McpBeforeToolDispatchBarrier,
   McpBootstrapScheduler,
@@ -123,6 +138,7 @@ export {
   workspaceMcpLeaseTransitionBarrier,
 } from "./session-lifecycle.js";
 export {
+  createInMemorySessionStore,
   createInMemorySessionStoreDirectory,
   createJsonlSessionStoreDirectory,
   openJsonlSessionStore,
@@ -130,6 +146,7 @@ export {
   type SessionContextCompactionFailedRecord,
   type SessionContextCompactionInterruptedRecord,
   type SessionContextCompactionStartedRecord,
+  type SessionEventRecord,
   type SessionGenesisRecord,
   type SessionModelResponseCompletedRecord,
   type SessionProviderAttemptInterruptedRecord,

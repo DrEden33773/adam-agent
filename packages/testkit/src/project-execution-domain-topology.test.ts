@@ -15,6 +15,7 @@ test("ProjectExecutionDomain is the sole production caller of ProjectLifecycleOw
   );
 
   expect(ownerMethodCalls).toEqual([
+    { call: "child.run", path: "managed-agent.ts" },
     { call: "options.lifecycleOwner.acquire", path: "project-execution-domain.ts" },
     { call: "session.run", path: "session-lifecycle.ts" },
     { call: "coordinator.run", path: "tool-runtime.ts" },

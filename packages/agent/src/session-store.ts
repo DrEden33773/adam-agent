@@ -63,7 +63,15 @@ export type CanonicalRuntimeEvent = Exclude<
 
 type V1PermissionSubject = Exclude<
   PermissionSubject,
-  { readonly type: "extension_capability" | "mcp_tool" | "patch" | "plan_command" | "skill" }
+  {
+    readonly type:
+      | "extension_capability"
+      | "managed_agent_spawn"
+      | "mcp_tool"
+      | "patch"
+      | "plan_command"
+      | "skill";
+  }
 >;
 type V1ToolError = {
   readonly code:
@@ -125,6 +133,7 @@ export type SessionGenesisRecord = {
     readonly sessionId: string;
     readonly projectId: string;
     readonly targetIdentity: ModelTargetIdentity;
+    readonly managedAgentTools?: "managed-agent-tools.a1.v1";
     readonly naming?: {
       readonly profileVersion: 1;
       readonly fallbackTitle: string;
@@ -1282,6 +1291,12 @@ const currentToolErrorSchema = z.union([
       "todo_dependency_incomplete",
       "todo_entity_limit_exceeded",
       "todo_revision_stale",
+      "managed_agent_cancelled",
+      "managed_agent_capacity_exceeded",
+      "managed_agent_deadline_exceeded",
+      "managed_agent_failed",
+      "managed_agent_result_too_large",
+      "managed_agent_unavailable",
     ]),
     message: z.string(),
   }),
@@ -1383,12 +1398,59 @@ const skillPermissionSubjectSchema = z.strictObject({
     .refine((value) => /^[\x20-\x7e]+$/u.test(value)),
   path: z.string().min(1).max(4_096).optional(),
 });
+const managedAgentSpawnPermissionSubjectSchema = z.strictObject({
+  type: z.literal("managed_agent_spawn"),
+  parentRootId: z.string().min(1).max(256),
+  parentSessionId: z.uuid(),
+  profile: z.literal("scout.v1"),
+  profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  targetIdentity: z.strictObject({
+    targetId: z.string().min(1).max(256),
+    vendor: z.string().min(1).max(128),
+    modelId: z.string().min(1).max(256),
+    route: z.enum(["direct", "vercel-ai-gateway"]),
+    upstreamProviderId: z.string().min(1).max(128).optional(),
+    profileVersion: z.number().int().positive(),
+    certification: z.enum(["certified", "experimental"]),
+  }),
+  taskDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  limits: z.strictObject({
+    maximumTurns: z.literal(8),
+    maximumTokens: z.literal(128_000),
+    maximumDeadlineMilliseconds: z.literal(600_000),
+  }),
+  thinkingPolicy: z
+    .strictObject({
+      schemaVersion: z.literal(1),
+      requestedLevelId: z.string().min(1).max(128),
+      effectiveLevelId: z.string().min(1).max(128),
+      capability: z.strictObject({
+        id: z.string().min(1).max(256),
+        version: z.literal(1),
+        digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+      }),
+      mapping: z.discriminatedUnion("thinkingType", [
+        z.strictObject({
+          requestPath: z.enum(["provider_options.deepseek", "reasoning.effort"]),
+          thinkingType: z.literal("disabled"),
+        }),
+        z.strictObject({
+          requestPath: z.enum(["provider_options.deepseek", "reasoning.effort"]),
+          thinkingType: z.literal("enabled"),
+          reasoningEffort: z.enum(["low", "high", "max"]),
+        }),
+      ]),
+      reasoningArtifact: z.literal("provider_reasoning"),
+    })
+    .optional(),
+});
 const v2PermissionSubjectSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("file"), path: z.string() }),
   z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
   extensionCapabilityPermissionSubjectSchema,
   patchPermissionSubjectSchema,
   skillPermissionSubjectSchema,
+  managedAgentSpawnPermissionSubjectSchema,
   z.strictObject({
     type: z.literal("command"),
     command: z.string(),
@@ -1466,6 +1528,7 @@ const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
   skillPermissionSubjectSchema,
   mcpPermissionSubjectSchema,
   inputResourcePermissionSubjectSchema,
+  managedAgentSpawnPermissionSubjectSchema,
   planCommandPermissionSubjectSchema,
   z.strictObject({
     type: z.literal("command"),
@@ -1848,6 +1911,7 @@ const sessionGenesisV1RecordSchema = z.strictObject({
   sessionId: z.uuid(),
   projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   targetIdentity: modelTargetIdentitySchema,
+  managedAgentTools: z.literal("managed-agent-tools.a1.v1").optional(),
   naming: z
     .strictObject({
       profileVersion: z.literal(1),

@@ -14,6 +14,15 @@ export type ToolArtifactSource = {
   readonly truncated: boolean;
 };
 
+export type ManagedAgentResultArtifactSourceV1 = {
+  readonly type: "managed_agent_result";
+  readonly schemaVersion: 1;
+  readonly agentId: string;
+  readonly attemptId: string;
+  readonly childSessionId: string;
+  readonly totalBytes: number;
+};
+
 export type McpToolResultArtifactSourceV1 = {
   readonly type: "mcp_tool_result";
   readonly schemaVersion: 1;
@@ -103,6 +112,7 @@ export type ArtifactSource =
   | ChangePreviewArtifactSource
   | ExtensionArtifactSource
   | InputResourceArtifactSourceV1
+  | ManagedAgentResultArtifactSourceV1
   | McpToolResultArtifactSourceV1
   | ModelResponseArtifactSource
   | PastedTextArtifactSourceV1

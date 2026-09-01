@@ -39,6 +39,14 @@ import {
   inputResourceLimitsV1,
 } from "./input-resources.js";
 import {
+  type AgentManager,
+  createAgentManager,
+  createManagedAgentToolRegistry,
+  type ManagedAgentStore,
+  recoverInterruptedManagedAgents,
+} from "./managed-agent.js";
+import { createJsonlManagedAgentStore } from "./managed-agent-store.js";
+import {
   createMcpRuntimeHost,
   inspectMcpConfiguration,
   type McpBeforeToolDispatchBarrier,
@@ -94,6 +102,7 @@ import {
 import {
   createProjectExecutionDomain,
   ProjectExecutionDomainError,
+  type ProjectExecutionRootClaim,
   projectRuntimeRootId,
 } from "./project-execution-domain.js";
 import {
@@ -218,6 +227,7 @@ import {
 import {
   bindInputResourceToolRegistry,
   createCodingToolRegistry,
+  createPermissionPolicy,
   type PermissionPolicy,
   type ToolEffect,
   type ToolRegistry,
@@ -353,6 +363,7 @@ export type WorkspaceMcpLeaseTransitionBarrier = {
 export type SessionLifecycleOptions = {
   readonly extensionHost?: ExtensionHost;
   readonly modelTargets?: ModelTargets;
+  readonly managedAgentTools?: "managed-agent-tools.a1.v1";
   readonly permissions?: PermissionPolicy;
   readonly preferences?: UserModelPolicyResolver;
   readonly workspaceRoot: string;
@@ -926,6 +937,60 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           lifecycleOwner:
             options[sessionProjectLifecycleOwner] ?? createProjectLifecycleOwner(options),
         });
+  let managedAgentStorePromise: Promise<ManagedAgentStore> | undefined;
+  const resolveManagedAgentStore = () => {
+    managedAgentStorePromise ??= createJsonlManagedAgentStore({
+      workspaceRoot: options.workspaceRoot,
+      ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
+    });
+    return managedAgentStorePromise;
+  };
+  const managedAgentStore: ManagedAgentStore = {
+    async append(record) {
+      return (await resolveManagedAgentStore()).append(record);
+    },
+    async read() {
+      return (await resolveManagedAgentStore()).read();
+    },
+  };
+  const managedChildSessionStores = createJsonlSessionStoreDirectory<SessionRecord>({
+    workspaceRoot: options.workspaceRoot,
+    stateRoot: join(effectiveSessionStateRoot(options.stateRoot), "managed-child-sessions"),
+  });
+  const activeAgentManagers = new Map<string, AgentManager>();
+  const toolsForSession = (
+    sessionId: string,
+    targetIdentity: ModelTargetIdentity,
+    thinkingPolicy?: ThinkingPolicySnapshotV1,
+    managedAgentTools = options.managedAgentTools,
+  ): ToolRegistry => {
+    const base = options.tools;
+    if (options.modelTargets === undefined || managedAgentTools !== "managed-agent-tools.a1.v1") {
+      if (base === undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return base;
+    }
+    const managerRouter: AgentManager = {
+      parentRootId: `session:${sessionId}`,
+      parentSessionId: sessionId,
+      targetIdentity,
+      ...(thinkingPolicy === undefined ? {} : { thinkingPolicy }),
+      async spawnForeground(input) {
+        const manager = activeAgentManagers.get(sessionId);
+        return manager === undefined
+          ? {
+              status: "failed",
+              error: {
+                code: "managed_agent_unavailable",
+                message: "The foreground scout host is unavailable.",
+              },
+            }
+          : manager.spawnForeground(input);
+      },
+    };
+    return combineToolRegistries(base, createManagedAgentToolRegistry({ manager: managerRouter }));
+  };
   const pendingMcpCatalogChanges = new Map<
     string,
     {
@@ -1034,13 +1099,20 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   let coordinatingOwnerOperation: TrackedOwnerOperation | undefined;
   const executeWithOwner = async <T>(
     kind: "ordinary" | "title",
-    operation: () => Promise<T>,
+    operation: (rootClaim: ProjectExecutionRootClaim) => Promise<T>,
+    rootId = projectRuntimeRootId,
   ): Promise<T> => {
     const active = coordinatingOwnerOperation;
     if (active !== undefined && (kind === "title" || active.kind === "title")) {
       await active.settlement;
     }
-    const operationPromise = executionDomain.runRoot({ rootId: projectRuntimeRootId }, operation);
+    const operationPromise = executionDomain.claimRoot({ rootId }).then(async (rootClaim) => {
+      try {
+        return await operation(rootClaim);
+      } finally {
+        await rootClaim.release();
+      }
+    });
     const tracked = {
       kind,
       settlement: operationPromise.then(
@@ -1068,15 +1140,21 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
     }
   };
-  const runWithOwner = <T>(operation: () => Promise<T>): Promise<T> =>
-    executeWithOwner("ordinary", operation);
-  const runTitleWithOwner = <T>(operation: () => Promise<T>): Promise<T> =>
-    executeWithOwner("title", operation);
-  const withOwner = async <T>(operation: () => Promise<T>): Promise<T> => {
+  const runWithOwner = <T>(
+    operation: (rootClaim: ProjectExecutionRootClaim) => Promise<T>,
+    rootId?: string,
+  ): Promise<T> => executeWithOwner("ordinary", operation, rootId);
+  const runTitleWithOwner = <T>(
+    operation: (rootClaim: ProjectExecutionRootClaim) => Promise<T>,
+  ): Promise<T> => executeWithOwner("title", operation);
+  const withOwner = async <T>(
+    operation: (rootClaim: ProjectExecutionRootClaim) => Promise<T>,
+    rootId?: string,
+  ): Promise<T> => {
     if (lifecycleClosing) {
       throw new SessionLifecycleError("session_invalid");
     }
-    return runWithOwner(operation);
+    return runWithOwner(operation, rootId);
   };
   const drainOwnerOperations = async (): Promise<void> => {
     while (trackedOwnerOperations.size > 0) {
@@ -1755,7 +1833,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         promptGenesis !== undefined && isGenesisRecord(promptGenesis)
           ? promptContextRecordFromRecords(promptGenesis, promptRecords)
           : undefined;
-      let compatibleTools = options.tools;
+      let compatibleTools = toolsForSession(
+        input.sessionId,
+        snapshot.targetIdentity,
+        undefined,
+        promptGenesis !== undefined && isGenesisRecord(promptGenesis)
+          ? promptGenesis.record.managedAgentTools
+          : undefined,
+      );
       if (activePromptContext?.recordVersion === 3 && activePromptContext.mcp !== undefined) {
         const profile =
           promptGenesis === undefined || !isGenesisRecord(promptGenesis)
@@ -1765,7 +1850,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           throw new SessionLifecycleError("session_invalid");
         }
         compatibleTools = combineToolRegistries(
-          options.tools,
+          compatibleTools,
           mcpProfileDefinitionRegistry(profile),
         );
       }
@@ -2006,7 +2091,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           sessionId,
           projectId,
           targetIdentity: input.targetIdentity,
-          promptContext: createPromptContextV3(options.tools, repository, skillContext),
+          ...(options.managedAgentTools === undefined
+            ? {}
+            : { managedAgentTools: options.managedAgentTools }),
+          promptContext: createPromptContextV3(
+            toolsForSession(sessionId, input.targetIdentity),
+            repository,
+            skillContext,
+          ),
           skillContext,
         },
       },
@@ -2345,6 +2437,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             sessionId,
             projectId: parent.projectId,
             targetIdentity,
+            ...(parentGenesis.record.managedAgentTools === undefined
+              ? {}
+              : { managedAgentTools: parentGenesis.record.managedAgentTools }),
             naming: { profileVersion: 1, fallbackTitle: branchFallback },
             ...(parentPromptContext === undefined ? {} : { promptContext: parentPromptContext }),
             ...(parentSkillContext === undefined ? {} : { skillContext: parentSkillContext }),
@@ -2612,7 +2707,16 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       let effectiveInput = input.input;
       disarmMcpIdle(input.sessionId);
       await waitForMcpIdleOperation(input.sessionId);
-      const continued = await withOwner(async () => {
+      const continued = await withOwner(async (parentRoot) => {
+        if (options.managedAgentTools === "managed-agent-tools.a1.v1") {
+          await recoverInterruptedManagedAgents(
+            managedAgentStore,
+            managedChildSessionStores,
+            createLazyArtifactStore(
+              join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
+            ),
+          );
+        }
         const workspaceTrusted = (await inspectWorkspaceTrust()).status === "trusted";
         const artifactCache = createArtifactMaterializationCache();
         const resumed = await resumeSession({ sessionId: input.sessionId }, artifactCache);
@@ -3187,6 +3291,13 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             "The selected input resources exceed the v1 session-lineage aggregate byte limit.",
           );
         }
+        const effectiveThinkingPolicy = recoveredThinkingPolicy ?? newRunThinkingPolicy;
+        const sessionTools = toolsForSession(
+          input.sessionId,
+          resumed.snapshot.targetIdentity,
+          effectiveThinkingPolicy,
+          first.record.managedAgentTools,
+        );
         const sessionDependencies = {
           artifactStore,
           model: resolved.driver,
@@ -3290,29 +3401,44 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ...(durableOutputLimits === undefined
             ? {}
             : { [sessionDurableOutputLimits]: durableOutputLimits }),
-          ...(options.tools === undefined
-            ? {}
-            : {
-                tools: bindInputResourceToolRegistry(
-                  activePromptContext?.recordVersion === 3 && activePromptContext.mcp !== undefined
-                    ? combineToolRegistries(
-                        options.tools,
-                        workspaceTrusted
-                          ? mcpHost.toolRegistry(
-                              input.sessionId,
-                              requireMcpCommittedProfile(committedMcpProfile, activePromptContext),
-                              artifactStore,
-                            )
-                          : mcpProfileDefinitionRegistry(
-                              requireMcpCommittedProfile(committedMcpProfile, activePromptContext),
-                            ),
+          tools: bindInputResourceToolRegistry(
+            activePromptContext?.recordVersion === 3 && activePromptContext.mcp !== undefined
+              ? combineToolRegistries(
+                  sessionTools,
+                  workspaceTrusted
+                    ? mcpHost.toolRegistry(
+                        input.sessionId,
+                        requireMcpCommittedProfile(committedMcpProfile, activePromptContext),
+                        artifactStore,
                       )
-                    : options.tools,
-                  { artifactStore, occurrences: runtimeInputResources },
-                ),
-              }),
+                    : mcpProfileDefinitionRegistry(
+                        requireMcpCommittedProfile(committedMcpProfile, activePromptContext),
+                      ),
+                )
+              : sessionTools,
+            { artifactStore, occurrences: runtimeInputResources },
+          ),
           ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
         };
+        const agentManager = createAgentManager({
+          artifactStore,
+          childContextProfile: resolved.contextProfile,
+          childModel: resolved.driver,
+          childSessionStores: managedChildSessionStores,
+          managedStore: managedAgentStore,
+          parentPermissions: options.permissions ?? createPermissionPolicy({ allowedEffects: [] }),
+          parentRoot,
+          parentSessionId: input.sessionId,
+          projectId: resumed.snapshot.projectId as `sha256:${string}`,
+          ...(activePromptContext === undefined
+            ? {}
+            : { repository: activePromptContext.repository }),
+          targetIdentity: resumed.snapshot.targetIdentity,
+          ...(effectiveThinkingPolicy === undefined
+            ? {}
+            : { thinkingPolicy: effectiveThinkingPolicy }),
+          workspaceRoot: options.workspaceRoot,
+        });
         const session = new AgentSession(sessionDependencies);
         let resolveSessionSettlement = () => {};
         const sessionSettlement = new Promise<void>((resolve) => {
@@ -3343,6 +3469,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         });
         activeSession = session;
         activeSessionSettlement = sessionSettlement;
+        if (first.record.managedAgentTools === "managed-agent-tools.a1.v1") {
+          activeAgentManagers.set(input.sessionId, agentManager);
+        }
         try {
           const runLimits = resumeState?.limits ?? input.limits;
           const result = await session.run(runInput ?? { text: resumeState?.userMessage ?? "" }, {
@@ -3356,6 +3485,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           }
           return { result, snapshot };
         } finally {
+          activeAgentManagers.delete(input.sessionId);
           resolveSessionSettlement();
           if (activeSession === session) {
             activeSession = undefined;
@@ -3379,7 +3509,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             armMcpIdle(input.sessionId, live.activation.generationId);
           }
         }
-      });
+      }, `session:${input.sessionId}`);
       const titleSnapshot = await startAutomaticTitle(
         input.sessionId,
         continued.snapshot,
