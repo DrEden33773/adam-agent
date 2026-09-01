@@ -209,11 +209,12 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
           : paths.filter((path) => fuzzyMatch(path, normalizedPrefix));
       const pathItems = candidates.map<PathAutocompleteItem>((path) => {
         const safePath = safeTerminalText(path);
+        const columns = projectPathColumns(safePath);
         return {
           adamPath: { path: safePath },
           value: `@${safePath}`,
-          label: this.#path(`@${safePath}`),
-          description: "project path",
+          label: this.#path(`@${columns.fileName}`),
+          description: columns.parentPath,
         };
       });
       return Promise.resolve(
@@ -247,6 +248,18 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     completed[cursorLine] = `${line.slice(0, start)}${item.value}${line.slice(cursorCol)}`;
     return { lines: completed, cursorLine, cursorCol: start + item.value.length };
   }
+}
+
+function projectPathColumns(path: string): {
+  readonly fileName: string;
+  readonly parentPath: string;
+} {
+  const withoutTrailingSlash = path.endsWith("/") ? path.slice(0, -1) : path;
+  const separator = withoutTrailingSlash.lastIndexOf("/");
+  return {
+    fileName: withoutTrailingSlash.slice(separator + 1),
+    parentPath: separator < 0 ? "./" : withoutTrailingSlash.slice(0, separator + 1),
+  };
 }
 
 function fuzzyMatch(candidate: string, query: string): boolean {

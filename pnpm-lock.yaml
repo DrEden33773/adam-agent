@@ -5,7 +5,7 @@ settings:
   excludeLinksFromLockfile: false
 
 patchedDependencies:
-  '@earendil-works/pi-tui@0.84.2': 814f1de18d279d6399a7beeab9ee687075af219545d9917ea806d4e862f5a4a8
+  '@earendil-works/pi-tui@0.84.2': 6f817f79792e901cbb772ac3a365925a70349ab11845a0aa4f7e844b2e3fcaa9
 
 importers:
 
@@ -52,7 +52,7 @@ importers:
         version: link:../../packages/presentation
       '@earendil-works/pi-tui':
         specifier: 0.84.2
-        version: 0.84.2(patch_hash=814f1de18d279d6399a7beeab9ee687075af219545d9917ea806d4e862f5a4a8)
+        version: 0.84.2(patch_hash=6f817f79792e901cbb772ac3a365925a70349ab11845a0aa4f7e844b2e3fcaa9)
       highlight.js:
         specifier: 11.11.1
         version: 11.11.1
@@ -1435,7 +1435,7 @@ snapshots:
   '@biomejs/cli-win32-x64@2.5.8':
     optional: true
 
-  '@earendil-works/pi-tui@0.84.2(patch_hash=814f1de18d279d6399a7beeab9ee687075af219545d9917ea806d4e862f5a4a8)':
+  '@earendil-works/pi-tui@0.84.2(patch_hash=6f817f79792e901cbb772ac3a365925a70349ab11845a0aa4f7e844b2e3fcaa9)':
     dependencies:
       get-east-asian-width: 1.6.0
       marked: 18.0.5

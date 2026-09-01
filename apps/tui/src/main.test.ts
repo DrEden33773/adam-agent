@@ -797,7 +797,7 @@ test("an accepted path atom stays adjacent to Text and Backspace removes it whol
   });
   try {
     fixture.write(" Inspect @srca");
-    await fixture.waitFor("@src/alpha.ts");
+    await fixture.waitFor("@alpha.ts");
     const beforeAccept = fixture.output().length;
     fixture.write("\t");
     await fixture.waitForCompleteFrameAfter("Inspect @src/alpha.ts", beforeAccept);
@@ -7004,10 +7004,22 @@ test("the real TUI opens inline project path completion from the at trigger", as
     fixture.write("Open @");
     await fixture.waitForCompleteFrameAfter("@README.md", beforeCompletion);
     const frame = fixture.output().slice(beforeCompletion);
+    let screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toMatch(/@README\.md\s+\.\//u);
+    expect(screen).toMatch(/@alpha\.ts\s+src\//u);
+
+    await fixture.resize(120, 40);
+    screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toMatch(/@README\.md\s+\.\//u);
+    expect(screen).toMatch(/@alpha\.ts\s+src\//u);
+
+    await fixture.resize(40, 12);
+    screen = fixture.screen()?.join("\n") ?? "";
+    expect(screen).toContain("@README.md");
+    expect((fixture.screen() ?? []).every((line) => visibleWidth(line) <= 40)).toBe(true);
     fixture.write("\u0011");
     await fixture.closed;
     expect(frame).toContain("@README.md");
-    expect(frame).toContain("@src/alpha.ts");
     expect(frame).not.toContain("Private source bytes.");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -7028,7 +7040,7 @@ test("the real TUI fuzzy-selects one durable project path atom without reading i
     fixture.write("\r");
     await fixture.waitFor("Adam · New session");
     fixture.write("Inspect @srca");
-    await fixture.waitFor("@src/alpha.ts");
+    await fixture.waitFor("@alpha.ts");
     const beforeAccept = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter("Inspect @src/alpha.ts", beforeAccept);
@@ -7065,7 +7077,7 @@ test("project path insertion renders terminal controls from filenames as inert t
     const fixture = startFixture({ stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     fixture.write("Inspect @");
-    await fixture.waitFor("@src/.ts");
+    await fixture.waitFor("@.ts");
     fixture.write("\r");
     await fixture.waitFor("Inspect @src/.ts");
     fixture.write("\u0011");
