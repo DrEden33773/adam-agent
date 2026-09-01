@@ -88,13 +88,10 @@ export function createProjectExecutionDomain(options: {
   };
 
   const createRelease = () => {
-    let released = false;
-    return async () => {
-      if (released) {
-        return;
-      }
-      released = true;
-      await releaseClaim();
+    let releasePromise: Promise<void> | undefined;
+    return () => {
+      releasePromise ??= releaseClaim();
+      return releasePromise;
     };
   };
 
@@ -134,11 +131,15 @@ export function createProjectExecutionDomain(options: {
         await releaseClaim();
         throw new ProjectExecutionDomainError("domain_closed");
       }
-      let rootReleased = false;
+      let rootReleasePromise: Promise<void> | undefined;
       return {
         rootId,
         async claimChild({ childId }) {
-          if (rootReleased || activeRootId !== rootId || ownerLease === undefined) {
+          if (
+            rootReleasePromise !== undefined ||
+            activeRootId !== rootId ||
+            ownerLease === undefined
+          ) {
             throw new ProjectExecutionDomainError("claim_released");
           }
           if (closed) {
@@ -147,12 +148,9 @@ export function createProjectExecutionDomain(options: {
           claimCount += 1;
           return { childId, release: createRelease() };
         },
-        async release() {
-          if (rootReleased) {
-            return;
-          }
-          rootReleased = true;
-          await releaseClaim();
+        release() {
+          rootReleasePromise ??= releaseClaim();
+          return rootReleasePromise;
         },
       };
     },

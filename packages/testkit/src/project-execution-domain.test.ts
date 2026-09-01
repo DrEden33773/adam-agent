@@ -246,6 +246,31 @@ test("ProjectExecutionDomain close reports a failed final OS release", async () 
   const root = await domain.claimRoot({ rootId: "parent-session" });
 
   await expect(root.release()).rejects.toBe(releaseFailure);
+  await expect(root.release()).rejects.toBe(releaseFailure);
+  await expect(domain.close()).rejects.toBe(releaseFailure);
+});
+
+test("ProjectExecutionDomain preserves a failed final OS release for child retries", async () => {
+  const releaseFailure = new Error("injected child owner release failure");
+  const owner: ProjectLifecycleOwner = {
+    async acquire() {
+      return {
+        async release() {
+          throw releaseFailure;
+        },
+      };
+    },
+    async run(operation) {
+      return operation();
+    },
+  };
+  const domain = createProjectExecutionDomain({ lifecycleOwner: owner });
+  const root = await domain.claimRoot({ rootId: "parent-session" });
+  const child = await root.claimChild({ childId: "child-1" });
+  await root.release();
+
+  await expect(child.release()).rejects.toBe(releaseFailure);
+  await expect(child.release()).rejects.toBe(releaseFailure);
   await expect(domain.close()).rejects.toBe(releaseFailure);
 });
 
