@@ -107,3 +107,38 @@ test("path mention rows separate file names from parent paths without changing i
     prefix: "@",
   });
 });
+
+test("path mentions recall root and nested files with the same matching name", async () => {
+  const provider = new AdamAutocompleteProvider({
+    getProjectPaths: () => [
+      "AGENTS.md",
+      "examples/portfolio-walkthrough/AGENTS.md",
+      "src/alpha.ts",
+    ],
+    getRunActive: () => false,
+    getSkills: () => [],
+  });
+  const input = "Use @agents";
+
+  await expect(
+    provider.getSuggestions([input], 0, input.length, {
+      signal: new AbortController().signal,
+    }),
+  ).resolves.toEqual({
+    items: [
+      {
+        adamPath: { path: "AGENTS.md" },
+        value: "@AGENTS.md",
+        label: "@AGENTS.md",
+        description: "./",
+      },
+      {
+        adamPath: { path: "examples/portfolio-walkthrough/AGENTS.md" },
+        value: "@examples/portfolio-walkthrough/AGENTS.md",
+        label: "@AGENTS.md",
+        description: "examples/portfolio-walkthrough/",
+      },
+    ],
+    prefix: "@agents",
+  });
+});

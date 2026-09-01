@@ -199,14 +199,14 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     const pathValuePrefix = pathMention?.[2];
     if (pathPrefix !== undefined && pathValuePrefix !== undefined) {
       const normalizedPrefix = pathValuePrefix.toLocaleLowerCase();
-      const paths = this.#getProjectPaths();
-      const prefixMatches = paths.filter((path) =>
-        path.toLocaleLowerCase().startsWith(normalizedPrefix),
-      );
-      const candidates =
-        prefixMatches.length > 0
-          ? prefixMatches
-          : paths.filter((path) => fuzzyMatch(path, normalizedPrefix));
+      const candidates = this.#getProjectPaths()
+        .map((path, index) => {
+          const rank = projectPathMatchRank(path, normalizedPrefix);
+          return rank === null ? null : { index, path, rank };
+        })
+        .filter((candidate) => candidate !== null)
+        .sort((left, right) => left.rank - right.rank || left.index - right.index)
+        .map((candidate) => candidate.path);
       const pathItems = candidates.map<PathAutocompleteItem>((path) => {
         const safePath = safeTerminalText(path);
         const columns = projectPathColumns(safePath);
@@ -260,6 +260,14 @@ function projectPathColumns(path: string): {
     fileName: withoutTrailingSlash.slice(separator + 1),
     parentPath: separator < 0 ? "./" : withoutTrailingSlash.slice(0, separator + 1),
   };
+}
+
+function projectPathMatchRank(path: string, query: string): number | null {
+  const normalizedPath = path.toLocaleLowerCase();
+  const fileName = projectPathColumns(normalizedPath).fileName;
+  if (fileName.startsWith(query)) return 0;
+  if (normalizedPath.startsWith(query)) return 1;
+  return fuzzyMatch(normalizedPath, query) ? 2 : null;
 }
 
 function fuzzyMatch(candidate: string, query: string): boolean {
