@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import { z } from "zod";
-import { AgentSession, sessionInitialThinkingPolicy } from "./agent-session.js";
+import { AgentSession } from "./agent-session.js";
 import type { ModelDriver, ModelMessage } from "./agent-session-contracts.js";
 import type { ArtifactReference, ArtifactStore } from "./artifact-store.js";
 import type { ContextProfile } from "./context-profile.js";
@@ -25,6 +25,8 @@ import {
 
 const maximumManagedAgentTaskBytes = 16 * 1024;
 const maximumManagedAgentResultBytes = 16 * 1024;
+const childLiveWorkspaceNotice =
+  "This child reads the live workspace. Parent changes may alter what it observes; isolated transcript does not mean repository snapshot or sandbox.";
 const managedAgentTaskSchema = z.strictObject({
   task: z
     .string()
@@ -113,12 +115,21 @@ export type ManagedAgentRecord =
         readonly maximumDeadlineMilliseconds: 600_000;
       };
       readonly taskDigest: `sha256:${string}`;
+      readonly task: string;
       readonly targetIdentity: ModelTargetIdentity;
       readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
       readonly repository?: {
         readonly revision: number;
         readonly effectiveDigest: `sha256:${string}`;
       };
+    }
+  | {
+      readonly schemaVersion: 1;
+      readonly type: "managed_agent_deadline_expired";
+      readonly sequence: number;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
     }
   | {
       readonly schemaVersion: 1;
@@ -151,8 +162,8 @@ export type ManagedAgentRecord =
       readonly childSessionId: string;
       readonly status: "failed";
       readonly error: { readonly code: string; readonly message: string };
-      readonly transcriptDigest: `sha256:${string}`;
-      readonly throughSequence: number;
+      readonly transcriptDigest?: `sha256:${string}`;
+      readonly throughSequence?: number;
     }
   | {
       readonly schemaVersion: 1;
@@ -221,6 +232,14 @@ export class ManagedAgentStoreError extends Error {
 const managedAgentRecordSchema = z.union([
   z.strictObject({
     schemaVersion: z.literal(1),
+    type: z.literal("managed_agent_deadline_expired"),
+    sequence: z.number().int().positive(),
+    agentId: z.uuid(),
+    attemptId: z.uuid(),
+    childSessionId: z.uuid(),
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(1),
     type: z.literal("managed_agent_admitted"),
     sequence: z.number().int().positive(),
     agentId: z.uuid(),
@@ -238,6 +257,10 @@ const managedAgentRecordSchema = z.union([
       maximumDeadlineMilliseconds: z.literal(600_000),
     }),
     taskDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    task: z
+      .string()
+      .min(1)
+      .refine((task) => Buffer.byteLength(task, "utf8") <= maximumManagedAgentTaskBytes),
     targetIdentity: targetIdentitySchema,
     thinkingPolicy: thinkingPolicySchema.optional(),
     repository: z
@@ -288,8 +311,11 @@ const managedAgentRecordSchema = z.union([
       code: z.string().min(1).max(128),
       message: z.string().min(1).max(4_096),
     }),
-    transcriptDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-    throughSequence: z.number().int().nonnegative(),
+    transcriptDigest: z
+      .string()
+      .regex(/^sha256:[0-9a-f]{64}$/u)
+      .optional(),
+    throughSequence: z.number().int().nonnegative().optional(),
   }),
   z.strictObject({
     schemaVersion: z.literal(1),
@@ -362,6 +388,9 @@ export async function recoverInterruptedManagedAgents(
             createReadToolRegistry({ workspaceRoot: process.cwd() }),
             repository,
           );
+    const logicalRun = childRecords?.find(
+      (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
+    );
     const validIdentity =
       genesis?.schemaVersion === 3 &&
       genesis.record.type === "session_genesis" &&
@@ -376,6 +405,15 @@ export async function recoverInterruptedManagedAgents(
         maximumDeadlineMilliseconds: scoutManagedAgentProfileV1.limits.maximumDeadlineMilliseconds,
       }) &&
       admission.parentRootId === `session:${admission.parentSessionId}` &&
+      logicalRun?.schemaVersion === 3 &&
+      logicalRun.record.type === "logical_run_started" &&
+      logicalRun.record.userMessage === childTaskMessage(admission.task) &&
+      digest(admission.task) === admission.taskDigest &&
+      isDeepStrictEqual(logicalRun.record.thinkingPolicy, admission.thinkingPolicy) &&
+      isDeepStrictEqual(logicalRun.record.limits, {
+        maxTurns: admission.limits.maximumTurns,
+        maxTokens: admission.limits.maximumTokens,
+      }) &&
       (admission.repository === undefined
         ? repository?.sources.length === 0
         : repository?.revision === admission.repository.revision &&
@@ -393,6 +431,36 @@ export async function recoverInterruptedManagedAgents(
           code: "managed_agent_inspection_required",
           message: "The durable child identity does not match its Managed Agent admission.",
         },
+      };
+      await store.append(terminal);
+      records = [...records, terminal];
+      terminalAttempts.add(admission.attemptId);
+      continue;
+    }
+    const deadlineRecord = records.find(
+      (record) =>
+        record.type === "managed_agent_deadline_expired" &&
+        record.attemptId === admission.attemptId,
+    );
+    if (deadlineRecord !== undefined) {
+      const terminal: ManagedAgentRecord = {
+        schemaVersion: 1,
+        type: "managed_agent_terminal",
+        sequence: records.length + 1,
+        agentId: admission.agentId,
+        attemptId: admission.attemptId,
+        childSessionId: admission.childSessionId,
+        status: "failed",
+        error: {
+          code: "managed_agent_deadline_exceeded",
+          message: "The foreground scout exceeded its aggregate deadline.",
+        },
+        ...(childRecords === undefined
+          ? {}
+          : {
+              transcriptDigest: digest(JSON.stringify(childRecords)),
+              throughSequence: childRecords.at(-1)?.sequence ?? 0,
+            }),
       };
       await store.append(terminal);
       records = [...records, terminal];
@@ -567,11 +635,30 @@ export function validateManagedAgentRecord(
   const candidate = parsed.data;
   if (candidate.type === "managed_agent_admitted") {
     if (
+      digest(candidate.task) !== candidate.taskDigest ||
       history.some(
         (record) =>
           record.agentId === candidate.agentId ||
           record.attemptId === candidate.attemptId ||
           record.childSessionId === candidate.childSessionId,
+      )
+    ) {
+      throw new ManagedAgentStoreError("managed_agent_log_invalid");
+    }
+  } else if (candidate.type === "managed_agent_deadline_expired") {
+    const admission = history.find(
+      (record) =>
+        record.type === "managed_agent_admitted" && record.attemptId === candidate.attemptId,
+    );
+    if (
+      admission === undefined ||
+      admission.agentId !== candidate.agentId ||
+      admission.childSessionId !== candidate.childSessionId ||
+      history.some(
+        (record) =>
+          (record.type === "managed_agent_deadline_expired" ||
+            record.type === "managed_agent_terminal") &&
+          record.attemptId === candidate.attemptId,
       )
     ) {
       throw new ManagedAgentStoreError("managed_agent_log_invalid");
@@ -679,6 +766,31 @@ export function createAgentManager(options: {
       const childClaim = await options.parentRoot.claimChild({ childId: agentId });
       const childController = new AbortController();
       let deadlineExpired = false;
+      let deadlineRequested = false;
+      let deadlineOperation: Promise<void> | undefined;
+      let admissionCommitted = false;
+      let terminalCommitStarted = false;
+      let terminalCommitted = false;
+      let releaseChildClaim = true;
+      const commitDeadlineExpiration = (): Promise<void> => {
+        if (terminalCommitStarted) {
+          return Promise.resolve();
+        }
+        if (!admissionCommitted) {
+          deadlineRequested = true;
+          return Promise.resolve();
+        }
+        deadlineOperation ??= appendManagedRecord({
+          type: "managed_agent_deadline_expired",
+          agentId,
+          attemptId,
+          childSessionId,
+        }).then(() => {
+          deadlineExpired = true;
+          childController.abort(new Error("Managed Agent deadline exceeded."));
+        });
+        return deadlineOperation;
+      };
       const abortFromCaller = () => childController.abort(input.signal.reason);
       if (input.signal.aborted) {
         abortFromCaller();
@@ -688,13 +800,11 @@ export function createAgentManager(options: {
       const deadline = (options.deadlineScheduler ?? nodeManagedAgentDeadlineScheduler).schedule(
         scoutManagedAgentProfileV1.limits.maximumDeadlineMilliseconds,
         () => {
-          deadlineExpired = true;
-          childController.abort(new Error("Managed Agent deadline exceeded."));
+          void commitDeadlineExpiration().catch(() => {
+            childController.abort(new Error("Managed Agent deadline persistence failed."));
+          });
         },
       );
-      let admissionCommitted = false;
-      let terminalCommitted = false;
-      let releaseChildClaim = true;
       try {
         await appendManagedRecord({
           type: "managed_agent_admitted",
@@ -714,6 +824,7 @@ export function createAgentManager(options: {
               scoutManagedAgentProfileV1.limits.maximumDeadlineMilliseconds,
           },
           taskDigest,
+          task: input.task,
           targetIdentity: options.targetIdentity,
           ...(options.thinkingPolicy === undefined
             ? {}
@@ -728,6 +839,9 @@ export function createAgentManager(options: {
               }),
         });
         admissionCommitted = true;
+        if (deadlineRequested) {
+          await commitDeadlineExpiration();
+        }
         const childStore = await options.childSessionStores.create(childSessionId);
         const childTools = createReadToolRegistry({ workspaceRoot: options.workspaceRoot });
         const childPromptContext = createPromptContextV1(childTools, options.repository);
@@ -778,14 +892,11 @@ export function createAgentManager(options: {
               ? {}
               : { thinkingPolicy: options.thinkingPolicy }),
           },
-          ...(options.thinkingPolicy === undefined
-            ? {}
-            : { [sessionInitialThinkingPolicy]: options.thinkingPolicy }),
         };
         const child = new AgentSession(childDependencies);
         const result = await child.run(
           {
-            text: `${input.task}\n\nThis child reads the live workspace. Parent changes may alter what it observes; isolated transcript does not mean repository snapshot or sandbox.`,
+            text: childTaskMessage(input.task),
           },
           {
             signal: childController.signal,
@@ -799,27 +910,36 @@ export function createAgentManager(options: {
         const transcriptDigest = digest(JSON.stringify(childRecords));
         const throughSequence = childRecords.at(-1)?.sequence ?? 0;
         const usage = usageFromChildRecords(childRecords);
-        if (result.status === "cancelled") {
-          if (deadlineExpired) {
-            await appendManagedRecord({
-              type: "managed_agent_terminal",
-              agentId,
-              attemptId,
-              childSessionId,
-              status: "failed",
-              error: {
-                code: "managed_agent_deadline_exceeded",
-                message: "The foreground scout exceeded its aggregate deadline.",
-              },
-              transcriptDigest,
-              throughSequence,
-            });
-            terminalCommitted = true;
-            return toolFailure(
-              "managed_agent_deadline_exceeded",
-              "The foreground scout deadline expired.",
-            );
+        const settleExpiredDeadline = async (): Promise<boolean> => {
+          await deadlineOperation;
+          if (!deadlineExpired) {
+            return false;
           }
+          terminalCommitStarted = true;
+          await appendManagedRecord({
+            type: "managed_agent_terminal",
+            agentId,
+            attemptId,
+            childSessionId,
+            status: "failed",
+            error: {
+              code: "managed_agent_deadline_exceeded",
+              message: "The foreground scout exceeded its aggregate deadline.",
+            },
+            transcriptDigest,
+            throughSequence,
+          });
+          terminalCommitted = true;
+          return true;
+        };
+        if (await settleExpiredDeadline()) {
+          return toolFailure(
+            "managed_agent_deadline_exceeded",
+            "The foreground scout deadline expired.",
+          );
+        }
+        if (result.status === "cancelled") {
+          terminalCommitStarted = true;
           await appendManagedRecord({
             type: "managed_agent_terminal",
             agentId,
@@ -841,6 +961,7 @@ export function createAgentManager(options: {
                   code: "model_output_truncated",
                   message: "The foreground scout reached its output limit.",
                 };
+          terminalCommitStarted = true;
           await appendManagedRecord({
             type: "managed_agent_terminal",
             agentId,
@@ -904,6 +1025,7 @@ export function createAgentManager(options: {
                     .then(({ id, mediaType, byteCount }) => ({ id, mediaType, byteCount })),
                 };
         if (terminalResult === undefined) {
+          terminalCommitStarted = true;
           await appendManagedRecord({
             type: "managed_agent_terminal",
             agentId,
@@ -923,6 +1045,13 @@ export function createAgentManager(options: {
             "The foreground scout result exceeds its bound.",
           );
         }
+        if (await settleExpiredDeadline()) {
+          return toolFailure(
+            "managed_agent_deadline_exceeded",
+            "The foreground scout deadline expired.",
+          );
+        }
+        terminalCommitStarted = true;
         await appendManagedRecord({
           type: "managed_agent_terminal",
           agentId,
@@ -943,18 +1072,34 @@ export function createAgentManager(options: {
       } catch (error) {
         if (admissionCommitted && !terminalCommitted) {
           try {
-            await appendManagedRecord({
-              type: "managed_agent_terminal",
-              agentId,
-              attemptId,
-              childSessionId,
-              status: "recovery_required",
-              error: {
-                code: "managed_agent_recovery_required",
-                message:
-                  "The child process ended without a causally proven terminal result. Adam did not replay the interrupted model request.",
-              },
-            });
+            await deadlineOperation;
+            terminalCommitStarted = true;
+            await appendManagedRecord(
+              deadlineExpired
+                ? {
+                    type: "managed_agent_terminal",
+                    agentId,
+                    attemptId,
+                    childSessionId,
+                    status: "failed",
+                    error: {
+                      code: "managed_agent_deadline_exceeded",
+                      message: "The foreground scout exceeded its aggregate deadline.",
+                    },
+                  }
+                : {
+                    type: "managed_agent_terminal",
+                    agentId,
+                    attemptId,
+                    childSessionId,
+                    status: "recovery_required",
+                    error: {
+                      code: "managed_agent_recovery_required",
+                      message:
+                        "The child process ended without a causally proven terminal result. Adam did not replay the interrupted model request.",
+                    },
+                  },
+            );
             terminalCommitted = true;
           } catch {
             releaseChildClaim = false;
@@ -1042,6 +1187,10 @@ function parseJson(value: string): unknown {
 
 function digest(value: string): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function childTaskMessage(task: string): string {
+  return `${task}\n\n${childLiveWorkspaceNotice}`;
 }
 
 function usageFromChildRecords(records: readonly SessionRecord[]): {

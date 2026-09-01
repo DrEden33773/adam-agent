@@ -43,6 +43,7 @@ const managedLimits = {
   maximumTokens: 128_000,
   maximumDeadlineMilliseconds: 600_000,
 } as const;
+const durableTask = "Persist one durable scout result.";
 
 test("ManagedAgentStore preserves one admitted and terminal identity across JSONL reopen", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-store-jsonl-"));
@@ -139,7 +140,8 @@ function managedStoreRecords() {
       profile: "scout.v1" as const,
       profileDigest: scoutManagedAgentProfileV1.digest,
       limits: managedLimits,
-      taskDigest: `sha256:${"b".repeat(64)}` as const,
+      task: durableTask,
+      taskDigest: `sha256:${createHash("sha256").update(durableTask).digest("hex")}` as const,
       targetIdentity,
       thinkingPolicy,
     },

@@ -1,9 +1,6 @@
 /** Tests only. This internal fault-injection surface has no compatibility promise. */
 
-export {
-  sessionInitialThinkingPolicy,
-  sessionToolProfileNames,
-} from "./agent-session.js";
+export { sessionToolProfileNames } from "./agent-session.js";
 export { AiSdkModelDriver as AiSdkModelDriverForTesting } from "./ai-sdk-model-driver.js";
 export {
   createObservedBiomeExecutionAdapter,

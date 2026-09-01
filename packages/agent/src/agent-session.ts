@@ -180,7 +180,6 @@ type AgentSessionBaseDependencies = {
 };
 
 export const sessionToolProfileNames = Symbol("adam-agent.session-tool-profile-names");
-export const sessionInitialThinkingPolicy = Symbol("adam-agent.session-initial-thinking-policy");
 
 export type AgentSessionDependencies = AgentSessionBaseDependencies &
   (
@@ -284,13 +283,7 @@ export class AgentSession {
       throw new RangeError("The model output limit must be a positive safe integer.");
     }
     this.#maximumOutputTokens = maximumOutputTokens;
-    this.#thinkingPolicy =
-      this.#durableContext?.thinkingPolicy ??
-      (
-        dependencies as AgentSessionDependencies & {
-          readonly [sessionInitialThinkingPolicy]?: ThinkingPolicySnapshotV1;
-        }
-      )[sessionInitialThinkingPolicy];
+    this.#thinkingPolicy = this.#durableContext?.thinkingPolicy;
     this.#model = dependencies.model;
     this.#modalityProfile = dependencies.modalityProfile;
     const durablePromptContext = this.#durableContext?.promptContext;

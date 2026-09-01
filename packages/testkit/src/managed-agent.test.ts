@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,7 +6,7 @@ import { join } from "node:path";
 import {
   AgentSession,
   type AgentSessionDependencies,
-  createFileArtifactStore,
+  type ArtifactStore,
   createPermissionPolicy,
   createReadToolRegistry,
   createSessionLifecycle,
@@ -77,6 +78,10 @@ const managedLimits = {
   maximumTokens: 128_000,
   maximumDeadlineMilliseconds: 600_000,
 } as const;
+const childLiveWorkspaceNotice =
+  "This child reads the live workspace. Parent changes may alter what it observes; isolated transcript does not mean repository snapshot or sandbox.";
+const testTaskDigest = (task: string) =>
+  `sha256:${createHash("sha256").update(task).digest("hex")}` as const;
 
 test("AgentSession spawns one permitted foreground scout and receives its durable result", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-scout-"));
@@ -834,6 +839,7 @@ test("AgentManager settles its injected aggregate deadline as durable terminal f
     });
     expect(await managedStore.read()).toMatchObject([
       { type: "managed_agent_admitted" },
+      { type: "managed_agent_deadline_expired" },
       {
         type: "managed_agent_terminal",
         status: "failed",
@@ -847,10 +853,98 @@ test("AgentManager settles its injected aggregate deadline as durable terminal f
   }
 });
 
+test("AgentManager cannot publish completion when deadline expires during artifact durability", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-deadline-artifact-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const largeAnswer = `Deadline artifact\n${"z".repeat(20 * 1024)}`;
+  const childModel: ModelDriver = {
+    async *stream() {
+      yield { type: "text_delta", text: largeAnswer };
+      yield { type: "usage", inputTokens: 50, outputTokens: 6_000 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const artifactWriteStarted = Promise.withResolvers<void>();
+  const allowArtifactWrite = Promise.withResolvers<void>();
+  const artifactStore: ArtifactStore = {
+    async write({ bytes, mediaType, source }) {
+      artifactWriteStarted.resolve();
+      await allowArtifactWrite.promise;
+      const id = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+      return { id, mediaType, byteCount: bytes.byteLength, source };
+    },
+    async read() {
+      return undefined;
+    },
+  };
+  let expire = () => {};
+  const deadlineScheduler: ManagedAgentDeadlineScheduler = {
+    schedule(_delayMilliseconds, onDeadline) {
+      expire = onDeadline;
+      return { cancel() {} };
+    },
+  };
+  const owner: ProjectLifecycleOwner = {
+    async acquire() {
+      return { async release() {} };
+    },
+    async run(operation) {
+      return operation();
+    },
+  };
+  const domain = createProjectExecutionDomain({ lifecycleOwner: owner });
+  const parentRoot = await domain.claimRoot({ rootId: "parent-session" });
+  const managedStore = createInMemoryManagedAgentStore();
+  const manager = createAgentManager({
+    artifactStore,
+    childContextProfile: contextProfile,
+    childModel,
+    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    deadlineScheduler,
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+  });
+
+  try {
+    const spawning = manager.spawnForeground({
+      callId: "deadline-artifact-spawn",
+      parentSessionId: "123e4567-e89b-42d3-a456-426614174181",
+      signal: new AbortController().signal,
+      task: "Return a large result before the deadline.",
+    });
+    await artifactWriteStarted.promise;
+    expire();
+    allowArtifactWrite.resolve();
+
+    await expect(spawning).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "managed_agent_deadline_exceeded" },
+    });
+    expect(await managedStore.read()).toMatchObject([
+      { type: "managed_agent_admitted" },
+      { type: "managed_agent_deadline_expired" },
+      {
+        type: "managed_agent_terminal",
+        status: "failed",
+        error: { code: "managed_agent_deadline_exceeded" },
+      },
+    ]);
+  } finally {
+    allowArtifactWrite.resolve();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("AgentManager publishes an oversized completed result through one immutable artifact", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-result-artifact-"));
   const workspaceRoot = join(testRoot, "workspace");
-  const artifactRoot = join(testRoot, "artifacts");
   await mkdir(workspaceRoot);
   const largeAnswer = `Managed result\n${"x".repeat(70 * 1024)}`;
   const childModel: ModelDriver = {
@@ -871,7 +965,18 @@ test("AgentManager publishes an oversized completed result through one immutable
   const domain = createProjectExecutionDomain({ lifecycleOwner: owner });
   const parentRoot = await domain.claimRoot({ rootId: "parent-session" });
   const managedStore = createInMemoryManagedAgentStore();
-  const artifactStore = await createFileArtifactStore({ root: artifactRoot });
+  const storedArtifacts = new Map<string, Uint8Array>();
+  const artifactStore: ArtifactStore = {
+    async write({ bytes, mediaType, source }) {
+      const stored = Uint8Array.from(bytes);
+      const id = `sha256:${createHash("sha256").update(stored).digest("hex")}`;
+      storedArtifacts.set(id, stored);
+      return { id, mediaType, byteCount: stored.byteLength, source };
+    },
+    async read(id) {
+      return storedArtifacts.get(id);
+    },
+  };
   const manager = createAgentManager({
     artifactStore,
     childContextProfile: contextProfile,
@@ -945,7 +1050,8 @@ test("ManagedAgentStore folds an admitted restart window without child provider 
     profile: "scout.v1",
     profileDigest: scoutManagedAgentProfileV1.digest,
     limits: managedLimits,
-    taskDigest: `sha256:${"e".repeat(64)}`,
+    task: "Interrupted admitted task.",
+    taskDigest: testTaskDigest("Interrupted admitted task."),
     targetIdentity,
   });
   await recoverInterruptedManagedAgents(managedStore);
@@ -976,7 +1082,8 @@ test("ManagedAgentStore rejects a terminal link with a different child identity"
     profile: "scout.v1" as const,
     profileDigest: scoutManagedAgentProfileV1.digest,
     limits: managedLimits,
-    taskDigest: `sha256:${"1".repeat(64)}` as const,
+    task: "Reject a mismatched terminal.",
+    taskDigest: testTaskDigest("Reject a mismatched terminal."),
     targetIdentity,
   };
   await managedStore.append(admission);
@@ -1004,6 +1111,7 @@ test("ManagedAgentStore links a complete child transcript after a terminal-link 
   const managedStore = createInMemoryManagedAgentStore();
   const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
   const childSessionId = "123e4567-e89b-42d3-a456-426614174123";
+  const recoveredTask = "Complete before the manager link.";
   const childStore = await childSessionStores.create(childSessionId);
   const childTools = createReadToolRegistry({ workspaceRoot: process.cwd() });
   const childPromptContext = createPromptContextV1(childTools);
@@ -1051,7 +1159,7 @@ test("ManagedAgentStore links a complete child transcript after a terminal-link 
   };
   const child = new AgentSession(childDependencies);
   await child.run(
-    { text: "Complete before the manager link." },
+    { text: `${recoveredTask}\n\n${childLiveWorkspaceNotice}` },
     { limits: { maxTurns: 8, maxTokens: 128_000 } },
   );
   const childRecordsBeforeCompaction = await childStore.read();
@@ -1085,7 +1193,8 @@ test("ManagedAgentStore links a complete child transcript after a terminal-link 
     profile: "scout.v1",
     profileDigest: scoutManagedAgentProfileV1.digest,
     limits: managedLimits,
-    taskDigest: `sha256:${"f".repeat(64)}`,
+    task: recoveredTask,
+    taskDigest: testTaskDigest(recoveredTask),
     targetIdentity,
   });
 
@@ -1140,7 +1249,8 @@ test("ManagedAgentStore requires inspection for a child genesis with a different
     profile: "scout.v1",
     profileDigest: scoutManagedAgentProfileV1.digest,
     limits: managedLimits,
-    taskDigest: `sha256:${"8".repeat(64)}`,
+    task: "Inspect a mismatched child identity.",
+    taskDigest: testTaskDigest("Inspect a mismatched child identity."),
     targetIdentity,
   });
 
