@@ -86,6 +86,7 @@ test("the packed extension API imports with only its public runtime shape", asyn
       "EXTENSION_BIOME_MAX_STDOUT_BYTES",
       "EXTENSION_BIOME_PROFILE",
       "EXTENSION_ID_MAX_LENGTH",
+      "EXTENSION_MANAGED_SESSION_CAPABILITY_ID",
       "EXTENSION_OPERATION_DEADLINE_DEFAULT_MS",
       "EXTENSION_OPERATION_DEADLINE_MAX_MS",
       "EXTENSION_OPERATION_INPUT_MAX_BYTES",
@@ -113,7 +114,7 @@ test("the packed extension API imports with only its public runtime shape", asyn
       "extensionProjectChangeSnapshotCodec",
       "parseExtensionPackageManifest",
     ]);
-    expect(Reflect.get(imported, "EXTENSION_API_VERSION")).toBe("0.3.0");
+    expect(Reflect.get(imported, "EXTENSION_API_VERSION")).toBe("0.4.0");
     const manifest = JSON.parse(await readFile(join(installedPackage, "package.json"), "utf8"));
     expect(manifest).toMatchObject({
       engines: { node: ">=24.0.0 <25" },
@@ -124,7 +125,7 @@ test("the packed extension API imports with only its public runtime shape", asyn
         type: "git",
         url: "git+https://github.com/DrEden33773/adam-agent.git",
       },
-      version: "0.3.0",
+      version: "0.4.0",
     });
     expect(manifest.publishConfig).toEqual({ access: "public", provenance: true });
   } finally {

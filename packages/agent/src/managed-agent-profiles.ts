@@ -65,3 +65,31 @@ export const researchManagedAgentProfileV1 = {
 };
 
 export type ResearchManagedAgentProfileV1 = typeof researchManagedAgentProfileV1;
+
+const reviewerManagedAgentProfileDefinitionV1 = {
+  id: "reviewer.v1",
+  version: 1,
+  toolNames: [],
+  allowedEffects: [],
+  limits: {
+    maximumTurnsPerAttempt: 8,
+    maximumCumulativeTokens: 128_000,
+    maximumDeadlineMilliseconds: 300_000 as const,
+  },
+  capabilities: {
+    background: false,
+    selectedSkills: false,
+    ambientExtensions: false,
+    parentCoordination: false,
+    nestedAgents: false,
+  },
+} as const;
+
+export const reviewerManagedAgentProfileV1 = {
+  ...reviewerManagedAgentProfileDefinitionV1,
+  digest: `sha256:${createHash("sha256")
+    .update(JSON.stringify(reviewerManagedAgentProfileDefinitionV1))
+    .digest("hex")}` as const,
+};
+
+export type ReviewerManagedAgentProfileV1 = typeof reviewerManagedAgentProfileV1;

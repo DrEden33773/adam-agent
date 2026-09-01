@@ -1314,7 +1314,7 @@ export async function activate() {}
         diagnostics: [
           {
             code: "extension_api_incompatible",
-            hostVersion: "0.3.0",
+            hostVersion: "0.4.0",
             requestedVersion: "^0.2.0",
           },
         ],
@@ -2649,7 +2649,7 @@ export async function activate(context) {
     },
     configuration: { profile: "fixture" },
     compatibility: {
-      api: { hostVersion: "0.3.0", requestedVersion: "^0.3.0" },
+      api: { hostVersion: "0.4.0", requestedVersion: "^0.3.0" },
       capabilities: {
         optional: [
           {

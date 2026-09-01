@@ -1,7 +1,8 @@
 import { valid, validRange } from "semver";
 import { z } from "zod";
 
-export const EXTENSION_API_VERSION = "0.3.0";
+export const EXTENSION_API_VERSION = "0.4.0";
+export const EXTENSION_MANAGED_SESSION_CAPABILITY_ID = "adam.managed-session@1";
 export const EXTENSION_BIOME_CAPABILITY_ID = "adam.analyzer-execution.biome@1";
 export const EXTENSION_BIOME_MAX_FILES = 100;
 export const EXTENSION_BIOME_MAX_FILE_BYTES = 1024 * 1024;
@@ -219,6 +220,7 @@ const operationContributionSchema = z.strictObject({
   input: contractReferenceSchema,
   output: contractReferenceSchema,
   progress: contractReferenceSchema,
+  managedOutput: contractReferenceSchema.optional(),
   command: commandDescriptorSchema.optional(),
   inputSource: projectChangesInputSourceSchema.optional(),
   report: contractReferenceSchema.optional(),
@@ -356,6 +358,7 @@ export type ExtensionOperationRegistration = {
   readonly input: ExtensionContractCodec;
   readonly output: ExtensionContractCodec;
   readonly progress: ExtensionContractCodec;
+  readonly managedOutput?: ExtensionContractCodec;
   execute(input: unknown, context: ExtensionOperationContext): Promise<unknown> | unknown;
   reconcile?(
     input: unknown,
@@ -451,10 +454,63 @@ export interface ExtensionBiomeCapability {
   }): Promise<ExtensionBiomeAnalysis>;
 }
 
+export interface ExtensionManagedSessionCapability {
+  run(input: ExtensionManagedSessionRequest): Promise<ExtensionManagedSessionTerminal>;
+}
+
+export type ExtensionManagedSessionRequest = {
+  readonly evidence: readonly ExtensionOperationEvidenceReference[];
+  readonly limits: {
+    readonly deadlineMilliseconds: number;
+    readonly maximumCumulativeTokens: number;
+    readonly maximumTurns: number;
+  };
+  readonly managedRole: string;
+  readonly output: ExtensionContractReference;
+  readonly profile: { readonly id: "reviewer.v1"; readonly version: 1 };
+  readonly selectedSkills: readonly [];
+  readonly task: string;
+};
+
+export type ExtensionManagedSessionTerminal = {
+  readonly agentId: string;
+  readonly attemptId: string;
+  readonly cost: { readonly status: "unavailable" };
+  readonly profile: {
+    readonly digest: `sha256:${string}`;
+    readonly id: "reviewer.v1";
+    readonly selectedSkillsDigest: `sha256:${string}`;
+    readonly version: 1;
+  };
+  readonly result: unknown;
+  readonly status: "completed";
+  readonly target: {
+    readonly certification: "certified" | "experimental";
+    readonly modelId: string;
+    readonly profileVersion: number;
+    readonly route: "direct" | "vercel-ai-gateway";
+    readonly targetId: string;
+    readonly upstreamProviderId?: string;
+    readonly vendor: string;
+  };
+  readonly transcript: {
+    readonly digest: `sha256:${string}`;
+    readonly sessionId: string;
+    readonly throughSequence: number;
+  };
+  readonly usage: {
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly reasoningTokens: number;
+    readonly turns: number;
+  };
+};
+
 export type ExtensionOperationCapabilities = {
   readonly [EXTENSION_BIOME_CAPABILITY_ID]?: ExtensionBiomeCapability;
   readonly [EXTENSION_ARTIFACT_CAPABILITY_ID]?: ExtensionArtifactPublishCapability;
   readonly [EXTENSION_RECORDS_CAPABILITY_ID]?: ExtensionRecordCapability;
+  readonly [EXTENSION_MANAGED_SESSION_CAPABILITY_ID]?: ExtensionManagedSessionCapability;
 };
 
 export type ExtensionOperationContext = {
