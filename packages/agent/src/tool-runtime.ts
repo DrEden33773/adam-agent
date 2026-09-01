@@ -348,7 +348,9 @@ export type PermissionSubject =
   | {
       readonly type: "managed_agent_spawn";
       readonly parentRootId: string;
+      readonly parentSessionId: string;
       readonly profile: "scout.v1";
+      readonly profileDigest: `sha256:${string}`;
       readonly targetIdentity: {
         readonly targetId: string;
         readonly vendor: string;
@@ -359,6 +361,11 @@ export type PermissionSubject =
         readonly certification: "certified" | "experimental";
       };
       readonly taskDigest: `sha256:${string}`;
+      readonly limits: {
+        readonly maximumTurns: 8;
+        readonly maximumTokens: 128000;
+        readonly maximumDeadlineMilliseconds: 600000;
+      };
       readonly thinkingPolicy?: {
         readonly schemaVersion: 1;
         readonly requestedLevelId: string;

@@ -41,11 +41,11 @@ import {
 import {
   type AgentManager,
   createAgentManager,
-  createJsonlManagedAgentStore,
   createManagedAgentToolRegistry,
   type ManagedAgentStore,
   recoverInterruptedManagedAgents,
 } from "./managed-agent.js";
+import { createJsonlManagedAgentStore } from "./managed-agent-store.js";
 import {
   createMcpRuntimeHost,
   inspectMcpConfiguration,
@@ -973,6 +973,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     }
     const managerRouter: AgentManager = {
       parentRootId: `session:${sessionId}`,
+      parentSessionId: sessionId,
       targetIdentity,
       ...(thinkingPolicy === undefined ? {} : { thinkingPolicy }),
       async spawnForeground(input) {
@@ -2708,7 +2709,13 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       await waitForMcpIdleOperation(input.sessionId);
       const continued = await withOwner(async (parentRoot) => {
         if (options.managedAgentTools === "managed-agent-tools.a1.v1") {
-          await recoverInterruptedManagedAgents(managedAgentStore, managedChildSessionStores);
+          await recoverInterruptedManagedAgents(
+            managedAgentStore,
+            managedChildSessionStores,
+            createLazyArtifactStore(
+              join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
+            ),
+          );
         }
         const workspaceTrusted = (await inspectWorkspaceTrust()).status === "trusted";
         const artifactCache = createArtifactMaterializationCache();
@@ -3421,6 +3428,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           managedStore: managedAgentStore,
           parentPermissions: options.permissions ?? createPermissionPolicy({ allowedEffects: [] }),
           parentRoot,
+          parentSessionId: input.sessionId,
           projectId: resumed.snapshot.projectId as `sha256:${string}`,
           ...(activePromptContext === undefined
             ? {}

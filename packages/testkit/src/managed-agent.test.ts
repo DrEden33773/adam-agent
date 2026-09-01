@@ -7,6 +7,7 @@ import {
   type AgentSessionDependencies,
   createFileArtifactStore,
   createPermissionPolicy,
+  createReadToolRegistry,
   createSessionLifecycle,
   type ModelDriver,
   type ModelRequest,
@@ -19,6 +20,7 @@ import {
   createInMemorySessionStoreDirectory,
   createManagedAgentToolRegistry,
   createProjectExecutionDomain,
+  createPromptContextV1,
   createTrustedWorkspaceTrustForTesting,
   type ManagedAgentDeadlineScheduler,
   ManagedAgentStoreError,
@@ -26,6 +28,9 @@ import {
   recoverInterruptedManagedAgents,
   type SessionRecord,
   type SessionStore,
+  type SessionStoreDirectory,
+  scoutManagedAgentProfileV1,
+  sessionDurableContext,
   sessionToolProfileNames,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
@@ -67,6 +72,11 @@ const thinkingPolicy = {
 } as const;
 
 const projectId = `sha256:${"d".repeat(64)}` as const;
+const managedLimits = {
+  maximumTurns: 8,
+  maximumTokens: 128_000,
+  maximumDeadlineMilliseconds: 600_000,
+} as const;
 
 test("AgentSession spawns one permitted foreground scout and receives its durable result", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-scout-"));
@@ -177,7 +187,11 @@ test("AgentSession spawns one permitted foreground scout and receives its durabl
     expect(permissionSubjects).toEqual([
       expect.objectContaining({
         type: "managed_agent_spawn",
+        parentRootId: "parent-session",
+        parentSessionId: "00000000-0000-4000-8000-000000000001",
         profile: "scout.v1",
+        profileDigest: scoutManagedAgentProfileV1.digest,
+        limits: managedLimits,
         targetIdentity,
         thinkingPolicy,
       }),
@@ -420,6 +434,78 @@ test("AgentManager records missing child token usage as durable terminal failure
   }
 });
 
+test("AgentManager records recovery-required before releasing a post-admission failure", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-post-admission-failure-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let ownerReleases = 0;
+  const owner: ProjectLifecycleOwner = {
+    async acquire() {
+      return {
+        async release() {
+          ownerReleases += 1;
+        },
+      };
+    },
+    async run(operation) {
+      return operation();
+    },
+  };
+  const unavailableChildStores: SessionStoreDirectory<SessionRecord> = {
+    async create() {
+      throw new Error("injected child genesis failure");
+    },
+    async listSessionEntries() {
+      return [];
+    },
+    async listSessionIds() {
+      return [];
+    },
+    async open() {
+      return undefined;
+    },
+  };
+  const domain = createProjectExecutionDomain({ lifecycleOwner: owner });
+  const parentRoot = await domain.claimRoot({ rootId: "parent-session" });
+  const managedStore = createInMemoryManagedAgentStore();
+  const manager = createAgentManager({
+    childContextProfile: contextProfile,
+    childModel: { async *stream() {} },
+    childSessionStores: unavailableChildStores,
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+  });
+
+  try {
+    await expect(
+      manager.spawnForeground({
+        callId: "post-admission-failure-spawn",
+        parentSessionId: "123e4567-e89b-42d3-a456-426614174161",
+        signal: new AbortController().signal,
+        task: "Fail after durable admission.",
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "managed_agent_unavailable" },
+    });
+    expect(await managedStore.read()).toMatchObject([
+      { type: "managed_agent_admitted" },
+      { type: "managed_agent_terminal", status: "recovery_required" },
+    ]);
+    expect(ownerReleases).toBe(0);
+    await parentRoot.release();
+    expect(ownerReleases).toBe(1);
+  } finally {
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle exposes foreground scout through the exact new-session Tool Profile", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-lifecycle-"));
   const stateRoot = join(testRoot, "state");
@@ -511,8 +597,10 @@ test("SessionLifecycle exposes foreground scout through the exact new-session To
     workspaceRoot,
     workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
   });
+  const lifecyclePermissionSubjects: unknown[] = [];
   lifecycle.subscribe((event) => {
     if (event.type === "tool_permission_requested") {
+      lifecyclePermissionSubjects.push(event.subject);
       lifecycle.decidePermission({ requestId: event.requestId, decision: "allow" });
     }
   });
@@ -541,6 +629,15 @@ test("SessionLifecycle exposes foreground scout through the exact new-session To
         },
       },
     });
+    expect(lifecyclePermissionSubjects).toEqual([
+      expect.objectContaining({
+        type: "managed_agent_spawn",
+        parentRootId: `session:${created.sessionId}`,
+        parentSessionId: created.sessionId,
+        profileDigest: scoutManagedAgentProfileV1.digest,
+        limits: managedLimits,
+      }),
+    ]);
     expect(parentFirstTools).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -843,9 +940,11 @@ test("ManagedAgentStore folds an admitted restart window without child provider 
     childSessionId: "123e4567-e89b-42d3-a456-426614174113",
     parentSessionId: "123e4567-e89b-42d3-a456-426614174114",
     parentToolCallId: "restart-window-spawn",
-    parentRootId: "parent-session",
+    parentRootId: "session:123e4567-e89b-42d3-a456-426614174114",
     projectId,
     profile: "scout.v1",
+    profileDigest: scoutManagedAgentProfileV1.digest,
+    limits: managedLimits,
     taskDigest: `sha256:${"e".repeat(64)}`,
     targetIdentity,
   });
@@ -872,9 +971,11 @@ test("ManagedAgentStore rejects a terminal link with a different child identity"
     childSessionId: "123e4567-e89b-42d3-a456-426614174153",
     parentSessionId: "123e4567-e89b-42d3-a456-426614174154",
     parentToolCallId: "mismatched-terminal-spawn",
-    parentRootId: "parent-session",
+    parentRootId: "session:123e4567-e89b-42d3-a456-426614174124",
     projectId,
     profile: "scout.v1" as const,
+    profileDigest: scoutManagedAgentProfileV1.digest,
+    limits: managedLimits,
     taskDigest: `sha256:${"1".repeat(64)}` as const,
     targetIdentity,
   };
@@ -904,8 +1005,31 @@ test("ManagedAgentStore links a complete child transcript after a terminal-link 
   const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
   const childSessionId = "123e4567-e89b-42d3-a456-426614174123";
   const childStore = await childSessionStores.create(childSessionId);
+  const childTools = createReadToolRegistry({ workspaceRoot: process.cwd() });
+  const childPromptContext = createPromptContextV1(childTools);
+  await childStore.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      recordVersion: 2,
+      sessionId: childSessionId,
+      projectId,
+      targetIdentity,
+      contextProfile,
+      promptContext: childPromptContext,
+    },
+  });
   let providerCalls = 0;
-  const child = new AgentSession({
+  const childDependencies: AgentSessionDependencies & {
+    readonly [sessionDurableContext]: {
+      readonly nextSequence: number;
+      readonly projectId: string;
+      readonly promptContext: typeof childPromptContext;
+      readonly sessionId: string;
+      readonly targetIdentity: typeof targetIdentity;
+    };
+  } = {
     contextProfile,
     model: {
       async *stream() {
@@ -916,11 +1040,37 @@ test("ManagedAgentStore links a complete child transcript after a terminal-link 
       },
     },
     store: childStore as SessionStore,
-  });
+    tools: childTools,
+    [sessionDurableContext]: {
+      nextSequence: 2,
+      projectId,
+      promptContext: childPromptContext,
+      sessionId: childSessionId,
+      targetIdentity,
+    },
+  };
+  const child = new AgentSession(childDependencies);
   await child.run(
     { text: "Complete before the manager link." },
     { limits: { maxTurns: 8, maxTokens: 128_000 } },
   );
+  const childRecordsBeforeCompaction = await childStore.read();
+  await childStore.append({
+    schemaVersion: 3,
+    sequence: childRecordsBeforeCompaction.length + 1,
+    record: {
+      type: "context_compaction_interrupted",
+      recordVersion: 1,
+      runId: "123e4567-e89b-42d3-a456-426614174125",
+      attemptId: "123e4567-e89b-42d3-a456-426614174126",
+      attemptNumber: 1,
+      windowNumber: 1,
+      trigger: "automatic_threshold",
+      sourceThrough: 1,
+      reason: "caller_cancelled",
+      usage: { inputTokens: 11, outputTokens: 3, reasoningTokens: 2 },
+    },
+  });
   await managedStore.append({
     schemaVersion: 1,
     type: "managed_agent_admitted",
@@ -930,9 +1080,11 @@ test("ManagedAgentStore links a complete child transcript after a terminal-link 
     childSessionId,
     parentSessionId: "123e4567-e89b-42d3-a456-426614174124",
     parentToolCallId: "terminal-link-window-spawn",
-    parentRootId: "parent-session",
+    parentRootId: "session:123e4567-e89b-42d3-a456-426614174124",
     projectId,
     profile: "scout.v1",
+    profileDigest: scoutManagedAgentProfileV1.digest,
+    limits: managedLimits,
     taskDigest: `sha256:${"f".repeat(64)}`,
     targetIdentity,
   });
@@ -948,6 +1100,58 @@ test("ManagedAgentStore links a complete child transcript after a terminal-link 
       result: { text: "Recovered completed scout result." },
       transcriptDigest: expect.stringMatching(/^sha256:/u),
       throughSequence: expect.any(Number),
+      usage: { inputTokens: 41, outputTokens: 11, reasoningTokens: 2 },
+      cost: { status: "unavailable" },
+    },
+  ]);
+});
+
+test("ManagedAgentStore requires inspection for a child genesis with a different project identity", async () => {
+  const managedStore = createInMemoryManagedAgentStore();
+  const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  const childSessionId = "123e4567-e89b-42d3-a456-426614174173";
+  const childStore = await childSessionStores.create(childSessionId);
+  const childTools = createReadToolRegistry({ workspaceRoot: process.cwd() });
+  await childStore.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      recordVersion: 2,
+      sessionId: childSessionId,
+      projectId,
+      targetIdentity,
+      contextProfile,
+      promptContext: createPromptContextV1(childTools),
+    },
+  });
+  const parentSessionId = "123e4567-e89b-42d3-a456-426614174174";
+  await managedStore.append({
+    schemaVersion: 1,
+    type: "managed_agent_admitted",
+    sequence: 1,
+    agentId: "123e4567-e89b-42d3-a456-426614174171",
+    attemptId: "123e4567-e89b-42d3-a456-426614174172",
+    childSessionId,
+    parentSessionId,
+    parentToolCallId: "identity-mismatch-spawn",
+    parentRootId: `session:${parentSessionId}`,
+    projectId: `sha256:${"9".repeat(64)}`,
+    profile: "scout.v1",
+    profileDigest: scoutManagedAgentProfileV1.digest,
+    limits: managedLimits,
+    taskDigest: `sha256:${"8".repeat(64)}`,
+    targetIdentity,
+  });
+
+  await recoverInterruptedManagedAgents(managedStore, childSessionStores);
+
+  expect(await managedStore.read()).toMatchObject([
+    { type: "managed_agent_admitted" },
+    {
+      type: "managed_agent_terminal",
+      status: "inspection_required",
+      error: { code: "managed_agent_inspection_required" },
     },
   ]);
 });

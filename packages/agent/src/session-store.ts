@@ -1401,7 +1401,9 @@ const skillPermissionSubjectSchema = z.strictObject({
 const managedAgentSpawnPermissionSubjectSchema = z.strictObject({
   type: z.literal("managed_agent_spawn"),
   parentRootId: z.string().min(1).max(256),
+  parentSessionId: z.uuid(),
   profile: z.literal("scout.v1"),
+  profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   targetIdentity: z.strictObject({
     targetId: z.string().min(1).max(256),
     vendor: z.string().min(1).max(128),
@@ -1412,6 +1414,11 @@ const managedAgentSpawnPermissionSubjectSchema = z.strictObject({
     certification: z.enum(["certified", "experimental"]),
   }),
   taskDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  limits: z.strictObject({
+    maximumTurns: z.literal(8),
+    maximumTokens: z.literal(128_000),
+    maximumDeadlineMilliseconds: z.literal(600_000),
+  }),
   thinkingPolicy: z
     .strictObject({
       schemaVersion: z.literal(1),

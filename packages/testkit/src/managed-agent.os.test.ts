@@ -7,6 +7,7 @@ import {
   createInMemoryManagedAgentStore,
   createJsonlManagedAgentStore,
   ManagedAgentStoreError,
+  scoutManagedAgentProfileV1,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
@@ -37,6 +38,11 @@ const thinkingPolicy = {
 } as const;
 
 const projectId = `sha256:${"d".repeat(64)}` as const;
+const managedLimits = {
+  maximumTurns: 8,
+  maximumTokens: 128_000,
+  maximumDeadlineMilliseconds: 600_000,
+} as const;
 
 test("ManagedAgentStore preserves one admitted and terminal identity across JSONL reopen", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-store-jsonl-"));
@@ -70,9 +76,7 @@ test("ManagedAgentStore rejects a torn JSONL tail without truncation or replay",
   try {
     const store = await createJsonlManagedAgentStore({ stateRoot, workspaceRoot });
     await store.append(managedStoreRecords()[0] as ReturnType<typeof managedStoreRecords>[number]);
-    const canonicalRoot = await realpath(workspaceRoot);
-    const projectKey = createHash("sha256").update(canonicalRoot).digest("hex");
-    const logPath = join(stateRoot, "projects", projectKey, "managed-agents", "events-v1.jsonl");
+    const logPath = await managedAgentLogPath(stateRoot, workspaceRoot);
     const before = `${JSON.stringify(managedStoreRecords()[0])}\n`;
     await writeFile(logPath, `${before}{"torn":true}`, "utf8");
 
@@ -83,6 +87,41 @@ test("ManagedAgentStore rejects a torn JSONL tail without truncation or replay",
     await rm(testRoot, { recursive: true, force: true });
   }
 });
+
+test.each([
+  {
+    caseName: "empty target identity",
+    mutation: { targetIdentity: { ...targetIdentity, targetId: "" } },
+  },
+  { caseName: "malformed digest", mutation: { taskDigest: "sha256:not-a-digest" } },
+])("ManagedAgentStore rejects restored authority with $caseName", async ({ mutation }) => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-store-authority-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    await createJsonlManagedAgentStore({ stateRoot, workspaceRoot });
+    const malformed = { ...managedStoreRecords()[0], ...mutation };
+    await writeFile(
+      await managedAgentLogPath(stateRoot, workspaceRoot),
+      `${JSON.stringify(malformed)}\n`,
+      "utf8",
+    );
+
+    await expect(createJsonlManagedAgentStore({ stateRoot, workspaceRoot })).rejects.toEqual(
+      new ManagedAgentStoreError("managed_agent_log_invalid"),
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+async function managedAgentLogPath(stateRoot: string, workspaceRoot: string): Promise<string> {
+  const canonicalRoot = await realpath(workspaceRoot);
+  const projectKey = createHash("sha256").update(canonicalRoot).digest("hex");
+  return join(stateRoot, "projects", projectKey, "managed-agents", "events-v1.jsonl");
+}
 
 function managedStoreRecords() {
   return [
@@ -98,6 +137,8 @@ function managedStoreRecords() {
       parentRootId: "parent-session",
       projectId,
       profile: "scout.v1" as const,
+      profileDigest: scoutManagedAgentProfileV1.digest,
+      limits: managedLimits,
       taskDigest: `sha256:${"b".repeat(64)}` as const,
       targetIdentity,
       thinkingPolicy,

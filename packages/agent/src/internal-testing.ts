@@ -1,7 +1,6 @@
 /** Tests only. This internal fault-injection surface has no compatibility promise. */
 
 export {
-  sessionInitialMessages,
   sessionInitialThinkingPolicy,
   sessionToolProfileNames,
 } from "./agent-session.js";
@@ -16,8 +15,6 @@ export { digestContextRecordPrefix } from "./durable-context.js";
 export { createInputResourceUserMessageV1 } from "./input-resources.js";
 export {
   createAgentManager,
-  createInMemoryManagedAgentStore,
-  createJsonlManagedAgentStore,
   createManagedAgentToolRegistry,
   type ManagedAgentDeadlineScheduler,
   type ManagedAgentRecord,
@@ -25,6 +22,11 @@ export {
   ManagedAgentStoreError,
   recoverInterruptedManagedAgents,
 } from "./managed-agent.js";
+export { scoutManagedAgentProfileV1 } from "./managed-agent-profiles.js";
+export {
+  createInMemoryManagedAgentStore,
+  createJsonlManagedAgentStore,
+} from "./managed-agent-store.js";
 export type {
   McpBeforeToolDispatchBarrier,
   McpBootstrapScheduler,
