@@ -12,6 +12,7 @@ export const fixtureScenarios = [
   "history",
   "input-resource-copying",
   "mcp-close-unconfirmed",
+  "managed-attention",
   "mutation",
   "mutation-long-preview",
   "mutation-after-release",

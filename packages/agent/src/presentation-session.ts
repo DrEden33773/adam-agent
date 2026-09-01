@@ -1,10 +1,11 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import type {
   AuthoritativePresentationSnapshot,
   CommandReceipt,
   McpDisplay,
+  PendingInteraction,
   PresentationCommand,
   PresentationDisplayState,
   PresentationSession,
@@ -174,10 +175,26 @@ export async function createPresentationSession(
       : createWebSearchConfigurationController({ environment: options.webSearchEnvironment });
   const webHttp = options.webHttp ?? createSafeWebHttpAdapter();
   const changePreviewCache = new Map<string, ToolPreviewDisplay | null>();
+  const managedPermissionInteractions = new Map<string, PendingInteraction>();
+  const withManagedPermissionInteractions = (
+    interactions: readonly PendingInteraction[],
+  ): readonly PendingInteraction[] => [
+    ...interactions.filter(
+      (interaction) => !managedPermissionInteractions.has(interaction.requestId),
+    ),
+    ...managedPermissionInteractions.values(),
+  ];
   const bufferedEvents: SessionRuntimeNotification[] = [];
+  const bufferedManagedAgentEvents: {
+    readonly parentSessionId: string;
+    readonly event: RuntimeEvent;
+  }[] = [];
   const bufferedMetadata: SessionMetadataEvent[] = [];
   let handleRuntime: ((notification: SessionRuntimeNotification) => void) | undefined;
   let handleMetadata: ((event: SessionMetadataEvent) => Promise<void>) | undefined;
+  let handleManagedAgentEvent:
+    | ((input: { readonly parentSessionId: string; readonly event: RuntimeEvent }) => void)
+    | undefined;
   const unsubscribeLifecycle = options.lifecycle.subscribeSessionEvents((notification) => {
     if (handleRuntime === undefined) {
       bufferedEvents.push(notification);
@@ -192,6 +209,14 @@ export async function createPresentationSession(
     }
     return handleMetadata(event);
   });
+  const unsubscribeManagedAgentEvents =
+    options.lifecycle.subscribeManagedAgentEvents?.((input) => {
+      if (handleManagedAgentEvent === undefined) {
+        bufferedManagedAgentEvents.push(input);
+        return;
+      }
+      handleManagedAgentEvent(input);
+    }) ?? (() => {});
 
   try {
     let created: CurrentSessionSnapshot | undefined;
@@ -432,7 +457,7 @@ export async function createPresentationSession(
         : null;
     const initialManagedAgents =
       created === undefined
-        ? { counts: { active: 0, completed: 0, attention: 0 as const }, agents: [] }
+        ? { counts: { active: 0, completed: 0, attention: 0 }, agents: [] }
         : await options.lifecycle.inspectManagedAgents({ sessionId: created.sessionId });
     const authoritative: AuthoritativePresentationSnapshot = {
       schemaVersion: 1,
@@ -540,7 +565,9 @@ export async function createPresentationSession(
               linkedOperations: projectedOperations.map(({ display }) => display),
               linkedOperationsTruncated: initialOperationProjection.truncated,
               context: projectSessionContext(created, initialContextUsage, modelTargetSnapshot),
-              pendingInteractions: await projectPendingInteractions(records, options),
+              pendingInteractions: withManagedPermissionInteractions(
+                await projectPendingInteractions(records, options),
+              ),
               repositoryInstructions: projectRepositoryInstructions(created),
               skills: projectSkills(created),
               projectPaths,
@@ -1291,7 +1318,7 @@ export async function createPresentationSession(
             linkedOperations: activatedOperations.map((operation) => operation.display),
             linkedOperationsTruncated: activatedOperationProjection.truncated,
             context: projectSessionContext(snapshot, activatedContextUsage, modelTargetSnapshot),
-            pendingInteractions: activatedPendingInteractions,
+            pendingInteractions: withManagedPermissionInteractions(activatedPendingInteractions),
             repositoryInstructions: projectRepositoryInstructions(snapshot),
             skills: activatedSkills,
             projectPaths,
@@ -1407,6 +1434,72 @@ export async function createPresentationSession(
     let metadataRefresh = Promise.resolve();
     const seenRuntimeNotificationIds = new Set<string>();
     const runtimeNotificationOrder: string[] = [];
+    handleManagedAgentEvent = ({ parentSessionId, event }) => {
+      const active = state.authoritative.active;
+      if (closed || active === null || active.session.id !== parentSessionId) {
+        return;
+      }
+      if (
+        event.type === "tool_permission_requested" &&
+        event.subject.type === "managed_agent_web_request"
+      ) {
+        if (
+          active.pendingInteractions.some(
+            (interaction) => interaction.requestId === event.requestId,
+          )
+        ) {
+          return;
+        }
+        const interaction = {
+          type: "permission" as const,
+          requestId: event.requestId,
+          callId: event.callId,
+          effect: event.effect,
+          subject: {
+            type: "generic" as const,
+            value: `${event.subject.agentId} (research.v1) · ${event.subject.providerOrigin} · ${event.subject.operation} ${JSON.stringify(event.subject.queryOrUrl)}`,
+          },
+          warning: `Allow ${event.subject.agentId} (research.v1) to send this exact Web request to ${event.subject.providerOrigin}: ${event.subject.queryOrUrl}?`,
+          canAllow: true,
+          changePreviewRef: null,
+        };
+        managedPermissionInteractions.set(event.requestId, interaction);
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          authoritative: {
+            ...state.authoritative,
+            active: {
+              ...active,
+              pendingInteractions: [...active.pendingInteractions, interaction],
+            },
+          },
+        };
+        publishStateChange();
+        return;
+      }
+      if (event.type === "tool_permission_decided" && event.requestId !== undefined) {
+        managedPermissionInteractions.delete(event.requestId);
+        const pendingInteractions = active.pendingInteractions.filter(
+          (interaction) => interaction.requestId !== event.requestId,
+        );
+        if (pendingInteractions.length === active.pendingInteractions.length) {
+          return;
+        }
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          authoritative: {
+            ...state.authoritative,
+            active: { ...active, pendingInteractions },
+          },
+        };
+        publishStateChange();
+      }
+    };
+    for (const event of bufferedManagedAgentEvents.splice(0)) {
+      handleManagedAgentEvent(event);
+    }
     handleRuntime = (notification) => {
       if (seenRuntimeNotificationIds.has(notification.notificationId)) {
         return;
@@ -1638,7 +1731,9 @@ export async function createPresentationSession(
               };
               publishStateChange();
             }
-            const pendingInteractions = await projectPendingInteractions(refreshedRecords, options);
+            const pendingInteractions = withManagedPermissionInteractions(
+              await projectPendingInteractions(refreshedRecords, options),
+            );
             const recoveredReasoning =
               missingReasoningSnapshot === undefined
                 ? undefined
@@ -1957,7 +2052,11 @@ export async function createPresentationSession(
           message: "The presentation session is closed.",
         };
       }
-      if (command.type === "refresh_managed_agents" || command.type === "cancel_managed_agent") {
+      if (
+        command.type === "refresh_managed_agents" ||
+        command.type === "cancel_managed_agent" ||
+        command.type === "send_managed_agent_message"
+      ) {
         if (state.authoritative.active?.session.id !== command.sessionId) {
           return {
             status: "rejected",
@@ -1969,7 +2068,14 @@ export async function createPresentationSession(
           const managedAgents =
             command.type === "refresh_managed_agents"
               ? await options.lifecycle.inspectManagedAgents({ sessionId: command.sessionId })
-              : await options.lifecycle.cancelManagedAgent(command);
+              : command.type === "cancel_managed_agent"
+                ? await options.lifecycle.cancelManagedAgent(command)
+                : await options.lifecycle.sendManagedAgentMessage({
+                    ...command,
+                    callId: `presentation:${createHash("sha256")
+                      .update(JSON.stringify(command))
+                      .digest("hex")}`,
+                  });
           state = {
             ...state,
             revision: state.revision + 1,
@@ -4214,6 +4320,7 @@ export async function createPresentationSession(
         }
         unsubscribeLifecycle();
         unsubscribeMetadata();
+        unsubscribeManagedAgentEvents();
         await activeRun?.settlement;
         await Promise.all(connectionSettlements);
         await webSearchSettlement;
@@ -4223,11 +4330,13 @@ export async function createPresentationSession(
         listeners.clear();
         state = { ...state, transient: null };
         bufferedEvents.length = 0;
+        bufferedManagedAgentEvents.length = 0;
       },
     };
   } catch (error) {
     unsubscribeLifecycle();
     unsubscribeMetadata();
+    unsubscribeManagedAgentEvents();
     throw error;
   }
 }

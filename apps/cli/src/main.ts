@@ -319,6 +319,12 @@ function formatPermissionPrompt(
   if (event.subject.type === "managed_agent_control") {
     return `Allow managed-child ${event.subject.action} for this exact parent session [y/N] `;
   }
+  if (event.subject.type === "parent_coordination") {
+    return `Allow managed-child ${event.subject.operation} for its exact owning parent [y/N] `;
+  }
+  if (event.subject.type === "managed_agent_web_request") {
+    return `Allow ${event.subject.agentId} (research.v1) to send this exact Web request to ${quoteForTerminal(event.subject.providerOrigin)}: ${quoteForTerminal(event.subject.queryOrUrl)}? [y/N] `;
+  }
   if (event.subject.type === "web_request") {
     const target =
       event.subject.operation === "fetch"

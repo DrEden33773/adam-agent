@@ -82,6 +82,52 @@ test("minimum-size rendering preserves the draft and returns to the supported la
   }
 });
 
+test("/agents replies through one exact attention barrier without starting a parent turn", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-attention-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "managed-attention",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Start one managed attention fixture.\r");
+    await waitForPath(join(controlRoot, "managed-attention-parent-settled"));
+    const beforeIdle = fixture.output().length;
+    await fixture.waitFor("Managed child needs exact input.");
+    await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
+    await fixture.waitForCompleteFrameAfter(" · idle", beforeIdle);
+    fixture.write("\u0015");
+    const beforeAgents = fixture.output().length;
+    fixture.write("/agents");
+    await fixture.waitForCompleteFrameAfter("/agents", beforeAgents);
+    fixture.write("\r\r");
+    await fixture.waitFor("Agents · 1 active · 0 completed");
+    fixture.write("\r");
+    await fixture.waitFor("Which exact fixture source should I use?");
+    fixture.write("r");
+    await fixture.waitFor("Enter one bounded reply for the exact managed-child attention request.");
+    fixture.write("Use the immutable fixture source.\r");
+    const replyPath = join(controlRoot, "managed-attention-reply");
+    await waitForPath(replyPath);
+    await expect(readFile(replyPath, "utf8")).resolves.toContain(
+      '"reply":"Use the immutable fixture source."',
+    );
+    expect(fixture.output()).not.toContain("automatic parent continuation");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("minimum-size mode consumes ordinary editor input while preserving safe exit", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-minimum-input-"));
   const workspaceRoot = join(testRoot, "workspace");

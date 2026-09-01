@@ -912,14 +912,19 @@ export type AuthoritativePresentationSnapshot = {
   readonly sessions: SessionSummaryPage;
   readonly active: ActiveSessionDisplay | null;
   readonly managedAgents: {
-    readonly counts: { readonly active: number; readonly completed: number; readonly attention: 0 };
+    readonly counts: {
+      readonly active: number;
+      readonly completed: number;
+      readonly attention: number;
+    };
     readonly agents: readonly {
       readonly agentId: string;
       readonly attemptId: string;
-      readonly profile: "scout.v1";
+      readonly profile: "scout.v1" | "research.v1";
       readonly mode: "foreground" | "background";
       readonly status:
         | "running"
+        | "waiting_for_parent"
         | "completed"
         | "failed"
         | "cancelled"
@@ -936,6 +941,19 @@ export type AuthoritativePresentationSnapshot = {
             };
           };
       readonly error?: { readonly code: string; readonly message: string };
+      readonly attention?: {
+        readonly attentionId: string;
+        readonly question: string;
+        readonly status: "waiting" | "orphaned";
+      };
+      readonly reports?: readonly {
+        readonly reportId: `sha256:${string}`;
+        readonly kind: "progress" | "finding";
+        readonly message: string;
+        readonly revision: number;
+        readonly messageByteCount: number;
+        readonly messageTruncated: boolean;
+      }[];
     }[];
   };
 };
@@ -1048,6 +1066,14 @@ export type PresentationCommand =
       readonly sessionId: string;
       readonly agentId: string;
       readonly expectedRevision: number;
+    }
+  | {
+      readonly type: "send_managed_agent_message";
+      readonly sessionId: string;
+      readonly agentId: string;
+      readonly expectedRevision: number;
+      readonly message: string;
+      readonly attentionId?: string;
     }
   | {
       readonly type: "select_session";

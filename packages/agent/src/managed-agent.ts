@@ -2,22 +2,36 @@ import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import { z } from "zod";
-import { AgentSession } from "./agent-session.js";
-import type { ModelDriver, ModelMessage } from "./agent-session-contracts.js";
+import { AgentSession, managedAgentRequestBoundary } from "./agent-session.js";
+import type {
+  ModelDriver,
+  ModelMessage,
+  PermissionDecisionCommand,
+  PermissionDecisionCommandResult,
+  RuntimeEvent,
+} from "./agent-session-contracts.js";
 import type { ArtifactReference, ArtifactStore } from "./artifact-store.js";
 import type { ContextProfile } from "./context-profile.js";
-import { scoutManagedAgentProfileV1 } from "./managed-agent-profiles.js";
+import {
+  researchManagedAgentProfileV1,
+  scoutManagedAgentProfileV1,
+} from "./managed-agent-profiles.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import type { ProjectExecutionRootClaim } from "./project-execution-domain.js";
 import {
   assemblePromptMessagesV1,
   createPromptContextV1,
+  createPromptContextV2,
   digestPromptRequestV1,
   type PromptContextRecord,
 } from "./prompt-assembly.js";
-import { sessionDurableContext } from "./session-durable-context.js";
+import {
+  type AgentSessionDurableContext,
+  sessionDurableContext,
+} from "./session-durable-context.js";
 import { modelMessagesFromCompleteRecords } from "./session-history-replay.js";
 import type { SessionRecord, SessionStore, SessionStoreDirectory } from "./session-store.js";
+import type { SkillContextRecordV1 } from "./skills.js";
 import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import {
   createInternalToolAdapter,
@@ -25,11 +39,14 @@ import {
   createReadToolRegistry,
   type JsonValue,
   type PermissionPolicy,
+  type ToolAdapter,
   type ToolRegistry,
   type ToolResult,
 } from "./tool-runtime.js";
 
 const maximumManagedAgentTaskBytes = 16 * 1024;
+const maximumManagedAgentMessageBytes = 8 * 1024;
+const maximumManagedAgentReportsPerAttempt = 16;
 const maximumManagedAgentResultBytes = 16 * 1024;
 const childLiveWorkspaceNotice =
   "This child reads the live workspace. Parent changes may alter what it observes; isolated transcript does not mean repository snapshot or sandbox.";
@@ -42,6 +59,17 @@ const managedAgentTaskSchema = z.strictObject({
 const managedAgentA2SpawnSchema = managedAgentTaskSchema.extend({
   mode: z.enum(["foreground", "background"]).optional(),
 });
+const managedAgentA3SpawnSchema = managedAgentTaskSchema
+  .extend({
+    profile: z.enum(["scout.v1", "research.v1"]),
+    skills: z.array(z.string().min(1).max(512)).min(1).max(8).optional(),
+    mode: z.enum(["foreground", "background"]).optional(),
+  })
+  .superRefine((input, context) => {
+    if (input.profile === "scout.v1" && input.skills !== undefined) {
+      context.addIssue({ code: "custom", message: "Only research.v1 accepts selected Skills." });
+    }
+  });
 const managedAgentListSchema = z.strictObject({
   status: z
     .enum([
@@ -66,9 +94,39 @@ const managedAgentWaitSchema = z.strictObject({
   agentIds: z.array(z.string().uuid()).min(1).max(2),
   until: z.enum(["any_terminal", "all_terminal"]).optional(),
 });
+const managedAgentA3WaitSchema = managedAgentWaitSchema.extend({
+  until: z.enum(["any_terminal", "all_terminal", "attention"]).optional(),
+});
 const managedAgentFollowUpSchema = managedAgentTaskSchema.extend({
   agentId: z.string().uuid(),
   expectedRevision: z.number().int().positive(),
+});
+const managedAgentSendSchema = z.strictObject({
+  agentId: z.string().uuid(),
+  expectedRevision: z.number().int().positive(),
+  message: z
+    .string()
+    .min(1)
+    .refine((message) => Buffer.byteLength(message, "utf8") <= maximumManagedAgentMessageBytes),
+  attentionId: z.string().uuid().optional(),
+});
+const managedAgentReportSchema = z.strictObject({
+  kind: z.enum(["progress", "finding"]),
+  message: z
+    .string()
+    .min(1)
+    .refine((message) => Buffer.byteLength(message, "utf8") <= maximumManagedAgentMessageBytes),
+});
+const managedAgentRequestParentInputSchema = z.strictObject({
+  question: z
+    .string()
+    .min(1)
+    .refine((question) => Buffer.byteLength(question, "utf8") <= maximumManagedAgentMessageBytes),
+});
+const managedRecordReceiptSchema = z.strictObject({
+  id: z.string().min(1),
+  revision: z.number().int().positive(),
+  digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
 });
 const targetIdentitySchema = z.strictObject({
   targetId: z.string().min(1).max(256),
@@ -104,8 +162,16 @@ const thinkingPolicySchema = z.strictObject({
 const managedAgentTerminalOutputSchema = z.strictObject({
   agentId: z.string().uuid(),
   attemptId: z.string().uuid(),
-  profile: z.literal("scout.v1"),
+  profile: z.enum(["scout.v1", "research.v1"]),
   profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  effectiveToolProfileDigest: z
+    .string()
+    .regex(/^sha256:[0-9a-f]{64}$/u)
+    .optional(),
+  skillActivationDigest: z
+    .string()
+    .regex(/^sha256:[0-9a-f]{64}$/u)
+    .optional(),
   status: z.literal("completed"),
   result: z.union([
     z.strictObject({ text: z.string() }),
@@ -144,9 +210,16 @@ export type ManagedAgentRecord =
       readonly parentToolCallId: string;
       readonly parentRootId: string;
       readonly projectId: `sha256:${string}`;
-      readonly profile: "scout.v1";
+      readonly profile: "scout.v1" | "research.v1";
       readonly mode?: "foreground" | "background";
       readonly profileDigest: `sha256:${string}`;
+      readonly effectiveToolProfileDigest?: `sha256:${string}`;
+      readonly skillActivationDigest?: `sha256:${string}`;
+      readonly selectedSkills?: readonly {
+        readonly qualifiedId: string;
+        readonly skillMdDigest: `sha256:${string}`;
+        readonly manifestDigest: `sha256:${string}`;
+      }[];
       readonly limits: {
         readonly maximumTurns: 8;
         readonly maximumTokens: number;
@@ -172,11 +245,107 @@ export type ManagedAgentRecord =
     }
   | {
       readonly schemaVersion: 1;
+      readonly type: "managed_agent_parent_message_enqueued";
+      readonly sequence: number;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+      readonly messageId: `sha256:${string}`;
+      readonly parentToolCallId: string;
+      readonly expectedRevision: number;
+      readonly sourceRunId?: string;
+      readonly sourceTurn?: number;
+      readonly sourceProviderAttempt?: number;
+      readonly argumentsDigest: `sha256:${string}`;
+      readonly message: string;
+    }
+  | {
+      readonly schemaVersion: 1;
+      readonly type: "managed_agent_parent_message_delivered";
+      readonly sequence: number;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+      readonly messageId: `sha256:${string}`;
+    }
+  | {
+      readonly schemaVersion: 1;
+      readonly type: "managed_agent_child_reported";
+      readonly sequence: number;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+      readonly reportId: `sha256:${string}`;
+      readonly childToolCallId: string;
+      readonly sourceRunId: string;
+      readonly sourceTurn: number;
+      readonly sourceProviderAttempt: number;
+      readonly argumentsDigest: `sha256:${string}`;
+      readonly kind: "progress" | "finding";
+      readonly message: string;
+    }
+  | {
+      readonly schemaVersion: 1;
+      readonly type: "managed_agent_attention_requested";
+      readonly sequence: number;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+      readonly attentionId: string;
+      readonly effectId: `sha256:${string}`;
+      readonly childToolCallId: string;
+      readonly sourceRunId: string;
+      readonly sourceTurn: number;
+      readonly sourceProviderAttempt: number;
+      readonly argumentsDigest: `sha256:${string}`;
+      readonly question: string;
+    }
+  | {
+      readonly schemaVersion: 1;
+      readonly type: "managed_agent_parent_reply_enqueued";
+      readonly sequence: number;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+      readonly attentionId: string;
+      readonly messageId: `sha256:${string}`;
+      readonly parentToolCallId: string;
+      readonly expectedRevision: number;
+      readonly sourceRunId?: string;
+      readonly sourceTurn?: number;
+      readonly sourceProviderAttempt?: number;
+      readonly argumentsDigest: `sha256:${string}`;
+      readonly message: string;
+    }
+  | {
+      readonly schemaVersion: 1;
+      readonly type: "managed_agent_parent_reply_delivered";
+      readonly sequence: number;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+      readonly attentionId: string;
+      readonly messageId: `sha256:${string}`;
+    }
+  | {
+      readonly schemaVersion: 1;
       readonly type: "managed_agent_deadline_expired";
       readonly sequence: number;
       readonly agentId: string;
       readonly attemptId: string;
       readonly childSessionId: string;
+    }
+  | {
+      readonly schemaVersion: 1;
+      readonly type: "managed_agent_inspection_required";
+      readonly sequence: number;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+      readonly error: {
+        readonly code: "managed_agent_inspection_required";
+        readonly message: string;
+      };
     }
   | {
       readonly schemaVersion: 1;
@@ -291,6 +460,102 @@ export class ManagedAgentStoreError extends Error {
 const managedAgentRecordSchema = z.union([
   z.strictObject({
     schemaVersion: z.literal(1),
+    type: z.literal("managed_agent_parent_message_enqueued"),
+    sequence: z.number().int().positive(),
+    agentId: z.uuid(),
+    attemptId: z.uuid(),
+    childSessionId: z.uuid(),
+    messageId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    parentToolCallId: z.string().min(1).max(256),
+    expectedRevision: z.number().int().positive(),
+    sourceRunId: z.uuid().optional(),
+    sourceTurn: z.number().int().positive().optional(),
+    sourceProviderAttempt: z.number().int().positive().optional(),
+    argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    message: z
+      .string()
+      .min(1)
+      .refine((message) => Buffer.byteLength(message, "utf8") <= maximumManagedAgentMessageBytes),
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(1),
+    type: z.literal("managed_agent_parent_message_delivered"),
+    sequence: z.number().int().positive(),
+    agentId: z.uuid(),
+    attemptId: z.uuid(),
+    childSessionId: z.uuid(),
+    messageId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(1),
+    type: z.literal("managed_agent_child_reported"),
+    sequence: z.number().int().positive(),
+    agentId: z.uuid(),
+    attemptId: z.uuid(),
+    childSessionId: z.uuid(),
+    reportId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    childToolCallId: z.string().min(1).max(256),
+    sourceRunId: z.uuid(),
+    sourceTurn: z.number().int().positive(),
+    sourceProviderAttempt: z.number().int().positive(),
+    argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    kind: z.enum(["progress", "finding"]),
+    message: z
+      .string()
+      .min(1)
+      .refine((value) => Buffer.byteLength(value, "utf8") <= maximumManagedAgentMessageBytes),
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(1),
+    type: z.literal("managed_agent_attention_requested"),
+    sequence: z.number().int().positive(),
+    agentId: z.uuid(),
+    attemptId: z.uuid(),
+    childSessionId: z.uuid(),
+    attentionId: z.uuid(),
+    effectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    childToolCallId: z.string().min(1).max(256),
+    sourceRunId: z.uuid(),
+    sourceTurn: z.number().int().positive(),
+    sourceProviderAttempt: z.number().int().positive(),
+    argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    question: z
+      .string()
+      .min(1)
+      .refine((value) => Buffer.byteLength(value, "utf8") <= maximumManagedAgentMessageBytes),
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(1),
+    type: z.literal("managed_agent_parent_reply_enqueued"),
+    sequence: z.number().int().positive(),
+    agentId: z.uuid(),
+    attemptId: z.uuid(),
+    childSessionId: z.uuid(),
+    attentionId: z.uuid(),
+    messageId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    parentToolCallId: z.string().min(1).max(256),
+    expectedRevision: z.number().int().positive(),
+    sourceRunId: z.uuid().optional(),
+    sourceTurn: z.number().int().positive().optional(),
+    sourceProviderAttempt: z.number().int().positive().optional(),
+    argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    message: z
+      .string()
+      .min(1)
+      .refine((value) => Buffer.byteLength(value, "utf8") <= maximumManagedAgentMessageBytes),
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(1),
+    type: z.literal("managed_agent_parent_reply_delivered"),
+    sequence: z.number().int().positive(),
+    agentId: z.uuid(),
+    attemptId: z.uuid(),
+    childSessionId: z.uuid(),
+    attentionId: z.uuid(),
+    messageId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(1),
     type: z.literal("managed_agent_cancel_requested"),
     sequence: z.number().int().positive(),
     agentId: z.uuid(),
@@ -308,6 +573,18 @@ const managedAgentRecordSchema = z.union([
   }),
   z.strictObject({
     schemaVersion: z.literal(1),
+    type: z.literal("managed_agent_inspection_required"),
+    sequence: z.number().int().positive(),
+    agentId: z.uuid(),
+    attemptId: z.uuid(),
+    childSessionId: z.uuid(),
+    error: z.strictObject({
+      code: z.literal("managed_agent_inspection_required"),
+      message: z.string().min(1).max(4_096),
+    }),
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(1),
     type: z.literal("managed_agent_admitted"),
     sequence: z.number().int().positive(),
     agentId: z.uuid(),
@@ -317,9 +594,27 @@ const managedAgentRecordSchema = z.union([
     parentToolCallId: z.string().min(1).max(256),
     parentRootId: z.string().min(1).max(256),
     projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-    profile: z.literal("scout.v1"),
+    profile: z.enum(["scout.v1", "research.v1"]),
     mode: z.enum(["foreground", "background"]).optional(),
     profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    effectiveToolProfileDigest: z
+      .string()
+      .regex(/^sha256:[0-9a-f]{64}$/u)
+      .optional(),
+    skillActivationDigest: z
+      .string()
+      .regex(/^sha256:[0-9a-f]{64}$/u)
+      .optional(),
+    selectedSkills: z
+      .array(
+        z.strictObject({
+          qualifiedId: z.string().min(1).max(512),
+          skillMdDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+          manifestDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+        }),
+      )
+      .max(8)
+      .optional(),
     limits: z.strictObject({
       maximumTurns: z.literal(8),
       maximumTokens: z.number().int().positive().max(128_000),
@@ -448,6 +743,7 @@ export async function recoverInterruptedManagedAgents(
   artifactStore?: ArtifactStore,
   parentSessionId?: string,
   now: () => number = Date.now,
+  parentRecords?: readonly SessionRecord[],
 ): Promise<void> {
   let records = await store.read();
   const terminalAttempts = new Set(
@@ -458,11 +754,14 @@ export async function recoverInterruptedManagedAgents(
   for (const admission of records) {
     if (
       admission.type !== "managed_agent_admitted" ||
-      terminalAttempts.has(admission.attemptId) ||
       (parentSessionId !== undefined && admission.parentSessionId !== parentSessionId)
     ) {
       continue;
     }
+    const existingTerminal = records.find(
+      (record) =>
+        record.type === "managed_agent_terminal" && record.attemptId === admission.attemptId,
+    );
     const childStore = await childSessionStores?.open(admission.childSessionId);
     const childRecords = await childStore?.read();
     const genesis = childRecords?.[0];
@@ -470,24 +769,33 @@ export async function recoverInterruptedManagedAgents(
       genesis?.schemaVersion === 3 && genesis.record.type === "session_genesis"
         ? genesis.record.promptContext?.repository
         : undefined;
+    const managedProfile =
+      admission.profile === "research.v1"
+        ? researchManagedAgentProfileV1
+        : scoutManagedAgentProfileV1;
+    const genesisPromptContext =
+      genesis?.schemaVersion === 3 && genesis.record.type === "session_genesis"
+        ? genesis.record.promptContext
+        : undefined;
     const expectedPromptContext =
-      repository === undefined
-        ? undefined
-        : createPromptContextV1(
-            createReadToolRegistry({ workspaceRoot: process.cwd() }),
-            repository,
-          );
+      admission.effectiveToolProfileDigest !== undefined
+        ? genesisPromptContext
+        : repository === undefined
+          ? undefined
+          : createPromptContextV1(
+              createReadToolRegistry({ workspaceRoot: process.cwd() }),
+              repository,
+            );
     const logicalRun = childRecords?.find(
       (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
     );
     const validAdmissionIdentity =
       admission.parentRootId === `session:${admission.parentSessionId}` &&
-      admission.profile === "scout.v1" &&
-      admission.profileDigest === scoutManagedAgentProfileV1.digest &&
-      admission.limits.maximumTurns === scoutManagedAgentProfileV1.limits.maximumTurnsPerAttempt &&
-      admission.limits.maximumTokens <= scoutManagedAgentProfileV1.limits.maximumCumulativeTokens &&
+      admission.profileDigest === managedProfile.digest &&
+      admission.limits.maximumTurns === managedProfile.limits.maximumTurnsPerAttempt &&
+      admission.limits.maximumTokens <= managedProfile.limits.maximumCumulativeTokens &&
       admission.limits.maximumDeadlineMilliseconds <=
-        scoutManagedAgentProfileV1.limits.maximumDeadlineMilliseconds &&
+        managedProfile.limits.maximumDeadlineMilliseconds &&
       ((admission.mode === undefined &&
         admission.admittedAtUnixMilliseconds === undefined &&
         admission.deadlineAtUnixMilliseconds === undefined) ||
@@ -496,6 +804,231 @@ export async function recoverInterruptedManagedAgents(
           admission.deadlineAtUnixMilliseconds !== undefined &&
           admission.deadlineAtUnixMilliseconds - admission.admittedAtUnixMilliseconds ===
             admission.limits.maximumDeadlineMilliseconds));
+    const childCoordinationEvents = (childRecords ?? []).flatMap((record) => {
+      const event =
+        record.schemaVersion === 1 || record.schemaVersion === 2
+          ? record.event
+          : record.record.type === "runtime_event"
+            ? record.record.event
+            : undefined;
+      return event === undefined ? [] : [{ event, sequence: record.sequence }];
+    });
+    const providerDeliveryLinks = (childRecords ?? []).flatMap((record) =>
+      record.schemaVersion === 3 && record.record.type === "provider_attempt_started"
+        ? (record.record.managedAgentDeliveries ?? [])
+        : [],
+    );
+    const outputString = (output: JsonValue, key: string): string | undefined => {
+      if (output === null || typeof output !== "object" || Array.isArray(output)) {
+        return undefined;
+      }
+      const object = output as { readonly [key: string]: JsonValue };
+      return typeof object[key] === "string" ? object[key] : undefined;
+    };
+    const outputReceipt = (
+      output: JsonValue,
+      key: string,
+    ): { readonly id: string; readonly revision: number; readonly digest: string } | undefined => {
+      if (output === null || typeof output !== "object" || Array.isArray(output)) {
+        return undefined;
+      }
+      const value = (output as { readonly [key: string]: JsonValue })[key];
+      if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        return undefined;
+      }
+      const parsed = managedRecordReceiptSchema.safeParse(value);
+      return parsed.success ? parsed.data : undefined;
+    };
+    const ordinaryReceipts = childCoordinationEvents.flatMap(({ event, sequence }) => {
+      if (event.type !== "user_message") {
+        return [];
+      }
+      const match = /Parent message \((sha256:[0-9a-f]{64})\):/u.exec(event.text);
+      return match?.[1] === undefined ? [] : [{ id: match[1], sequence, text: event.text }];
+    });
+    const completedCoordination = childCoordinationEvents.flatMap(({ event, sequence }) =>
+      event.type === "tool_completed" &&
+      (event.name === "report_to_parent" || event.name === "request_parent_input")
+        ? [{ event, sequence }]
+        : [],
+    );
+    const parentSendResults = (parentRecords ?? []).flatMap((record) => {
+      const event =
+        record.schemaVersion === 1 || record.schemaVersion === 2
+          ? record.event
+          : record.record.type === "runtime_event"
+            ? record.record.event
+            : undefined;
+      return event?.type === "tool_completed" && event.name === "send_agent_message"
+        ? [event.output]
+        : [];
+    });
+    const managerDeliveryRecords = records.flatMap((record) =>
+      (record.type === "managed_agent_parent_message_enqueued" ||
+        record.type === "managed_agent_parent_reply_enqueued") &&
+      record.attemptId === admission.attemptId
+        ? [record]
+        : [],
+    );
+    const allManagerDeliveryRecords = records.flatMap((record) =>
+      record.type === "managed_agent_parent_message_enqueued" ||
+      record.type === "managed_agent_parent_reply_enqueued"
+        ? [record]
+        : [],
+    );
+    const parentSourceTruthIsValid = parentSendResults.every((output) => {
+      const agentId = outputString(output, "agentId");
+      const attemptId = outputString(output, "attemptId");
+      const sourceReceipt = outputReceipt(output, "record");
+      if (agentId === undefined || attemptId === undefined || sourceReceipt === undefined) {
+        return false;
+      }
+      const sourceAdmission = records.find(
+        (record) =>
+          record.type === "managed_agent_admitted" &&
+          record.agentId === agentId &&
+          record.attemptId === attemptId,
+      );
+      const managerRecord = allManagerDeliveryRecords.find(
+        (record) =>
+          record.agentId === agentId &&
+          record.attemptId === attemptId &&
+          managedRecordReceipt(record).id === sourceReceipt.id,
+      );
+      return (
+        sourceAdmission !== undefined &&
+        managerRecord !== undefined &&
+        isDeepStrictEqual(sourceReceipt, managedRecordReceipt(managerRecord))
+      );
+    });
+    const deliveryLinksAreValid =
+      new Set(providerDeliveryLinks.map((link) => link.id)).size === providerDeliveryLinks.length &&
+      providerDeliveryLinks.every((link) => {
+        const managerRecord = managerDeliveryRecords.find((record) => record.messageId === link.id);
+        return (
+          managerRecord !== undefined && managedRecordReceipt(managerRecord).digest === link.digest
+        );
+      });
+    const coordinationSourceIsValid =
+      deliveryLinksAreValid &&
+      parentSourceTruthIsValid &&
+      ordinaryReceipts.every(({ id, text }) => {
+        const managerRecord = managerDeliveryRecords.find(
+          (record) =>
+            record.type === "managed_agent_parent_message_enqueued" && record.messageId === id,
+        );
+        return (
+          managerRecord !== undefined &&
+          text === `Parent message (${managerRecord.messageId}): ${managerRecord.message}`
+        );
+      }) &&
+      completedCoordination.every(({ event }) => {
+        if (event.name === "report_to_parent") {
+          const reportId = outputString(event.output, "reportId");
+          const sourceReceipt = outputReceipt(event.output, "record");
+          const managerRecord = records.find(
+            (record) =>
+              record.type === "managed_agent_child_reported" &&
+              record.attemptId === admission.attemptId &&
+              record.reportId === reportId,
+          );
+          return (
+            managerRecord !== undefined &&
+            sourceReceipt !== undefined &&
+            isDeepStrictEqual(sourceReceipt, managedRecordReceipt(managerRecord))
+          );
+        }
+        const attentionId = outputString(event.output, "attentionId");
+        const messageId = outputString(event.output, "messageId");
+        const sourceAttentionReceipt = outputReceipt(event.output, "attentionRecord");
+        const sourceReplyReceipt = outputReceipt(event.output, "replyRecord");
+        const attentionRecord = records.find(
+          (record) =>
+            record.type === "managed_agent_attention_requested" &&
+            record.attemptId === admission.attemptId &&
+            record.attentionId === attentionId,
+        );
+        const replyRecord = records.find(
+          (record) =>
+            record.type === "managed_agent_parent_reply_enqueued" &&
+            record.attemptId === admission.attemptId &&
+            record.attentionId === attentionId &&
+            record.messageId === messageId,
+        );
+        return (
+          attentionRecord !== undefined &&
+          replyRecord !== undefined &&
+          sourceAttentionReceipt !== undefined &&
+          sourceReplyReceipt !== undefined &&
+          isDeepStrictEqual(sourceAttentionReceipt, managedRecordReceipt(attentionRecord)) &&
+          isDeepStrictEqual(sourceReplyReceipt, managedRecordReceipt(replyRecord))
+        );
+      });
+    if (validAdmissionIdentity && coordinationSourceIsValid) {
+      for (const message of records.flatMap((record) =>
+        record.type === "managed_agent_parent_message_enqueued" &&
+        record.attemptId === admission.attemptId
+          ? [record]
+          : [],
+      )) {
+        const delivery = providerDeliveryLinks.find(
+          (link) =>
+            link.id === message.messageId && link.digest === managedRecordReceipt(message).digest,
+        );
+        if (
+          delivery !== undefined &&
+          !records.some(
+            (record) =>
+              record.type === "managed_agent_parent_message_delivered" &&
+              record.messageId === message.messageId,
+          )
+        ) {
+          const delivered: ManagedAgentRecord = {
+            schemaVersion: 1,
+            type: "managed_agent_parent_message_delivered",
+            sequence: records.length + 1,
+            agentId: message.agentId,
+            attemptId: message.attemptId,
+            childSessionId: message.childSessionId,
+            messageId: message.messageId,
+          };
+          await store.append(delivered);
+          records = [...records, delivered];
+        }
+      }
+      for (const reply of records.flatMap((record) =>
+        record.type === "managed_agent_parent_reply_enqueued" &&
+        record.attemptId === admission.attemptId
+          ? [record]
+          : [],
+      )) {
+        const delivery = providerDeliveryLinks.find(
+          (link) =>
+            link.id === reply.messageId && link.digest === managedRecordReceipt(reply).digest,
+        );
+        if (
+          delivery !== undefined &&
+          !records.some(
+            (record) =>
+              record.type === "managed_agent_parent_reply_delivered" &&
+              record.messageId === reply.messageId,
+          )
+        ) {
+          const delivered: ManagedAgentRecord = {
+            schemaVersion: 1,
+            type: "managed_agent_parent_reply_delivered",
+            sequence: records.length + 1,
+            agentId: reply.agentId,
+            attemptId: reply.attemptId,
+            childSessionId: reply.childSessionId,
+            attentionId: reply.attentionId,
+            messageId: reply.messageId,
+          };
+          await store.append(delivered);
+          records = [...records, delivered];
+        }
+      }
+    }
     let validResume = admission.resume === undefined;
     let resumedMessages: readonly ModelMessage[] = [];
     if (admission.resume !== undefined && childSessionStores !== undefined) {
@@ -558,7 +1091,7 @@ export async function recoverInterruptedManagedAgents(
         sourceHistories.every((history) => history.valid) &&
         validSourceTerminalLink &&
         admission.limits.maximumTokens ===
-          scoutManagedAgentProfileV1.limits.maximumCumulativeTokens - cumulativeTokens;
+          managedProfile.limits.maximumCumulativeTokens - cumulativeTokens;
       resumedMessages = boundary.messages;
     }
     const providerAttempt = childRecords?.find(
@@ -580,7 +1113,9 @@ export async function recoverInterruptedManagedAgents(
               {
                 role: "developer",
                 content:
-                  "Managed child profile scout.v1. Work only on the exact delegated task. Use repository reads only. Do not write, execute, use Web or MCP, select Skills, access extensions, spawn, coordinate with peers, or change model and permission authority.",
+                  admission.profile === "research.v1"
+                    ? "Managed child profile research.v1. Work only on the exact delegated research task with the admitted repository reads, selected Skills, Web evidence, and parent-only coordination. Do not write, execute, use MCP, access ambient extensions, spawn, coordinate with peers, or change model and permission authority."
+                    : "Managed child profile scout.v1. Work only on the exact delegated task. Use repository reads only. Do not write, execute, use Web or MCP, select Skills, access extensions, spawn, coordinate with peers, or change model and permission authority.",
               },
               ...resumedMessages,
               ...currentMessages,
@@ -600,6 +1135,32 @@ export async function recoverInterruptedManagedAgents(
             expectedPromptContext?.toolProfile.definitions.map(({ definition }) => definition) ??
               [],
           ));
+    const effectiveToolNames = genesisPromptContext?.toolProfile.definitions.map(
+      (definition) => definition.name,
+    );
+    const allowedToolNames = new Set(
+      admission.profile === "research.v1"
+        ? researchManagedAgentProfileV1.toolNames
+        : ["read_file", "search_repository", "report_to_parent", "request_parent_input"],
+    );
+    const validEffectiveProfile =
+      effectiveToolNames?.includes("read_file") === true &&
+      effectiveToolNames.includes("search_repository") &&
+      effectiveToolNames.every((name) => allowedToolNames.has(name));
+    const genesisSkillContext =
+      genesis?.schemaVersion === 3 && genesis.record.type === "session_genesis"
+        ? genesis.record.skillContext
+        : undefined;
+    const genesisSelectedSkills = genesisSkillContext?.active.map((activation) => ({
+      qualifiedId: activation.qualifiedId,
+      skillMdDigest: activation.skillMdDigest,
+      manifestDigest: activation.manifest.digest,
+    }));
+    const validSelectedSkills =
+      isDeepStrictEqual(genesisSelectedSkills, admission.selectedSkills) &&
+      (admission.skillActivationDigest === undefined
+        ? genesisSkillContext === undefined
+        : genesisSkillContext?.activationDigest === admission.skillActivationDigest);
     const validGenesisIdentity =
       genesis?.schemaVersion === 3 &&
       genesis.record.type === "session_genesis" &&
@@ -607,17 +1168,51 @@ export async function recoverInterruptedManagedAgents(
       genesis.record.projectId === admission.projectId &&
       isDeepStrictEqual(genesis.record.targetIdentity, admission.targetIdentity) &&
       isDeepStrictEqual(genesis.record.promptContext, expectedPromptContext) &&
-      admission.profileDigest === scoutManagedAgentProfileV1.digest &&
-      admission.limits.maximumTurns === scoutManagedAgentProfileV1.limits.maximumTurnsPerAttempt &&
-      admission.limits.maximumTokens <= scoutManagedAgentProfileV1.limits.maximumCumulativeTokens &&
+      (admission.effectiveToolProfileDigest === undefined ||
+        genesis.record.promptContext?.toolProfile.digest ===
+          admission.effectiveToolProfileDigest) &&
+      validEffectiveProfile &&
+      validSelectedSkills &&
+      coordinationSourceIsValid &&
+      admission.profileDigest === managedProfile.digest &&
+      admission.limits.maximumTurns === managedProfile.limits.maximumTurnsPerAttempt &&
+      admission.limits.maximumTokens <= managedProfile.limits.maximumCumulativeTokens &&
       admission.limits.maximumDeadlineMilliseconds <=
-        scoutManagedAgentProfileV1.limits.maximumDeadlineMilliseconds &&
+        managedProfile.limits.maximumDeadlineMilliseconds &&
       admission.parentRootId === `session:${admission.parentSessionId}` &&
       validResumeProjection &&
       (admission.repository === undefined
         ? repository?.sources.length === 0
         : repository?.revision === admission.repository.revision &&
           repository.effectiveDigest === admission.repository.effectiveDigest);
+    if (existingTerminal?.type === "managed_agent_terminal") {
+      if (
+        existingTerminal.status !== "inspection_required" &&
+        childRecords !== undefined &&
+        !records.some(
+          (record) =>
+            record.type === "managed_agent_inspection_required" &&
+            record.attemptId === admission.attemptId,
+        ) &&
+        (!validAdmissionIdentity || !validResume || !validGenesisIdentity)
+      ) {
+        const inspection: ManagedAgentRecord = {
+          schemaVersion: 1,
+          type: "managed_agent_inspection_required",
+          sequence: records.length + 1,
+          agentId: admission.agentId,
+          attemptId: admission.attemptId,
+          childSessionId: admission.childSessionId,
+          error: {
+            code: "managed_agent_inspection_required",
+            message: "The durable child coordination receipt does not match manager truth.",
+          },
+        };
+        await store.append(inspection);
+        records = [...records, inspection];
+      }
+      continue;
+    }
     if (!validAdmissionIdentity || !validResume) {
       const terminal: ManagedAgentRecord = {
         schemaVersion: 1,
@@ -925,6 +1520,9 @@ export function validateManagedAgentRecord(
           previous.projectId !== candidate.projectId ||
           previous.profile !== candidate.profile ||
           previous.profileDigest !== candidate.profileDigest ||
+          previous.effectiveToolProfileDigest !== candidate.effectiveToolProfileDigest ||
+          previous.skillActivationDigest !== candidate.skillActivationDigest ||
+          !isDeepStrictEqual(previous.selectedSkills, candidate.selectedSkills) ||
           !isDeepStrictEqual(previous.targetIdentity, candidate.targetIdentity) ||
           !isDeepStrictEqual(previous.thinkingPolicy, candidate.thinkingPolicy) ||
           !isDeepStrictEqual(previous.repository, candidate.repository) ||
@@ -937,6 +1535,262 @@ export function validateManagedAgentRecord(
             (record) =>
               record.type === "managed_agent_terminal" && record.attemptId === previous.attemptId,
           )))
+    ) {
+      throw new ManagedAgentStoreError("managed_agent_log_invalid");
+    }
+  } else if (candidate.type === "managed_agent_parent_message_enqueued") {
+    const admission = history
+      .flatMap((record) => (record.type === "managed_agent_admitted" ? [record] : []))
+      .find((record) => record.attemptId === candidate.attemptId);
+    const expectedArgumentsDigest = digest(
+      JSON.stringify({
+        agentId: candidate.agentId,
+        expectedRevision: candidate.expectedRevision,
+        message: candidate.message,
+      }),
+    );
+    const expectedMessageId =
+      admission === undefined
+        ? undefined
+        : digest(
+            JSON.stringify({
+              parentRootId: admission.parentRootId,
+              parentSessionId: admission.parentSessionId,
+              attemptId: candidate.attemptId,
+              callId: candidate.parentToolCallId,
+              toolName: "send_agent_message",
+              argumentsDigest: expectedArgumentsDigest,
+              ...(candidate.sourceRunId === undefined
+                ? {}
+                : {
+                    sourceRunId: candidate.sourceRunId,
+                    sourceTurn: candidate.sourceTurn,
+                    sourceProviderAttempt: candidate.sourceProviderAttempt,
+                  }),
+            }),
+          );
+    if (
+      admission === undefined ||
+      admission.agentId !== candidate.agentId ||
+      admission.childSessionId !== candidate.childSessionId ||
+      !(
+        (candidate.sourceRunId === undefined &&
+          candidate.sourceTurn === undefined &&
+          candidate.sourceProviderAttempt === undefined) ||
+        (candidate.sourceRunId !== undefined &&
+          candidate.sourceTurn !== undefined &&
+          candidate.sourceProviderAttempt !== undefined)
+      ) ||
+      candidate.expectedRevision !==
+        history.filter((record) => record.agentId === candidate.agentId).length ||
+      candidate.argumentsDigest !== expectedArgumentsDigest ||
+      candidate.messageId !== expectedMessageId ||
+      history.some(
+        (record) =>
+          record.type === "managed_agent_terminal" && record.attemptId === candidate.attemptId,
+      ) ||
+      history.some(
+        (record) =>
+          record.type === "managed_agent_parent_message_enqueued" &&
+          (record.messageId === candidate.messageId ||
+            (record.attemptId === candidate.attemptId &&
+              record.parentToolCallId === candidate.parentToolCallId &&
+              record.sourceRunId === candidate.sourceRunId &&
+              record.sourceTurn === candidate.sourceTurn &&
+              record.sourceProviderAttempt === candidate.sourceProviderAttempt)),
+      )
+    ) {
+      throw new ManagedAgentStoreError("managed_agent_log_invalid");
+    }
+  } else if (candidate.type === "managed_agent_parent_message_delivered") {
+    const enqueued = history.find(
+      (record) =>
+        record.type === "managed_agent_parent_message_enqueued" &&
+        record.messageId === candidate.messageId,
+    );
+    if (
+      enqueued === undefined ||
+      enqueued.agentId !== candidate.agentId ||
+      enqueued.attemptId !== candidate.attemptId ||
+      enqueued.childSessionId !== candidate.childSessionId ||
+      history.some(
+        (record) =>
+          record.type === "managed_agent_parent_message_delivered" &&
+          record.messageId === candidate.messageId,
+      )
+    ) {
+      throw new ManagedAgentStoreError("managed_agent_log_invalid");
+    }
+  } else if (
+    candidate.type === "managed_agent_child_reported" ||
+    candidate.type === "managed_agent_attention_requested"
+  ) {
+    const admission = history
+      .flatMap((record) => (record.type === "managed_agent_admitted" ? [record] : []))
+      .find((record) => record.attemptId === candidate.attemptId);
+    const duplicate = history.some((record) =>
+      candidate.type === "managed_agent_child_reported"
+        ? record.type === "managed_agent_child_reported" &&
+          (record.reportId === candidate.reportId ||
+            (record.attemptId === candidate.attemptId &&
+              record.childToolCallId === candidate.childToolCallId &&
+              record.sourceRunId === candidate.sourceRunId &&
+              record.sourceTurn === candidate.sourceTurn &&
+              record.sourceProviderAttempt === candidate.sourceProviderAttempt))
+        : record.type === "managed_agent_attention_requested" &&
+          (record.attentionId === candidate.attentionId ||
+            (record.attemptId === candidate.attemptId &&
+              record.childToolCallId === candidate.childToolCallId &&
+              record.sourceRunId === candidate.sourceRunId &&
+              record.sourceTurn === candidate.sourceTurn &&
+              record.sourceProviderAttempt === candidate.sourceProviderAttempt)),
+    );
+    const expectedArgumentsDigest = digest(
+      JSON.stringify(
+        candidate.type === "managed_agent_child_reported"
+          ? { kind: candidate.kind, message: candidate.message }
+          : { question: candidate.question },
+      ),
+    );
+    const expectedEffectId =
+      admission === undefined
+        ? undefined
+        : digest(
+            JSON.stringify({
+              parentRootId: admission.parentRootId,
+              sourceSessionId: candidate.childSessionId,
+              sourceAttemptId: candidate.attemptId,
+              sourceToolCallId: candidate.childToolCallId,
+              sourceRunId: candidate.sourceRunId,
+              sourceTurn: candidate.sourceTurn,
+              sourceProviderAttempt: candidate.sourceProviderAttempt,
+              toolName:
+                candidate.type === "managed_agent_child_reported"
+                  ? "report_to_parent"
+                  : "request_parent_input",
+              argumentsDigest: expectedArgumentsDigest,
+            }),
+          );
+    if (
+      admission === undefined ||
+      admission.agentId !== candidate.agentId ||
+      admission.childSessionId !== candidate.childSessionId ||
+      candidate.argumentsDigest !== expectedArgumentsDigest ||
+      (candidate.type === "managed_agent_child_reported"
+        ? candidate.reportId !== expectedEffectId
+        : candidate.effectId !== expectedEffectId) ||
+      duplicate ||
+      history.some(
+        (record) =>
+          record.type === "managed_agent_terminal" && record.attemptId === candidate.attemptId,
+      )
+    ) {
+      throw new ManagedAgentStoreError("managed_agent_log_invalid");
+    }
+  } else if (candidate.type === "managed_agent_parent_reply_enqueued") {
+    const attention = history.find(
+      (record) =>
+        record.type === "managed_agent_attention_requested" &&
+        record.attentionId === candidate.attentionId,
+    );
+    const admission = history
+      .flatMap((record) => (record.type === "managed_agent_admitted" ? [record] : []))
+      .find((record) => record.attemptId === candidate.attemptId);
+    const expectedArgumentsDigest = digest(
+      JSON.stringify({
+        agentId: candidate.agentId,
+        expectedRevision: candidate.expectedRevision,
+        message: candidate.message,
+        attentionId: candidate.attentionId,
+      }),
+    );
+    const expectedMessageId =
+      admission === undefined
+        ? undefined
+        : digest(
+            JSON.stringify({
+              parentRootId: admission.parentRootId,
+              parentSessionId: admission.parentSessionId,
+              attemptId: candidate.attemptId,
+              callId: candidate.parentToolCallId,
+              toolName: "send_agent_message",
+              argumentsDigest: expectedArgumentsDigest,
+              ...(candidate.sourceRunId === undefined
+                ? {}
+                : {
+                    sourceRunId: candidate.sourceRunId,
+                    sourceTurn: candidate.sourceTurn,
+                    sourceProviderAttempt: candidate.sourceProviderAttempt,
+                  }),
+            }),
+          );
+    if (
+      admission === undefined ||
+      attention === undefined ||
+      attention.agentId !== candidate.agentId ||
+      attention.attemptId !== candidate.attemptId ||
+      attention.childSessionId !== candidate.childSessionId ||
+      !(
+        (candidate.sourceRunId === undefined &&
+          candidate.sourceTurn === undefined &&
+          candidate.sourceProviderAttempt === undefined) ||
+        (candidate.sourceRunId !== undefined &&
+          candidate.sourceTurn !== undefined &&
+          candidate.sourceProviderAttempt !== undefined)
+      ) ||
+      candidate.expectedRevision !==
+        history.filter((record) => record.agentId === candidate.agentId).length ||
+      candidate.argumentsDigest !== expectedArgumentsDigest ||
+      candidate.messageId !== expectedMessageId ||
+      history.some(
+        (record) =>
+          (record.type === "managed_agent_parent_reply_enqueued" &&
+            (record.attentionId === candidate.attentionId ||
+              (record.parentToolCallId === candidate.parentToolCallId &&
+                record.sourceRunId === candidate.sourceRunId &&
+                record.sourceTurn === candidate.sourceTurn &&
+                record.sourceProviderAttempt === candidate.sourceProviderAttempt))) ||
+          (record.type === "managed_agent_terminal" && record.attemptId === candidate.attemptId),
+      )
+    ) {
+      throw new ManagedAgentStoreError("managed_agent_log_invalid");
+    }
+  } else if (candidate.type === "managed_agent_parent_reply_delivered") {
+    const reply = history
+      .flatMap((record) => (record.type === "managed_agent_parent_reply_enqueued" ? [record] : []))
+      .find((record) => record.messageId === candidate.messageId);
+    if (
+      reply === undefined ||
+      reply.agentId !== candidate.agentId ||
+      reply.attemptId !== candidate.attemptId ||
+      reply.childSessionId !== candidate.childSessionId ||
+      reply.attentionId !== candidate.attentionId ||
+      history.some(
+        (record) =>
+          record.type === "managed_agent_parent_reply_delivered" &&
+          record.messageId === candidate.messageId,
+      )
+    ) {
+      throw new ManagedAgentStoreError("managed_agent_log_invalid");
+    }
+  } else if (candidate.type === "managed_agent_inspection_required") {
+    const admission = history.find(
+      (record) =>
+        record.type === "managed_agent_admitted" && record.attemptId === candidate.attemptId,
+    );
+    if (
+      admission === undefined ||
+      admission.agentId !== candidate.agentId ||
+      admission.childSessionId !== candidate.childSessionId ||
+      !history.some(
+        (record) =>
+          record.type === "managed_agent_terminal" && record.attemptId === candidate.attemptId,
+      ) ||
+      history.some(
+        (record) =>
+          record.type === "managed_agent_inspection_required" &&
+          record.attemptId === candidate.attemptId,
+      )
     ) {
       throw new ManagedAgentStoreError("managed_agent_log_invalid");
     }
@@ -1002,10 +1856,11 @@ export function validateManagedAgentRecord(
 export type ManagedAgentSummary = {
   readonly agentId: string;
   readonly attemptId: string;
-  readonly profile: "scout.v1";
+  readonly profile: "scout.v1" | "research.v1";
   readonly mode: "foreground" | "background";
   readonly status:
     | "running"
+    | "waiting_for_parent"
     | "completed"
     | "failed"
     | "cancelled"
@@ -1016,12 +1871,29 @@ export type ManagedAgentSummary = {
     | { readonly text: string }
     | { readonly artifact: Pick<ArtifactReference, "id" | "mediaType" | "byteCount"> };
   readonly error?: { readonly code: string; readonly message: string };
+  readonly attention?: {
+    readonly attentionId: string;
+    readonly question: string;
+    readonly status: "waiting" | "orphaned";
+  };
+  readonly reports: readonly {
+    readonly reportId: `sha256:${string}`;
+    readonly kind: "progress" | "finding";
+    readonly message: string;
+    readonly revision: number;
+    readonly messageByteCount: number;
+    readonly messageTruncated: boolean;
+  }[];
   readonly resultByteCount?: number;
   readonly resultTruncated?: boolean;
 };
 
 export type ManagedAgentSnapshot = {
-  readonly counts: { readonly active: number; readonly completed: number; readonly attention: 0 };
+  readonly counts: {
+    readonly active: number;
+    readonly completed: number;
+    readonly attention: number;
+  };
   readonly agents: readonly ManagedAgentSummary[];
 };
 
@@ -1047,28 +1919,91 @@ export function managedAgentSnapshotFromRecords(
       (record) =>
         record.type === "managed_agent_terminal" && record.attemptId === admission.attemptId,
     );
+    const inspection = records.findLast(
+      (record) =>
+        record.type === "managed_agent_inspection_required" &&
+        record.attemptId === admission.attemptId,
+    );
+    const attention = records
+      .flatMap((record) =>
+        record.type === "managed_agent_attention_requested" &&
+        record.attemptId === admission.attemptId
+          ? [record]
+          : [],
+      )
+      .findLast(
+        (record) =>
+          !records.some(
+            (candidate) =>
+              candidate.type === "managed_agent_parent_reply_enqueued" &&
+              candidate.attentionId === record.attentionId,
+          ),
+      );
+    const reports = records
+      .flatMap((record) =>
+        record.type === "managed_agent_child_reported" && record.attemptId === admission.attemptId
+          ? [record]
+          : [],
+      )
+      .slice(-4)
+      .map((record) => {
+        const messageByteCount = Buffer.byteLength(record.message, "utf8");
+        return {
+          reportId: record.reportId,
+          kind: record.kind,
+          message: boundedUtf8Prefix(record.message, 512),
+          revision: record.sequence,
+          messageByteCount,
+          messageTruncated: messageByteCount > 512,
+        };
+      });
     return {
       agentId: admission.agentId,
       attemptId: admission.attemptId,
       profile: admission.profile,
       mode: admission.mode ?? "foreground",
-      status: terminal?.type === "managed_agent_terminal" ? terminal.status : "running",
+      status:
+        inspection?.type === "managed_agent_inspection_required"
+          ? "inspection_required"
+          : terminal?.type === "managed_agent_terminal"
+            ? terminal.status
+            : attention === undefined
+              ? "running"
+              : "waiting_for_parent",
       revision,
-      ...(terminal?.type !== "managed_agent_terminal" || terminal.status !== "completed"
+      reports,
+      ...(inspection !== undefined ||
+      terminal?.type !== "managed_agent_terminal" ||
+      terminal.status !== "completed"
         ? {}
         : { result: terminal.result }),
-      ...(terminal?.type !== "managed_agent_terminal" ||
-      terminal.status === "completed" ||
-      terminal.status === "cancelled"
+      ...(inspection?.type === "managed_agent_inspection_required"
+        ? { error: inspection.error }
+        : terminal?.type !== "managed_agent_terminal" ||
+            terminal.status === "completed" ||
+            terminal.status === "cancelled"
+          ? {}
+          : { error: terminal.error }),
+      ...(attention === undefined
         ? {}
-        : { error: terminal.error }),
+        : {
+            attention: {
+              attentionId: attention.attentionId,
+              question: attention.question,
+              status: terminal === undefined ? ("waiting" as const) : ("orphaned" as const),
+            },
+          }),
     };
   });
   return {
     counts: {
-      active: agents.filter((agent) => agent.status === "running").length,
-      completed: agents.filter((agent) => agent.status !== "running").length,
-      attention: 0,
+      active: agents.filter(
+        (agent) => agent.status === "running" || agent.status === "waiting_for_parent",
+      ).length,
+      completed: agents.filter(
+        (agent) => agent.status !== "running" && agent.status !== "waiting_for_parent",
+      ).length,
+      attention: agents.filter((agent) => agent.status === "waiting_for_parent").length,
     },
     agents,
   };
@@ -1077,8 +2012,7 @@ export function managedAgentSnapshotFromRecords(
 function boundedManagedAgentListAgents(
   agents: readonly ManagedAgentSummary[],
 ): readonly ManagedAgentSummary[] {
-  const maximumTextBytes =
-    agents.length === 1 ? Number.POSITIVE_INFINITY : Math.floor((10 * 1024) / agents.length);
+  const maximumTextBytes = Math.floor((10 * 1024) / Math.max(1, agents.length));
   return agents.map((agent) => {
     const boundedAgent =
       agent.error === undefined
@@ -1113,19 +2047,36 @@ export type AgentManager = {
   readonly targetIdentity: ModelTargetIdentity;
   readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
   promptSummary(): string;
+  selectedSkillIdentities(
+    skills: readonly string[],
+  ): readonly { readonly qualifiedId: string; readonly digest: `sha256:${string}` }[] | undefined;
   snapshot(): Promise<ManagedAgentSnapshot>;
+  decidePermission(command: PermissionDecisionCommand): PermissionDecisionCommandResult;
   rebindParentRoot(parentRoot: ProjectExecutionRootClaim): void;
+  rebindResearchContext(context: ManagedAgentResearchContext | undefined): void;
   spawnForeground(input: {
     readonly callId: string;
     readonly parentSessionId: string;
     readonly signal: AbortSignal;
     readonly task: string;
+    readonly profile?: "scout.v1" | "research.v1";
+    readonly skills?: readonly string[];
+    readonly approvedSkills?: readonly {
+      readonly qualifiedId: string;
+      readonly digest: `sha256:${string}`;
+    }[];
   }): Promise<ToolResult>;
   spawnBackground(input: {
     readonly callId: string;
     readonly parentSessionId: string;
     readonly signal: AbortSignal;
     readonly task: string;
+    readonly profile?: "scout.v1" | "research.v1";
+    readonly skills?: readonly string[];
+    readonly approvedSkills?: readonly {
+      readonly qualifiedId: string;
+      readonly digest: `sha256:${string}`;
+    }[];
   }): Promise<ToolResult>;
   list(input?: {
     readonly status?: "active" | "terminal" | ManagedAgentSummary["status"];
@@ -1134,7 +2085,7 @@ export type AgentManager = {
   }): Promise<ToolResult>;
   wait(input: {
     readonly agentIds: readonly string[];
-    readonly until: "any_terminal" | "all_terminal";
+    readonly until: "any_terminal" | "all_terminal" | "attention";
     readonly signal: AbortSignal;
   }): Promise<ToolResult>;
   cancel(input: {
@@ -1149,8 +2100,38 @@ export type AgentManager = {
     readonly signal: AbortSignal;
     readonly task: string;
   }): Promise<ToolResult>;
+  send(input: {
+    readonly agentId: string;
+    readonly expectedRevision: number;
+    readonly callId: string;
+    readonly message: string;
+    readonly attentionId?: string;
+    readonly sourceRunId?: string;
+    readonly sourceTurn?: number;
+    readonly sourceProviderAttempt?: number;
+  }): Promise<ToolResult>;
   waitForIdle(): Promise<void>;
   close(): Promise<void>;
+};
+
+export type ManagedAgentResearchContext = {
+  readonly repository?: PromptContextRecord["repository"];
+  readonly tools?: ToolRegistry;
+  readonly skillIdentities?: readonly {
+    readonly qualifiedId: string;
+    readonly digest: `sha256:${string}`;
+  }[];
+  readonly resolveSkills?: (input: {
+    readonly skills: readonly string[];
+    readonly attemptId: string;
+    readonly childSessionId: string;
+  }) => Promise<{
+    readonly context: SkillContextRecordV1;
+    readonly contents: ReadonlyMap<string, string>;
+  }>;
+  readonly authorizeProjectContextLoad?: AgentSessionDurableContext["authorizeProjectContextLoad"];
+  readonly extensionSkillSources?: AgentSessionDurableContext["extensionSkillSources"];
+  readonly withCurrentExtensionSkillSources?: AgentSessionDurableContext["withCurrentExtensionSkillSources"];
 };
 
 export type ManagedAgentDeadlineScheduler = {
@@ -1172,6 +2153,21 @@ export function createAgentManager(options: {
   readonly childSessionStores: SessionStoreDirectory<SessionRecord>;
   readonly managedStore: ManagedAgentStore;
   readonly parentPermissions: PermissionPolicy;
+  readonly parentCoordination?: { readonly interactive: boolean | (() => boolean) };
+  readonly researchTools?: ToolRegistry;
+  readonly researchSkillIdentities?: readonly {
+    readonly qualifiedId: string;
+    readonly digest: `sha256:${string}`;
+  }[];
+  readonly resolveResearchSkills?: (input: {
+    readonly skills: readonly string[];
+    readonly attemptId: string;
+    readonly childSessionId: string;
+  }) => Promise<{
+    readonly context: SkillContextRecordV1;
+    readonly contents: ReadonlyMap<string, string>;
+  }>;
+  readonly onChildPermissionEvent?: (event: RuntimeEvent) => void;
   readonly deadlineScheduler?: ManagedAgentDeadlineScheduler;
   readonly closeDrainScheduler?: ManagedAgentDeadlineScheduler;
   readonly parentRoot: ProjectExecutionRootClaim;
@@ -1184,6 +2180,16 @@ export function createAgentManager(options: {
   readonly now?: () => number;
 }): AgentManager {
   let currentParentRoot = options.parentRoot;
+  let currentResearchContext: ManagedAgentResearchContext | undefined = {
+    ...(options.repository === undefined ? {} : { repository: options.repository }),
+    ...(options.researchTools === undefined ? {} : { tools: options.researchTools }),
+    ...(options.researchSkillIdentities === undefined
+      ? {}
+      : { skillIdentities: options.researchSkillIdentities }),
+    ...(options.resolveResearchSkills === undefined
+      ? {}
+      : { resolveSkills: options.resolveResearchSkills }),
+  };
   let boundParentSessionId = options.parentSessionId ?? "00000000-0000-4000-8000-000000000001";
   let appendQueue = Promise.resolve();
   const appendManagedRecord = async (input: ManagedAgentRecordInput): Promise<void> => {
@@ -1198,14 +2204,33 @@ export function createAgentManager(options: {
     appendQueue = operation.catch(() => undefined);
     await operation;
   };
+  const hasInteractiveParentSink = (): boolean => {
+    const interactive = options.parentCoordination?.interactive;
+    return typeof interactive === "function" ? interactive() : interactive === true;
+  };
   type ForceManagedAgentRecovery = () => Promise<
     "forced" | "already_terminal" | "terminal_in_progress"
   >;
+  type AdmittedIdentity = {
+    readonly agentId: string;
+    readonly attemptId: string;
+    readonly childSessionId: string;
+    readonly effectiveToolProfileDigest: `sha256:${string}`;
+    readonly skillActivationDigest?: `sha256:${string}`;
+    readonly forceRecovery: ForceManagedAgentRecovery;
+  };
   type SpawnInput = {
     readonly callId: string;
     readonly parentSessionId: string;
     readonly signal: AbortSignal;
     readonly task: string;
+    readonly profile?: "scout.v1" | "research.v1";
+    readonly skills?: readonly string[];
+    readonly approvedSkills?: readonly {
+      readonly qualifiedId: string;
+      readonly digest: `sha256:${string}`;
+    }[];
+    readonly preserveLegacyProfile?: boolean;
     readonly mode: "foreground" | "background";
     readonly agentId?: string;
     readonly revision?: number;
@@ -1218,12 +2243,7 @@ export function createAgentManager(options: {
       { readonly type: "managed_agent_admitted" }
     >["resume"];
     readonly resumedMessages?: readonly ModelMessage[];
-    readonly onAdmitted?: (identity: {
-      readonly agentId: string;
-      readonly attemptId: string;
-      readonly childSessionId: string;
-      readonly forceRecovery: ForceManagedAgentRecovery;
-    }) => void;
+    readonly onAdmitted?: (identity: AdmittedIdentity) => void;
     readonly onManagerAdmitted?: (forceRecovery: ForceManagedAgentRecovery) => void;
   };
   const activeAttempts = new Map<
@@ -1233,7 +2253,8 @@ export function createAgentManager(options: {
       readonly controller: AbortController;
       readonly completion: Promise<ToolResult>;
       readonly forceRecovery: ForceManagedAgentRecovery;
-      readonly revision: number;
+      readonly childSessionId: string;
+      revision: number;
       cancelPromise?: Promise<ToolResult>;
     }
   >();
@@ -1245,6 +2266,488 @@ export function createAgentManager(options: {
       forceRecovery?: ForceManagedAgentRecovery;
     }
   >();
+  const coordinationStates = new Map<
+    string,
+    {
+      attentionId: string | undefined;
+      attention: Promise<void>;
+      notifyAttention: () => void;
+      readonly resetAttention: () => void;
+      reply:
+        | {
+            readonly attentionId: string;
+            readonly promise: Promise<ToolResult>;
+            readonly resolve: (result: ToolResult) => void;
+          }
+        | undefined;
+    }
+  >();
+  const childPermissionSessions = new Map<string, AgentSession>();
+  const childPermissionRequests = new Map<
+    string,
+    Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>
+  >();
+  const childPermissionQueue: RuntimeEvent[] = [];
+  let activeChildPermissionRequestId: string | undefined;
+  const publishNextChildPermission = () => {
+    if (activeChildPermissionRequestId !== undefined) {
+      return;
+    }
+    while (childPermissionQueue.length > 0) {
+      const next = childPermissionQueue.shift();
+      if (
+        next?.type !== "tool_permission_requested" ||
+        !childPermissionSessions.has(next.requestId)
+      ) {
+        continue;
+      }
+      activeChildPermissionRequestId = next.requestId;
+      options.onChildPermissionEvent?.(next);
+      return;
+    }
+  };
+  const observeChildPermissionEvent = (child: AgentSession, event: RuntimeEvent) => {
+    if (event.type === "tool_permission_requested") {
+      childPermissionSessions.set(event.requestId, child);
+      childPermissionRequests.set(event.requestId, event);
+      childPermissionQueue.push(event);
+      publishNextChildPermission();
+      return;
+    }
+    if (
+      event.type === "tool_permission_decided" &&
+      event.requestId !== undefined &&
+      event.requestId === activeChildPermissionRequestId
+    ) {
+      childPermissionSessions.delete(event.requestId);
+      childPermissionRequests.delete(event.requestId);
+      activeChildPermissionRequestId = undefined;
+      options.onChildPermissionEvent?.(event);
+      publishNextChildPermission();
+    }
+  };
+  const createCoordinationState = () => {
+    const state: {
+      attentionId: string | undefined;
+      attention: Promise<void>;
+      notifyAttention: () => void;
+      readonly resetAttention: () => void;
+      reply: undefined;
+    } = {
+      attentionId: undefined,
+      attention: Promise.resolve(),
+      notifyAttention: () => {},
+      resetAttention() {
+        const attention = Promise.withResolvers<void>();
+        state.attention = attention.promise;
+        state.notifyAttention = () => attention.resolve();
+      },
+      reply: undefined,
+    };
+    state.resetAttention();
+    return state;
+  };
+  const prepareParentMessageDelivery = async (
+    agentId: string,
+    attemptId: string,
+    childSessionId: string,
+  ) => {
+    const records = await options.managedStore.read();
+    const pending = records.flatMap((record) =>
+      record.type === "managed_agent_parent_message_enqueued" &&
+      record.agentId === agentId &&
+      record.attemptId === attemptId &&
+      !records.some(
+        (candidate) =>
+          candidate.type === "managed_agent_parent_message_delivered" &&
+          candidate.messageId === record.messageId,
+      )
+        ? [record]
+        : [],
+    );
+    const pendingReplies = records.flatMap((record) =>
+      record.type === "managed_agent_parent_reply_enqueued" &&
+      record.agentId === agentId &&
+      record.attemptId === attemptId &&
+      !records.some(
+        (candidate) =>
+          candidate.type === "managed_agent_parent_reply_delivered" &&
+          candidate.messageId === record.messageId,
+      )
+        ? [record]
+        : [],
+    );
+    return {
+      messages: pending.map((record) => ({ id: record.messageId, text: record.message })),
+      deliveries: [...pending, ...pendingReplies].map((record) => ({
+        id: record.messageId,
+        digest: managedRecordReceipt(record).digest,
+      })),
+      async acknowledge() {
+        for (const record of pending) {
+          const current = await options.managedStore.read();
+          if (
+            current.some(
+              (candidate) =>
+                candidate.type === "managed_agent_parent_message_delivered" &&
+                candidate.messageId === record.messageId,
+            )
+          ) {
+            continue;
+          }
+          await appendManagedRecord({
+            type: "managed_agent_parent_message_delivered",
+            agentId,
+            attemptId,
+            childSessionId,
+            messageId: record.messageId,
+          });
+          const active = activeAttempts.get(agentId);
+          if (active?.attemptId === attemptId) {
+            active.revision += 1;
+          }
+        }
+        for (const record of pendingReplies) {
+          const current = await options.managedStore.read();
+          if (
+            current.some(
+              (candidate) =>
+                candidate.type === "managed_agent_parent_reply_delivered" &&
+                candidate.messageId === record.messageId,
+            )
+          ) {
+            continue;
+          }
+          await appendManagedRecord({
+            type: "managed_agent_parent_reply_delivered",
+            agentId,
+            attemptId,
+            childSessionId,
+            attentionId: record.attentionId,
+            messageId: record.messageId,
+          });
+          const active = activeAttempts.get(agentId);
+          if (active?.attemptId === attemptId) {
+            active.revision += 1;
+          }
+        }
+      },
+    };
+  };
+  const childCoordinationRegistry = (input: {
+    readonly agentId: string;
+    readonly attemptId: string;
+    readonly childSessionId: string;
+    readonly allowInputRequest: boolean;
+  }): ToolRegistry => {
+    const report = createInternalToolAdapter(
+      {
+        definition: {
+          name: "report_to_parent",
+          description: "Report one bounded progress update or finding to the owning parent.",
+          inputSchema: z.toJSONSchema(managedAgentReportSchema),
+        },
+        outputSchema: z.custom<JsonValue>(),
+        effect: "delegate",
+        cancellation: "unsupported",
+        maximumResult: { maximumBytes: maximumManagedAgentResultBytes },
+        prepare(argumentsJson, identity) {
+          const parsed = managedAgentReportSchema.safeParse(parseJson(argumentsJson));
+          if (
+            !parsed.success ||
+            identity?.runId === undefined ||
+            identity.turn === undefined ||
+            identity.attempt === undefined
+          ) {
+            return toolFailure("invalid_tool_input", "Tool input is invalid.");
+          }
+          const sourceRunId = identity.runId;
+          const sourceTurn = identity.turn;
+          const sourceProviderAttempt = identity.attempt;
+          const argumentsDigest = digest(JSON.stringify(parsed.data));
+          return {
+            status: "ready",
+            permissionSubject: {
+              type: "parent_coordination",
+              operation: "report" as const,
+              parentRootId: currentParentRoot.rootId,
+              parentSessionId: boundParentSessionId,
+              agentId: input.agentId,
+              attemptId: input.attemptId,
+              childSessionId: input.childSessionId,
+              childToolCallId: identity?.callId ?? "unavailable",
+              sourceRunId,
+              sourceTurn,
+              sourceProviderAttempt,
+              messageDigest: digest(parsed.data.message),
+            },
+            async execute(context) {
+              const records = await options.managedStore.read();
+              const existing = records
+                .flatMap((record) =>
+                  record.type === "managed_agent_child_reported" ? [record] : [],
+                )
+                .find(
+                  (record) =>
+                    record.attemptId === input.attemptId &&
+                    record.childToolCallId === context.callId &&
+                    record.sourceRunId === sourceRunId &&
+                    record.sourceTurn === sourceTurn &&
+                    record.sourceProviderAttempt === sourceProviderAttempt,
+                );
+              if (existing !== undefined) {
+                return existing.argumentsDigest === argumentsDigest
+                  ? {
+                      status: "completed",
+                      output: {
+                        reportId: existing.reportId,
+                        revision: existing.sequence,
+                        record: managedRecordReceipt(existing),
+                        status: "reported",
+                      },
+                    }
+                  : toolFailure(
+                      "managed_agent_unavailable",
+                      "The child report identity was reused with different arguments.",
+                    );
+              }
+              if (
+                records.filter(
+                  (record) =>
+                    record.type === "managed_agent_child_reported" &&
+                    record.attemptId === input.attemptId,
+                ).length >= maximumManagedAgentReportsPerAttempt
+              ) {
+                return toolFailure(
+                  "managed_agent_capacity_exceeded",
+                  "The child reached its bounded parent-report count.",
+                );
+              }
+              const reportId = digest(
+                JSON.stringify({
+                  parentRootId: currentParentRoot.rootId,
+                  sourceSessionId: input.childSessionId,
+                  sourceAttemptId: input.attemptId,
+                  sourceToolCallId: context.callId,
+                  sourceRunId,
+                  sourceTurn,
+                  sourceProviderAttempt,
+                  toolName: "report_to_parent",
+                  argumentsDigest,
+                }),
+              );
+              await appendManagedRecord({
+                type: "managed_agent_child_reported",
+                agentId: input.agentId,
+                attemptId: input.attemptId,
+                childSessionId: input.childSessionId,
+                reportId,
+                childToolCallId: context.callId,
+                sourceRunId,
+                sourceTurn,
+                sourceProviderAttempt,
+                argumentsDigest,
+                kind: parsed.data.kind,
+                message: parsed.data.message,
+              });
+              const active = activeAttempts.get(input.agentId);
+              if (active?.attemptId === input.attemptId) {
+                active.revision += 1;
+              }
+              const appended = (await options.managedStore.read())
+                .flatMap((record) =>
+                  record.type === "managed_agent_child_reported" ? [record] : [],
+                )
+                .find((record) => record.reportId === reportId);
+              if (appended === undefined) {
+                return toolFailure(
+                  "managed_agent_unavailable",
+                  "The exact child report is unavailable.",
+                );
+              }
+              return {
+                status: "completed",
+                output: {
+                  reportId,
+                  revision: appended.sequence,
+                  record: managedRecordReceipt(appended),
+                  status: "reported",
+                },
+              };
+            },
+          };
+        },
+      },
+      "never",
+    );
+    const requestInput = createInternalToolAdapter(
+      {
+        definition: {
+          name: "request_parent_input",
+          description: "Request one bounded exact reply from the owning interactive parent.",
+          inputSchema: z.toJSONSchema(managedAgentRequestParentInputSchema),
+        },
+        outputSchema: z.custom<JsonValue>(),
+        effect: "delegate",
+        cancellation: "abort_signal",
+        maximumResult: { maximumBytes: maximumManagedAgentResultBytes },
+        prepare(argumentsJson, identity) {
+          const parsed = managedAgentRequestParentInputSchema.safeParse(parseJson(argumentsJson));
+          if (
+            !parsed.success ||
+            identity?.runId === undefined ||
+            identity.turn === undefined ||
+            identity.attempt === undefined
+          ) {
+            return toolFailure("invalid_tool_input", "Tool input is invalid.");
+          }
+          const sourceRunId = identity.runId;
+          const sourceTurn = identity.turn;
+          const sourceProviderAttempt = identity.attempt;
+          const argumentsDigest = digest(JSON.stringify(parsed.data));
+          return {
+            status: "ready",
+            permissionSubject: {
+              type: "parent_coordination",
+              operation: "request_input" as const,
+              parentRootId: currentParentRoot.rootId,
+              parentSessionId: boundParentSessionId,
+              agentId: input.agentId,
+              attemptId: input.attemptId,
+              childSessionId: input.childSessionId,
+              childToolCallId: identity?.callId ?? "unavailable",
+              sourceRunId,
+              sourceTurn,
+              sourceProviderAttempt,
+              messageDigest: digest(parsed.data.question),
+            },
+            async execute(context) {
+              if (!hasInteractiveParentSink()) {
+                return toolFailure(
+                  "managed_agent_unavailable",
+                  "The interactive parent reply sink is unavailable.",
+                );
+              }
+              const state = coordinationStates.get(input.attemptId);
+              const records = await options.managedStore.read();
+              const existing = records
+                .flatMap((record) =>
+                  record.type === "managed_agent_attention_requested" ? [record] : [],
+                )
+                .find(
+                  (record) =>
+                    record.attemptId === input.attemptId &&
+                    record.childToolCallId === context.callId &&
+                    record.sourceRunId === sourceRunId &&
+                    record.sourceTurn === sourceTurn &&
+                    record.sourceProviderAttempt === sourceProviderAttempt,
+                );
+              if (existing !== undefined) {
+                if (existing.argumentsDigest !== argumentsDigest) {
+                  return toolFailure(
+                    "managed_agent_unavailable",
+                    "The child attention identity was reused with different arguments.",
+                  );
+                }
+                const reply = records
+                  .flatMap((record) =>
+                    record.type === "managed_agent_parent_reply_enqueued" ? [record] : [],
+                  )
+                  .find((record) => record.attentionId === existing.attentionId);
+                if (reply !== undefined) {
+                  return {
+                    status: "completed",
+                    output: {
+                      attentionId: existing.attentionId,
+                      messageId: reply.messageId,
+                      reply: reply.message,
+                      revision: reply.sequence,
+                      attentionRecord: managedRecordReceipt(existing),
+                      replyRecord: managedRecordReceipt(reply),
+                    },
+                  };
+                }
+                if (state?.reply?.attentionId === existing.attentionId) {
+                  return state.reply.promise;
+                }
+              }
+              if (state === undefined || state.attentionId !== undefined) {
+                return toolFailure(
+                  "managed_agent_unavailable",
+                  "The child cannot open another parent-input request.",
+                );
+              }
+              const attentionId = randomUUID();
+              const effectId = digest(
+                JSON.stringify({
+                  parentRootId: currentParentRoot.rootId,
+                  sourceSessionId: input.childSessionId,
+                  sourceAttemptId: input.attemptId,
+                  sourceToolCallId: context.callId,
+                  sourceRunId,
+                  sourceTurn,
+                  sourceProviderAttempt,
+                  toolName: "request_parent_input",
+                  argumentsDigest,
+                }),
+              );
+              await appendManagedRecord({
+                type: "managed_agent_attention_requested",
+                agentId: input.agentId,
+                attemptId: input.attemptId,
+                childSessionId: input.childSessionId,
+                attentionId,
+                effectId,
+                childToolCallId: context.callId,
+                sourceRunId,
+                sourceTurn,
+                sourceProviderAttempt,
+                argumentsDigest,
+                question: parsed.data.question,
+              });
+              state.attentionId = attentionId;
+              state.notifyAttention();
+              const active = activeAttempts.get(input.agentId);
+              if (active?.attemptId === input.attemptId) {
+                active.revision += 1;
+              }
+              const reply = Promise.withResolvers<ToolResult>();
+              state.reply = {
+                attentionId,
+                promise: reply.promise,
+                resolve(result) {
+                  context.signal.removeEventListener("abort", abort);
+                  state.reply = undefined;
+                  state.attentionId = undefined;
+                  state.resetAttention();
+                  reply.resolve(result);
+                },
+              };
+              const abort = () => {
+                state.reply = undefined;
+                state.attentionId = undefined;
+                state.resetAttention();
+                reply.resolve(
+                  toolFailure(
+                    "managed_agent_cancelled",
+                    "The parent-input request ended before an exact reply.",
+                  ),
+                );
+              };
+              if (context.signal.aborted) {
+                abort();
+              } else {
+                context.signal.addEventListener("abort", abort, { once: true });
+              }
+              return reply.promise;
+            },
+          };
+        },
+      },
+      "never",
+    );
+    return createInternalToolRegistry([report, ...(input.allowInputRequest ? [requestInput] : [])]);
+  };
   const knownAgentIds = new Set<string>();
   let reservedSlots = 0;
   let reservedNewIdentities = 0;
@@ -1308,12 +2811,65 @@ export function createAgentManager(options: {
     const agentId = input.agentId ?? randomUUID();
     const attemptId = randomUUID();
     const childSessionId = randomUUID();
+    coordinationStates.set(attemptId, createCoordinationState());
     const taskDigest = digest(input.task);
-    const maximumTokens =
-      input.maximumTokens ?? scoutManagedAgentProfileV1.limits.maximumCumulativeTokens;
+    const profile = input.profile ?? "scout.v1";
+    const managedProfile =
+      profile === "research.v1" ? researchManagedAgentProfileV1 : scoutManagedAgentProfileV1;
+    if (
+      (profile === "scout.v1" && input.skills !== undefined) ||
+      (input.skills !== undefined &&
+        (input.skills.length > 8 || new Set(input.skills).size !== input.skills.length))
+    ) {
+      return toolFailure("invalid_tool_input", "The managed-child profile selection is invalid.");
+    }
+    let selectedSkillProjection:
+      | {
+          readonly context: SkillContextRecordV1;
+          readonly contents: ReadonlyMap<string, string>;
+        }
+      | undefined;
+    try {
+      selectedSkillProjection =
+        profile === "research.v1" && (input.skills?.length ?? 0) > 0
+          ? await currentResearchContext?.resolveSkills?.({
+              skills: input.skills ?? [],
+              attemptId,
+              childSessionId,
+            })
+          : undefined;
+    } catch {
+      return toolFailure(
+        "invalid_tool_input",
+        "The exact selected managed-child Skills are unavailable.",
+      );
+    }
+    if (
+      profile === "research.v1" &&
+      (input.skills?.length ?? 0) > 0 &&
+      selectedSkillProjection === undefined
+    ) {
+      return toolFailure(
+        "invalid_tool_input",
+        "The exact selected managed-child Skills are unavailable.",
+      );
+    }
+    const resolvedSkillIdentities = selectedSkillProjection?.context.active.map((activation) => ({
+      qualifiedId: activation.qualifiedId,
+      digest: activation.skillMdDigest,
+    }));
+    if (
+      input.skills !== undefined &&
+      !isDeepStrictEqual(resolvedSkillIdentities, input.approvedSkills)
+    ) {
+      return toolFailure(
+        "invalid_tool_input",
+        "The selected managed-child Skill identity changed after approval.",
+      );
+    }
+    const maximumTokens = input.maximumTokens ?? managedProfile.limits.maximumCumulativeTokens;
     const maximumDeadlineMilliseconds =
-      input.maximumDeadlineMilliseconds ??
-      scoutManagedAgentProfileV1.limits.maximumDeadlineMilliseconds;
+      input.maximumDeadlineMilliseconds ?? managedProfile.limits.maximumDeadlineMilliseconds;
     const admittedAtUnixMilliseconds =
       input.admittedAtUnixMilliseconds ?? (options.now ?? Date.now)();
     const deadlineAtUnixMilliseconds =
@@ -1328,6 +2884,8 @@ export function createAgentManager(options: {
     let terminalCommitted = false;
     let releaseChildClaim = true;
     let childClaimReleased = false;
+    let unsubscribeChildPermissions = () => {};
+    let ownedChild: AgentSession | undefined;
     const releaseClaimOnce = async (): Promise<void> => {
       if (childClaimReleased) {
         return;
@@ -1404,6 +2962,94 @@ export function createAgentManager(options: {
       },
     );
     try {
+      const readTools = createReadToolRegistry({ workspaceRoot: options.workspaceRoot });
+      const researchTools = currentResearchContext?.tools;
+      const effectiveResearchTools =
+        profile !== "research.v1" || researchTools === undefined
+          ? undefined
+          : {
+              definitions: () =>
+                researchTools
+                  ?.definitions()
+                  .filter(
+                    (definition) =>
+                      definition.name !== "read_skill_resource" ||
+                      selectedSkillProjection !== undefined,
+                  ) ?? [],
+              resolve(name: string) {
+                if (name === "read_skill_resource" && selectedSkillProjection === undefined) {
+                  return undefined;
+                }
+                const adapter = researchTools.resolve(name);
+                if (adapter === undefined || (name !== "web_search" && name !== "web_fetch")) {
+                  return adapter;
+                }
+                const wrapped: ToolAdapter = {
+                  ...adapter,
+                  prepare(argumentsJson) {
+                    const prepared = adapter.prepare(argumentsJson);
+                    if (
+                      prepared.status !== "ready" ||
+                      prepared.permissionSubject.type !== "web_request"
+                    ) {
+                      return prepared;
+                    }
+                    const subject = prepared.permissionSubject;
+                    return {
+                      ...prepared,
+                      permissionSubject: {
+                        type: "managed_agent_web_request",
+                        operation: subject.operation,
+                        parentRootId: currentParentRoot.rootId,
+                        parentSessionId: boundParentSessionId,
+                        agentId,
+                        attemptId,
+                        childSessionId,
+                        profile: "research.v1",
+                        providerOrigin: subject.providerOrigin,
+                        queryOrUrl: subject.operation === "search" ? subject.query : subject.url,
+                        argumentsDigest: digest(JSON.stringify(parseJson(argumentsJson))),
+                      },
+                    };
+                  },
+                };
+                return wrapped;
+              },
+            };
+      const coordinationTools =
+        options.parentCoordination === undefined
+          ? undefined
+          : childCoordinationRegistry({
+              agentId,
+              attemptId,
+              childSessionId,
+              allowInputRequest: input.mode === "background" && hasInteractiveParentSink(),
+            });
+      const registries = [
+        readTools,
+        ...(effectiveResearchTools === undefined ? [] : [effectiveResearchTools]),
+        ...(coordinationTools === undefined ? [] : [coordinationTools]),
+      ];
+      const childDefinitions = registries.flatMap((registry) => registry.definitions());
+      if (
+        new Set(childDefinitions.map((definition) => definition.name)).size !==
+        childDefinitions.length
+      ) {
+        throw new TypeError("The effective managed-child Tool Profile contains duplicate names.");
+      }
+      const childTools: ToolRegistry = {
+        definitions: () => childDefinitions,
+        resolve: (name) =>
+          registries.find((registry) => registry.resolve(name) !== undefined)?.resolve(name),
+      };
+      const childPromptContext =
+        selectedSkillProjection === undefined
+          ? createPromptContextV1(childTools, currentResearchContext?.repository)
+          : createPromptContextV2(
+              childTools,
+              currentResearchContext?.repository ?? createPromptContextV1(undefined).repository,
+              selectedSkillProjection.context,
+            );
       await appendManagedRecord({
         type: "managed_agent_admitted",
         agentId,
@@ -1413,11 +3059,24 @@ export function createAgentManager(options: {
         parentToolCallId: input.callId,
         parentRootId: currentParentRoot.rootId,
         projectId: options.projectId,
-        profile: "scout.v1",
+        profile,
         mode: input.mode,
-        profileDigest: scoutManagedAgentProfileV1.digest,
+        profileDigest: managedProfile.digest,
+        ...(input.preserveLegacyProfile === true
+          ? {}
+          : { effectiveToolProfileDigest: childPromptContext.toolProfile.digest }),
+        ...(selectedSkillProjection === undefined
+          ? {}
+          : {
+              skillActivationDigest: selectedSkillProjection.context.activationDigest,
+              selectedSkills: selectedSkillProjection.context.active.map((activation) => ({
+                qualifiedId: activation.qualifiedId,
+                skillMdDigest: activation.skillMdDigest,
+                manifestDigest: activation.manifest.digest,
+              })),
+            }),
         limits: {
-          maximumTurns: scoutManagedAgentProfileV1.limits.maximumTurnsPerAttempt,
+          maximumTurns: managedProfile.limits.maximumTurnsPerAttempt,
           maximumTokens,
           maximumDeadlineMilliseconds,
         },
@@ -1428,12 +3087,12 @@ export function createAgentManager(options: {
         childInputDigest: digest(childTaskMessage(input.task)),
         targetIdentity: options.targetIdentity,
         ...(options.thinkingPolicy === undefined ? {} : { thinkingPolicy: options.thinkingPolicy }),
-        ...(options.repository === undefined
+        ...(currentResearchContext?.repository === undefined
           ? {}
           : {
               repository: {
-                revision: options.repository.revision,
-                effectiveDigest: options.repository.effectiveDigest,
+                revision: currentResearchContext.repository.revision,
+                effectiveDigest: currentResearchContext.repository.effectiveDigest,
               },
             }),
       });
@@ -1443,8 +3102,6 @@ export function createAgentManager(options: {
         await commitDeadlineExpiration();
       }
       const childStore = await options.childSessionStores.create(childSessionId);
-      const childTools = createReadToolRegistry({ workspaceRoot: options.workspaceRoot });
-      const childPromptContext = createPromptContextV1(childTools, options.repository);
       await childStore.append({
         schemaVersion: 3,
         sequence: 1,
@@ -1456,18 +3113,37 @@ export function createAgentManager(options: {
           targetIdentity: options.targetIdentity,
           contextProfile: options.childContextProfile,
           promptContext: childPromptContext,
+          ...(selectedSkillProjection === undefined
+            ? {}
+            : { skillContext: selectedSkillProjection.context }),
         },
       });
       const initialMessages: ModelMessage[] = [
         {
           role: "developer",
           content:
-            "Managed child profile scout.v1. Work only on the exact delegated task. Use repository reads only. Do not write, execute, use Web or MCP, select Skills, access extensions, spawn, coordinate with peers, or change model and permission authority.",
+            profile === "research.v1"
+              ? "Managed child profile research.v1. Work only on the exact delegated research task with the admitted repository reads, selected Skills, Web evidence, and parent-only coordination. Do not write, execute, use MCP, access ambient extensions, spawn, coordinate with peers, or change model and permission authority."
+              : "Managed child profile scout.v1. Work only on the exact delegated task. Use repository reads only. Do not write, execute, use Web or MCP, select Skills, access extensions, spawn, coordinate with peers, or change model and permission authority.",
         },
         ...(input.resumedMessages ?? []),
       ];
       const childPermissions: PermissionPolicy = {
         decide(permission) {
+          if (permission.subject.type === "parent_coordination") {
+            return options.parentCoordination === undefined ? "deny" : "allow";
+          }
+          if (permission.subject.type === "managed_agent_web_request") {
+            if (profile !== "research.v1") {
+              return "deny";
+            }
+            const decision = options.parentPermissions.decide(permission);
+            return decision === "ask" && options.onChildPermissionEvent === undefined
+              ? "deny"
+              : decision === "ask" && !hasInteractiveParentSink()
+                ? "deny"
+                : decision;
+          }
           if (permission.effect !== "read") {
             return "deny";
           }
@@ -1485,10 +3161,38 @@ export function createAgentManager(options: {
           nextSequence: 2,
           projectId: options.projectId,
           promptContext: childPromptContext,
+          ...(selectedSkillProjection === undefined
+            ? {}
+            : {
+                skillContext: selectedSkillProjection.context,
+                activeSkillContents: selectedSkillProjection.contents,
+              }),
           repositoryWorkspaceRoot: options.workspaceRoot,
-          authorizeProjectContextLoad: async () => true,
+          ...(currentResearchContext?.authorizeProjectContextLoad === undefined
+            ? {}
+            : {
+                authorizeProjectContextLoad: currentResearchContext.authorizeProjectContextLoad,
+              }),
+          ...(currentResearchContext?.extensionSkillSources === undefined
+            ? {}
+            : { extensionSkillSources: currentResearchContext.extensionSkillSources }),
+          ...(currentResearchContext?.withCurrentExtensionSkillSources === undefined
+            ? {}
+            : {
+                withCurrentExtensionSkillSources:
+                  currentResearchContext.withCurrentExtensionSkillSources,
+              }),
           afterLogicalRunStarted: () => {
-            input.onAdmitted?.({ agentId, attemptId, childSessionId, forceRecovery });
+            input.onAdmitted?.({
+              agentId,
+              attemptId,
+              childSessionId,
+              effectiveToolProfileDigest: childPromptContext.toolProfile.digest,
+              ...(selectedSkillProjection === undefined
+                ? {}
+                : { skillActivationDigest: selectedSkillProjection.context.activationDigest }),
+              forceRecovery,
+            });
           },
           sessionId: childSessionId,
           targetIdentity: options.targetIdentity,
@@ -1496,8 +3200,14 @@ export function createAgentManager(options: {
             ? {}
             : { thinkingPolicy: options.thinkingPolicy }),
         },
+        [managedAgentRequestBoundary]: () =>
+          prepareParentMessageDelivery(agentId, attemptId, childSessionId),
       };
       const child = new AgentSession(childDependencies);
+      ownedChild = child;
+      unsubscribeChildPermissions = child.subscribe((event) =>
+        observeChildPermissionEvent(child, event),
+      );
       const result = await child.run(
         {
           text: childTaskMessage(input.task),
@@ -1505,7 +3215,7 @@ export function createAgentManager(options: {
         {
           signal: childController.signal,
           limits: {
-            maxTurns: scoutManagedAgentProfileV1.limits.maximumTurnsPerAttempt,
+            maxTurns: managedProfile.limits.maximumTurnsPerAttempt,
             maxTokens: maximumTokens,
           },
         },
@@ -1595,8 +3305,12 @@ export function createAgentManager(options: {
       ) => ({
         agentId,
         attemptId,
-        profile: "scout.v1" as const,
-        profileDigest: scoutManagedAgentProfileV1.digest,
+        profile,
+        profileDigest: managedProfile.digest,
+        effectiveToolProfileDigest: childPromptContext.toolProfile.digest,
+        ...(selectedSkillProjection === undefined
+          ? {}
+          : { skillActivationDigest: selectedSkillProjection.context.activationDigest }),
         status: "completed" as const,
         result: terminalResult,
         targetIdentity: options.targetIdentity,
@@ -1739,6 +3453,38 @@ export function createAgentManager(options: {
         "The foreground scout could not be started safely.",
       );
     } finally {
+      for (const [requestId, child] of childPermissionSessions) {
+        if (child === ownedChild) {
+          const request = childPermissionRequests.get(requestId);
+          const surfaced = activeChildPermissionRequestId === requestId;
+          child.decidePermission({ requestId, decision: "deny" });
+          childPermissionSessions.delete(requestId);
+          childPermissionRequests.delete(requestId);
+          if (surfaced && request !== undefined) {
+            options.onChildPermissionEvent?.({
+              type: "tool_permission_decided",
+              callId: request.callId,
+              name: request.name,
+              decision: "deny",
+              requestId,
+              effect: request.effect,
+              scope: request.scope,
+              subject: request.subject,
+              ...(request.changePreviewRef === undefined
+                ? {}
+                : { changePreviewRef: request.changePreviewRef }),
+            });
+          }
+        }
+      }
+      unsubscribeChildPermissions();
+      if (
+        activeChildPermissionRequestId !== undefined &&
+        !childPermissionSessions.has(activeChildPermissionRequestId)
+      ) {
+        activeChildPermissionRequestId = undefined;
+        publishNextChildPermission();
+      }
       deadline.cancel();
       input.signal.removeEventListener("abort", abortFromCaller);
       if (releaseChildClaim) {
@@ -1761,18 +3507,8 @@ export function createAgentManager(options: {
     } else {
       input.signal.addEventListener("abort", abortFromCaller, { once: true });
     }
-    let resolveAdmission: (identity: {
-      readonly agentId: string;
-      readonly attemptId: string;
-      readonly childSessionId: string;
-      readonly forceRecovery: ForceManagedAgentRecovery;
-    }) => void = () => {};
-    const admitted = new Promise<{
-      readonly agentId: string;
-      readonly attemptId: string;
-      readonly childSessionId: string;
-      readonly forceRecovery: ForceManagedAgentRecovery;
-    }>((resolve) => {
+    let resolveAdmission: (identity: AdmittedIdentity) => void = () => {};
+    const admitted = new Promise<AdmittedIdentity>((resolve) => {
       resolveAdmission = resolve;
     });
     const pendingId = Symbol("managed-agent-background-admission");
@@ -1816,18 +3552,22 @@ export function createAgentManager(options: {
     }
     pendingAdmissions.delete(pendingId);
     releaseAdmissionReservation(newIdentity);
+    const admittedRevision = (await options.managedStore.read()).filter(
+      (record) => record.agentId === identity.agentId,
+    ).length;
     activeAttempts.set(identity.agentId, {
       attemptId: identity.attemptId,
+      childSessionId: identity.childSessionId,
       controller,
       completion,
       forceRecovery: identity.forceRecovery,
-      revision: input.revision ?? 1,
+      revision: admittedRevision,
     });
     knownAgentIds.add(identity.agentId);
     input.signal.removeEventListener("abort", abortFromCaller);
     if (managerClosing) {
       try {
-        await manager.cancel({ agentId: identity.agentId, expectedRevision: input.revision ?? 1 });
+        await manager.cancel({ agentId: identity.agentId, expectedRevision: admittedRevision });
       } finally {
         activeAttempts.delete(identity.agentId);
       }
@@ -1846,10 +3586,20 @@ export function createAgentManager(options: {
         agentId: identity.agentId,
         attemptId: identity.attemptId,
         childSessionId: identity.childSessionId,
-        profile: "scout.v1",
+        profile: input.profile ?? "scout.v1",
+        profileDigest:
+          input.profile === "research.v1"
+            ? researchManagedAgentProfileV1.digest
+            : scoutManagedAgentProfileV1.digest,
+        ...(identity.effectiveToolProfileDigest === undefined
+          ? {}
+          : { effectiveToolProfileDigest: identity.effectiveToolProfileDigest }),
+        ...(identity.skillActivationDigest === undefined
+          ? {}
+          : { skillActivationDigest: identity.skillActivationDigest }),
         mode: "background",
         status: "running",
-        revision: input.revision ?? 1,
+        revision: admittedRevision,
       },
     };
   };
@@ -1867,18 +3617,8 @@ export function createAgentManager(options: {
     } else {
       input.signal.addEventListener("abort", abortFromCaller, { once: true });
     }
-    let resolveAdmission: (identity: {
-      readonly agentId: string;
-      readonly attemptId: string;
-      readonly childSessionId: string;
-      readonly forceRecovery: ForceManagedAgentRecovery;
-    }) => void = () => {};
-    const admitted = new Promise<{
-      readonly agentId: string;
-      readonly attemptId: string;
-      readonly childSessionId: string;
-      readonly forceRecovery: ForceManagedAgentRecovery;
-    }>((resolve) => {
+    let resolveAdmission: (identity: AdmittedIdentity) => void = () => {};
+    const admitted = new Promise<AdmittedIdentity>((resolve) => {
       resolveAdmission = resolve;
     });
     const pendingId = Symbol("managed-agent-foreground-admission");
@@ -1922,12 +3662,16 @@ export function createAgentManager(options: {
     }
     pendingAdmissions.delete(pendingId);
     releaseAdmissionReservation(true);
+    const admittedRevision = (await options.managedStore.read()).filter(
+      (record) => record.agentId === identity.agentId,
+    ).length;
     activeAttempts.set(identity.agentId, {
       attemptId: identity.attemptId,
+      childSessionId: identity.childSessionId,
       controller,
       completion,
       forceRecovery: identity.forceRecovery,
-      revision: 1,
+      revision: admittedRevision,
     });
     knownAgentIds.add(identity.agentId);
     try {
@@ -1948,7 +3692,10 @@ export function createAgentManager(options: {
       const ids = [...knownAgentIds].sort();
       const active = activeAttempts.size;
       const completed = ids.length - active;
-      const prefix = `Managed agents: ${active} active, ${completed} completed, 0 need attention; IDs: `;
+      const attention = [...coordinationStates.values()].filter(
+        (state) => state.attentionId !== undefined,
+      ).length;
+      const prefix = `Managed agents: ${active} active, ${completed} completed, ${attention} need attention; IDs: `;
       let summary = prefix;
       for (const id of ids) {
         const next = `${summary === prefix ? "" : ", "}${id}`;
@@ -1959,11 +3706,36 @@ export function createAgentManager(options: {
       }
       return summary;
     },
+    selectedSkillIdentities(skills) {
+      const available = new Map(
+        (currentResearchContext?.skillIdentities ?? []).map((entry) => [entry.qualifiedId, entry]),
+      );
+      const selected = skills.flatMap((skill) => {
+        const entry = available.get(skill);
+        return entry === undefined ? [] : [entry];
+      });
+      return selected.length === skills.length ? selected : undefined;
+    },
+    decidePermission(command) {
+      const child = childPermissionSessions.get(command.requestId);
+      return (
+        child?.decidePermission(command) ?? {
+          status: "rejected",
+          error: {
+            code: "permission_request_not_pending",
+            message: "The child permission request is not pending.",
+          },
+        }
+      );
+    },
     rebindParentRoot(parentRoot) {
       if (parentRoot.rootId !== manager.parentRootId) {
         throw new TypeError("The managed-child parent root cannot change.");
       }
       currentParentRoot = parentRoot;
+    },
+    rebindResearchContext(context) {
+      currentResearchContext = context;
     },
     spawnForeground,
     spawnBackground,
@@ -1991,10 +3763,10 @@ export function createAgentManager(options: {
           return true;
         }
         if (input.status === "active") {
-          return agent.status === "running";
+          return agent.status === "running" || agent.status === "waiting_for_parent";
         }
         if (input.status === "terminal") {
-          return agent.status !== "running";
+          return agent.status !== "running" && agent.status !== "waiting_for_parent";
         }
         return agent.status === input.status;
       });
@@ -2111,12 +3883,15 @@ export function createAgentManager(options: {
       );
       const deadlineAtUnixMilliseconds = admissions[0]?.deadlineAtUnixMilliseconds;
       const followUpNow = (options.now ?? Date.now)();
+      const followUpProfile =
+        latest?.profile === "research.v1"
+          ? researchManagedAgentProfileV1
+          : scoutManagedAgentProfileV1;
       const remainingDeadlineMilliseconds =
         deadlineAtUnixMilliseconds === undefined
-          ? scoutManagedAgentProfileV1.limits.maximumDeadlineMilliseconds
+          ? followUpProfile.limits.maximumDeadlineMilliseconds
           : deadlineAtUnixMilliseconds - followUpNow;
-      const remainingTokens =
-        scoutManagedAgentProfileV1.limits.maximumCumulativeTokens - cumulativeTokens;
+      const remainingTokens = followUpProfile.limits.maximumCumulativeTokens - cumulativeTokens;
       const sourceRecords = attemptHistories.at(-1)?.childRecords ?? [];
       const replayBoundary = managedReplayBoundary(sourceRecords);
       const resumedMessages = replayBoundary.messages;
@@ -2155,10 +3930,319 @@ export function createAgentManager(options: {
         admittedAtUnixMilliseconds: followUpNow,
         maximumDeadlineMilliseconds: remainingDeadlineMilliseconds,
         maximumTokens: remainingTokens,
+        ...(latest === undefined
+          ? {}
+          : {
+              profile: latest.profile,
+              ...(latest.selectedSkills === undefined
+                ? {}
+                : {
+                    skills: latest.selectedSkills.map((skill) => skill.qualifiedId),
+                    approvedSkills: latest.selectedSkills.map((skill) => ({
+                      qualifiedId: skill.qualifiedId,
+                      digest: skill.skillMdDigest,
+                    })),
+                  }),
+              ...(latest.effectiveToolProfileDigest === undefined
+                ? { preserveLegacyProfile: true }
+                : {}),
+            }),
         ...(resume === undefined ? {} : { resume }),
         resumedMessages,
         revision: expectedRevision + 1,
       });
+    },
+    async send(input) {
+      const active = activeAttempts.get(input.agentId);
+      const argumentsDigest = digest(
+        JSON.stringify({
+          agentId: input.agentId,
+          expectedRevision: input.expectedRevision,
+          message: input.message,
+          ...(input.attentionId === undefined ? {} : { attentionId: input.attentionId }),
+        }),
+      );
+      const records = await options.managedStore.read();
+      const existingReply = records
+        .flatMap((record) =>
+          record.type === "managed_agent_parent_reply_enqueued" ? [record] : [],
+        )
+        .find(
+          (record) =>
+            record.agentId === input.agentId &&
+            record.parentToolCallId === input.callId &&
+            record.sourceRunId === input.sourceRunId &&
+            record.sourceTurn === input.sourceTurn &&
+            record.sourceProviderAttempt === input.sourceProviderAttempt,
+        );
+      if (existingReply !== undefined) {
+        if (existingReply.argumentsDigest !== argumentsDigest) {
+          return toolFailure(
+            "managed_agent_unavailable",
+            "The parent reply identity was reused with different arguments.",
+          );
+        }
+        const activeState = coordinationStates.get(existingReply.attemptId);
+        const replyRevision = records.filter(
+          (record) =>
+            record.agentId === existingReply.agentId && record.sequence <= existingReply.sequence,
+        ).length;
+        const attentionRecord = records.find(
+          (record) =>
+            record.type === "managed_agent_attention_requested" &&
+            record.attentionId === existingReply.attentionId,
+        );
+        if (
+          activeState?.reply?.attentionId === existingReply.attentionId &&
+          attentionRecord?.type === "managed_agent_attention_requested"
+        ) {
+          activeState.reply.resolve({
+            status: "completed",
+            output: {
+              attentionId: existingReply.attentionId,
+              messageId: existingReply.messageId,
+              reply: existingReply.message,
+              revision: replyRevision,
+              attentionRecord: managedRecordReceipt(attentionRecord),
+              replyRecord: managedRecordReceipt(existingReply),
+            },
+          });
+        }
+        return {
+          status: "completed",
+          output: {
+            agentId: existingReply.agentId,
+            attemptId: existingReply.attemptId,
+            attentionId: existingReply.attentionId,
+            messageId: existingReply.messageId,
+            delivery: records.some(
+              (record) =>
+                record.type === "managed_agent_parent_reply_delivered" &&
+                record.messageId === existingReply.messageId,
+            )
+              ? "delivered"
+              : "enqueued",
+            revision: records.filter((record) => record.agentId === input.agentId).length,
+            record: managedRecordReceipt(existingReply),
+          },
+        };
+      }
+      const existing = records
+        .flatMap((record) =>
+          record.type === "managed_agent_parent_message_enqueued" ? [record] : [],
+        )
+        .find(
+          (record) =>
+            record.agentId === input.agentId &&
+            record.parentToolCallId === input.callId &&
+            record.sourceRunId === input.sourceRunId &&
+            record.sourceTurn === input.sourceTurn &&
+            record.sourceProviderAttempt === input.sourceProviderAttempt,
+        );
+      if (existing !== undefined) {
+        if (existing.argumentsDigest !== argumentsDigest) {
+          return toolFailure(
+            "managed_agent_unavailable",
+            "The parent message identity was reused with different arguments.",
+          );
+        }
+        const delivered = records.some(
+          (record) =>
+            record.type === "managed_agent_parent_message_delivered" &&
+            record.messageId === existing.messageId,
+        );
+        return {
+          status: "completed",
+          output: {
+            agentId: existing.agentId,
+            attemptId: existing.attemptId,
+            messageId: existing.messageId,
+            delivery: delivered ? "delivered" : "enqueued",
+            revision: records.filter((record) => record.agentId === input.agentId).length,
+            record: managedRecordReceipt(existing),
+          },
+        };
+      }
+      if (input.attentionId !== undefined) {
+        const state = active === undefined ? undefined : coordinationStates.get(active.attemptId);
+        if (
+          active === undefined ||
+          input.expectedRevision !== active.revision ||
+          state?.attentionId !== input.attentionId ||
+          state.reply?.attentionId !== input.attentionId
+        ) {
+          return toolFailure(
+            "invalid_tool_input",
+            "The managed child attention identity or revision is stale.",
+          );
+        }
+        const messageId = digest(
+          JSON.stringify({
+            parentRootId: manager.parentRootId,
+            parentSessionId: manager.parentSessionId,
+            attemptId: active.attemptId,
+            callId: input.callId,
+            toolName: "send_agent_message",
+            argumentsDigest,
+            ...(input.sourceRunId === undefined
+              ? {}
+              : {
+                  sourceRunId: input.sourceRunId,
+                  sourceTurn: input.sourceTurn,
+                  sourceProviderAttempt: input.sourceProviderAttempt,
+                }),
+          }),
+        );
+        try {
+          await appendManagedRecord({
+            type: "managed_agent_parent_reply_enqueued",
+            agentId: input.agentId,
+            attemptId: active.attemptId,
+            childSessionId: active.childSessionId,
+            attentionId: input.attentionId,
+            messageId,
+            parentToolCallId: input.callId,
+            expectedRevision: input.expectedRevision,
+            ...(input.sourceRunId === undefined
+              ? {}
+              : {
+                  sourceRunId: input.sourceRunId,
+                  sourceTurn: input.sourceTurn,
+                  sourceProviderAttempt: input.sourceProviderAttempt,
+                }),
+            argumentsDigest,
+            message: input.message,
+          });
+        } catch {
+          return toolFailure(
+            "invalid_tool_input",
+            "The managed child revision changed before the reply became durable.",
+          );
+        }
+        active.revision += 1;
+        const replyRecord = (await options.managedStore.read()).find(
+          (record) =>
+            record.type === "managed_agent_parent_reply_enqueued" && record.messageId === messageId,
+        );
+        if (replyRecord?.type !== "managed_agent_parent_reply_enqueued") {
+          return toolFailure("managed_agent_unavailable", "The exact parent reply is unavailable.");
+        }
+        const attentionRecord = records.find(
+          (record) =>
+            record.type === "managed_agent_attention_requested" &&
+            record.attentionId === input.attentionId,
+        );
+        if (attentionRecord?.type !== "managed_agent_attention_requested") {
+          return toolFailure(
+            "managed_agent_unavailable",
+            "The exact attention record is unavailable.",
+          );
+        }
+        state.reply.resolve({
+          status: "completed",
+          output: {
+            attentionId: input.attentionId,
+            messageId,
+            reply: input.message,
+            revision: active.revision,
+            attentionRecord: managedRecordReceipt(attentionRecord),
+            replyRecord: managedRecordReceipt(replyRecord),
+          },
+        });
+        return {
+          status: "completed",
+          output: {
+            agentId: input.agentId,
+            attemptId: active.attemptId,
+            attentionId: input.attentionId,
+            messageId,
+            delivery: "enqueued",
+            revision: active.revision,
+            record: managedRecordReceipt(replyRecord),
+          },
+        };
+      }
+      if (
+        active === undefined ||
+        input.expectedRevision !== active.revision ||
+        coordinationStates.get(active.attemptId)?.attentionId !== undefined ||
+        records.filter(
+          (record) =>
+            record.type === "managed_agent_parent_message_enqueued" &&
+            record.attemptId === active.attemptId &&
+            !records.some(
+              (candidate) =>
+                candidate.type === "managed_agent_parent_message_delivered" &&
+                candidate.messageId === record.messageId,
+            ),
+        ).length >= 4
+      ) {
+        return toolFailure(
+          "invalid_tool_input",
+          "The managed child identity, revision, or ordinary-message shape is invalid.",
+        );
+      }
+      const messageId = digest(
+        JSON.stringify({
+          parentRootId: manager.parentRootId,
+          parentSessionId: manager.parentSessionId,
+          attemptId: active.attemptId,
+          callId: input.callId,
+          toolName: "send_agent_message",
+          argumentsDigest,
+          ...(input.sourceRunId === undefined
+            ? {}
+            : {
+                sourceRunId: input.sourceRunId,
+                sourceTurn: input.sourceTurn,
+                sourceProviderAttempt: input.sourceProviderAttempt,
+              }),
+        }),
+      );
+      try {
+        await appendManagedRecord({
+          type: "managed_agent_parent_message_enqueued",
+          agentId: input.agentId,
+          attemptId: active.attemptId,
+          childSessionId: active.childSessionId,
+          messageId,
+          parentToolCallId: input.callId,
+          expectedRevision: input.expectedRevision,
+          ...(input.sourceRunId === undefined
+            ? {}
+            : {
+                sourceRunId: input.sourceRunId,
+                sourceTurn: input.sourceTurn,
+                sourceProviderAttempt: input.sourceProviderAttempt,
+              }),
+          argumentsDigest,
+          message: input.message,
+        });
+      } catch {
+        return toolFailure(
+          "invalid_tool_input",
+          "The managed child revision changed before the message became durable.",
+        );
+      }
+      active.revision += 1;
+      const enqueuedRecord = (await options.managedStore.read()).find(
+        (record) =>
+          record.type === "managed_agent_parent_message_enqueued" && record.messageId === messageId,
+      );
+      if (enqueuedRecord?.type !== "managed_agent_parent_message_enqueued") {
+        return toolFailure("managed_agent_unavailable", "The exact parent message is unavailable.");
+      }
+      return {
+        status: "completed",
+        output: {
+          agentId: input.agentId,
+          attemptId: active.attemptId,
+          messageId,
+          delivery: "enqueued",
+          revision: active.revision,
+          record: managedRecordReceipt(enqueuedRecord),
+        },
+      };
     },
     async wait(input) {
       const snapshot = await manager.snapshot();
@@ -2175,16 +4259,35 @@ export function createAgentManager(options: {
         );
       }
       const conditionMet =
-        input.until === "any_terminal"
+        input.until === "attention"
           ? input.agentIds.some((agentId) => byId.get(agentId)?.status !== "running")
-          : input.agentIds.every((agentId) => byId.get(agentId)?.status !== "running");
+          : input.until === "any_terminal"
+            ? input.agentIds.some((agentId) => {
+                const status = byId.get(agentId)?.status;
+                return status !== "running" && status !== "waiting_for_parent";
+              })
+            : input.agentIds.every((agentId) => {
+                const status = byId.get(agentId)?.status;
+                return status !== "running" && status !== "waiting_for_parent";
+              });
       if (conditionMet) {
         return manager.list();
       }
-      const completions = input.agentIds.flatMap((agentId) => {
-        const completion = activeAttempts.get(agentId)?.completion;
-        return completion === undefined ? [] : [completion];
-      });
+      const completions: Promise<unknown>[] = [];
+      for (const agentId of input.agentIds) {
+        const active = activeAttempts.get(agentId);
+        if (active === undefined) {
+          continue;
+        }
+        if (input.until === "attention") {
+          const attention = coordinationStates.get(active.attemptId)?.attention;
+          if (attention !== undefined) {
+            completions.push(Promise.race([attention, active.completion]));
+          }
+        } else {
+          completions.push(active.completion);
+        }
+      }
       if (completions.length === 0) {
         return toolFailure(
           "managed_agent_unavailable",
@@ -2201,7 +4304,7 @@ export function createAgentManager(options: {
         input.signal.addEventListener("abort", resolveAbort, { once: true });
       }
       const settlement =
-        input.until === "any_terminal"
+        input.until === "any_terminal" || input.until === "attention"
           ? Promise.race(completions).then(() => "settled" as const)
           : Promise.allSettled(completions).then(() => "settled" as const);
       const outcome = await Promise.race([settlement, aborted]);
@@ -2297,21 +4400,28 @@ export function createAgentManager(options: {
 
 export function createManagedAgentToolRegistry(options: {
   readonly manager: AgentManager;
-  readonly profile?: "managed-agent-tools.a1.v1" | "managed-agent-tools.a2-long-lived.v1";
+  readonly profile?:
+    | "managed-agent-tools.a1.v1"
+    | "managed-agent-tools.a2-long-lived.v1"
+    | "managed-agent-tools.a3-long-lived.v1";
 }): ToolRegistry {
   const profile = options.profile ?? "managed-agent-tools.a1.v1";
   const spawnSchema =
-    profile === "managed-agent-tools.a2-long-lived.v1"
-      ? managedAgentA2SpawnSchema
-      : managedAgentTaskSchema;
+    profile === "managed-agent-tools.a3-long-lived.v1"
+      ? managedAgentA3SpawnSchema
+      : profile === "managed-agent-tools.a2-long-lived.v1"
+        ? managedAgentA2SpawnSchema
+        : managedAgentTaskSchema;
   const adapter = createInternalToolAdapter(
     {
       definition: {
         name: "spawn_agent",
         description:
-          profile === "managed-agent-tools.a2-long-lived.v1"
-            ? "Start one foreground or same-process background read-only scout. Background requires the long-lived interactive session host; the scout cannot write, execute, spawn, inherit extensions, or change its model or permissions."
-            : "Run one foreground read-only scout with fresh bounded context. It cannot run in background, select Skills, write, execute, spawn, inherit extensions, or change its model or permissions.",
+          profile === "managed-agent-tools.a3-long-lived.v1"
+            ? "Start one single-level managed child with a code-owned non-mutating profile. The child cannot spawn peers, write or execute, inherit ambient extensions, or change its model or permissions."
+            : profile === "managed-agent-tools.a2-long-lived.v1"
+              ? "Start one foreground or same-process background read-only scout. Background requires the long-lived interactive session host; the scout cannot write, execute, spawn, inherit extensions, or change its model or permissions."
+              : "Run one foreground read-only scout with fresh bounded context. It cannot run in background, select Skills, write, execute, spawn, inherit extensions, or change its model or permissions.",
         inputSchema: z.toJSONSchema(spawnSchema),
       },
       outputSchema: z.union([
@@ -2320,10 +4430,19 @@ export function createManagedAgentToolRegistry(options: {
           agentId: z.string().uuid(),
           attemptId: z.string().uuid(),
           childSessionId: z.string().uuid(),
-          profile: z.literal("scout.v1"),
+          profile: z.enum(["scout.v1", "research.v1"]),
+          profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+          effectiveToolProfileDigest: z
+            .string()
+            .regex(/^sha256:[0-9a-f]{64}$/u)
+            .optional(),
+          skillActivationDigest: z
+            .string()
+            .regex(/^sha256:[0-9a-f]{64}$/u)
+            .optional(),
           mode: z.literal("background"),
           status: z.literal("running"),
-          revision: z.literal(1),
+          revision: z.number().int().positive(),
         }),
       ]) as z.ZodType<JsonValue>,
       effect: "delegate",
@@ -2334,14 +4453,28 @@ export function createManagedAgentToolRegistry(options: {
         if (!parsed.success) {
           return toolFailure("invalid_tool_input", "Tool input is invalid.");
         }
+        const a3Input =
+          profile === "managed-agent-tools.a3-long-lived.v1"
+            ? managedAgentA3SpawnSchema.parse(parsed.data)
+            : undefined;
+        const selectedSkillIdentities =
+          a3Input?.skills === undefined
+            ? undefined
+            : options.manager.selectedSkillIdentities(a3Input.skills);
+        if (a3Input?.skills !== undefined && selectedSkillIdentities === undefined) {
+          return toolFailure(
+            "invalid_tool_input",
+            "The exact selected managed-child Skills are unavailable.",
+          );
+        }
         return {
           status: "ready",
           permissionSubject: {
             type: "managed_agent_spawn",
             parentRootId: options.manager.parentRootId,
             parentSessionId: options.manager.parentSessionId,
-            profile: "scout.v1",
-            ...(profile !== "managed-agent-tools.a2-long-lived.v1"
+            profile: a3Input?.profile ?? "scout.v1",
+            ...(profile === "managed-agent-tools.a1.v1"
               ? {}
               : {
                   mode:
@@ -2349,7 +4482,23 @@ export function createManagedAgentToolRegistry(options: {
                       ? "background"
                       : "foreground",
                 }),
-            profileDigest: scoutManagedAgentProfileV1.digest,
+            profileDigest:
+              a3Input?.profile === "research.v1"
+                ? researchManagedAgentProfileV1.digest
+                : scoutManagedAgentProfileV1.digest,
+            ...(selectedSkillIdentities === undefined
+              ? {}
+              : { selectedSkills: selectedSkillIdentities }),
+            ...(profile !== "managed-agent-tools.a3-long-lived.v1"
+              ? {}
+              : {
+                  parentCoordination: {
+                    reportToParent: true as const,
+                    requestParentInput: "mode" in parsed.data && parsed.data.mode === "background",
+                    maximumMessageBytes: 8_192 as const,
+                    maximumPendingMessages: 4 as const,
+                  },
+                }),
             targetIdentity: options.manager.targetIdentity,
             taskDigest: digest(parsed.data.task),
             limits: {
@@ -2372,6 +4521,15 @@ export function createManagedAgentToolRegistry(options: {
               parentSessionId: context.sessionId,
               signal: context.signal,
               task: parsed.data.task,
+              ...(a3Input === undefined
+                ? {}
+                : {
+                    profile: a3Input.profile,
+                    ...(a3Input.skills === undefined ? {} : { skills: a3Input.skills }),
+                    ...(selectedSkillIdentities === undefined
+                      ? {}
+                      : { approvedSkills: selectedSkillIdentities }),
+                  }),
             });
           },
         };
@@ -2456,15 +4614,25 @@ export function createManagedAgentToolRegistry(options: {
       definition: {
         name: "wait_agents",
         description:
-          "Wait causally for selected managed children to reach terminal state. Cancelling this wait does not cancel a child.",
-        inputSchema: z.toJSONSchema(managedAgentWaitSchema),
+          profile === "managed-agent-tools.a3-long-lived.v1"
+            ? "Wait causally for selected managed children to reach terminal state or request parent attention. Cancelling this wait does not cancel a child."
+            : "Wait causally for selected managed children to reach terminal state. Cancelling this wait does not cancel a child.",
+        inputSchema: z.toJSONSchema(
+          profile === "managed-agent-tools.a3-long-lived.v1"
+            ? managedAgentA3WaitSchema
+            : managedAgentWaitSchema,
+        ),
       },
       outputSchema: z.custom<JsonValue>(),
       effect: "read",
       cancellation: "abort_signal",
       maximumResult: { maximumBytes: maximumManagedAgentResultBytes },
       prepare(argumentsJson) {
-        const parsed = managedAgentWaitSchema.safeParse(parseJson(argumentsJson));
+        const parsed = (
+          profile === "managed-agent-tools.a3-long-lived.v1"
+            ? managedAgentA3WaitSchema
+            : managedAgentWaitSchema
+        ).safeParse(parseJson(argumentsJson));
         if (!parsed.success || new Set(parsed.data.agentIds).size !== parsed.data.agentIds.length) {
           return toolFailure("invalid_tool_input", "Tool input is invalid.");
         }
@@ -2527,12 +4695,73 @@ export function createManagedAgentToolRegistry(options: {
     },
     "never",
   );
+  const sendAdapter = createInternalToolAdapter(
+    {
+      definition: {
+        name: "send_agent_message",
+        description:
+          "Queue one bounded parent message for an active child. A waiting child requires its exact attention ID; enqueued or delivered does not mean the child followed it.",
+        inputSchema: z.toJSONSchema(managedAgentSendSchema),
+      },
+      outputSchema: z.custom<JsonValue>(),
+      effect: "delegate",
+      cancellation: "unsupported",
+      maximumResult: { maximumBytes: maximumManagedAgentResultBytes },
+      prepare(argumentsJson, identity) {
+        const parsed = managedAgentSendSchema.safeParse(parseJson(argumentsJson));
+        if (
+          !parsed.success ||
+          identity?.runId === undefined ||
+          identity.turn === undefined ||
+          identity.attempt === undefined
+        ) {
+          return toolFailure("invalid_tool_input", "Tool input is invalid.");
+        }
+        return {
+          status: "ready",
+          permissionSubject: {
+            type: "managed_agent_control",
+            action: "send" as const,
+            parentRootId: options.manager.parentRootId,
+            parentSessionId: options.manager.parentSessionId,
+            agentId: parsed.data.agentId,
+            expectedRevision: parsed.data.expectedRevision,
+            messageDigest: digest(parsed.data.message),
+            sourceRunId: identity.runId,
+            sourceTurn: identity.turn,
+            sourceProviderAttempt: identity.attempt,
+          },
+          execute: (context) =>
+            options.manager.send({
+              agentId: parsed.data.agentId,
+              expectedRevision: parsed.data.expectedRevision,
+              message: parsed.data.message,
+              ...(parsed.data.attentionId === undefined
+                ? {}
+                : { attentionId: parsed.data.attentionId }),
+              ...(context.sourceRunId === undefined ||
+              context.sourceTurn === undefined ||
+              context.sourceProviderAttempt === undefined
+                ? {}
+                : {
+                    sourceRunId: context.sourceRunId,
+                    sourceTurn: context.sourceTurn,
+                    sourceProviderAttempt: context.sourceProviderAttempt,
+                  }),
+              callId: context.callId,
+            }),
+        };
+      },
+    },
+    "never",
+  );
   return createInternalToolRegistry([
     adapter,
     listAdapter,
     waitAdapter,
     followUpAdapter,
     cancelAdapter,
+    ...(profile === "managed-agent-tools.a3-long-lived.v1" ? [sendAdapter] : []),
   ]);
 }
 
@@ -2546,6 +4775,24 @@ function parseJson(value: string): unknown {
 
 function digest(value: string): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function managedRecordReceipt(record: ManagedAgentRecord): {
+  readonly id: string;
+  readonly revision: number;
+  readonly digest: `sha256:${string}`;
+} {
+  const id =
+    record.type === "managed_agent_admitted"
+      ? record.attemptId
+      : record.type === "managed_agent_child_reported"
+        ? record.reportId
+        : record.type === "managed_agent_attention_requested"
+          ? record.effectId
+          : "messageId" in record
+            ? record.messageId
+            : `${record.attemptId}:${record.type}`;
+  return { id, revision: record.sequence, digest: digest(JSON.stringify(record)) };
 }
 
 function childTaskMessage(task: string): string {

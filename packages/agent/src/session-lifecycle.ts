@@ -10,6 +10,7 @@ import type {
   PermissionDecisionCommandResult,
   RunOptions,
   RunResult,
+  RuntimeEvent,
   RuntimeEventListener,
   RuntimeEventNotification,
   UserInput,
@@ -42,6 +43,7 @@ import {
   type AgentManager,
   createAgentManager,
   createManagedAgentToolRegistry,
+  type ManagedAgentResearchContext,
   type ManagedAgentSnapshot,
   type ManagedAgentStore,
   managedAgentSnapshotFromRecords,
@@ -192,6 +194,7 @@ import {
   type SessionTodoStoreInheritedRecord,
 } from "./session-store.js";
 import {
+  activateSkillContextV1,
   buildSkillResourceManifestV1,
   createInitialSkillContextV1,
   type ExtensionSkillSourceV1,
@@ -369,7 +372,10 @@ export type WorkspaceMcpLeaseTransitionBarrier = {
 export type SessionLifecycleOptions = {
   readonly extensionHost?: ExtensionHost;
   readonly modelTargets?: ModelTargets;
-  readonly managedAgentTools?: "managed-agent-tools.a1.v1" | "managed-agent-tools.a2-long-lived.v1";
+  readonly managedAgentTools?:
+    | "managed-agent-tools.a1.v1"
+    | "managed-agent-tools.a2-long-lived.v1"
+    | "managed-agent-tools.a3-long-lived.v1";
   readonly permissions?: PermissionPolicy;
   readonly preferences?: UserModelPolicyResolver;
   readonly workspaceRoot: string;
@@ -453,6 +459,10 @@ export type SessionRuntimeNotification = RuntimeEventNotification & {
 };
 
 export type SessionRuntimeNotificationListener = (notification: SessionRuntimeNotification) => void;
+export type ManagedAgentRuntimeEventListener = (input: {
+  readonly parentSessionId: string;
+  readonly event: RuntimeEvent;
+}) => void;
 
 export type RepositoryInstructionsReloadResult =
   | {
@@ -667,6 +677,14 @@ export interface SessionLifecycle {
     readonly agentId: string;
     readonly expectedRevision: number;
   }): Promise<ManagedAgentSnapshot>;
+  sendManagedAgentMessage(input: {
+    readonly sessionId: string;
+    readonly agentId: string;
+    readonly expectedRevision: number;
+    readonly callId: string;
+    readonly message: string;
+    readonly attentionId?: string;
+  }): Promise<ManagedAgentSnapshot>;
   inspectWorkspaceTrust(): Promise<WorkspaceTrustSnapshot>;
   inspectContextUsage(input: {
     readonly sessionId: string;
@@ -705,6 +723,7 @@ export interface SessionLifecycle {
   }): Promise<SessionNamingResult>;
   subscribe(listener: RuntimeEventListener): () => void;
   subscribeSessionEvents(listener: SessionRuntimeNotificationListener): () => void;
+  subscribeManagedAgentEvents?(listener: ManagedAgentRuntimeEventListener): () => void;
   subscribeMetadata(listener: SessionMetadataListener): () => void;
 }
 
@@ -853,6 +872,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   });
   const listeners = new Set<RuntimeEventListener>();
   const sessionEventListeners = new Set<SessionRuntimeNotificationListener>();
+  const managedAgentEventListeners = new Set<ManagedAgentRuntimeEventListener>();
   const metadataListeners = new Set<SessionMetadataListener>();
   let activeSession: AgentSession | undefined;
   let activeSessionSettlement: Promise<void> | undefined;
@@ -1022,7 +1042,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     if (
       options.modelTargets === undefined ||
       (managedAgentTools !== "managed-agent-tools.a1.v1" &&
-        managedAgentTools !== "managed-agent-tools.a2-long-lived.v1")
+        managedAgentTools !== "managed-agent-tools.a2-long-lived.v1" &&
+        managedAgentTools !== "managed-agent-tools.a3-long-lived.v1")
     ) {
       if (baseWithWeb === undefined) {
         throw new SessionLifecycleError("session_invalid");
@@ -1038,6 +1059,20 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         return (
           activeAgentManagers.get(sessionId)?.promptSummary() ??
           "Managed agents: 0 active, 0 completed, 0 need attention; IDs: "
+        );
+      },
+      selectedSkillIdentities(skills) {
+        return activeAgentManagers.get(sessionId)?.selectedSkillIdentities(skills);
+      },
+      decidePermission(command) {
+        return (
+          activeAgentManagers.get(sessionId)?.decidePermission(command) ?? {
+            status: "rejected",
+            error: {
+              code: "permission_request_not_pending",
+              message: "The child permission request is not pending.",
+            },
+          }
         );
       },
       async snapshot() {
@@ -1120,6 +1155,18 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             }
           : manager.followUp(input);
       },
+      async send(input) {
+        const manager = activeAgentManagers.get(sessionId);
+        return manager === undefined
+          ? {
+              status: "failed",
+              error: {
+                code: "managed_agent_unavailable",
+                message: "The managed-child host is unavailable.",
+              },
+            }
+          : manager.send(input);
+      },
       async waitForIdle() {
         await activeAgentManagers.get(sessionId)?.waitForIdle();
       },
@@ -1128,6 +1175,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       },
       rebindParentRoot(parentRoot) {
         activeAgentManagers.get(sessionId)?.rebindParentRoot(parentRoot);
+      },
+      rebindResearchContext(context) {
+        activeAgentManagers.get(sessionId)?.rebindResearchContext(context);
       },
     };
     return combineToolRegistries(
@@ -2884,7 +2934,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (
           options.managedAgentTools !== undefined &&
           !(
-            options.managedAgentTools === "managed-agent-tools.a2-long-lived.v1" &&
+            (options.managedAgentTools === "managed-agent-tools.a2-long-lived.v1" ||
+              options.managedAgentTools === "managed-agent-tools.a3-long-lived.v1") &&
             activeAgentManagers.has(input.sessionId)
           )
         ) {
@@ -2895,6 +2946,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
             ),
             input.sessionId,
+            Date.now,
+            await readSessionRecords(options, input.sessionId),
           );
         }
         const workspaceTrusted = (await inspectWorkspaceTrust()).status === "trusted";
@@ -3483,7 +3536,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           artifactStore,
           model: resolved.driver,
           store: store as unknown as SessionStore,
-          ...(first.record.managedAgentTools !== "managed-agent-tools.a2-long-lived.v1"
+          ...(first.record.managedAgentTools !== "managed-agent-tools.a2-long-lived.v1" &&
+          first.record.managedAgentTools !== "managed-agent-tools.a3-long-lived.v1"
             ? {}
             : {
                 [managedAgentPromptSummary]: () =>
@@ -3608,9 +3662,115 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ),
           ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
         };
+        const researchContext: ManagedAgentResearchContext | undefined =
+          first.record.managedAgentTools !== "managed-agent-tools.a3-long-lived.v1"
+            ? activePromptContext === undefined
+              ? undefined
+              : { repository: activePromptContext.repository }
+            : {
+                ...(activePromptContext === undefined
+                  ? {}
+                  : { repository: activePromptContext.repository }),
+                skillIdentities:
+                  activeSkillContext?.registry.candidates.map((candidate) => ({
+                    qualifiedId: candidate.qualifiedId,
+                    digest: candidate.skillMdDigest,
+                  })) ?? [],
+                tools: {
+                  definitions: () =>
+                    sessionTools
+                      .definitions()
+                      .filter((definition) =>
+                        [
+                          "read_skill_resource",
+                          "web_search",
+                          "web_fetch",
+                          "web_open",
+                          "web_find",
+                        ].includes(definition.name),
+                      ),
+                  resolve(name) {
+                    return [
+                      "read_skill_resource",
+                      "web_search",
+                      "web_fetch",
+                      "web_open",
+                      "web_find",
+                    ].includes(name)
+                      ? sessionTools.resolve(name)
+                      : undefined;
+                  },
+                },
+                async resolveSkills(selection) {
+                  const skillContext = await createInitialSkillContextV1({
+                    artifactStore,
+                    effectiveContextTokens: resolved.contextProfile.contextWindowTokens,
+                    estimatorVersion: resolved.contextProfile.estimatorVersion,
+                    projectId: resumed.snapshot.projectId,
+                    sessionId: selection.childSessionId,
+                    userHome: homedir(),
+                    workspaceRoot: options.workspaceRoot,
+                    extensionSources,
+                    includeProjectSources: (await inspectWorkspaceTrust()).status === "trusted",
+                  });
+                  let selectedContext = skillContext;
+                  for (const [index, qualifiedId] of selection.skills.entries()) {
+                    const candidate = selectedContext.registry.candidates.find(
+                      (entry) => entry.qualifiedId === qualifiedId,
+                    );
+                    if (candidate === undefined) {
+                      throw new SessionLifecycleError("session_skill_unavailable");
+                    }
+                    const manifest = await buildSkillResourceManifestV1({
+                      candidate,
+                      workspaceRoot: options.workspaceRoot,
+                      userHome: homedir(),
+                      userHomeDigest: selectedContext.userHomeDigest,
+                      ...(extensionSources.length === 0 ? {} : { extensionSources }),
+                    });
+                    selectedContext = activateSkillContextV1({
+                      context: selectedContext,
+                      qualifiedId,
+                      reason: "user_explicit",
+                      runId: selection.attemptId,
+                      requestId: `${selection.attemptId}:skill:${index + 1}`,
+                      manifest,
+                    }).context;
+                  }
+                  return {
+                    context: selectedContext,
+                    contents: await materializeActiveSkillContents(options, selectedContext),
+                  };
+                },
+                authorizeProjectContextLoad: async () =>
+                  (await inspectWorkspaceTrust()).status === "trusted",
+                ...(extensionSources.length === 0
+                  ? {}
+                  : { extensionSkillSources: extensionSources }),
+                ...(options.extensionHost === undefined
+                  ? {}
+                  : {
+                      withCurrentExtensionSkillSources: <T>(
+                        sources: readonly ExtensionSkillSourceV1[],
+                        operation: () => Promise<T>,
+                      ) =>
+                        withInternalExtensionSkillSourcesCurrent(
+                          options.extensionHost as ExtensionHost,
+                          sources.map((source) => ({
+                            extensionId: source.locator.extensionId,
+                            packageName: source.locator.packageName,
+                            packageVersion: source.locator.packageVersion,
+                            lifecycleRevision: source.lifecycleRevision,
+                            lifecycleDigest: source.lifecycleDigest,
+                          })),
+                          operation,
+                        ),
+                    }),
+              };
         const existingAgentManager = activeAgentManagers.get(input.sessionId);
         const agentManager =
-          first.record.managedAgentTools === "managed-agent-tools.a2-long-lived.v1" &&
+          (first.record.managedAgentTools === "managed-agent-tools.a2-long-lived.v1" ||
+            first.record.managedAgentTools === "managed-agent-tools.a3-long-lived.v1") &&
           existingAgentManager !== undefined
             ? existingAgentManager
             : createAgentManager({
@@ -3621,6 +3781,92 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                 managedStore: managedAgentStore,
                 parentPermissions:
                   options.permissions ?? createPermissionPolicy({ allowedEffects: [] }),
+                ...(first.record.managedAgentTools === "managed-agent-tools.a3-long-lived.v1"
+                  ? {
+                      parentCoordination: {
+                        interactive: () => managedAgentEventListeners.size > 0,
+                      },
+                      researchSkillIdentities:
+                        activeSkillContext?.registry.candidates.map((candidate) => ({
+                          qualifiedId: candidate.qualifiedId,
+                          digest: candidate.skillMdDigest,
+                        })) ?? [],
+                      researchTools: {
+                        definitions: () =>
+                          sessionTools
+                            .definitions()
+                            .filter((definition) =>
+                              [
+                                "read_skill_resource",
+                                "web_search",
+                                "web_fetch",
+                                "web_open",
+                                "web_find",
+                              ].includes(definition.name),
+                            ),
+                        resolve(name) {
+                          return [
+                            "read_skill_resource",
+                            "web_search",
+                            "web_fetch",
+                            "web_open",
+                            "web_find",
+                          ].includes(name)
+                            ? sessionTools.resolve(name)
+                            : undefined;
+                        },
+                      },
+                      async resolveResearchSkills(selection) {
+                        const skillContext = await createInitialSkillContextV1({
+                          artifactStore,
+                          effectiveContextTokens: resolved.contextProfile.contextWindowTokens,
+                          estimatorVersion: resolved.contextProfile.estimatorVersion,
+                          projectId: resumed.snapshot.projectId,
+                          sessionId: selection.childSessionId,
+                          userHome: homedir(),
+                          workspaceRoot: options.workspaceRoot,
+                          extensionSources,
+                          includeProjectSources: workspaceTrusted,
+                        });
+                        let selectedContext = skillContext;
+                        for (const [index, qualifiedId] of selection.skills.entries()) {
+                          const candidate = selectedContext.registry.candidates.find(
+                            (entry) => entry.qualifiedId === qualifiedId,
+                          );
+                          if (candidate === undefined) {
+                            throw new SessionLifecycleError("session_skill_unavailable");
+                          }
+                          const manifest = await buildSkillResourceManifestV1({
+                            candidate,
+                            workspaceRoot: options.workspaceRoot,
+                            userHome: homedir(),
+                            userHomeDigest: selectedContext.userHomeDigest,
+                            ...(extensionSources.length === 0 ? {} : { extensionSources }),
+                          });
+                          selectedContext = activateSkillContextV1({
+                            context: selectedContext,
+                            qualifiedId,
+                            reason: "user_explicit",
+                            runId: selection.attemptId,
+                            requestId: `${selection.attemptId}:skill:${index + 1}`,
+                            manifest,
+                          }).context;
+                        }
+                        return {
+                          context: selectedContext,
+                          contents: await materializeActiveSkillContents(options, selectedContext),
+                        };
+                      },
+                      onChildPermissionEvent(event) {
+                        for (const listener of listeners) {
+                          listener(event);
+                        }
+                        for (const listener of managedAgentEventListeners) {
+                          listener({ parentSessionId: input.sessionId, event });
+                        }
+                      },
+                    }
+                  : {}),
                 parentRoot,
                 parentSessionId: input.sessionId,
                 projectId: resumed.snapshot.projectId as `sha256:${string}`,
@@ -3634,6 +3880,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                 workspaceRoot: options.workspaceRoot,
               });
         agentManager.rebindParentRoot(parentRoot);
+        agentManager.rebindResearchContext(researchContext);
         await agentManager.snapshot();
         const session = new AgentSession(sessionDependencies);
         let resolveSessionSettlement = () => {};
@@ -3681,7 +3928,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           }
           return { result, snapshot };
         } finally {
-          if (first.record.managedAgentTools !== "managed-agent-tools.a2-long-lived.v1") {
+          if (
+            first.record.managedAgentTools !== "managed-agent-tools.a2-long-lived.v1" &&
+            first.record.managedAgentTools !== "managed-agent-tools.a3-long-lived.v1"
+          ) {
             activeAgentManagers.delete(input.sessionId);
           }
           resolveSessionSettlement();
@@ -4373,8 +4623,18 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       return ownerOperation;
     },
     decidePermission(command) {
+      const parentDecision = activeSession?.decidePermission(command);
+      if (parentDecision?.status === "accepted") {
+        return parentDecision;
+      }
+      for (const manager of activeAgentManagers.values()) {
+        const childDecision = manager.decidePermission(command);
+        if (childDecision.status === "accepted") {
+          return childDecision;
+        }
+      }
       return (
-        activeSession?.decidePermission(command) ?? {
+        parentDecision ?? {
           status: "rejected",
           error: {
             code: "permission_request_not_pending",
@@ -4430,7 +4690,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       if (!hasManagedAgentAdmission) {
         return { counts: { active: 0, completed: 0, attention: 0 }, agents: [] };
       }
-      if (options.managedAgentTools === "managed-agent-tools.a2-long-lived.v1") {
+      if (
+        options.managedAgentTools === "managed-agent-tools.a2-long-lived.v1" ||
+        options.managedAgentTools === "managed-agent-tools.a3-long-lived.v1"
+      ) {
         try {
           await withOwner(
             async () =>
@@ -4441,6 +4704,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                   join(effectiveSessionStateRoot(options.stateRoot), "artifacts"),
                 ),
                 input.sessionId,
+                Date.now,
+                await readSessionRecords(options, input.sessionId),
               ),
             `session:${input.sessionId}`,
           );
@@ -4458,6 +4723,30 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         throw new SessionLifecycleError("session_invalid");
       }
       const result = await manager.cancel(input);
+      if (result.status !== "completed") {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return manager.snapshot();
+    },
+    async sendManagedAgentMessage(input) {
+      const manager = activeAgentManagers.get(input.sessionId);
+      const sessionRecords = await readSessionRecords(options, input.sessionId);
+      const genesis = sessionRecords[0];
+      if (
+        manager === undefined ||
+        genesis?.schemaVersion !== 3 ||
+        genesis.record.type !== "session_genesis" ||
+        genesis.record.managedAgentTools !== "managed-agent-tools.a3-long-lived.v1"
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const result = await manager.send({
+        agentId: input.agentId,
+        expectedRevision: input.expectedRevision,
+        callId: input.callId,
+        message: input.message,
+        ...(input.attentionId === undefined ? {} : { attentionId: input.attentionId }),
+      });
       if (result.status !== "completed") {
         throw new SessionLifecycleError("session_invalid");
       }
@@ -5146,6 +5435,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       sessionEventListeners.add(listener);
       return () => {
         sessionEventListeners.delete(listener);
+      };
+    },
+    subscribeManagedAgentEvents(listener) {
+      managedAgentEventListeners.add(listener);
+      return () => {
+        managedAgentEventListeners.delete(listener);
       };
     },
     subscribeMetadata(listener) {

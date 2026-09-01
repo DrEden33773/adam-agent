@@ -271,6 +271,9 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
           },
         };
   const lifecycle = createSessionLifecycle({
+    ...(options.scenario === "managed-attention"
+      ? { managedAgentTools: "managed-agent-tools.a3-long-lived.v1" as const }
+      : {}),
     ...(options.scenario === "plan-review-recovery"
       ? {
           [planApprovalIntentBarrier]: {
@@ -293,11 +296,13 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     ...(preferences === undefined ? {} : { preferences }),
     permissions: createPermissionPolicy({
       allowedEffects:
-        options.scenario === "todo"
-          ? ["read", "write"]
-          : options.scenario === "tool-artifact" || options.scenario === "shell"
-            ? ["read", "execute"]
-            : ["read"],
+        options.scenario === "managed-attention"
+          ? ["read", "delegate"]
+          : options.scenario === "todo"
+            ? ["read", "write"]
+            : options.scenario === "tool-artifact" || options.scenario === "shell"
+              ? ["read", "execute"]
+              : ["read"],
       askedEffects: options.scenario === "web-search" ? ["write", "network"] : ["write"],
     }),
     workspaceTrust:
@@ -897,6 +902,7 @@ function observeTuiDispatch(
       options.scenario === "tool-artifact" ||
       options.scenario === "artifact-backed-assistant" ||
       options.scenario === "artifact-page-race" ||
+      options.scenario === "managed-attention" ||
       options.scenario === "reasoning-artifact" ||
       options.scenario === "reasoning-artifact-race" ||
       options.scenario === "reasoning-artifact-reorder" ||
@@ -995,6 +1001,21 @@ function observeTuiDispatch(
           ),
           writeFile(join(controlRoot, `${command.type}-settled`), `${settled.status}\n`, "utf8"),
         ]);
+        return settled;
+      }
+      if (
+        options.scenario === "managed-attention" &&
+        controlRoot !== undefined &&
+        (command.type === "submit_prompt" ||
+          command.type === "refresh_managed_agents" ||
+          command.type === "send_managed_agent_message")
+      ) {
+        const settled = await receipt;
+        await writeFile(
+          join(controlRoot, `${command.type}-settled`),
+          `${settled.status}\n`,
+          "utf8",
+        );
         return settled;
       }
       if (!observeDispatch) {
@@ -1161,6 +1182,9 @@ function createFixtureModelTargets(options: {
   let planSubmissionOrdinal = 0;
   let reasoningViewportOrdinal = 0;
   let toolPreviewOrdinal = 0;
+  let managedAttentionParentOrdinal = 0;
+  let managedAttentionChildOrdinal = 0;
+  let managedAttentionAgentId = "";
   const model: ModelDriver = {
     async *stream(request) {
       if (request.tools.length === 0) {
@@ -1190,6 +1214,98 @@ function createFixtureModelTargets(options: {
         latestUser.content.startsWith("Seeded project session for ")
       ) {
         yield { type: "text_delta", text: "Seeded project session ready." };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      if (options.scenario === "managed-attention") {
+        const child = request.messages.some(
+          (message) =>
+            message.role === "developer" &&
+            message.content.startsWith("Managed child profile research.v1"),
+        );
+        if (child) {
+          managedAttentionChildOrdinal += 1;
+          if (managedAttentionChildOrdinal === 1) {
+            yield {
+              type: "tool_call_start",
+              id: "fixture-parent-input",
+              name: "request_parent_input",
+            };
+            yield {
+              type: "tool_call_delta",
+              id: "fixture-parent-input",
+              json: '{"question":"Which exact fixture source should I use?"}',
+            };
+            yield { type: "tool_call_end", id: "fixture-parent-input" };
+            yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+            yield { type: "finish", reason: "tool_calls" };
+            return;
+          }
+          const reply = request.messages.findLast(
+            (message) => message.role === "tool" && message.callId === "fixture-parent-input",
+          );
+          if (
+            reply?.role !== "tool" ||
+            reply.result.status !== "completed" ||
+            options.controlRoot === undefined
+          ) {
+            throw new TypeError("The managed attention fixture requires one exact reply.");
+          }
+          await writeFile(
+            join(options.controlRoot, "managed-attention-reply"),
+            `${JSON.stringify(reply.result.output)}\n`,
+            "utf8",
+          );
+          yield { type: "text_delta", text: "Managed attention reply observed." };
+          yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+          yield { type: "finish", reason: "stop" };
+          return;
+        }
+        managedAttentionParentOrdinal += 1;
+        if (managedAttentionParentOrdinal === 1) {
+          yield { type: "tool_call_start", id: "fixture-spawn-research", name: "spawn_agent" };
+          yield {
+            type: "tool_call_delta",
+            id: "fixture-spawn-research",
+            json: '{"task":"Request exact fixture input.","profile":"research.v1","mode":"background"}',
+          };
+          yield { type: "tool_call_end", id: "fixture-spawn-research" };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        if (managedAttentionParentOrdinal === 2) {
+          const spawn = request.messages.findLast(
+            (message) => message.role === "tool" && message.callId === "fixture-spawn-research",
+          );
+          if (
+            spawn?.role !== "tool" ||
+            spawn.result.status !== "completed" ||
+            spawn.result.output === null ||
+            typeof spawn.result.output !== "object" ||
+            !("agentId" in spawn.result.output)
+          ) {
+            throw new TypeError("The managed attention child identity is unavailable.");
+          }
+          // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+          managedAttentionAgentId = String(spawn.result.output["agentId"]);
+          yield { type: "tool_call_start", id: "fixture-wait-attention", name: "wait_agents" };
+          yield {
+            type: "tool_call_delta",
+            id: "fixture-wait-attention",
+            json: JSON.stringify({ agentIds: [managedAttentionAgentId], until: "attention" }),
+          };
+          yield { type: "tool_call_end", id: "fixture-wait-attention" };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: "Managed child needs exact input." };
+        if (options.controlRoot !== undefined) {
+          await writeFile(
+            join(options.controlRoot, "managed-attention-parent-settled"),
+            "settled\n",
+            "utf8",
+          );
+        }
         yield { type: "finish", reason: "stop" };
         return;
       }

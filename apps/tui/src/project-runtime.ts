@@ -101,7 +101,7 @@ export async function createProductionProjectRuntime(
   const extensionSnapshot = await host.loadConfiguredExtensions();
   lifecycle = createSessionLifecycle({
     extensionHost: host,
-    managedAgentTools: "managed-agent-tools.a2-long-lived.v1",
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
     modelTargets: options.modelTargets,
     permissions: options.permissions,
     preferences: options.preferences,
