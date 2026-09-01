@@ -2689,39 +2689,6 @@ export async function createPresentationSession(
           };
         }
       }
-      if (command.type === "stage_pasted_image") {
-        if (!attachmentAvailable) {
-          return {
-            status: "rejected",
-            code: "not_available",
-            message: attachmentUnavailableReason ?? "Images are not available for this session.",
-          };
-        }
-        if (activeRun !== undefined || state.composer.sealed) {
-          return {
-            status: "rejected",
-            code: "conflict",
-            message: "A clipboard image cannot be staged while the current turn is sealed.",
-          };
-        }
-        try {
-          await turnComposer.stagePastedImage(
-            command.bytes,
-            command.mutation,
-            persistCurrentTurnDraft,
-          );
-          return { status: "admitted", commandId: randomUUID(), resource: null };
-        } catch (error) {
-          return {
-            status: "rejected",
-            code: "not_available",
-            message:
-              error instanceof Error
-                ? error.message
-                : "The clipboard image could not be staged safely.",
-          };
-        }
-      }
       if (command.type === "replace_draft_text") {
         if (activeRun !== undefined || state.composer.sealed) {
           return {

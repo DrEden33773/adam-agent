@@ -44,30 +44,13 @@ test("the TUI Registry exposes the idle managed-child navigator", () => {
   });
 });
 
-test("the TUI Registry parses the explicit clipboard image action", () => {
+test("the TUI Registry has no application-owned clipboard read actions", () => {
+  expect(adamCommandRegistry.parse("/paste")).toMatchObject({ kind: "unknown", name: "paste" });
   expect(adamCommandRegistry.parse("/paste-image")).toMatchObject({
-    kind: "known",
-    argumentsText: "",
-    command: {
-      id: "paste-image",
-      usage: "/paste-image",
-    },
+    kind: "unknown",
+    name: "paste-image",
   });
-});
-
-test("the TUI Registry owns one fixed unified clipboard command and key", () => {
-  expect(adamCommandRegistry.parse("/paste")).toMatchObject({
-    kind: "known",
-    argumentsText: "",
-    command: { id: "paste", usage: "/paste" },
-  });
-  expect(adamCommandRegistry.keybinding("paste_clipboard")).toEqual({
-    action: "paste_clipboard",
-    description: "Paste supported image or text from clipboard",
-    inputs: ["alt+v"],
-    keys: "Alt+V",
-    section: "editor",
-  });
+  expect(adamCommandRegistry.keybindings().map((binding) => binding.keys)).not.toContain("Alt+V");
 });
 
 test("the TUI Registry exposes only descriptor commands backed by project changes", () => {

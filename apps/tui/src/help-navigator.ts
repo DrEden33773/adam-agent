@@ -159,9 +159,7 @@ function helpContent(
     theme.toolTitle("Effective Hotkeys"),
     "",
     ...keybindings
-      .filter(
-        (binding) => binding.section === "application" || binding.action === "paste_clipboard",
-      )
+      .filter((binding) => binding.section === "application")
       .map((binding) => formatKeybinding(binding, theme)),
     "",
     "Editor bindings  /help editor",
@@ -171,7 +169,5 @@ function helpContent(
 }
 
 function formatKeybinding(binding: AdamKeybindingDefinition, theme: AdamTuiTheme): string {
-  return binding.action === "paste_clipboard"
-    ? `${theme.toolTitle(binding.keys)} — ${binding.description}`
-    : `${theme.toolTitle(binding.keys)}  ${binding.description}`;
+  return `${theme.toolTitle(binding.keys)}  ${binding.description}`;
 }

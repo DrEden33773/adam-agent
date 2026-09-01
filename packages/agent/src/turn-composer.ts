@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { isUnsafePresentationControl, stripTerminalSequences } from "@adam-agent/presentation";
-import { normalizeExplicitUserImageToPngV1 } from "./image-input.js";
 import type { TurnComposerResourceStager } from "./input-resource-staging.js";
 import {
   type InputResourceOccurrenceV1,
@@ -155,11 +154,6 @@ export type TurnComposer = {
   ): Promise<string>;
   stagePastedText(
     text: string,
-    mutation?: { readonly at: TurnComposerDraftPoint; readonly baseRevision: number },
-    commit?: () => Promise<void>,
-  ): Promise<string>;
-  stagePastedImage(
-    bytes: Uint8Array,
     mutation?: { readonly at: TurnComposerDraftPoint; readonly baseRevision: number },
     commit?: () => Promise<void>,
   ): Promise<string>;
@@ -1084,118 +1078,6 @@ export async function createTurnComposer(options: {
             ? { ...element, kind: resource.kind }
             : element,
         );
-        resource.staged = staged;
-        resource.state = "ready";
-        try {
-          await commit?.();
-        } catch (error) {
-          elements = previousElements;
-          nextOrdinal = previousNextOrdinal;
-          revision = previousRevision;
-          undoStack.push(...previousUndoStack);
-          resources.delete(id);
-          await discardStaging(resource);
-          publish();
-          throw error;
-        }
-        publish();
-      })();
-      resource.settlement = settlement;
-      await settlement;
-      return id;
-    },
-    async stagePastedImage(bytes, mutation, commit) {
-      if (closed || sealed) {
-        throw new TypeError("The turn composer is not accepting pasted images.");
-      }
-      const normalizedPng = normalizeExplicitUserImageToPngV1(bytes);
-      const retainedCount =
-        [...resources.values()].filter(
-          (resource) => resource.state !== "cancelled" && resource.state !== "removed",
-        ).length +
-        [...pastedTexts.values()].filter((candidate) => candidate.state !== "removed").length;
-      if (retainedCount >= inputResourceLimitsV1.maximumOccurrencesPerRun) {
-        throw new TypeError("The turn composer input count exceeds the v1 run limit.");
-      }
-      if (options.stager.stageImage === undefined) {
-        throw new TypeError("Clipboard-image staging is unavailable.");
-      }
-      const id = randomUUID();
-      const elementId = randomUUID();
-      const ordinal = nextOrdinal;
-      const previousElements = elements;
-      const previousNextOrdinal = nextOrdinal;
-      const previousRevision = revision;
-      const previousUndoStack = [...undoStack];
-      const resource: TurnComposerResource = {
-        id,
-        elementId,
-        displayName: "Clipboard image",
-        state: "copying",
-        byteCount: null,
-        kind: "image",
-        mediaHint: "image",
-        ordinal,
-        origin: "pasted_image",
-        support: "image",
-        diagnostic: null,
-        controller: new AbortController(),
-        staged: null,
-        retained: false,
-        settlement: null,
-      };
-      insertAtomicElement(
-        { elementId, type: "resource", kind: "image", ordinal, resourceId: id },
-        mutation,
-      );
-      nextOrdinal += 1;
-      revision += 1;
-      undoStack.length = 0;
-      resources.set(id, resource);
-      publish();
-      const settlement = (async () => {
-        let staged: StagedInputResourceSelectionV1;
-        try {
-          staged = (await options.stager.stageImage?.({
-            id,
-            bytes: normalizedPng,
-            signal: resource.controller.signal,
-          })) as StagedInputResourceSelectionV1;
-        } catch (error) {
-          if (resource.state === "cancelled" || closed || !resources.has(id)) {
-            return;
-          }
-          elements = previousElements;
-          nextOrdinal = previousNextOrdinal;
-          revision = previousRevision;
-          undoStack.push(...previousUndoStack);
-          resources.delete(id);
-          publish();
-          throw error;
-        }
-        if (
-          closed ||
-          resource.state === "cancelled" ||
-          !resources.has(id) ||
-          staged.support !== "image" ||
-          staged.mediaHint !== "image" ||
-          staged.staged.mediaType !== "image/png" ||
-          staged.origin !== "pasted_image"
-        ) {
-          await options.stager.discard(staged);
-          if (!closed && resources.has(id)) {
-            elements = previousElements;
-            nextOrdinal = previousNextOrdinal;
-            revision = previousRevision;
-            undoStack.push(...previousUndoStack);
-            resources.delete(id);
-            publish();
-            throw new TypeError("The clipboard image normalization result is invalid.");
-          }
-          return;
-        }
-        resource.displayName = staged.displayName;
-        resource.byteCount = staged.staged.byteCount;
         resource.staged = staged;
         resource.state = "ready";
         try {

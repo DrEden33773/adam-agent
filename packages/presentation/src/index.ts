@@ -1271,14 +1271,6 @@ export type PresentationCommand =
       };
     }
   | {
-      readonly type: "stage_pasted_image";
-      readonly bytes: Uint8Array;
-      readonly mutation?: {
-        readonly at: DraftPoint;
-        readonly baseRevision: number;
-      };
-    }
-  | {
       readonly type: "replace_draft_text";
       readonly baseRevision: number;
       readonly document: readonly DraftTextDocumentPart[];

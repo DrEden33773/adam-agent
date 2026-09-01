@@ -26,11 +26,6 @@ export type TurnComposerResourceStager = {
     readonly path: string;
     readonly signal: AbortSignal;
   }): Promise<StagedInputResourceSelectionV1>;
-  stageImage?(input: {
-    readonly id: string;
-    readonly bytes: Uint8Array;
-    readonly signal: AbortSignal;
-  }): Promise<StagedInputResourceSelectionV1>;
   stageText?(input: {
     readonly id: string;
     readonly text: string;
@@ -90,28 +85,6 @@ export async function createFileTurnComposerResourceStager(options: {
           mediaHint: occurrence.mediaHint,
           support: occurrence.support,
           origin: "selected_file",
-        };
-      } catch (error) {
-        if (staged !== undefined) {
-          await staging.discard(staged);
-        }
-        throw error;
-      }
-    },
-    async stageImage(input) {
-      let staged: StagedArtifactReference | undefined;
-      try {
-        input.signal.throwIfAborted();
-        staged = await staging.write({ bytes: input.bytes, mediaType: "image/png" });
-        input.signal.throwIfAborted();
-        return {
-          type: "staged_artifact",
-          staged,
-          displayName: "Clipboard image",
-          digest: staged.id,
-          mediaHint: "image",
-          support: "image",
-          origin: "pasted_image",
         };
       } catch (error) {
         if (staged !== undefined) {

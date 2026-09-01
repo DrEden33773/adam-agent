@@ -802,7 +802,7 @@ test("a kebab-case built-in command remains a valid extension reservation", asyn
   const host = createExtensionHost({
     capabilities: [],
     extensions: [],
-    reservedCommandNames: ["paste-image"],
+    reservedCommandNames: ["review-changes"],
   });
 
   await expect(host.loadConfiguredExtensions()).resolves.toEqual({ extensions: [] });
