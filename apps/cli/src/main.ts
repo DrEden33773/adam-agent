@@ -16,6 +16,7 @@ import {
   createPermissionPolicy,
   createPresentationPreferences,
   createSessionLifecycle,
+  createWebSearchConfiguration,
   createWorkspaceTrust,
   ExtensionConfigurationError,
   ExtensionHostError,
@@ -318,6 +319,16 @@ function formatPermissionPrompt(
   if (event.subject.type === "managed_agent_control") {
     return `Allow managed-child ${event.subject.action} for this exact parent session [y/N] `;
   }
+  if (event.subject.type === "web_request") {
+    const target =
+      event.subject.operation === "fetch"
+        ? event.subject.url
+        : `${event.subject.query} (limit ${event.subject.limit}${event.subject.language === undefined ? "" : `, language ${event.subject.language}`}${event.subject.timeRange === undefined ? "" : `, time range ${event.subject.timeRange}`})`;
+    return `Allow ${event.name} for this exact Web request to ${quoteForTerminal(event.subject.providerOrigin)}: ${quoteForTerminal(target)} [y/N] `;
+  }
+  if (event.subject.type === "web_artifact") {
+    return `Allow ${event.name} to ${event.subject.operation} immutable Web artifact ${event.subject.artifactId} [y/N] `;
+  }
   return `Allow ${event.name} for ${quoteForTerminal(event.subject.path)} [y/N] `;
 }
 
@@ -563,6 +574,9 @@ async function createRunLifecycle(modelTargets: ModelTargets): Promise<SessionLi
       workspaceRoot,
     }),
     stateRoot,
+    webSearchConfiguration: createWebSearchConfiguration({
+      environment: userConfigurationEnvironment,
+    }),
     workspaceRoot,
     tools: createCodingToolRegistry({ workspaceRoot, stateRoot, artifactStore }),
     permissions: createPermissionPolicy({

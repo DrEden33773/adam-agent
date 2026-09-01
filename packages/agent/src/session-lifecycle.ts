@@ -235,6 +235,10 @@ import {
   type ToolRegistry,
 } from "./tool-runtime.js";
 import type { UserModelPolicyResolver } from "./user-model-policy.js";
+import { createJsonlWebEvidenceStore, type WebHttpAdapter } from "./web-evidence.js";
+import { createWebEvidenceProduction } from "./web-evidence-production.js";
+import { createSafeWebHttpAdapter } from "./web-safe-http.js";
+import type { WebSearchConfiguration } from "./web-search-configuration.js";
 
 export type { McpSessionSnapshot } from "./mcp-host.js";
 export { SessionLifecycleError } from "./session-lifecycle-error.js";
@@ -371,6 +375,8 @@ export type SessionLifecycleOptions = {
   readonly workspaceRoot: string;
   readonly stateRoot?: string;
   readonly tools?: ToolRegistry;
+  readonly webHttp?: WebHttpAdapter;
+  readonly webSearchConfiguration?: WebSearchConfiguration;
   readonly workspaceTrust?: WorkspaceTrustController;
   readonly [mcpBootstrapScheduler]?: McpBootstrapScheduler;
   readonly [mcpBeforeToolDispatchBarrier]?: McpBeforeToolDispatchBarrier;
@@ -396,6 +402,8 @@ export type SessionLifecycleOptions = {
   readonly [inputResourceIngestBarrier]?: InputResourceIngestBarrier;
   readonly [workspaceMcpLeaseTransitionBarrier]?: WorkspaceMcpLeaseTransitionBarrier;
 };
+
+type WebEvidenceProfileV1 = NonNullable<SessionGenesisRecord["record"]["webEvidence"]>;
 
 export type SessionContinueResult = {
   readonly result: RunResult;
@@ -800,6 +808,8 @@ const nodeSessionTitleDeadlineScheduler: SessionTitleDeadlineScheduler = {
 };
 
 export function createSessionLifecycle(providedOptions: SessionLifecycleOptions): SessionLifecycle {
+  const effectiveStateRoot = effectiveSessionStateRoot(providedOptions.stateRoot);
+  const sharedArtifactStore = createLazyArtifactStore(join(effectiveStateRoot, "artifacts"));
   const storeDirectory =
     providedOptions[sessionStoreDirectory] ??
     createJsonlSessionStoreDirectory<SessionRecord>({
@@ -814,19 +824,26 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         environment: process.env,
         workspaceRoot: providedOptions.workspaceRoot,
       }),
+    ...(providedOptions.webSearchConfiguration === undefined
+      ? {}
+      : {
+          webHttp: providedOptions.webHttp ?? createSafeWebHttpAdapter(),
+          webSearchConfiguration: providedOptions.webSearchConfiguration,
+        }),
     [sessionStoreDirectory]: storeDirectory,
     tools:
       providedOptions.tools ??
       createCodingToolRegistry({
-        artifactStore: createLazyArtifactStore(
-          join(effectiveSessionStateRoot(providedOptions.stateRoot), "artifacts"),
-        ),
+        artifactStore: sharedArtifactStore,
         workspaceRoot: providedOptions.workspaceRoot,
         ...(providedOptions.stateRoot === undefined
           ? {}
           : { stateRoot: providedOptions.stateRoot }),
       }),
   };
+  const webEvidenceStore = createJsonlWebEvidenceStore({
+    filePath: join(effectiveStateRoot, "web-evidence.jsonl"),
+  });
   const lineage = createSessionLineageTraversal({
     readRecords: async (sessionId) => {
       const store = await storeDirectory.open(sessionId);
@@ -966,22 +983,51 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     stateRoot: join(effectiveSessionStateRoot(options.stateRoot), "managed-child-sessions"),
   });
   const activeAgentManagers = new Map<string, AgentManager>();
-  const toolsForSession = (
+  const toolsForSession = async (
     sessionId: string,
     targetIdentity: ModelTargetIdentity,
     thinkingPolicy?: ThinkingPolicySnapshotV1,
     managedAgentTools = options.managedAgentTools,
-  ): ToolRegistry => {
+    webEvidence?: WebEvidenceProfileV1,
+  ): Promise<ToolRegistry> => {
     const base = options.tools;
+    let baseWithWeb = base;
+    if (webEvidence !== undefined) {
+      if (
+        options.webHttp === undefined ||
+        options.webSearchConfiguration === undefined ||
+        base === undefined
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const currentConfiguration = await options.webSearchConfiguration.load();
+      const desiredProvider = webEvidence.searchProvider;
+      const searchAvailable =
+        desiredProvider !== null &&
+        currentConfiguration.status === "configured" &&
+        currentConfiguration.provider !== null &&
+        isDeepStrictEqual(currentConfiguration.provider, desiredProvider);
+      const webTools = await createWebEvidenceProduction({
+        artifactStore: sharedArtifactStore,
+        configuration:
+          desiredProvider === null
+            ? { status: "unconfigured", provider: null, diagnostic: null }
+            : { status: "configured", provider: desiredProvider, diagnostic: null },
+        http: options.webHttp,
+        ...(desiredProvider === null ? {} : { searchAvailable }),
+        store: webEvidenceStore,
+      });
+      baseWithWeb = combineToolRegistries(base, webTools);
+    }
     if (
       options.modelTargets === undefined ||
       (managedAgentTools !== "managed-agent-tools.a1.v1" &&
         managedAgentTools !== "managed-agent-tools.a2-long-lived.v1")
     ) {
-      if (base === undefined) {
+      if (baseWithWeb === undefined) {
         throw new SessionLifecycleError("session_invalid");
       }
-      return base;
+      return baseWithWeb;
     }
     const managerRouter: AgentManager = {
       parentRootId: `session:${sessionId}`,
@@ -1085,7 +1131,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       },
     };
     return combineToolRegistries(
-      base,
+      baseWithWeb,
       createManagedAgentToolRegistry({ manager: managerRouter, profile: managedAgentTools }),
     );
   };
@@ -1931,12 +1977,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         promptGenesis !== undefined && isGenesisRecord(promptGenesis)
           ? promptContextRecordFromRecords(promptGenesis, promptRecords)
           : undefined;
-      let compatibleTools = toolsForSession(
+      let compatibleTools = await toolsForSession(
         input.sessionId,
         snapshot.targetIdentity,
         undefined,
         promptGenesis !== undefined && isGenesisRecord(promptGenesis)
           ? promptGenesis.record.managedAgentTools
+          : undefined,
+        promptGenesis !== undefined && isGenesisRecord(promptGenesis)
+          ? promptGenesis.record.webEvidence
           : undefined,
       );
       if (activePromptContext?.recordVersion === 3 && activePromptContext.mcp !== undefined) {
@@ -2177,6 +2226,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       createLazyArtifactStore(join(effectiveSessionStateRoot(options.stateRoot), "artifacts")),
     );
     input.signal?.throwIfAborted();
+    const webConfiguration = await options.webSearchConfiguration?.load();
+    const webEvidence: WebEvidenceProfileV1 | undefined =
+      webConfiguration === undefined
+        ? undefined
+        : {
+            version: 1,
+            searchProvider:
+              webConfiguration.status === "configured" ? webConfiguration.provider : null,
+          };
     return {
       genesis: {
         schemaVersion: 3,
@@ -2192,8 +2250,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ...(options.managedAgentTools === undefined
             ? {}
             : { managedAgentTools: options.managedAgentTools }),
+          ...(webEvidence === undefined ? {} : { webEvidence }),
           promptContext: createPromptContextV3(
-            toolsForSession(sessionId, input.targetIdentity),
+            await toolsForSession(
+              sessionId,
+              input.targetIdentity,
+              undefined,
+              options.managedAgentTools,
+              webEvidence,
+            ),
             repository,
             skillContext,
           ),
@@ -2538,6 +2603,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             ...(parentGenesis.record.managedAgentTools === undefined
               ? {}
               : { managedAgentTools: parentGenesis.record.managedAgentTools }),
+            ...(parentGenesis.record.webEvidence === undefined
+              ? {}
+              : { webEvidence: parentGenesis.record.webEvidence }),
             naming: { profileVersion: 1, fallbackTitle: branchFallback },
             ...(parentPromptContext === undefined ? {} : { promptContext: parentPromptContext }),
             ...(parentSkillContext === undefined ? {} : { skillContext: parentSkillContext }),
@@ -3404,11 +3472,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           );
         }
         const effectiveThinkingPolicy = recoveredThinkingPolicy ?? newRunThinkingPolicy;
-        const sessionTools = toolsForSession(
+        const sessionTools = await toolsForSession(
           input.sessionId,
           resumed.snapshot.targetIdentity,
           effectiveThinkingPolicy,
           first.record.managedAgentTools,
+          first.record.webEvidence,
         );
         const sessionDependencies = {
           artifactStore,

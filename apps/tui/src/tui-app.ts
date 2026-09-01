@@ -558,6 +558,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let defaultTargetRejected = false;
   let startupTargetFailure: string | null = null;
   let workspaceTrustMutationPending = false;
+  let webSearchConfigurationPending = false;
   editorSlot.addChild(editor);
   const supportedRoot = new VStack([
     header,
@@ -2071,7 +2072,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           });
       }
     }
-    if (startupTrustBlocked || (active === null && state.draft === null)) {
+    if (
+      webSearchConfigurationPending ||
+      startupTrustBlocked ||
+      (active === null && state.draft === null)
+    ) {
       editor.disableSubmit = true;
     } else {
       editor.disableSubmit = false;
@@ -3173,11 +3178,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       diagnostic: state.authoritative.targets.diagnostic,
       modelPolicy: configuration.modelPolicy,
       onClose: () => close(),
+      onEditWebSearch() {
+        close();
+        editor.setText("/config web ");
+        editor.disableSubmit = false;
+        tui.setFocus(editor);
+        renderState();
+      },
       onReset(field) {
         applyConfigurationMutation(field, null, () => close(true));
       },
       target: targetForState(state),
       theme,
+      webSearch: configuration.webSearch,
     });
     handle = showOverlay(page, {
       width: "90%",
@@ -3189,16 +3202,95 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     clearNotice();
     tui.requestRender();
   };
+  const applyWebSearchConfiguration = (endpoint: string | null): void => {
+    clearExitWindow();
+    editor.disableSubmit = true;
+    if (endpoint === null) {
+      const actionId = showNotice(
+        "progress",
+        "Clearing Web Search configuration…",
+        "until_replaced",
+      );
+      void options.presentation
+        .dispatch({ type: "clear_web_search" })
+        .then((receipt) => {
+          if (receipt.status === "admitted") {
+            editor.setText("");
+            settleNotice(
+              actionId,
+              "success",
+              "Web Search is not configured. Fetch, open, and find remain available; configure an Owner-selected SearXNG endpoint to enable search for new sessions.",
+              "until_next_action",
+            );
+          } else {
+            settleNotice(actionId, "error", receipt.message, "until_edit");
+          }
+        })
+        .catch(() => {
+          settleNotice(
+            actionId,
+            "error",
+            "The Web Search configuration could not be cleared.",
+            "until_edit",
+          );
+        })
+        .finally(() => {
+          editor.disableSubmit = false;
+          renderState();
+        });
+      return;
+    }
+    const warning = webSearchEndpointWarning(endpoint);
+    webSearchConfigurationPending = true;
+    const actionId = showNotice(
+      "progress",
+      `Testing Web Search with adam-agent-connection-test. ${warning}`,
+      "until_replaced",
+    );
+    void options.presentation
+      .dispatch({ type: "test_and_set_web_search", endpoint })
+      .then((receipt) => {
+        if (receipt.status === "admitted") {
+          editor.setText("");
+          settleNotice(
+            actionId,
+            "success",
+            `Web Search enabled for new sessions. ${warning}`,
+            "until_next_action",
+          );
+        } else {
+          settleNotice(actionId, "error", receipt.message, "until_edit");
+        }
+      })
+      .catch(() => {
+        settleNotice(
+          actionId,
+          "error",
+          "The SearXNG connection test failed; the prior configuration is unchanged.",
+          "until_edit",
+        );
+      })
+      .finally(() => {
+        webSearchConfigurationPending = false;
+        editor.disableSubmit = false;
+        renderState();
+      });
+  };
   const handleConfigurationCommand = (argumentsText: string): void => {
     if (argumentsText.length === 0) {
       showConfigurationPage();
+      return;
+    }
+    const webMutation = parseWebSearchConfigurationMutation(argumentsText);
+    if (webMutation !== undefined) {
+      applyWebSearchConfiguration(webMutation.endpoint);
       return;
     }
     const mutation = parseConfigurationMutation(argumentsText);
     if (mutation === null) {
       showNotice(
         "warning",
-        "Usage: /config [context|output|compaction <tokens|default>]",
+        "Usage: /config [context|output|compaction <tokens|default>|web <endpoint|clear>]",
         "until_edit",
       );
       editor.disableSubmit = false;
@@ -5519,6 +5611,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         return { consume: true };
       }
       const active = options.presentation.getState().authoritative.active;
+      if (webSearchConfigurationPending) {
+        clearExitWindow();
+        void options.presentation.dispatch({ type: "cancel_web_search_test" });
+        return { consume: true };
+      }
       const runActive =
         options.presentation.getState().transient !== null ||
         (active?.pendingInteractions.length ?? 0) > 0;
@@ -5652,6 +5749,29 @@ function parseConfigurationMutation(argumentsText: string): {
   }
   const value = Number(rawValue);
   return Number.isSafeInteger(value) ? { field, value } : null;
+}
+
+function parseWebSearchConfigurationMutation(
+  argumentsText: string,
+): { readonly endpoint: string | null } | undefined {
+  const match = /^web[ \t]+([^\s]+)$/u.exec(argumentsText);
+  const value = match?.[1];
+  if (value === undefined) {
+    return undefined;
+  }
+  return { endpoint: value === "clear" ? null : value };
+}
+
+function webSearchEndpointWarning(endpoint: string): string {
+  try {
+    const url = new URL(endpoint);
+    if (url.protocol === "http:" && (url.hostname === "127.0.0.1" || url.hostname === "[::1]")) {
+      return "Adam will connect only to the exact configured loopback SearXNG endpoint. Adam does not install, start, monitor, or recover that service.";
+    }
+  } catch {
+    return "The endpoint must pass Adam's exact SearXNG policy before any connection test.";
+  }
+  return "This public SearXNG operator can receive your search query and network address. Adam will not verify, replace, or fall back from this endpoint.";
 }
 
 function reasoningAnchorId(reasoningId: string): string {

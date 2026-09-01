@@ -20,6 +20,9 @@ export class PermissionOverlay implements Component, Focusable {
   #previewOffset = 0;
   #previewPageSize = 8;
   #selection: "allow" | "deny";
+  #subjectLineCount = 0;
+  #subjectOffset = 0;
+  #subjectPageSize = 4;
 
   constructor(options: {
     readonly interaction: PendingInteraction;
@@ -43,13 +46,20 @@ export class PermissionOverlay implements Component, Focusable {
   handleInput(data: string): void {
     const wheel = data.codePointAt(0) === 27 ? data.slice(1).match(/^\[<(64|65);\d+;\d+M$/u) : null;
     if (wheel !== null) {
-      this.#scrollPreview(wheel[1] === "64" ? -3 : 3);
+      this.#scrollAuthorityOrPreview(wheel[1] === "64" ? -3 : 3);
       return;
     }
     if (matchesKey(data, Key.pageUp) || matchesKey(data, Key.pageDown)) {
-      this.#scrollPreview(
-        matchesKey(data, Key.pageUp) ? -this.#previewPageSize : this.#previewPageSize,
-      );
+      const direction = matchesKey(data, Key.pageUp) ? -1 : 1;
+      const subjectMaximum = Math.max(0, this.#subjectLineCount - this.#subjectPageSize);
+      if (
+        (direction > 0 && this.#subjectOffset < subjectMaximum) ||
+        (direction < 0 && this.#previewOffset === 0 && this.#subjectOffset > 0)
+      ) {
+        this.#scrollSubject(direction * this.#subjectPageSize);
+      } else {
+        this.#scrollPreview(direction * this.#previewPageSize);
+      }
       return;
     }
     if (matchesKey(data, Key.left) || matchesKey(data, Key.right)) {
@@ -79,7 +89,7 @@ export class PermissionOverlay implements Component, Focusable {
       "Subject",
     )} `;
     const actionPrefixWidth = visibleWidth(actionPrefix);
-    const actionLines =
+    const allActionLines =
       width > actionPrefixWidth
         ? wrapExactText(subject, width - actionPrefixWidth).map((line, index) =>
             index === 0 ? `${actionPrefix}${this.#theme.subject(line)}` : this.#theme.subject(line),
@@ -90,6 +100,27 @@ export class PermissionOverlay implements Component, Focusable {
               Math.max(1, width),
             ).map((line) => this.#theme.keyword(line)),
             ...wrapExactText(subject, Math.max(1, width)).map((line) => this.#theme.subject(line)),
+          ];
+    this.#subjectPageSize = width < 60 ? 2 : 4;
+    this.#subjectLineCount = allActionLines.length;
+    this.#subjectOffset = Math.min(
+      this.#subjectOffset,
+      Math.max(0, this.#subjectLineCount - this.#subjectPageSize),
+    );
+    const actionLines = allActionLines.slice(
+      this.#subjectOffset,
+      this.#subjectOffset + this.#subjectPageSize,
+    );
+    const subjectPosition =
+      this.#subjectLineCount <= this.#subjectPageSize
+        ? []
+        : [
+            this.#theme.muted(
+              `Subject ${this.#subjectOffset + 1}-${Math.min(
+                this.#subjectLineCount,
+                this.#subjectOffset + this.#subjectPageSize,
+              )} of ${this.#subjectLineCount} · Wheel/PageUp/PageDown`,
+            ),
           ];
     const warningLine =
       this.#interaction.warning === undefined
@@ -121,6 +152,7 @@ export class PermissionOverlay implements Component, Focusable {
         ? [
             this.#theme.toolTitle("Permission required"),
             ...actionLines,
+            ...subjectPosition,
             ...warningLine,
             options,
             "Enter · Esc deny · Ctrl+C abort",
@@ -130,6 +162,7 @@ export class PermissionOverlay implements Component, Focusable {
         : [
             this.#theme.toolTitle("Permission required"),
             ...actionLines,
+            ...subjectPosition,
             ...warningLine,
             "",
             ...preview,
@@ -144,6 +177,28 @@ export class PermissionOverlay implements Component, Focusable {
   #scrollPreview(lines: number): void {
     const maximum = Math.max(0, this.#preview.split("\n").length - this.#previewPageSize);
     this.#previewOffset = Math.max(0, Math.min(maximum, this.#previewOffset + lines));
+  }
+
+  #scrollSubject(lines: number): void {
+    const maximum = Math.max(0, this.#subjectLineCount - this.#subjectPageSize);
+    this.#subjectOffset = Math.max(0, Math.min(maximum, this.#subjectOffset + lines));
+  }
+
+  #scrollAuthorityOrPreview(lines: number): void {
+    const subjectMaximum = Math.max(0, this.#subjectLineCount - this.#subjectPageSize);
+    if (lines > 0) {
+      if (this.#subjectOffset < subjectMaximum) {
+        this.#scrollSubject(lines);
+      } else {
+        this.#scrollPreview(lines);
+      }
+      return;
+    }
+    if (this.#previewOffset > 0) {
+      this.#scrollPreview(lines);
+    } else {
+      this.#scrollSubject(lines);
+    }
   }
 }
 

@@ -86,3 +86,71 @@ test("Plan shell permission renders a reversible exact representation of unsafe 
   );
   expect(withoutVisualLineBreaks).not.toContain("unknown  --diagnose");
 });
+
+test("Web permission shows the exact URL and public-operator warning without truncating authority", () => {
+  const overlay = new PermissionOverlay({
+    interaction: {
+      type: "permission",
+      requestId: "web-permission",
+      callId: "web-fetch",
+      effect: "network",
+      subject: { type: "generic", value: "https://docs.example.test/evidence?q=exact" },
+      warning:
+        "This public operator can receive this exact Web request and network address. Adam will not verify, replace, or fall back from this endpoint.",
+      canAllow: true,
+      changePreviewRef: null,
+    },
+    onDecision() {},
+    theme: createAdamTuiTheme(true),
+  });
+  overlay.setPreview({ readable: true, text: "No workspace mutation preview is required." });
+
+  const rendered = overlay.render(200).join("\n").replace(/\s+/gu, " ");
+  expect(rendered).toContain("Action network · Subject https://docs.example.test/evidence?q=exact");
+  expect(rendered).toContain(
+    "This public operator can receive this exact Web request and network address. Adam will not verify, replace, or fall back from this endpoint.",
+  );
+});
+
+test("long Web authority pages while warning and Allow or Deny controls stay visible", () => {
+  const exactSubject = `https://search.example.test · query ${JSON.stringify("q".repeat(4 * 1024))} · limit 10`;
+  const overlay = new PermissionOverlay({
+    interaction: {
+      type: "permission",
+      requestId: "long-web-permission",
+      callId: "long-web-search",
+      effect: "network",
+      subject: { type: "generic", value: exactSubject },
+      warning:
+        "This public operator can receive this exact Web request and network address. Adam will not verify, replace, or fall back from this endpoint.",
+      canAllow: true,
+      changePreviewRef: null,
+    },
+    onDecision() {},
+    theme: createAdamTuiTheme(true),
+  });
+  overlay.setPreview({ readable: true, text: "No workspace mutation preview is required." });
+
+  const first = overlay.render(80).join("\n");
+  expect(first).toContain("Subject 1-4 of");
+  expect(first).toContain("This public operator can receive this exact Web request");
+  expect(first).toContain("Allow");
+  expect(first).toContain("Deny");
+  expect(first.length).toBeLessThan(4 * 1024);
+  overlay.handleInput("\u001b[6~");
+  const second = overlay.render(80).join("\n");
+  expect(second).toContain("Subject 5-8 of");
+  expect(second).not.toBe(first);
+  expect(second).toContain("Allow");
+  expect(second).toContain("Deny");
+  overlay.setPreview({
+    readable: true,
+    text: Array.from({ length: 20 }, (_, index) => `preview line ${index + 1}`).join("\n"),
+  });
+  for (let page = 0; page < 100; page += 1) {
+    overlay.handleInput("\u001b[6~");
+  }
+  const finalPage = overlay.render(80).join("\n");
+  expect(finalPage).toContain("limit 10");
+  expect(finalPage).toMatch(/Preview (?:9|13)-/u);
+});

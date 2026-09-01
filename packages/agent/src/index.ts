@@ -194,3 +194,9 @@ export {
   type ToolReplayClass,
   type ToolResult,
 } from "./tool-runtime.js";
+export {
+  createWebSearchConfiguration,
+  type SearxngSearchConfigurationV1,
+  type WebSearchConfiguration,
+  type WebSearchConfigurationSnapshot,
+} from "./web-search-configuration.js";

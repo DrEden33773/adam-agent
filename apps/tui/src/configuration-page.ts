@@ -1,5 +1,6 @@
 import type { TargetDisplay, UserModelPolicyDisplay } from "@adam-agent/presentation";
 import type { Component, SelectItem } from "@earendil-works/pi-tui";
+import { wrapTextWithAnsi } from "@earendil-works/pi-tui";
 
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { SearchableSelectList } from "./searchable-select-list.js";
@@ -16,16 +17,34 @@ export class ConfigurationPage implements Component {
   readonly #notice: string | null;
   readonly #targetId: string;
   readonly #theme: AdamTuiTheme;
+  readonly #webNotice: string | null;
 
   constructor(options: {
     readonly diagnostic: { readonly code: string; readonly message: string } | null;
     readonly modelPolicy: UserModelPolicyDisplay;
     readonly onClose: () => void;
+    readonly onEditWebSearch: () => void;
     readonly onReset: (field: ConfigurationField) => void;
     readonly target: TargetDisplay | undefined;
     readonly theme: AdamTuiTheme;
+    readonly webSearch:
+      | {
+          readonly status: "Configured" | "Invalid" | "Unconfigured" | "Unsafe";
+          readonly endpoint: string | null;
+          readonly diagnostic: { readonly code: string; readonly message: string } | null;
+        }
+      | undefined;
   }) {
     this.#theme = options.theme;
+    this.#webNotice =
+      options.webSearch === undefined
+        ? null
+        : options.webSearch.status === "Unconfigured"
+          ? "Web Search is not configured. Fetch, open, and find remain available; configure an Owner-selected SearXNG endpoint to enable search for new sessions."
+          : (options.webSearch.diagnostic?.message ??
+            (options.webSearch.endpoint === null
+              ? `Web Search is ${options.webSearch.status}.`
+              : `Web Search ${options.webSearch.status}: ${safeTerminalText(options.webSearch.endpoint)}`));
     this.#targetId = safeTerminalText(options.target?.targetId ?? "no available target");
     this.#notice =
       options.diagnostic === null
@@ -72,17 +91,29 @@ export class ConfigurationPage implements Component {
       label: field.label,
       description: `saved ${tokenValue(field.saved)} · official ${tokenValue(field.official)} · effective ${tokenValue(field.effective)} · ${field.source ?? "unavailable"}`,
     }));
+    if (options.webSearch !== undefined) {
+      items.push({
+        value: "webSearch",
+        label: "Web Search",
+        description:
+          options.webSearch.endpoint === null
+            ? `${options.webSearch.status} · Fetch, open, and find remain available`
+            : `${options.webSearch.status} · ${safeTerminalText(options.webSearch.endpoint)}`,
+      });
+    }
     this.#list = new SearchableSelectList({
       items: items.map((item) => ({
         item,
         searchText: `${item.label ?? ""} ${item.description ?? ""} ${item.value}`,
       })),
-      maxVisible: 3,
+      maxVisible: 4,
       onCancel: options.onClose,
       onSelect: (item) => {
         const field = this.#fields.get(item.value);
         if (field !== undefined) {
           options.onReset(field);
+        } else if (item.value === "webSearch") {
+          options.onEditWebSearch();
         }
       },
       theme: options.theme.editor.selectList,
@@ -103,10 +134,15 @@ export class ConfigurationPage implements Component {
       this.#theme.muted(`New-session target · ${this.#targetId}`),
       "",
       ...this.#list.render(width),
+      ...(this.#webNotice === null
+        ? []
+        : ["", ...wrapTextWithAnsi(this.#theme.muted(this.#webNotice), Math.max(1, width))]),
       ...(this.#notice === null ? [] : ["", this.#theme.muted(this.#notice)]),
       "",
-      this.#theme.muted("Enter reset selected to default · Esc close · Ctrl+Q exit"),
-      this.#theme.muted("Set values with /config context|output|compaction <tokens|default>"),
+      this.#theme.muted("Enter reset selected or edit Web Search · Esc close · Ctrl+Q exit"),
+      this.#theme.muted(
+        "Set values with /config context|output|compaction <tokens|default> or /config web <endpoint|clear>",
+      ),
     ];
   }
 }

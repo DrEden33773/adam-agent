@@ -50,7 +50,10 @@ type UserConfigurationRead =
 
 export type UserConfigurationStorage = {
   read(): Promise<UserConfigurationRead>;
-  write(text: string): Promise<void>;
+  write(
+    text: string,
+    options?: { readonly beforeCommit?: (() => void) | undefined },
+  ): Promise<void>;
 };
 
 type OwnerConfigurationStorage = UserConfigurationStorage & {
@@ -408,7 +411,7 @@ function createPresentationPreferencesFromStorage(
   };
 }
 
-function createOwnerConfigurationFileStorage(options: {
+export function createOwnerConfigurationFileStorage(options: {
   readonly configurationPath: string;
   readonly directoryPath: string;
   readonly maximumBytes: number;
@@ -468,7 +471,10 @@ function createOwnerConfigurationFileStorage(options: {
         await directory.close();
       }
     },
-    async write(text) {
+    async write(text, writeOptions) {
+      if (text.length === 0 || Buffer.byteLength(text, "utf8") > options.maximumBytes) {
+        throw new TypeError("The user configuration exceeds its byte limit.");
+      }
       const { configurationPath, directoryPath } = options;
       await mkdir(directoryPath, { recursive: true, mode: 0o700 });
       const directory = await openOwnerDirectory(directoryPath);
@@ -509,6 +515,7 @@ function createOwnerConfigurationFileStorage(options: {
         await temporary.sync();
         await temporary.close();
         temporary = undefined;
+        writeOptions?.beforeCommit?.();
         await rename(temporaryPath, configurationPath);
         await directory.sync();
       } catch (error) {
@@ -812,7 +819,7 @@ function isUserModelPolicyField(value: unknown): value is UserModelPolicyField {
   );
 }
 
-function hasDuplicateJsonObjectKey(text: string): boolean {
+export function hasDuplicateJsonObjectKey(text: string): boolean {
   const containers: Array<Set<string> | null> = [];
   for (let index = 0; index < text.length; index += 1) {
     const character = text[index];

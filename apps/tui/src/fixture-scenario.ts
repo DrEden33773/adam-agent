@@ -56,6 +56,8 @@ export const fixtureScenarios = [
   "tool-multiple",
   "unsafe-history",
   "unsafe-output",
+  "web-search",
+  "web-search-configuration-pending",
   "write",
 ] as const;
 

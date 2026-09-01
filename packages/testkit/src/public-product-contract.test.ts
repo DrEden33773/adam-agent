@@ -1,7 +1,8 @@
-import { readdir, readFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-
+import { createWebSearchConfiguration } from "@adam-agent/agent";
 import { expect, test } from "vitest";
 
 const productRoot = fileURLToPath(new URL("../../..", import.meta.url));
@@ -1389,6 +1390,48 @@ test("PresentationSession linked-operation projection has one package-internal o
 async function readPackageJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, "utf8"));
 }
+
+test("WebEvidence production composition has one closed concrete SearchProvider branch", async () => {
+  const sourceRoot = join(productRoot, "packages", "agent", "src");
+  const files = (await readdir(sourceRoot)).filter((name) => name.endsWith("-search-provider.ts"));
+  const production = await readFile(join(sourceRoot, "web-evidence-production.ts"), "utf8");
+
+  expect(files).toEqual(["searxng-search-provider.ts"]);
+  expect(production.match(/case "searxng"/gu)).toHaveLength(1);
+  expect(production.match(/\bcase\b/gu)).toHaveLength(1);
+  expect(production.match(/new SearxngSearchProvider/gu)).toHaveLength(2);
+  expect(production).not.toMatch(
+    /providerFallback|fallbackProvider|defaultSearchEndpoint|publicSearchEndpoint|searchProviderRegistry/u,
+  );
+  expect(
+    moduleSpecifiers(production).filter((specifier) => specifier.endsWith("-search-provider.js")),
+  ).toEqual(["./searxng-search-provider.js"]);
+  const concreteOwners = await Promise.all(
+    (await readdir(sourceRoot))
+      .filter((name) => name.endsWith(".ts") && !name.endsWith(".test.ts"))
+      .map(async (name) => ({ name, source: await readFile(join(sourceRoot, name), "utf8") })),
+  );
+  expect(
+    concreteOwners
+      .filter(({ source }) => source.includes("SearxngSearchProvider"))
+      .map(({ name }) => name)
+      .sort(),
+  ).toEqual(["searxng-search-provider.ts", "web-evidence-production.ts"]);
+});
+
+test("the public headless Web Search configuration capability is runtime read-only", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-agent-public-web-config-"));
+  try {
+    const reader = createWebSearchConfiguration({ environment: { XDG_CONFIG_HOME: root } });
+    expect(Object.keys(reader)).toEqual(["load"]);
+    expect(reader).not.toHaveProperty("activateSearxng");
+    expect(reader).not.toHaveProperty("testAndActivateSearxng");
+    expect(reader).not.toHaveProperty("clear");
+    await expect(reader.load()).resolves.toMatchObject({ status: "unconfigured" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 function isForbiddenPublicClaim(text: string): boolean {
   return forbiddenPublicClaimPatterns.some((pattern) => pattern.test(text));

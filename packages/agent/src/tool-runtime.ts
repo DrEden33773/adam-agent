@@ -133,6 +133,13 @@ export type ToolResult =
               | "managed_agent_failed"
               | "managed_agent_result_too_large"
               | "managed_agent_unavailable"
+              | "web_cancelled"
+              | "web_deadline_exceeded"
+              | "web_provider_invalid"
+              | "web_provider_unavailable"
+              | "web_response_invalid"
+              | "web_response_too_large"
+              | "web_source_unavailable"
               | "shell_start_failed"
               | "tool_io_failed";
             readonly message: string;
@@ -397,6 +404,26 @@ export type PermissionSubject =
       readonly agentId?: string;
       readonly expectedRevision?: number;
       readonly taskDigest?: `sha256:${string}`;
+    }
+  | {
+      readonly type: "web_request";
+      readonly operation: "fetch";
+      readonly providerOrigin: string;
+      readonly url: string;
+    }
+  | {
+      readonly type: "web_request";
+      readonly operation: "search";
+      readonly providerOrigin: string;
+      readonly query: string;
+      readonly limit: number;
+      readonly language?: string;
+      readonly timeRange?: "day" | "week" | "month" | "year";
+    }
+  | {
+      readonly type: "web_artifact";
+      readonly operation: "open" | "find";
+      readonly artifactId: `sha256:${string}`;
     };
 
 export type PermissionPolicyInput = {

@@ -78,6 +78,12 @@ import {
   type TurnComposerStageBarrier,
   turnComposerStageBarrier,
 } from "./turn-composer.js";
+import type { WebHttpAdapter } from "./web-evidence.js";
+import { createSafeWebHttpAdapter } from "./web-safe-http.js";
+import {
+  createWebSearchConfigurationController,
+  type WebSearchConfigurationSnapshot,
+} from "./web-search-configuration.js";
 
 /** Tests only. Production hydration has no artificial publication barrier. */
 export const presentationHydrationBarrier = Symbol("adam-agent.presentation-hydration-barrier");
@@ -123,6 +129,8 @@ type PresentationSessionBaseOptions = {
   readonly projectLabel: string;
   readonly stateRoot?: string;
   readonly workspaceRoot: string;
+  readonly webHttp?: WebHttpAdapter;
+  readonly webSearchEnvironment?: NodeJS.ProcessEnv;
   readonly [presentationHydrationBarrier]?: PresentationHydrationBarrier;
   readonly [presentationRuntimeRefreshBarrier]?: PresentationRuntimeRefreshBarrier;
   readonly [presentationArtifactReadBarrier]?: PresentationArtifactReadBarrier;
@@ -160,6 +168,11 @@ export async function createPresentationSession(
   options: CreatePresentationSessionOptions,
 ): Promise<PresentationSession> {
   options.lifecycle.enableAutomaticTitles();
+  const webSearchConfiguration =
+    options.webSearchEnvironment === undefined
+      ? undefined
+      : createWebSearchConfigurationController({ environment: options.webSearchEnvironment });
+  const webHttp = options.webHttp ?? createSafeWebHttpAdapter();
   const changePreviewCache = new Map<string, ToolPreviewDisplay | null>();
   const bufferedEvents: SessionRuntimeNotification[] = [];
   const bufferedMetadata: SessionMetadataEvent[] = [];
@@ -363,6 +376,7 @@ export async function createPresentationSession(
       );
     };
     let configuredPreferences = await options.preferences?.load();
+    let configuredWebSearch = await webSearchConfiguration?.load();
     let configuredTargetContexts = await projectConfiguredTargetContexts(configuredPreferences);
     let preferenceDiagnostic = resolvePreferenceDiagnostic(configuredPreferences);
     const knownTargets = new Map<string, ModelTargetIdentity>();
@@ -504,9 +518,16 @@ export async function createPresentationSession(
         }),
         defaultTargetId: configuredPreferences?.defaultTargetId ?? null,
         diagnostic: preferenceDiagnostic,
-        ...(configuredPreferences === undefined
+        ...(configuredPreferences === undefined && configuredWebSearch === undefined
           ? {}
-          : { configuration: { modelPolicy: configuredPreferences.modelPolicy } }),
+          : {
+              configuration: {
+                modelPolicy: configuredPreferences?.modelPolicy ?? emptyUserModelPolicyDisplay(),
+                ...(configuredWebSearch === undefined
+                  ? {}
+                  : { webSearch: projectWebSearchConfiguration(configuredWebSearch) }),
+              },
+            }),
       },
       sessions: { items: initialCatalogItems, nextCursor: catalogPage.nextCursor },
       managedAgents: initialManagedAgents,
@@ -585,6 +606,12 @@ export async function createPresentationSession(
         settlement?: Promise<CommandReceipt>;
       }
     >();
+    let activeWebSearchTest:
+      | {
+          readonly controller: AbortController;
+          settlement?: Promise<CommandReceipt>;
+        }
+      | undefined;
     const publishTargetConnection = (targetId: string, connection: TargetConnection): boolean => {
       if (closed) {
         return false;
@@ -1801,6 +1828,7 @@ export async function createPresentationSession(
       AuthoritativePresentationSnapshot["targets"]
     > => {
       configuredPreferences = await options.preferences?.load();
+      configuredWebSearch = await webSearchConfiguration?.load();
       configuredTargetContexts = await projectConfiguredTargetContexts(configuredPreferences);
       preferenceDiagnostic = resolvePreferenceDiagnostic(configuredPreferences);
       return {
@@ -1811,14 +1839,23 @@ export async function createPresentationSession(
         }),
         defaultTargetId: configuredPreferences?.defaultTargetId ?? null,
         diagnostic: preferenceDiagnostic,
-        ...(configuredPreferences === undefined
+        ...(configuredPreferences === undefined && configuredWebSearch === undefined
           ? {}
-          : { configuration: { modelPolicy: configuredPreferences.modelPolicy } }),
+          : {
+              configuration: {
+                modelPolicy: configuredPreferences?.modelPolicy ?? emptyUserModelPolicyDisplay(),
+                ...(configuredWebSearch === undefined
+                  ? {}
+                  : { webSearch: projectWebSearchConfiguration(configuredWebSearch) }),
+              },
+            }),
       };
     };
 
     const configurationMutationConflict = (): CommandReceipt | null =>
-      activeRun !== undefined || (state.authoritative.active?.pendingInteractions.length ?? 0) > 0
+      activeRun !== undefined ||
+      activeWebSearchTest !== undefined ||
+      (state.authoritative.active?.pendingInteractions.length ?? 0) > 0
         ? {
             status: "rejected",
             code: "conflict",
@@ -2282,6 +2319,104 @@ export async function createPresentationSession(
             status: "rejected",
             code: "persistence_failed",
             message: "The model configuration could not be saved.",
+          };
+        }
+      }
+      if (command.type === "cancel_web_search_test") {
+        const active = activeWebSearchTest;
+        if (active === undefined) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "There is no active Web Search connection test.",
+          };
+        }
+        active.controller.abort(new DOMException("Web Search test cancelled.", "AbortError"));
+        await active.settlement;
+        return { status: "admitted", commandId: randomUUID(), resource: null };
+      }
+      if (command.type === "test_and_set_web_search") {
+        const conflict = configurationMutationConflict();
+        if (conflict !== null) {
+          return conflict;
+        }
+        if (webSearchConfiguration === undefined) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "Web Search configuration is not available in this Presentation session.",
+          };
+        }
+        const entry: {
+          readonly controller: AbortController;
+          settlement?: Promise<CommandReceipt>;
+        } = { controller: new AbortController() };
+        activeWebSearchTest = entry;
+        const settlement: Promise<CommandReceipt> = (async () => {
+          try {
+            await webSearchConfiguration.testAndActivateSearxng({
+              endpoint: command.endpoint,
+              http: webHttp,
+              signal: entry.controller.signal,
+            });
+            if (!closed) {
+              const targets = await refreshConfiguredTargets();
+              if (!closed) {
+                state = {
+                  revision: state.revision + 1,
+                  authoritative: { ...state.authoritative, targets },
+                  draft: state.draft,
+                  composer: state.composer,
+                  transient: state.transient,
+                };
+                publishStateChange();
+              }
+            }
+            return { status: "admitted", commandId: randomUUID(), resource: null };
+          } catch {
+            return {
+              status: "rejected",
+              code: "authority_rejected",
+              message: "The SearXNG connection test failed; the prior configuration is unchanged.",
+            };
+          } finally {
+            if (activeWebSearchTest === entry) {
+              activeWebSearchTest = undefined;
+            }
+          }
+        })();
+        entry.settlement = settlement;
+        return settlement;
+      }
+      if (command.type === "clear_web_search") {
+        const conflict = configurationMutationConflict();
+        if (conflict !== null) {
+          return conflict;
+        }
+        if (webSearchConfiguration === undefined) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "Web Search configuration is not available in this Presentation session.",
+          };
+        }
+        try {
+          await webSearchConfiguration.clear();
+          const targets = await refreshConfiguredTargets();
+          state = {
+            revision: state.revision + 1,
+            authoritative: { ...state.authoritative, targets },
+            draft: state.draft,
+            composer: state.composer,
+            transient: state.transient,
+          };
+          publishStateChange();
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The Web Search configuration could not be cleared.",
           };
         }
       }
@@ -4058,9 +4193,13 @@ export async function createPresentationSession(
         const connectionSettlements = [...activeConnectionTests.values()].flatMap((active) =>
           active.settlement === undefined ? [] : [active.settlement],
         );
+        const webSearchSettlement = activeWebSearchTest?.settlement;
         for (const active of activeConnectionTests.values()) {
           active.controller.abort(new DOMException("Presentation session closed.", "AbortError"));
         }
+        activeWebSearchTest?.controller.abort(
+          new DOMException("Presentation session closed.", "AbortError"),
+        );
         await turnComposer.close();
         for (const observer of operationObservers.values()) {
           observer.abort();
@@ -4077,6 +4216,7 @@ export async function createPresentationSession(
         unsubscribeMetadata();
         await activeRun?.settlement;
         await Promise.all(connectionSettlements);
+        await webSearchSettlement;
         await runtimeRefresh;
         await metadataRefresh;
         await Promise.all(operationRefreshes);
@@ -4912,4 +5052,27 @@ function projectSessionTitleGeneration(
       return unreachable;
     }
   }
+}
+
+function emptyUserModelPolicyDisplay() {
+  return {
+    contextWindowTokens: null,
+    maximumOutputTokens: null,
+    automaticCompactionWindowTokens: null,
+  } as const;
+}
+
+function projectWebSearchConfiguration(snapshot: WebSearchConfigurationSnapshot) {
+  return {
+    status:
+      snapshot.status === "configured"
+        ? ("Configured" as const)
+        : snapshot.status === "invalid"
+          ? ("Invalid" as const)
+          : snapshot.status === "unsafe"
+            ? ("Unsafe" as const)
+            : ("Unconfigured" as const),
+    endpoint: snapshot.provider?.endpoint ?? null,
+    diagnostic: snapshot.diagnostic,
+  };
 }

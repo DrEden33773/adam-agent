@@ -356,7 +356,7 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     id: "config",
     name: "config",
     summary: "Inspect and tighten owner-local model limits for new sessions.",
-    usage: "/config [context|output|compaction <tokens|default>]",
+    usage: "/config [context|output|compaction <tokens|default>|web <endpoint|clear>]",
   },
   {
     aliases: [],
@@ -741,15 +741,18 @@ function completeSingleFiniteArgument(
 }
 
 function completeConfigurationArguments(argumentsText: string): AdamArgumentCompletions | null {
-  const fields = ["context", "output", "compaction"] as const;
+  const fields = ["context", "output", "compaction", "web"] as const;
   if (!/\s/u.test(argumentsText)) {
     return completeSingleFiniteArgument(argumentsText, fields, false);
   }
-  const valueMatch = /^(context|output|compaction)[ \t]+([^\s]*)$/u.exec(argumentsText);
+  const valueMatch = /^(context|output|compaction|web)[ \t]+([^\s]*)$/u.exec(argumentsText);
   if (valueMatch === null) {
     return null;
   }
-  return completeSingleFiniteArgument(valueMatch[2] ?? "", ["default"]);
+  return completeSingleFiniteArgument(
+    valueMatch[2] ?? "",
+    valueMatch[1] === "web" ? ["clear"] : ["default"],
+  );
 }
 
 function rankSuggestions<Entry>(

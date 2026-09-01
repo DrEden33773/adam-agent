@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   access,
   chmod,
@@ -3260,7 +3261,10 @@ test("the production TUI opens owner-local configuration from an exact draft", a
 
   try {
     const fixture = startFixture({
-      launch: { configRoot, startupTargetId: "deepseek-v4-flash.direct" },
+      launch: {
+        configRoot,
+        startupTargetId: "deepseek-v4-flash.direct",
+      },
       stateRoot,
       workspaceRoot,
     });
@@ -3294,7 +3298,10 @@ test("the production TUI applies one exact draft policy command", async () => {
 
   try {
     const fixture = startFixture({
-      launch: { configRoot, startupTargetId: "deepseek-v4-flash.direct" },
+      launch: {
+        configRoot,
+        startupTargetId: "deepseek-v4-flash.direct",
+      },
       scenario: "provider-no-usage",
       stateRoot,
       workspaceRoot,
@@ -3340,6 +3347,179 @@ test("the production TUI applies one exact draft policy command", async () => {
     );
   } finally {
     await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI tests and persists one explicit public SearXNG endpoint", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-web-configuration-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const controlRoot = join(testRoot, "control");
+  const endpoint = "https://search.example.test/search";
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      launch: { configRoot, startupTargetId: "deepseek-v4-flash.direct" },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write(`/config web ${endpoint}\r`);
+    await waitForFileContents(
+      join(controlRoot, "web-search-dispatch-started"),
+      "test_and_set_web_search\n",
+    );
+    await waitForFileContents(join(controlRoot, "web-search-dispatch-settled"), "admitted\n");
+    await fixture.resize(81, 24);
+    const settledFrame = fixture.screen()?.join("\n") ?? "";
+    expect(settledFrame).toContain("Web Search enabled for new sessions.");
+    expect(settledFrame.replace(/\s+/gu, " ")).toContain(
+      "This public SearXNG operator can receive your search query and network address. Adam will not verify, replace, or fall back from this endpoint.",
+    );
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    await expect(readFile(join(configRoot, "adam-agent", "web.json"), "utf8")).resolves.toBe(
+      `${JSON.stringify({
+        schemaVersion: 1,
+        searchProvider: {
+          kind: "searxng",
+          endpoint,
+          activation: {
+            protocol: "searxng-json.v1",
+            endpointDigest: `sha256:${createHash("sha256").update(endpoint).digest("hex")}`,
+          },
+        },
+      })}\n`,
+    );
+  } finally {
+    await rm(testRoot);
+  }
+});
+
+test("the production TUI shows the exact Owner-managed loopback SearXNG warning", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-loopback-web-configuration-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const controlRoot = join(testRoot, "control");
+  const endpoint = "http://127.0.0.1:8888/search";
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      launch: { configRoot, startupTargetId: "deepseek-v4-flash.direct" },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write(`/config web ${endpoint}\r`);
+    await waitForFileContents(join(controlRoot, "web-search-dispatch-settled"), "admitted\n");
+    await fixture.resize(81, 24);
+    expect((fixture.screen()?.join("\n") ?? "").replace(/\s+/gu, " ")).toContain(
+      "Adam will connect only to the exact configured loopback SearXNG endpoint. Adam does not install, start, monitor, or recover that service.",
+    );
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot);
+  }
+});
+
+test("the production TUI renders exact Web permission and a responsive settled search card", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-web-card-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const configDirectory = join(configRoot, "adam-agent");
+  const endpoint = "https://search.example.test/search";
+  await mkdir(workspaceRoot);
+  await mkdir(configDirectory, { recursive: true, mode: 0o700 });
+  await chmod(configDirectory, 0o700);
+  await writeFile(
+    join(configDirectory, "web.json"),
+    `${JSON.stringify({
+      schemaVersion: 1,
+      searchProvider: {
+        kind: "searxng",
+        endpoint,
+        activation: {
+          protocol: "searxng-json.v1",
+          endpointDigest: `sha256:${createHash("sha256").update(endpoint).digest("hex")}`,
+        },
+      },
+    })}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
+
+  try {
+    const fixture = startFixture({
+      launch: {
+        configRoot,
+        startupTargetId: "deepseek-v4-flash.direct",
+        webSearchResultUrl: "https://docs.example.test/tui-card",
+      },
+      scenario: "web-search",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const before = fixture.output().length;
+    fixture.write("Render one Web card\r");
+    await fixture.waitForAfter("Permission required", before);
+    const permissionFrame = (fixture.screen()?.join("\n") ?? "").replace(/\s+/gu, " ");
+    expect(permissionFrame).toContain("https://search.example.test");
+    expect(permissionFrame).toContain("query");
+    expect(permissionFrame).toContain('"tui web evidence" · limit 1');
+    fixture.write("\r");
+    await fixture.waitForAfter("Web search card complete.", before);
+    await fixture.waitForAfter("1 Web source", before);
+    await fixture.resize(60, 24);
+    const settledFrame = fixture.screen()?.join("\n") ?? "";
+    expect(settledFrame).toContain("web search");
+    expect(settledFrame).toContain("1 Web source");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot);
+  }
+});
+
+test("Ctrl+C cancels a held Web Search configuration test without changing prior bytes", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-web-config-cancel-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      launch: { configRoot, startupTargetId: "deepseek-v4-flash.direct" },
+      scenario: "web-search-configuration-pending",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/config web https://held-search.example.test/search\r");
+    await waitForFileContents(join(controlRoot, "web-search-http-requested"), "requested\n");
+    fixture.write("\u0003");
+    await waitForFileContents(join(controlRoot, "cancel_web_search_test-settled"), "admitted\n");
+    await waitForFileContents(join(controlRoot, "test_and_set_web_search-settled"), "rejected\n");
+    await expect(
+      readFile(join(configRoot, "adam-agent", "web.json"), "utf8"),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot);
   }
 });
 
@@ -8105,7 +8285,8 @@ test("a settled write card previews numbered content from its canonical change a
     await fixture.waitFor("Permission required");
     await fixture.waitFor("Preview 1-8 of");
     fixture.write("\u001b[6~");
-    await fixture.waitFor("+export const value12 = 12;");
+    await fixture.resize(81, 24);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("+export const value12 = 12;");
     const beforeAllow = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForAfter("Write complete.", beforeAllow);

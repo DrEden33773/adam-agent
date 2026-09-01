@@ -210,7 +210,13 @@ export function projectPendingPermissionCandidates(
               warning:
                 "Plan parsing is not a sandbox. Approval may run project code, write cache or artifacts, read accessible data, or use network.",
             }
-          : {}),
+          : entry.record.event.subject?.type === "web_request"
+            ? {
+                warning: isLiteralLoopbackProviderOrigin(entry.record.event.subject.providerOrigin)
+                  ? "Adam will connect only to the exact configured loopback SearXNG endpoint. Adam does not install, start, monitor, or recover that service."
+                  : "This public operator can receive this exact Web request and network address. Adam will not verify, replace, or fall back from this endpoint.",
+              }
+            : {}),
         canAllow: entry.record.event.effect !== "write",
         changePreviewRef,
       },
@@ -363,6 +369,9 @@ function presentationChangePreviewRef(
 }
 
 function toolKind(name: string): ToolCallDisplay["kind"] {
+  if (name === "web_search" || name === "web_fetch" || name === "web_open" || name === "web_find") {
+    return "web";
+  }
   if (name === "read_file" || name === "search_repository") {
     return "read";
   }
@@ -373,6 +382,19 @@ function toolKind(name: string): ToolCallDisplay["kind"] {
     return "mutation";
   }
   return name.startsWith("mcp__") ? "mcp" : "unknown";
+}
+
+function isLiteralLoopbackProviderOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+    return (
+      url.protocol === "http:" &&
+      (url.hostname === "127.0.0.1" || url.hostname === "[::1]") &&
+      url.port !== ""
+    );
+  } catch {
+    return false;
+  }
 }
 
 function toolLabel(name: string): string {
@@ -386,7 +408,15 @@ function toolLabel(name: string): string {
           ? "write"
           : name === "edit_file"
             ? "edit"
-            : name;
+            : name === "web_search"
+              ? "web search"
+              : name === "web_fetch"
+                ? "web fetch"
+                : name === "web_open"
+                  ? "web open"
+                  : name === "web_find"
+                    ? "web find"
+                    : name;
 }
 
 function safeToolSubject(
@@ -399,6 +429,18 @@ function safeToolSubject(
   if (subject?.type === "command" || subject?.type === "plan_command") {
     return { type: "command", value: subject.command };
   }
+  if (subject?.type === "web_request") {
+    return {
+      type: "generic",
+      value:
+        subject.operation === "fetch"
+          ? `${subject.providerOrigin} · ${subject.url}`
+          : `${subject.providerOrigin} · query ${JSON.stringify(subject.query)} · limit ${subject.limit}${subject.language === undefined ? "" : ` · language ${JSON.stringify(subject.language)}`}${subject.timeRange === undefined ? "" : ` · time range ${subject.timeRange}`}`,
+    };
+  }
+  if (subject?.type === "web_artifact") {
+    return { type: "generic", value: subject.artifactId };
+  }
   const outputRecord = jsonRecord(output);
   const outputPath = outputRecord?.path;
   if (typeof outputPath === "string") {
@@ -409,7 +451,7 @@ function safeToolSubject(
 
 function toolResultSummary(name: string, output: JsonValue | undefined): string | null {
   const outputRecord = jsonRecord(output);
-  const { resultCount } = outputRecord ?? {};
+  const { matches, partial, resultCount, results, status, text } = outputRecord ?? {};
   if (name === "read_file" && typeof outputRecord?.content === "string") {
     return `${Buffer.byteLength(outputRecord.content, "utf8")} bytes${
       outputRecord.truncated === true ? " · output truncated" : ""
@@ -442,6 +484,18 @@ function toolResultSummary(name: string, output: JsonValue | undefined): string 
   if (name === "search_repository" && typeof resultCount === "number") {
     return `${resultCount} ${resultCount === 1 ? "result" : "results"}`;
   }
+  if (name === "web_search" && Array.isArray(results)) {
+    return `${results.length} Web ${results.length === 1 ? "source" : "sources"}${partial === true ? " · partial" : ""}`;
+  }
+  if (name === "web_fetch" && status === "redirect") {
+    return "Cross-origin redirect · separate approval required";
+  }
+  if ((name === "web_fetch" || name === "web_open") && typeof text === "string") {
+    return `${Buffer.byteLength(text, "utf8")} bytes${outputRecord?.truncated === true ? " · more available" : ""}`;
+  }
+  if (name === "web_find" && Array.isArray(matches)) {
+    return `${matches.length} exact ${matches.length === 1 ? "match" : "matches"}${outputRecord?.truncated === true ? " · more available" : ""}`;
+  }
   if (name.startsWith("mcp__")) {
     const content = outputRecord?.content;
     const outputTruncated =
@@ -465,6 +519,7 @@ function toolPreview(
   changePreviewCache: ReadonlyMap<string, ToolPreviewDisplay | null>,
 ): ToolCallDisplay["preview"] {
   const outputRecord = jsonRecord(output);
+  const { text: outputText } = outputRecord ?? {};
   if (name === "read_file" && typeof outputRecord?.content === "string") {
     const bounded = boundedTextLines(
       outputRecord.content,
@@ -476,7 +531,21 @@ function toolPreview(
       language: subject?.type === "path" ? languageForPath(subject.value) : null,
       lines: bounded.lines.map((text, index) => ({ number: index + 1, text })),
       omittedBytes: bounded.omittedBytes,
-      sourceTruncated: outputRecord.truncated === true,
+      sourceTruncated: outputRecord?.truncated === true,
+    };
+  }
+  if ((name === "web_fetch" || name === "web_open") && typeof outputText === "string") {
+    const bounded = boundedTextLines(
+      outputText,
+      toolTextPreviewMaximumBytes,
+      toolTextPreviewMaximumLines,
+    );
+    return {
+      kind: "read_text",
+      language: null,
+      lines: bounded.lines.map((text, index) => ({ number: index + 1, text })),
+      omittedBytes: bounded.omittedBytes,
+      sourceTruncated: outputRecord?.truncated === true,
     };
   }
   if (
