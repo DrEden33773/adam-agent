@@ -640,6 +640,37 @@ test("TurnComposer seals the exact ordered draft without turning resource tokens
   }
 });
 
+test("TurnComposer seals one path atom as text without input-resource authority", async () => {
+  const composer = await createTurnComposer({ onChange() {}, stager: createPastedTextStager() });
+  try {
+    composer.setText("Inspect @src");
+    await expect(
+      composer.replaceText({
+        baseRevision: composer.snapshot().revision,
+        document: [
+          { type: "text", text: "Inspect " },
+          { type: "path", elementId: "path-1", path: "src/alpha.ts" },
+        ],
+      }),
+    ).resolves.toBe(true);
+    expect(composer.readExpandedText()).toBe("Inspect @src/alpha.ts");
+
+    const sealed = await composer.seal(new AbortController().signal);
+    expect(sealed).toMatchObject({
+      renderedText: "Inspect @src/alpha.ts",
+      text: "Inspect @src/alpha.ts",
+      elements: [
+        { type: "text", text: "Inspect " },
+        { type: "path", elementId: "path-1", path: "src/alpha.ts", text: "@src/alpha.ts" },
+      ],
+      structuredContent: [{ type: "text", text: "Inspect @src/alpha.ts" }],
+      selections: [],
+    });
+  } finally {
+    await composer.close();
+  }
+});
+
 test("TurnComposer captures and restores one recoverable ordered draft through retained artifacts", async () => {
   const retained: string[] = [];
   const pastedTexts = new Map<string, string>();
@@ -709,7 +740,7 @@ test("TurnComposer captures and restores one recoverable ordered draft through r
       type: "new_session",
       targetId: "deepseek-v4-flash.direct",
     });
-    expect(draft.schemaVersion).toBe(2);
+    expect(draft.schemaVersion).toBe(3);
     expect(retained).toHaveLength(2);
     const legacyDraft: RecoverableTurnDraftV1 = {
       ...draft,

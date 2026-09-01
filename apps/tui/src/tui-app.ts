@@ -77,7 +77,6 @@ import {
   PlanContinuationSelector,
   PlanReviewSelector,
 } from "./plan-review-selector.js";
-import { ProjectPathPicker } from "./project-path-picker.js";
 import { reasoningFoldTitle } from "./reasoning-fold.js";
 import { ResourceReloadPicker } from "./resource-reload-picker.js";
 import {
@@ -265,7 +264,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     string,
     { readonly name: string; readonly qualifiedId: string }
   >();
+  const pathAtomValues = new Map<string, string>();
   const structuredEditorCompletion = createAdamStructuredEditorCompletion({
+    pathStyle: theme.pathReference,
+    onPathAtom({ elementId, path }) {
+      pathAtomValues.set(elementId, path);
+    },
     onSkillAtom({ elementId, name, qualifiedId }) {
       skillAtomIdentities.set(elementId, { name, qualifiedId });
     },
@@ -409,12 +413,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly hide: () => void;
       }
     | undefined;
-  let pathPicker:
-    | {
-        readonly close: () => void;
-        readonly hide: () => void;
-      }
-    | undefined;
   let mcpWizard:
     | {
         readonly close: () => void;
@@ -477,7 +475,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     todoNavigator,
     artifactNavigator,
     mcpWizard,
-    pathPicker,
     skillPalette,
     sessionInspector,
     chronologyPicker,
@@ -496,8 +493,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     dismissedPlanSubjectKey = undefined;
     skillPalette?.hide();
     skillPalette = undefined;
-    pathPicker?.hide();
-    pathPicker = undefined;
     mcpWizard?.hide();
     mcpWizard = undefined;
     sessionInspector?.hide();
@@ -702,6 +697,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     projectedComposerKey = composerKey;
     if (scopeChanged) {
       skillAtomIdentities.clear();
+      pathAtomValues.clear();
     }
     for (const element of composer.elements) {
       if (element.type === "skill") {
@@ -709,6 +705,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           name: element.name,
           qualifiedId: element.qualifiedId,
         });
+      } else if (element.type === "path") {
+        pathAtomValues.set(element.elementId, element.path);
       }
     }
     if (!composer.elements.some((element) => element.type !== "text")) {
@@ -735,6 +733,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       if (element.type === "skill") {
         return { type: "atom", id: element.elementId, label: `$${element.name}` };
+      }
+      if (element.type === "path") {
+        return {
+          type: "atom",
+          id: element.elementId,
+          label: `@${element.path}`,
+          style: theme.pathReference,
+        };
       }
       return {
         type: "atom",
@@ -1803,12 +1809,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
               : `${label} ${safeTerminalText(subject)}`;
         const action = `Ctrl+O ${expanded ? "fold" : "expand"}`;
         const titleWithAction = (baseWidth: number): string =>
-          theme.toolTitle(`${truncateToWidth(baseTitle, baseWidth)} · ${action}`);
+          `${theme.toolTitle(truncateToWidth(baseTitle, baseWidth))}${theme.text(` · ${action}`)}`;
         const toolTitle = new ResponsiveText(() => physicalTerminal.columns);
         toolTitle.setText({
           narrow: titleWithAction(14),
           standard: titleWithAction(32),
-          wide: theme.toolTitle(`${baseTitle} · ${action}`),
+          wide: `${theme.toolTitle(baseTitle)}${theme.text(` · ${action}`)}`,
         });
         tool.addChild(toolTitle);
         if (item.preview !== null) {
@@ -2328,65 +2334,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       });
   };
   let emptyDraftChangeGeneration = 0;
-  const showProjectPathPicker = (): void => {
-    const state = options.presentation.getState();
-    const active = state.authoritative.active;
-    const projectPaths = active?.projectPaths ?? state.draft?.projectPaths;
-    if (
-      pathPicker !== undefined ||
-      projectPaths === undefined ||
-      projectPaths.items.length === 0 ||
-      !isProjectPathTrigger(editor.getExpandedText())
-    ) {
-      return;
-    }
-    let handle: { hide(): void } | undefined;
-    const close = () => {
-      handle?.hide();
-      pathPicker = undefined;
-      tui.setFocus(editor);
-      tui.requestRender();
-    };
-    const picker = new ProjectPathPicker({
-      catalog: projectPaths,
-      onClose: close,
-      onSelect(path) {
-        const value = `\`${safeTerminalText(path)}\``;
-        if (structuredEditorActive && localStructuredDocument !== null) {
-          const edit = structuredEditorCompletion.accept(
-            localStructuredDocument,
-            editor.getDocumentCursor(),
-            { label: value, value },
-            "@",
-          );
-          if (edit !== null) {
-            editor.setDocument(edit.document, edit.cursor);
-            editor.onEditIntent?.({
-              type: "replace",
-              document: edit.document,
-              range: edit.range,
-              text: edit.text,
-            });
-          }
-        } else {
-          const draft = editor.getExpandedText();
-          const trigger = draft.lastIndexOf("@");
-          if (trigger >= 0) {
-            editor.setText(`${draft.slice(0, trigger)}${value}${draft.slice(trigger + 1)}`);
-          }
-        }
-        close();
-      },
-      theme,
-    });
-    handle = showOverlay(picker, {
-      width: "90%",
-      minWidth: 36,
-      maxHeight: "80%",
-      margin: 1,
-    });
-    pathPicker = { close, hide: () => handle?.hide() };
-  };
   editor.onChange = () => {
     const text = editor.getExpandedText();
     emptyDraftChangeGeneration += 1;
@@ -2412,7 +2359,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       clearExitWindow();
       renderState();
     }
-    showProjectPathPicker();
   };
   const prepareDraftInsertion = async (
     intent: EditorPasteIntent,
@@ -2502,18 +2448,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         })
         .then((receipt) => {
           if (receipt?.status === "admitted") {
-            showNotice("success", "Input resource removed.", "until_next_action");
+            pathAtomValues.delete(intent.atomId);
+            skillAtomIdentities.delete(intent.atomId);
+            showNotice("success", "Draft element removed.", "until_next_action");
           } else {
             showNotice(
               "error",
-              receipt?.message ?? "The input resource could not be removed.",
+              receipt?.message ?? "The draft element could not be removed.",
               "until_edit",
             );
           }
           renderState();
         })
         .catch(() => {
-          showNotice("error", "The input resource could not be removed.", "until_edit");
+          showNotice("error", "The draft element could not be removed.", "until_edit");
           renderState();
         });
       return;
@@ -2549,7 +2497,6 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const localLiteralText = intent.document
       .flatMap((part) => (part.type === "text" ? [part.text] : []))
       .join("");
-    showProjectPathPicker();
     if (localLiteralText.startsWith("/")) {
       renderState();
       return;
@@ -2570,14 +2517,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                     name: skillAtomIdentities.get(part.id)?.name ?? "",
                     qualifiedId: skillAtomIdentities.get(part.id)?.qualifiedId ?? "",
                   }
-                : {
-                    type:
-                      composer.elements.find((element) => element.elementId === part.id)?.type ===
-                      "pasted_text"
-                        ? ("pasted_text" as const)
-                        : ("resource" as const),
-                    elementId: part.id,
-                  },
+                : pathAtomValues.has(part.id)
+                  ? {
+                      type: "path" as const,
+                      elementId: part.id,
+                      path: pathAtomValues.get(part.id) ?? "",
+                    }
+                  : {
+                      type:
+                        composer.elements.find((element) => element.elementId === part.id)?.type ===
+                        "pasted_text"
+                          ? ("pasted_text" as const)
+                          : ("resource" as const),
+                      elementId: part.id,
+                    },
           ),
         });
       })
@@ -5628,7 +5581,9 @@ function renderLargeReasoning(options: {
     content.addChild(new Text(options.theme.muted("Loading bounded reasoning range…")));
   } else if (options.view.failureInitial) {
     content.addChild(
-      new Text(options.theme.danger("Reasoning range unavailable · Ctrl+T retry loading")),
+      new Text(
+        `${options.theme.danger("Reasoning range unavailable")}${options.theme.text(" · Ctrl+T retry loading")}`,
+      ),
     );
   } else {
     if (options.view.failureAbove) {
@@ -5957,14 +5912,6 @@ function sessionRunStatus(
     return "permission required";
   }
   return activity === "using_tool" ? "using tool" : (activity ?? "idle");
-}
-
-function isProjectPathTrigger(draft: string): boolean {
-  if (!draft.endsWith("@")) {
-    return false;
-  }
-  const beforeTrigger = draft.at(-2);
-  return beforeTrigger === undefined || /\s/u.test(beforeTrigger);
 }
 
 function authoritativePromptHistory(active: ActiveSessionDisplay | null): readonly string[] {

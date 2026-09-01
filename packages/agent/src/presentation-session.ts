@@ -2745,7 +2745,9 @@ export async function createPresentationSession(
               ? await turnComposer.remove(element.resourceId, persistCurrentTurnDraft)
               : element.type === "pasted_text"
                 ? await turnComposer.removePastedText(element.pastedTextId, persistCurrentTurnDraft)
-                : await turnComposer.removeSkill(element.elementId, persistCurrentTurnDraft);
+                : element.type === "path"
+                  ? await turnComposer.removePath(element.elementId, persistCurrentTurnDraft)
+                  : await turnComposer.removeSkill(element.elementId, persistCurrentTurnDraft);
           return removed
             ? { status: "admitted", commandId: randomUUID(), resource: null }
             : {

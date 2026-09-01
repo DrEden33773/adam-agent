@@ -22,9 +22,22 @@ export type SkillAutocompleteIdentity = {
   readonly qualifiedId: string;
 };
 
+export type PathAutocompleteIdentity = {
+  readonly path: string;
+};
+
 type SkillAutocompleteItem = AutocompleteItem & {
   readonly adamSkill: SkillAutocompleteIdentity;
 };
+
+type PathAutocompleteItem = AutocompleteItem & {
+  readonly adamPath: PathAutocompleteIdentity;
+};
+
+export function pathAutocompleteIdentity(item: AutocompleteItem): PathAutocompleteIdentity | null {
+  const candidate = item as Partial<PathAutocompleteItem>;
+  return candidate.adamPath?.path === undefined ? null : candidate.adamPath;
+}
 
 export function skillAutocompleteIdentity(
   item: AutocompleteItem,
@@ -36,7 +49,7 @@ export function skillAutocompleteIdentity(
 }
 
 export class AdamAutocompleteProvider implements AutocompleteProvider {
-  readonly triggerCharacters = ["$"];
+  readonly triggerCharacters = ["$", "@"];
   readonly #getAttachmentsAvailable: () => boolean;
   readonly #getProjectPaths: () => readonly string[];
   readonly #getRunActive: () => boolean;
@@ -181,6 +194,32 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
         skillItems.length === 0 ? null : { items: skillItems, prefix: mentionPrefix },
       );
     }
+    const pathMention = /(?:^|\s)(@([^\s@]*))$/u.exec(beforeCursor);
+    const pathPrefix = pathMention?.[1];
+    const pathValuePrefix = pathMention?.[2];
+    if (pathPrefix !== undefined && pathValuePrefix !== undefined) {
+      const normalizedPrefix = pathValuePrefix.toLocaleLowerCase();
+      const paths = this.#getProjectPaths();
+      const prefixMatches = paths.filter((path) =>
+        path.toLocaleLowerCase().startsWith(normalizedPrefix),
+      );
+      const candidates =
+        prefixMatches.length > 0
+          ? prefixMatches
+          : paths.filter((path) => fuzzyMatch(path, normalizedPrefix));
+      const pathItems = candidates.map<PathAutocompleteItem>((path) => {
+        const safePath = safeTerminalText(path);
+        return {
+          adamPath: { path: safePath },
+          value: `@${safePath}`,
+          label: this.#path(`@${safePath}`),
+          description: "project path",
+        };
+      });
+      return Promise.resolve(
+        pathItems.length === 0 ? null : { items: pathItems, prefix: pathPrefix },
+      );
+    }
     if (options.force !== true) {
       return Promise.resolve(null);
     }
@@ -208,6 +247,17 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     completed[cursorLine] = `${line.slice(0, start)}${item.value}${line.slice(cursorCol)}`;
     return { lines: completed, cursorLine, cursorCol: start + item.value.length };
   }
+}
+
+function fuzzyMatch(candidate: string, query: string): boolean {
+  const normalizedCandidate = candidate.toLocaleLowerCase();
+  let position = 0;
+  for (const character of query) {
+    position = normalizedCandidate.indexOf(character, position);
+    if (position < 0) return false;
+    position += character.length;
+  }
+  return true;
 }
 
 function skillSourceLabel(source: SkillCompletion["source"]): string {
