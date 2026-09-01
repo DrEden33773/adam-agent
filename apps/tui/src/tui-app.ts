@@ -37,6 +37,7 @@ import {
   VStack,
 } from "@earendil-works/pi-tui";
 import PQueue from "p-queue";
+import { AgentNavigator } from "./agent-navigator.js";
 import {
   ArtifactNavigator,
   activeChronologyArtifacts,
@@ -444,6 +445,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly hide: () => void;
       }
     | undefined;
+  let agentNavigator:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+      }
+    | undefined;
   let todoNavigatorGeneration = 0;
   let planActionOverlay:
     | {
@@ -462,6 +469,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const closeableOverlaysInPrecedence = (): readonly (CloseableOverlay | undefined)[] => [
     planActionOverlay,
     helpNavigator,
+    agentNavigator,
     todoNavigator,
     artifactNavigator,
     mcpWizard,
@@ -503,6 +511,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     todoNavigatorGeneration += 1;
     todoNavigator?.hide();
     todoNavigator = undefined;
+    agentNavigator?.hide();
+    agentNavigator = undefined;
     thinkingPicker?.hide();
     thinkingPicker = undefined;
   };
@@ -2165,19 +2175,26 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         active.todo === undefined
           ? ""
           : ` · todo ${active.todo.counts.pending}/${active.todo.counts.inProgress}/${active.todo.counts.completed} · ${active.todo.blockedCount} blocked`;
+      const managedAgents = state.authoritative.managedAgents.counts;
+      const agentSummary =
+        managedAgents.active === 0 && managedAgents.completed === 0
+          ? ""
+          : ` · Agents ${managedAgents.active} active/${managedAgents.completed} completed`;
+      const compactAgentSummary =
+        managedAgents.active === 0 ? "" : ` · agents ${managedAgents.active}`;
       const pasteHint =
         runStatus === "idle" && editor.focused && focusedCloseableOverlay() === undefined
           ? " · Alt+V paste"
           : "";
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}${pasteHint}`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}${agentSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}${pasteHint}`,
         ),
         standard: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete${pasteHint}`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}${agentSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete${pasteHint}`,
         ),
         narrow: theme.muted(
-          `${runStatus}${compactPlanSummary} · ${footerContextCompactText(active)}${compactTodoSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}\n/help · Tab complete`,
+          `${runStatus}${compactPlanSummary} · ${footerContextCompactText(active)}${compactTodoSummary}${compactAgentSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}\n/help · Tab complete`,
         ),
       });
     }
@@ -2816,6 +2833,87 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     };
     clearNotice();
     tui.requestRender();
+  };
+  const showAgentNavigator = (expectedSessionId: string): void => {
+    agentNavigator?.hide();
+    agentNavigator = undefined;
+    const actionId = showNotice(
+      "progress",
+      "Loading authoritative managed-child state…",
+      "until_replaced",
+      expectedSessionId,
+    );
+    renderState();
+    void options.presentation
+      .dispatch({ type: "refresh_managed_agents", sessionId: expectedSessionId })
+      .then((receipt) => {
+        const current = options.presentation.getState().authoritative;
+        if (receipt.status === "rejected" || current.active?.session.id !== expectedSessionId) {
+          settleNotice(
+            actionId,
+            "error",
+            receipt.status === "rejected"
+              ? receipt.message
+              : "The active session changed before /agents opened.",
+            "until_replaced",
+            expectedSessionId,
+          );
+          renderState();
+          return;
+        }
+        let handle: { hide(): void } | undefined;
+        const close = () => {
+          handle?.hide();
+          agentNavigator = undefined;
+          tui.setFocus(editor);
+          tui.requestRender();
+        };
+        const navigator = new AgentNavigator({
+          managedAgents: current.managedAgents,
+          onCancel(input) {
+            void options.presentation
+              .dispatch({
+                type: "cancel_managed_agent",
+                sessionId: expectedSessionId,
+                ...input,
+              })
+              .then((cancelReceipt) => {
+                close();
+                showNotice(
+                  cancelReceipt.status === "admitted" ? "success" : "error",
+                  cancelReceipt.status === "admitted"
+                    ? "Managed child cancelled after causal settlement."
+                    : cancelReceipt.message,
+                  "until_next_action",
+                  expectedSessionId,
+                );
+                renderState();
+              });
+          },
+          onChange: () => tui.requestRender(),
+          onClose: close,
+          theme,
+        });
+        handle = showOverlay(navigator, {
+          width: "90%",
+          minWidth: 36,
+          maxHeight: "80%",
+          margin: 1,
+        });
+        agentNavigator = { close, hide: () => handle?.hide() };
+        settleNoticeClear(actionId);
+        tui.requestRender();
+      })
+      .catch(() => {
+        settleNotice(
+          actionId,
+          "error",
+          "Managed-child state is unavailable.",
+          "until_replaced",
+          expectedSessionId,
+        );
+        renderState();
+      });
   };
   const showTodoNavigator = (expectedSessionId: string): void => {
     const current = options.presentation.getState().authoritative.active;
@@ -4288,6 +4386,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           renderState();
         },
       );
+      return;
+    }
+    if (
+      parsedCommand.kind === "known" &&
+      parsedCommand.command.id === "agents" &&
+      parsedCommand.argumentsText.length === 0
+    ) {
+      editor.setText("");
+      editor.disableSubmit = false;
+      showAgentNavigator(active.session.id);
       return;
     }
     if (

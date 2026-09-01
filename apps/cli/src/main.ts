@@ -313,7 +313,10 @@ function formatPermissionPrompt(
     return `Allow ${event.name} for linked input resource ${quoteForTerminal(event.subject.occurrenceId)} [y/N] `;
   }
   if (event.subject.type === "managed_agent_spawn") {
-    return `Allow ${event.subject.profile} foreground scout for this exact task (${event.subject.taskDigest}) [y/N] `;
+    return `Allow ${event.subject.profile} ${event.subject.mode ?? "foreground"} scout for this exact task (${event.subject.taskDigest}) [y/N] `;
+  }
+  if (event.subject.type === "managed_agent_control") {
+    return `Allow managed-child ${event.subject.action} for this exact parent session [y/N] `;
   }
   return `Allow ${event.name} for ${quoteForTerminal(event.subject.path)} [y/N] `;
 }

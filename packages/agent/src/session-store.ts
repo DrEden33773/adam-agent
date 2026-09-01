@@ -66,6 +66,7 @@ type V1PermissionSubject = Exclude<
   {
     readonly type:
       | "extension_capability"
+      | "managed_agent_control"
       | "managed_agent_spawn"
       | "mcp_tool"
       | "patch"
@@ -133,7 +134,9 @@ export type SessionGenesisRecord = {
     readonly sessionId: string;
     readonly projectId: string;
     readonly targetIdentity: ModelTargetIdentity;
-    readonly managedAgentTools?: "managed-agent-tools.a1.v1";
+    readonly managedAgentTools?:
+      | "managed-agent-tools.a1.v1"
+      | "managed-agent-tools.a2-long-lived.v1";
     readonly naming?: {
       readonly profileVersion: 1;
       readonly fallbackTitle: string;
@@ -746,6 +749,7 @@ export type SessionProviderAttemptStartedRecord = {
       readonly version: 1;
       readonly assemblyIdentityDigest: Sha256Digest;
       readonly requestProjectionDigest: Sha256Digest;
+      readonly managedAgentSummary?: string;
       readonly approvedPlanProjectionDigest?: Sha256Digest;
     };
     readonly projectedContent?: ProjectedContentUsageV1;
@@ -1403,6 +1407,7 @@ const managedAgentSpawnPermissionSubjectSchema = z.strictObject({
   parentRootId: z.string().min(1).max(256),
   parentSessionId: z.uuid(),
   profile: z.literal("scout.v1"),
+  mode: z.enum(["foreground", "background"]).optional(),
   profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   targetIdentity: z.strictObject({
     targetId: z.string().min(1).max(256),
@@ -1444,12 +1449,44 @@ const managedAgentSpawnPermissionSubjectSchema = z.strictObject({
     })
     .optional(),
 });
+const managedAgentControlPermissionSubjectSchema = z
+  .strictObject({
+    type: z.literal("managed_agent_control"),
+    action: z.enum(["list", "wait", "follow_up", "cancel"]),
+    parentRootId: z.string().min(1).max(256),
+    parentSessionId: z.uuid(),
+    agentId: z.uuid().optional(),
+    expectedRevision: z.number().int().positive().optional(),
+    taskDigest: z
+      .string()
+      .regex(/^sha256:[0-9a-f]{64}$/u)
+      .optional(),
+  })
+  .superRefine((subject, context) => {
+    if (
+      (subject.action === "cancel" &&
+        (subject.agentId === undefined ||
+          subject.expectedRevision === undefined ||
+          subject.taskDigest !== undefined)) ||
+      (subject.action === "follow_up" &&
+        (subject.agentId === undefined ||
+          subject.expectedRevision === undefined ||
+          subject.taskDigest === undefined)) ||
+      ((subject.action === "list" || subject.action === "wait") &&
+        (subject.agentId !== undefined ||
+          subject.expectedRevision !== undefined ||
+          subject.taskDigest !== undefined))
+    ) {
+      context.addIssue({ code: "custom", message: "Invalid managed-agent control authority." });
+    }
+  });
 const v2PermissionSubjectSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("file"), path: z.string() }),
   z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
   extensionCapabilityPermissionSubjectSchema,
   patchPermissionSubjectSchema,
   skillPermissionSubjectSchema,
+  managedAgentControlPermissionSubjectSchema,
   managedAgentSpawnPermissionSubjectSchema,
   z.strictObject({
     type: z.literal("command"),
@@ -1528,6 +1565,7 @@ const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
   skillPermissionSubjectSchema,
   mcpPermissionSubjectSchema,
   inputResourcePermissionSubjectSchema,
+  managedAgentControlPermissionSubjectSchema,
   managedAgentSpawnPermissionSubjectSchema,
   planCommandPermissionSubjectSchema,
   z.strictObject({
@@ -1911,7 +1949,9 @@ const sessionGenesisV1RecordSchema = z.strictObject({
   sessionId: z.uuid(),
   projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   targetIdentity: modelTargetIdentitySchema,
-  managedAgentTools: z.literal("managed-agent-tools.a1.v1").optional(),
+  managedAgentTools: z
+    .enum(["managed-agent-tools.a1.v1", "managed-agent-tools.a2-long-lived.v1"])
+    .optional(),
   naming: z
     .strictObject({
       profileVersion: z.literal(1),
@@ -2726,6 +2766,10 @@ const sessionV3RecordSchema = z.union([
         version: z.literal(1),
         assemblyIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
         requestProjectionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+        managedAgentSummary: z
+          .string()
+          .refine((value) => Buffer.byteLength(value, "utf8") <= 1024)
+          .optional(),
         approvedPlanProjectionDigest: z
           .string()
           .regex(/^sha256:[0-9a-f]{64}$/u)

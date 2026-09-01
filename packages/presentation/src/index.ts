@@ -904,6 +904,33 @@ export type AuthoritativePresentationSnapshot = {
   readonly targets: TargetCatalogDisplay;
   readonly sessions: SessionSummaryPage;
   readonly active: ActiveSessionDisplay | null;
+  readonly managedAgents: {
+    readonly counts: { readonly active: number; readonly completed: number; readonly attention: 0 };
+    readonly agents: readonly {
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly profile: "scout.v1";
+      readonly mode: "foreground" | "background";
+      readonly status:
+        | "running"
+        | "completed"
+        | "failed"
+        | "cancelled"
+        | "recovery_required"
+        | "inspection_required";
+      readonly revision: number;
+      readonly result?:
+        | { readonly text: string }
+        | {
+            readonly artifact: {
+              readonly id: string;
+              readonly mediaType: string;
+              readonly byteCount: number;
+            };
+          };
+      readonly error?: { readonly code: string; readonly message: string };
+    }[];
+  };
 };
 
 export type PresentationTransientState = {
@@ -1008,6 +1035,13 @@ export type TodoEntityResource = {
 };
 
 export type PresentationCommand =
+  | { readonly type: "refresh_managed_agents"; readonly sessionId: string }
+  | {
+      readonly type: "cancel_managed_agent";
+      readonly sessionId: string;
+      readonly agentId: string;
+      readonly expectedRevision: number;
+    }
   | {
       readonly type: "select_session";
       readonly sessionId: string;

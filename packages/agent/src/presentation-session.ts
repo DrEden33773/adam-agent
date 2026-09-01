@@ -416,6 +416,10 @@ export async function createPresentationSession(
       "targetIdentity" in options && options.targetIdentity !== undefined
         ? await options.lifecycle.previewNewSession({ targetIdentity: options.targetIdentity })
         : null;
+    const initialManagedAgents =
+      created === undefined
+        ? { counts: { active: 0, completed: 0, attention: 0 as const }, agents: [] }
+        : await options.lifecycle.inspectManagedAgents({ sessionId: created.sessionId });
     const authoritative: AuthoritativePresentationSnapshot = {
       schemaVersion: 1,
       continuity: initialOperationProjection.truncated
@@ -505,6 +509,7 @@ export async function createPresentationSession(
           : { configuration: { modelPolicy: configuredPreferences.modelPolicy } }),
       },
       sessions: { items: initialCatalogItems, nextCursor: catalogPage.nextCursor },
+      managedAgents: initialManagedAgents,
       active:
         created === undefined || summary === undefined
           ? null
@@ -1157,6 +1162,9 @@ export async function createPresentationSession(
       const activatedContextUsage = await options.lifecycle.inspectContextUsage({
         sessionId: snapshot.sessionId,
       });
+      const activatedManagedAgents = await options.lifecycle.inspectManagedAgents({
+        sessionId: snapshot.sessionId,
+      });
       const activatedPreviewHydration = hydrateChangePreviews(
         activatedRecords,
         options,
@@ -1249,6 +1257,7 @@ export async function createPresentationSession(
             items: catalogItems,
             nextCursor: state.authoritative.sessions.nextCursor,
           },
+          managedAgents: activatedManagedAgents,
           active: {
             session: activatedSummary,
             transcript: transcriptPage(transcript, loadedTranscriptStart, snapshot.sessionId),
@@ -1266,7 +1275,10 @@ export async function createPresentationSession(
         },
         draft: null,
         composer: projectTurnComposer(activatedSkills),
-        transient: null,
+        transient:
+          activeRun === undefined
+            ? null
+            : (state.transient ?? { activity: "working", assistant: null, reasoning: null }),
       };
       draftTargetIdentity = null;
       publishStateChange();
@@ -1675,7 +1687,13 @@ export async function createPresentationSession(
               draft: state.draft,
               composer: state.composer,
               transient: isAssistantTerminalEvent(event)
-                ? null
+                ? activeRun === undefined
+                  ? null
+                  : (state.transient ?? {
+                      activity: "working",
+                      assistant: null,
+                      reasoning: null,
+                    })
                 : recoveredReasoning === undefined
                   ? state.transient
                   : {
@@ -1901,6 +1919,34 @@ export async function createPresentationSession(
           code: "presentation_closed",
           message: "The presentation session is closed.",
         };
+      }
+      if (command.type === "refresh_managed_agents" || command.type === "cancel_managed_agent") {
+        if (state.authoritative.active?.session.id !== command.sessionId) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected session is no longer active.",
+          };
+        }
+        try {
+          const managedAgents =
+            command.type === "refresh_managed_agents"
+              ? await options.lifecycle.inspectManagedAgents({ sessionId: command.sessionId })
+              : await options.lifecycle.cancelManagedAgent(command);
+          state = {
+            ...state,
+            revision: state.revision + 1,
+            authoritative: { ...state.authoritative, managedAgents },
+          };
+          publishStateChange();
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message: "Managed-child state changed or became unavailable.",
+          };
+        }
       }
       if (command.type === "list_todos") {
         const active = state.authoritative.active;
@@ -2813,6 +2859,10 @@ export async function createPresentationSession(
           .finally(() => {
             if (activeRun === runState) {
               activeRun = undefined;
+              if (!closed && state.transient !== null) {
+                state = { ...state, revision: state.revision + 1, transient: null };
+                publishStateChange();
+              }
             }
           });
         runState.settlement = settlement;
@@ -2993,15 +3043,10 @@ export async function createPresentationSession(
           .finally(() => {
             if (activeRun === runState) {
               activeRun = undefined;
-            }
-            if (
-              !closed &&
-              admittedSessionId === null &&
-              state.authoritative.active === null &&
-              state.transient !== null
-            ) {
-              state = { ...state, revision: state.revision + 1, transient: null };
-              publishStateChange();
+              if (!closed && state.transient !== null) {
+                state = { ...state, revision: state.revision + 1, transient: null };
+                publishStateChange();
+              }
             }
           });
         runState.settlement = settlement;

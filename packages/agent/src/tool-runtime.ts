@@ -350,6 +350,7 @@ export type PermissionSubject =
       readonly parentRootId: string;
       readonly parentSessionId: string;
       readonly profile: "scout.v1";
+      readonly mode?: "foreground" | "background";
       readonly profileDigest: `sha256:${string}`;
       readonly targetIdentity: {
         readonly targetId: string;
@@ -387,6 +388,15 @@ export type PermissionSubject =
             };
         readonly reasoningArtifact: "provider_reasoning";
       };
+    }
+  | {
+      readonly type: "managed_agent_control";
+      readonly action: "list" | "wait" | "follow_up" | "cancel";
+      readonly parentRootId: string;
+      readonly parentSessionId: string;
+      readonly agentId?: string;
+      readonly expectedRevision?: number;
+      readonly taskDigest?: `sha256:${string}`;
     };
 
 export type PermissionPolicyInput = {
