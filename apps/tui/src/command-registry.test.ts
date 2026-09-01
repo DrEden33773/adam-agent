@@ -36,6 +36,14 @@ test("the TUI Registry exposes the read-only Todo navigator", () => {
   });
 });
 
+test("the TUI Registry exposes the idle managed-child navigator", () => {
+  const parsed = adamCommandRegistry.parse("/agents");
+  expect(parsed).toMatchObject({
+    kind: "known",
+    command: { id: "agents", availability: "idle", usage: "/agents" },
+  });
+});
+
 test("the TUI Registry parses the explicit clipboard image action", () => {
   expect(adamCommandRegistry.parse("/paste-image")).toMatchObject({
     kind: "known",

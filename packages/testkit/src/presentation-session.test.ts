@@ -999,6 +999,7 @@ test("PresentationSession opens an empty project catalog without creating a sess
         },
         targets: { items: [], defaultTargetId: null, diagnostic: null },
         sessions: { items: [], nextCursor: null },
+        managedAgents: { counts: { active: 0, completed: 0, attention: 0 }, agents: [] },
         active: null,
       },
       draft: null,
@@ -5348,6 +5349,7 @@ test("PresentationSession opens an exact target as a recoverable draft", async (
           diagnostic: null,
         },
         sessions: { items: [], nextCursor: null },
+        managedAgents: { counts: { active: 0, completed: 0, attention: 0 }, agents: [] },
         active: null,
       },
       draft: {

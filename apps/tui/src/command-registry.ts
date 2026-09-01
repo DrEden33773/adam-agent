@@ -8,6 +8,7 @@ export type AdamCommandDefinition = {
   readonly availability: "always" | "idle";
   readonly id:
     | "artifacts"
+    | "agents"
     | "attach"
     | "cancelattach"
     | "clone"
@@ -229,6 +230,14 @@ const composerCommandIds = new Set<AdamCommandDefinition["id"]>([
 ]);
 
 const builtInCommands: readonly AdamCommandDefinition[] = [
+  {
+    aliases: [],
+    availability: "idle",
+    id: "agents",
+    name: "agents",
+    summary: "Inspect and cancel managed children for the active session.",
+    usage: "/agents",
+  },
   {
     aliases: [],
     availability: "idle",

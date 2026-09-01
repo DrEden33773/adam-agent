@@ -4730,6 +4730,9 @@ test("the footer exposes authoritative project context and run facts", async () 
     await fixture.resize(120, 40);
     fixture.write("Produce an artifact-backed answer\r");
     await fixture.waitFor("Adam · Streaming session");
+    await fixture.waitFor("Assistant response stored as artifact");
+    const afterFirstAnswer = fixture.output().lastIndexOf("Assistant response stored as artifact");
+    await fixture.waitForCompleteFrameAfter(" · idle", afterFirstAnswer);
     const beforeCompaction = fixture.output().length;
     fixture.write("Continue after the large answer\r");
     await fixture.waitForCompleteFrameAfter("Working", beforeCompaction);
@@ -4768,24 +4771,36 @@ test("the footer distinguishes provider-reported context occupancy at every widt
   try {
     const fixture = startFixture({ scenario: "provider-usage", stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
-    const beforePrompt = fixture.output().length;
     fixture.write("Report exact usage\r");
     await fixture.waitFor("Provider usage answer.");
-    await fixture.waitForAfter(" · idle", beforePrompt);
+    const afterAnswer = fixture.output().lastIndexOf("Provider usage answer.");
+    await fixture.waitForCompleteFrameAfter(
+      "workspace · 12345/32768 context · provider reported · idle",
+      afterAnswer,
+    );
     expect(await readFilesRecursively(stateRoot)).toContain('"inputTokens":12345');
 
     let beforeResize = fixture.output().length;
     await fixture.resize(120, 40);
+    await fixture.waitForCompleteFrameAfter(
+      "workspace · 12345/32768 context · provider reported · idle",
+      beforeResize,
+    );
     let frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
     expect(frame).toContain("workspace · 12345/32768 context · provider reported · idle");
 
     beforeResize = fixture.output().length;
     await fixture.resize(80, 24);
+    await fixture.waitForCompleteFrameAfter(
+      "workspace · 12345/32768 context · provider reported · idle",
+      beforeResize,
+    );
     frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
     expect(frame).toContain("workspace · 12345/32768 context · provider reported · idle");
 
     beforeResize = fixture.output().length;
     await fixture.resize(40, 12);
+    await fixture.waitForCompleteFrameAfter("idle · ctx 12.3k/32.8k reported", beforeResize);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
     expect(frame).toContain("idle · ctx 12.3k/32.8k reported");
     fixture.write("\u0011");
@@ -8677,6 +8692,8 @@ test("completed durable-context compaction renders an explicit chronology marker
     fixture.write("Produce an artifact-backed answer\r");
     await fixture.waitFor("Assistant response stored as artifact");
     await fixture.waitFor("Adam · Streaming session");
+    const afterFirstAnswer = fixture.output().lastIndexOf("Assistant response stored as artifact");
+    await fixture.waitForCompleteFrameAfter(" · idle", afterFirstAnswer);
     const beforeCompaction = fixture.output().length;
     fixture.write("Continue after the large answer\r");
     await fixture.waitForAfter("Context compacted · window 1", beforeCompaction);

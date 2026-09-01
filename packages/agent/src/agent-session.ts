@@ -180,6 +180,7 @@ type AgentSessionBaseDependencies = {
 };
 
 export const sessionToolProfileNames = Symbol("adam-agent.session-tool-profile-names");
+export const managedAgentPromptSummary = Symbol("adam-agent.managed-agent-prompt-summary");
 
 export type AgentSessionDependencies = AgentSessionBaseDependencies &
   (
@@ -208,6 +209,8 @@ export class AgentSession {
   #plan: PlanCycleSnapshot | undefined;
   #planGitAttestation: PlanGitAttestationV1 | undefined;
   readonly #permissions: PermissionPolicy | undefined;
+  readonly #managedAgentPromptSummary: (() => string) | undefined;
+  #lastManagedAgentPromptSummary: string | undefined;
   #promptContext: PromptContextRecord | undefined;
   #skillContext: SkillContextRecordV1 | undefined;
   readonly #activeSkillContents = new Map<string, string>();
@@ -331,6 +334,11 @@ export class AgentSession {
           ? (this.#tools?.definitions() ?? [])
           : planRequestToolDefinitions(this.#tools, this.#plan);
     this.#permissions = dependencies.permissions;
+    this.#managedAgentPromptSummary = (
+      dependencies as AgentSessionDependencies & {
+        readonly [managedAgentPromptSummary]?: () => string;
+      }
+    )[managedAgentPromptSummary];
     this.#promptContext =
       this.#durableContext === undefined
         ? createPromptContextV1(this.#tools)
@@ -796,6 +804,9 @@ export class AgentSession {
                       version: 1 as const,
                       assemblyIdentityDigest: this.#promptContext.assemblyIdentityDigest,
                       requestProjectionDigest: digestPromptRequestV1(requestMessages, requestTools),
+                      ...(this.#lastManagedAgentPromptSummary === undefined
+                        ? {}
+                        : { managedAgentSummary: this.#lastManagedAgentPromptSummary }),
                       ...(approvedPlan === undefined
                         ? {}
                         : {
@@ -1293,7 +1304,7 @@ export class AgentSession {
   }
 
   #assemblePromptMessages(transcript: readonly ModelMessage[]): readonly ModelMessage[] {
-    const messages =
+    let messages =
       this.#promptContext === undefined
         ? [...transcript]
         : assemblePromptMessagesV1(
@@ -1302,6 +1313,19 @@ export class AgentSession {
             this.#skillContext,
             this.#activeSkillContents,
           );
+    const managedSummary = this.#managedAgentPromptSummary?.();
+    this.#lastManagedAgentPromptSummary = managedSummary;
+    if (managedSummary !== undefined) {
+      if (Buffer.byteLength(managedSummary, "utf8") > 1024) {
+        throw new RangeError("The managed-child prompt summary exceeds its bound.");
+      }
+      const insertionIndex = messages.findLastIndex((message) => message.role === "user");
+      messages = [
+        ...messages.slice(0, insertionIndex < 0 ? messages.length : insertionIndex),
+        { role: "developer", content: managedSummary },
+        ...messages.slice(insertionIndex < 0 ? messages.length : insertionIndex),
+      ];
+    }
     return this.#todoEnabled ? modelMessagesWithTodoSummaryV1(messages, this.#todo) : messages;
   }
 

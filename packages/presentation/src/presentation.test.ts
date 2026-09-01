@@ -7,6 +7,7 @@ import {
 } from "./index.js";
 
 const emptySnapshot: AuthoritativePresentationSnapshot = {
+  managedAgents: { counts: { active: 0, completed: 0, attention: 0 }, agents: [] },
   schemaVersion: 1,
   continuity: {
     status: "current",

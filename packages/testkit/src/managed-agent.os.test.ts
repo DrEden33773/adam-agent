@@ -7,6 +7,7 @@ import {
   createInMemoryManagedAgentStore,
   createJsonlManagedAgentStore,
   ManagedAgentStoreError,
+  recoverInterruptedManagedAgents,
   scoutManagedAgentProfileV1,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
@@ -65,6 +66,46 @@ test("ManagedAgentStore preserves one admitted and terminal identity across JSON
 
     await expect(memory.read()).resolves.toEqual(records);
     await expect(cold.read()).resolves.toEqual(records);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ManagedAgentStore reopens A2 background cancel and repeated-attempt truth", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-store-a2-jsonl-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const records = managedA2StoreRecords();
+
+  try {
+    const store = await createJsonlManagedAgentStore({ stateRoot, workspaceRoot });
+    for (const record of records) {
+      await store.append(record);
+    }
+    const cold = await createJsonlManagedAgentStore({ stateRoot, workspaceRoot });
+    await expect(cold.read()).resolves.toEqual(records);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ManagedAgentStore folds a cold A2 background admission without provider replay", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-store-a2-restart-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const admission = managedA2StoreRecords()[0];
+
+  try {
+    const warm = await createJsonlManagedAgentStore({ stateRoot, workspaceRoot });
+    await warm.append(admission);
+    const cold = await createJsonlManagedAgentStore({ stateRoot, workspaceRoot });
+    await recoverInterruptedManagedAgents(cold);
+    await expect(cold.read()).resolves.toMatchObject([
+      { type: "managed_agent_admitted", mode: "background" },
+      { type: "managed_agent_terminal", status: "recovery_required" },
+    ]);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -162,6 +203,76 @@ function managedStoreRecords() {
       throughSequence: 9,
       usage: { inputTokens: 100, outputTokens: 20, reasoningTokens: 5 },
       cost: { status: "unavailable" as const },
+    },
+  ] as const;
+}
+
+function managedA2StoreRecords() {
+  const first = {
+    ...managedStoreRecords()[0],
+    mode: "background" as const,
+    parentRootId: "session:123e4567-e89b-42d3-a456-426614174104",
+    deadlineAtUnixMilliseconds: 1_900_000_000_000,
+    admittedAtUnixMilliseconds: 1_899_999_400_000,
+  };
+  return [
+    first,
+    {
+      schemaVersion: 1 as const,
+      type: "managed_agent_cancel_requested" as const,
+      sequence: 2,
+      agentId: first.agentId,
+      attemptId: first.attemptId,
+      childSessionId: first.childSessionId,
+      expectedRevision: 1,
+    },
+    {
+      schemaVersion: 1 as const,
+      type: "managed_agent_terminal" as const,
+      sequence: 3,
+      agentId: first.agentId,
+      attemptId: first.attemptId,
+      childSessionId: first.childSessionId,
+      status: "cancelled" as const,
+      reason: "caller" as const,
+      transcriptDigest: `sha256:${"e".repeat(64)}` as const,
+      throughSequence: 5,
+    },
+    {
+      ...first,
+      sequence: 4,
+      attemptId: "123e4567-e89b-42d3-a456-426614174105",
+      childSessionId: "123e4567-e89b-42d3-a456-426614174106",
+      parentToolCallId: "follow-up-store-contract",
+      limits: {
+        ...managedLimits,
+        maximumTokens: 127_500,
+        maximumDeadlineMilliseconds: 590_000,
+      },
+      admittedAtUnixMilliseconds: 1_899_999_410_000,
+      resume: {
+        sourceAttemptId: first.attemptId,
+        sourceChildSessionId: first.childSessionId,
+        sourceTranscriptDigest:
+          `sha256:${createHash("sha256").update("[]").digest("hex")}` as const,
+        replayMessagesDigest: `sha256:${createHash("sha256").update("[]").digest("hex")}` as const,
+        throughSequence: 0,
+      },
+    },
+    {
+      schemaVersion: 1 as const,
+      type: "managed_agent_terminal" as const,
+      sequence: 5,
+      agentId: first.agentId,
+      attemptId: "123e4567-e89b-42d3-a456-426614174105",
+      childSessionId: "123e4567-e89b-42d3-a456-426614174106",
+      status: "recovery_required" as const,
+      recoveryPhase: "pre_genesis" as const,
+      error: {
+        code: "managed_agent_recovery_required" as const,
+        message:
+          "The child process ended without a causally proven terminal result. Adam did not replay the interrupted model request.",
+      },
     },
   ] as const;
 }
