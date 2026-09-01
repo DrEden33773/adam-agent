@@ -2,7 +2,6 @@ import { spawn } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { AppliedViewportTerminal } from "./applied-viewport-terminal.test-support.js";
-import type { ClipboardReader } from "./clipboard-reader.js";
 import type { FixtureScenario } from "./fixture-scenario.js";
 import { runTuiFixture } from "./test-fixture.js";
 import { VirtualTerminal } from "./virtual-terminal.test-support.js";
@@ -31,7 +30,6 @@ export type TuiFixture = {
 };
 
 export type StartTuiFixtureOptions = {
-  readonly clipboardReader?: ClipboardReader;
   readonly controlRoot?: string;
   readonly external?: boolean;
   readonly launch?: {
@@ -88,7 +86,6 @@ function startInProcessTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
   const terminal = new VirtualTerminal();
   const execution = withTuiColorEnvironment(input.noColor === true, () =>
     runTuiFixture({
-      ...(input.clipboardReader === undefined ? {} : { clipboardReader: input.clipboardReader }),
       ...(input.controlRoot === undefined ? {} : { controlRoot: input.controlRoot }),
       ...(input.launch === undefined ? {} : { launch: input.launch }),
       ...(input.scenario === undefined ? {} : { scenario: input.scenario }),

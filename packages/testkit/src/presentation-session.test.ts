@@ -3085,68 +3085,6 @@ test("PresentationSession removes and undoes one whole Text atom without renumbe
   }
 });
 
-test("PresentationSession normalizes one pasted clipboard image and blocks an incompatible target", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-clipboard-image-"));
-  const stateRoot = join(testRoot, "state");
-  const workspaceRoot = join(testRoot, "workspace");
-  await mkdir(workspaceRoot);
-  const png = Buffer.from(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
-    "base64",
-  );
-  const modelTargets = settledModelTargets("Clipboard images must not reach a text target.");
-  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
-  const presentation = await createPresentationSession({
-    lifecycle,
-    modelTargets,
-    openProject: true,
-    projectLabel: "workspace",
-    stateRoot,
-    workspaceRoot,
-  });
-
-  try {
-    await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
-    await expect(
-      presentation.dispatch({ type: "stage_pasted_image", bytes: png }),
-    ).resolves.toMatchObject({ status: "admitted" });
-    expect(presentation.getState().composer).toMatchObject({
-      renderedText: "[Image #1]",
-      resources: [
-        {
-          kind: "image",
-          origin: "pasted_image",
-          displayName: "Clipboard image",
-          mediaHint: "image",
-          support: "image",
-          state: "ready",
-        },
-      ],
-    });
-    await expect(
-      presentation.dispatch({
-        type: "submit_draft_prompt",
-        text: "Inspect this image.",
-        skills: [],
-        thinkingSelection: null,
-      }),
-    ).resolves.toEqual({
-      status: "rejected",
-      code: "not_available",
-      message: "The exact target does not support images. Switch targets or remove the Image atom.",
-    });
-    await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
-    await expect(
-      presentation.dispatch({ type: "stage_pasted_image", bytes: Buffer.from("not an image") }),
-    ).resolves.toMatchObject({ status: "rejected", code: "not_available" });
-    expect(presentation.getState().composer.resources).toHaveLength(1);
-  } finally {
-    await presentation.close();
-    await lifecycle.close();
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
 test("PresentationSession removes a ready resource before sealing the draft", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-remove-resource-"));
   const stateRoot = join(testRoot, "state");

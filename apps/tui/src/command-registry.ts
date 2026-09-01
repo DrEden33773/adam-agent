@@ -28,8 +28,6 @@ export type AdamCommandDefinition = {
     | "model"
     | "name"
     | "new"
-    | "paste"
-    | "paste-image"
     | "plan"
     | "reload"
     | "resume"
@@ -55,7 +53,6 @@ export type AdamKeybindingAction =
   | "fork_from_target"
   | "interrupt"
   | "new_session_from_target"
-  | "paste_clipboard"
   | "rename_session"
   | "save_default_target"
   | "submit"
@@ -293,22 +290,6 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     name: "copy",
     summary: "Copy the last assistant response or the expanded current draft.",
     usage: "/copy [draft]",
-  },
-  {
-    aliases: [],
-    availability: "idle",
-    id: "paste",
-    name: "paste",
-    summary: "Paste one supported image or text value from the platform clipboard.",
-    usage: "/paste",
-  },
-  {
-    aliases: [],
-    availability: "idle",
-    id: "paste-image",
-    name: "paste-image",
-    summary: "Stage one PNG or JPEG image from the platform clipboard.",
-    usage: "/paste-image",
   },
   {
     aliases: [],
@@ -575,13 +556,6 @@ const keybindingProjections: readonly KeybindingProjection[] = [
     keys: "Ctrl+Q",
     description: "Exit Adam",
     section: "application",
-  },
-  {
-    action: "paste_clipboard",
-    adamInputs: ["alt+v"],
-    keys: "Alt+V",
-    description: "Paste supported image or text from clipboard",
-    section: "editor",
   },
   {
     action: "toggle_reasoning",

@@ -33,11 +33,9 @@ import {
 } from "@adam-agent/agent/internal-testing";
 import type { PresentationSession } from "@adam-agent/presentation";
 import { ProcessTerminal, type Terminal } from "@earendil-works/pi-tui";
-import type { ClipboardReader } from "./clipboard-reader.js";
 import { createAdamCommandRegistry } from "./command-registry.js";
 import { type FixtureScenario, isFixtureScenario } from "./fixture-scenario.js";
 import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
-import type { ClipboardImageReader } from "./linux-clipboard-image.js";
 import { type ClipboardAdapter, type DeadlineScheduler, runTui } from "./tui-app.js";
 import { tuiProcessFailureMessage } from "./tui-process-failure.js";
 
@@ -156,8 +154,6 @@ const contextProfile: ContextProfile = {
 
 export type TuiFixtureOptions = {
   readonly clipboard?: ClipboardAdapter;
-  readonly clipboardReader?: ClipboardReader;
-  readonly clipboardImageReader?: ClipboardImageReader;
   readonly controlRoot?: string;
   readonly deadlineScheduler?: DeadlineScheduler;
   readonly launch?: {
@@ -622,12 +618,6 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
         : undefined);
     await runTui({
       ...(clipboard === undefined ? {} : { clipboard }),
-      ...(options.clipboardReader === undefined
-        ? {}
-        : { clipboardReader: options.clipboardReader }),
-      ...(options.clipboardImageReader === undefined
-        ? {}
-        : { clipboardImageReader: options.clipboardImageReader }),
       closeRuntime,
       ...(options.scenario === "review-unavailable" || reviewFixture !== undefined
         ? {

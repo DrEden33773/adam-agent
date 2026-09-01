@@ -161,45 +161,6 @@ test("TurnComposer counts a candidate Skill atom against the structured text byt
   }
 });
 
-test("TurnComposer rejects a malformed pasted image before publishing a draft mutation", async () => {
-  let publications = 0;
-  let stagingInvoked = false;
-  const stager: TurnComposerResourceStager = {
-    async stage() {
-      throw new Error("No file should be staged in this test.");
-    },
-    async stageImage() {
-      stagingInvoked = true;
-      throw new Error("Malformed bytes must not reach artifact staging.");
-    },
-    async retain() {},
-    async discard() {},
-    async close() {},
-  };
-  const composer = await createTurnComposer({
-    onChange() {
-      publications += 1;
-    },
-    stager,
-  });
-
-  try {
-    await expect(composer.stagePastedImage(Buffer.from("not an image"))).rejects.toThrow(
-      "not a complete valid PNG or JPEG",
-    );
-    expect(stagingInvoked).toBe(false);
-    expect(publications).toBe(0);
-    expect(composer.snapshot()).toMatchObject({
-      elements: [],
-      renderedText: "",
-      resources: [],
-      revision: 0,
-    });
-  } finally {
-    await composer.close();
-  }
-});
-
 test("TurnComposer does not publish or retain text when its recoverable commit fails", async () => {
   let publications = 0;
   const stager: TurnComposerResourceStager = {

@@ -1,5 +1,5 @@
 diff --git a/dist/components/editor.d.ts b/dist/components/editor.d.ts
-index a6fedc9e3b36d066e34860d040db6df47d88c432..a5886312e10e67795d2cbdd68a2bab23e1c5eb01 100644
+index a6fedc9e3b36d066e34860d040db6df47d88c432..65f825bd282b60ec640e88c53af4c9d080ab3ea7 100644
 --- a/dist/components/editor.d.ts
 +++ b/dist/components/editor.d.ts
 @@ -1,4 +1,4 @@
@@ -120,7 +120,7 @@ index a6fedc9e3b36d066e34860d040db6df47d88c432..a5886312e10e67795d2cbdd68a2bab23
       * Insert text at the current cursor position.
       * Used for programmatic insertion (e.g., clipboard image markers).
 diff --git a/dist/components/editor.js b/dist/components/editor.js
-index 4786b46932b65785cfbd2304610ca77ccead910a..8035125c53bc01ea849ab57c5fa83fafb540ad51 100644
+index 4786b46932b65785cfbd2304610ca77ccead910a..3f6cd055d2c424f0f7168ed07e668b04e3e5632b 100644
 --- a/dist/components/editor.js
 +++ b/dist/components/editor.js
 @@ -219,6 +219,7 @@ export class Editor {
@@ -1042,7 +1042,7 @@ index 848119411c1ff2885b8d1efe97f2f297bd4cd470..c49053c1e2060b5e2ebb11210debde0b
      private readonly searchCurrentMatchStyle;
      private readonly openUrl?;
 diff --git a/dist/tui-alt-screen.js b/dist/tui-alt-screen.js
-index 4edcf845ba7866782a8ec7219508a2dce0073a91..dfa6559c1ceb9f944cc9095bed75c86823ba67bd 100644
+index 4edcf845ba7866782a8ec7219508a2dce0073a91..8abe8317ebda25f7c962585bb30aa113c22d3ce5 100644
 --- a/dist/tui-alt-screen.js
 +++ b/dist/tui-alt-screen.js
 @@ -59,6 +59,7 @@ export class TuiAltScreen extends TuiBase {
@@ -1061,12 +1061,38 @@ index 4edcf845ba7866782a8ec7219508a2dce0073a91..dfa6559c1ceb9f944cc9095bed75c868
          this.searchMatchStyle = options.searchMatchStyle ?? ((text) => `\x1b[4m${text}\x1b[24m`);
          this.searchCurrentMatchStyle = options.searchCurrentMatchStyle ?? ((text) => `\x1b[1;7m${text}\x1b[22;27m`);
          this.openUrl = options.openUrl;
-@@ -423,7 +425,7 @@ export class TuiAltScreen extends TuiBase {
+@@ -423,7 +425,12 @@ export class TuiAltScreen extends TuiBase {
              return { consume: true };
          const keybindings = getKeybindings();
          const isRelease = isKeyRelease(data);
 -        if (keybindings.matches(data, "tui.altScreen.search")) {
++        if (keybindings.matches(data, "tui.input.copy") && this.getSelectionBounds()) {
++            if (!isRelease)
++                void this.copySelectionToClipboard();
++            return { consume: true };
++        }
 +        if (this.transcriptSearchEnabled && keybindings.matches(data, "tui.altScreen.search")) {
              if (!isRelease)
                  this.openSearch();
              return { consume: true };
+@@ -824,7 +831,6 @@ export class TuiAltScreen extends TuiBase {
+                 this.requestRender();
+                 return;
+             }
+-            void this.copySelectionToClipboard();
+             this.requestRender();
+             return;
+         }
+@@ -891,6 +897,12 @@ export class TuiAltScreen extends TuiBase {
+         const selection = this.getSelectionBounds();
+         if (!selection)
+             return;
++        this.selectionAnchor = undefined;
++        this.selectionFocus = undefined;
++        this.selectionGranularity = "character";
++        this.selectionInitialRange = undefined;
++        this.selectionDragged = false;
++        this.requestRender();
+         let sourceLines = this.previousScreen;
+         if (selection.start.scrollView) {
+             if (!this.currentLayout)
