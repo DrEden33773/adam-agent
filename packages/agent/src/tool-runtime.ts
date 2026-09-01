@@ -127,6 +127,12 @@ export type ToolResult =
               | "mcp_output_invalid"
               | "mcp_output_unsupported"
               | "mcp_result_too_large"
+              | "managed_agent_cancelled"
+              | "managed_agent_capacity_exceeded"
+              | "managed_agent_deadline_exceeded"
+              | "managed_agent_failed"
+              | "managed_agent_result_too_large"
+              | "managed_agent_unavailable"
               | "shell_start_failed"
               | "tool_io_failed";
             readonly message: string;
@@ -190,6 +196,24 @@ function identifyToolAdapter(
         }),
       )
       .digest("hex")}`,
+  };
+}
+
+export function createInternalToolAdapter(
+  adapter: Omit<ToolAdapter, "definitionDigest" | "replay">,
+  replay: ToolReplayClass,
+): ToolAdapter {
+  return identifyToolAdapter(adapter, replay);
+}
+
+export function createInternalToolRegistry(adapters: readonly ToolAdapter[]): ToolRegistry {
+  const byName = new Map(adapters.map((adapter) => [adapter.definition.name, adapter]));
+  if (byName.size !== adapters.length) {
+    throw new TypeError("Tool adapter names must be unique.");
+  }
+  return {
+    definitions: () => [...byName.values()].map((adapter) => adapter.definition),
+    resolve: (name) => byName.get(name),
   };
 }
 
@@ -320,6 +344,42 @@ export type PermissionSubject =
       readonly serverDefinitionDigest: `sha256:${string}`;
       readonly definitionDigest: `sha256:${string}`;
       readonly argumentsDigest: `sha256:${string}`;
+    }
+  | {
+      readonly type: "managed_agent_spawn";
+      readonly parentRootId: string;
+      readonly profile: "scout.v1";
+      readonly targetIdentity: {
+        readonly targetId: string;
+        readonly vendor: string;
+        readonly modelId: string;
+        readonly route: "direct" | "vercel-ai-gateway";
+        readonly upstreamProviderId?: string;
+        readonly profileVersion: number;
+        readonly certification: "certified" | "experimental";
+      };
+      readonly taskDigest: `sha256:${string}`;
+      readonly thinkingPolicy?: {
+        readonly schemaVersion: 1;
+        readonly requestedLevelId: string;
+        readonly effectiveLevelId: string;
+        readonly capability: {
+          readonly id: string;
+          readonly version: 1;
+          readonly digest: `sha256:${string}`;
+        };
+        readonly mapping:
+          | {
+              readonly requestPath: "provider_options.deepseek" | "reasoning.effort";
+              readonly thinkingType: "disabled";
+            }
+          | {
+              readonly requestPath: "provider_options.deepseek" | "reasoning.effort";
+              readonly thinkingType: "enabled";
+              readonly reasoningEffort: "low" | "high" | "max";
+            };
+        readonly reasoningArtifact: "provider_reasoning";
+      };
     };
 
 export type PermissionPolicyInput = {

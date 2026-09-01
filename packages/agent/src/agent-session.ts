@@ -136,6 +136,7 @@ import {
   createSessionUserContentMessageV1,
   validateSessionUserContentV1,
 } from "./structured-user-content.js";
+import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import {
   createTodoInputV1Schema,
   createTodoMutationV1,
@@ -178,6 +179,10 @@ type AgentSessionBaseDependencies = {
   readonly store: SessionStore;
 };
 
+export const sessionToolProfileNames = Symbol("adam-agent.session-tool-profile-names");
+export const sessionInitialThinkingPolicy = Symbol("adam-agent.session-initial-thinking-policy");
+export const sessionInitialMessages = Symbol("adam-agent.session-initial-messages");
+
 export type AgentSessionDependencies = AgentSessionBaseDependencies &
   (
     | {
@@ -214,6 +219,8 @@ export class AgentSession {
   readonly #durableOutputLimits: Required<AgentSessionDurableOutputLimits>;
   readonly #contextProfile: ContextProfile | undefined;
   readonly #maximumOutputTokens: number;
+  readonly #thinkingPolicy: ThinkingPolicySnapshotV1 | undefined;
+  readonly #initialMessages: readonly ModelMessage[];
   readonly #store: SessionStore<SessionRecord>;
   #activeAbortController: AbortController | undefined;
   #activeProviderAttempt:
@@ -279,13 +286,33 @@ export class AgentSession {
       throw new RangeError("The model output limit must be a positive safe integer.");
     }
     this.#maximumOutputTokens = maximumOutputTokens;
+    this.#thinkingPolicy =
+      this.#durableContext?.thinkingPolicy ??
+      (
+        dependencies as AgentSessionDependencies & {
+          readonly [sessionInitialThinkingPolicy]?: ThinkingPolicySnapshotV1;
+        }
+      )[sessionInitialThinkingPolicy];
+    this.#initialMessages =
+      this.#durableContext?.initialMessages ??
+      (
+        dependencies as AgentSessionDependencies & {
+          readonly [sessionInitialMessages]?: readonly ModelMessage[];
+        }
+      )[sessionInitialMessages] ??
+      [];
     this.#model = dependencies.model;
     this.#modalityProfile = dependencies.modalityProfile;
     const durablePromptContext = this.#durableContext?.promptContext;
+    const configuredToolNames = (
+      dependencies as AgentSessionDependencies & {
+        readonly [sessionToolProfileNames]?: readonly string[];
+      }
+    )[sessionToolProfileNames];
     const selectedToolNames =
       durablePromptContext === undefined
         ? this.#durableContext === undefined
-          ? [
+          ? (configuredToolNames ?? [
               "read_file",
               "search_repository",
               "write_file",
@@ -295,9 +322,12 @@ export class AgentSession {
               "get_todo",
               "list_todos",
               "update_todo",
-            ]
+            ])
           : ["read_file", "write_file", "edit_file", "run_shell"]
         : durablePromptContext.toolProfile.definitions.map((definition) => definition.name);
+    if (new Set(selectedToolNames).size !== selectedToolNames.length) {
+      throw new TypeError("The initial Tool Profile names must be unique.");
+    }
     this.#todoEnabled = hasTodoToolProfileV1(selectedToolNames.map((name) => ({ name })));
     this.#todo = this.#durableContext?.todo ?? emptyTodoStoreSnapshotV1();
     this.#tools =
@@ -596,7 +626,7 @@ export class AgentSession {
     }
     const messages: ModelMessage[] =
       resume === undefined
-        ? [...(this.#durableContext?.initialMessages ?? []), projectedUserMessage]
+        ? [...this.#initialMessages, projectedUserMessage]
         : resume.messages.map((message) => ({ ...message }));
     const toolResultsById = new Map<
       string,
@@ -863,9 +893,7 @@ export class AgentSession {
           maximumOutputTokens,
           purpose: "ordinary",
           signal,
-          ...(this.#durableContext?.thinkingPolicy === undefined
-            ? {}
-            : { thinkingPolicy: this.#durableContext.thinkingPolicy }),
+          ...(this.#thinkingPolicy === undefined ? {} : { thinkingPolicy: this.#thinkingPolicy }),
         })) {
           if (signal.aborted) {
             break;
