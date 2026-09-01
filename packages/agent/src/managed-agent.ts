@@ -14,6 +14,7 @@ import type { ArtifactReference, ArtifactStore } from "./artifact-store.js";
 import type { ContextProfile } from "./context-profile.js";
 import {
   researchManagedAgentProfileV1,
+  reviewerManagedAgentProfileV1,
   scoutManagedAgentProfileV1,
 } from "./managed-agent-profiles.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
@@ -162,7 +163,7 @@ const thinkingPolicySchema = z.strictObject({
 const managedAgentTerminalOutputSchema = z.strictObject({
   agentId: z.string().uuid(),
   attemptId: z.string().uuid(),
-  profile: z.enum(["scout.v1", "research.v1"]),
+  profile: z.enum(["reviewer.v1", "scout.v1", "research.v1"]),
   profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   effectiveToolProfileDigest: z
     .string()
@@ -210,7 +211,7 @@ export type ManagedAgentRecord =
       readonly parentToolCallId: string;
       readonly parentRootId: string;
       readonly projectId: `sha256:${string}`;
-      readonly profile: "scout.v1" | "research.v1";
+      readonly profile: "reviewer.v1" | "scout.v1" | "research.v1";
       readonly mode?: "foreground" | "background";
       readonly profileDigest: `sha256:${string}`;
       readonly effectiveToolProfileDigest?: `sha256:${string}`;
@@ -221,7 +222,7 @@ export type ManagedAgentRecord =
         readonly manifestDigest: `sha256:${string}`;
       }[];
       readonly limits: {
-        readonly maximumTurns: 8;
+        readonly maximumTurns: number;
         readonly maximumTokens: number;
         readonly maximumDeadlineMilliseconds: number;
       };
@@ -594,7 +595,7 @@ const managedAgentRecordSchema = z.union([
     parentToolCallId: z.string().min(1).max(256),
     parentRootId: z.string().min(1).max(256),
     projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-    profile: z.enum(["scout.v1", "research.v1"]),
+    profile: z.enum(["reviewer.v1", "scout.v1", "research.v1"]),
     mode: z.enum(["foreground", "background"]).optional(),
     profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
     effectiveToolProfileDigest: z
@@ -616,7 +617,7 @@ const managedAgentRecordSchema = z.union([
       .max(8)
       .optional(),
     limits: z.strictObject({
-      maximumTurns: z.literal(8),
+      maximumTurns: z.number().int().min(1).max(8),
       maximumTokens: z.number().int().positive().max(128_000),
       maximumDeadlineMilliseconds: z.number().int().positive().max(600_000),
     }),
@@ -762,6 +763,9 @@ export async function recoverInterruptedManagedAgents(
       (record) =>
         record.type === "managed_agent_terminal" && record.attemptId === admission.attemptId,
     );
+    if (admission.profile === "reviewer.v1") {
+      continue;
+    }
     const childStore = await childSessionStores?.open(admission.childSessionId);
     const childRecords = await childStore?.read();
     const genesis = childRecords?.[0];
@@ -1901,10 +1905,15 @@ export function managedAgentSnapshotFromRecords(
   records: readonly ManagedAgentRecord[],
   parentSessionId: string,
 ): ManagedAgentSnapshot {
-  const admissions = records.flatMap((record) =>
-    record.type === "managed_agent_admitted" && record.parentSessionId === parentSessionId
-      ? [record]
-      : [],
+  const admissions = records.filter(
+    (
+      record,
+    ): record is Extract<ManagedAgentRecord, { readonly type: "managed_agent_admitted" }> & {
+      readonly profile: "scout.v1" | "research.v1";
+    } =>
+      record.type === "managed_agent_admitted" &&
+      record.profile !== "reviewer.v1" &&
+      record.parentSessionId === parentSessionId,
   );
   const latestAdmissions = [...admissions]
     .reverse()
@@ -2078,6 +2087,16 @@ export type AgentManager = {
       readonly digest: `sha256:${string}`;
     }[];
   }): Promise<ToolResult>;
+  runReviewer(input: {
+    readonly callId: string;
+    readonly managedRole: string;
+    readonly maximumDeadlineMilliseconds: number;
+    readonly maximumTokens: number;
+    readonly maximumTurns: number;
+    readonly parentSessionId: string;
+    readonly signal: AbortSignal;
+    readonly task: string;
+  }): Promise<ToolResult>;
   list(input?: {
     readonly status?: "active" | "terminal" | ManagedAgentSummary["status"];
     readonly limit?: number;
@@ -2224,13 +2243,15 @@ export function createAgentManager(options: {
     readonly parentSessionId: string;
     readonly signal: AbortSignal;
     readonly task: string;
-    readonly profile?: "scout.v1" | "research.v1";
+    readonly profile?: "reviewer.v1" | "scout.v1" | "research.v1";
     readonly skills?: readonly string[];
     readonly approvedSkills?: readonly {
       readonly qualifiedId: string;
       readonly digest: `sha256:${string}`;
     }[];
     readonly preserveLegacyProfile?: boolean;
+    readonly managedRole?: string;
+    readonly maximumTurns?: number;
     readonly mode: "foreground" | "background";
     readonly agentId?: string;
     readonly revision?: number;
@@ -2815,7 +2836,11 @@ export function createAgentManager(options: {
     const taskDigest = digest(input.task);
     const profile = input.profile ?? "scout.v1";
     const managedProfile =
-      profile === "research.v1" ? researchManagedAgentProfileV1 : scoutManagedAgentProfileV1;
+      profile === "research.v1"
+        ? researchManagedAgentProfileV1
+        : profile === "reviewer.v1"
+          ? reviewerManagedAgentProfileV1
+          : scoutManagedAgentProfileV1;
     if (
       (profile === "scout.v1" && input.skills !== undefined) ||
       (input.skills !== undefined &&
@@ -2962,7 +2987,10 @@ export function createAgentManager(options: {
       },
     );
     try {
-      const readTools = createReadToolRegistry({ workspaceRoot: options.workspaceRoot });
+      const readTools =
+        profile === "reviewer.v1"
+          ? createInternalToolRegistry([])
+          : createReadToolRegistry({ workspaceRoot: options.workspaceRoot });
       const researchTools = currentResearchContext?.tools;
       const effectiveResearchTools =
         profile !== "research.v1" || researchTools === undefined
@@ -3076,7 +3104,7 @@ export function createAgentManager(options: {
               })),
             }),
         limits: {
-          maximumTurns: managedProfile.limits.maximumTurnsPerAttempt,
+          maximumTurns: input.maximumTurns ?? managedProfile.limits.maximumTurnsPerAttempt,
           maximumTokens,
           maximumDeadlineMilliseconds,
         },
@@ -3084,7 +3112,7 @@ export function createAgentManager(options: {
         admittedAtUnixMilliseconds,
         ...(input.resume === undefined ? {} : { resume: input.resume }),
         taskDigest,
-        childInputDigest: digest(childTaskMessage(input.task)),
+        childInputDigest: digest(childTaskMessage(input.task, profile)),
         targetIdentity: options.targetIdentity,
         ...(options.thinkingPolicy === undefined ? {} : { thinkingPolicy: options.thinkingPolicy }),
         ...(currentResearchContext?.repository === undefined
@@ -3122,9 +3150,11 @@ export function createAgentManager(options: {
         {
           role: "developer",
           content:
-            profile === "research.v1"
-              ? "Managed child profile research.v1. Work only on the exact delegated research task with the admitted repository reads, selected Skills, Web evidence, and parent-only coordination. Do not write, execute, use MCP, access ambient extensions, spawn, coordinate with peers, or change model and permission authority."
-              : "Managed child profile scout.v1. Work only on the exact delegated task. Use repository reads only. Do not write, execute, use Web or MCP, select Skills, access extensions, spawn, coordinate with peers, or change model and permission authority.",
+            profile === "reviewer.v1"
+              ? (input.managedRole ?? "Managed child profile reviewer.v1.")
+              : profile === "research.v1"
+                ? "Managed child profile research.v1. Work only on the exact delegated research task with the admitted repository reads, selected Skills, Web evidence, and parent-only coordination. Do not write, execute, use MCP, access ambient extensions, spawn, coordinate with peers, or change model and permission authority."
+                : "Managed child profile scout.v1. Work only on the exact delegated task. Use repository reads only. Do not write, execute, use Web or MCP, select Skills, access extensions, spawn, coordinate with peers, or change model and permission authority.",
         },
         ...(input.resumedMessages ?? []),
       ];
@@ -3210,12 +3240,12 @@ export function createAgentManager(options: {
       );
       const result = await child.run(
         {
-          text: childTaskMessage(input.task),
+          text: childTaskMessage(input.task, profile),
         },
         {
           signal: childController.signal,
           limits: {
-            maxTurns: managedProfile.limits.maximumTurnsPerAttempt,
+            maxTurns: input.maximumTurns ?? managedProfile.limits.maximumTurnsPerAttempt,
             maxTokens: maximumTokens,
           },
         },
@@ -3681,6 +3711,20 @@ export function createAgentManager(options: {
       input.signal.removeEventListener("abort", abortFromCaller);
     }
   };
+  const runReviewer: AgentManager["runReviewer"] = async (input) => {
+    if (
+      !Number.isSafeInteger(input.maximumTurns) ||
+      input.maximumTurns <= 0 ||
+      input.maximumTurns > reviewerManagedAgentProfileV1.limits.maximumTurnsPerAttempt
+    ) {
+      return toolFailure("invalid_tool_input", "The managed reviewer limits are invalid.");
+    }
+    return runAttempt({
+      ...input,
+      mode: "foreground",
+      profile: "reviewer.v1",
+    });
+  };
   const manager: AgentManager = {
     parentRootId: options.parentRoot.rootId,
     get parentSessionId() {
@@ -3737,6 +3781,7 @@ export function createAgentManager(options: {
     rebindResearchContext(context) {
       currentResearchContext = context;
     },
+    runReviewer,
     spawnForeground,
     spawnBackground,
     async snapshot() {
@@ -4795,8 +4840,11 @@ function managedRecordReceipt(record: ManagedAgentRecord): {
   return { id, revision: record.sequence, digest: digest(JSON.stringify(record)) };
 }
 
-function childTaskMessage(task: string): string {
-  return `${task}\n\n${childLiveWorkspaceNotice}`;
+function childTaskMessage(
+  task: string,
+  profile: "reviewer.v1" | "scout.v1" | "research.v1" = "scout.v1",
+): string {
+  return profile === "reviewer.v1" ? task : `${task}\n\n${childLiveWorkspaceNotice}`;
 }
 
 function boundedUtf8Prefix(value: string, maximumBytes: number): string {

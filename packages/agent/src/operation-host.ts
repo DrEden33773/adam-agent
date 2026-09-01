@@ -7,6 +7,8 @@ import type {
   ExtensionBiomeAnalysis,
   ExtensionBiomeFileSnapshot,
   ExtensionJsonValue,
+  ExtensionManagedSessionRequest,
+  ExtensionManagedSessionTerminal,
   ExtensionOperationBudgetSnapshot,
   ExtensionOperationCapabilities,
   ExtensionOperationContext,
@@ -32,6 +34,7 @@ import {
   EXTENSION_BIOME_MAX_STDERR_BYTES,
   EXTENSION_BIOME_MAX_STDOUT_BYTES,
   EXTENSION_BIOME_PROFILE,
+  EXTENSION_MANAGED_SESSION_CAPABILITY_ID,
   EXTENSION_OPERATION_DEADLINE_DEFAULT_MS,
   EXTENSION_OPERATION_DEADLINE_MAX_MS,
   EXTENSION_OPERATION_INPUT_MAX_BYTES,
@@ -46,9 +49,13 @@ import {
   EXTENSION_RECORD_MAX_CREATES,
   EXTENSION_RECORDS_CAPABILITY_ID,
 } from "@adam-agent/extension-api";
+import type { ModelDriver } from "./agent-session-contracts.js";
 import type { ArtifactStore } from "./artifact-store.js";
 import type { BiomeExecutionAdapter, BiomeExecutionOutput } from "./biome-execution.js";
+import type { ContextProfile } from "./context-profile.js";
 import { type ExtensionRecordStore, ExtensionRecordStoreError } from "./extension-record-store.js";
+import { createAgentManager, type ManagedAgentStore } from "./managed-agent.js";
+import type { ModelTargetIdentity } from "./model-targets.js";
 import {
   createInMemoryOperationStore,
   type OperationCancellationReason,
@@ -63,8 +70,11 @@ import {
 import {
   type ProjectExecutionDomain,
   ProjectExecutionDomainError,
+  type ProjectExecutionRootClaim,
   projectRuntimeRootId,
 } from "./project-execution-domain.js";
+import type { SessionRecord, SessionStoreDirectory } from "./session-store.js";
+import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import type { PermissionPolicy } from "./tool-runtime.js";
 
 export type RegisteredOperation = {
@@ -213,12 +223,18 @@ export class OperationHostError extends Error {
 
 type ActiveOperation = {
   readonly abortController: AbortController;
+  managedSessionRun?: {
+    readonly digest: string;
+    readonly terminal: Promise<ExtensionManagedSessionTerminal>;
+  };
   artifactBytes: number;
   readonly artifacts: ExtensionArtifactSummary[];
   readonly deadlineAt: string;
   artifactCount: number;
   capabilityCalls: number;
   readonly operationId: string;
+  readonly origin?: OperationOrigin;
+  readonly parentRoot: ProjectExecutionRootClaim;
   ownerDidSettle: boolean;
   readonly ownerSettled: Promise<void>;
   readonly projectId: string;
@@ -268,6 +284,21 @@ export function createOperationHost(options: {
   readonly originAuthority?: OperationOriginAuthority;
   readonly projectRoot: string;
   readonly permissions?: PermissionPolicy;
+  readonly managedSession?: {
+    readonly childContextProfile: ContextProfile;
+    readonly childModel: ModelDriver;
+    readonly childSessionStores: SessionStoreDirectory<SessionRecord>;
+    readonly managedStore: ManagedAgentStore;
+    readonly parentPermissions: PermissionPolicy;
+    resolveOrigin(input: {
+      readonly origin: OperationOrigin;
+      readonly projectId: `sha256:${string}`;
+    }): Promise<{
+      readonly targetIdentity: ModelTargetIdentity;
+      readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
+    }>;
+    readonly workspaceRoot: string;
+  };
   readonly recordStore?: ExtensionRecordStore;
   readonly resolveOperation: (contributionId: string) => RegisteredOperation | undefined;
   readonly store?: OperationStore;
@@ -484,9 +515,11 @@ export function createOperationHost(options: {
           inputBytes: normalizedInput.byteLength,
           nextSequence: 2,
           operationId,
+          ...(origin === undefined ? {} : { origin }),
           ownerDidSettle: false,
           ownerSettled,
           projectId,
+          parentRoot: executionClaim,
           progressBytes: 0,
           progressRecords: 0,
           recordBytes: 0,
@@ -512,6 +545,7 @@ export function createOperationHost(options: {
             options.biomeExecution,
             options.permissions,
             options.recordStore,
+            options.managedSession,
           )
             .catch(() => undefined)
             .finally(async () => {
@@ -834,6 +868,7 @@ function createOperationCapabilities(
   permissions: PermissionPolicy | undefined,
   recordStore: ExtensionRecordStore | undefined,
   appendAndPublish: (record: OperationEventRecord) => Promise<void>,
+  managedSession: Parameters<typeof createOperationHost>[0]["managedSession"],
 ): ExtensionOperationCapabilities {
   const artifactCapability =
     artifactStore !== undefined &&
@@ -851,6 +886,12 @@ function createOperationCapabilities(
     active.registered.capabilityIds.includes(EXTENSION_BIOME_CAPABILITY_ID)
       ? createBiomeCapability(active, biomeExecution, permissions)
       : undefined;
+  const managedSessionCapability =
+    active.registered.capabilityIds.includes(EXTENSION_MANAGED_SESSION_CAPABILITY_ID) &&
+    active.registered.registration.managedOutput !== undefined &&
+    managedSession !== undefined
+      ? createManagedSessionCapability(active, managedSession, artifactStore, recordStore)
+      : undefined;
   return Object.freeze({
     ...(biomeCapability === undefined ? {} : { [EXTENSION_BIOME_CAPABILITY_ID]: biomeCapability }),
     ...(artifactCapability === undefined
@@ -859,7 +900,353 @@ function createOperationCapabilities(
     ...(recordCapability === undefined
       ? {}
       : { [EXTENSION_RECORDS_CAPABILITY_ID]: recordCapability }),
+    ...(managedSessionCapability === undefined
+      ? {}
+      : { [EXTENSION_MANAGED_SESSION_CAPABILITY_ID]: managedSessionCapability }),
   });
+}
+
+function createManagedSessionCapability(
+  active: ActiveOperation,
+  runtime: NonNullable<Parameters<typeof createOperationHost>[0]["managedSession"]>,
+  artifactStore: ArtifactStore | undefined,
+  recordStore: ExtensionRecordStore | undefined,
+) {
+  return Object.freeze({
+    async run(input: ExtensionManagedSessionRequest): Promise<ExtensionManagedSessionTerminal> {
+      assertCapabilityActive(active);
+      const origin = active.origin;
+      const outputCodec = active.registered.registration.managedOutput;
+      if (origin === undefined || outputCodec === undefined) {
+        throw new TypeError("The managed session requires a linked ordinary operation.");
+      }
+      try {
+        validateManagedSessionRequest(input, outputCodec, active.deadlineAt);
+      } catch (error) {
+        active.forcedFailure ??= {
+          code: "operation_capability_input_invalid",
+          message: "The operation supplied invalid capability input.",
+        };
+        throw error;
+      }
+      const inputDigest = normalizeOperationInput(input).digest;
+      const existing = active.managedSessionRun;
+      if (existing !== undefined) {
+        if (existing.digest !== inputDigest) {
+          active.forcedFailure ??= {
+            code: "operation_capability_conflict",
+            message: "The operation reused a single-use capability with conflicting input.",
+          };
+          throw new TypeError("This operation already owns a different managed session run.");
+        }
+        return existing.terminal;
+      }
+      const terminal = (async () => {
+        const evidenceText = await materializeManagedSessionEvidence(
+          input.evidence,
+          active,
+          artifactStore,
+          recordStore,
+        );
+        const resolved = await runtime.resolveOrigin({
+          origin,
+          projectId: active.projectId as `sha256:${string}`,
+        });
+        const manager = createAgentManager({
+          childContextProfile: runtime.childContextProfile,
+          childModel: runtime.childModel,
+          childSessionStores: runtime.childSessionStores,
+          managedStore: runtime.managedStore,
+          parentPermissions: runtime.parentPermissions,
+          parentRoot: active.parentRoot,
+          parentSessionId: origin.sessionId,
+          projectId: active.projectId as `sha256:${string}`,
+          targetIdentity: resolved.targetIdentity,
+          ...(resolved.thinkingPolicy === undefined
+            ? {}
+            : { thinkingPolicy: resolved.thinkingPolicy }),
+          workspaceRoot: runtime.workspaceRoot,
+        });
+        try {
+          const result = await manager.runReviewer({
+            callId: `${active.operationId}:managed-session`,
+            managedRole: input.managedRole,
+            maximumDeadlineMilliseconds: Math.min(
+              input.limits.deadlineMilliseconds,
+              Math.max(1, Date.parse(active.deadlineAt) - Date.now()),
+            ),
+            maximumTokens: input.limits.maximumCumulativeTokens,
+            maximumTurns: input.limits.maximumTurns,
+            parentSessionId: origin.sessionId,
+            signal: active.abortController.signal,
+            task: `${input.task}\n\nImmutable review evidence:\n${evidenceText}`,
+          });
+          if (result.status !== "completed") {
+            throw new Error(result.error.message);
+          }
+          const terminal = result.output as {
+            readonly agentId: string;
+            readonly attemptId: string;
+            readonly cost: { readonly status: "unavailable" };
+            readonly profileDigest: `sha256:${string}`;
+            readonly result: { readonly text: string };
+            readonly targetIdentity: ModelTargetIdentity;
+            readonly transcript: ExtensionManagedSessionTerminal["transcript"];
+            readonly usage: Omit<ExtensionManagedSessionTerminal["usage"], "turns">;
+          };
+          let candidate: unknown;
+          try {
+            candidate = JSON.parse(terminal.result.text);
+          } catch {
+            rejectManagedSessionOutput(active, outputCodec);
+          }
+          let decoded: ReturnType<typeof outputCodec.decode>;
+          try {
+            decoded = outputCodec.decode(candidate);
+          } catch {
+            rejectManagedSessionOutput(active, outputCodec);
+          }
+          if (!decoded.ok) {
+            rejectManagedSessionOutput(active, outputCodec);
+          }
+          let normalizedResult: ReturnType<typeof normalizeOperationInput>;
+          try {
+            normalizedResult = normalizeOperationInput(decoded.value);
+          } catch {
+            rejectManagedSessionOutput(active, outputCodec);
+          }
+          if (normalizedResult.byteLength > EXTENSION_OPERATION_OUTPUT_MAX_BYTES) {
+            rejectManagedSessionOutput(active, outputCodec);
+          }
+          const transcriptStore = await runtime.childSessionStores.open(
+            terminal.transcript.sessionId,
+          );
+          const transcriptRecords = await transcriptStore?.read();
+          if (transcriptRecords === undefined) {
+            throw new TypeError("The managed session transcript is unavailable.");
+          }
+          const turns = transcriptRecords.filter(
+            (record) =>
+              record.schemaVersion === 3 && record.record.type === "model_response_completed",
+          ).length;
+          assertCapabilityActive(active);
+          return Object.freeze({
+            agentId: terminal.agentId,
+            attemptId: terminal.attemptId,
+            cost: terminal.cost,
+            profile: {
+              digest: terminal.profileDigest,
+              id: "reviewer.v1" as const,
+              selectedSkillsDigest:
+                "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945" as const,
+              version: 1 as const,
+            },
+            result: normalizedResult.value,
+            status: "completed" as const,
+            target: terminal.targetIdentity,
+            transcript: terminal.transcript,
+            usage: { ...terminal.usage, turns },
+          });
+        } finally {
+          await manager.close();
+        }
+      })().catch((error: unknown) => {
+        if (!active.abortController.signal.aborted && active.cancelReason === undefined) {
+          active.forcedFailure ??= {
+            code: "operation_capability_execution_failed",
+            message: "The managed session capability failed.",
+          };
+        }
+        throw error;
+      });
+      active.managedSessionRun = { digest: inputDigest, terminal };
+      return terminal;
+    },
+  });
+}
+
+function rejectManagedSessionOutput(
+  active: ActiveOperation,
+  outputCodec: NonNullable<ExtensionOperationRegistration["managedOutput"]>,
+): never {
+  active.forcedFailure ??= {
+    code: "operation_capability_output_invalid",
+    message: `The managed review returned output that does not match ${outputCodec.id}@${outputCodec.version}.`,
+  };
+  throw new TypeError("The managed session output contract rejected the result.");
+}
+
+async function materializeManagedSessionEvidence(
+  evidence: ExtensionManagedSessionRequest["evidence"],
+  active: ActiveOperation,
+  artifactStore: ArtifactStore | undefined,
+  recordStore: ExtensionRecordStore | undefined,
+): Promise<string> {
+  if (!Array.isArray(evidence) || evidence.length === 0 || evidence.length > 8) {
+    throw new TypeError("The managed session evidence is invalid.");
+  }
+  const provenance = {
+    contributionId: active.registered.contributionId,
+    extensionId: active.registered.extensionId,
+    extensionVersion: active.registered.extensionVersion,
+    operationId: active.operationId,
+    projectId: active.projectId,
+  };
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  const sections: string[] = [];
+  let aggregateBytes = 0;
+  for (const [index, reference] of evidence.entries()) {
+    if (reference.type === "artifact") {
+      if (
+        artifactStore === undefined ||
+        !sameCapabilityProvenance(reference.artifact.provenance, provenance)
+      ) {
+        throw new TypeError("The managed session artifact evidence is unavailable.");
+      }
+      const bytes = await artifactStore.read(reference.artifact.id);
+      if (bytes === undefined || bytes.byteLength !== reference.artifact.byteCount) {
+        throw new TypeError("The managed session artifact evidence is unavailable.");
+      }
+      aggregateBytes += bytes.byteLength;
+      if (aggregateBytes > EXTENSION_OPERATION_INPUT_MAX_BYTES) {
+        throw new TypeError("The managed session evidence exceeds its aggregate bound.");
+      }
+      sections.push(`[artifact ${index + 1}]\n${decoder.decode(bytes)}`);
+      continue;
+    }
+    if (
+      recordStore === undefined ||
+      !sameCapabilityProvenance(reference.record.provenance, provenance)
+    ) {
+      throw new TypeError("The managed session record evidence is unavailable.");
+    }
+    const record = await recordStore.get(
+      {
+        extensionId: active.registered.extensionId,
+        extensionVersion: active.registered.extensionVersion,
+        projectId: active.projectId,
+      },
+      reference.record.key,
+    );
+    if (
+      record === undefined ||
+      record.digest !== reference.record.digest ||
+      record.byteCount !== reference.record.byteCount
+    ) {
+      throw new TypeError("The managed session record evidence is unavailable.");
+    }
+    const value = JSON.stringify(record.value);
+    aggregateBytes += Buffer.byteLength(value, "utf8");
+    if (aggregateBytes > EXTENSION_OPERATION_INPUT_MAX_BYTES) {
+      throw new TypeError("The managed session evidence exceeds its aggregate bound.");
+    }
+    sections.push(`[record ${index + 1}]\n${value}`);
+  }
+  return sections.join("\n\n");
+}
+
+function sameCapabilityProvenance(
+  actual: {
+    readonly contributionId: string;
+    readonly extensionId: string;
+    readonly extensionVersion: string;
+    readonly operationId: string;
+    readonly projectId: string;
+  },
+  expected: {
+    readonly contributionId: string;
+    readonly extensionId: string;
+    readonly extensionVersion: string;
+    readonly operationId: string;
+    readonly projectId: string;
+  },
+): boolean {
+  return (
+    actual.contributionId === expected.contributionId &&
+    actual.extensionId === expected.extensionId &&
+    actual.extensionVersion === expected.extensionVersion &&
+    actual.operationId === expected.operationId &&
+    actual.projectId === expected.projectId
+  );
+}
+
+function validateManagedSessionRequest(
+  input: ExtensionManagedSessionRequest,
+  outputCodec: ExtensionOperationRegistration["managedOutput"],
+  operationDeadlineAt: string,
+): void {
+  if (
+    typeof input !== "object" ||
+    input === null ||
+    !hasExactKeys(input, [
+      "evidence",
+      "limits",
+      "managedRole",
+      "output",
+      "profile",
+      "selectedSkills",
+      "task",
+    ]) ||
+    !hasExactKeys(input.limits, [
+      "deadlineMilliseconds",
+      "maximumCumulativeTokens",
+      "maximumTurns",
+    ]) ||
+    !hasExactKeys(input.output, ["id", "version"]) ||
+    !hasExactKeys(input.profile, ["id", "version"]) ||
+    !Array.isArray(input.evidence) ||
+    input.evidence.length === 0 ||
+    input.evidence.length > 8 ||
+    input.profile?.id !== "reviewer.v1" ||
+    input.profile.version !== 1 ||
+    !Array.isArray(input.selectedSkills) ||
+    input.selectedSkills.length !== 0 ||
+    typeof input.managedRole !== "string" ||
+    input.managedRole.length === 0 ||
+    !isStrictUnicode(input.managedRole) ||
+    Buffer.byteLength(input.managedRole, "utf8") > 16 * 1024 ||
+    typeof input.task !== "string" ||
+    input.task.length === 0 ||
+    !isStrictUnicode(input.task) ||
+    Buffer.byteLength(input.task, "utf8") > 16 * 1024 ||
+    !Number.isSafeInteger(input.limits.maximumTurns) ||
+    input.limits.maximumTurns <= 0 ||
+    input.limits.maximumTurns > 8 ||
+    !Number.isSafeInteger(input.limits.maximumCumulativeTokens) ||
+    input.limits.maximumCumulativeTokens <= 0 ||
+    input.limits.maximumCumulativeTokens > 128_000 ||
+    !Number.isSafeInteger(input.limits.deadlineMilliseconds) ||
+    input.limits.deadlineMilliseconds <= 0 ||
+    input.limits.deadlineMilliseconds > 300_000 ||
+    input.limits.deadlineMilliseconds > Date.parse(operationDeadlineAt) - Date.now() ||
+    outputCodec === undefined ||
+    input.output.id !== outputCodec.id ||
+    input.output.version !== outputCodec.version
+  ) {
+    throw new TypeError("The managed session request is invalid.");
+  }
+}
+
+function isStrictUnicode(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hasExactKeys(value: unknown, expected: readonly string[]): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const actual = Object.keys(value).sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
 }
 
 function createArtifactCapability(
@@ -1657,6 +2044,7 @@ async function executeOperation(
   biomeExecution: BiomeExecutionAdapter | undefined,
   permissions: PermissionPolicy | undefined,
   recordStore: ExtensionRecordStore | undefined,
+  managedSession: Parameters<typeof createOperationHost>[0]["managedSession"],
 ): Promise<void> {
   const deadlineDelay = Math.max(0, Date.parse(active.deadlineAt) - Date.now());
   const deadline = setTimeout(() => {
@@ -1686,6 +2074,7 @@ async function executeOperation(
       permissions,
       recordStore,
       appendAndPublish,
+      managedSession,
     ),
     deadlineAt: active.deadlineAt,
     diagnostics: Object.freeze(

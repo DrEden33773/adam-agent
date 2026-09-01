@@ -1107,6 +1107,18 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             }
           : manager.spawnBackground(input);
       },
+      async runReviewer(input) {
+        const manager = activeAgentManagers.get(sessionId);
+        return manager === undefined
+          ? {
+              status: "failed",
+              error: {
+                code: "managed_agent_unavailable",
+                message: "The managed reviewer host is unavailable.",
+              },
+            }
+          : manager.runReviewer(input);
+      },
       async list(input) {
         const manager = activeAgentManagers.get(sessionId);
         return manager === undefined

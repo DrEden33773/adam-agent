@@ -9,6 +9,7 @@ import {
   EXTENSION_ARTIFACT_CAPABILITY_ID,
   EXTENSION_BIOME_CAPABILITY_ID,
   EXTENSION_ID_MAX_LENGTH,
+  EXTENSION_MANAGED_SESSION_CAPABILITY_ID,
   EXTENSION_OPERATION_DEADLINE_MAX_MS,
   EXTENSION_PACKAGE_NAME_MAX_LENGTH,
   EXTENSION_PACKAGE_VERSION_MAX_LENGTH,
@@ -91,6 +92,7 @@ export type ExtensionHostOptions = {
   readonly operationDisableGraceMs?: number;
   readonly operationOriginAuthority?: OperationOriginAuthority;
   readonly operationStore?: OperationStore;
+  readonly managedSession?: Parameters<typeof createOperationHost>[0]["managedSession"];
   readonly permissions?: PermissionPolicy;
   readonly projectChangeMaterializer?: ProjectChangeMaterializer;
   readonly projectLifecycleOwner?: ProjectLifecycleOwner;
@@ -146,7 +148,7 @@ export type ExtensionDiagnostic =
   | {
       readonly actual: ExtensionContractReference;
       readonly code: "contribution_contract_mismatch";
-      readonly contract: "input" | "output" | "progress";
+      readonly contract: "input" | "managedOutput" | "output" | "progress";
       readonly contributionId: string;
       readonly expected: ExtensionContractReference;
     }
@@ -157,7 +159,7 @@ export type ExtensionDiagnostic =
     }
   | {
       readonly code: "contribution_codec_invalid";
-      readonly contract: "input" | "output" | "progress";
+      readonly contract: "input" | "managedOutput" | "output" | "progress";
       readonly contributionId: string;
     }
   | {
@@ -412,6 +414,10 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       options.artifactStore === undefined) ||
     (options.capabilities.some((capability) => capability.id === EXTENSION_BIOME_CAPABILITY_ID) &&
       (options.biomeExecution === undefined || options.permissions === undefined)) ||
+    (options.capabilities.some(
+      (capability) => capability.id === EXTENSION_MANAGED_SESSION_CAPABILITY_ID,
+    ) &&
+      options.managedSession === undefined) ||
     (options.operationDeadlineMs !== undefined &&
       (!Number.isSafeInteger(options.operationDeadlineMs) ||
         options.operationDeadlineMs <= 0 ||
@@ -467,6 +473,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       ? {}
       : { originAuthority: options.operationOriginAuthority }),
     ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
+    ...(options.managedSession === undefined ? {} : { managedSession: options.managedSession }),
     recordStore,
     resolveOperation: (contributionId) => registeredOperations.get(contributionId),
     ...(options.operationStore === undefined ? {} : { store: options.operationStore }),
@@ -743,7 +750,11 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
               });
               continue;
             }
-            if (!satisfies(EXTENSION_API_VERSION, manifest.adamAgent.apiVersion)) {
+            if (
+              !["0.3.0", EXTENSION_API_VERSION].some((version) =>
+                satisfies(version, manifest.adamAgent.apiVersion),
+              )
+            ) {
               extensions.push({
                 diagnostics: [
                   {
@@ -1511,12 +1522,20 @@ function matchOperationRegistrationsUnchecked(
 
 function findInvalidCodec(
   registration: OperationRegistrationCandidate,
-): "input" | "output" | "progress" | undefined {
-  return (["input", "output", "progress"] as const).find(
+): "input" | "managedOutput" | "output" | "progress" | undefined {
+  const required = (["input", "output", "progress"] as const).find(
     (contract) =>
       typeof registration[contract].decode !== "function" ||
       typeof registration[contract].encode !== "function",
   );
+  if (required !== undefined) {
+    return required;
+  }
+  return registration.managedOutput !== undefined &&
+    (typeof registration.managedOutput.decode !== "function" ||
+      typeof registration.managedOutput.encode !== "function")
+    ? "managedOutput"
+    : undefined;
 }
 
 type OperationRegistrationCandidate = {
@@ -1525,6 +1544,7 @@ type OperationRegistrationCandidate = {
   readonly input: ExtensionContractCodecCandidate;
   readonly output: ExtensionContractCodecCandidate;
   readonly progress: ExtensionContractCodecCandidate;
+  readonly managedOutput?: ExtensionContractCodecCandidate;
   readonly reconcile?: unknown;
 };
 
@@ -1576,6 +1596,9 @@ function digestOperationDefinition(input: {
       ...(input.contribution.inputSource === undefined
         ? {}
         : { inputSource: input.contribution.inputSource }),
+      ...(input.contribution.managedOutput === undefined
+        ? {}
+        : { managedOutput: input.contribution.managedOutput }),
       ...(input.contribution.report === undefined ? {} : { report: input.contribution.report }),
       ...(input.contribution.recovery === undefined
         ? {}
@@ -1636,7 +1659,7 @@ function findContractMismatch(
 ):
   | {
       readonly actual: ExtensionContractReference;
-      readonly contract: "input" | "output" | "progress";
+      readonly contract: "input" | "managedOutput" | "output" | "progress";
       readonly expected: ExtensionContractReference;
     }
   | undefined {
@@ -1651,6 +1674,24 @@ function findContractMismatch(
         expected: declaration[contract],
       };
     }
+  }
+  if (
+    (declaration.managedOutput === undefined) !== (registration.managedOutput === undefined) ||
+    (declaration.managedOutput !== undefined &&
+      registration.managedOutput !== undefined &&
+      !codecMatches(registration.managedOutput, declaration.managedOutput))
+  ) {
+    return {
+      actual:
+        registration.managedOutput === undefined
+          ? { id: "unregistered", version: 1 }
+          : {
+              id: registration.managedOutput.id,
+              version: registration.managedOutput.version,
+            },
+      contract: "managedOutput",
+      expected: declaration.managedOutput ?? { id: "undeclared", version: 1 },
+    };
   }
   return undefined;
 }
