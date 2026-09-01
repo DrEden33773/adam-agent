@@ -787,7 +787,7 @@ test("slash completion uses the literal text part after one pasted Text atom", a
   }
 });
 
-test("the existing at path picker remains atom-safe after one pasted Text atom", async () => {
+test("an accepted path atom stays adjacent to Text and Backspace removes it whole", async () => {
   const { fixture, testRoot } = await startPastedTextAtomFixture({
     prepare: async (workspaceRoot) => {
       await mkdir(join(workspaceRoot, "src"), { recursive: true });
@@ -796,12 +796,16 @@ test("the existing at path picker remains atom-safe after one pasted Text atom",
     slug: "at-completion",
   });
   try {
-    const beforePicker = fixture.output().length;
-    fixture.write(" Inspect @");
-    await fixture.waitForCompleteFrameAfter("Select a project path", beforePicker);
+    fixture.write(" Inspect @srca");
+    await fixture.waitFor("@src/alpha.ts");
     const beforeAccept = fixture.output().length;
-    fixture.write("alpha\r");
-    await fixture.waitForCompleteFrameAfter("Inspect `src/alpha.ts`", beforeAccept);
+    fixture.write("\t");
+    await fixture.waitForCompleteFrameAfter("Inspect @src/alpha.ts", beforeAccept);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("[Text #1]");
+    const beforeRemoval = fixture.output().length;
+    fixture.write("\u007f");
+    await fixture.waitForCompleteFrameAfter("Draft element removed.", beforeRemoval);
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("@src/alpha.ts");
     expect(fixture.screen()?.join("\n") ?? "").toContain("[Text #1]");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -2167,7 +2171,7 @@ test("the production TUI deletes and undoes one whole staged file atom", async (
     await fixture.waitFor("[File #1]after");
 
     fixture.write(`${"\u001b[D".repeat(6)}\u001b[3~`);
-    await fixture.waitFor("Input resource removed.");
+    await fixture.waitFor("Draft element removed.");
     expect(fixture.screen()?.join("\n") ?? "").not.toContain("[File #1]");
     expect(fixture.screen()?.join("\n") ?? "").not.toContain("Draft inputs");
 
@@ -4397,7 +4401,7 @@ test("Tab path completion renders terminal controls from filenames as inert text
   }
 });
 
-test("the at path selector opens only at a token boundary", async () => {
+test("at path completion opens only at a token boundary", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-at-boundary-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -4414,14 +4418,12 @@ test("the at path selector opens only at a token boundary", async () => {
       workspaceRoot,
     });
     await fixture.waitFor("Adam · New session");
-    const beforeDraft = fixture.output().length;
     fixture.write("email@example@");
     fixture.write("\u0011");
     await waitForPath(join(controlRoot, "clipboard.txt"));
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("email@example@");
-    expect(result.stdout.slice(beforeDraft)).not.toContain("Select a project path");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -4536,7 +4538,7 @@ test("accepted Skill completion preserves its exact identity across a recoverabl
     await expect(first.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
     const recoveredManifest = await readFilesRecursively(join(stateRoot, "drafts"));
-    expect(recoveredManifest).toContain('"schemaVersion":2');
+    expect(recoveredManifest).toContain('"schemaVersion":3');
     expect(recoveredManifest).toContain('"type":"skill"');
     expect(recoveredManifest).toMatch(/"elementId":"adam-skill-[^"]+"/u);
     expect(recoveredManifest).toContain(
@@ -4599,7 +4601,7 @@ test("a Skill atom navigates as one token and Backspace removes its exact occurr
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
     const recoveredManifest = await readFilesRecursively(join(stateRoot, "drafts"));
-    expect(recoveredManifest).toContain('"schemaVersion":2');
+    expect(recoveredManifest).toContain('"schemaVersion":3');
     expect(recoveredManifest).toContain('"text":"xy"');
     expect(recoveredManifest).not.toContain('"type":"skill"');
     expect(recoveredManifest).not.toContain("skill:v1:project:.:first");
@@ -6987,7 +6989,7 @@ test("the real TUI reloads its Skill palette through lifecycle authority", async
   }
 });
 
-test("the real TUI opens the bounded project path selector from the at trigger", async () => {
+test("the real TUI opens inline project path completion from the at trigger", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-project-paths-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -6998,21 +7000,21 @@ test("the real TUI opens the bounded project path selector from the at trigger",
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
+    const beforeCompletion = fixture.output().length;
     fixture.write("Open @");
-    await fixture.waitForCompleteFrameAfter("Select a project path", 0);
-    expectFramedOverlay(fixture.output(), "Select a project path");
+    await fixture.waitForCompleteFrameAfter("@README.md", beforeCompletion);
+    const frame = fixture.output().slice(beforeCompletion);
     fixture.write("\u0011");
     await fixture.closed;
-    expect(fixture.output()).toContain("Select a project path");
-    expect(fixture.output()).toContain("README.md");
-    expect(fixture.output()).toContain("src/alpha.ts");
-    expect(fixture.output()).not.toContain("Private source bytes.");
+    expect(frame).toContain("@README.md");
+    expect(frame).toContain("@src/alpha.ts");
+    expect(frame).not.toContain("Private source bytes.");
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
 });
 
-test("the real TUI fuzzy-selects and quotes a normalized project path without reading it", async () => {
+test("the real TUI fuzzy-selects one durable project path atom without reading it", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-project-path-insert-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -7021,21 +7023,31 @@ test("the real TUI fuzzy-selects and quotes a normalized project path without re
   await writeFile(join(workspaceRoot, "src", "alpha.ts"), "PRIVATE_ALPHA_BYTES\n", "utf8");
 
   try {
-    const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
-    fixture.write("Inspect @");
-    await fixture.waitFor("Select a project path");
-    fixture.write("srca");
-    await fixture.waitFor("Filter: srca");
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Inspect `src/alpha.ts`");
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Inspect @srca");
+    await fixture.waitFor("@src/alpha.ts");
+    const beforeAccept = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Inspect @src/alpha.ts", beforeAccept);
+    expect(fixture.output().slice(beforeAccept)).toContain("\u001b[38;2;249;226;175m@src/alpha.ts");
     fixture.write("\u0011");
     await fixture.closed;
 
     const durableState = await readFilesRecursively(stateRoot);
-    expect(durableState).toContain("Inspect `src/alpha.ts`");
+    expect(durableState).toContain('"type":"path"');
+    expect(durableState).toContain('"path":"src/alpha.ts"');
     expect(durableState).not.toContain("PRIVATE_ALPHA_BYTES");
     expect(fixture.output()).not.toContain("PRIVATE_ALPHA_BYTES");
+
+    const restarted = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await restarted.waitFor("Select an exact model target");
+    restarted.write("\r");
+    await restarted.waitFor("Inspect @src/alpha.ts");
+    restarted.write("\u0011");
+    await expect(restarted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -7053,9 +7065,9 @@ test("project path insertion renders terminal controls from filenames as inert t
     const fixture = startFixture({ stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     fixture.write("Inspect @");
-    await fixture.waitFor("Select a project path");
+    await fixture.waitFor("@src/.ts");
     fixture.write("\r");
-    await fixture.waitFor("Inspect `src/.ts`");
+    await fixture.waitFor("Inspect @src/.ts");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });

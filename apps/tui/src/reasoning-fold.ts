@@ -16,14 +16,15 @@ export function reasoningFoldTitle(options: {
   const marker = options.expanded ? "▾" : "▸";
   const provider = safeTerminalText(options.provider);
   const action = `Ctrl+T ${options.expanded ? "fold" : "expand"}`;
+  const hint = options.theme.text(` · ${action}`);
   if (options.status === "active") {
-    return `${marker} Thinking · provider reasoning · ${provider} · ${action}`;
+    return `${marker} Thinking · provider reasoning · ${provider}${hint}`;
   }
   if (options.status === "completed") {
-    return options.theme.allow(`✓ ${marker} Thinking done · ${provider} · ${action}`);
+    return `${options.theme.allow(`✓ ${marker} Thinking done · ${provider}`)}${hint}`;
   }
   if (options.status === "interrupted") {
-    return options.theme.muted(`◇ ${marker} Thinking interrupted · ${provider} · ${action}`);
+    return `${options.theme.muted(`◇ ${marker} Thinking interrupted · ${provider}`)}${hint}`;
   }
-  return options.theme.danger(`× ${marker} Thinking failed · ${provider} · ${action}`);
+  return `${options.theme.danger(`× ${marker} Thinking failed · ${provider}`)}${hint}`;
 }

@@ -830,7 +830,8 @@ export type DraftTextDocumentPart =
       readonly elementId: string;
       readonly name: string;
       readonly qualifiedId: string;
-    };
+    }
+  | { readonly type: "path"; readonly elementId: string; readonly path: string };
 
 export type TurnComposerDisplay = {
   readonly attachmentAvailable: boolean;
@@ -857,6 +858,7 @@ export type TurnComposerDisplay = {
         readonly qualifiedId: string;
         readonly available: boolean;
       }
+    | { readonly type: "path"; readonly elementId: string; readonly path: string }
   )[];
   readonly renderedText: string;
   readonly unavailableReason: string | null;

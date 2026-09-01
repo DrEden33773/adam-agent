@@ -12,7 +12,7 @@ import {
   pastedTextLimitsV1,
   type StagedPastedTextSelectionV1,
 } from "./pasted-text.js";
-import type { RecoverableTurnDraft, RecoverableTurnDraftV2 } from "./recoverable-turn-draft.js";
+import type { RecoverableTurnDraft, RecoverableTurnDraftV3 } from "./recoverable-turn-draft.js";
 import type { StagedUserContentElementV1 } from "./structured-user-content.js";
 
 export {
@@ -60,7 +60,8 @@ export type TurnComposerElementSnapshot =
       readonly elementId: string;
       readonly name: string;
       readonly qualifiedId: string;
-    };
+    }
+  | { readonly type: "path"; readonly elementId: string; readonly path: string };
 
 export type TurnComposerSealedElement =
   | { readonly type: "text"; readonly text: string }
@@ -83,6 +84,12 @@ export type TurnComposerSealedElement =
       readonly elementId: string;
       readonly name: string;
       readonly qualifiedId: string;
+      readonly text: string;
+    }
+  | {
+      readonly type: "path";
+      readonly elementId: string;
+      readonly path: string;
       readonly text: string;
     };
 
@@ -170,16 +177,18 @@ export type TurnComposer = {
             readonly name: string;
             readonly qualifiedId: string;
           }
+        | { readonly type: "path"; readonly elementId: string; readonly path: string }
       )[];
     },
     commit?: () => Promise<void>,
   ): Promise<boolean>;
-  captureDraft(scope: RecoverableTurnDraftV2["scope"]): Promise<RecoverableTurnDraftV2>;
+  captureDraft(scope: RecoverableTurnDraftV3["scope"]): Promise<RecoverableTurnDraftV3>;
   restoreDraft(draft: RecoverableTurnDraft): Promise<void>;
   undo(baseRevision: number, commit?: () => Promise<void>): Promise<boolean>;
   cancel(id: string): Promise<boolean>;
   remove(id: string, commit?: () => Promise<void>): Promise<boolean>;
   removePastedText(id: string, commit?: () => Promise<void>): Promise<boolean>;
+  removePath(elementId: string, commit?: () => Promise<void>): Promise<boolean>;
   removeSkill(elementId: string, commit?: () => Promise<void>): Promise<boolean>;
   setText(text: string): void;
   commitText(text: string, commit: () => Promise<void>): Promise<void>;
@@ -287,7 +296,9 @@ export async function createTurnComposer(options: {
           ? element.text
           : element.type === "skill"
             ? `$${element.name}`
-            : atomToken(element.type === "pasted_text" ? "text" : element.kind, element.ordinal),
+            : element.type === "path"
+              ? `@${element.path}`
+              : atomToken(element.type === "pasted_text" ? "text" : element.kind, element.ordinal),
       )
       .join("");
 
@@ -299,9 +310,16 @@ export async function createTurnComposer(options: {
     candidateElements: readonly TurnComposerElementSnapshot[] = elements,
   ): number =>
     Buffer.byteLength(literal, "utf8") +
-    candidateElements
-      .filter((element) => element.type === "skill")
-      .reduce((total, element) => total + Buffer.byteLength(`$${element.name}`, "utf8"), 0) +
+    candidateElements.reduce(
+      (total, element) =>
+        total +
+        (element.type === "skill"
+          ? Buffer.byteLength(`$${element.name}`, "utf8")
+          : element.type === "path"
+            ? Buffer.byteLength(`@${element.path}`, "utf8")
+            : 0),
+      0,
+    ) +
     [...pastedTexts.values()]
       .filter((pastedText) => pastedText.state !== "removed")
       .reduce((total, pastedText) => total + pastedText.byteCount, 0);
@@ -478,8 +496,9 @@ export async function createTurnComposer(options: {
     return { element, previousElements };
   };
 
-  const removeSkillElement = (
+  const removeInlineAtomElement = (
     elementId: string,
+    type: "path" | "skill",
   ):
     | {
         readonly previousElements: readonly TurnComposerElementSnapshot[];
@@ -487,7 +506,7 @@ export async function createTurnComposer(options: {
     | undefined => {
     const previousElements = elements;
     const index = previousElements.findIndex(
-      (element) => element.type === "skill" && element.elementId === elementId,
+      (element) => element.type === type && element.elementId === elementId,
     );
     if (index < 0) {
       return undefined;
@@ -552,7 +571,7 @@ export async function createTurnComposer(options: {
         }
       }
       return {
-        schemaVersion: 2,
+        schemaVersion: 3,
         scope,
         nextOrdinal,
         elements: elements.map((element) => ({ ...element })),
@@ -725,11 +744,20 @@ export async function createTurnComposer(options: {
             ) {
               return false;
             }
+            if (atom.type === "path" && (part.type !== "path" || atom.path !== part.path)) {
+              return false;
+            }
             nextElements.push(atom);
             currentAtomIndex += 1;
           } else if (
             part.type === "skill" &&
             isValidSkillIdentity(part.name, part.qualifiedId) &&
+            !elements.some((element) => element.elementId === part.elementId)
+          ) {
+            nextElements.push({ ...part });
+          } else if (
+            part.type === "path" &&
+            isValidPathAtom(part.path) &&
             !elements.some((element) => element.elementId === part.elementId)
           ) {
             nextElements.push({ ...part });
@@ -909,10 +937,33 @@ export async function createTurnComposer(options: {
       const previousText = text;
       const previousRevision = revision;
       const previousUndoStack = [...undoStack];
-      const removed = removeSkillElement(elementId);
+      const removed = removeInlineAtomElement(elementId, "skill");
       if (removed === undefined) {
         return false;
       }
+      text = literalText();
+      pushUndo({ previousElements: removed.previousElements });
+      try {
+        await commit?.();
+      } catch (error) {
+        elements = previousElements;
+        text = previousText;
+        revision = previousRevision;
+        undoStack.length = 0;
+        undoStack.push(...previousUndoStack);
+        throw error;
+      }
+      publish();
+      return true;
+    },
+    async removePath(elementId, commit) {
+      if (closed || sealed) return false;
+      const previousElements = elements;
+      const previousText = text;
+      const previousRevision = revision;
+      const previousUndoStack = [...undoStack];
+      const removed = removeInlineAtomElement(elementId, "path");
+      if (removed === undefined) return false;
       text = literalText();
       pushUndo({ previousElements: removed.previousElements });
       try {
@@ -1400,6 +1451,9 @@ export async function createTurnComposer(options: {
           if (element.type === "skill") {
             return { ...element, text: `$${element.name}` };
           }
+          if (element.type === "path") {
+            return { ...element, text: `@${element.path}` };
+          }
           const resource = resourceById.get(element.resourceId);
           if (resource?.staged === null || resource?.staged === undefined) {
             throw new TurnComposerError(
@@ -1440,6 +1494,9 @@ export async function createTurnComposer(options: {
             if (element.type === "skill") {
               return { type: "text", text: `$${element.name}` };
             }
+            if (element.type === "path") {
+              return { type: "text", text: `@${element.path}` };
+            }
             const selectionIndex = selectionIndexById.get(element.resourceId);
             if (selectionIndex === undefined) {
               throw new TurnComposerError(
@@ -1460,7 +1517,9 @@ export async function createTurnComposer(options: {
               ? [element.text]
               : element.type === "skill"
                 ? [`$${element.name}`]
-                : [],
+                : element.type === "path"
+                  ? [`@${element.path}`]
+                  : [],
           )
           .join(""),
         selections: retained.map((resource) => resource.staged as StagedInputResourceSelectionV1),
@@ -1529,6 +1588,9 @@ export async function createTurnComposer(options: {
           }
           if (element.type === "skill") {
             return `$${element.name}`;
+          }
+          if (element.type === "path") {
+            return `@${element.path}`;
           }
           const pastedText = pastedTexts.get(element.pastedTextId);
           if (pastedText?.state !== "ready" || pastedText.text === null) {
@@ -1675,6 +1737,10 @@ function isValidSkillIdentity(name: string, qualifiedId: string): boolean {
     /^[\x20-\x7e]+$/u.test(qualifiedId) &&
     Buffer.byteLength(qualifiedId, "utf8") <= 16_384
   );
+}
+
+function isValidPathAtom(path: string): boolean {
+  return path.length > 0 && path.length <= 4096 && !/[\0\r\n]/u.test(path);
 }
 
 function normalizeStructuredTextElements(

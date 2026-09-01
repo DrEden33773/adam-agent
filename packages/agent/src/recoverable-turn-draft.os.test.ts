@@ -15,7 +15,7 @@ test("recoverable turn draft atomically replaces one owner-private project manif
     stateRoot: testRoot,
   });
   const first = {
-    schemaVersion: 2 as const,
+    schemaVersion: 3 as const,
     scope: { type: "new_session" as const, targetId: "deepseek-v4-flash.direct" },
     nextOrdinal: 1,
     elements: [{ elementId: "text-1", type: "text" as const, text: "first" }],
@@ -46,6 +46,13 @@ test("recoverable turn draft atomically replaces one owner-private project manif
       mode: 0o600,
     });
     await expect(repository.load({ type: "new_session" })).resolves.toEqual(legacy);
+    await repository.delete({ type: "new_session" });
+
+    const previous = { ...first, schemaVersion: 2 as const };
+    await writeFile(join(draftsRoot, "new-session.json"), `${JSON.stringify(previous)}\n`, {
+      mode: 0o600,
+    });
+    await expect(repository.load({ type: "new_session" })).resolves.toEqual(previous);
     await repository.delete({ type: "new_session" });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -93,7 +100,7 @@ test("recoverable turn draft rejects a V2 graph whose Skill text exceeds the pay
 
   try {
     await repository.save({
-      schemaVersion: 2,
+      schemaVersion: 3,
       scope: { type: "new_session", targetId: "deepseek-v4-flash.direct" },
       nextOrdinal: 1,
       elements: [],

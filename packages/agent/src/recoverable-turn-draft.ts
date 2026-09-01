@@ -92,11 +92,22 @@ export type RecoverableTurnDraftV2 = Omit<RecoverableTurnDraftV1, "elements" | "
   )[];
 };
 
-export type RecoverableTurnDraft = RecoverableTurnDraftV1 | RecoverableTurnDraftV2;
+export type RecoverableTurnDraftV3 = Omit<RecoverableTurnDraftV2, "elements" | "schemaVersion"> & {
+  readonly schemaVersion: 3;
+  readonly elements: readonly (
+    | RecoverableTurnDraftV2["elements"][number]
+    | { readonly type: "path"; readonly elementId: string; readonly path: string }
+  )[];
+};
+
+export type RecoverableTurnDraft =
+  | RecoverableTurnDraftV1
+  | RecoverableTurnDraftV2
+  | RecoverableTurnDraftV3;
 
 export type RecoverableTurnDraftRepository = {
   load(scope: TurnDraftScopeV1): Promise<RecoverableTurnDraft | null>;
-  save(draft: RecoverableTurnDraftV2): Promise<void>;
+  save(draft: RecoverableTurnDraftV3): Promise<void>;
   delete(scope: TurnDraftScopeV1): Promise<void>;
 };
 
@@ -178,6 +189,15 @@ const skillElementSchema = z.strictObject({
     .min(1)
     .max(16_384)
     .refine((value) => /^[\x20-\x7e]+$/u.test(value) && Buffer.byteLength(value, "utf8") <= 16_384),
+});
+const pathElementSchema = z.strictObject({
+  elementId: z.string().min(1).max(256),
+  type: z.literal("path"),
+  path: z
+    .string()
+    .min(1)
+    .max(4096)
+    .refine((value) => !/[\0\r\n]/u.test(value)),
 });
 const draftV1Schema = z
   .strictObject({
@@ -269,23 +289,45 @@ const draftV2Schema = z
   })
   .superRefine((draft, context) => validateDraftGraph(draft, context));
 
+const draftV3Schema = z
+  .strictObject({
+    schemaVersion: z.literal(3),
+    scope: draftV1Schema.shape.scope,
+    nextOrdinal: draftV1Schema.shape.nextOrdinal,
+    elements: z
+      .array(
+        z.discriminatedUnion("type", [
+          textElementSchema,
+          resourceElementSchema,
+          pastedTextElementSchema,
+          skillElementSchema,
+          pathElementSchema,
+        ]),
+      )
+      .max(17),
+    resources: draftV1Schema.shape.resources,
+    pastedTexts: draftV1Schema.shape.pastedTexts,
+  })
+  .superRefine((draft, context) => validateDraftGraph(draft, context));
+
 const recoverableDraftSchema = z.discriminatedUnion("schemaVersion", [
   draftV1Schema,
   draftV2Schema,
+  draftV3Schema,
 ]);
 
 function validateDraftGraph(draft: RecoverableTurnDraft, context: z.RefinementCtx): void {
-  const allElements: readonly RecoverableTurnDraftV2["elements"][number][] = draft.elements;
+  const allElements: readonly RecoverableTurnDraftV3["elements"][number][] = draft.elements;
   const resourceElements = allElements.filter(
     (
       element,
-    ): element is Extract<RecoverableTurnDraftV2["elements"][number], { type: "resource" }> =>
+    ): element is Extract<RecoverableTurnDraftV3["elements"][number], { type: "resource" }> =>
       element.type === "resource",
   );
   const pastedTextElements = allElements.filter(
     (
       element,
-    ): element is Extract<RecoverableTurnDraftV2["elements"][number], { type: "pasted_text" }> =>
+    ): element is Extract<RecoverableTurnDraftV3["elements"][number], { type: "pasted_text" }> =>
       element.type === "pasted_text",
   );
   const pastedTexts = draft.pastedTexts ?? [];
@@ -302,7 +344,9 @@ function validateDraftGraph(draft: RecoverableTurnDraft, context: z.RefinementCt
           ? Buffer.byteLength(element.text, "utf8")
           : element.type === "skill"
             ? Buffer.byteLength(`$${element.name}`, "utf8")
-            : 0),
+            : element.type === "path"
+              ? Buffer.byteLength(`@${element.path}`, "utf8")
+              : 0),
       0,
     ) +
       pastedTexts.reduce((total, pastedText) => total + pastedText.byteCount, 0) >
@@ -434,7 +478,7 @@ export async function createRecoverableTurnDraftRepository(options: {
     },
     save(draft) {
       return enqueueMutation(async () => {
-        const validated = draftV2Schema.parse(draft);
+        const validated = draftV3Schema.parse(draft);
         const serialized = `${JSON.stringify(validated)}\n`;
         if (Buffer.byteLength(serialized, "utf8") > maximumManifestBytes) {
           throw new TypeError("The recoverable draft manifest is too large.");

@@ -6,12 +6,18 @@ import type {
   EditorStructuredCompletionProjection,
 } from "@earendil-works/pi-tui";
 import {
+  type PathAutocompleteIdentity,
+  pathAutocompleteIdentity,
   type SkillAutocompleteIdentity,
   skillAutocompleteIdentity,
 } from "./command-autocomplete.js";
 
 export function createAdamStructuredEditorCompletion(
   options: {
+    readonly pathStyle?: (text: string) => string;
+    readonly onPathAtom?: (
+      identity: PathAutocompleteIdentity & { readonly elementId: string },
+    ) => void;
     readonly onSkillAtom?: (
       identity: SkillAutocompleteIdentity & { readonly elementId: string },
     ) => void;
@@ -19,12 +25,22 @@ export function createAdamStructuredEditorCompletion(
 ): EditorStructuredCompletion {
   return {
     promote(text, cursorOffset, item, prefix) {
-      if (skillAutocompleteIdentity(item) === null) {
+      if (skillAutocompleteIdentity(item) === null && pathAutocompleteIdentity(item) === null) {
         return null;
       }
       const document: readonly EditorDocumentPart[] = [
         { type: "text", id: "adam-editor-text-1", text },
       ];
+      if (pathAutocompleteIdentity(item) !== null) {
+        return acceptPathAtom(
+          document,
+          { partId: "adam-editor-text-1", offset: cursorOffset },
+          item,
+          prefix,
+          options.onPathAtom,
+          options.pathStyle,
+        );
+      }
       return acceptSkillAtom(
         document,
         { partId: "adam-editor-text-1", offset: cursorOffset },
@@ -83,6 +99,16 @@ export function createAdamStructuredEditorCompletion(
       if (skill !== null) {
         return acceptSkillAtom(document, cursor, item, prefix, options.onSkillAtom);
       }
+      if (pathAutocompleteIdentity(item) !== null) {
+        return acceptPathAtom(
+          document,
+          cursor,
+          item,
+          prefix,
+          options.onPathAtom,
+          options.pathStyle,
+        );
+      }
       const replacement = `${textCursor.part.text.slice(0, start)}${item.value}${textCursor.part.text.slice(textCursor.offset)}`;
       const nextDocument = document.map((part) =>
         part.id === textCursor.part.id ? { ...textCursor.part, text: replacement } : part,
@@ -102,6 +128,50 @@ export function createAdamStructuredEditorCompletion(
 }
 
 export const adamStructuredEditorCompletion = createAdamStructuredEditorCompletion();
+
+function acceptPathAtom(
+  document: readonly EditorDocumentPart[],
+  cursor: EditorDocumentPoint,
+  item: Parameters<EditorStructuredCompletion["accept"]>[2],
+  prefix: string,
+  onPathAtom:
+    | ((identity: PathAutocompleteIdentity & { readonly elementId: string }) => void)
+    | undefined,
+  pathStyle: ((text: string) => string) | undefined,
+): ReturnType<EditorStructuredCompletion["accept"]> {
+  const path = pathAutocompleteIdentity(item);
+  const textCursor = textPartAtCursor(document, cursor);
+  if (path === null || textCursor === null) return null;
+  const start = textCursor.offset - prefix.length;
+  if (start < 0 || textCursor.part.text.slice(start, textCursor.offset) !== prefix) return null;
+  const elementId = `adam-path-${randomUUID()}`;
+  const before = textCursor.part.text.slice(0, start);
+  const after = textCursor.part.text.slice(textCursor.offset);
+  const nextDocument = [
+    ...document.slice(0, textCursor.index),
+    ...(before.length === 0 ? [] : [{ ...textCursor.part, text: before }]),
+    {
+      type: "atom" as const,
+      id: elementId,
+      label: `@${path.path}`,
+      ...(pathStyle === undefined ? {} : { style: pathStyle }),
+    },
+    ...(after.length === 0
+      ? []
+      : [{ type: "text" as const, id: nextTextPartId(document), text: after }]),
+    ...document.slice(textCursor.index + 1),
+  ];
+  onPathAtom?.({ ...path, elementId });
+  return {
+    cursor: { partId: elementId, edge: "after" },
+    document: nextDocument,
+    range: {
+      anchor: { partId: textCursor.part.id, offset: start },
+      focus: { partId: textCursor.part.id, offset: textCursor.offset },
+    },
+    text: item.value,
+  };
+}
 
 function acceptSkillAtom(
   document: readonly EditorDocumentPart[],
