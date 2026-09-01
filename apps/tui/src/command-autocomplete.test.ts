@@ -76,3 +76,34 @@ test("forced project-path rows use the caller's Text semantic slot", async () =>
     prefix: "src/a",
   });
 });
+
+test("path mention rows separate file names from parent paths without changing identity", async () => {
+  const provider = new AdamAutocompleteProvider({
+    getProjectPaths: () => ["README.md", "packages/extension-api/README.md"],
+    getRunActive: () => false,
+    getSkills: () => [],
+    path: (value) => `<text>${value}</text>`,
+  });
+
+  await expect(
+    provider.getSuggestions(["Use @"], 0, 5, {
+      signal: new AbortController().signal,
+    }),
+  ).resolves.toEqual({
+    items: [
+      {
+        adamPath: { path: "README.md" },
+        value: "@README.md",
+        label: "<text>@README.md</text>",
+        description: "./",
+      },
+      {
+        adamPath: { path: "packages/extension-api/README.md" },
+        value: "@packages/extension-api/README.md",
+        label: "<text>@README.md</text>",
+        description: "packages/extension-api/",
+      },
+    ],
+    prefix: "@",
+  });
+});
