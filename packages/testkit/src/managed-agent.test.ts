@@ -1050,8 +1050,8 @@ test("ManagedAgentStore folds an admitted restart window without child provider 
     profile: "scout.v1",
     profileDigest: scoutManagedAgentProfileV1.digest,
     limits: managedLimits,
-    task: "Interrupted admitted task.",
     taskDigest: testTaskDigest("Interrupted admitted task."),
+    childInputDigest: testTaskDigest(`Interrupted admitted task.\n\n${childLiveWorkspaceNotice}`),
     targetIdentity,
   });
   await recoverInterruptedManagedAgents(managedStore);
@@ -1082,8 +1082,10 @@ test("ManagedAgentStore rejects a terminal link with a different child identity"
     profile: "scout.v1" as const,
     profileDigest: scoutManagedAgentProfileV1.digest,
     limits: managedLimits,
-    task: "Reject a mismatched terminal.",
     taskDigest: testTaskDigest("Reject a mismatched terminal."),
+    childInputDigest: testTaskDigest(
+      `Reject a mismatched terminal.\n\n${childLiveWorkspaceNotice}`,
+    ),
     targetIdentity,
   };
   await managedStore.append(admission);
@@ -1193,8 +1195,8 @@ test("ManagedAgentStore links a complete child transcript after a terminal-link 
     profile: "scout.v1",
     profileDigest: scoutManagedAgentProfileV1.digest,
     limits: managedLimits,
-    task: recoveredTask,
     taskDigest: testTaskDigest(recoveredTask),
+    childInputDigest: testTaskDigest(`${recoveredTask}\n\n${childLiveWorkspaceNotice}`),
     targetIdentity,
   });
 
@@ -1249,8 +1251,10 @@ test("ManagedAgentStore requires inspection for a child genesis with a different
     profile: "scout.v1",
     profileDigest: scoutManagedAgentProfileV1.digest,
     limits: managedLimits,
-    task: "Inspect a mismatched child identity.",
     taskDigest: testTaskDigest("Inspect a mismatched child identity."),
+    childInputDigest: testTaskDigest(
+      `Inspect a mismatched child identity.\n\n${childLiveWorkspaceNotice}`,
+    ),
     targetIdentity,
   });
 
@@ -1262,6 +1266,69 @@ test("ManagedAgentStore requires inspection for a child genesis with a different
       type: "managed_agent_terminal",
       status: "inspection_required",
       error: { code: "managed_agent_inspection_required" },
+    },
+  ]);
+});
+
+test("ManagedAgentStore preserves a durable deadline between child genesis and logical run", async () => {
+  const managedStore = createInMemoryManagedAgentStore();
+  const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  const childSessionId = "123e4567-e89b-42d3-a456-426614174193";
+  const childStore = await childSessionStores.create(childSessionId);
+  const childTools = createReadToolRegistry({ workspaceRoot: process.cwd() });
+  await childStore.append({
+    schemaVersion: 3,
+    sequence: 1,
+    record: {
+      type: "session_genesis",
+      recordVersion: 2,
+      sessionId: childSessionId,
+      projectId,
+      targetIdentity,
+      contextProfile,
+      promptContext: createPromptContextV1(childTools),
+    },
+  });
+  const parentSessionId = "123e4567-e89b-42d3-a456-426614174194";
+  const agentId = "123e4567-e89b-42d3-a456-426614174191";
+  const attemptId = "123e4567-e89b-42d3-a456-426614174192";
+  const task = "Expire before the child logical run.";
+  await managedStore.append({
+    schemaVersion: 1,
+    type: "managed_agent_admitted",
+    sequence: 1,
+    agentId,
+    attemptId,
+    childSessionId,
+    parentSessionId,
+    parentToolCallId: "pre-run-deadline-spawn",
+    parentRootId: `session:${parentSessionId}`,
+    projectId,
+    profile: "scout.v1",
+    profileDigest: scoutManagedAgentProfileV1.digest,
+    limits: managedLimits,
+    taskDigest: testTaskDigest(task),
+    childInputDigest: testTaskDigest(`${task}\n\n${childLiveWorkspaceNotice}`),
+    targetIdentity,
+  });
+  await managedStore.append({
+    schemaVersion: 1,
+    type: "managed_agent_deadline_expired",
+    sequence: 2,
+    agentId,
+    attemptId,
+    childSessionId,
+  });
+
+  await recoverInterruptedManagedAgents(managedStore, childSessionStores);
+
+  expect(await managedStore.read()).toMatchObject([
+    { type: "managed_agent_admitted" },
+    { type: "managed_agent_deadline_expired" },
+    {
+      type: "managed_agent_terminal",
+      status: "failed",
+      error: { code: "managed_agent_deadline_exceeded" },
     },
   ]);
 });

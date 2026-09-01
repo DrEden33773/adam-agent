@@ -115,7 +115,7 @@ export type ManagedAgentRecord =
         readonly maximumDeadlineMilliseconds: 600_000;
       };
       readonly taskDigest: `sha256:${string}`;
-      readonly task: string;
+      readonly childInputDigest: `sha256:${string}`;
       readonly targetIdentity: ModelTargetIdentity;
       readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
       readonly repository?: {
@@ -257,10 +257,7 @@ const managedAgentRecordSchema = z.union([
       maximumDeadlineMilliseconds: z.literal(600_000),
     }),
     taskDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-    task: z
-      .string()
-      .min(1)
-      .refine((task) => Buffer.byteLength(task, "utf8") <= maximumManagedAgentTaskBytes),
+    childInputDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
     targetIdentity: targetIdentitySchema,
     thinkingPolicy: thinkingPolicySchema.optional(),
     repository: z
@@ -391,7 +388,7 @@ export async function recoverInterruptedManagedAgents(
     const logicalRun = childRecords?.find(
       (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
     );
-    const validIdentity =
+    const validGenesisIdentity =
       genesis?.schemaVersion === 3 &&
       genesis.record.type === "session_genesis" &&
       genesis.record.sessionId === admission.childSessionId &&
@@ -405,20 +402,11 @@ export async function recoverInterruptedManagedAgents(
         maximumDeadlineMilliseconds: scoutManagedAgentProfileV1.limits.maximumDeadlineMilliseconds,
       }) &&
       admission.parentRootId === `session:${admission.parentSessionId}` &&
-      logicalRun?.schemaVersion === 3 &&
-      logicalRun.record.type === "logical_run_started" &&
-      logicalRun.record.userMessage === childTaskMessage(admission.task) &&
-      digest(admission.task) === admission.taskDigest &&
-      isDeepStrictEqual(logicalRun.record.thinkingPolicy, admission.thinkingPolicy) &&
-      isDeepStrictEqual(logicalRun.record.limits, {
-        maxTurns: admission.limits.maximumTurns,
-        maxTokens: admission.limits.maximumTokens,
-      }) &&
       (admission.repository === undefined
         ? repository?.sources.length === 0
         : repository?.revision === admission.repository.revision &&
           repository.effectiveDigest === admission.repository.effectiveDigest);
-    if (childRecords !== undefined && !validIdentity) {
+    if (childRecords !== undefined && !validGenesisIdentity) {
       const terminal: ManagedAgentRecord = {
         schemaVersion: 1,
         type: "managed_agent_terminal",
@@ -461,6 +449,34 @@ export async function recoverInterruptedManagedAgents(
               transcriptDigest: digest(JSON.stringify(childRecords)),
               throughSequence: childRecords.at(-1)?.sequence ?? 0,
             }),
+      };
+      await store.append(terminal);
+      records = [...records, terminal];
+      terminalAttempts.add(admission.attemptId);
+      continue;
+    }
+    const validRunIdentity =
+      logicalRun?.schemaVersion === 3 &&
+      logicalRun.record.type === "logical_run_started" &&
+      digest(logicalRun.record.userMessage) === admission.childInputDigest &&
+      isDeepStrictEqual(logicalRun.record.thinkingPolicy, admission.thinkingPolicy) &&
+      isDeepStrictEqual(logicalRun.record.limits, {
+        maxTurns: admission.limits.maximumTurns,
+        maxTokens: admission.limits.maximumTokens,
+      });
+    if (childRecords !== undefined && !validRunIdentity) {
+      const terminal: ManagedAgentRecord = {
+        schemaVersion: 1,
+        type: "managed_agent_terminal",
+        sequence: records.length + 1,
+        agentId: admission.agentId,
+        attemptId: admission.attemptId,
+        childSessionId: admission.childSessionId,
+        status: "inspection_required",
+        error: {
+          code: "managed_agent_inspection_required",
+          message: "The durable child run does not match its Managed Agent admission.",
+        },
       };
       await store.append(terminal);
       records = [...records, terminal];
@@ -635,7 +651,6 @@ export function validateManagedAgentRecord(
   const candidate = parsed.data;
   if (candidate.type === "managed_agent_admitted") {
     if (
-      digest(candidate.task) !== candidate.taskDigest ||
       history.some(
         (record) =>
           record.agentId === candidate.agentId ||
@@ -824,7 +839,7 @@ export function createAgentManager(options: {
               scoutManagedAgentProfileV1.limits.maximumDeadlineMilliseconds,
           },
           taskDigest,
-          task: input.task,
+          childInputDigest: digest(childTaskMessage(input.task)),
           targetIdentity: options.targetIdentity,
           ...(options.thinkingPolicy === undefined
             ? {}

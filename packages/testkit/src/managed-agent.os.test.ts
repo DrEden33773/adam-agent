@@ -44,6 +44,8 @@ const managedLimits = {
   maximumDeadlineMilliseconds: 600_000,
 } as const;
 const durableTask = "Persist one durable scout result.";
+const childLiveWorkspaceNotice =
+  "This child reads the live workspace. Parent changes may alter what it observes; isolated transcript does not mean repository snapshot or sandbox.";
 
 test("ManagedAgentStore preserves one admitted and terminal identity across JSONL reopen", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-store-jsonl-"));
@@ -140,8 +142,10 @@ function managedStoreRecords() {
       profile: "scout.v1" as const,
       profileDigest: scoutManagedAgentProfileV1.digest,
       limits: managedLimits,
-      task: durableTask,
       taskDigest: `sha256:${createHash("sha256").update(durableTask).digest("hex")}` as const,
+      childInputDigest: `sha256:${createHash("sha256")
+        .update(`${durableTask}\n\n${childLiveWorkspaceNotice}`)
+        .digest("hex")}` as const,
       targetIdentity,
       thinkingPolicy,
     },
