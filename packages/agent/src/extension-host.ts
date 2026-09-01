@@ -51,9 +51,14 @@ import {
   ProjectChangeMaterializerError,
 } from "./project-change-materializer.js";
 import {
+  createProjectExecutionDomain,
+  type ProjectExecutionDomain,
+  ProjectExecutionDomainError,
+  projectRuntimeRootId,
+} from "./project-execution-domain.js";
+import {
   createProjectLifecycleOwner,
   type ProjectLifecycleOwner,
-  ProjectLifecycleOwnerError,
 } from "./project-lifecycle-owner.js";
 import type { PermissionPolicy } from "./tool-runtime.js";
 
@@ -234,6 +239,14 @@ export interface ExtensionHost {
   listContributions(): readonly ExtensionContributionSummary[];
   loadConfiguredExtensions(): Promise<ExtensionHostSnapshot>;
   startProjectChanges(options: ExtensionProjectChangesStartOptions): Promise<OperationReference>;
+}
+
+const extensionProjectExecutionDomains = new WeakMap<ExtensionHost, ProjectExecutionDomain>();
+
+export function projectExecutionDomainForExtensionHost(
+  host: ExtensionHost,
+): ProjectExecutionDomain | undefined {
+  return extensionProjectExecutionDomains.get(host);
 }
 
 export type ExtensionProjectChangesStartOptions = {
@@ -439,6 +452,9 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
           workspaceRoot: options.projectRoot ?? process.cwd(),
           ...(options.stateRoot === undefined ? {} : { stateRoot: options.stateRoot }),
         }));
+  const projectExecutionDomain = createProjectExecutionDomain({
+    lifecycleOwner: projectLifecycleOwner,
+  });
   const operationHost: OperationHostControl = createOperationHost({
     ...(options.artifactStore === undefined ? {} : { artifactStore: options.artifactStore }),
     ...(options.operationDeadlineMs === undefined
@@ -446,7 +462,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       : { defaultDeadlineMs: options.operationDeadlineMs }),
     ...(options.biomeExecution === undefined ? {} : { biomeExecution: options.biomeExecution }),
     projectRoot: options.projectRoot ?? process.cwd(),
-    lifecycleOwner: projectLifecycleOwner,
+    executionDomain: projectExecutionDomain,
     ...(options.operationOriginAuthority === undefined
       ? {}
       : { originAuthority: options.operationOriginAuthority }),
@@ -588,8 +604,8 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       ) {
         return Promise.resolve({ extensions: existing });
       }
-      const operation = projectLifecycleOwner
-        .run(async () => {
+      const operation = projectExecutionDomain
+        .runRoot({ rootId: projectRuntimeRootId }, async () => {
           const availableCapabilities = new Map(
             options.capabilities.map((capability) => [capability.id, capability]),
           );
@@ -1063,8 +1079,13 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
           return { extensions };
         })
         .catch((error: unknown) => {
-          if (error instanceof ProjectLifecycleOwnerError) {
-            throw new ExtensionHostError(error.code, { cause: error });
+          if (error instanceof ProjectExecutionDomainError) {
+            throw new ExtensionHostError(
+              error.code === "root_conflict" || error.code === "project_in_use"
+                ? "project_in_use"
+                : "project_owner_unavailable",
+              { cause: error },
+            );
           }
           throw error;
         });
@@ -1082,6 +1103,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
     lifecycleCommandQueues,
     sources: extensionSkillSources,
   });
+  extensionProjectExecutionDomains.set(host, projectExecutionDomain);
   return host;
 }
 

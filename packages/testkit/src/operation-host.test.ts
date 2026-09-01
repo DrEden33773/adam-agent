@@ -588,6 +588,9 @@ test("ExtensionHost lists only linked operations inside an exact session prefix"
         sourceSequence: 3,
       },
     });
+    for await (const _record of host.operations.events({ operationId: included.operationId })) {
+      // A distinct operation root is eligible only after causal terminal settlement.
+    }
     const secondIncluded = await host.operations.startLinked({
       contributionId: "fixture.review",
       idempotencyKey: "linked-list-included-2",
@@ -598,11 +601,19 @@ test("ExtensionHost lists only linked operations inside an exact session prefix"
         sourceSequence: 5,
       },
     });
-    await host.operations.start({
+    for await (const _record of host.operations.events({
+      operationId: secondIncluded.operationId,
+    })) {
+      // A distinct operation root is eligible only after causal terminal settlement.
+    }
+    const legacy = await host.operations.start({
       contributionId: "fixture.review",
       idempotencyKey: "linked-list-legacy-1",
       input: { revision: "legacy" },
     });
+    for await (const _record of host.operations.events({ operationId: legacy.operationId })) {
+      // A distinct operation root is eligible only after causal terminal settlement.
+    }
     const afterPrefix = await host.operations.startLinked({
       contributionId: "fixture.review",
       idempotencyKey: "linked-list-after-prefix-1",
@@ -613,7 +624,10 @@ test("ExtensionHost lists only linked operations inside an exact session prefix"
         sourceSequence: 8,
       },
     });
-    await host.operations.startLinked({
+    for await (const _record of host.operations.events({ operationId: afterPrefix.operationId })) {
+      // A distinct operation root is eligible only after causal terminal settlement.
+    }
+    const otherSession = await host.operations.startLinked({
       contributionId: "fixture.review",
       idempotencyKey: "linked-list-other-session-1",
       input: { revision: "other" },
@@ -623,6 +637,11 @@ test("ExtensionHost lists only linked operations inside an exact session prefix"
         sourceSequence: 2,
       },
     });
+    for await (const _record of host.operations.events({
+      operationId: otherSession.operationId,
+    })) {
+      // A distinct operation root is eligible only after causal terminal settlement.
+    }
 
     await expect(host.operations.listLinked({ sessionId, throughSequence: 7 })).resolves.toEqual({
       items: [included, secondIncluded],
