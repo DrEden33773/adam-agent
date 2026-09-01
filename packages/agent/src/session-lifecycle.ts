@@ -27,8 +27,8 @@ import {
 } from "./durable-model-response-policy.js";
 import {
   type ExtensionHost,
-  extensionProjectExecutionDomain,
   loadInternalExtensionSkillSources,
+  projectExecutionDomainForExtensionHost,
   withInternalExtensionSkillSourcesCurrent,
 } from "./extension-host.js";
 import {
@@ -915,9 +915,13 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         .catch(() => undefined);
     }
   };
+  const extensionExecutionDomain =
+    options.extensionHost === undefined
+      ? undefined
+      : projectExecutionDomainForExtensionHost(options.extensionHost);
   const executionDomain =
-    options[sessionProjectLifecycleOwner] === undefined && options.extensionHost !== undefined
-      ? options.extensionHost[extensionProjectExecutionDomain]
+    options[sessionProjectLifecycleOwner] === undefined && extensionExecutionDomain !== undefined
+      ? extensionExecutionDomain
       : createProjectExecutionDomain({
           lifecycleOwner:
             options[sessionProjectLifecycleOwner] ?? createProjectLifecycleOwner(options),

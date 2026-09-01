@@ -234,7 +234,6 @@ export type ExtensionHostSnapshot = {
 
 export interface ExtensionHost {
   readonly operations: OperationHost;
-  readonly [extensionProjectExecutionDomain]: ProjectExecutionDomain;
   disableExtension(extensionId: string): Promise<ExtensionStateSnapshot>;
   enableExtension(extensionId: string): Promise<ExtensionStateSnapshot>;
   listContributions(): readonly ExtensionContributionSummary[];
@@ -242,9 +241,13 @@ export interface ExtensionHost {
   startProjectChanges(options: ExtensionProjectChangesStartOptions): Promise<OperationReference>;
 }
 
-export const extensionProjectExecutionDomain = Symbol(
-  "adam-agent.extension-project-execution-domain",
-);
+const extensionProjectExecutionDomains = new WeakMap<ExtensionHost, ProjectExecutionDomain>();
+
+export function projectExecutionDomainForExtensionHost(
+  host: ExtensionHost,
+): ProjectExecutionDomain | undefined {
+  return extensionProjectExecutionDomains.get(host);
+}
 
 export type ExtensionProjectChangesStartOptions = {
   readonly command: {
@@ -470,7 +473,6 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
   });
   let loadInFlight: Promise<ExtensionHostSnapshot> | undefined;
   const host: ExtensionHost = {
-    [extensionProjectExecutionDomain]: projectExecutionDomain,
     operations: operationHost,
     disableExtension(extensionId) {
       return enqueueLifecycleCommand(lifecycleCommandQueues, extensionId, async () => {
@@ -1101,6 +1103,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
     lifecycleCommandQueues,
     sources: extensionSkillSources,
   });
+  extensionProjectExecutionDomains.set(host, projectExecutionDomain);
   return host;
 }
 

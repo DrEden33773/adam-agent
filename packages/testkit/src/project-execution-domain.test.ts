@@ -192,6 +192,63 @@ test("ProjectExecutionDomain close fences an acquisition already in flight", asy
   expect(releases).toBe(1);
 });
 
+test("ProjectExecutionDomain close waits for a final OS release already in flight", async () => {
+  const ownerReleaseStarted = Promise.withResolvers<void>();
+  const allowOwnerRelease = Promise.withResolvers<void>();
+  const owner: ProjectLifecycleOwner = {
+    async acquire() {
+      return {
+        async release() {
+          ownerReleaseStarted.resolve();
+          await allowOwnerRelease.promise;
+        },
+      };
+    },
+    async run(operation) {
+      return operation();
+    },
+  };
+  const domain = createProjectExecutionDomain({ lifecycleOwner: owner });
+  const root = await domain.claimRoot({ rootId: "parent-session" });
+
+  const releasing = root.release();
+  await ownerReleaseStarted.promise;
+  const closing = domain.close().then(() => "closed" as const);
+  const firstSettlement = Promise.race([
+    closing,
+    domain
+      .claimRoot({ rootId: "parent-session" })
+      .catch((error: unknown) => ({ admissionError: error }) as const),
+  ]);
+
+  await expect(firstSettlement).resolves.toEqual({
+    admissionError: new ProjectExecutionDomainError("domain_closed"),
+  });
+  allowOwnerRelease.resolve();
+  await expect(Promise.all([releasing, closing])).resolves.toEqual([undefined, "closed"]);
+});
+
+test("ProjectExecutionDomain close reports a failed final OS release", async () => {
+  const releaseFailure = new Error("injected owner release failure");
+  const owner: ProjectLifecycleOwner = {
+    async acquire() {
+      return {
+        async release() {
+          throw releaseFailure;
+        },
+      };
+    },
+    async run(operation) {
+      return operation();
+    },
+  };
+  const domain = createProjectExecutionDomain({ lifecycleOwner: owner });
+  const root = await domain.claimRoot({ rootId: "parent-session" });
+
+  await expect(root.release()).rejects.toBe(releaseFailure);
+  await expect(domain.close()).rejects.toBe(releaseFailure);
+});
+
 test("ProjectExecutionDomain runs one operation under an exact root claim", async () => {
   let releases = 0;
   const owner: ProjectLifecycleOwner = {

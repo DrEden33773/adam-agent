@@ -54,10 +54,13 @@ export function createProjectExecutionDomain(options: {
   let activeRootId: string | undefined;
   let ownerLease: ProjectLifecycleOwnerLease | undefined;
   let acquisitionPromise: Promise<ProjectLifecycleOwnerLease> | undefined;
+  let finalReleasePromise: Promise<void> | undefined;
+  let finalReleaseFailure: { readonly error: unknown } | undefined;
   let claimCount = 0;
   let closed = false;
   let closePromise: Promise<void> | undefined;
   let resolveClose: (() => void) | undefined;
+  let rejectClose: ((error: unknown) => void) | undefined;
 
   const releaseClaim = async () => {
     claimCount -= 1;
@@ -65,10 +68,23 @@ export function createProjectExecutionDomain(options: {
       return;
     }
     const lease = ownerLease;
-    ownerLease = undefined;
-    activeRootId = undefined;
-    await lease?.release();
-    resolveClose?.();
+    const release = (async () => {
+      try {
+        await lease?.release();
+        ownerLease = undefined;
+        activeRootId = undefined;
+        resolveClose?.();
+      } catch (error) {
+        closed = true;
+        finalReleaseFailure = { error };
+        rejectClose?.(error);
+        throw error;
+      } finally {
+        finalReleasePromise = undefined;
+      }
+    })();
+    finalReleasePromise = release;
+    await release;
   };
 
   const createRelease = () => {
@@ -86,6 +102,9 @@ export function createProjectExecutionDomain(options: {
     async claimRoot({ rootId }) {
       if (closed) {
         throw new ProjectExecutionDomainError("domain_closed");
+      }
+      if (finalReleasePromise !== undefined) {
+        throw new ProjectExecutionDomainError("root_conflict");
       }
       if (activeRootId !== undefined && activeRootId !== rootId) {
         throw new ProjectExecutionDomainError("root_conflict");
@@ -148,11 +167,16 @@ export function createProjectExecutionDomain(options: {
     close() {
       closed = true;
       closePromise ??=
-        claimCount === 0
-          ? Promise.resolve()
-          : new Promise<void>((resolve) => {
-              resolveClose = resolve;
-            });
+        finalReleasePromise !== undefined
+          ? finalReleasePromise
+          : finalReleaseFailure !== undefined
+            ? Promise.reject(finalReleaseFailure.error)
+            : claimCount === 0
+              ? Promise.resolve()
+              : new Promise<void>((resolve, reject) => {
+                  resolveClose = resolve;
+                  rejectClose = reject;
+                });
       return closePromise;
     },
   };
