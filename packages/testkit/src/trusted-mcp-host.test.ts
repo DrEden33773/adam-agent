@@ -1775,9 +1775,7 @@ test("SessionLifecycle retains its MCP lease while an activation claim precedes 
   };
   const secondActivationLeaseReady = Promise.withResolvers<void>();
   const allowSecondActivation = Promise.withResolvers<void>();
-  const cancellationReachedOwner = Promise.withResolvers<void>();
   let holdNextActivation = false;
-  let observeNextOwnerAcquire = false;
   let leaseAcquisitionCount = 0;
   let leaseReleaseCount = 0;
   const workspaceTrust: WorkspaceTrustController = {
@@ -1802,12 +1800,7 @@ test("SessionLifecycle retains its MCP lease while an activation claim precedes 
     workspaceRoot,
     workspaceTrust,
     [mcpTransportFactory]: peer,
-    [sessionProjectLifecycleOwner]: createQueuedProjectLifecycleOwner(() => {
-      if (observeNextOwnerAcquire) {
-        observeNextOwnerAcquire = false;
-        cancellationReachedOwner.resolve();
-      }
-    }),
+    [sessionProjectLifecycleOwner]: createQueuedProjectLifecycleOwner(),
     [workspaceMcpLeaseTransitionBarrier]: {
       async activationLeaseReady() {
         if (holdNextActivation) {
@@ -1852,7 +1845,6 @@ test("SessionLifecycle retains its MCP lease while an activation claim precedes 
       "The second MCP activation did not acquire its pre-generation lease claim.",
     );
     const firstTransportClosed = peer.nextClose("fixture");
-    observeNextOwnerAcquire = true;
     cancellingFirst = lifecycle.configureMcp({
       type: "cancel_configuration",
       sessionId: first.sessionId,
@@ -1864,9 +1856,9 @@ test("SessionLifecycle retains its MCP lease while an activation claim precedes 
       "The first MCP generation did not close while the second activation held its claim.",
     );
     await withFailureGuard(
-      cancellationReachedOwner.promise,
+      cancellingFirst,
       5_000,
-      "MCP cancellation did not finish its lease-release decision.",
+      "MCP cancellation did not finish under the re-entered project root.",
     );
     expect(leaseAcquisitionCount).toBe(1);
     expect(leaseReleaseCount).toBe(0);

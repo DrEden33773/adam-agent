@@ -61,9 +61,10 @@ import {
   OperationStoreError,
 } from "./operation-store.js";
 import {
-  type ProjectLifecycleOwner,
-  ProjectLifecycleOwnerError,
-} from "./project-lifecycle-owner.js";
+  type ProjectExecutionDomain,
+  ProjectExecutionDomainError,
+  projectRuntimeRootId,
+} from "./project-execution-domain.js";
 import type { PermissionPolicy } from "./tool-runtime.js";
 
 export type RegisteredOperation = {
@@ -263,7 +264,7 @@ export function createOperationHost(options: {
   readonly artifactStore?: ArtifactStore;
   readonly biomeExecution?: BiomeExecutionAdapter;
   readonly defaultDeadlineMs?: number;
-  readonly lifecycleOwner: ProjectLifecycleOwner;
+  readonly executionDomain: ProjectExecutionDomain;
   readonly originAuthority?: OperationOriginAuthority;
   readonly projectRoot: string;
   readonly permissions?: PermissionPolicy;
@@ -373,13 +374,16 @@ export function createOperationHost(options: {
         decodedInput = decodeInput(registered.registration, normalizedInput.value);
         inputDecoded = true;
       }
-      const lifecycleLease = await options.lifecycleOwner.acquire().catch((error: unknown) => {
-        if (error instanceof ProjectLifecycleOwnerError) {
-          throw new OperationHostError(error.code, { cause: error });
-        }
-        throw error;
-      });
-      let lifecycleLeaseTransferred = false;
+      const operationId = randomUUID();
+      const executionClaim = await options.executionDomain
+        .claimRoot({ rootId: projectRuntimeRootId })
+        .catch((error: unknown) => {
+          if (error instanceof ProjectExecutionDomainError) {
+            throw new OperationHostError(operationOwnerErrorCode(error), { cause: error });
+          }
+          throw error;
+        });
+      let executionClaimTransferred = false;
       try {
         const raced = await store.findByIdempotency(scope);
         const racedReference =
@@ -404,7 +408,6 @@ export function createOperationHost(options: {
         if (normalizedInput === undefined || !inputDecoded) {
           throw new OperationHostError("operation_input_invalid");
         }
-        const operationId = randomUUID();
         const now = Date.now();
         const recordedAt = new Date(now).toISOString();
         const deadlineAt = new Date(now + deadlineMs).toISOString();
@@ -498,7 +501,7 @@ export function createOperationHost(options: {
           terminalPersistenceFailed: false,
         };
         activeOperations.set(operationId, active);
-        lifecycleLeaseTransferred = true;
+        executionClaimTransferred = true;
         queueMicrotask(() => {
           void executeOperation(
             active,
@@ -512,7 +515,7 @@ export function createOperationHost(options: {
           )
             .catch(() => undefined)
             .finally(async () => {
-              await lifecycleLease.release();
+              await executionClaim.release();
               active.ownerDidSettle = true;
               active.signalOwnerSettled();
               releaseActiveOperation(active, activeOperations);
@@ -520,8 +523,8 @@ export function createOperationHost(options: {
         });
         return { operationId };
       } finally {
-        if (!lifecycleLeaseTransferred) {
-          await lifecycleLease.release();
+        if (!executionClaimTransferred) {
+          await executionClaim.release();
         }
       }
     });
@@ -587,8 +590,8 @@ export function createOperationHost(options: {
       if (currentRecovery !== undefined) {
         return currentRecovery;
       }
-      const recovery = options.lifecycleOwner
-        .run(async () => {
+      const recovery = options.executionDomain
+        .runRoot({ rootId: projectRuntimeRootId }, async () => {
           const records = await store.read(operationId);
           if (records.length === 0) {
             throw new OperationHostError("operation_not_found");
@@ -694,8 +697,8 @@ export function createOperationHost(options: {
           return host.query(operationId);
         })
         .catch((error: unknown) => {
-          if (error instanceof ProjectLifecycleOwnerError) {
-            throw new OperationHostError(error.code, { cause: error });
+          if (error instanceof ProjectExecutionDomainError) {
+            throw new OperationHostError(operationOwnerErrorCode(error), { cause: error });
           }
           throw error;
         });
@@ -726,8 +729,8 @@ export function createOperationHost(options: {
       }
       const active = activeOperations.get(operationId);
       if (active === undefined) {
-        return options.lifecycleOwner
-          .run(async () => {
+        return options.executionDomain
+          .runRoot({ rootId: projectRuntimeRootId }, async () => {
             const records = await store.read(operationId);
             const current = createSnapshot(records, false, options.resolveOperation);
             if (
@@ -750,8 +753,8 @@ export function createOperationHost(options: {
             return host.query(operationId);
           })
           .catch((error: unknown) => {
-            if (error instanceof ProjectLifecycleOwnerError) {
-              throw new OperationHostError(error.code, { cause: error });
+            if (error instanceof ProjectExecutionDomainError) {
+              throw new OperationHostError(operationOwnerErrorCode(error), { cause: error });
             }
             throw error;
           });
@@ -2556,6 +2559,14 @@ function isTerminal(event: OperationEventRecord["event"]): event is DurableOpera
     event.type === "operation_failed" ||
     event.type === "operation_inspection_required"
   );
+}
+
+function operationOwnerErrorCode(
+  error: ProjectExecutionDomainError,
+): "project_in_use" | "project_owner_unavailable" {
+  return error.code === "root_conflict" || error.code === "project_in_use"
+    ? "project_in_use"
+    : "project_owner_unavailable";
 }
 
 function operationHostErrorMessage(code: OperationHostError["code"]): string {

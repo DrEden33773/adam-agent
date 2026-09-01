@@ -62,6 +62,10 @@ export {
   presentationSessionRecordReader,
   resolvePresentationTerminalContext,
 } from "./presentation-session.js";
+export {
+  createProjectExecutionDomain,
+  ProjectExecutionDomainError,
+} from "./project-execution-domain.js";
 export type {
   ProjectLifecycleOwner,
   ProjectLifecycleOwnerLease,

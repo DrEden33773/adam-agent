@@ -27,6 +27,7 @@ import {
 } from "./durable-model-response-policy.js";
 import {
   type ExtensionHost,
+  extensionProjectExecutionDomain,
   loadInternalExtensionSkillSources,
   withInternalExtensionSkillSourcesCurrent,
 } from "./extension-host.js";
@@ -91,9 +92,13 @@ import {
   type PlanShellEnvironmentV1,
 } from "./plan-shell-environment.js";
 import {
+  createProjectExecutionDomain,
+  ProjectExecutionDomainError,
+  projectRuntimeRootId,
+} from "./project-execution-domain.js";
+import {
   createProjectLifecycleOwner,
   type ProjectLifecycleOwner,
-  ProjectLifecycleOwnerError,
 } from "./project-lifecycle-owner.js";
 import {
   assemblePromptMessagesV1,
@@ -910,7 +915,13 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         .catch(() => undefined);
     }
   };
-  const owner = options[sessionProjectLifecycleOwner] ?? createProjectLifecycleOwner(options);
+  const executionDomain =
+    options[sessionProjectLifecycleOwner] === undefined && options.extensionHost !== undefined
+      ? options.extensionHost[extensionProjectExecutionDomain]
+      : createProjectExecutionDomain({
+          lifecycleOwner:
+            options[sessionProjectLifecycleOwner] ?? createProjectLifecycleOwner(options),
+        });
   const pendingMcpCatalogChanges = new Map<
     string,
     {
@@ -1025,7 +1036,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     if (active !== undefined && (kind === "title" || active.kind === "title")) {
       await active.settlement;
     }
-    const operationPromise = owner.run(operation);
+    const operationPromise = executionDomain.runRoot({ rootId: projectRuntimeRootId }, operation);
     const tracked = {
       kind,
       settlement: operationPromise.then(
@@ -1038,8 +1049,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     try {
       return await operationPromise;
     } catch (error) {
-      if (error instanceof ProjectLifecycleOwnerError) {
-        throw new SessionLifecycleError(error.code);
+      if (error instanceof ProjectExecutionDomainError) {
+        throw new SessionLifecycleError(
+          error.code === "root_conflict" || error.code === "project_in_use"
+            ? "project_in_use"
+            : "project_owner_unavailable",
+        );
       }
       throw error;
     } finally {
@@ -2546,6 +2561,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         } catch {
           durable = false;
         }
+        await executionDomain.close();
         return {
           status:
             hostResult.status === "closed" && durable

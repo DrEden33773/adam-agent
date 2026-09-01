@@ -38,7 +38,6 @@ import {
   inputResourceIngestBarrier,
   openJsonlSessionStore,
   type ProjectLifecycleOwner,
-  ProjectLifecycleOwnerError,
   planApprovalIntentBarrier,
   preparedDirectDeepSeekV2ContextProfile,
   type SessionRecord,
@@ -2880,47 +2879,23 @@ test("SessionLifecycle close causally joins an admitted naming mutation", async 
   }
 });
 
-test("SessionLifecycle close drains every admitted owner operation after acquisition reorder", async () => {
+test("SessionLifecycle close drains an admitted ProjectExecutionDomain acquisition", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-owner-drain-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
   await mkdir(workspaceRoot);
-  const firstAcquisitionStarted = Promise.withResolvers<void>();
-  const releaseFirstAcquisition = Promise.withResolvers<void>();
-  const secondAcquisitionStarted = Promise.withResolvers<void>();
-  const releaseSecondAcquisition = Promise.withResolvers<void>();
-  let reorderAcquisitions = false;
-  let reorderedRun = 0;
-  let secondAcquisitionHeld = false;
+  const acquisitionStarted = Promise.withResolvers<void>();
+  const releaseAcquisition = Promise.withResolvers<void>();
+  let holdAcquisition = false;
   const owner: ProjectLifecycleOwner = {
     async acquire() {
+      if (holdAcquisition) {
+        acquisitionStarted.resolve();
+        await releaseAcquisition.promise;
+      }
       return { async release() {} };
     },
     async run(operation) {
-      if (!reorderAcquisitions) {
-        return operation();
-      }
-      reorderedRun += 1;
-      if (reorderedRun === 1) {
-        firstAcquisitionStarted.resolve();
-        await releaseFirstAcquisition.promise;
-        throw new ProjectLifecycleOwnerError("project_in_use");
-      }
-      if (reorderedRun === 2) {
-        secondAcquisitionHeld = true;
-        secondAcquisitionStarted.resolve();
-        try {
-          const result = await operation();
-          await releaseSecondAcquisition.promise;
-          return result;
-        } finally {
-          secondAcquisitionHeld = false;
-        }
-      }
-      if (secondAcquisitionHeld) {
-        releaseSecondAcquisition.resolve();
-        throw new ProjectLifecycleOwnerError("project_in_use");
-      }
       return operation();
     },
   };
@@ -2931,7 +2906,7 @@ test("SessionLifecycle close drains every admitted owner operation after acquisi
     [sessionCloseDrainBarrier]: {
       beforeWait({ activeCount }) {
         drainedCounts.push(activeCount);
-        releaseSecondAcquisition.resolve();
+        releaseAcquisition.resolve();
       },
     },
     [sessionProjectLifecycleOwner]: owner,
@@ -2939,27 +2914,19 @@ test("SessionLifecycle close drains every admitted owner operation after acquisi
 
   try {
     const created = await lifecycle.create({ targetIdentity });
-    reorderAcquisitions = true;
-    const firstNaming = lifecycle.setSessionManualName({
+    holdAcquisition = true;
+    const naming = lifecycle.setSessionManualName({
       sessionId: created.sessionId,
-      name: "Rejected first acquisition",
+      name: "Durable domain acquisition",
     });
-    await firstAcquisitionStarted.promise;
-    const secondNaming = lifecycle.setSessionManualName({
-      sessionId: created.sessionId,
-      name: "Durable reordered acquisition",
-    });
-    await secondAcquisitionStarted.promise;
-    releaseFirstAcquisition.resolve();
-    await expect(firstNaming).rejects.toMatchObject({ code: "project_in_use" });
+    await acquisitionStarted.promise;
     const closing = lifecycle.close();
 
-    await expect(secondNaming).resolves.toMatchObject({ status: "updated" });
+    await expect(naming).resolves.toMatchObject({ status: "updated" });
     await expect(closing).resolves.toEqual({ status: "closed" });
     expect(drainedCounts).toEqual([1]);
   } finally {
-    releaseFirstAcquisition.resolve();
-    releaseSecondAcquisition.resolve();
+    releaseAcquisition.resolve();
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -2980,20 +2947,19 @@ test("SessionLifecycle close joins title admission before returning", async () =
   let observeCloseDurability = false;
   const owner: ProjectLifecycleOwner = {
     async acquire() {
-      return { async release() {} };
-    },
-    async run(operation) {
       const hold = holdNextOwnerOperation;
       holdNextOwnerOperation = false;
       if (observeCloseDurability && !hold) {
         closeDurabilityStarted.resolve();
       }
-      const result = await operation();
       if (hold) {
         heldOwnerOperation.resolve();
         await releaseOwnerOperation.promise;
       }
-      return result;
+      return { async release() {} };
+    },
+    async run(operation) {
+      return operation();
     },
   };
   const closeOrder: string[] = [];
