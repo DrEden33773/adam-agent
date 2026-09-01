@@ -7,6 +7,7 @@ import {
   createJsonlOperationStore,
   createPresentationSession,
   createSessionLifecycle,
+  createWebSearchConfiguration,
   ExtensionConfigurationError,
   type ExtensionContributionSummary,
   loadExtensionConfiguration,
@@ -105,6 +106,7 @@ export async function createProductionProjectRuntime(
     permissions: options.permissions,
     preferences: options.preferences,
     stateRoot: options.stateRoot,
+    webSearchConfiguration: createWebSearchConfiguration({ environment: options.environment }),
     workspaceRoot: options.workspaceRoot,
     workspaceTrust: options.workspaceTrust,
   });
@@ -140,6 +142,7 @@ export async function createProductionProjectRuntime(
         projectChanges: host,
         projectLabel: options.projectLabel,
         stateRoot: options.stateRoot,
+        webSearchEnvironment: options.environment,
         workspaceRoot: options.workspaceRoot,
         ...input,
       });

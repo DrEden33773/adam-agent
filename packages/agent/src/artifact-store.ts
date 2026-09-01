@@ -97,6 +97,16 @@ export type PastedTextArtifactSourceV1 = {
   readonly provenance: "user_paste";
 };
 
+export type WebEvidenceArtifactSourceV1 = {
+  readonly type: "web_evidence";
+  readonly schemaVersion: 1;
+  readonly fetchId: `sha256:${string}`;
+  readonly sourceId: `sha256:${string}`;
+  readonly url: string;
+  readonly finalUrl?: string;
+  readonly provenance: "web_fetch" | "web_search_result";
+};
+
 export type PlanArtifactSourceV1 = {
   readonly type: "plan";
   readonly schemaVersion: 1;
@@ -118,7 +128,8 @@ export type ArtifactSource =
   | PastedTextArtifactSourceV1
   | PlanArtifactSourceV1
   | SkillArtifactSource
-  | ToolArtifactSource;
+  | ToolArtifactSource
+  | WebEvidenceArtifactSourceV1;
 
 export type ArtifactReference<TSource extends ArtifactSource = ArtifactSource> = {
   readonly id: string;

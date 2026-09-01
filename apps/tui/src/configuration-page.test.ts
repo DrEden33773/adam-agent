@@ -59,17 +59,38 @@ test("Enter resets exactly the focused owner-local policy field", () => {
   expect(onClose).not.toHaveBeenCalled();
 });
 
+test("Web Search is one configuration row whose editor keeps endpoint activation explicit", () => {
+  const onClose = vi.fn();
+  const onReset = vi.fn();
+  const onEditWebSearch = vi.fn();
+  const page = createPage(onClose, onReset, onEditWebSearch);
+
+  const rendered = page.render(100).join("\n");
+  expect(rendered).toContain("Web Search");
+  expect(rendered).toContain("Unconfigured · Fetch, open, and find remain available");
+  page.handleInput("\u001b[B");
+  page.handleInput("\u001b[B");
+  page.handleInput("\u001b[B");
+  page.handleInput("\r");
+
+  expect(onEditWebSearch).toHaveBeenCalledOnce();
+  expect(onReset).not.toHaveBeenCalled();
+});
+
 function createPage(
   onClose: () => void,
   onReset: (field: ConfigurationField) => void,
+  onEditWebSearch = vi.fn(),
 ): ConfigurationPage {
   return new ConfigurationPage({
     diagnostic: null,
     modelPolicy,
     onClose,
+    onEditWebSearch,
     onReset,
     target,
     theme: createAdamTuiTheme(true),
+    webSearch: { status: "Unconfigured", endpoint: null, diagnostic: null },
   });
 }
 

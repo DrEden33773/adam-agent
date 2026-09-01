@@ -101,6 +101,7 @@ export {
   type RepositorySearchProcessObserver,
   repositorySearchBackendForTesting,
 } from "./repository-search.js";
+export { createSearxngAdapterForTesting } from "./searxng-search-provider.js";
 export {
   createPresentationPreferencesWithStorageForTesting,
   createTrustedWorkspaceTrustForTesting,
@@ -163,3 +164,21 @@ export {
   type TurnComposerStageBarrier,
   turnComposerStageBarrier,
 } from "./turn-composer.js";
+export { extractWebText as extractWebTextForTesting } from "./web-content-extraction.js";
+export {
+  createInMemoryWebEvidenceStore,
+  createJsonlWebEvidenceStore,
+  createWebEvidenceToolRegistry,
+  type WebHttpAdapter,
+} from "./web-evidence.js";
+export { createWebEvidenceProduction } from "./web-evidence-production.js";
+export {
+  createSafeWebHttpAdapter,
+  resolveWebTarget as resolveWebTargetForTesting,
+  SafeWebHttpError,
+  type WebDnsResolver,
+} from "./web-safe-http.js";
+export {
+  createWebSearchConfigurationController,
+  createWebSearchConfigurationWithStorageForTesting,
+} from "./web-search-configuration.js";

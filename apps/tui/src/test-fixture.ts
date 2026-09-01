@@ -13,6 +13,7 @@ import {
   createPresentationPreferences,
   createPresentationSession,
   createSessionLifecycle,
+  createWebSearchConfiguration,
   createWorkspaceTrust,
   type ModelDriver,
   ModelDriverError,
@@ -163,6 +164,7 @@ export type TuiFixtureOptions = {
     readonly configRoot?: string;
     readonly seedTargetIds?: readonly string[];
     readonly startupTargetId?: string;
+    readonly webSearchResultUrl?: string;
     readonly workspaceTrust?: "owner-local" | "unavailable";
     readonly workspaceTrustMutation?: "reject";
   };
@@ -208,6 +210,66 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
               : { XDG_CONFIG_HOME: options.launch.configRoot }),
           },
         });
+  const webSearchEnvironment =
+    options.launch === undefined
+      ? undefined
+      : {
+          ...process.env,
+          ...(options.launch.configRoot === undefined
+            ? {}
+            : { XDG_CONFIG_HOME: options.launch.configRoot }),
+        };
+  const webHttp =
+    webSearchEnvironment === undefined
+      ? undefined
+      : {
+          async fetch(input: { readonly url: string }) {
+            if (
+              options.scenario === "web-search-configuration-pending" &&
+              options.controlRoot !== undefined
+            ) {
+              await writeFile(
+                join(options.controlRoot, "web-search-http-requested"),
+                "requested\n",
+                "utf8",
+              );
+              await new Promise<void>((resolve) => {
+                if ((input as { readonly signal?: AbortSignal }).signal?.aborted === true) {
+                  resolve();
+                  return;
+                }
+                (input as { readonly signal?: AbortSignal }).signal?.addEventListener(
+                  "abort",
+                  () => resolve(),
+                  { once: true },
+                );
+              });
+              throw (input as { readonly signal?: AbortSignal }).signal?.reason;
+            }
+            return {
+              status: 200,
+              url: input.url,
+              mediaType: "application/json",
+              body: Buffer.from(
+                options.scenario === "web-search"
+                  ? JSON.stringify({
+                      results: [
+                        {
+                          url: options.launch?.webSearchResultUrl as string,
+                          title: "TUI Web evidence",
+                          content: "Untrusted TUI Web snippet",
+                          publishedDate: null,
+                          engines: ["fixture"],
+                          score: 1,
+                        },
+                      ],
+                    })
+                  : '{"results":[]}',
+                "utf8",
+              ),
+            };
+          },
+        };
   const lifecycle = createSessionLifecycle({
     ...(options.scenario === "plan-review-recovery"
       ? {
@@ -236,7 +298,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
           : options.scenario === "tool-artifact" || options.scenario === "shell"
             ? ["read", "execute"]
             : ["read"],
-      askedEffects: ["write"],
+      askedEffects: options.scenario === "web-search" ? ["write", "network"] : ["write"],
     }),
     workspaceTrust:
       options.launch?.workspaceTrust === "owner-local"
@@ -253,6 +315,14 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
           ? unavailableWorkspaceTrust()
           : createTrustedWorkspaceTrustForTesting(options.workspaceRoot),
     stateRoot: options.stateRoot,
+    ...(webSearchEnvironment === undefined
+      ? {}
+      : {
+          ...(webHttp === undefined ? {} : { webHttp }),
+          webSearchConfiguration: createWebSearchConfiguration({
+            environment: webSearchEnvironment,
+          }),
+        }),
     workspaceRoot: options.workspaceRoot,
   });
   const reviewFixture =
@@ -429,6 +499,12 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
             ...(preferences === undefined ? {} : { preferences }),
             projectLabel: "workspace",
             stateRoot: options.stateRoot,
+            ...(webSearchEnvironment === undefined
+              ? {}
+              : {
+                  ...(webHttp === undefined ? {} : { webHttp }),
+                  webSearchEnvironment,
+                }),
             workspaceRoot: options.workspaceRoot,
             ...(composerBarrier === undefined
               ? {}
@@ -900,6 +976,27 @@ function observeTuiDispatch(
         );
         return settled;
       }
+      if (
+        (command.type === "test_and_set_web_search" ||
+          command.type === "cancel_web_search_test" ||
+          command.type === "clear_web_search") &&
+        controlRoot !== undefined
+      ) {
+        await Promise.all([
+          writeFile(join(controlRoot, "web-search-dispatch-started"), `${command.type}\n`, "utf8"),
+          writeFile(join(controlRoot, `${command.type}-started`), "started\n", "utf8"),
+        ]);
+        const settled = await receipt;
+        await Promise.all([
+          writeFile(
+            join(controlRoot, "web-search-dispatch-settled"),
+            `${settled.status}\n`,
+            "utf8",
+          ),
+          writeFile(join(controlRoot, `${command.type}-settled`), `${settled.status}\n`, "utf8"),
+        ]);
+        return settled;
+      }
       if (!observeDispatch) {
         return receipt;
       }
@@ -1146,6 +1243,20 @@ function createFixtureModelTargets(options: {
           return;
         }
         yield { type: "text_delta", text: "Search complete." };
+      } else if (options.scenario === "web-search") {
+        const latest = request.messages.at(-1);
+        if (latest?.role === "user") {
+          yield { type: "tool_call_start", id: "search-web", name: "web_search" };
+          yield {
+            type: "tool_call_delta",
+            id: "search-web",
+            json: '{"query":"tui web evidence","limit":1}',
+          };
+          yield { type: "tool_call_end", id: "search-web" };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: "Web search card complete." };
       } else if (options.scenario === "todo") {
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {

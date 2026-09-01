@@ -71,7 +71,9 @@ type V1PermissionSubject = Exclude<
       | "mcp_tool"
       | "patch"
       | "plan_command"
-      | "skill";
+      | "skill"
+      | "web_artifact"
+      | "web_request";
   }
 >;
 type V1ToolError = {
@@ -137,6 +139,17 @@ export type SessionGenesisRecord = {
     readonly managedAgentTools?:
       | "managed-agent-tools.a1.v1"
       | "managed-agent-tools.a2-long-lived.v1";
+    readonly webEvidence?: {
+      readonly version: 1;
+      readonly searchProvider: null | {
+        readonly kind: "searxng";
+        readonly endpoint: string;
+        readonly activation: {
+          readonly protocol: "searxng-json.v1";
+          readonly endpointDigest: `sha256:${string}`;
+        };
+      };
+    };
     readonly naming?: {
       readonly profileVersion: 1;
       readonly fallbackTitle: string;
@@ -1301,6 +1314,13 @@ const currentToolErrorSchema = z.union([
       "managed_agent_failed",
       "managed_agent_result_too_large",
       "managed_agent_unavailable",
+      "web_cancelled",
+      "web_deadline_exceeded",
+      "web_provider_invalid",
+      "web_provider_unavailable",
+      "web_response_invalid",
+      "web_response_too_large",
+      "web_source_unavailable",
     ]),
     message: z.string(),
   }),
@@ -1480,6 +1500,39 @@ const managedAgentControlPermissionSubjectSchema = z
       context.addIssue({ code: "custom", message: "Invalid managed-agent control authority." });
     }
   });
+const webPermissionUrlSchema = z
+  .url()
+  .refine((value) => Buffer.byteLength(value, "utf8") <= 4 * 1024);
+const webProviderOriginSchema = webPermissionUrlSchema.refine(
+  (value) => new URL(value).origin === value,
+);
+const webRequestPermissionSubjectSchema = z.discriminatedUnion("operation", [
+  z
+    .strictObject({
+      type: z.literal("web_request"),
+      operation: z.literal("fetch"),
+      providerOrigin: webProviderOriginSchema,
+      url: webPermissionUrlSchema,
+    })
+    .refine((subject) => new URL(subject.url).origin === subject.providerOrigin),
+  z.strictObject({
+    type: z.literal("web_request"),
+    operation: z.literal("search"),
+    providerOrigin: webProviderOriginSchema,
+    query: z
+      .string()
+      .min(1)
+      .refine((value) => Buffer.byteLength(value, "utf8") <= 4 * 1024),
+    limit: z.number().int().min(1).max(10),
+    language: z.string().min(1).max(32).optional(),
+    timeRange: z.enum(["day", "week", "month", "year"]).optional(),
+  }),
+]);
+const webArtifactPermissionSubjectSchema = z.strictObject({
+  type: z.literal("web_artifact"),
+  operation: z.enum(["open", "find"]),
+  artifactId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+});
 const v2PermissionSubjectSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("file"), path: z.string() }),
   z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
@@ -1488,6 +1541,8 @@ const v2PermissionSubjectSchema = z.discriminatedUnion("type", [
   skillPermissionSubjectSchema,
   managedAgentControlPermissionSubjectSchema,
   managedAgentSpawnPermissionSubjectSchema,
+  webArtifactPermissionSubjectSchema,
+  webRequestPermissionSubjectSchema,
   z.strictObject({
     type: z.literal("command"),
     command: z.string(),
@@ -1568,6 +1623,8 @@ const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
   managedAgentControlPermissionSubjectSchema,
   managedAgentSpawnPermissionSubjectSchema,
   planCommandPermissionSubjectSchema,
+  webArtifactPermissionSubjectSchema,
+  webRequestPermissionSubjectSchema,
   z.strictObject({
     type: z.literal("command"),
     command: z.string(),
@@ -1951,6 +2008,21 @@ const sessionGenesisV1RecordSchema = z.strictObject({
   targetIdentity: modelTargetIdentitySchema,
   managedAgentTools: z
     .enum(["managed-agent-tools.a1.v1", "managed-agent-tools.a2-long-lived.v1"])
+    .optional(),
+  webEvidence: z
+    .strictObject({
+      version: z.literal(1),
+      searchProvider: z
+        .strictObject({
+          kind: z.literal("searxng"),
+          endpoint: z.url().max(4_096),
+          activation: z.strictObject({
+            protocol: z.literal("searxng-json.v1"),
+            endpointDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+          }),
+        })
+        .nullable(),
+    })
     .optional(),
   naming: z
     .strictObject({

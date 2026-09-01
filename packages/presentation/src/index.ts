@@ -147,7 +147,14 @@ export type TargetCatalogDisplay = {
   readonly items: readonly TargetDisplay[];
   readonly defaultTargetId: string | null;
   readonly diagnostic: { readonly code: string; readonly message: string } | null;
-  readonly configuration?: { readonly modelPolicy: UserModelPolicyDisplay };
+  readonly configuration?: {
+    readonly modelPolicy: UserModelPolicyDisplay;
+    readonly webSearch?: {
+      readonly status: "Configured" | "Invalid" | "Unconfigured" | "Unsafe";
+      readonly endpoint: string | null;
+      readonly diagnostic: { readonly code: string; readonly message: string } | null;
+    };
+  };
 };
 
 export type SessionSummary = {
@@ -329,7 +336,7 @@ export type ToolCallDisplay = {
   readonly branchBoundary: null;
   readonly callId: string;
   readonly qualifiedName: string;
-  readonly kind: "read" | "shell" | "mutation" | "mcp" | "unknown";
+  readonly kind: "read" | "shell" | "mutation" | "mcp" | "web" | "unknown";
   readonly effect: "read" | "write" | "execute" | "network" | "delegate" | "administrative" | null;
   readonly label: string;
   readonly subject: {
@@ -1123,6 +1130,9 @@ export type PresentationCommand =
         | "automaticCompactionWindowTokens";
       readonly value: number | null;
     }
+  | { readonly type: "test_and_set_web_search"; readonly endpoint: string }
+  | { readonly type: "cancel_web_search_test" }
+  | { readonly type: "clear_web_search" }
   | {
       readonly type: "test_target_connection" | "cancel_target_connection_test";
       readonly targetId: string;

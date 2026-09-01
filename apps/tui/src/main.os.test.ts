@@ -428,6 +428,11 @@ test("the production PTY persists owner-only config and trust, completes a finit
     expect(configurationFrame).toContain("> Context window");
     expect(configurationFrame).toContain("Output limit");
     expect(configurationFrame).toContain("saved 1234 tokens");
+    expect(configurationFrame).toContain("Web Search");
+    expect(configurationFrame).toContain(
+      "Web Search is not configured. Fetch, open, and find remain",
+    );
+    expect(configurationFrame).toContain("available; configure an Owner-selected SearXNG endpoint");
     beforeAction = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
     fixture.write("configuration focus restored");
