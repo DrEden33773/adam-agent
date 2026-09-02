@@ -2125,15 +2125,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         selectedSkills.size === 0
           ? ""
           : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`;
+      const planSummary = draft.mode === "plan" ? " · Plan exploring · read-only" : "";
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
+          `${safeTerminalText(state.authoritative.project.label)} · New session draft${planSummary} · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
         ),
         standard: theme.muted(
-          `New session draft · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
+          `New session draft${planSummary} · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
         ),
         narrow: theme.muted(
-          `draft · idle\n${safeTerminalText(draft.targetId)}\n/help · Tab complete`,
+          `draft${draft.mode === "plan" ? " · plan" : ""} · idle\n${safeTerminalText(draft.targetId)}\n/help · Tab complete`,
         ),
       });
     } else if (active !== null) {
@@ -3797,6 +3798,46 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       if (parsedDraft.kind === "known" && parsedDraft.command.id === "thinking") {
         handleThinkingCommand(parsedDraft.argumentsText);
+        return;
+      }
+      if (parsedDraft.kind === "known" && parsedDraft.command.id === "plan") {
+        if (parsedDraft.argumentsText.length > 0) {
+          showNotice("warning", "Usage: /plan", "until_edit");
+          editor.disableSubmit = false;
+          renderState();
+          return;
+        }
+        const entering = state.draft.mode === "default";
+        editor.setText("");
+        const planActionId = showNotice(
+          "progress",
+          entering ? "Entering read-only Plan…" : "Exiting read-only Plan…",
+          "until_replaced",
+        );
+        void options.presentation
+          .dispatch({ type: "set_draft_mode", mode: entering ? "plan" : "default" })
+          .then((receipt) => {
+            if (receipt.status === "admitted") {
+              settleNotice(
+                planActionId,
+                "success",
+                entering ? "Entered read-only Plan." : "Exited read-only Plan.",
+                "until_next_action",
+              );
+            } else {
+              settleNotice(planActionId, "error", receipt.message, "until_edit");
+            }
+            renderState();
+          })
+          .catch(() => {
+            settleNotice(
+              planActionId,
+              "error",
+              "The new-session Plan mode could not be changed safely.",
+              "until_edit",
+            );
+            renderState();
+          });
         return;
       }
       if (parsedDraft.kind === "known" && parsedDraft.command.id === "config") {

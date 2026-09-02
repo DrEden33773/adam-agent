@@ -188,6 +188,7 @@ import {
   type SessionGenesisRecord,
   type SessionMcpWorkspaceConfirmedRecord,
   type SessionModelResponseField,
+  type SessionPlanCycleEnteredRecord,
   type SessionRecord,
   type SessionStore,
   type SessionStoreDirectory,
@@ -614,6 +615,7 @@ export interface SessionLifecycle {
   admit(input: {
     readonly targetIdentity: ModelTargetIdentity;
     readonly input: UserInput;
+    readonly mode?: "plan";
     readonly limits?: RunOptions["limits"];
     readonly runId?: string;
     readonly signal?: AbortSignal;
@@ -1196,6 +1198,28 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       baseWithWeb,
       createManagedAgentToolRegistry({ manager: managerRouter, profile: managedAgentTools }),
     );
+  };
+  const toolsForSessionAuthority = async (
+    sessionId: string,
+    genesis: SessionGenesisRecord,
+    records: readonly SessionRecord[],
+  ): Promise<ToolRegistry> => {
+    let tools = await toolsForSession(
+      sessionId,
+      genesis.record.targetIdentity,
+      undefined,
+      genesis.record.managedAgentTools,
+      genesis.record.webEvidence,
+    );
+    const promptContext = promptContextRecordFromRecords(genesis, records);
+    if (promptContext?.recordVersion === 3 && promptContext.mcp !== undefined) {
+      const profile = await mcpCommittedProfileFromLineage(lineage, genesis, records);
+      if (profile === undefined || profile.digest !== promptContext.mcp.profileDigest) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      tools = combineToolRegistries(tools, mcpProfileDefinitionRegistry(profile));
+    }
+    return tools;
   };
   const pendingMcpCatalogChanges = new Map<
     string,
@@ -1865,7 +1889,21 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     validateCurrentSessionHistory(first, records, options.workspaceRoot);
     await lineage.validateSessionLineage(first, records);
     await validateMcpAuthorityFromLineage(lineage, first, records);
-    await validatePlanToolProfilesFromLineage(options, lineage, first, records);
+    const planTools = records.some(
+      (entry) =>
+        entry.schemaVersion === 3 &&
+        (entry.record.type === "plan_cycle_entered" ||
+          entry.record.type === "plan_cycle_inherited"),
+    )
+      ? await toolsForSession(
+          input.sessionId,
+          first.record.targetIdentity,
+          undefined,
+          first.record.managedAgentTools,
+          first.record.webEvidence,
+        )
+      : options.tools;
+    await validatePlanToolProfilesFromLineage(lineage, first, records, planTools);
     await skillResourceBytesFromLineage(lineage, first, records);
     const artifactInspection = await inspectModelResponseArtifactLineage(
       options,
@@ -1971,6 +2009,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     artifactCache = createArtifactMaterializationCache(),
   ): Promise<SessionResumeResult> => {
     let snapshot = await inspectSession(input, artifactCache);
+    let sessionAuthorityTools: ToolRegistry | undefined;
+    if (snapshot.schemaVersion === 3) {
+      const authorityRecords = await readSessionRecords(options, input.sessionId);
+      const authorityGenesis = authorityRecords[0];
+      if (authorityGenesis === undefined || !isGenesisRecord(authorityGenesis)) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      sessionAuthorityTools = await toolsForSessionAuthority(
+        input.sessionId,
+        authorityGenesis,
+        authorityRecords,
+      );
+    }
     if (snapshot.schemaVersion === 3 && snapshot.degradation !== undefined) {
       return {
         status: "rejected",
@@ -1982,6 +2033,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       };
     }
     if (snapshot.schemaVersion === 3 && snapshot.status === "interrupted") {
+      const recoveryTools = sessionAuthorityTools;
+      if (recoveryTools === undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
       const restoredUserMessage = await appendMissingUserMessage(options, snapshot);
       if (restoredUserMessage) {
         snapshot = await inspectSession(input, artifactCache);
@@ -2020,14 +2075,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       if (
         snapshot.schemaVersion === 3 &&
         snapshot.status === "interrupted" &&
-        (await settleCompletedResponseTerminal(options, snapshot, artifactCache))
+        (await settleCompletedResponseTerminal(options, snapshot, artifactCache, recoveryTools))
       ) {
         snapshot = await inspectSession(input, artifactCache);
       }
       if (
         snapshot.schemaVersion === 3 &&
         snapshot.status === "interrupted" &&
-        (await settleIndeterminateToolEffects(options, snapshot))
+        (await settleIndeterminateToolEffects(options, snapshot, recoveryTools))
       ) {
         snapshot = await inspectSession(input, artifactCache);
       }
@@ -2039,35 +2094,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         promptGenesis !== undefined && isGenesisRecord(promptGenesis)
           ? promptContextRecordFromRecords(promptGenesis, promptRecords)
           : undefined;
-      let compatibleTools = await toolsForSession(
-        input.sessionId,
-        snapshot.targetIdentity,
-        undefined,
-        promptGenesis !== undefined && isGenesisRecord(promptGenesis)
-          ? promptGenesis.record.managedAgentTools
-          : undefined,
-        promptGenesis !== undefined && isGenesisRecord(promptGenesis)
-          ? promptGenesis.record.webEvidence
-          : undefined,
-      );
-      if (activePromptContext?.recordVersion === 3 && activePromptContext.mcp !== undefined) {
-        const profile =
-          promptGenesis === undefined || !isGenesisRecord(promptGenesis)
-            ? undefined
-            : await mcpCommittedProfileFromLineage(lineage, promptGenesis, promptRecords);
-        if (profile === undefined || profile.digest !== activePromptContext.mcp.profileDigest) {
-          throw new SessionLifecycleError("session_invalid");
-        }
-        compatibleTools = combineToolRegistries(
-          compatibleTools,
-          mcpProfileDefinitionRegistry(profile),
-        );
+      if (promptGenesis === undefined || !isGenesisRecord(promptGenesis)) {
+        throw new SessionLifecycleError("session_invalid");
       }
+      const compatibleTools =
+        sessionAuthorityTools ??
+        (await toolsForSessionAuthority(input.sessionId, promptGenesis, promptRecords));
       if (
         snapshot.promptContext !== undefined &&
-        (promptGenesis === undefined ||
-          !isGenesisRecord(promptGenesis) ||
-          activePromptContext === undefined ||
+        (activePromptContext === undefined ||
           !isPromptContextRecordCompatible(activePromptContext, compatibleTools) ||
           !isPromptContextCompatible(snapshot.promptContext, compatibleTools))
       ) {
@@ -2178,6 +2213,28 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     }
   };
 
+  const preparePlanCycleEntry = async (
+    sequence: number,
+    eligibleToolProfile: PlanEligibleToolProfileV1,
+  ): Promise<SessionPlanCycleEnteredRecord> => ({
+    schemaVersion: 3,
+    sequence,
+    record: {
+      type: "plan_cycle_entered",
+      recordVersion: 1,
+      cycleId: randomUUID(),
+      revision: 1,
+      policyVersion: "plan-policy.hybrid-v1",
+      shellPolicyVersion: "plan-shell-policy.v1",
+      shellEnvironment: await (
+        options[planShellEnvironmentFactory] ?? createPlanShellEnvironmentV1
+      )(),
+      gitPolicyVersion: planGitAutomaticPolicyV1.version,
+      gitPolicyDigest: planGitAutomaticPolicyV1.digest,
+      eligibleToolProfile,
+    },
+  });
+
   const prepareSessionCreation = async (input: {
     readonly targetIdentity: ModelTargetIdentity;
     readonly runId?: string;
@@ -2187,6 +2244,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   }): Promise<{
     readonly genesis: SessionGenesisRecord;
     readonly mcp: McpSessionSnapshot | undefined;
+    readonly tools: ToolRegistry;
     readonly skillManifests: ReadonlyMap<string, SkillResourceManifestV1>;
     readonly skillPolicies: ReadonlyMap<string, "allow">;
     readonly selectedSkills?: readonly string[];
@@ -2297,6 +2355,13 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             searchProvider:
               webConfiguration.status === "configured" ? webConfiguration.provider : null,
           };
+    const tools = await toolsForSession(
+      sessionId,
+      input.targetIdentity,
+      undefined,
+      options.managedAgentTools,
+      webEvidence,
+    );
     return {
       genesis: {
         schemaVersion: 3,
@@ -2313,21 +2378,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             ? {}
             : { managedAgentTools: options.managedAgentTools }),
           ...(webEvidence === undefined ? {} : { webEvidence }),
-          promptContext: createPromptContextV3(
-            await toolsForSession(
-              sessionId,
-              input.targetIdentity,
-              undefined,
-              options.managedAgentTools,
-              webEvidence,
-            ),
-            repository,
-            skillContext,
-          ),
+          promptContext: createPromptContextV3(tools, repository, skillContext),
           skillContext,
         },
       },
       mcp,
+      tools,
       skillManifests,
       skillPolicies,
       ...(input.skills === undefined ? {} : { selectedSkills }),
@@ -2337,11 +2393,16 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   const persistPreparedSession = async (prepared: {
     readonly genesis: SessionGenesisRecord;
     readonly mcp: McpSessionSnapshot | undefined;
+    readonly plan?: SessionPlanCycleEnteredRecord;
   }): Promise<CurrentSessionSnapshot> => {
     const store = await storeDirectory.create(prepared.genesis.record.sessionId);
-    await store.append(prepared.genesis);
-    const snapshot = snapshotFromGenesis(prepared.genesis, 1);
-    return prepared.mcp === undefined ? snapshot : { ...snapshot, mcp: prepared.mcp };
+    const records =
+      prepared.plan === undefined ? [prepared.genesis] : [prepared.genesis, prepared.plan];
+    await store.appendBatch(records);
+    const snapshot = snapshotFromGenesis(prepared.genesis, records.length);
+    const plan = planCycleSnapshotFromRecords(records);
+    const current = plan === undefined ? snapshot : { ...snapshot, plan };
+    return prepared.mcp === undefined ? current : { ...current, mcp: prepared.mcp };
   };
 
   return {
@@ -2349,6 +2410,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       const runId = input.runId ?? randomUUID();
       if (
         !z.uuid().safeParse(runId).success ||
+        (input.mode !== undefined && input.mode !== "plan") ||
         (input.input.text.trim().length === 0 &&
           (input.pastedTextSelections === undefined || input.pastedTextSelections.length === 0)) ||
         !draftRunLimitsAreValid(input.limits) ||
@@ -2393,10 +2455,30 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ...(input.input.skills === undefined ? {} : { skills: input.input.skills }),
           resolved,
         });
+        let plan: SessionPlanCycleEnteredRecord | undefined;
+        if (input.mode === "plan") {
+          const promptContext = prepared.genesis.record.promptContext;
+          if (promptContext === undefined) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          plan = await preparePlanCycleEntry(
+            2,
+            planToolProfileFromAuthority(
+              promptContext.toolProfile,
+              prepared.tools,
+              undefined,
+              "plan-policy.hybrid-v1",
+            ),
+          );
+        }
         input.signal?.throwIfAborted();
         let snapshot: CurrentSessionSnapshot;
         try {
-          snapshot = await persistPreparedSession(prepared);
+          snapshot = await persistPreparedSession({
+            genesis: prepared.genesis,
+            mcp: prepared.mcp,
+            ...(plan === undefined ? {} : { plan }),
+          });
         } catch {
           throw new SessionLifecycleError("session_persistence_failed");
         }
@@ -2460,6 +2542,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           input.sourceBoundary === undefined && input.atSequence === parentRecords.length;
         let normalizedCurrentTail = false;
         if (parent.status === "interrupted" && requestedCurrentTail) {
+          const parentGenesis = parentRecords[0];
+          if (parentGenesis === undefined || !isGenesisRecord(parentGenesis)) {
+            throw new SessionLifecycleError("session_invalid");
+          }
+          const parentTools = await toolsForSessionAuthority(
+            input.parentSessionId,
+            parentGenesis,
+            parentRecords,
+          );
           const restoredUserMessage = await appendMissingUserMessage(options, parent);
           if (restoredUserMessage) {
             parent = (await inspectSession(
@@ -2493,7 +2584,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           }
           const indeterminateEffect =
             parent.status === "interrupted" &&
-            (await settleIndeterminateToolEffects(options, parent));
+            (await settleIndeterminateToolEffects(options, parent, parentTools));
           if (indeterminateEffect) {
             parent = (await inspectSession(
               { sessionId: input.parentSessionId },
@@ -3387,9 +3478,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           createBranchMessages(options, lineage, records, artifactCache),
           lineage.createInheritedContextEvidence(records),
         ]);
+        const sessionAuthorityTools = await toolsForSessionAuthority(
+          input.sessionId,
+          first,
+          replayRecords,
+        );
         const resumeState =
           resumed.snapshot.status === "interrupted"
-            ? createAgentResumeState(replayRecords, options, resumed.snapshot)
+            ? createAgentResumeState(replayRecords, sessionAuthorityTools, resumed.snapshot)
             : undefined;
         if (resumeState !== undefined && planApproval === undefined) {
           const kickoffRecord = replayRecords.findLast(
@@ -5300,31 +5396,23 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           throw new SessionLifecycleError("session_plan_unavailable");
         }
         const records = await readSessionRecords(options, input.sessionId);
-        const eligibleToolProfile = planToolProfile(
-          inspected,
-          options.tools,
-          "plan-policy.hybrid-v1",
+        const genesis = records[0];
+        if (genesis === undefined || !isGenesisRecord(genesis)) {
+          throw new SessionLifecycleError("session_invalid");
+        }
+        const sessionTools = await toolsForSession(
+          input.sessionId,
+          inspected.targetIdentity,
+          undefined,
+          genesis.record.managedAgentTools,
+          genesis.record.webEvidence,
         );
-        const shellEnvironment = await (
-          options[planShellEnvironmentFactory] ?? createPlanShellEnvironmentV1
-        )();
+        const entry = await preparePlanCycleEntry(
+          (records.at(-1)?.sequence ?? 0) + 1,
+          planToolProfile(inspected, sessionTools, "plan-policy.hybrid-v1"),
+        );
         const store = await openSessionStore(options, input.sessionId);
-        await store.append({
-          schemaVersion: 3,
-          sequence: (records.at(-1)?.sequence ?? 0) + 1,
-          record: {
-            type: "plan_cycle_entered",
-            recordVersion: 1,
-            cycleId: randomUUID(),
-            revision: 1,
-            policyVersion: "plan-policy.hybrid-v1",
-            shellPolicyVersion: "plan-shell-policy.v1",
-            shellEnvironment,
-            gitPolicyVersion: planGitAutomaticPolicyV1.version,
-            gitPolicyDigest: planGitAutomaticPolicyV1.digest,
-            eligibleToolProfile,
-          },
-        });
+        await store.append(entry);
         const snapshot = await inspectSession({ sessionId: input.sessionId });
         if (snapshot.schemaVersion !== 3) {
           throw new SessionLifecycleError("session_invalid");
@@ -6321,6 +6409,7 @@ async function settleRunTerminalIntent(
 async function settleIndeterminateToolEffects(
   options: SessionLifecycleOptions,
   snapshot: CurrentSessionSnapshot,
+  tools: ToolRegistry,
 ): Promise<boolean> {
   const records = await readSessionRecords(options, snapshot.sessionId);
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
@@ -6368,11 +6457,11 @@ async function settleIndeterminateToolEffects(
           candidate.record.event.callId === call.id &&
           candidate.record.event.name === call.name,
       );
-      const exactIntent = isExactToolIntent(options, snapshot, responseRecord.record, call);
+      const exactIntent = isExactToolIntent(tools, snapshot, responseRecord.record, call);
       if (
         !terminal &&
         (!exactIntent ||
-          (started && !isExactSafeReplay(options, snapshot, responseRecord.record, call)))
+          (started && !isExactSafeReplay(tools, snapshot, responseRecord.record, call)))
       ) {
         indeterminateCalls.push({ callId: call.id, name: call.name, requested, started });
       }
@@ -6490,6 +6579,7 @@ async function settleCompletedResponseTerminal(
   options: SessionLifecycleOptions,
   snapshot: CurrentSessionSnapshot,
   artifactCache: ModelResponseArtifactCache,
+  tools: ToolRegistry,
 ): Promise<boolean> {
   const records = await readSessionRecords(options, snapshot.sessionId);
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
@@ -6560,9 +6650,7 @@ async function settleCompletedResponseTerminal(
         record.record.event.callId === call.id &&
         record.record.event.name === call.name,
     );
-    return (
-      started && !terminal && !isExactSafeReplay(options, snapshot, responseRecord.record, call)
-    );
+    return started && !terminal && !isExactSafeReplay(tools, snapshot, responseRecord.record, call);
   });
   if (!isStopResponse && !isOutputLimitResponse && hasUnsafeStartedEffect) {
     return false;
@@ -6685,12 +6773,12 @@ function indeterminateToolMessage(call: ToolCallIdentity): string {
 }
 
 function isExactSafeReplay(
-  options: SessionLifecycleOptions,
+  tools: ToolRegistry,
   snapshot: CurrentSessionSnapshot,
   responseRecord: Extract<SessionRecord, { readonly schemaVersion: 3 }>["record"],
   call: { readonly id: string; readonly name: string; readonly argumentsJson: string },
 ): boolean {
-  if (!isExactToolIntent(options, snapshot, responseRecord, call)) {
+  if (!isExactToolIntent(tools, snapshot, responseRecord, call)) {
     return false;
   }
   if (responseRecord.type !== "model_response_completed") {
@@ -6699,12 +6787,12 @@ function isExactSafeReplay(
   const intent = responseRecord.response.toolIntents.find(
     (candidate) => candidate.callId === call.id && candidate.name === call.name,
   );
-  const adapter = options.tools?.resolve(call.name);
+  const adapter = tools.resolve(call.name);
   return intent?.replay === "safe" && adapter?.replay === "safe";
 }
 
 function isExactToolIntent(
-  options: SessionLifecycleOptions,
+  tools: ToolRegistry,
   snapshot: CurrentSessionSnapshot,
   responseRecord: Extract<SessionRecord, { readonly schemaVersion: 3 }>["record"],
   call: { readonly id: string; readonly name: string; readonly argumentsJson: string },
@@ -6718,7 +6806,7 @@ function isExactToolIntent(
   const intent = responseRecord.response.toolIntents.find(
     (candidate) => candidate.callId === call.id && candidate.name === call.name,
   );
-  const adapter = options.tools?.resolve(call.name);
+  const adapter = tools.resolve(call.name);
   return (
     intent !== undefined &&
     adapter !== undefined &&
@@ -6731,7 +6819,7 @@ function isExactToolIntent(
 
 function createAgentResumeState(
   records: readonly SessionRecord[],
-  options: SessionLifecycleOptions,
+  tools: ToolRegistry,
   snapshot: CurrentSessionSnapshot,
 ): {
   readonly userMessage: string;
@@ -6896,7 +6984,7 @@ function createAgentResumeState(
             candidate.record.event.callId === call.id &&
             candidate.record.event.name === call.name,
         );
-        if (started && !isExactSafeReplay(options, snapshot, responseRecord.record, call)) {
+        if (started && !isExactSafeReplay(tools, snapshot, responseRecord.record, call)) {
           throw new SessionLifecycleError("session_invalid");
         }
         const permission = currentRecords.findLast(
@@ -6913,7 +7001,7 @@ function createAgentResumeState(
           permission.record.event.type === "tool_permission_decided"
             ? permission.record.event
             : undefined;
-        const exactIntent = isExactToolIntent(options, snapshot, responseRecord.record, call);
+        const exactIntent = isExactToolIntent(tools, snapshot, responseRecord.record, call);
         const repositoryRecord = currentRecords.findLast(
           (candidate) =>
             candidate.sequence > responseRecord.sequence &&
@@ -8111,12 +8199,12 @@ function planToolProfileFromAuthority(
 }
 
 async function validatePlanToolProfilesFromLineage(
-  options: SessionLifecycleOptions,
   lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
+  tools: ToolRegistry | undefined,
 ): Promise<void> {
-  if (options.tools === undefined) {
+  if (tools === undefined) {
     throw new SessionLifecycleError("session_invalid");
   }
   for (const entry of records) {
@@ -8143,7 +8231,7 @@ async function validatePlanToolProfilesFromLineage(
     }
     const expected = planToolProfileFromAuthority(
       promptContext.toolProfile,
-      options.tools,
+      tools,
       mcpProfile,
       entry.record.policyVersion,
     );

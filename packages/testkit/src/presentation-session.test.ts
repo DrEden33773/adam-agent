@@ -1841,6 +1841,99 @@ test("PresentationSession freezes the exact eligible hybrid Tool Profile for a P
   }
 });
 
+test("PresentationSession enters Plan through the exact composed session Tool Registry", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-composed-tools-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelTargets = settledModelTargets("Composed session settled.");
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycleOptions: Parameters<typeof createRawSessionLifecycle>[0] = {
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+    modelTargets,
+    stateRoot,
+    webHttp: {
+      async fetch() {
+        throw new Error("Plan profile construction must not perform Web I/O.");
+      },
+    },
+    webSearchConfiguration: {
+      async load() {
+        return { status: "unconfigured", provider: null, diagnostic: null };
+      },
+    },
+    workspaceRoot,
+  };
+  let lifecycle = harness.createLifecycle(lifecycleOptions);
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Complete one ordinary production-composed turn." },
+    });
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      projectLabel: "workspace",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    try {
+      await expect(
+        presentation.dispatch({ type: "enter_plan", sessionId: created.sessionId }),
+      ).resolves.toMatchObject({ status: "admitted" });
+      expect(
+        presentation
+          .getState()
+          .authoritative.active?.plan?.eligibleToolProfile.definitions.map(
+            (definition) => definition.name,
+          ),
+      ).toEqual([
+        "read_file",
+        "search_repository",
+        "run_shell",
+        "activate_skill",
+        "read_skill_resource",
+        "read_input_resource",
+        "get_todo",
+        "list_todos",
+        "web_open",
+        "web_find",
+        "list_agents",
+        "wait_agents",
+      ]);
+    } finally {
+      await presentation.close();
+    }
+
+    await lifecycle.close();
+    lifecycle = harness.createLifecycle(lifecycleOptions);
+    const inspected = await lifecycle.inspect({ sessionId: created.sessionId });
+    expect(inspected).toMatchObject({ plan: { state: "exploring", revision: 1 } });
+    if (inspected.schemaVersion !== 3 || inspected.plan === undefined) {
+      throw new Error("Expected the cold composed Plan cycle.");
+    }
+    const child = await lifecycle.branch({
+      parentSessionId: created.sessionId,
+      atSequence: inspected.lastSequence,
+    });
+    expect(child).toMatchObject({
+      plan: {
+        state: "exploring",
+        cycleId: inspected.plan.cycleId,
+        revision: inspected.plan.revision,
+        eligibleToolProfile: inspected.plan.eligibleToolProfile,
+      },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("PresentationSession exits one Plan cycle and enters a distinct later cycle", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-plan-repeat-"));
   const stateRoot = join(testRoot, "state");
@@ -3988,6 +4081,105 @@ test("PresentationSession begins a new-session draft without creating durable se
   }
 });
 
+test("PresentationSession admits the first draft prompt directly into durable Plan", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-plan-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let ordinaryTools: readonly string[] = [];
+  const driver: ModelDriver = {
+    async *stream(request) {
+      if (request.purpose === "title") {
+        yield { type: "text_delta", text: "Draft Plan" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryTools = request.tools.map((tool) => tool.name);
+      yield { type: "text_delta", text: "Draft Plan exploration complete." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionAutomaticTitlesEnabled]: false,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    try {
+      await presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+      await expect(
+        presentation.dispatch({ type: "set_draft_mode", mode: "plan" }),
+      ).resolves.toMatchObject({ status: "admitted" });
+      expect(presentation.getState().draft?.mode).toBe("plan");
+      await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({ items: [] });
+
+      const completed = waitForAssistantMessage(presentation, "Draft Plan exploration complete.");
+      await expect(
+        presentation.dispatch({
+          type: "submit_draft_prompt",
+          text: "Plan the first durable change.",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).resolves.toMatchObject({ status: "admitted" });
+      await completed;
+
+      expect(ordinaryTools).toEqual([
+        "read_file",
+        "search_repository",
+        "run_shell",
+        "activate_skill",
+        "read_skill_resource",
+        "read_input_resource",
+        "get_todo",
+        "list_todos",
+        "submit_plan",
+      ]);
+      expect(presentation.getState().authoritative.active?.plan).toMatchObject({
+        state: "exploring",
+        revision: 1,
+        policyVersion: "plan-policy.hybrid-v1",
+      });
+      await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({
+        items: [{ plan: { state: "exploring" } }],
+      });
+    } finally {
+      await presentation.close();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("PresentationSession previews the draft Skill catalog without creating durable session identity", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-draft-skills-"));
   const stateRoot = join(testRoot, "state");
@@ -5292,6 +5484,7 @@ test("PresentationSession opens an exact target as a recoverable draft", async (
       },
       draft: {
         targetId: targetIdentity.targetId,
+        mode: "default",
         projectPaths: expect.objectContaining({ items: [], omittedCount: 0 }),
         skills: expect.objectContaining({ items: [], reloadAvailable: false }),
       },
