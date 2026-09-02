@@ -384,7 +384,7 @@ test("real PTY submits a Plan with assistant preamble and restores every termina
     await fixture.waitFor("Adam · New session");
     const beforePlan = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforePlan);
+    await fixture.waitForCompleteFrameAfter("Plan exploring", beforePlan);
     const beforeSubmission = fixture.output().length;
     fixture.write("Create the exact PTY Plan\r");
     await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeSubmission);
@@ -421,7 +421,7 @@ test("real PTY restores every terminal input mode after Plan settlement and refr
     await fixture.waitFor("Adam · New session");
     const beforePlan = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforePlan);
+    await fixture.waitForCompleteFrameAfter("Plan exploring", beforePlan);
     fixture.write("Create the failing-refresh PTY Plan\r");
     await waitForFileContents(join(controlRoot, "plan-settlement-read-failed"), "failed\n");
 

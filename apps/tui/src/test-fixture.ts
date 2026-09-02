@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   type ContextProfile,
+  createCodingToolRegistry,
   createExtensionHost,
   createFileArtifactStore,
   createInMemoryOperationStore,
@@ -23,6 +24,7 @@ import {
 } from "@adam-agent/agent";
 import {
   createInMemorySessionStoreDirectory,
+  createPlanToolProfileV1,
   createTrustedWorkspaceTrustForTesting,
   mcpCloseConfirmation,
   type PresentationArtifactReadBarrier,
@@ -324,6 +326,14 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
             };
           },
         };
+  const historicalPlanRegistry =
+    options.scenario === "plan-read-v1"
+      ? createCodingToolRegistry({ workspaceRoot: options.workspaceRoot })
+      : undefined;
+  const historicalPlanStores =
+    options.scenario === "plan-read-v1"
+      ? createInMemorySessionStoreDirectory<SessionRecord>()
+      : undefined;
   const lifecycle = createSessionLifecycle({
     ...(options.scenario === "managed-attention"
       ? { managedAgentTools: "managed-agent-tools.a3-long-lived.v1" as const }
@@ -357,6 +367,10 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       : {}),
     ...(modelTargets === undefined ? {} : { modelTargets }),
     ...(preferences === undefined ? {} : { preferences }),
+    ...(historicalPlanStores === undefined
+      ? {}
+      : { [sessionStoreDirectory]: historicalPlanStores }),
+    ...(historicalPlanRegistry === undefined ? {} : { tools: historicalPlanRegistry }),
     permissions: createPermissionPolicy({
       allowedEffects:
         options.scenario === "managed-attention"
@@ -466,6 +480,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       options.scenario === "history" ||
       options.scenario === "artifact-history" ||
       options.scenario === "copy-older-assistant" ||
+      options.scenario === "plan-read-v1" ||
       options.scenario === "reasoning-multiple" ||
       options.scenario === "reasoning-large-multiple" ||
       options.scenario === "reasoning-artifact-session-race" ||
@@ -474,7 +489,44 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       options.scenario === "tool-multiple" ||
       options.scenario === "unsafe-history"
         ? await lifecycle.create({ targetIdentity }).then(async (created) => {
-            if (options.scenario === "history") {
+            if (options.scenario === "plan-read-v1") {
+              const source = created.promptContext?.toolProfile;
+              if (source === undefined || historicalPlanRegistry === undefined) {
+                throw new Error("Expected historical Plan source authority.");
+              }
+              const eligibleToolProfile = createPlanToolProfileV1({
+                source: { version: source.version, digest: source.digest },
+                definitions: source.definitions.flatMap((definition) => {
+                  const adapter = historicalPlanRegistry.resolve(definition.name);
+                  return adapter?.effect === "read"
+                    ? [
+                        {
+                          name: definition.name,
+                          definitionDigest: adapter.definitionDigest as `sha256:${string}`,
+                          effect: adapter.effect,
+                          source: "builtin" as const,
+                        },
+                      ]
+                    : [];
+                }),
+              });
+              const store = await historicalPlanStores?.open(created.sessionId);
+              if (store === undefined) {
+                throw new Error("Expected the historical Plan session store.");
+              }
+              await store.append({
+                schemaVersion: 3,
+                sequence: created.lastSequence + 1,
+                record: {
+                  type: "plan_cycle_entered",
+                  recordVersion: 1,
+                  cycleId: "123e4567-e89b-42d3-a456-426614176100",
+                  revision: 1,
+                  policyVersion: "plan-policy.read-v1",
+                  eligibleToolProfile,
+                },
+              });
+            } else if (options.scenario === "history") {
               for (let index = 1; index <= 3; index += 1) {
                 await lifecycle.continue({
                   sessionId: created.sessionId,

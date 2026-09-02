@@ -4133,7 +4133,157 @@ test("the idle footer exposes Registry-driven interaction hints", async () => {
   }
 });
 
-test("a new-session draft toggles read-only Plan without creating durable identity", async () => {
+test("current hybrid Plan copy is policy-aware in notices and footer", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-hybrid-copy-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: {},
+      scenario: "skill-selection",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Admit the current hybrid Plan session\r");
+    await fixture.waitFor("Skill selection complete.");
+    const afterAnswer = fixture.output().lastIndexOf("Skill selection complete.");
+    await fixture.waitForCompleteFrameAfter(" · idle", afterAnswer);
+    const beforePlan = fixture.output().length;
+    fixture.write("/plan\r");
+    await fixture.waitForCompleteFrameAfter("Plan exploring", beforePlan);
+    const output = fixture.output().slice(beforePlan);
+    const frame = fixture.screen()?.join("\n") ?? "";
+
+    expect(output).toContain("Entered Plan.");
+    expect(frame).toContain("Plan exploring");
+    expect(frame).toContain(
+      "plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies",
+    );
+    expect(`${output}\n${frame}`).not.toContain("read-only Plan");
+    expect(frame).not.toContain("Plan exploring · read-only");
+
+    for (const [columns, rows, policyCopy] of [
+      [120, 40, ["plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies"]],
+      [80, 24, ["plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies"]],
+      [40, 12, ["inspect:auto · ambig:ask ·", "mutate:deny"]],
+    ] as const) {
+      await fixture.resize(columns, rows);
+      const resizedFrame = fixture.screen() ?? [];
+      for (const expected of policyCopy) {
+        expect(resizedFrame.join("\n")).toContain(expected);
+      }
+      expect(resizedFrame.join("\n")).not.toContain("read-only");
+      expect(resizedFrame.every((line) => visibleWidth(line) <= columns)).toBe(true);
+    }
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("production Help renders policy-neutral Plan Registry copy", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-help-copy-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    await fixture.resize(120, 40);
+    const beforeHelp = fixture.output().length;
+    fixture.write("/help commands\r");
+    await fixture.waitForCompleteFrameAfter("Command Reference", beforeHelp);
+    const frame = fixture.screen()?.join("\n") ?? "";
+    expect(frame).toContain("/plan · idle only · Enter or exit the authoritative Plan cycle.");
+    expect(frame).not.toContain("read-only Plan");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("NO_COLOR preserves current hybrid Plan policy copy without claiming read-only", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-hybrid-no-color-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: {},
+      noColor: true,
+      scenario: "skill-selection",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Admit the colorless hybrid Plan session\r");
+    await fixture.waitFor("Skill selection complete.");
+    const afterAnswer = fixture.output().lastIndexOf("Skill selection complete.");
+    await fixture.waitForCompleteFrameAfter(" · idle", afterAnswer);
+    const beforePlan = fixture.output().length;
+    fixture.write("/plan\r");
+    await fixture.waitForCompleteFrameAfter(
+      "plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies",
+      beforePlan,
+    );
+    const frame = fixture.screen()?.join("\n") ?? "";
+
+    expect(frame).toContain("Entered Plan.");
+    expect(frame).not.toContain("read-only");
+    expect(frame).not.toContain("\u001b[38;2;");
+    expect(frame).not.toContain("\u001b[48;2;");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("historical read-v1 Plan keeps exact read-only footer wording", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-read-v1-copy-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "plan-read-v1", stateRoot, workspaceRoot });
+    await fixture.waitForCompleteFrameAfter("plan-policy.read-v1 · read-only", 0);
+    let frame = fixture.screen() ?? [];
+    expect(frame.join("\n")).toContain("Plan exploring");
+    expect(frame.join("\n")).not.toContain("hybrid-v1");
+
+    await fixture.resize(40, 12);
+    frame = fixture.screen() ?? [];
+    expect(frame.join("\n")).toContain("plan read-only");
+    expect(frame.every((line) => visibleWidth(line) <= 40)).toBe(true);
+
+    const beforeExit = fixture.output().length;
+    fixture.write("/plan\r");
+    await fixture.waitForCompleteFrameAfter("Exited Plan.", beforeExit);
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("plan read-only");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a new-session draft toggles policy-aware Plan without creating durable identity", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-status-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -4151,9 +4301,11 @@ test("a new-session draft toggles read-only Plan without creating durable identi
 
     const beforeEntry = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforeEntry);
+    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeEntry);
     let frame = latestSynchronizedFrame(fixture.output()).join("\n");
-    expect(frame).toContain("Plan exploring · read-only");
+    expect(frame).toContain("Plan exploring");
+    expect(frame).not.toContain("read-only");
+    expect(frame).not.toContain("plan-policy.");
     expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
 
     const beforeTargetSwitch = fixture.output().length;
@@ -4166,17 +4318,15 @@ test("a new-session draft toggles read-only Plan without creating durable identi
       beforeTargetSelection,
     );
     const beforeSwitchedTargetClose = fixture.output().length;
-    await fixture.waitForCompleteFrameAfter(
-      "Plan exploring · read-only",
-      beforeSwitchedTargetClose,
-    );
-    expect(fixture.screen()?.join("\n") ?? "").toContain("Plan exploring · read-only");
+    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeSwitchedTargetClose);
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("read-only");
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("plan-policy.");
 
     const beforeExit = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitForAfter("Exited read-only Plan.", beforeExit);
+    await fixture.waitForAfter("Exited Plan.", beforeExit);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeExit)).join("\n");
-    expect(frame).not.toContain("Plan exploring · read-only");
+    expect(frame).not.toContain("Plan exploring");
 
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -4185,7 +4335,7 @@ test("a new-session draft toggles read-only Plan without creating durable identi
   }
 });
 
-test("a prompt-admitted production session enters read-only Plan after its first turn", async () => {
+test("a prompt-admitted production session enters policy-aware Plan after its first turn", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-after-admission-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -4213,9 +4363,13 @@ test("a prompt-admitted production session enters read-only Plan after its first
 
     const beforePlan = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforePlan);
+    await fixture.waitForCompleteFrameAfter(
+      "plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies",
+      beforePlan,
+    );
     const frame = latestSynchronizedFrame(fixture.output().slice(beforePlan)).join("\n");
-    expect(frame).toContain("Plan exploring · read-only");
+    expect(frame).toContain("Plan exploring");
+    expect(frame).not.toContain("read-only");
     expect(frame).not.toContain("Plan could not be entered from the current session state.");
 
     fixture.write("\u0011");
@@ -4242,7 +4396,7 @@ test("the production TUI reviews, revises, and implements the exact ready Plan",
     await fixture.resize(120, 40);
     const beforeEntry = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforeEntry);
+    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeEntry);
 
     const beforeInitialSubmission = fixture.output().length;
     fixture.write("Create the exact implementation plan\r");
@@ -4319,7 +4473,7 @@ test("the production TUI keeps the exact composer draft while a ready Plan revie
     await fixture.resize(120, 40);
     const beforeEntry = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforeEntry);
+    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeEntry);
     const beforePlan = fixture.output().length;
     fixture.write("Create a plan whose ready state must remain exact\r");
     await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);
@@ -4361,7 +4515,7 @@ test("the production TUI cancels a ready Plan only after concise confirmation", 
     await fixture.resize(120, 40);
     const beforeEntry = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforeEntry);
+    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeEntry);
     const beforePlan = fixture.output().length;
     fixture.write("Create a plan that will be cancelled exactly\r");
     await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);
@@ -4424,7 +4578,7 @@ test("the production TUI explicitly continues a recovered unstarted Plan approva
     await fixture.resize(120, 40);
     const beforeEntry = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforeEntry);
+    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeEntry);
     const beforePlan = fixture.output().length;
     fixture.write("Create a plan whose durable approval must be recovered\r");
     await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);
