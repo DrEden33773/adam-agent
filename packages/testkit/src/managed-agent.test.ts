@@ -5928,6 +5928,31 @@ test("ManagedAgentStore atomically rejects a concurrent seventeenth parent attem
     reason: { code: "managed_agent_log_invalid" },
   });
   await expect(managedStore.read()).resolves.toHaveLength(16);
+
+  const legacyStore = createInMemoryManagedAgentStore();
+  for (let ordinal = 1; ordinal <= 17; ordinal += 1) {
+    const suffix = ordinal.toString().padStart(11, "0");
+    const task = `Historical capacity attempt ${ordinal}.`;
+    await legacyStore.append({
+      schemaVersion: 1,
+      type: "managed_agent_admitted",
+      sequence: ordinal,
+      agentId: `123e4567-e89b-42d3-a456-4${suffix}`,
+      attemptId: `123e4567-e89b-42d3-a456-5${suffix}`,
+      childSessionId: `123e4567-e89b-42d3-a456-6${suffix}`,
+      parentSessionId,
+      parentToolCallId: `historical-capacity-${ordinal}`,
+      parentRootId: `session:${parentSessionId}`,
+      projectId,
+      profile: "scout.v1",
+      profileDigest: scoutManagedAgentProfileV1.digest,
+      limits: managedLimits,
+      taskDigest: testTaskDigest(task),
+      childInputDigest: testTaskDigest(`${task}\n\n${childLiveWorkspaceNotice}`),
+      targetIdentity,
+    });
+  }
+  await expect(legacyStore.read()).resolves.toHaveLength(17);
 });
 
 test("AgentSession injects only the bounded O(1) managed-child summary into the parent prompt", async () => {

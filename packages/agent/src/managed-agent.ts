@@ -1635,7 +1635,7 @@ export function validateManagedAgentRecord(
           record.attemptId === candidate.attemptId ||
           record.childSessionId === candidate.childSessionId,
       ) ||
-      (candidate.profile !== "reviewer.v1" &&
+      (isCurrentManagedAgentProfile(candidate.profile) &&
         history.filter(
           (record) =>
             record.type === "managed_agent_admitted" &&
