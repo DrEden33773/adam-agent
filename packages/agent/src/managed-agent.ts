@@ -2024,8 +2024,11 @@ export type ManagedAgentSummary = {
   readonly attemptId: string;
   readonly profile: BuiltInManagedAgentProfileId;
   readonly mode: "foreground" | "background";
+  readonly targetIdentity: ModelTargetIdentity;
+  readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
   readonly status:
     | "running"
+    | "permission_required"
     | "stalled"
     | "waiting_for_parent"
     | "completed"
@@ -2034,6 +2037,29 @@ export type ManagedAgentSummary = {
     | "recovery_required"
     | "inspection_required";
   readonly revision: number;
+  readonly phase:
+    | "model"
+    | "tool"
+    | "permission_required"
+    | "waiting_for_parent"
+    | "stalled"
+    | "terminal";
+  readonly activeTool?: {
+    readonly callId: string;
+    readonly name: string;
+    readonly status: "requested" | "running" | "permission_required";
+  };
+  readonly transcript: {
+    readonly childSessionId: string;
+    readonly throughSequence: number;
+  };
+  readonly attemptHistory: readonly {
+    readonly attemptId: string;
+    readonly childSessionId: string;
+    readonly status: ManagedAgentSummary["status"];
+    readonly current: boolean;
+    readonly throughSequence: number;
+  }[];
   readonly result?:
     | { readonly text: string }
     | { readonly artifact: Pick<ArtifactReference, "id" | "mediaType" | "byteCount"> };
@@ -2080,14 +2106,19 @@ export type ManagedAgentSummary = {
 export type ManagedAgentSnapshot = {
   readonly counts: {
     readonly active: number;
-    readonly completed: number;
+    readonly terminal: number;
     readonly attention: number;
   };
   readonly agents: readonly ManagedAgentSummary[];
 };
 
 function isManagedAgentActiveStatus(status: ManagedAgentSummary["status"]): boolean {
-  return status === "running" || status === "stalled" || status === "waiting_for_parent";
+  return (
+    status === "running" ||
+    status === "permission_required" ||
+    status === "stalled" ||
+    status === "waiting_for_parent"
+  );
 }
 
 export function managedAgentSnapshotFromRecords(
@@ -2194,13 +2225,67 @@ export function managedAgentSnapshotFromRecords(
               ? "running"
               : "stalled"
             : "waiting_for_parent";
+    const attemptHistory = identityAdmissions.map((attemptAdmission) => {
+      const attemptTerminal = records.find(
+        (record) =>
+          record.type === "managed_agent_terminal" &&
+          record.attemptId === attemptAdmission.attemptId,
+      );
+      const attemptInspection = records.findLast(
+        (record) =>
+          record.type === "managed_agent_inspection_required" &&
+          record.attemptId === attemptAdmission.attemptId,
+      );
+      const current = attemptAdmission.attemptId === admission.attemptId;
+      const status: ManagedAgentSummary["status"] = current
+        ? projectedStatus
+        : attemptInspection?.type === "managed_agent_inspection_required"
+          ? "inspection_required"
+          : attemptTerminal?.type === "managed_agent_terminal"
+            ? attemptTerminal.status
+            : "recovery_required";
+      return {
+        attemptId: attemptAdmission.attemptId,
+        childSessionId: attemptAdmission.childSessionId,
+        status,
+        current,
+        throughSequence:
+          attemptTerminal?.type === "managed_agent_terminal" &&
+          "throughSequence" in attemptTerminal &&
+          attemptTerminal.throughSequence !== undefined
+            ? attemptTerminal.throughSequence
+            : 0,
+      };
+    });
     return {
       agentId: admission.agentId,
       attemptId: admission.attemptId,
       profile: admission.profile,
       mode: admission.mode ?? "foreground",
+      targetIdentity: admission.targetIdentity,
+      ...(admission.thinkingPolicy === undefined
+        ? {}
+        : { thinkingPolicy: admission.thinkingPolicy }),
       status: projectedStatus,
       revision,
+      phase:
+        projectedStatus === "stalled"
+          ? "stalled"
+          : projectedStatus === "waiting_for_parent"
+            ? "waiting_for_parent"
+            : isManagedAgentActiveStatus(projectedStatus)
+              ? "model"
+              : "terminal",
+      transcript: {
+        childSessionId: admission.childSessionId,
+        throughSequence:
+          terminal?.type === "managed_agent_terminal" &&
+          "throughSequence" in terminal &&
+          terminal.throughSequence !== undefined
+            ? terminal.throughSequence
+            : 0,
+      },
+      attemptHistory,
       reports,
       ...(inspection !== undefined ||
       terminal?.type !== "managed_agent_terminal" ||
@@ -2256,9 +2341,141 @@ export function managedAgentSnapshotFromRecords(
   return {
     counts: {
       active: agents.filter((agent) => isManagedAgentActiveStatus(agent.status)).length,
-      completed: agents.filter((agent) => !isManagedAgentActiveStatus(agent.status)).length,
+      terminal: agents.filter((agent) => !isManagedAgentActiveStatus(agent.status)).length,
       attention: agents.filter(
         (agent) => agent.status === "stalled" || agent.status === "waiting_for_parent",
+      ).length,
+    },
+    agents,
+  };
+}
+
+export async function managedAgentSnapshotWithChildHistories(input: {
+  readonly records: readonly ManagedAgentRecord[];
+  readonly parentSessionId: string;
+  readonly childSessionStores: SessionStoreDirectory<SessionRecord>;
+  readonly permissionRequired?: (agentId: string) => boolean;
+  readonly watchdogState?: (
+    attemptId: string,
+  ) => "running" | "paused_permission" | "paused_parent" | "stalled" | undefined;
+}): Promise<ManagedAgentSnapshot> {
+  const snapshot = managedAgentSnapshotFromRecords(input.records, input.parentSessionId);
+  const agents = await Promise.all(
+    snapshot.agents.map(async (agent) => {
+      const admissions = input.records.flatMap((record) =>
+        record.type === "managed_agent_admitted" && record.agentId === agent.agentId
+          ? [record]
+          : [],
+      );
+      const histories = await Promise.all(
+        admissions.map(async (admission) => {
+          try {
+            const store = await input.childSessionStores.open(admission.childSessionId);
+            return (await store?.read()) ?? [];
+          } catch {
+            return undefined;
+          }
+        }),
+      );
+      const currentHistory = histories.at(-1);
+      const activeTool = currentManagedAgentTool(currentHistory ?? []);
+      const transcript = {
+        ...agent.transcript,
+        throughSequence: currentHistory?.at(-1)?.sequence ?? agent.transcript.throughSequence,
+      };
+      const permissionRequired = input.permissionRequired?.(agent.agentId) ?? false;
+      const status =
+        permissionRequired && isManagedAgentActiveStatus(agent.status)
+          ? ("permission_required" as const)
+          : agent.status;
+      const attemptHistory = agent.attemptHistory.map((attempt, index) => ({
+        ...attempt,
+        throughSequence: histories[index]?.at(-1)?.sequence ?? attempt.throughSequence,
+        ...(attempt.current ? { status } : {}),
+      }));
+      const phase =
+        status === "permission_required"
+          ? ("permission_required" as const)
+          : status === "stalled"
+            ? ("stalled" as const)
+            : status === "waiting_for_parent"
+              ? ("waiting_for_parent" as const)
+              : !isManagedAgentActiveStatus(status)
+                ? ("terminal" as const)
+                : activeTool === undefined
+                  ? ("model" as const)
+                  : ("tool" as const);
+      const projectedActiveTool =
+        activeTool === undefined
+          ? {}
+          : {
+              activeTool: {
+                ...activeTool,
+                status:
+                  status === "permission_required"
+                    ? ("permission_required" as const)
+                    : activeTool.status,
+              },
+            };
+      const liveWatchdogState = input.watchdogState?.(agent.attemptId);
+      const watchdog =
+        liveWatchdogState === undefined || agent.watchdog === undefined
+          ? {}
+          : { watchdog: { ...agent.watchdog, state: liveWatchdogState } };
+      if (histories.some((history) => history === undefined)) {
+        return {
+          ...agent,
+          status,
+          phase,
+          transcript,
+          attemptHistory,
+          ...projectedActiveTool,
+          ...watchdog,
+        };
+      }
+      const usage = histories.reduce(
+        (total, history) => {
+          const next = usageFromChildRecords(history ?? []);
+          return {
+            inputTokens: total.inputTokens + next.inputTokens,
+            outputTokens: total.outputTokens + next.outputTokens,
+            reasoningTokens: total.reasoningTokens + next.reasoningTokens,
+            providerCalls: total.providerCalls + providerCallsFromChildRecords(history ?? []),
+          };
+        },
+        { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, providerCalls: 0 },
+      );
+      const usedTokens = usage.inputTokens + usage.outputTokens;
+      return {
+        ...agent,
+        status,
+        phase,
+        transcript,
+        attemptHistory,
+        ...projectedActiveTool,
+        ...(agent.usage === undefined ? {} : { usage }),
+        ...(agent.budget === undefined
+          ? {}
+          : {
+              budget: {
+                ...agent.budget,
+                usedTokens,
+                remainingTokens: Math.max(0, agent.budget.maximumCumulativeTokens - usedTokens),
+              },
+            }),
+        ...watchdog,
+      };
+    }),
+  );
+  return {
+    counts: {
+      active: agents.filter((agent) => isManagedAgentActiveStatus(agent.status)).length,
+      terminal: agents.filter((agent) => !isManagedAgentActiveStatus(agent.status)).length,
+      attention: agents.filter(
+        (agent) =>
+          agent.status === "permission_required" ||
+          agent.status === "stalled" ||
+          agent.status === "waiting_for_parent",
       ).length,
     },
     agents,
@@ -2440,6 +2657,13 @@ export function createAgentManager(options: {
     readonly contents: ReadonlyMap<string, string>;
   }>;
   readonly onChildPermissionEvent?: (event: RuntimeEvent) => void;
+  readonly onChildRuntimeEvent?: (input: {
+    readonly agentId: string;
+    readonly attemptId: string;
+    readonly childSessionId: string;
+    readonly event: RuntimeEvent;
+  }) => void;
+  readonly onManagedAgentStateChanged?: () => void;
   readonly deadlineScheduler?: ManagedAgentDeadlineScheduler;
   readonly inactivityScheduler?: ManagedAgentInactivityScheduler;
   readonly closeDrainScheduler?: ManagedAgentDeadlineScheduler;
@@ -2493,6 +2717,7 @@ export function createAgentManager(options: {
         sequence: records.length + 1,
       });
       appended = true;
+      options.onManagedAgentStateChanged?.();
     });
     appendQueue = operation.catch(() => undefined);
     await operation;
@@ -3698,6 +3923,7 @@ export function createAgentManager(options: {
       const child = new AgentSession(childDependencies);
       ownedChild = child;
       unsubscribeChildPermissions = child.subscribe((event) => {
+        options.onChildRuntimeEvent?.({ agentId, attemptId, childSessionId, event });
         observeChildPermissionEvent(child, event);
         if (event.type === "tool_permission_requested") {
           pauseInactivity("permission");
@@ -4258,11 +4484,11 @@ export function createAgentManager(options: {
     promptSummary() {
       const ids = [...knownAgentIds].sort();
       const active = activeAttempts.size;
-      const completed = ids.length - active;
+      const terminal = ids.length - active;
       const attention =
         [...coordinationStates.values()].filter((state) => state.attentionId !== undefined).length +
         stalledAttemptIds.size;
-      const prefix = `Managed agents: ${active} active, ${completed} completed, ${attention} need attention; IDs: `;
+      const prefix = `Managed agents: ${active} active, ${terminal} terminal, ${attention} need attention; IDs: `;
       let summary = prefix;
       for (const id of ids) {
         const next = `${summary === prefix ? "" : ", "}${id}`;
@@ -4310,63 +4536,22 @@ export function createAgentManager(options: {
     async snapshot() {
       await Promise.all([...inactivityControls.values()].map((control) => control.settled()));
       const records = await options.managedStore.read();
-      const snapshot = managedAgentSnapshotFromRecords(records, manager.parentSessionId);
-      const agents = await Promise.all(
-        snapshot.agents.map(async (agent) => {
-          knownAgentIds.add(agent.agentId);
-          const admissions = records.flatMap((record) =>
-            record.type === "managed_agent_admitted" && record.agentId === agent.agentId
-              ? [record]
-              : [],
-          );
-          const histories = await Promise.all(
-            admissions.map(async (admission) => {
-              try {
-                const store = await options.childSessionStores.open(admission.childSessionId);
-                return (await store?.read()) ?? [];
-              } catch {
-                return undefined;
-              }
-            }),
-          );
-          const control = inactivityControls.get(agent.attemptId);
-          const watchdog =
-            control === undefined || agent.watchdog === undefined
-              ? {}
-              : { watchdog: { ...agent.watchdog, state: control.state() } };
-          if (histories.some((history) => history === undefined)) {
-            return { ...agent, ...watchdog };
-          }
-          const usage = histories.reduce(
-            (total, history) => {
-              const next = usageFromChildRecords(history ?? []);
-              return {
-                inputTokens: total.inputTokens + next.inputTokens,
-                outputTokens: total.outputTokens + next.outputTokens,
-                reasoningTokens: total.reasoningTokens + next.reasoningTokens,
-                providerCalls: total.providerCalls + providerCallsFromChildRecords(history ?? []),
-              };
-            },
-            { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, providerCalls: 0 },
-          );
-          const usedTokens = usage.inputTokens + usage.outputTokens;
-          return {
-            ...agent,
-            ...(agent.usage === undefined ? {} : { usage }),
-            ...(agent.budget === undefined
-              ? {}
-              : {
-                  budget: {
-                    ...agent.budget,
-                    usedTokens,
-                    remainingTokens: Math.max(0, agent.budget.maximumCumulativeTokens - usedTokens),
-                  },
-                }),
-            ...watchdog,
-          };
-        }),
-      );
-      return { ...snapshot, agents };
+      const snapshot = await managedAgentSnapshotWithChildHistories({
+        records,
+        parentSessionId: manager.parentSessionId,
+        childSessionStores: options.childSessionStores,
+        permissionRequired: (agentId) =>
+          [...childPermissionRequests.values()].some(
+            (request) =>
+              request.subject.type === "managed_agent_web_request" &&
+              request.subject.agentId === agentId,
+          ),
+        watchdogState: (attemptId) => inactivityControls.get(attemptId)?.state(),
+      });
+      for (const agent of snapshot.agents) {
+        knownAgentIds.add(agent.agentId);
+      }
+      return snapshot;
     },
     async list(input = {}) {
       const snapshot = await manager.snapshot();
@@ -5481,6 +5666,36 @@ function providerCallsFromChildRecords(records: readonly SessionRecord[]): numbe
   return records.filter(
     (record) => record.schemaVersion === 3 && record.record.type === "provider_attempt_started",
   ).length;
+}
+
+function currentManagedAgentTool(
+  records: readonly SessionRecord[],
+): ManagedAgentSummary["activeTool"] {
+  const active = new Map<
+    string,
+    { readonly callId: string; readonly name: string; status: "requested" | "running" }
+  >();
+  for (const record of records) {
+    const event =
+      record.schemaVersion === 1 || record.schemaVersion === 2
+        ? record.event
+        : record.record.type === "runtime_event"
+          ? record.record.event
+          : undefined;
+    if (event?.type === "tool_requested") {
+      active.set(event.callId, { callId: event.callId, name: event.name, status: "requested" });
+    } else if (event?.type === "tool_started") {
+      const existing = active.get(event.callId);
+      active.set(event.callId, {
+        callId: event.callId,
+        name: existing?.name ?? event.name,
+        status: "running",
+      });
+    } else if (event?.type === "tool_completed" || event?.type === "tool_failed") {
+      active.delete(event.callId);
+    }
+  }
+  return [...active.values()].at(-1);
 }
 
 function managedCumulativeTokens(

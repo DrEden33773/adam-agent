@@ -146,7 +146,7 @@ export class AgentNavigator implements Component {
     }
     return [
       this.#theme.toolTitle(
-        `Agents · ${this.#managedAgents.counts.active} active · ${this.#managedAgents.counts.completed} completed`,
+        `Agents · ${this.#managedAgents.counts.active} active · ${this.#managedAgents.counts.terminal} terminal`,
       ),
       "",
       ...this.#list.render(width),

@@ -2191,9 +2191,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : ` · todo ${active.todo.counts.pending}/${active.todo.counts.inProgress}/${active.todo.counts.completed} · ${active.todo.blockedCount} blocked`;
       const managedAgents = state.authoritative.managedAgents.counts;
       const agentSummary =
-        managedAgents.active === 0 && managedAgents.completed === 0
+        managedAgents.active === 0 && managedAgents.terminal === 0
           ? ""
-          : ` · Agents ${managedAgents.active} active/${managedAgents.completed} completed`;
+          : ` · Agents ${managedAgents.active} active/${managedAgents.terminal} terminal`;
       const compactAgentSummary =
         managedAgents.active === 0 ? "" : ` · agents ${managedAgents.active}`;
       const planPolicySummary =
