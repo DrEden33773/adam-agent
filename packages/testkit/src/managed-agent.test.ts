@@ -4482,7 +4482,7 @@ test("AgentManager starts one explicit follow-up attempt on the same terminal ch
         await releaseFollowUp.promise;
       }
       yield { type: "text_delta", text: `${task} complete` };
-      yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+      yield { type: "usage", inputTokens: 10, outputTokens: 3, reasoningTokens: 2 };
       yield { type: "finish", reason: "stop" };
     },
   };
@@ -4559,6 +4559,7 @@ test("AgentManager starts one explicit follow-up attempt on the same terminal ch
     expect(admissions.map((record) => record.agentId)).toEqual([agentId, agentId]);
     expect(new Set(admissions.map((record) => record.attemptId))).toHaveLength(2);
     expect(admissions[1]).toMatchObject({
+      usageAccountingVersion: 2,
       limits: { maximumTokens: 127_987 },
       deadlineAtUnixMilliseconds: admissions[0]?.deadlineAtUnixMilliseconds,
       resume: {

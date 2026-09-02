@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { AgentSession, managedAgentPromptSummary } from "./agent-session.js";
 import type {
+  ModelDriver,
   ModelMessage,
   PermissionDecisionCommand,
   PermissionDecisionCommandResult,
@@ -717,6 +718,18 @@ export interface SessionLifecycle {
   }): Promise<RepositoryInstructionsReloadResult>;
   reloadSkills(input: { readonly sessionId: string }): Promise<SkillsReloadResult>;
   regenerateSessionTitle(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
+  resolveManagedSessionOrigin(input: {
+    readonly origin: {
+      readonly sessionId: string;
+      readonly sourceSequence: number;
+    };
+    readonly signal: AbortSignal;
+  }): Promise<{
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly childContextProfile: ContextProfile;
+    readonly childModel: ModelDriver;
+    readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
+  }>;
   resume(input: { readonly sessionId: string }): Promise<SessionResumeResult>;
   clearSessionManualName(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
   setSessionManualName(input: {
@@ -5280,6 +5293,62 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         admission.resolve();
         titleAdmissionOperations.delete(admission.promise);
       }
+    },
+    async resolveManagedSessionOrigin(input) {
+      await prepareSessionInspection(input.origin.sessionId);
+      if (
+        !Number.isSafeInteger(input.origin.sourceSequence) ||
+        input.origin.sourceSequence <= 0 ||
+        options.modelTargets === undefined
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const snapshot = await inspectSession({ sessionId: input.origin.sessionId });
+      if (snapshot.schemaVersion !== 3 || input.origin.sourceSequence > snapshot.lastSequence) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const records = await readSessionRecords(options, input.origin.sessionId);
+      const prefix = records.filter((record) => record.sequence <= input.origin.sourceSequence);
+      if (prefix.at(-1)?.sequence !== input.origin.sourceSequence) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const genesis = prefix[0];
+      if (genesis === undefined || !isGenesisRecord(genesis)) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const resolved = await options.modelTargets.resolve({
+        targetId: snapshot.targetIdentity.targetId,
+        targetIdentity: snapshot.targetIdentity,
+        allowExperimental: snapshot.targetIdentity.certification === "experimental",
+        signal: input.signal,
+      });
+      const childContextProfile = historicalContextProfile(
+        genesis,
+        contextSnapshotFromRecords(prefix)?.profile,
+        resolved.contextProfile,
+      );
+      if (
+        !sameModelTargetIdentity(resolved.identity, snapshot.targetIdentity) ||
+        !modelTargetUsesContextProfile(snapshot.targetIdentity, childContextProfile) ||
+        !isHistoricalContextProfileSupported(resolved.contextProfile, childContextProfile)
+      ) {
+        throw new SessionLifecycleError("session_model_target_incompatible");
+      }
+      const sourceRun = prefix.findLast(
+        (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
+      );
+      const thinkingPolicy =
+        sourceRun?.schemaVersion === 3 && sourceRun.record.type === "logical_run_started"
+          ? sourceRun.record.thinkingPolicy
+          : undefined;
+      return {
+        targetIdentity: resolved.identity,
+        childContextProfile,
+        childModel: resolved.driver,
+        ...(thinkingPolicy === undefined
+          ? {}
+          : { thinkingPolicy: requireRecoveredThinkingPolicy(resolved, thinkingPolicy) }),
+      };
     },
     async resume(input) {
       if (activeTitleSessions.has(input.sessionId)) {
