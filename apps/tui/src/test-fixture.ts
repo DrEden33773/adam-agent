@@ -359,11 +359,9 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       allowedEffects:
         options.scenario === "managed-attention"
           ? ["read", "delegate"]
-          : options.scenario === "todo"
-            ? ["read", "write"]
-            : options.scenario === "tool-artifact" || options.scenario === "shell"
-              ? ["read", "execute"]
-              : ["read"],
+          : options.scenario === "tool-artifact" || options.scenario === "shell"
+            ? ["read", "execute"]
+            : ["read"],
       askedEffects: options.scenario === "web-search" ? ["write", "network"] : ["write"],
     }),
     workspaceTrust:

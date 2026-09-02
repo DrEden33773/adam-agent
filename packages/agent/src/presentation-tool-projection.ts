@@ -223,7 +223,8 @@ export function projectPendingPermissionCandidates(
                     : "This public operator can receive this exact Web request and network address. Adam will not verify, replace, or fall back from this endpoint.",
                 }
               : {}),
-        canAllow: entry.record.event.effect !== "write",
+        canAllow:
+          entry.record.event.name !== "write_file" && entry.record.event.name !== "edit_file",
         changePreviewRef,
       },
     ];

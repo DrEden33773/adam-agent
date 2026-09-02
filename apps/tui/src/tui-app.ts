@@ -2065,7 +2065,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       });
       permission = { overlay, requestId: pending.requestId, hide: () => handle.hide() };
       if (pending.changePreviewRef === null) {
-        overlay.setPreview({ readable: pending.effect !== "write", text: "No preview available." });
+        overlay.setPreview({ readable: pending.canAllow, text: "No preview available." });
       } else {
         void options.presentation
           .dispatch({ type: "read_artifact", artifact: pending.changePreviewRef, range: null })
