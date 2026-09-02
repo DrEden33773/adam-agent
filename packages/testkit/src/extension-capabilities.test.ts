@@ -438,30 +438,7 @@ test("ExtensionHost preserves the exact historical origin policy for one managed
           if (lifecycle === undefined) {
             throw new Error("The session lifecycle is unavailable.");
           }
-          const resolver = Reflect.get(lifecycle, "resolveManagedSessionOrigin");
-          if (typeof resolver === "function") {
-            return (await Reflect.apply(resolver, lifecycle, [input])) as {
-              readonly targetIdentity: ModelTargetIdentity;
-              readonly childContextProfile?: ContextProfile;
-              readonly childModel?: ModelDriver;
-              readonly thinkingPolicy?: NonNullable<ModelRequest["thinkingPolicy"]>;
-            };
-          }
-          const snapshot = await lifecycle.inspect({ sessionId: input.origin.sessionId });
-          if (snapshot.schemaVersion !== 3) {
-            throw new Error("The origin session is unavailable.");
-          }
-          const resolved = await modelTargets.resolve({
-            allowExperimental: true,
-            signal: input.signal,
-            targetId: snapshot.targetIdentity.targetId,
-            targetIdentity: snapshot.targetIdentity,
-          });
-          return {
-            childContextProfile: resolved.contextProfile,
-            childModel: resolved.driver,
-            targetIdentity: resolved.identity,
-          };
+          return lifecycle.resolveManagedSessionOrigin(input);
         },
         workspaceRoot,
       },
