@@ -47,6 +47,7 @@ import {
   type SessionStoreDirectory,
   sessionAutomaticTitlesEnabled,
   sessionCloseDrainBarrier,
+  sessionDurableOutputLimits,
   sessionLogicalRunStartedBarrier,
   sessionProjectLifecycleOwner,
   sessionStoreDirectory,
@@ -584,6 +585,220 @@ test("SessionLifecycle exposes submit_plan only while exploring and makes it ter
   }
 });
 
+test("SessionLifecycle preserves a non-empty submit_plan preamble across current and cold inspection", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-submit-preamble-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const markdown = "# Reviewed plan\n\n1. Preserve the preamble.\n2. Submit the artifact.\n";
+  const title = "Reviewed plan";
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "The exact Plan is ready for external review." },
+    { type: "tool_call_start", id: "submit-plan-with-preamble", name: "submit_plan" },
+    {
+      type: "tool_call_delta",
+      id: "submit-plan-with-preamble",
+      json: JSON.stringify({ title, markdown }),
+    },
+    { type: "tool_call_end", id: "submit-plan-with-preamble" },
+    { type: "finish", reason: "tool_calls" },
+  ]);
+  const modelTargets = modelTargetsWithDriver(driver);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycleOptions = {
+    modelTargets,
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  };
+  let lifecycle = harness.createLifecycle(lifecycleOptions);
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Publish the exact implementation plan." },
+    });
+
+    expect(continued).toMatchObject({
+      result: { status: "completed", answer: "" },
+      snapshot: {
+        plan: {
+          state: "ready",
+          revision: 2,
+          submission: {
+            title,
+            contentDigest: `sha256:${createHash("sha256").update(markdown).digest("hex")}`,
+          },
+        },
+      },
+    });
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      plan: { state: "ready", revision: 2, submission: { title } },
+    });
+
+    await lifecycle.close();
+    lifecycle = harness.createLifecycle(lifecycleOptions);
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      plan: { state: "ready", revision: 2, submission: { title } },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle preserves an artifact-backed submit_plan preamble across current and cold inspection", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-submit-artifact-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const markdown =
+    "# Artifact-backed plan\n\n1. Retain the assistant preamble.\n2. Review the Plan.\n";
+  const title = "Artifact-backed plan";
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "This preamble must be stored outside the inline response field." },
+    { type: "tool_call_start", id: "submit-artifact-plan", name: "submit_plan" },
+    {
+      type: "tool_call_delta",
+      id: "submit-artifact-plan",
+      json: JSON.stringify({ title, markdown }),
+    },
+    { type: "tool_call_end", id: "submit-artifact-plan" },
+    { type: "finish", reason: "tool_calls" },
+  ]);
+  const modelTargets = modelTargetsWithDriver(driver);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycleOptions = {
+    modelTargets,
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [sessionDurableOutputLimits]: {
+      maximumInlineFieldBytes: 4,
+      maximumReferencedArtifactBytes: 1_024,
+      maximumResponseContentBytes: 2_048,
+    },
+  };
+  let lifecycle = harness.createLifecycle(lifecycleOptions);
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Publish an artifact-backed Plan response." },
+    });
+
+    expect(continued).toMatchObject({
+      result: { status: "completed", answer: "" },
+      snapshot: { plan: { state: "ready", revision: 2, submission: { title } } },
+    });
+    const store = await harness.sessions.open(created.sessionId);
+    const durableTypes =
+      (await store?.read())?.flatMap((record) =>
+        record.schemaVersion === 3 ? [record.record.type] : [],
+      ) ?? [];
+    expect(durableTypes).toContain("model_response_published");
+    expect(durableTypes).toContain("run_settled");
+    expect(durableTypes).not.toContain("session_settled");
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      plan: { state: "ready", revision: 2, submission: { title } },
+    });
+
+    await lifecycle.close();
+    lifecycle = harness.createLifecycle(lifecycleOptions);
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      plan: { state: "ready", revision: 2, submission: { title } },
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle rejects a terminal submit_plan history whose Plan record is missing", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-submit-missing-record-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver([
+    { type: "text_delta", text: "The Plan record must remain authoritative." },
+    { type: "tool_call_start", id: "submit-plan-without-record", name: "submit_plan" },
+    {
+      type: "tool_call_delta",
+      id: "submit-plan-without-record",
+      json: '{"markdown":"# Missing durable Plan record\\n"}',
+    },
+    { type: "tool_call_end", id: "submit-plan-without-record" },
+    { type: "finish", reason: "tool_calls" },
+  ]);
+  const backing = createInMemorySessionStoreDirectory<SessionRecord>();
+  const wrapStore = (
+    store: Awaited<ReturnType<SessionStoreDirectory<SessionRecord>["create"]>>,
+  ) => {
+    let droppedSequence: number | undefined;
+    return {
+      async append(record: SessionRecord) {
+        await store.append(
+          droppedSequence === undefined || record.sequence < droppedSequence
+            ? record
+            : { ...record, sequence: record.sequence - 1 },
+        );
+      },
+      async appendBatch(records: readonly SessionRecord[]) {
+        const filtered = records.flatMap((record) => {
+          if (record.schemaVersion === 3 && record.record.type === "plan_submitted") {
+            droppedSequence = record.sequence;
+            return [];
+          }
+          return [record];
+        });
+        await store.appendBatch(filtered);
+      },
+      read: () => store.read(),
+    };
+  };
+  const directory: SessionStoreDirectory<SessionRecord> = {
+    async create(sessionId) {
+      return wrapStore(await backing.create(sessionId));
+    },
+    listSessionEntries: () => backing.listSessionEntries(),
+    listSessionIds: () => backing.listSessionIds(),
+    async open(sessionId) {
+      const store = await backing.open(sessionId);
+      return store === undefined ? undefined : wrapStore(store);
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets: modelTargetsWithDriver(driver),
+    stateRoot,
+    workspaceRoot,
+    [sessionAutomaticTitlesEnabled]: false,
+    [sessionStoreDirectory]: directory,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Publish a Plan whose canonical record is dropped." },
+      }),
+    ).rejects.toMatchObject({ code: "session_invalid" });
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle accepts submit_plan at the exact UTF-8 title and Markdown byte boundaries", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-submit-boundary-"));
   const stateRoot = join(testRoot, "state");
@@ -779,7 +994,13 @@ test.each(["first", "last"] as const)(
   },
 );
 
-test.each(["failed terminal", "mismatched completed output", "mismatched artifact byte count"])(
+test.each([
+  "failed terminal",
+  "mismatched completed output",
+  "mismatched artifact byte count",
+  "mismatched content digest",
+  "non-empty session settlement",
+])(
   "SessionLifecycle rejects a forged plan_submitted record after a $caseName",
   async (caseName) => {
     const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-submit-forged-"));
@@ -822,14 +1043,23 @@ test.each(["failed terminal", "mismatched completed output", "mismatched artifac
       const submitted = records?.find(
         (entry) => entry.schemaVersion === 3 && entry.record.type === "plan_submitted",
       );
+      const settlement = records?.find(
+        (entry) =>
+          entry.schemaVersion === 3 &&
+          entry.record.type === "runtime_event" &&
+          entry.record.event.type === "session_settled",
+      );
       if (
         terminal?.schemaVersion !== 3 ||
         terminal.record.type !== "runtime_event" ||
         terminal.record.event.type !== "tool_completed" ||
         submitted?.schemaVersion !== 3 ||
-        submitted.record.type !== "plan_submitted"
+        submitted.record.type !== "plan_submitted" ||
+        settlement?.schemaVersion !== 3 ||
+        settlement.record.type !== "runtime_event" ||
+        settlement.record.event.type !== "session_settled"
       ) {
-        throw new Error("Expected the exact submit terminal and Plan record.");
+        throw new Error("Expected the exact submit terminal, Plan record, and settlement.");
       }
       if (caseName === "failed terminal") {
         Object.assign(terminal.record, {
@@ -849,9 +1079,15 @@ test.each(["failed terminal", "mismatched completed output", "mismatched artifac
             contentDigest: submitted.record.contentDigest,
           },
         });
-      } else {
+      } else if (caseName === "mismatched artifact byte count") {
         Object.assign(submitted.record.artifact, {
           byteCount: submitted.record.artifact.byteCount + 1,
+        });
+      } else if (caseName === "mismatched content digest") {
+        Object.assign(submitted.record, { contentDigest: `sha256:${"0".repeat(64)}` });
+      } else {
+        Object.assign(settlement.record.event, {
+          result: { status: "completed", answer: "forged Plan answer" },
         });
       }
 

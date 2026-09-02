@@ -1349,6 +1349,39 @@ export async function createPresentationSession(
       );
       return activation;
     };
+    const recoverAdmittedRunSnapshot = async (sessionId: string): Promise<void> => {
+      if (closed) {
+        return;
+      }
+      try {
+        const inspected = await options.lifecycle.inspect({ sessionId });
+        if (inspected.schemaVersion === 3) {
+          await activateSnapshot(inspected);
+        }
+      } catch {
+        const activeSessionId = state.authoritative.active?.session.id;
+        if (closed || (activeSessionId !== undefined && activeSessionId !== sessionId)) {
+          return;
+        }
+        state = {
+          revision: state.revision + 1,
+          authoritative: {
+            ...state.authoritative,
+            continuity: {
+              status: "degraded",
+              fault: {
+                code: "authoritative_state_unavailable",
+                message: "The durable session view is temporarily unavailable.",
+              },
+            },
+          },
+          draft: state.draft,
+          composer: state.composer,
+          transient: null,
+        };
+        publishStateChange();
+      }
+    };
     const refreshActiveNaming = async (
       sessionId: string,
       throughSequence: number,
@@ -2932,6 +2965,13 @@ export async function createPresentationSession(
             message: "The prompt does not target the active session or is blank.",
           };
         }
+        if (state.authoritative.continuity.status !== "current") {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The active session boundary is no longer available for this command.",
+          };
+        }
         if (activeRun !== undefined) {
           return {
             status: "rejected",
@@ -3084,15 +3124,7 @@ export async function createPresentationSession(
               await activateSnapshot(continued.snapshot);
             }
           })
-          .catch(async () => {
-            if (closed) {
-              return;
-            }
-            const inspected = await options.lifecycle.inspect({ sessionId: command.sessionId });
-            if (inspected.schemaVersion === 3) {
-              await activateSnapshot(inspected);
-            }
-          })
+          .catch(() => recoverAdmittedRunSnapshot(command.sessionId))
           .finally(() => {
             if (activeRun === runState) {
               activeRun = undefined;
@@ -3148,6 +3180,13 @@ export async function createPresentationSession(
             status: "rejected",
             code: "invalid_command",
             message: "A non-empty prompt and exact draft target are required.",
+          };
+        }
+        if (state.authoritative.continuity.status !== "current") {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The active session boundary is no longer available for this command.",
           };
         }
         if (activeRun !== undefined) {
@@ -3268,15 +3307,12 @@ export async function createPresentationSession(
               await activateSnapshot(continued.snapshot);
             }
           })
-          .catch(async () => {
+          .catch(() => {
             const sessionId = admittedSessionId;
             if (closed || sessionId === null) {
               return;
             }
-            const inspected = await options.lifecycle.inspect({ sessionId });
-            if (inspected.schemaVersion === 3) {
-              await activateSnapshot(inspected);
-            }
+            return recoverAdmittedRunSnapshot(sessionId);
           })
           .finally(() => {
             if (activeRun === runState) {
@@ -3311,7 +3347,18 @@ export async function createPresentationSession(
         if (activeRun === runState) {
           runState.sessionId = admitted.sessionId;
         }
-        const admittedSnapshot = await options.lifecycle.inspect({ sessionId: admitted.sessionId });
+        let admittedSnapshot: Awaited<ReturnType<SessionLifecycle["inspect"]>>;
+        try {
+          admittedSnapshot = await options.lifecycle.inspect({ sessionId: admitted.sessionId });
+        } catch {
+          await settlement;
+          turnComposer.unseal();
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The admitted draft session could not be read from durable history.",
+          };
+        }
         if (admittedSnapshot.schemaVersion !== 3) {
           await settlement;
           turnComposer.unseal();
