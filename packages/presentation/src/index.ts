@@ -812,6 +812,7 @@ export type PresentationFault = {
 
 export type NewSessionDraftDisplay = {
   readonly targetId: string;
+  readonly mode: "default" | "plan";
   readonly skills: SkillCatalogDisplay;
   readonly projectPaths: ProjectPathCatalogDisplay;
 };
@@ -1084,6 +1085,10 @@ export type PresentationCommand =
   | {
       readonly type: "create_session";
       readonly targetId: string;
+    }
+  | {
+      readonly type: "set_draft_mode";
+      readonly mode: "default" | "plan";
     }
   | {
       readonly type: "enter_plan";

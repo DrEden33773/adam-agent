@@ -3902,27 +3902,90 @@ test("the idle footer exposes Registry-driven interaction hints", async () => {
   }
 });
 
-test("the production TUI toggles and displays authoritative read-only Plan status", async () => {
+test("a new-session draft toggles read-only Plan without creating durable identity", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-status-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
 
   try {
-    const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    const beforeTarget = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
+    const beforeTargetClose = fixture.output().length;
+    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
     await fixture.resize(120, 40);
 
+    const beforeEntry = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitFor("Plan exploring · read-only");
+    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforeEntry);
     let frame = latestSynchronizedFrame(fixture.output()).join("\n");
     expect(frame).toContain("Plan exploring · read-only");
+    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
+
+    const beforeTargetSwitch = fixture.output().length;
+    fixture.write("/target\r");
+    await fixture.waitForCompleteFrameAfter("Select an exact model target", beforeTargetSwitch);
+    const beforeTargetSelection = fixture.output().length;
+    fixture.write("\u001b[B\r");
+    await fixture.waitForCompleteFrameAfter(
+      "deepseek-v4-pro.direct · Certified",
+      beforeTargetSelection,
+    );
+    const beforeSwitchedTargetClose = fixture.output().length;
+    await fixture.waitForCompleteFrameAfter(
+      "Plan exploring · read-only",
+      beforeSwitchedTargetClose,
+    );
+    expect(fixture.screen()?.join("\n") ?? "").toContain("Plan exploring · read-only");
 
     const beforeExit = fixture.output().length;
     fixture.write("/plan\r");
     await fixture.waitForAfter("Exited read-only Plan.", beforeExit);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeExit)).join("\n");
     expect(frame).not.toContain("Plan exploring · read-only");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("a prompt-admitted production session enters read-only Plan after its first turn", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-after-admission-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      launch: {},
+      scenario: "skill-selection",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Select an exact model target");
+    const beforeTarget = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
+    const beforeTargetClose = fixture.output().length;
+    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
+
+    const beforePrompt = fixture.output().length;
+    fixture.write("Confirm the current Plan capability\r");
+    await fixture.waitForAfter("Skill selection complete.", beforePrompt);
+    const afterAnswer = fixture.output().lastIndexOf("Skill selection complete.");
+    await fixture.waitForCompleteFrameAfter(" · idle", afterAnswer);
+
+    const beforePlan = fixture.output().length;
+    fixture.write("/plan\r");
+    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforePlan);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforePlan)).join("\n");
+    expect(frame).toContain("Plan exploring · read-only");
+    expect(frame).not.toContain("Plan could not be entered from the current session state.");
 
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -3938,11 +4001,17 @@ test("the production TUI reviews, revises, and implements the exact ready Plan",
   await mkdir(workspaceRoot);
 
   try {
-    const fixture = startFixture({ scenario: "plan-review", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    const fixture = startFixture({ launch: {}, scenario: "plan-review", stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    const beforeTarget = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
+    const beforeTargetClose = fixture.output().length;
+    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
     await fixture.resize(120, 40);
+    const beforeEntry = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitFor("Plan exploring · read-only");
+    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforeEntry);
 
     const beforeInitialSubmission = fixture.output().length;
     fixture.write("Create the exact implementation plan\r");
@@ -4009,11 +4078,17 @@ test("the production TUI keeps the exact composer draft while a ready Plan revie
   await mkdir(workspaceRoot);
 
   try {
-    const fixture = startFixture({ scenario: "plan-review", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    const fixture = startFixture({ launch: {}, scenario: "plan-review", stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    const beforeTarget = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
+    const beforeTargetClose = fixture.output().length;
+    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
     await fixture.resize(120, 40);
+    const beforeEntry = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitFor("Plan exploring · read-only");
+    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforeEntry);
     const beforePlan = fixture.output().length;
     fixture.write("Create a plan whose ready state must remain exact\r");
     await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);
@@ -4045,11 +4120,17 @@ test("the production TUI cancels a ready Plan only after concise confirmation", 
   await mkdir(workspaceRoot);
 
   try {
-    const fixture = startFixture({ scenario: "plan-review", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    const fixture = startFixture({ launch: {}, scenario: "plan-review", stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    const beforeTarget = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
+    const beforeTargetClose = fixture.output().length;
+    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
     await fixture.resize(120, 40);
+    const beforeEntry = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitFor("Plan exploring · read-only");
+    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforeEntry);
     const beforePlan = fixture.output().length;
     fixture.write("Create a plan that will be cancelled exactly\r");
     await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);
@@ -4098,14 +4179,21 @@ test("the production TUI explicitly continues a recovered unstarted Plan approva
 
   try {
     const fixture = startFixture({
+      launch: {},
       scenario: "plan-review-recovery",
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitFor("Select an exact model target");
+    const beforeTarget = fixture.output().length;
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
+    const beforeTargetClose = fixture.output().length;
+    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
     await fixture.resize(120, 40);
+    const beforeEntry = fixture.output().length;
     fixture.write("/plan\r");
-    await fixture.waitFor("Plan exploring · read-only");
+    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforeEntry);
     const beforePlan = fixture.output().length;
     fixture.write("Create a plan whose durable approval must be recovered\r");
     await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);

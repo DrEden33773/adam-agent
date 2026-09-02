@@ -17,6 +17,7 @@ import { deflateSync } from "node:zlib";
 import {
   type ContextProfile,
   createCodingToolRegistry,
+  createFileArtifactStore,
   createModelTargets,
   createMutationToolRegistry,
   createPermissionPolicy,
@@ -33,8 +34,10 @@ import {
 } from "@adam-agent/agent";
 import {
   createInMemorySessionStoreDirectory,
+  createJsonlWebEvidenceStore,
   createPlanToolProfileV1,
   createUnavailablePlanShellEnvironmentV1,
+  createWebEvidenceToolRegistry,
   inputResourceIngestBarrier,
   openJsonlSessionStore,
   type ProjectLifecycleOwner,
@@ -9536,6 +9539,222 @@ test("SessionLifecycle explicitly replays one exact safe read after revalidating
       ],
     });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle replays one started web_open through its composed session Tool Registry", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-web-open-replay-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const url = "https://example.com/durable-plan-evidence.txt";
+  const body = Buffer.from("durable Web evidence", "utf8");
+  let httpCalls = 0;
+  const webHttp = {
+    async fetch() {
+      httpCalls += 1;
+      return { status: 200, url, mediaType: "text/plain; charset=utf-8", body };
+    },
+  };
+  const artifactStore = await createFileArtifactStore({ root: join(stateRoot, "artifacts") });
+  const webStore = createJsonlWebEvidenceStore({ filePath: join(stateRoot, "web-evidence.jsonl") });
+  const seedTools = await createWebEvidenceToolRegistry({
+    artifactStore,
+    http: webHttp,
+    store: webStore,
+  });
+  const fetchPrepared = seedTools.resolve("web_fetch")?.prepare(JSON.stringify({ url }));
+  if (fetchPrepared?.status !== "ready") {
+    throw new Error("Expected the Web fetch seed to be ready.");
+  }
+  const fetched = await fetchPrepared.execute({
+    callId: "seed-web-fetch",
+    sessionId: "123e4567-e89b-42d3-a456-426614174600",
+    signal: new AbortController().signal,
+    toolName: "web_fetch",
+    toolProfileDigest: `sha256:${"1".repeat(64)}`,
+  });
+  const artifactId =
+    fetched.status === "completed" &&
+    typeof fetched.output === "object" &&
+    fetched.output !== null &&
+    typeof Reflect.get(fetched.output, "artifactId") === "string"
+      ? (Reflect.get(fetched.output, "artifactId") as `sha256:${string}`)
+      : undefined;
+  const webOpen = seedTools.resolve("web_open");
+  if (artifactId === undefined || webOpen === undefined) {
+    throw new Error("Expected the seeded immutable Web artifact and web_open Adapter.");
+  }
+  let replayedToolResult: ModelMessage | undefined;
+  const modelToolDefinitions = [
+    ...createCodingToolRegistry({ workspaceRoot }).definitions(),
+    ...seedTools.definitions(),
+  ];
+  const driver = new FakeModelDriver((request) => {
+    replayedToolResult = request.messages.findLast(
+      (message) => message.role === "tool" && message.name === "web_open",
+    );
+    return [
+      { type: "text_delta", text: "Recovered the immutable Web evidence." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets = modelTargetsWithDriver(driver);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycleOptions = {
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    stateRoot,
+    webHttp,
+    webSearchConfiguration: {
+      async load() {
+        return { status: "unconfigured" as const, provider: null, diagnostic: null };
+      },
+    },
+    workspaceRoot,
+  };
+  let lifecycle = harness.createLifecycle(lifecycleOptions);
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const runId = "123e4567-e89b-42d3-a456-426614174601";
+    const call = {
+      id: "open-after-restart",
+      name: "web_open",
+      argumentsJson: JSON.stringify({ artifactId }),
+    } as const;
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the created session store.");
+    }
+    const records: readonly Omit<
+      Extract<SessionRecord, { readonly schemaVersion: 3 }>,
+      "sequence"
+    >[] = [
+      {
+        schemaVersion: 3,
+        record: { type: "logical_run_started", runId, userMessage: "Open durable Web evidence" },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "user_message", text: "Open durable Web evidence" },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "provider_attempt_started",
+          runId,
+          turn: 1,
+          attempt: 1,
+          targetIdentity,
+          promptProjection: promptProjectionFor(
+            created,
+            "Open durable Web evidence",
+            modelToolDefinitions,
+          ),
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: { type: "runtime_event", runId, event: { type: "model_message_started" } },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "model_response_completed",
+          runId,
+          turn: 1,
+          attempt: 1,
+          targetIdentity,
+          response: {
+            text: "",
+            toolCalls: [call],
+            toolIntents: [
+              {
+                callId: call.id,
+                name: call.name,
+                argumentsDigest: `sha256:${createHash("sha256")
+                  .update(call.argumentsJson)
+                  .digest("hex")}`,
+                effect: "read",
+                definitionDigest: webOpen.definitionDigest,
+                replay: "safe",
+              },
+            ],
+            finishReason: "tool_calls",
+          },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "model_message_completed", text: "" },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "tool_requested", callId: call.id, name: call.name },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: {
+            type: "tool_permission_decided",
+            callId: call.id,
+            name: call.name,
+            decision: "allow",
+            effect: "read",
+            scope: "call",
+            subject: { type: "web_artifact", operation: "open", artifactId },
+          },
+        },
+      },
+      {
+        schemaVersion: 3,
+        record: {
+          type: "runtime_event",
+          runId,
+          event: { type: "tool_started", callId: call.id, name: call.name },
+        },
+      },
+    ];
+    for (const [index, record] of records.entries()) {
+      await store.append({ ...record, sequence: index + 2 } as SessionRecord);
+    }
+    await lifecycle.close();
+    lifecycle = harness.createLifecycle(lifecycleOptions);
+
+    await expect(lifecycle.resume({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "ready",
+      snapshot: { status: "interrupted" },
+    });
+    await expect(lifecycle.continue({ sessionId: created.sessionId })).resolves.toMatchObject({
+      result: { status: "completed", answer: "Recovered the immutable Web evidence." },
+    });
+    expect(replayedToolResult).toMatchObject({
+      role: "tool",
+      name: "web_open",
+      result: {
+        status: "completed",
+        output: { artifactId, text: "durable Web evidence", truncated: false, nextCursor: null },
+      },
+    });
+    expect(httpCalls).toBe(1);
+  } finally {
+    await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }
 });

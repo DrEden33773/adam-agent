@@ -589,6 +589,7 @@ export async function createPresentationSession(
           ? null
           : {
               targetId: initialDraft.targetIdentity.targetId,
+              mode: "default",
               skills: projectSkillContext(initialDraft.skillContext, false),
               projectPaths,
             },
@@ -2563,6 +2564,8 @@ export async function createPresentationSession(
         await turnComposer.clear({ preserveRetained: true });
         attachmentAvailable = true;
         attachmentUnavailableReason = null;
+        const draftMode =
+          state.authoritative.active === null ? (state.draft?.mode ?? "default") : "default";
         state = {
           revision: state.revision + 1,
           authoritative: {
@@ -2576,6 +2579,7 @@ export async function createPresentationSession(
           },
           draft: {
             targetId: targetIdentity.targetId,
+            mode: draftMode,
             skills: projectSkillContext(preview.skillContext, false),
             projectPaths,
           },
@@ -2586,6 +2590,29 @@ export async function createPresentationSession(
         if (recovered !== null) {
           await turnComposer.restoreDraft(recovered);
         }
+        publishStateChange();
+        return { status: "admitted", commandId: randomUUID(), resource: null };
+      }
+      if (command.type === "set_draft_mode") {
+        if (activeRun !== undefined) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "The active session already has a running command.",
+          };
+        }
+        if (state.authoritative.active !== null || state.draft === null) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The new-session draft is no longer active.",
+          };
+        }
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          draft: { ...state.draft, mode: command.mode },
+        };
         publishStateChange();
         return { status: "admitted", commandId: randomUUID(), resource: null };
       }
@@ -3214,6 +3241,7 @@ export async function createPresentationSession(
           },
           runId: commandId,
           signal: controller.signal,
+          ...(draft.mode === "plan" ? { mode: "plan" as const } : {}),
           ...(sealedDraft.selections.length === 0
             ? {}
             : { resourceSelections: sealedDraft.selections }),
