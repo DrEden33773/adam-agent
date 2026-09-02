@@ -2466,9 +2466,16 @@ export function createAgentManager(options: {
   };
   let boundParentSessionId = options.parentSessionId ?? "00000000-0000-4000-8000-000000000001";
   let appendQueue = Promise.resolve();
-  const appendManagedRecord = async (input: ManagedAgentRecordInput): Promise<void> => {
+  const appendManagedRecord = async (
+    input: ManagedAgentRecordInput,
+    guard: () => boolean = () => true,
+  ): Promise<boolean> => {
+    let appended = false;
     const operation = appendQueue.then(async () => {
       const records = await options.managedStore.read();
+      if (!guard()) {
+        return;
+      }
       if (
         input.type === "managed_agent_admitted" &&
         input.profile !== "reviewer.v1" &&
@@ -2485,9 +2492,11 @@ export function createAgentManager(options: {
         schemaVersion: 1,
         sequence: records.length + 1,
       });
+      appended = true;
     });
     appendQueue = operation.catch(() => undefined);
     await operation;
+    return appended;
   };
   const hasInteractiveParentSink = (): boolean => {
     const interactive = options.parentCoordination?.interactive;
@@ -3306,19 +3315,27 @@ export function createAgentManager(options: {
       ) {
         return;
       }
-      await appendManagedRecord({
-        type: "managed_agent_stalled",
-        agentId,
-        attemptId,
-        childSessionId,
-        maximumInactivityMilliseconds: 300_000,
-      });
+      const appended = await appendManagedRecord(
+        {
+          type: "managed_agent_stalled",
+          agentId,
+          attemptId,
+          childSessionId,
+          maximumInactivityMilliseconds: 300_000,
+        },
+        () => generation === inactivityGeneration && !terminalCommitStarted,
+      );
+      if (!appended) {
+        return;
+      }
       stalledAttemptIds.add(attemptId);
       const active = activeAttempts.get(agentId);
       if (active?.attemptId === attemptId) {
         active.revision += 1;
       }
-      coordinationStates.get(attemptId)?.notifyAttention();
+      if (generation === inactivityGeneration) {
+        coordinationStates.get(attemptId)?.notifyAttention();
+      }
     };
     const enqueueInactivity = (operation: () => Promise<void>): Promise<void> => {
       const queued = inactivitySettlement.then(operation).catch((error: unknown) => {
@@ -3342,48 +3359,55 @@ export function createAgentManager(options: {
         },
       );
     };
+    const invalidateInactivityWindow = (): void => {
+      inactivityGeneration += 1;
+      inactivityTimer?.cancel();
+      inactivityTimer = undefined;
+    };
+    const enqueueInactivityProgress = (startNextWindow: boolean): void => {
+      invalidateInactivityWindow();
+      void enqueueInactivity(async () => {
+        if (terminalCommitStarted) {
+          return;
+        }
+        if (stalledAttemptIds.has(attemptId)) {
+          await appendManagedRecord({
+            type: "managed_agent_resumed",
+            agentId,
+            attemptId,
+            childSessionId,
+          });
+          stalledAttemptIds.delete(attemptId);
+          const active = activeAttempts.get(agentId);
+          if (active?.attemptId === attemptId) {
+            active.revision += 1;
+          }
+          const coordination = coordinationStates.get(attemptId);
+          if (coordination?.attentionId === undefined) {
+            coordination?.resetAttention();
+          }
+        }
+        if (startNextWindow && inactivityPauseReason === undefined) {
+          resetInactivity();
+        }
+      }).catch(() => undefined);
+    };
     const pauseInactivity = (reason: "permission" | "parent"): void => {
       if (maximumInactivityMilliseconds === undefined) {
         return;
       }
       inactivityPauseReason = reason;
-      inactivityGeneration += 1;
-      inactivityTimer?.cancel();
-      inactivityTimer = undefined;
+      enqueueInactivityProgress(false);
     };
     const resumeInactivity = (): void => {
       if (maximumInactivityMilliseconds === undefined || inactivityPauseReason === undefined) {
         return;
       }
       inactivityPauseReason = undefined;
-      resetInactivity();
+      enqueueInactivityProgress(true);
     };
     const recordInactivityProgress = (): void => {
-      if (!stalledAttemptIds.has(attemptId)) {
-        resetInactivity();
-        return;
-      }
-      void enqueueInactivity(async () => {
-        if (!stalledAttemptIds.has(attemptId) || terminalCommitStarted) {
-          return;
-        }
-        await appendManagedRecord({
-          type: "managed_agent_resumed",
-          agentId,
-          attemptId,
-          childSessionId,
-        });
-        stalledAttemptIds.delete(attemptId);
-        const active = activeAttempts.get(agentId);
-        if (active?.attemptId === attemptId) {
-          active.revision += 1;
-        }
-        const coordination = coordinationStates.get(attemptId);
-        if (coordination?.attentionId === undefined) {
-          coordination?.resetAttention();
-        }
-        resetInactivity();
-      }).catch(() => undefined);
+      enqueueInactivityProgress(true);
     };
     inactivityControls.set(attemptId, {
       pauseParent: () => pauseInactivity("parent"),

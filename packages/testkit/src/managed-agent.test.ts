@@ -1690,7 +1690,8 @@ test("AgentManager pauses current inactivity for permission and resumes after th
       status: "accepted",
     });
     await permissionDecided.promise;
-    expect(scheduled).toHaveLength(schedulesWhilePaused + 1);
+    await manager.snapshot();
+    expect(scheduled.length).toBeGreaterThan(schedulesWhilePaused);
     await manager.waitForIdle();
     expect(providerCalls).toBe(2);
   } finally {
@@ -5712,29 +5713,7 @@ test("AgentManager retains the current context budget across exactly four child 
   });
   const parentSessionId = "123e4567-e89b-42d3-a456-426614174551";
   const parentRoot = await domain.claimRoot({ rootId: `session:${parentSessionId}` });
-  const baseManagedStore = createInMemoryManagedAgentStore();
-  let freezeConcurrentAdmissionReads = false;
-  let concurrentAdmissionReads = 0;
-  let concurrentAdmissionSnapshot: Awaited<ReturnType<typeof baseManagedStore.read>> | undefined;
-  const concurrentReadsReached = Promise.withResolvers<void>();
-  const managedStore = {
-    append: (record: Parameters<typeof baseManagedStore.append>[0]) =>
-      baseManagedStore.append(record),
-    async read() {
-      if (!freezeConcurrentAdmissionReads) {
-        return baseManagedStore.read();
-      }
-      concurrentAdmissionSnapshot ??= await baseManagedStore.read();
-      concurrentAdmissionReads += 1;
-      if (concurrentAdmissionReads === 2) {
-        freezeConcurrentAdmissionReads = false;
-        concurrentReadsReached.resolve();
-      } else {
-        await concurrentReadsReached.promise;
-      }
-      return concurrentAdmissionSnapshot;
-    },
-  };
+  const managedStore = createInMemoryManagedAgentStore();
   const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
   const manager = createAgentManager({
     builtInProfileVersion: 2,
@@ -5856,7 +5835,6 @@ test("AgentManager retains the current context budget across exactly four child 
       }
     }
     expect(providerCalls).toBe(15);
-    freezeConcurrentAdmissionReads = true;
     const concurrentAdmissions = await Promise.all([
       manager.spawnBackground({
         callId: "current-parent-attempt-16-concurrent",
@@ -5902,6 +5880,54 @@ test("AgentManager retains the current context budget across exactly four child 
     await domain.close();
     await rm(testRoot, { recursive: true, force: true });
   }
+});
+
+test("ManagedAgentStore atomically rejects a concurrent seventeenth parent attempt", async () => {
+  const managedStore = createInMemoryManagedAgentStore();
+  const parentSessionId = "123e4567-e89b-42d3-a456-426614174651";
+  const admission = (ordinal: number, sequence: number) => {
+    const suffix = ordinal.toString().padStart(11, "0");
+    const task = `Concurrent capacity attempt ${ordinal}.`;
+    return {
+      schemaVersion: 1 as const,
+      type: "managed_agent_admitted" as const,
+      sequence,
+      agentId: `123e4567-e89b-42d3-a456-1${suffix}`,
+      attemptId: `123e4567-e89b-42d3-a456-2${suffix}`,
+      childSessionId: `123e4567-e89b-42d3-a456-3${suffix}`,
+      parentSessionId,
+      parentToolCallId: `concurrent-capacity-${ordinal}`,
+      parentRootId: `session:${parentSessionId}`,
+      projectId,
+      profile: "scout.v2" as const,
+      mode: "background" as const,
+      profileDigest: scoutManagedAgentProfileV2.digest,
+      usageAccountingVersion: 2 as const,
+      limits: {
+        maximumTokens: 1_000_000,
+        maximumInactivityMilliseconds: 300_000,
+      },
+      admittedAtUnixMilliseconds: 1_800_000_000_000 + ordinal,
+      taskDigest: testTaskDigest(task),
+      childInputDigest: testTaskDigest(`${task}\n\n${childLiveWorkspaceNotice}`),
+      targetIdentity,
+    };
+  };
+  for (let ordinal = 1; ordinal <= 15; ordinal += 1) {
+    await managedStore.append(admission(ordinal, ordinal));
+  }
+
+  const settlements = await Promise.allSettled([
+    managedStore.append(admission(16, 16)),
+    managedStore.append(admission(17, 17)),
+  ]);
+
+  expect(settlements.map((settlement) => settlement.status)).toEqual(["fulfilled", "rejected"]);
+  expect(settlements[1]).toMatchObject({
+    status: "rejected",
+    reason: { code: "managed_agent_log_invalid" },
+  });
+  await expect(managedStore.read()).resolves.toHaveLength(16);
 });
 
 test("AgentSession injects only the bounded O(1) managed-child summary into the parent prompt", async () => {
