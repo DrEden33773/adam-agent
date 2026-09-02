@@ -14,8 +14,10 @@ import type { ArtifactReference, ArtifactStore } from "./artifact-store.js";
 import type { ContextProfile } from "./context-profile.js";
 import {
   researchManagedAgentProfileV1,
+  researchManagedAgentProfileV2,
   reviewerManagedAgentProfileV1,
   scoutManagedAgentProfileV1,
+  scoutManagedAgentProfileV2,
 } from "./managed-agent-profiles.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import type { ProjectExecutionRootClaim } from "./project-execution-domain.js";
@@ -51,6 +53,73 @@ const maximumManagedAgentReportsPerAttempt = 16;
 const maximumManagedAgentResultBytes = 16 * 1024;
 const childLiveWorkspaceNotice =
   "This child reads the live workspace. Parent changes may alter what it observes; isolated transcript does not mean repository snapshot or sandbox.";
+type BuiltInManagedAgentProfileId = "scout.v1" | "scout.v2" | "research.v1" | "research.v2";
+type ManagedAgentProfileId = "reviewer.v1" | BuiltInManagedAgentProfileId;
+
+function isResearchManagedAgentProfile(
+  profile: ManagedAgentProfileId,
+): profile is "research.v1" | "research.v2" {
+  return profile === "research.v1" || profile === "research.v2";
+}
+
+function isCurrentManagedAgentProfile(
+  profile: ManagedAgentProfileId,
+): profile is "scout.v2" | "research.v2" {
+  return profile === "scout.v2" || profile === "research.v2";
+}
+
+function managedAgentProfile(profile: ManagedAgentProfileId) {
+  return profile === "research.v2"
+    ? researchManagedAgentProfileV2
+    : profile === "scout.v2"
+      ? scoutManagedAgentProfileV2
+      : profile === "research.v1"
+        ? researchManagedAgentProfileV1
+        : profile === "reviewer.v1"
+          ? reviewerManagedAgentProfileV1
+          : scoutManagedAgentProfileV1;
+}
+
+function managedAdmissionLimitsAreValid(
+  admission: Extract<ManagedAgentRecord, { readonly type: "managed_agent_admitted" }>,
+  contextWindowTokens?: number,
+): boolean {
+  if (isCurrentManagedAgentProfile(admission.profile)) {
+    const profile =
+      admission.profile === "research.v2"
+        ? researchManagedAgentProfileV2
+        : scoutManagedAgentProfileV2;
+    return (
+      admission.limits.maximumTurns === undefined &&
+      admission.limits.maximumDeadlineMilliseconds === undefined &&
+      admission.limits.maximumInactivityMilliseconds ===
+        profile.limits.maximumInactivityMilliseconds &&
+      admission.deadlineAtUnixMilliseconds === undefined &&
+      (contextWindowTokens === undefined || admission.limits.maximumTokens === contextWindowTokens)
+    );
+  }
+  const profile =
+    admission.profile === "research.v1"
+      ? researchManagedAgentProfileV1
+      : admission.profile === "reviewer.v1"
+        ? reviewerManagedAgentProfileV1
+        : scoutManagedAgentProfileV1;
+  return (
+    admission.limits.maximumInactivityMilliseconds === undefined &&
+    admission.limits.maximumTurns === profile.limits.maximumTurnsPerAttempt &&
+    admission.limits.maximumTokens <= profile.limits.maximumCumulativeTokens &&
+    admission.limits.maximumDeadlineMilliseconds !== undefined &&
+    admission.limits.maximumDeadlineMilliseconds <= profile.limits.maximumDeadlineMilliseconds &&
+    ((admission.mode === undefined &&
+      admission.admittedAtUnixMilliseconds === undefined &&
+      admission.deadlineAtUnixMilliseconds === undefined) ||
+      (admission.mode !== undefined &&
+        admission.admittedAtUnixMilliseconds !== undefined &&
+        admission.deadlineAtUnixMilliseconds !== undefined &&
+        admission.deadlineAtUnixMilliseconds - admission.admittedAtUnixMilliseconds ===
+          admission.limits.maximumDeadlineMilliseconds))
+  );
+}
 const managedAgentTaskSchema = z.strictObject({
   task: z
     .string()
@@ -71,12 +140,24 @@ const managedAgentA3SpawnSchema = managedAgentTaskSchema
       context.addIssue({ code: "custom", message: "Only research.v1 accepts selected Skills." });
     }
   });
+const managedAgentA3SpawnSchemaV2 = managedAgentTaskSchema
+  .extend({
+    profile: z.enum(["scout.v2", "research.v2"]),
+    skills: z.array(z.string().min(1).max(512)).min(1).max(8).optional(),
+    mode: z.enum(["foreground", "background"]).optional(),
+  })
+  .superRefine((input, context) => {
+    if (input.profile === "scout.v2" && input.skills !== undefined) {
+      context.addIssue({ code: "custom", message: "Only research.v2 accepts selected Skills." });
+    }
+  });
 const managedAgentListSchema = z.strictObject({
   status: z
     .enum([
       "active",
       "terminal",
       "running",
+      "stalled",
       "completed",
       "failed",
       "cancelled",
@@ -163,7 +244,7 @@ const thinkingPolicySchema = z.strictObject({
 const managedAgentTerminalOutputSchema = z.strictObject({
   agentId: z.string().uuid(),
   attemptId: z.string().uuid(),
-  profile: z.enum(["reviewer.v1", "scout.v1", "research.v1"]),
+  profile: z.enum(["reviewer.v1", "scout.v1", "scout.v2", "research.v1", "research.v2"]),
   profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   effectiveToolProfileDigest: z
     .string()
@@ -211,7 +292,7 @@ export type ManagedAgentRecord =
       readonly parentToolCallId: string;
       readonly parentRootId: string;
       readonly projectId: `sha256:${string}`;
-      readonly profile: "reviewer.v1" | "scout.v1" | "research.v1";
+      readonly profile: ManagedAgentProfileId;
       readonly mode?: "foreground" | "background";
       readonly profileDigest: `sha256:${string}`;
       readonly usageAccountingVersion?: 2;
@@ -223,9 +304,10 @@ export type ManagedAgentRecord =
         readonly manifestDigest: `sha256:${string}`;
       }[];
       readonly limits: {
-        readonly maximumTurns: number;
+        readonly maximumTurns?: number;
         readonly maximumTokens: number;
-        readonly maximumDeadlineMilliseconds: number;
+        readonly maximumDeadlineMilliseconds?: number;
+        readonly maximumInactivityMilliseconds?: number;
       };
       readonly deadlineAtUnixMilliseconds?: number;
       readonly admittedAtUnixMilliseconds?: number;
@@ -339,6 +421,23 @@ export type ManagedAgentRecord =
     }
   | {
       readonly schemaVersion: 1;
+      readonly type: "managed_agent_stalled";
+      readonly sequence: number;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+      readonly maximumInactivityMilliseconds: 300_000;
+    }
+  | {
+      readonly schemaVersion: 1;
+      readonly type: "managed_agent_resumed";
+      readonly sequence: number;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+    }
+  | {
+      readonly schemaVersion: 1;
       readonly type: "managed_agent_inspection_required";
       readonly sequence: number;
       readonly agentId: string;
@@ -378,6 +477,7 @@ export type ManagedAgentRecord =
         readonly outputTokens: number;
         readonly reasoningTokens: number;
       };
+      readonly providerCalls?: number;
       readonly cost: { readonly status: "unavailable" };
     }
   | {
@@ -575,6 +675,23 @@ const managedAgentRecordSchema = z.union([
   }),
   z.strictObject({
     schemaVersion: z.literal(1),
+    type: z.literal("managed_agent_stalled"),
+    sequence: z.number().int().positive(),
+    agentId: z.uuid(),
+    attemptId: z.uuid(),
+    childSessionId: z.uuid(),
+    maximumInactivityMilliseconds: z.literal(300_000),
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(1),
+    type: z.literal("managed_agent_resumed"),
+    sequence: z.number().int().positive(),
+    agentId: z.uuid(),
+    attemptId: z.uuid(),
+    childSessionId: z.uuid(),
+  }),
+  z.strictObject({
+    schemaVersion: z.literal(1),
     type: z.literal("managed_agent_inspection_required"),
     sequence: z.number().int().positive(),
     agentId: z.uuid(),
@@ -596,7 +713,7 @@ const managedAgentRecordSchema = z.union([
     parentToolCallId: z.string().min(1).max(256),
     parentRootId: z.string().min(1).max(256),
     projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-    profile: z.enum(["reviewer.v1", "scout.v1", "research.v1"]),
+    profile: z.enum(["reviewer.v1", "scout.v1", "scout.v2", "research.v1", "research.v2"]),
     mode: z.enum(["foreground", "background"]).optional(),
     profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
     usageAccountingVersion: z.literal(2).optional(),
@@ -619,9 +736,10 @@ const managedAgentRecordSchema = z.union([
       .max(8)
       .optional(),
     limits: z.strictObject({
-      maximumTurns: z.number().int().min(1).max(8),
-      maximumTokens: z.number().int().positive().max(128_000),
-      maximumDeadlineMilliseconds: z.number().int().positive().max(600_000),
+      maximumTurns: z.number().int().min(1).max(8).optional(),
+      maximumTokens: z.number().int().positive().safe(),
+      maximumDeadlineMilliseconds: z.number().int().positive().max(600_000).optional(),
+      maximumInactivityMilliseconds: z.number().int().positive().max(300_000).optional(),
     }),
     deadlineAtUnixMilliseconds: z.number().int().nonnegative().safe().optional(),
     admittedAtUnixMilliseconds: z.number().int().nonnegative().safe().optional(),
@@ -672,6 +790,7 @@ const managedAgentRecordSchema = z.union([
       outputTokens: z.number().int().nonnegative(),
       reasoningTokens: z.number().int().nonnegative(),
     }),
+    providerCalls: z.number().int().positive().optional(),
     cost: z.strictObject({ status: z.literal("unavailable") }),
   }),
   z.strictObject({
@@ -775,10 +894,7 @@ export async function recoverInterruptedManagedAgents(
       genesis?.schemaVersion === 3 && genesis.record.type === "session_genesis"
         ? genesis.record.promptContext?.repository
         : undefined;
-    const managedProfile =
-      admission.profile === "research.v1"
-        ? researchManagedAgentProfileV1
-        : scoutManagedAgentProfileV1;
+    const managedProfile = managedAgentProfile(admission.profile);
     const genesisPromptContext =
       genesis?.schemaVersion === 3 && genesis.record.type === "session_genesis"
         ? genesis.record.promptContext
@@ -798,18 +914,7 @@ export async function recoverInterruptedManagedAgents(
     const validAdmissionIdentity =
       admission.parentRootId === `session:${admission.parentSessionId}` &&
       admission.profileDigest === managedProfile.digest &&
-      admission.limits.maximumTurns === managedProfile.limits.maximumTurnsPerAttempt &&
-      admission.limits.maximumTokens <= managedProfile.limits.maximumCumulativeTokens &&
-      admission.limits.maximumDeadlineMilliseconds <=
-        managedProfile.limits.maximumDeadlineMilliseconds &&
-      ((admission.mode === undefined &&
-        admission.admittedAtUnixMilliseconds === undefined &&
-        admission.deadlineAtUnixMilliseconds === undefined) ||
-        (admission.mode !== undefined &&
-          admission.admittedAtUnixMilliseconds !== undefined &&
-          admission.deadlineAtUnixMilliseconds !== undefined &&
-          admission.deadlineAtUnixMilliseconds - admission.admittedAtUnixMilliseconds ===
-            admission.limits.maximumDeadlineMilliseconds));
+      managedAdmissionLimitsAreValid(admission);
     const childCoordinationEvents = (childRecords ?? []).flatMap((record) => {
       const event =
         record.schemaVersion === 1 || record.schemaVersion === 2
@@ -1070,6 +1175,11 @@ export async function recoverInterruptedManagedAgents(
         sourceHistories,
         admission.usageAccountingVersion ?? 1,
       );
+      const cumulativeBudget = isCurrentManagedAgentProfile(admission.profile)
+        ? sourceAdmissions[0]?.limits.maximumTokens
+        : admission.profile === "research.v1"
+          ? researchManagedAgentProfileV1.limits.maximumCumulativeTokens
+          : scoutManagedAgentProfileV1.limits.maximumCumulativeTokens;
       const sourceTranscriptDigest = digest(JSON.stringify(sourceRecords ?? []));
       const sourceThroughSequence = sourceRecords?.at(-1)?.sequence ?? 0;
       const validSourceTerminalLink =
@@ -1092,8 +1202,8 @@ export async function recoverInterruptedManagedAgents(
         boundary.throughSequence === admission.resume.throughSequence &&
         sourceHistories.every((history) => history.valid) &&
         validSourceTerminalLink &&
-        admission.limits.maximumTokens ===
-          managedProfile.limits.maximumCumulativeTokens - cumulativeTokens;
+        cumulativeBudget !== undefined &&
+        admission.limits.maximumTokens === cumulativeBudget - cumulativeTokens;
       resumedMessages = boundary.messages;
     }
     const providerAttempt = childRecords?.find(
@@ -1114,10 +1224,9 @@ export async function recoverInterruptedManagedAgents(
             [
               {
                 role: "developer",
-                content:
-                  admission.profile === "research.v1"
-                    ? "Managed child profile research.v1. Work only on the exact delegated research task with the admitted repository reads, selected Skills, Web evidence, and parent-only coordination. Do not write, execute, use MCP, access ambient extensions, spawn, coordinate with peers, or change model and permission authority."
-                    : "Managed child profile scout.v1. Work only on the exact delegated task. Use repository reads only. Do not write, execute, use Web or MCP, select Skills, access extensions, spawn, coordinate with peers, or change model and permission authority.",
+                content: isResearchManagedAgentProfile(admission.profile)
+                  ? `Managed child profile ${admission.profile}. Work only on the exact delegated research task with the admitted repository reads, selected Skills, Web evidence, and parent-only coordination. Do not write, execute, use MCP, access ambient extensions, spawn, coordinate with peers, or change model and permission authority.`
+                  : `Managed child profile ${admission.profile}. Work only on the exact delegated task. Use repository reads only. Do not write, execute, use Web or MCP, select Skills, access extensions, spawn, coordinate with peers, or change model and permission authority.`,
               },
               ...resumedMessages,
               ...currentMessages,
@@ -1141,8 +1250,8 @@ export async function recoverInterruptedManagedAgents(
       (definition) => definition.name,
     );
     const allowedToolNames = new Set(
-      admission.profile === "research.v1"
-        ? researchManagedAgentProfileV1.toolNames
+      isResearchManagedAgentProfile(admission.profile)
+        ? managedProfile.toolNames
         : ["read_file", "search_repository", "report_to_parent", "request_parent_input"],
     );
     const validEffectiveProfile =
@@ -1177,10 +1286,10 @@ export async function recoverInterruptedManagedAgents(
       validSelectedSkills &&
       coordinationSourceIsValid &&
       admission.profileDigest === managedProfile.digest &&
-      admission.limits.maximumTurns === managedProfile.limits.maximumTurnsPerAttempt &&
-      admission.limits.maximumTokens <= managedProfile.limits.maximumCumulativeTokens &&
-      admission.limits.maximumDeadlineMilliseconds <=
-        managedProfile.limits.maximumDeadlineMilliseconds &&
+      managedAdmissionLimitsAreValid(
+        admission,
+        genesis.record.contextProfile?.contextWindowTokens,
+      ) &&
       admission.parentRootId === `session:${admission.parentSessionId}` &&
       validResumeProjection &&
       (admission.repository === undefined
@@ -1294,10 +1403,15 @@ export async function recoverInterruptedManagedAgents(
       logicalRun.record.type === "logical_run_started" &&
       digest(logicalRun.record.userMessage) === admission.childInputDigest &&
       isDeepStrictEqual(logicalRun.record.thinkingPolicy, admission.thinkingPolicy) &&
-      isDeepStrictEqual(logicalRun.record.limits, {
-        maxTurns: admission.limits.maximumTurns,
-        maxTokens: admission.limits.maximumTokens,
-      });
+      isDeepStrictEqual(
+        logicalRun.record.limits,
+        admission.limits.maximumTurns === undefined
+          ? { maxTokens: admission.limits.maximumTokens }
+          : {
+              maxTurns: admission.limits.maximumTurns,
+              maxTokens: admission.limits.maximumTokens,
+            },
+      );
     if (childRecords !== undefined && !validRunIdentity) {
       const terminal: ManagedAgentRecord = {
         schemaVersion: 1,
@@ -1350,6 +1464,7 @@ export async function recoverInterruptedManagedAgents(
     const transcriptDigest = digest(JSON.stringify(childRecords));
     const throughSequence = childRecords?.at(-1)?.sequence ?? 0;
     const usage = usageFromChildRecords(childRecords ?? []);
+    const providerCalls = providerCallsFromChildRecords(childRecords ?? []);
     let terminal: ManagedAgentRecord | undefined;
     if (childSettlement?.type === "session_settled") {
       if (childSettlement.result.status === "completed") {
@@ -1359,7 +1474,7 @@ export async function recoverInterruptedManagedAgents(
           JSON.stringify({
             agentId: admission.agentId,
             attemptId: admission.attemptId,
-            profile: "scout.v1",
+            profile: admission.profile,
             profileDigest: admission.profileDigest,
             status: "completed",
             result: inlineResult,
@@ -1373,6 +1488,7 @@ export async function recoverInterruptedManagedAgents(
               throughSequence,
             },
             usage,
+            ...(isCurrentManagedAgentProfile(admission.profile) ? { providerCalls } : {}),
             cost: { status: "unavailable" },
           }),
           "utf8",
@@ -1411,6 +1527,7 @@ export async function recoverInterruptedManagedAgents(
             transcriptDigest,
             throughSequence,
             usage,
+            ...(isCurrentManagedAgentProfile(admission.profile) ? { providerCalls } : {}),
             cost: { status: "unavailable" },
           };
         }
@@ -1529,10 +1646,11 @@ export function validateManagedAgentRecord(
           !isDeepStrictEqual(previous.targetIdentity, candidate.targetIdentity) ||
           !isDeepStrictEqual(previous.thinkingPolicy, candidate.thinkingPolicy) ||
           !isDeepStrictEqual(previous.repository, candidate.repository) ||
-          candidate.limits.maximumTurns > previous.limits.maximumTurns ||
+          (candidate.limits.maximumTurns ?? Number.POSITIVE_INFINITY) >
+            (previous.limits.maximumTurns ?? Number.POSITIVE_INFINITY) ||
           candidate.limits.maximumTokens > previous.limits.maximumTokens ||
-          candidate.limits.maximumDeadlineMilliseconds >
-            previous.limits.maximumDeadlineMilliseconds ||
+          (candidate.limits.maximumDeadlineMilliseconds ?? Number.POSITIVE_INFINITY) >
+            (previous.limits.maximumDeadlineMilliseconds ?? Number.POSITIVE_INFINITY) ||
           candidate.deadlineAtUnixMilliseconds !== previous.deadlineAtUnixMilliseconds ||
           !history.some(
             (record) =>
@@ -1777,10 +1895,9 @@ export function validateManagedAgentRecord(
       throw new ManagedAgentStoreError("managed_agent_log_invalid");
     }
   } else if (candidate.type === "managed_agent_inspection_required") {
-    const admission = history.find(
-      (record) =>
-        record.type === "managed_agent_admitted" && record.attemptId === candidate.attemptId,
-    );
+    const admission = history
+      .flatMap((record) => (record.type === "managed_agent_admitted" ? [record] : []))
+      .find((record) => record.attemptId === candidate.attemptId);
     if (
       admission === undefined ||
       admission.agentId !== candidate.agentId ||
@@ -1798,13 +1915,42 @@ export function validateManagedAgentRecord(
       throw new ManagedAgentStoreError("managed_agent_log_invalid");
     }
   } else if (
+    candidate.type === "managed_agent_stalled" ||
+    candidate.type === "managed_agent_resumed"
+  ) {
+    const admission = history
+      .flatMap((record) => (record.type === "managed_agent_admitted" ? [record] : []))
+      .find((record) => record.attemptId === candidate.attemptId);
+    const latestLiveness = history.findLast(
+      (record) =>
+        (record.type === "managed_agent_stalled" || record.type === "managed_agent_resumed") &&
+        record.attemptId === candidate.attemptId,
+    );
+    if (
+      admission === undefined ||
+      !isCurrentManagedAgentProfile(admission.profile) ||
+      admission.agentId !== candidate.agentId ||
+      admission.childSessionId !== candidate.childSessionId ||
+      (candidate.type === "managed_agent_stalled" &&
+        (candidate.maximumInactivityMilliseconds !==
+          admission.limits.maximumInactivityMilliseconds ||
+          latestLiveness?.type === "managed_agent_stalled")) ||
+      (candidate.type === "managed_agent_resumed" &&
+        latestLiveness?.type !== "managed_agent_stalled") ||
+      history.some(
+        (record) =>
+          record.type === "managed_agent_terminal" && record.attemptId === candidate.attemptId,
+      )
+    ) {
+      throw new ManagedAgentStoreError("managed_agent_log_invalid");
+    }
+  } else if (
     candidate.type === "managed_agent_deadline_expired" ||
     candidate.type === "managed_agent_cancel_requested"
   ) {
-    const admission = history.find(
-      (record) =>
-        record.type === "managed_agent_admitted" && record.attemptId === candidate.attemptId,
-    );
+    const admission = history
+      .flatMap((record) => (record.type === "managed_agent_admitted" ? [record] : []))
+      .find((record) => record.attemptId === candidate.attemptId);
     if (
       admission === undefined ||
       admission.agentId !== candidate.agentId ||
@@ -1859,10 +2005,11 @@ export function validateManagedAgentRecord(
 export type ManagedAgentSummary = {
   readonly agentId: string;
   readonly attemptId: string;
-  readonly profile: "scout.v1" | "research.v1";
+  readonly profile: BuiltInManagedAgentProfileId;
   readonly mode: "foreground" | "background";
   readonly status:
     | "running"
+    | "stalled"
     | "waiting_for_parent"
     | "completed"
     | "failed"
@@ -1889,6 +2036,28 @@ export type ManagedAgentSummary = {
   }[];
   readonly resultByteCount?: number;
   readonly resultTruncated?: boolean;
+  readonly context?: { readonly contextWindowTokens: number };
+  readonly usage?: {
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly reasoningTokens: number;
+    readonly providerCalls: number;
+  };
+  readonly budget?: {
+    readonly maximumCumulativeTokens: number;
+    readonly usedTokens: number;
+    readonly remainingTokens: number;
+  };
+  readonly attempts?: {
+    readonly childAttempts: number;
+    readonly maximumChildAttempts: 4;
+    readonly parentAttempts: number;
+    readonly maximumParentAttempts: 16;
+  };
+  readonly watchdog?: {
+    readonly state: "running" | "paused_permission" | "paused_parent" | "stalled" | "terminal";
+    readonly maximumInactivityMilliseconds: 300_000;
+  };
 };
 
 export type ManagedAgentSnapshot = {
@@ -1900,6 +2069,10 @@ export type ManagedAgentSnapshot = {
   readonly agents: readonly ManagedAgentSummary[];
 };
 
+function isManagedAgentActiveStatus(status: ManagedAgentSummary["status"]): boolean {
+  return status === "running" || status === "stalled" || status === "waiting_for_parent";
+}
+
 export function managedAgentSnapshotFromRecords(
   records: readonly ManagedAgentRecord[],
   parentSessionId: string,
@@ -1908,7 +2081,7 @@ export function managedAgentSnapshotFromRecords(
     (
       record,
     ): record is Extract<ManagedAgentRecord, { readonly type: "managed_agent_admitted" }> & {
-      readonly profile: "scout.v1" | "research.v1";
+      readonly profile: BuiltInManagedAgentProfileId;
     } =>
       record.type === "managed_agent_admitted" &&
       record.profile !== "reviewer.v1" &&
@@ -1930,6 +2103,11 @@ export function managedAgentSnapshotFromRecords(
     const inspection = records.findLast(
       (record) =>
         record.type === "managed_agent_inspection_required" &&
+        record.attemptId === admission.attemptId,
+    );
+    const latestLiveness = records.findLast(
+      (record) =>
+        (record.type === "managed_agent_stalled" || record.type === "managed_agent_resumed") &&
         record.attemptId === admission.attemptId,
     );
     const attention = records
@@ -1965,19 +2143,46 @@ export function managedAgentSnapshotFromRecords(
           messageTruncated: messageByteCount > 512,
         };
       });
+    const identityAdmissions = admissions.filter(
+      (candidate) => candidate.agentId === admission.agentId,
+    );
+    const currentProfile = isCurrentManagedAgentProfile(admission.profile);
+    const currentUsage = records.reduce(
+      (total, record) => {
+        if (
+          record.type !== "managed_agent_terminal" ||
+          record.status !== "completed" ||
+          !identityAdmissions.some((candidate) => candidate.attemptId === record.attemptId)
+        ) {
+          return total;
+        }
+        return {
+          inputTokens: total.inputTokens + record.usage.inputTokens,
+          outputTokens: total.outputTokens + record.usage.outputTokens,
+          reasoningTokens: total.reasoningTokens + record.usage.reasoningTokens,
+          providerCalls: total.providerCalls + (record.providerCalls ?? 0),
+        };
+      },
+      { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, providerCalls: 0 },
+    );
+    const maximumCumulativeTokens = identityAdmissions[0]?.limits.maximumTokens;
+    const usedTokens = currentUsage.inputTokens + currentUsage.outputTokens;
+    const projectedStatus =
+      inspection?.type === "managed_agent_inspection_required"
+        ? "inspection_required"
+        : terminal?.type === "managed_agent_terminal"
+          ? terminal.status
+          : attention === undefined
+            ? latestLiveness?.type !== "managed_agent_stalled"
+              ? "running"
+              : "stalled"
+            : "waiting_for_parent";
     return {
       agentId: admission.agentId,
       attemptId: admission.attemptId,
       profile: admission.profile,
       mode: admission.mode ?? "foreground",
-      status:
-        inspection?.type === "managed_agent_inspection_required"
-          ? "inspection_required"
-          : terminal?.type === "managed_agent_terminal"
-            ? terminal.status
-            : attention === undefined
-              ? "running"
-              : "waiting_for_parent",
+      status: projectedStatus,
       revision,
       reports,
       ...(inspection !== undefined ||
@@ -2001,17 +2206,43 @@ export function managedAgentSnapshotFromRecords(
               status: terminal === undefined ? ("waiting" as const) : ("orphaned" as const),
             },
           }),
+      ...(currentProfile && maximumCumulativeTokens !== undefined
+        ? {
+            context: { contextWindowTokens: identityAdmissions[0]?.limits.maximumTokens ?? 0 },
+            usage: currentUsage,
+            budget: {
+              maximumCumulativeTokens,
+              usedTokens,
+              remainingTokens: Math.max(0, maximumCumulativeTokens - usedTokens),
+            },
+            attempts: {
+              childAttempts: identityAdmissions.length,
+              maximumChildAttempts: 4 as const,
+              parentAttempts: admissions.length,
+              maximumParentAttempts: 16 as const,
+            },
+            watchdog: {
+              state:
+                projectedStatus === "stalled"
+                  ? ("stalled" as const)
+                  : projectedStatus === "waiting_for_parent"
+                    ? ("paused_parent" as const)
+                    : projectedStatus === "running"
+                      ? ("running" as const)
+                      : ("terminal" as const),
+              maximumInactivityMilliseconds: 300_000 as const,
+            },
+          }
+        : {}),
     };
   });
   return {
     counts: {
-      active: agents.filter(
-        (agent) => agent.status === "running" || agent.status === "waiting_for_parent",
+      active: agents.filter((agent) => isManagedAgentActiveStatus(agent.status)).length,
+      completed: agents.filter((agent) => !isManagedAgentActiveStatus(agent.status)).length,
+      attention: agents.filter(
+        (agent) => agent.status === "stalled" || agent.status === "waiting_for_parent",
       ).length,
-      completed: agents.filter(
-        (agent) => agent.status !== "running" && agent.status !== "waiting_for_parent",
-      ).length,
-      attention: agents.filter((agent) => agent.status === "waiting_for_parent").length,
     },
     agents,
   };
@@ -2052,6 +2283,8 @@ function boundedManagedAgentListAgents(
 export type AgentManager = {
   readonly parentRootId: string;
   readonly parentSessionId: string;
+  readonly builtInProfileVersion: 1 | 2;
+  readonly contextWindowTokens: number;
   readonly targetIdentity: ModelTargetIdentity;
   readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
   promptSummary(): string;
@@ -2067,7 +2300,7 @@ export type AgentManager = {
     readonly parentSessionId: string;
     readonly signal: AbortSignal;
     readonly task: string;
-    readonly profile?: "scout.v1" | "research.v1";
+    readonly profile?: BuiltInManagedAgentProfileId;
     readonly skills?: readonly string[];
     readonly approvedSkills?: readonly {
       readonly qualifiedId: string;
@@ -2079,7 +2312,7 @@ export type AgentManager = {
     readonly parentSessionId: string;
     readonly signal: AbortSignal;
     readonly task: string;
-    readonly profile?: "scout.v1" | "research.v1";
+    readonly profile?: BuiltInManagedAgentProfileId;
     readonly skills?: readonly string[];
     readonly approvedSkills?: readonly {
       readonly qualifiedId: string;
@@ -2156,6 +2389,10 @@ export type ManagedAgentDeadlineScheduler = {
   schedule(delayMilliseconds: number, onDeadline: () => void): { cancel(): void };
 };
 
+export type ManagedAgentInactivityScheduler = {
+  schedule(delayMilliseconds: number, onInactivity: () => void): { cancel(): void };
+};
+
 const nodeManagedAgentDeadlineScheduler: ManagedAgentDeadlineScheduler = {
   schedule(delayMilliseconds, onDeadline) {
     const timer = setTimeout(onDeadline, delayMilliseconds);
@@ -2187,6 +2424,7 @@ export function createAgentManager(options: {
   }>;
   readonly onChildPermissionEvent?: (event: RuntimeEvent) => void;
   readonly deadlineScheduler?: ManagedAgentDeadlineScheduler;
+  readonly inactivityScheduler?: ManagedAgentInactivityScheduler;
   readonly closeDrainScheduler?: ManagedAgentDeadlineScheduler;
   readonly parentRoot: ProjectExecutionRootClaim;
   readonly parentSessionId?: string;
@@ -2196,6 +2434,7 @@ export function createAgentManager(options: {
   readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
   readonly workspaceRoot: string;
   readonly now?: () => number;
+  readonly builtInProfileVersion?: 1 | 2;
 }): AgentManager {
   let currentParentRoot = options.parentRoot;
   let currentResearchContext: ManagedAgentResearchContext | undefined = {
@@ -2242,7 +2481,7 @@ export function createAgentManager(options: {
     readonly parentSessionId: string;
     readonly signal: AbortSignal;
     readonly task: string;
-    readonly profile?: "reviewer.v1" | "scout.v1" | "research.v1";
+    readonly profile?: ManagedAgentProfileId;
     readonly skills?: readonly string[];
     readonly approvedSkills?: readonly {
       readonly qualifiedId: string;
@@ -2300,6 +2539,16 @@ export function createAgentManager(options: {
             readonly resolve: (result: ToolResult) => void;
           }
         | undefined;
+    }
+  >();
+  const inactivityControls = new Map<
+    string,
+    {
+      readonly pauseParent: () => void;
+      readonly resume: () => void;
+      readonly progress: () => void;
+      readonly settled: () => Promise<void>;
+      readonly state: () => "running" | "paused_permission" | "paused_parent" | "stalled";
     }
   >();
   const childPermissionSessions = new Map<string, AgentSession>();
@@ -2446,6 +2695,7 @@ export function createAgentManager(options: {
             attentionId: record.attentionId,
             messageId: record.messageId,
           });
+          inactivityControls.get(attemptId)?.resume();
           const active = activeAttempts.get(agentId);
           if (active?.attemptId === attemptId) {
             active.revision += 1;
@@ -2570,6 +2820,7 @@ export function createAgentManager(options: {
                 kind: parsed.data.kind,
                 message: parsed.data.message,
               });
+              inactivityControls.get(input.attemptId)?.progress();
               const active = activeAttempts.get(input.agentId);
               if (active?.attemptId === input.attemptId) {
                 active.revision += 1;
@@ -2725,6 +2976,7 @@ export function createAgentManager(options: {
                 argumentsDigest,
                 question: parsed.data.question,
               });
+              inactivityControls.get(input.attemptId)?.pauseParent();
               state.attentionId = attentionId;
               state.notifyAttention();
               const active = activeAttempts.get(input.agentId);
@@ -2769,6 +3021,7 @@ export function createAgentManager(options: {
     return createInternalToolRegistry([report, ...(input.allowInputRequest ? [requestInput] : [])]);
   };
   const knownAgentIds = new Set<string>();
+  const stalledAttemptIds = new Set<string>();
   let reservedSlots = 0;
   let reservedNewIdentities = 0;
   let managerClosing = false;
@@ -2814,11 +3067,19 @@ export function createAgentManager(options: {
         "The managed-child parent session does not match this host.",
       );
     }
+    const profile =
+      input.profile ?? (options.builtInProfileVersion === 2 ? "scout.v2" : "scout.v1");
     const existingAdmissions = (await options.managedStore.read()).filter(
       (record) =>
         record.type === "managed_agent_admitted" &&
         record.parentSessionId === input.parentSessionId,
     );
+    if (profile !== "reviewer.v1" && existingAdmissions.length >= 16) {
+      return toolFailure(
+        "managed_agent_capacity_exceeded",
+        "This parent session already owns the maximum sixteen managed child attempts.",
+      );
+    }
     if (
       input.agentId === undefined &&
       new Set(existingAdmissions.map((record) => record.agentId)).size >= 8
@@ -2833,15 +3094,17 @@ export function createAgentManager(options: {
     const childSessionId = randomUUID();
     coordinationStates.set(attemptId, createCoordinationState());
     const taskDigest = digest(input.task);
-    const profile = input.profile ?? "scout.v1";
-    const managedProfile =
-      profile === "research.v1"
+    const managedProfile = managedAgentProfile(profile);
+    const currentProfile = isCurrentManagedAgentProfile(profile);
+    const legacyProfile = currentProfile
+      ? undefined
+      : profile === "research.v1"
         ? researchManagedAgentProfileV1
         : profile === "reviewer.v1"
           ? reviewerManagedAgentProfileV1
           : scoutManagedAgentProfileV1;
     if (
-      (profile === "scout.v1" && input.skills !== undefined) ||
+      ((profile === "scout.v1" || profile === "scout.v2") && input.skills !== undefined) ||
       (input.skills !== undefined &&
         (input.skills.length > 8 || new Set(input.skills).size !== input.skills.length))
     ) {
@@ -2855,7 +3118,7 @@ export function createAgentManager(options: {
       | undefined;
     try {
       selectedSkillProjection =
-        profile === "research.v1" && (input.skills?.length ?? 0) > 0
+        isResearchManagedAgentProfile(profile) && (input.skills?.length ?? 0) > 0
           ? await currentResearchContext?.resolveSkills?.({
               skills: input.skills ?? [],
               attemptId,
@@ -2869,7 +3132,7 @@ export function createAgentManager(options: {
       );
     }
     if (
-      profile === "research.v1" &&
+      isResearchManagedAgentProfile(profile) &&
       (input.skills?.length ?? 0) > 0 &&
       selectedSkillProjection === undefined
     ) {
@@ -2891,18 +3154,42 @@ export function createAgentManager(options: {
         "The selected managed-child Skill identity changed after approval.",
       );
     }
-    const maximumTokens = input.maximumTokens ?? managedProfile.limits.maximumCumulativeTokens;
-    const maximumDeadlineMilliseconds =
-      input.maximumDeadlineMilliseconds ?? managedProfile.limits.maximumDeadlineMilliseconds;
+    const maximumTokens =
+      input.maximumTokens ??
+      (currentProfile
+        ? options.childContextProfile.contextWindowTokens
+        : (legacyProfile as NonNullable<typeof legacyProfile>).limits.maximumCumulativeTokens);
+    const maximumTurns = currentProfile
+      ? undefined
+      : (input.maximumTurns ??
+        (legacyProfile as NonNullable<typeof legacyProfile>).limits.maximumTurnsPerAttempt);
+    const maximumDeadlineMilliseconds = currentProfile
+      ? undefined
+      : (input.maximumDeadlineMilliseconds ??
+        (legacyProfile as NonNullable<typeof legacyProfile>).limits.maximumDeadlineMilliseconds);
+    const maximumInactivityMilliseconds = currentProfile
+      ? profile === "research.v2"
+        ? researchManagedAgentProfileV2.limits.maximumInactivityMilliseconds
+        : scoutManagedAgentProfileV2.limits.maximumInactivityMilliseconds
+      : undefined;
     const admittedAtUnixMilliseconds =
       input.admittedAtUnixMilliseconds ?? (options.now ?? Date.now)();
     const deadlineAtUnixMilliseconds =
-      input.deadlineAtUnixMilliseconds ?? admittedAtUnixMilliseconds + maximumDeadlineMilliseconds;
+      maximumDeadlineMilliseconds === undefined
+        ? undefined
+        : (input.deadlineAtUnixMilliseconds ??
+          admittedAtUnixMilliseconds + maximumDeadlineMilliseconds);
     const childClaim = await currentParentRoot.claimChild({ childId: agentId });
     const childController = new AbortController();
     let deadlineExpired = false;
     let deadlineRequested = false;
     let deadlineOperation: Promise<void> | undefined;
+    let inactivityTimer: { cancel(): void } | undefined;
+    let inactivityPauseReason: "permission" | "parent" | undefined;
+    let inactivitySettlement = Promise.resolve();
+    let inactivityFailure: unknown;
+    let lastAssistantDelta: string | undefined;
+    const lastReasoningDeltas = new Map<string, string>();
     let admissionCommitted = false;
     let terminalCommitStarted = false;
     let terminalCommitted = false;
@@ -2971,20 +3258,136 @@ export function createAgentManager(options: {
       });
       return deadlineOperation;
     };
+    const commitInactivityStall = async (): Promise<void> => {
+      if (!currentProfile || terminalCommitStarted) {
+        return;
+      }
+      const records = await options.managedStore.read();
+      const latestLiveness = records.findLast(
+        (record) =>
+          (record.type === "managed_agent_stalled" || record.type === "managed_agent_resumed") &&
+          record.attemptId === attemptId,
+      );
+      if (
+        latestLiveness?.type === "managed_agent_stalled" ||
+        records.some(
+          (record) => record.type === "managed_agent_terminal" && record.attemptId === attemptId,
+        )
+      ) {
+        return;
+      }
+      await appendManagedRecord({
+        type: "managed_agent_stalled",
+        agentId,
+        attemptId,
+        childSessionId,
+        maximumInactivityMilliseconds: 300_000,
+      });
+      stalledAttemptIds.add(attemptId);
+      const active = activeAttempts.get(agentId);
+      if (active?.attemptId === attemptId) {
+        active.revision += 1;
+      }
+      coordinationStates.get(attemptId)?.notifyAttention();
+    };
+    const enqueueInactivity = (operation: () => Promise<void>): Promise<void> => {
+      const queued = inactivitySettlement.then(operation).catch((error: unknown) => {
+        inactivityFailure ??= error;
+        throw error;
+      });
+      inactivitySettlement = queued.catch(() => undefined);
+      return queued;
+    };
+    const resetInactivity = (): void => {
+      if (maximumInactivityMilliseconds === undefined || inactivityPauseReason !== undefined) {
+        return;
+      }
+      inactivityTimer?.cancel();
+      inactivityTimer = (options.inactivityScheduler ?? nodeManagedAgentDeadlineScheduler).schedule(
+        maximumInactivityMilliseconds,
+        () => {
+          void enqueueInactivity(commitInactivityStall).catch(() => undefined);
+        },
+      );
+    };
+    const pauseInactivity = (reason: "permission" | "parent"): void => {
+      if (maximumInactivityMilliseconds === undefined) {
+        return;
+      }
+      inactivityPauseReason = reason;
+      inactivityTimer?.cancel();
+      inactivityTimer = undefined;
+    };
+    const resumeInactivity = (): void => {
+      if (maximumInactivityMilliseconds === undefined || inactivityPauseReason === undefined) {
+        return;
+      }
+      inactivityPauseReason = undefined;
+      resetInactivity();
+    };
+    const recordInactivityProgress = (): void => {
+      if (!stalledAttemptIds.has(attemptId)) {
+        resetInactivity();
+        return;
+      }
+      void enqueueInactivity(async () => {
+        if (!stalledAttemptIds.has(attemptId) || terminalCommitStarted) {
+          return;
+        }
+        await appendManagedRecord({
+          type: "managed_agent_resumed",
+          agentId,
+          attemptId,
+          childSessionId,
+        });
+        stalledAttemptIds.delete(attemptId);
+        const active = activeAttempts.get(agentId);
+        if (active?.attemptId === attemptId) {
+          active.revision += 1;
+        }
+        const coordination = coordinationStates.get(attemptId);
+        if (coordination?.attentionId === undefined) {
+          coordination?.resetAttention();
+        }
+        resetInactivity();
+      }).catch(() => undefined);
+    };
+    inactivityControls.set(attemptId, {
+      pauseParent: () => pauseInactivity("parent"),
+      resume: resumeInactivity,
+      progress: recordInactivityProgress,
+      state: () =>
+        stalledAttemptIds.has(attemptId)
+          ? "stalled"
+          : inactivityPauseReason === "permission"
+            ? "paused_permission"
+            : inactivityPauseReason === "parent"
+              ? "paused_parent"
+              : "running",
+      async settled() {
+        await inactivitySettlement;
+        if (inactivityFailure !== undefined) {
+          throw inactivityFailure;
+        }
+      },
+    });
     const abortFromCaller = () => childController.abort(input.signal.reason);
     if (input.signal.aborted) {
       abortFromCaller();
     } else {
       input.signal.addEventListener("abort", abortFromCaller, { once: true });
     }
-    const deadline = (options.deadlineScheduler ?? nodeManagedAgentDeadlineScheduler).schedule(
-      maximumDeadlineMilliseconds,
-      () => {
-        void commitDeadlineExpiration().catch(() => {
-          childController.abort(new Error("Managed Agent deadline persistence failed."));
-        });
-      },
-    );
+    const deadline =
+      maximumDeadlineMilliseconds === undefined
+        ? { cancel() {} }
+        : (options.deadlineScheduler ?? nodeManagedAgentDeadlineScheduler).schedule(
+            maximumDeadlineMilliseconds,
+            () => {
+              void commitDeadlineExpiration().catch(() => {
+                childController.abort(new Error("Managed Agent deadline persistence failed."));
+              });
+            },
+          );
     try {
       const readTools =
         profile === "reviewer.v1"
@@ -2992,7 +3395,7 @@ export function createAgentManager(options: {
           : createReadToolRegistry({ workspaceRoot: options.workspaceRoot });
       const researchTools = currentResearchContext?.tools;
       const effectiveResearchTools =
-        profile !== "research.v1" || researchTools === undefined
+        !isResearchManagedAgentProfile(profile) || researchTools === undefined
           ? undefined
           : {
               definitions: () =>
@@ -3032,7 +3435,7 @@ export function createAgentManager(options: {
                         agentId,
                         attemptId,
                         childSessionId,
-                        profile: "research.v1",
+                        profile,
                         providerOrigin: subject.providerOrigin,
                         queryOrUrl: subject.operation === "search" ? subject.query : subject.url,
                         argumentsDigest: digest(JSON.stringify(parseJson(argumentsJson))),
@@ -3104,11 +3507,12 @@ export function createAgentManager(options: {
               })),
             }),
         limits: {
-          maximumTurns: input.maximumTurns ?? managedProfile.limits.maximumTurnsPerAttempt,
           maximumTokens,
-          maximumDeadlineMilliseconds,
+          ...(maximumTurns === undefined ? {} : { maximumTurns }),
+          ...(maximumDeadlineMilliseconds === undefined ? {} : { maximumDeadlineMilliseconds }),
+          ...(maximumInactivityMilliseconds === undefined ? {} : { maximumInactivityMilliseconds }),
         },
-        deadlineAtUnixMilliseconds,
+        ...(deadlineAtUnixMilliseconds === undefined ? {} : { deadlineAtUnixMilliseconds }),
         admittedAtUnixMilliseconds,
         ...(input.resume === undefined ? {} : { resume: input.resume }),
         taskDigest,
@@ -3126,6 +3530,7 @@ export function createAgentManager(options: {
       });
       admissionCommitted = true;
       input.onManagerAdmitted?.(forceRecovery);
+      resetInactivity();
       if (deadlineRequested) {
         await commitDeadlineExpiration();
       }
@@ -3152,9 +3557,9 @@ export function createAgentManager(options: {
           content:
             profile === "reviewer.v1"
               ? (input.managedRole ?? "Managed child profile reviewer.v1.")
-              : profile === "research.v1"
-                ? "Managed child profile research.v1. Work only on the exact delegated research task with the admitted repository reads, selected Skills, Web evidence, and parent-only coordination. Do not write, execute, use MCP, access ambient extensions, spawn, coordinate with peers, or change model and permission authority."
-                : "Managed child profile scout.v1. Work only on the exact delegated task. Use repository reads only. Do not write, execute, use Web or MCP, select Skills, access extensions, spawn, coordinate with peers, or change model and permission authority.",
+              : isResearchManagedAgentProfile(profile)
+                ? `Managed child profile ${profile}. Work only on the exact delegated research task with the admitted repository reads, selected Skills, Web evidence, and parent-only coordination. Do not write, execute, use MCP, access ambient extensions, spawn, coordinate with peers, or change model and permission authority.`
+                : `Managed child profile ${profile}. Work only on the exact delegated task. Use repository reads only. Do not write, execute, use Web or MCP, select Skills, access extensions, spawn, coordinate with peers, or change model and permission authority.`,
         },
         ...(input.resumedMessages ?? []),
       ];
@@ -3164,7 +3569,7 @@ export function createAgentManager(options: {
             return options.parentCoordination === undefined ? "deny" : "allow";
           }
           if (permission.subject.type === "managed_agent_web_request") {
-            if (profile !== "research.v1") {
+            if (!isResearchManagedAgentProfile(profile)) {
               return "deny";
             }
             const decision = options.parentPermissions.decide(permission);
@@ -3235,9 +3640,57 @@ export function createAgentManager(options: {
       };
       const child = new AgentSession(childDependencies);
       ownedChild = child;
-      unsubscribeChildPermissions = child.subscribe((event) =>
-        observeChildPermissionEvent(child, event),
-      );
+      unsubscribeChildPermissions = child.subscribe((event) => {
+        observeChildPermissionEvent(child, event);
+        if (event.type === "tool_permission_requested") {
+          pauseInactivity("permission");
+          return;
+        }
+        if (event.type === "tool_permission_decided") {
+          resumeInactivity();
+          return;
+        }
+        if (
+          event.type === "model_message_delta" &&
+          event.text.length > 0 &&
+          event.text !== lastAssistantDelta
+        ) {
+          lastAssistantDelta = event.text;
+          recordInactivityProgress();
+          return;
+        }
+        if (event.type === "model_reasoning_started") {
+          recordInactivityProgress();
+          return;
+        }
+        if (
+          event.type === "model_reasoning_updated" &&
+          event.text.length > 0 &&
+          event.text !== lastReasoningDeltas.get(event.id)
+        ) {
+          lastReasoningDeltas.set(event.id, event.text);
+          recordInactivityProgress();
+          return;
+        }
+        if (event.type === "model_reasoning_settled") {
+          recordInactivityProgress();
+          return;
+        }
+        if (
+          event.type === "model_message_started" ||
+          event.type === "model_message_completed" ||
+          event.type === "tool_requested" ||
+          event.type === "tool_started" ||
+          event.type === "tool_completed" ||
+          event.type === "tool_failed" ||
+          event.type === "context_compaction_started" ||
+          event.type === "context_compaction_committed" ||
+          event.type === "context_compaction_failed" ||
+          event.type === "context_compaction_interrupted"
+        ) {
+          recordInactivityProgress();
+        }
+      });
       const result = await child.run(
         {
           text: childTaskMessage(input.task, profile),
@@ -3245,7 +3698,7 @@ export function createAgentManager(options: {
         {
           signal: childController.signal,
           limits: {
-            maxTurns: input.maximumTurns ?? managedProfile.limits.maximumTurnsPerAttempt,
+            ...(maximumTurns === undefined ? {} : { maxTurns: maximumTurns }),
             maxTokens: maximumTokens,
           },
         },
@@ -3260,6 +3713,7 @@ export function createAgentManager(options: {
       const transcriptDigest = digest(JSON.stringify(childRecords));
       const throughSequence = childRecords.at(-1)?.sequence ?? 0;
       const usage = usageFromChildRecords(childRecords);
+      const providerCalls = providerCallsFromChildRecords(childRecords);
       const settleExpiredDeadline = async (): Promise<boolean> => {
         await deadlineOperation;
         if (!deadlineExpired) {
@@ -3420,6 +3874,7 @@ export function createAgentManager(options: {
         transcriptDigest,
         throughSequence,
         usage,
+        ...(currentProfile ? { providerCalls } : {}),
         cost: { status: "unavailable" },
       });
       terminalCommitted = true;
@@ -3516,6 +3971,9 @@ export function createAgentManager(options: {
         publishNextChildPermission();
       }
       deadline.cancel();
+      inactivityTimer?.cancel();
+      stalledAttemptIds.delete(attemptId);
+      inactivityControls.delete(attemptId);
       input.signal.removeEventListener("abort", abortFromCaller);
       if (releaseChildClaim) {
         await releaseClaimOnce();
@@ -3616,11 +4074,10 @@ export function createAgentManager(options: {
         agentId: identity.agentId,
         attemptId: identity.attemptId,
         childSessionId: identity.childSessionId,
-        profile: input.profile ?? "scout.v1",
-        profileDigest:
-          input.profile === "research.v1"
-            ? researchManagedAgentProfileV1.digest
-            : scoutManagedAgentProfileV1.digest,
+        profile: input.profile ?? (options.builtInProfileVersion === 2 ? "scout.v2" : "scout.v1"),
+        profileDigest: managedAgentProfile(
+          input.profile ?? (options.builtInProfileVersion === 2 ? "scout.v2" : "scout.v1"),
+        ).digest,
         ...(identity.effectiveToolProfileDigest === undefined
           ? {}
           : { effectiveToolProfileDigest: identity.effectiveToolProfileDigest }),
@@ -3727,6 +4184,8 @@ export function createAgentManager(options: {
   };
   const manager: AgentManager = {
     parentRootId: options.parentRoot.rootId,
+    builtInProfileVersion: options.builtInProfileVersion ?? 1,
+    contextWindowTokens: options.childContextProfile.contextWindowTokens,
     get parentSessionId() {
       return boundParentSessionId;
     },
@@ -3736,9 +4195,9 @@ export function createAgentManager(options: {
       const ids = [...knownAgentIds].sort();
       const active = activeAttempts.size;
       const completed = ids.length - active;
-      const attention = [...coordinationStates.values()].filter(
-        (state) => state.attentionId !== undefined,
-      ).length;
+      const attention =
+        [...coordinationStates.values()].filter((state) => state.attentionId !== undefined).length +
+        stalledAttemptIds.size;
       const prefix = `Managed agents: ${active} active, ${completed} completed, ${attention} need attention; IDs: `;
       let summary = prefix;
       for (const id of ids) {
@@ -3785,12 +4244,60 @@ export function createAgentManager(options: {
     spawnForeground,
     spawnBackground,
     async snapshot() {
+      await Promise.all([...inactivityControls.values()].map((control) => control.settled()));
       const records = await options.managedStore.read();
       const snapshot = managedAgentSnapshotFromRecords(records, manager.parentSessionId);
-      for (const agent of snapshot.agents) {
-        knownAgentIds.add(agent.agentId);
-      }
-      return snapshot;
+      const agents = await Promise.all(
+        snapshot.agents.map(async (agent) => {
+          knownAgentIds.add(agent.agentId);
+          const admissions = records.flatMap((record) =>
+            record.type === "managed_agent_admitted" && record.agentId === agent.agentId
+              ? [record]
+              : [],
+          );
+          const histories = await Promise.all(
+            admissions.map(async (admission) => {
+              try {
+                const store = await options.childSessionStores.open(admission.childSessionId);
+                return (await store?.read()) ?? [];
+              } catch {
+                return [];
+              }
+            }),
+          );
+          const usage = histories.reduce(
+            (total, history) => {
+              const next = usageFromChildRecords(history);
+              return {
+                inputTokens: total.inputTokens + next.inputTokens,
+                outputTokens: total.outputTokens + next.outputTokens,
+                reasoningTokens: total.reasoningTokens + next.reasoningTokens,
+                providerCalls: total.providerCalls + providerCallsFromChildRecords(history),
+              };
+            },
+            { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, providerCalls: 0 },
+          );
+          const usedTokens = usage.inputTokens + usage.outputTokens;
+          const control = inactivityControls.get(agent.attemptId);
+          return {
+            ...agent,
+            ...(agent.usage === undefined ? {} : { usage }),
+            ...(agent.budget === undefined
+              ? {}
+              : {
+                  budget: {
+                    ...agent.budget,
+                    usedTokens,
+                    remainingTokens: Math.max(0, agent.budget.maximumCumulativeTokens - usedTokens),
+                  },
+                }),
+            ...(control === undefined || agent.watchdog === undefined
+              ? {}
+              : { watchdog: { ...agent.watchdog, state: control.state() } }),
+          };
+        }),
+      );
+      return { ...snapshot, agents };
     },
     async list(input = {}) {
       const snapshot = await manager.snapshot();
@@ -3808,10 +4315,10 @@ export function createAgentManager(options: {
           return true;
         }
         if (input.status === "active") {
-          return agent.status === "running" || agent.status === "waiting_for_parent";
+          return isManagedAgentActiveStatus(agent.status);
         }
         if (input.status === "terminal") {
-          return agent.status !== "running" && agent.status !== "waiting_for_parent";
+          return !isManagedAgentActiveStatus(agent.status);
         }
         return agent.status === input.status;
       });
@@ -3921,15 +4428,20 @@ export function createAgentManager(options: {
       const cumulativeTokens = managedCumulativeTokens(attemptHistories, 2);
       const deadlineAtUnixMilliseconds = admissions[0]?.deadlineAtUnixMilliseconds;
       const followUpNow = (options.now ?? Date.now)();
-      const followUpProfile =
+      const currentFollowUp = latest !== undefined && isCurrentManagedAgentProfile(latest.profile);
+      const legacyFollowUpProfile =
         latest?.profile === "research.v1"
           ? researchManagedAgentProfileV1
           : scoutManagedAgentProfileV1;
-      const remainingDeadlineMilliseconds =
-        deadlineAtUnixMilliseconds === undefined
-          ? followUpProfile.limits.maximumDeadlineMilliseconds
+      const remainingDeadlineMilliseconds = currentFollowUp
+        ? undefined
+        : deadlineAtUnixMilliseconds === undefined
+          ? legacyFollowUpProfile.limits.maximumDeadlineMilliseconds
           : deadlineAtUnixMilliseconds - followUpNow;
-      const remainingTokens = followUpProfile.limits.maximumCumulativeTokens - cumulativeTokens;
+      const cumulativeBudget = currentFollowUp
+        ? admissions[0]?.limits.maximumTokens
+        : legacyFollowUpProfile.limits.maximumCumulativeTokens;
+      const remainingTokens = (cumulativeBudget ?? 0) - cumulativeTokens;
       const sourceRecords = attemptHistories.at(-1)?.childRecords ?? [];
       const replayBoundary = managedReplayBoundary(sourceRecords);
       const resumedMessages = replayBoundary.messages;
@@ -3953,7 +4465,7 @@ export function createAgentManager(options: {
         admissions.length >= 4 ||
         totalAttempts >= 16 ||
         remainingTokens <= 0 ||
-        remainingDeadlineMilliseconds <= 0
+        (remainingDeadlineMilliseconds !== undefined && remainingDeadlineMilliseconds <= 0)
       ) {
         return toolFailure(
           "invalid_tool_input",
@@ -3963,10 +4475,14 @@ export function createAgentManager(options: {
       return spawnBackground({
         ...input,
         agentId: input.agentId,
-        deadlineAtUnixMilliseconds:
-          deadlineAtUnixMilliseconds ?? followUpNow + remainingDeadlineMilliseconds,
-        admittedAtUnixMilliseconds: followUpNow,
-        maximumDeadlineMilliseconds: remainingDeadlineMilliseconds,
+        ...(remainingDeadlineMilliseconds === undefined
+          ? {}
+          : {
+              deadlineAtUnixMilliseconds:
+                deadlineAtUnixMilliseconds ?? followUpNow + remainingDeadlineMilliseconds,
+              admittedAtUnixMilliseconds: followUpNow,
+              maximumDeadlineMilliseconds: remainingDeadlineMilliseconds,
+            }),
         maximumTokens: remainingTokens,
         ...(latest === undefined
           ? {}
@@ -4302,11 +4818,11 @@ export function createAgentManager(options: {
           : input.until === "any_terminal"
             ? input.agentIds.some((agentId) => {
                 const status = byId.get(agentId)?.status;
-                return status !== "running" && status !== "waiting_for_parent";
+                return status !== undefined && !isManagedAgentActiveStatus(status);
               })
             : input.agentIds.every((agentId) => {
                 const status = byId.get(agentId)?.status;
-                return status !== "running" && status !== "waiting_for_parent";
+                return status !== undefined && !isManagedAgentActiveStatus(status);
               });
       if (conditionMet) {
         return manager.list();
@@ -4441,25 +4957,31 @@ export function createManagedAgentToolRegistry(options: {
   readonly profile?:
     | "managed-agent-tools.a1.v1"
     | "managed-agent-tools.a2-long-lived.v1"
-    | "managed-agent-tools.a3-long-lived.v1";
+    | "managed-agent-tools.a3-long-lived.v1"
+    | "managed-agent-tools.a1.v2"
+    | "managed-agent-tools.a2-long-lived.v2"
+    | "managed-agent-tools.a3-long-lived.v2";
 }): ToolRegistry {
   const profile = options.profile ?? "managed-agent-tools.a1.v1";
-  const spawnSchema =
-    profile === "managed-agent-tools.a3-long-lived.v1"
-      ? managedAgentA3SpawnSchema
-      : profile === "managed-agent-tools.a2-long-lived.v1"
-        ? managedAgentA2SpawnSchema
-        : managedAgentTaskSchema;
+  const current = profile.endsWith(".v2");
+  const a3 = profile.includes(".a3-long-lived.");
+  const a2 = profile.includes(".a2-long-lived.");
+  const spawnSchema = a3
+    ? current
+      ? managedAgentA3SpawnSchemaV2
+      : managedAgentA3SpawnSchema
+    : a2
+      ? managedAgentA2SpawnSchema
+      : managedAgentTaskSchema;
   const adapter = createInternalToolAdapter(
     {
       definition: {
         name: "spawn_agent",
-        description:
-          profile === "managed-agent-tools.a3-long-lived.v1"
-            ? "Start one single-level managed child with a code-owned non-mutating profile. The child cannot spawn peers, write or execute, inherit ambient extensions, or change its model or permissions."
-            : profile === "managed-agent-tools.a2-long-lived.v1"
-              ? "Start one foreground or same-process background read-only scout. Background requires the long-lived interactive session host; the scout cannot write, execute, spawn, inherit extensions, or change its model or permissions."
-              : "Run one foreground read-only scout with fresh bounded context. It cannot run in background, select Skills, write, execute, spawn, inherit extensions, or change its model or permissions.",
+        description: a3
+          ? "Start one single-level managed child with a code-owned non-mutating profile. The child cannot spawn peers, write or execute, inherit ambient extensions, or change its model or permissions."
+          : a2
+            ? "Start one foreground or same-process background read-only scout. Background requires the long-lived interactive session host; the scout cannot write, execute, spawn, inherit extensions, or change its model or permissions."
+            : "Run one foreground read-only scout with fresh bounded context. It cannot run in background, select Skills, write, execute, spawn, inherit extensions, or change its model or permissions.",
         inputSchema: z.toJSONSchema(spawnSchema),
       },
       outputSchema: z.union([
@@ -4468,7 +4990,7 @@ export function createManagedAgentToolRegistry(options: {
           agentId: z.string().uuid(),
           attemptId: z.string().uuid(),
           childSessionId: z.string().uuid(),
-          profile: z.enum(["scout.v1", "research.v1"]),
+          profile: z.enum(["scout.v1", "scout.v2", "research.v1", "research.v2"]),
           profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
           effectiveToolProfileDigest: z
             .string()
@@ -4491,10 +5013,11 @@ export function createManagedAgentToolRegistry(options: {
         if (!parsed.success) {
           return toolFailure("invalid_tool_input", "Tool input is invalid.");
         }
-        const a3Input =
-          profile === "managed-agent-tools.a3-long-lived.v1"
-            ? managedAgentA3SpawnSchema.parse(parsed.data)
-            : undefined;
+        const a3Input = a3
+          ? current
+            ? managedAgentA3SpawnSchemaV2.parse(parsed.data)
+            : managedAgentA3SpawnSchema.parse(parsed.data)
+          : undefined;
         const selectedSkillIdentities =
           a3Input?.skills === undefined
             ? undefined
@@ -4511,8 +5034,8 @@ export function createManagedAgentToolRegistry(options: {
             type: "managed_agent_spawn",
             parentRootId: options.manager.parentRootId,
             parentSessionId: options.manager.parentSessionId,
-            profile: a3Input?.profile ?? "scout.v1",
-            ...(profile === "managed-agent-tools.a1.v1"
+            profile: a3Input?.profile ?? (current ? "scout.v2" : "scout.v1"),
+            ...(!a2 && !a3
               ? {}
               : {
                   mode:
@@ -4520,14 +5043,13 @@ export function createManagedAgentToolRegistry(options: {
                       ? "background"
                       : "foreground",
                 }),
-            profileDigest:
-              a3Input?.profile === "research.v1"
-                ? researchManagedAgentProfileV1.digest
-                : scoutManagedAgentProfileV1.digest,
+            profileDigest: managedAgentProfile(
+              a3Input?.profile ?? (current ? "scout.v2" : "scout.v1"),
+            ).digest,
             ...(selectedSkillIdentities === undefined
               ? {}
               : { selectedSkills: selectedSkillIdentities }),
-            ...(profile !== "managed-agent-tools.a3-long-lived.v1"
+            ...(!a3
               ? {}
               : {
                   parentCoordination: {
@@ -4539,12 +5061,18 @@ export function createManagedAgentToolRegistry(options: {
                 }),
             targetIdentity: options.manager.targetIdentity,
             taskDigest: digest(parsed.data.task),
-            limits: {
-              maximumTurns: scoutManagedAgentProfileV1.limits.maximumTurnsPerAttempt,
-              maximumTokens: scoutManagedAgentProfileV1.limits.maximumCumulativeTokens,
-              maximumDeadlineMilliseconds:
-                scoutManagedAgentProfileV1.limits.maximumDeadlineMilliseconds,
-            },
+            limits: current
+              ? {
+                  maximumTokens: options.manager.contextWindowTokens,
+                  maximumInactivityMilliseconds:
+                    scoutManagedAgentProfileV2.limits.maximumInactivityMilliseconds,
+                }
+              : {
+                  maximumTurns: scoutManagedAgentProfileV1.limits.maximumTurnsPerAttempt,
+                  maximumTokens: scoutManagedAgentProfileV1.limits.maximumCumulativeTokens,
+                  maximumDeadlineMilliseconds:
+                    scoutManagedAgentProfileV1.limits.maximumDeadlineMilliseconds,
+                },
             ...(options.manager.thinkingPolicy === undefined
               ? {}
               : { thinkingPolicy: options.manager.thinkingPolicy }),
@@ -4575,7 +5103,7 @@ export function createManagedAgentToolRegistry(options: {
     },
     "never",
   );
-  if (profile === "managed-agent-tools.a1.v1") {
+  if (!a2 && !a3) {
     return createInternalToolRegistry([adapter]);
   }
   const listAdapter = createInternalToolAdapter(
@@ -4651,26 +5179,19 @@ export function createManagedAgentToolRegistry(options: {
     {
       definition: {
         name: "wait_agents",
-        description:
-          profile === "managed-agent-tools.a3-long-lived.v1"
-            ? "Wait causally for selected managed children to reach terminal state or request parent attention. Cancelling this wait does not cancel a child."
-            : "Wait causally for selected managed children to reach terminal state. Cancelling this wait does not cancel a child.",
-        inputSchema: z.toJSONSchema(
-          profile === "managed-agent-tools.a3-long-lived.v1"
-            ? managedAgentA3WaitSchema
-            : managedAgentWaitSchema,
-        ),
+        description: a3
+          ? "Wait causally for selected managed children to reach terminal state or request parent attention. Cancelling this wait does not cancel a child."
+          : "Wait causally for selected managed children to reach terminal state. Cancelling this wait does not cancel a child.",
+        inputSchema: z.toJSONSchema(a3 ? managedAgentA3WaitSchema : managedAgentWaitSchema),
       },
       outputSchema: z.custom<JsonValue>(),
       effect: "read",
       cancellation: "abort_signal",
       maximumResult: { maximumBytes: maximumManagedAgentResultBytes },
       prepare(argumentsJson) {
-        const parsed = (
-          profile === "managed-agent-tools.a3-long-lived.v1"
-            ? managedAgentA3WaitSchema
-            : managedAgentWaitSchema
-        ).safeParse(parseJson(argumentsJson));
+        const parsed = (a3 ? managedAgentA3WaitSchema : managedAgentWaitSchema).safeParse(
+          parseJson(argumentsJson),
+        );
         if (!parsed.success || new Set(parsed.data.agentIds).size !== parsed.data.agentIds.length) {
           return toolFailure("invalid_tool_input", "Tool input is invalid.");
         }
@@ -4799,7 +5320,7 @@ export function createManagedAgentToolRegistry(options: {
     waitAdapter,
     followUpAdapter,
     cancelAdapter,
-    ...(profile === "managed-agent-tools.a3-long-lived.v1" ? [sendAdapter] : []),
+    ...(a3 ? [sendAdapter] : []),
   ]);
 }
 
@@ -4833,10 +5354,7 @@ function managedRecordReceipt(record: ManagedAgentRecord): {
   return { id, revision: record.sequence, digest: digest(JSON.stringify(record)) };
 }
 
-function childTaskMessage(
-  task: string,
-  profile: "reviewer.v1" | "scout.v1" | "research.v1" = "scout.v1",
-): string {
+function childTaskMessage(task: string, profile: ManagedAgentProfileId = "scout.v1"): string {
   return profile === "reviewer.v1" ? task : `${task}\n\n${childLiveWorkspaceNotice}`;
 }
 
@@ -4883,6 +5401,12 @@ function usageFromChildRecords(records: readonly SessionRecord[]): {
     },
     { inputTokens: 0, outputTokens: 0, reasoningTokens: 0 },
   );
+}
+
+function providerCallsFromChildRecords(records: readonly SessionRecord[]): number {
+  return records.filter(
+    (record) => record.schemaVersion === 3 && record.record.type === "provider_attempt_started",
+  ).length;
 }
 
 function managedCumulativeTokens(

@@ -377,7 +377,10 @@ export type SessionLifecycleOptions = {
   readonly managedAgentTools?:
     | "managed-agent-tools.a1.v1"
     | "managed-agent-tools.a2-long-lived.v1"
-    | "managed-agent-tools.a3-long-lived.v1";
+    | "managed-agent-tools.a3-long-lived.v1"
+    | "managed-agent-tools.a1.v2"
+    | "managed-agent-tools.a2-long-lived.v2"
+    | "managed-agent-tools.a3-long-lived.v2";
   readonly permissions?: PermissionPolicy;
   readonly preferences?: UserModelPolicyResolver;
   readonly workspaceRoot: string;
@@ -410,6 +413,20 @@ export type SessionLifecycleOptions = {
   readonly [inputResourceIngestBarrier]?: InputResourceIngestBarrier;
   readonly [workspaceMcpLeaseTransitionBarrier]?: WorkspaceMcpLeaseTransitionBarrier;
 };
+
+type ManagedAgentToolsProfile = NonNullable<SessionLifecycleOptions["managedAgentTools"]>;
+
+function isLongLivedManagedAgentTools(profile: ManagedAgentToolsProfile | undefined): boolean {
+  return profile?.includes("-long-lived.") === true;
+}
+
+function hasManagedAgentCoordination(profile: ManagedAgentToolsProfile | undefined): boolean {
+  return profile?.includes(".a3-long-lived.") === true;
+}
+
+function managedAgentToolsVersion(profile: ManagedAgentToolsProfile | undefined): 1 | 2 {
+  return profile?.endsWith(".v2") === true ? 2 : 1;
+}
 
 type WebEvidenceProfileV1 = NonNullable<SessionGenesisRecord["record"]["webEvidence"]>;
 
@@ -1058,7 +1075,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       options.modelTargets === undefined ||
       (managedAgentTools !== "managed-agent-tools.a1.v1" &&
         managedAgentTools !== "managed-agent-tools.a2-long-lived.v1" &&
-        managedAgentTools !== "managed-agent-tools.a3-long-lived.v1")
+        managedAgentTools !== "managed-agent-tools.a3-long-lived.v1" &&
+        managedAgentTools !== "managed-agent-tools.a1.v2" &&
+        managedAgentTools !== "managed-agent-tools.a2-long-lived.v2" &&
+        managedAgentTools !== "managed-agent-tools.a3-long-lived.v2")
     ) {
       if (baseWithWeb === undefined) {
         throw new SessionLifecycleError("session_invalid");
@@ -1068,6 +1088,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     const managerRouter: AgentManager = {
       parentRootId: `session:${sessionId}`,
       parentSessionId: sessionId,
+      builtInProfileVersion: managedAgentTools.endsWith(".v2") ? 2 : 1,
+      get contextWindowTokens() {
+        return activeAgentManagers.get(sessionId)?.contextWindowTokens ?? 0;
+      },
       targetIdentity,
       ...(thinkingPolicy === undefined ? {} : { thinkingPolicy }),
       promptSummary() {
@@ -3050,8 +3074,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (
           options.managedAgentTools !== undefined &&
           !(
-            (options.managedAgentTools === "managed-agent-tools.a2-long-lived.v1" ||
-              options.managedAgentTools === "managed-agent-tools.a3-long-lived.v1") &&
+            isLongLivedManagedAgentTools(options.managedAgentTools) &&
             activeAgentManagers.has(input.sessionId)
           )
         ) {
@@ -3657,8 +3680,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           artifactStore,
           model: resolved.driver,
           store: store as unknown as SessionStore,
-          ...(first.record.managedAgentTools !== "managed-agent-tools.a2-long-lived.v1" &&
-          first.record.managedAgentTools !== "managed-agent-tools.a3-long-lived.v1"
+          ...(!isLongLivedManagedAgentTools(first.record.managedAgentTools)
             ? {}
             : {
                 [managedAgentPromptSummary]: () =>
@@ -3784,7 +3806,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
         };
         const researchContext: ManagedAgentResearchContext | undefined =
-          first.record.managedAgentTools !== "managed-agent-tools.a3-long-lived.v1"
+          !hasManagedAgentCoordination(first.record.managedAgentTools)
             ? activePromptContext === undefined
               ? undefined
               : { repository: activePromptContext.repository }
@@ -3890,19 +3912,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               };
         const existingAgentManager = activeAgentManagers.get(input.sessionId);
         const agentManager =
-          (first.record.managedAgentTools === "managed-agent-tools.a2-long-lived.v1" ||
-            first.record.managedAgentTools === "managed-agent-tools.a3-long-lived.v1") &&
+          isLongLivedManagedAgentTools(first.record.managedAgentTools) &&
           existingAgentManager !== undefined
             ? existingAgentManager
             : createAgentManager({
                 artifactStore,
                 childContextProfile: resolved.contextProfile,
                 childModel: resolved.driver,
+                builtInProfileVersion: managedAgentToolsVersion(first.record.managedAgentTools),
                 childSessionStores: managedChildSessionStores,
                 managedStore: managedAgentStore,
                 parentPermissions:
                   options.permissions ?? createPermissionPolicy({ allowedEffects: [] }),
-                ...(first.record.managedAgentTools === "managed-agent-tools.a3-long-lived.v1"
+                ...(hasManagedAgentCoordination(first.record.managedAgentTools)
                   ? {
                       parentCoordination: {
                         interactive: () => managedAgentEventListeners.size > 0,
@@ -4049,10 +4071,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           }
           return { result, snapshot };
         } finally {
-          if (
-            first.record.managedAgentTools !== "managed-agent-tools.a2-long-lived.v1" &&
-            first.record.managedAgentTools !== "managed-agent-tools.a3-long-lived.v1"
-          ) {
+          if (!isLongLivedManagedAgentTools(first.record.managedAgentTools)) {
             activeAgentManagers.delete(input.sessionId);
           }
           resolveSessionSettlement();
@@ -4811,10 +4830,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       if (!hasManagedAgentAdmission) {
         return { counts: { active: 0, completed: 0, attention: 0 }, agents: [] };
       }
-      if (
-        options.managedAgentTools === "managed-agent-tools.a2-long-lived.v1" ||
-        options.managedAgentTools === "managed-agent-tools.a3-long-lived.v1"
-      ) {
+      if (isLongLivedManagedAgentTools(options.managedAgentTools)) {
         try {
           await withOwner(
             async () =>
@@ -4857,7 +4873,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         manager === undefined ||
         genesis?.schemaVersion !== 3 ||
         genesis.record.type !== "session_genesis" ||
-        genesis.record.managedAgentTools !== "managed-agent-tools.a3-long-lived.v1"
+        !hasManagedAgentCoordination(genesis.record.managedAgentTools)
       ) {
         throw new SessionLifecycleError("session_invalid");
       }

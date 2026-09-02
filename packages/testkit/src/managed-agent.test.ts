@@ -292,6 +292,151 @@ test("AgentSession spawns one permitted foreground scout and receives its durabl
   }
 });
 
+test("AgentManager current scout crosses the legacy token and provider-call boundaries", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-current-capacity-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "evidence.txt"), "current child evidence\n", "utf8");
+  const currentContextProfile = {
+    version: 2,
+    contextWindowTokens: 1_000_000,
+    maximumOutputTokens: 384_000,
+    ordinaryOutputReserveTokens: 4_096,
+    compactionSummaryMaximumOutputTokens: 32_768,
+    compactAtTokens: 900_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+    estimatorVersion: 1,
+  } as const;
+  let providerCalls = 0;
+  const childModel: ModelDriver = {
+    async *stream() {
+      providerCalls += 1;
+      if (providerCalls <= 9) {
+        const callId = `read-evidence-${providerCalls}`;
+        yield { type: "tool_call_start", id: callId, name: "read_file" };
+        yield { type: "tool_call_delta", id: callId, json: '{"path":"evidence.txt"}' };
+        yield { type: "tool_call_end", id: callId };
+        yield {
+          type: "usage",
+          inputTokens: 16_000,
+          outputTokens: 4,
+          reasoningTokens: 2,
+        };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Current scout completed after every read." };
+      yield { type: "usage", inputTokens: 16_000, outputTokens: 8, reasoningTokens: 3 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const owner: ProjectLifecycleOwner = {
+    async acquire() {
+      return { async release() {} };
+    },
+    async run(operation) {
+      return operation();
+    },
+  };
+  const domain = createProjectExecutionDomain({ lifecycleOwner: owner });
+  const parentSessionId = "123e4567-e89b-42d3-a456-426614174501";
+  const parentRoot = await domain.claimRoot({ rootId: `session:${parentSessionId}` });
+  const managedStore = createInMemoryManagedAgentStore();
+  const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  const currentProfileOptions = { builtInProfileVersion: 2 as const };
+  const manager = createAgentManager({
+    childContextProfile: currentContextProfile,
+    childModel,
+    childSessionStores,
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    parentSessionId,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+    ...currentProfileOptions,
+  });
+
+  try {
+    await expect(
+      manager.spawnForeground({
+        callId: "current-capacity-spawn",
+        parentSessionId: manager.parentSessionId,
+        signal: new AbortController().signal,
+        task: "Read every required evidence step before answering.",
+      }),
+    ).resolves.toMatchObject({
+      status: "completed",
+      output: {
+        profile: "scout.v2",
+        result: { text: "Current scout completed after every read." },
+      },
+    });
+    expect(providerCalls).toBe(10);
+    const records = await managedStore.read();
+    const admission = records.find((record) => record.type === "managed_agent_admitted");
+    expect(admission).toMatchObject({
+      profile: "scout.v2",
+      limits: {
+        maximumTokens: currentContextProfile.contextWindowTokens,
+        maximumInactivityMilliseconds: 300_000,
+      },
+    });
+    expect(admission?.limits).not.toHaveProperty("maximumTurns");
+    expect(admission).not.toHaveProperty("deadlineAtUnixMilliseconds");
+    if (admission?.type !== "managed_agent_admitted") {
+      throw new Error("Expected the current managed admission.");
+    }
+    const childStore = await childSessionStores.open(admission.childSessionId);
+    const childRecords = await childStore?.read();
+    expect(
+      childRecords?.filter(
+        (record) =>
+          record.schemaVersion === 3 &&
+          record.record.type === "runtime_event" &&
+          record.record.event.type === "tool_completed" &&
+          record.record.event.name === "read_file",
+      ),
+    ).toHaveLength(9);
+    await expect(manager.snapshot()).resolves.toMatchObject({
+      agents: [
+        {
+          profile: "scout.v2",
+          context: { contextWindowTokens: 1_000_000 },
+          usage: {
+            inputTokens: 160_000,
+            outputTokens: 44,
+            reasoningTokens: 21,
+            providerCalls: 10,
+          },
+          budget: {
+            maximumCumulativeTokens: 1_000_000,
+            usedTokens: 160_044,
+            remainingTokens: 839_956,
+          },
+          attempts: {
+            childAttempts: 1,
+            maximumChildAttempts: 4,
+            parentAttempts: 1,
+            maximumParentAttempts: 16,
+          },
+          watchdog: { state: "terminal", maximumInactivityMilliseconds: 300_000 },
+        },
+      ],
+    });
+    const beforeRecovery = await managedStore.read();
+    await recoverInterruptedManagedAgents(managedStore, childSessionStores);
+    await expect(managedStore.read()).resolves.toEqual(beforeRecovery);
+  } finally {
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("AgentSession rejects managed profile selection before permission or child provider work", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-profile-reject-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -717,6 +862,92 @@ test("SessionLifecycle exposes foreground scout through the exact new-session To
   }
 });
 
+test("SessionLifecycle publishes only current managed profiles in a new v2 Tool Profile", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-current-tool-profile-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const currentTargetIdentity = { ...targetIdentity, profileVersion: 3 };
+  let modelTools: ModelRequest["tools"] | undefined;
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: currentTargetIdentity,
+        driver: {
+          async *stream(request) {
+            if (request.purpose === "ordinary") {
+              modelTools = request.tools;
+            }
+            yield { type: "text_delta", text: "Current Tool Profile observed." };
+            yield { type: "finish", reason: "stop" };
+          },
+        },
+        contextProfile: {
+          version: 2,
+          contextWindowTokens: 1_000_000,
+          maximumOutputTokens: 384_000,
+          ordinaryOutputReserveTokens: 4_096,
+          compactionSummaryMaximumOutputTokens: 32_768,
+          compactAtTokens: 900_000,
+          postCompactTargetTokens: 200_000,
+          retainedTargetTokens: 20_000,
+          estimatorVersion: 1,
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: currentTargetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: {
+              version: 2,
+              contextWindowTokens: 1_000_000,
+              maximumOutputTokens: 384_000,
+              ordinaryOutputReserveTokens: 4_096,
+              compactionSummaryMaximumOutputTokens: 32_768,
+              compactAtTokens: 900_000,
+              postCompactTargetTokens: 200_000,
+              retainedTargetTokens: 20_000,
+              estimatorVersion: 1,
+            },
+          },
+        ],
+      };
+    },
+  };
+  const currentTools = { managedAgentTools: "managed-agent-tools.a3-long-lived.v2" as const };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+    ...currentTools,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity: currentTargetIdentity });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Inspect the current managed Tool Profile." },
+    });
+    expect(continued.result).toEqual({
+      status: "completed",
+      answer: "Current Tool Profile observed.",
+    });
+    const spawn = modelTools?.find((definition) => definition.name === "spawn_agent");
+    const inputSchema = JSON.stringify(spawn?.inputSchema);
+    expect(inputSchema).toContain("scout.v2");
+    expect(inputSchema).toContain("research.v2");
+    expect(inputSchema).not.toContain("scout.v1");
+    expect(inputSchema).not.toContain("research.v1");
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("AgentManager cancels a foreground child through its exact caller signal before terminal link", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-cancel-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -855,6 +1086,741 @@ test("AgentManager settles its injected aggregate deadline as durable terminal f
       },
     ]);
   } finally {
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentManager marks a current child stalled after one causal inactivity window", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-current-stall-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const childStarted = Promise.withResolvers<void>();
+  const releaseProgress = Promise.withResolvers<void>();
+  const progressProcessed = Promise.withResolvers<void>();
+  const releaseCompletion = Promise.withResolvers<void>();
+  let childSignal: AbortSignal | undefined;
+  const childModel: ModelDriver = {
+    async *stream(request) {
+      childSignal = request.signal;
+      childStarted.resolve();
+      await releaseProgress.promise;
+      yield { type: "text_delta", text: "Progress resumed after attention." };
+      progressProcessed.resolve();
+      await releaseCompletion.promise;
+      yield { type: "usage", inputTokens: 10, outputTokens: 4 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  let scheduledDelay: number | undefined;
+  let expire = () => {};
+  const scheduled: Array<{ readonly fire: () => void; cancelled: boolean }> = [];
+  const inactivityScheduler = {
+    schedule(delayMilliseconds: number, onDeadline: () => void) {
+      scheduledDelay = delayMilliseconds;
+      const entry = { fire: onDeadline, cancelled: false };
+      scheduled.push(entry);
+      expire = () => {
+        if (!entry.cancelled) {
+          entry.fire();
+        }
+      };
+      return {
+        cancel() {
+          entry.cancelled = true;
+        },
+      };
+    },
+  };
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentRoot = await domain.claimRoot({ rootId: "current-stall-parent" });
+  const managedStore = createInMemoryManagedAgentStore();
+  const currentOptions = { builtInProfileVersion: 2 as const, inactivityScheduler };
+  const manager = createAgentManager({
+    childContextProfile: {
+      version: 2,
+      contextWindowTokens: 1_000_000,
+      maximumOutputTokens: 384_000,
+      ordinaryOutputReserveTokens: 4_096,
+      compactionSummaryMaximumOutputTokens: 32_768,
+      compactAtTokens: 900_000,
+      postCompactTargetTokens: 200_000,
+      retainedTargetTokens: 20_000,
+      estimatorVersion: 1,
+    },
+    childModel,
+    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+    ...currentOptions,
+  });
+
+  try {
+    const spawned = await manager.spawnBackground({
+      callId: "current-stall-spawn",
+      parentSessionId: manager.parentSessionId,
+      signal: new AbortController().signal,
+      task: "Wait at one causal provider barrier.",
+    });
+    if (
+      spawned.status !== "completed" ||
+      spawned.output === null ||
+      typeof spawned.output !== "object" ||
+      !("agentId" in spawned.output)
+    ) {
+      throw new Error("Expected one current background identity.");
+    }
+    // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+    const agentId = spawned.output["agentId"] as string;
+    await childStarted.promise;
+    expect(scheduledDelay).toBe(300_000);
+    const waiting = manager.wait({
+      agentIds: [agentId],
+      until: "attention",
+      signal: new AbortController().signal,
+    });
+    expire();
+    await expect(waiting).resolves.toMatchObject({
+      status: "completed",
+      output: {
+        counts: { active: 1, attention: 1 },
+        agents: [{ agentId, status: "stalled" }],
+      },
+    });
+    expect(childSignal?.aborted).toBe(false);
+    expect(await managedStore.read()).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "managed_agent_stalled", agentId })]),
+    );
+    expect(
+      (await managedStore.read()).some((record) => record.type === "managed_agent_terminal"),
+    ).toBe(false);
+    const firstStallRevision = (await manager.snapshot()).agents[0]?.revision;
+    releaseProgress.resolve();
+    await progressProcessed.promise;
+    await expect(manager.snapshot()).resolves.toMatchObject({
+      counts: { active: 1, attention: 0 },
+      agents: [{ agentId, status: "running", revision: (firstStallRevision ?? 0) + 1 }],
+    });
+    expect(await managedStore.read()).toEqual(
+      expect.arrayContaining([expect.objectContaining({ type: "managed_agent_resumed", agentId })]),
+    );
+    const resumedWindow = scheduled.at(-1);
+    if (resumedWindow?.cancelled === false) {
+      resumedWindow.fire();
+    }
+    await expect(
+      manager.wait({
+        agentIds: [agentId],
+        until: "attention",
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({
+      status: "completed",
+      output: { agents: [{ agentId, status: "stalled" }] },
+    });
+    expect(
+      (await managedStore.read()).filter((record) => record.type === "managed_agent_stalled"),
+    ).toHaveLength(2);
+  } finally {
+    releaseProgress.resolve();
+    releaseCompletion.resolve();
+    await manager.waitForIdle();
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentManager resets current inactivity after one changed nonempty assistant delta", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-current-progress-reset-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const releaseDelta = Promise.withResolvers<void>();
+  const requestStarted = Promise.withResolvers<void>();
+  const deltaProcessed = Promise.withResolvers<void>();
+  const releaseReasoning = Promise.withResolvers<void>();
+  const reasoningProcessed = Promise.withResolvers<void>();
+  const releaseIgnoredDeltas = Promise.withResolvers<void>();
+  const ignoredDeltasProcessed = Promise.withResolvers<void>();
+  const releaseCompletion = Promise.withResolvers<void>();
+  const childModel: ModelDriver = {
+    async *stream() {
+      requestStarted.resolve();
+      await releaseDelta.promise;
+      yield { type: "text_delta", text: "changed progress" };
+      deltaProcessed.resolve();
+      await releaseIgnoredDeltas.promise;
+      yield { type: "text_delta", text: "" };
+      yield { type: "text_delta", text: "changed progress" };
+      ignoredDeltasProcessed.resolve();
+      await releaseReasoning.promise;
+      yield {
+        type: "reasoning_start",
+        id: "current-reasoning",
+        artifactType: "provider_reasoning",
+      };
+      yield { type: "reasoning_delta", id: "current-reasoning", text: "changed reasoning" };
+      yield { type: "reasoning_end", id: "current-reasoning" };
+      reasoningProcessed.resolve();
+      await releaseCompletion.promise;
+      yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const scheduled: Array<{
+    readonly delayMilliseconds: number;
+    readonly fire: () => void;
+    cancelled: boolean;
+  }> = [];
+  const inactivityScheduler = {
+    schedule(delayMilliseconds: number, onInactivity: () => void) {
+      const entry = { delayMilliseconds, fire: onInactivity, cancelled: false };
+      scheduled.push(entry);
+      return {
+        cancel() {
+          entry.cancelled = true;
+        },
+      };
+    },
+  };
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentRoot = await domain.claimRoot({ rootId: "current-progress-parent" });
+  const managedStore = createInMemoryManagedAgentStore();
+  const currentOptions = { builtInProfileVersion: 2 as const, inactivityScheduler };
+  const manager = createAgentManager({
+    childContextProfile: {
+      version: 2,
+      contextWindowTokens: 1_000_000,
+      maximumOutputTokens: 384_000,
+      ordinaryOutputReserveTokens: 4_096,
+      compactionSummaryMaximumOutputTokens: 32_768,
+      compactAtTokens: 900_000,
+      postCompactTargetTokens: 200_000,
+      retainedTargetTokens: 20_000,
+      estimatorVersion: 1,
+    },
+    childModel,
+    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+    ...currentOptions,
+  });
+
+  try {
+    const spawned = await manager.spawnBackground({
+      callId: "current-progress-spawn",
+      parentSessionId: manager.parentSessionId,
+      signal: new AbortController().signal,
+      task: "Reset only for changed nonempty progress.",
+    });
+    if (
+      spawned.status !== "completed" ||
+      spawned.output === null ||
+      typeof spawned.output !== "object" ||
+      !("agentId" in spawned.output)
+    ) {
+      throw new Error("Expected one current background identity.");
+    }
+    // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+    const agentId = spawned.output["agentId"] as string;
+    await requestStarted.promise;
+    const windowsBeforeDelta = scheduled.length;
+    expect(windowsBeforeDelta).toBeGreaterThan(0);
+    releaseDelta.resolve();
+    await deltaProcessed.promise;
+    expect(scheduled).toHaveLength(windowsBeforeDelta + 1);
+    const preDeltaWindow = scheduled[windowsBeforeDelta - 1];
+    expect(preDeltaWindow).toMatchObject({ delayMilliseconds: 300_000, cancelled: true });
+    if (preDeltaWindow?.cancelled === false) {
+      preDeltaWindow.fire();
+    }
+    await expect(manager.snapshot()).resolves.toMatchObject({
+      counts: { active: 1, attention: 0 },
+      agents: [{ agentId, status: "running" }],
+    });
+    expect(
+      (await managedStore.read()).some((record) => record.type === "managed_agent_stalled"),
+    ).toBe(false);
+    const windowsAfterChangedDelta = scheduled.length;
+    releaseIgnoredDeltas.resolve();
+    await ignoredDeltasProcessed.promise;
+    expect(scheduled).toHaveLength(windowsAfterChangedDelta);
+    releaseReasoning.resolve();
+    await reasoningProcessed.promise;
+    expect(scheduled).toHaveLength(windowsBeforeDelta + 4);
+    expect(
+      scheduled.slice(windowsBeforeDelta, windowsBeforeDelta + 3).every((entry) => entry.cancelled),
+    ).toBe(true);
+  } finally {
+    releaseDelta.resolve();
+    releaseIgnoredDeltas.resolve();
+    releaseReasoning.resolve();
+    releaseCompletion.resolve();
+    await manager.waitForIdle();
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentManager resets current inactivity across one real tool settlement", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-current-tool-reset-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "evidence.txt"), "tool reset evidence\n", "utf8");
+  const secondRequest = Promise.withResolvers<void>();
+  const releaseCompletion = Promise.withResolvers<void>();
+  let providerCalls = 0;
+  let schedulesAtFirstRequest = 0;
+  const scheduled: Array<{
+    readonly fire: () => void;
+    cancelled: boolean;
+  }> = [];
+  const inactivityScheduler = {
+    schedule(_delayMilliseconds: number, onInactivity: () => void) {
+      const entry = { fire: onInactivity, cancelled: false };
+      scheduled.push(entry);
+      return {
+        cancel() {
+          entry.cancelled = true;
+        },
+      };
+    },
+  };
+  const childModel: ModelDriver = {
+    async *stream() {
+      providerCalls += 1;
+      if (providerCalls === 1) {
+        schedulesAtFirstRequest = scheduled.length;
+        yield { type: "tool_call_start", id: "current-tool-reset", name: "read_file" };
+        yield {
+          type: "tool_call_delta",
+          id: "current-tool-reset",
+          json: '{"path":"evidence.txt"}',
+        };
+        yield { type: "tool_call_end", id: "current-tool-reset" };
+        yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      secondRequest.resolve();
+      await releaseCompletion.promise;
+      yield { type: "text_delta", text: "Tool settlement completed." };
+      yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentRoot = await domain.claimRoot({ rootId: "current-tool-reset-parent" });
+  const managedStore = createInMemoryManagedAgentStore();
+  const currentOptions = { builtInProfileVersion: 2 as const, inactivityScheduler };
+  const manager = createAgentManager({
+    childContextProfile: {
+      version: 2,
+      contextWindowTokens: 1_000_000,
+      maximumOutputTokens: 384_000,
+      ordinaryOutputReserveTokens: 4_096,
+      compactionSummaryMaximumOutputTokens: 32_768,
+      compactAtTokens: 900_000,
+      postCompactTargetTokens: 200_000,
+      retainedTargetTokens: 20_000,
+      estimatorVersion: 1,
+    },
+    childModel,
+    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+    ...currentOptions,
+  });
+
+  try {
+    const spawned = await manager.spawnBackground({
+      callId: "current-tool-reset-spawn",
+      parentSessionId: manager.parentSessionId,
+      signal: new AbortController().signal,
+      task: "Read one exact file before waiting.",
+    });
+    if (
+      spawned.status !== "completed" ||
+      spawned.output === null ||
+      typeof spawned.output !== "object" ||
+      !("agentId" in spawned.output)
+    ) {
+      throw new Error("Expected one current background identity.");
+    }
+    // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+    const agentId = spawned.output["agentId"] as string;
+    await secondRequest.promise;
+    expect(scheduled.length).toBeGreaterThan(schedulesAtFirstRequest);
+    const oldWindow = scheduled[schedulesAtFirstRequest - 1];
+    expect(oldWindow?.cancelled).toBe(true);
+    if (oldWindow?.cancelled === false) {
+      oldWindow.fire();
+    }
+    await expect(manager.snapshot()).resolves.toMatchObject({
+      agents: [{ agentId, status: "running" }],
+    });
+    expect(
+      (await managedStore.read()).some((record) => record.type === "managed_agent_stalled"),
+    ).toBe(false);
+  } finally {
+    releaseCompletion.resolve();
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentManager pauses current inactivity for permission and resumes after the exact decision", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-current-permission-pause-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const researchTools = await createWebEvidenceToolRegistry({
+    artifactStore: {
+      async write() {
+        throw new Error("A denied permission fixture must not publish Web evidence.");
+      },
+      async read() {
+        return undefined;
+      },
+    },
+    http: {
+      async fetch() {
+        throw new Error("A denied permission fixture must not reach HTTP.");
+      },
+    },
+  });
+  const permissionRequested =
+    Promise.withResolvers<Extract<RuntimeEvent, { readonly type: "tool_permission_requested" }>>();
+  const permissionDecided = Promise.withResolvers<void>();
+  const scheduled: Array<{
+    readonly fire: () => void;
+    cancelled: boolean;
+  }> = [];
+  const inactivityScheduler = {
+    schedule(_delayMilliseconds: number, onInactivity: () => void) {
+      const entry = { fire: onInactivity, cancelled: false };
+      scheduled.push(entry);
+      return {
+        cancel() {
+          entry.cancelled = true;
+        },
+      };
+    },
+  };
+  let providerCalls = 0;
+  const childModel: ModelDriver = {
+    async *stream() {
+      providerCalls += 1;
+      if (providerCalls === 1) {
+        yield { type: "tool_call_start", id: "permission-pause-web", name: "web_fetch" };
+        yield {
+          type: "tool_call_delta",
+          id: "permission-pause-web",
+          json: '{"url":"https://example.com/permission-pause"}',
+        };
+        yield { type: "tool_call_end", id: "permission-pause-web" };
+        yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Permission decision resumed progress." };
+      yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentRoot = await domain.claimRoot({ rootId: "current-permission-parent" });
+  const managedStore = createInMemoryManagedAgentStore();
+  const currentOptions = { builtInProfileVersion: 2 as const, inactivityScheduler };
+  const manager = createAgentManager({
+    childContextProfile: {
+      version: 2,
+      contextWindowTokens: 1_000_000,
+      maximumOutputTokens: 384_000,
+      ordinaryOutputReserveTokens: 4_096,
+      compactionSummaryMaximumOutputTokens: 32_768,
+      compactAtTokens: 900_000,
+      postCompactTargetTokens: 200_000,
+      retainedTargetTokens: 20_000,
+      estimatorVersion: 1,
+    },
+    childModel,
+    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    managedStore,
+    onChildPermissionEvent(event) {
+      if (event.type === "tool_permission_requested") {
+        permissionRequested.resolve(event);
+      } else if (event.type === "tool_permission_decided") {
+        permissionDecided.resolve();
+      }
+    },
+    parentCoordination: { interactive: true },
+    parentPermissions: createPermissionPolicy({
+      allowedEffects: ["read"],
+      askedEffects: ["network"],
+    }),
+    parentRoot,
+    projectId,
+    researchTools,
+    targetIdentity,
+    workspaceRoot,
+    ...currentOptions,
+  });
+
+  try {
+    const spawned = await manager.spawnBackground({
+      callId: "current-permission-spawn",
+      parentSessionId: manager.parentSessionId,
+      profile: "research.v2",
+      signal: new AbortController().signal,
+      task: "Request one exact Web permission.",
+    });
+    if (
+      spawned.status !== "completed" ||
+      spawned.output === null ||
+      typeof spawned.output !== "object" ||
+      !("agentId" in spawned.output)
+    ) {
+      throw new Error("Expected one current background identity.");
+    }
+    // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+    const agentId = spawned.output["agentId"] as string;
+    const request = await permissionRequested.promise;
+    const pausedWindow = scheduled.at(-1);
+    expect(pausedWindow?.cancelled).toBe(true);
+    const schedulesWhilePaused = scheduled.length;
+    if (pausedWindow?.cancelled === false) {
+      pausedWindow.fire();
+    }
+    await expect(manager.snapshot()).resolves.toMatchObject({
+      agents: [
+        {
+          agentId,
+          status: "running",
+          watchdog: { state: "paused_permission" },
+          usage: {
+            inputTokens: 10,
+            outputTokens: 3,
+            reasoningTokens: 0,
+            providerCalls: 1,
+          },
+          budget: { usedTokens: 13, remainingTokens: 999_987 },
+        },
+      ],
+    });
+    expect(scheduled).toHaveLength(schedulesWhilePaused);
+    expect(manager.decidePermission({ requestId: request.requestId, decision: "deny" })).toEqual({
+      status: "accepted",
+    });
+    await permissionDecided.promise;
+    expect(scheduled).toHaveLength(schedulesWhilePaused + 1);
+    await manager.waitForIdle();
+    expect(providerCalls).toBe(2);
+  } finally {
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentManager pauses current inactivity while waiting for the exact parent reply", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-current-parent-pause-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const secondRequest = Promise.withResolvers<void>();
+  const releaseCompletion = Promise.withResolvers<void>();
+  const scheduled: Array<{ readonly fire: () => void; cancelled: boolean }> = [];
+  const inactivityScheduler = {
+    schedule(_delayMilliseconds: number, onInactivity: () => void) {
+      const entry = { fire: onInactivity, cancelled: false };
+      scheduled.push(entry);
+      return {
+        cancel() {
+          entry.cancelled = true;
+        },
+      };
+    },
+  };
+  let providerCalls = 0;
+  const childModel: ModelDriver = {
+    async *stream() {
+      providerCalls += 1;
+      if (providerCalls === 1) {
+        yield { type: "tool_call_start", id: "current-parent-wait", name: "request_parent_input" };
+        yield {
+          type: "tool_call_delta",
+          id: "current-parent-wait",
+          json: '{"question":"Which exact evidence should I prioritize?"}',
+        };
+        yield { type: "tool_call_end", id: "current-parent-wait" };
+        yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      secondRequest.resolve();
+      await releaseCompletion.promise;
+      yield { type: "text_delta", text: "Exact parent reply delivered." };
+      yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentRoot = await domain.claimRoot({ rootId: "current-parent-pause-root" });
+  const managedStore = createInMemoryManagedAgentStore();
+  const currentOptions = { builtInProfileVersion: 2 as const, inactivityScheduler };
+  const manager = createAgentManager({
+    childContextProfile: {
+      version: 2,
+      contextWindowTokens: 1_000_000,
+      maximumOutputTokens: 384_000,
+      ordinaryOutputReserveTokens: 4_096,
+      compactionSummaryMaximumOutputTokens: 32_768,
+      compactAtTokens: 900_000,
+      postCompactTargetTokens: 200_000,
+      retainedTargetTokens: 20_000,
+      estimatorVersion: 1,
+    },
+    childModel,
+    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    managedStore,
+    parentCoordination: { interactive: true },
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+    parentRoot,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+    ...currentOptions,
+  });
+
+  try {
+    const spawned = await manager.spawnBackground({
+      callId: "current-parent-pause-spawn",
+      parentSessionId: manager.parentSessionId,
+      profile: "research.v2",
+      signal: new AbortController().signal,
+      task: "Request one exact parent reply.",
+    });
+    if (
+      spawned.status !== "completed" ||
+      spawned.output === null ||
+      typeof spawned.output !== "object" ||
+      !("agentId" in spawned.output)
+    ) {
+      throw new Error("Expected one current background identity.");
+    }
+    // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+    const agentId = spawned.output["agentId"] as string;
+    const attention = await manager.wait({
+      agentIds: [agentId],
+      until: "attention",
+      signal: new AbortController().signal,
+    });
+    if (
+      attention.status !== "completed" ||
+      attention.output === null ||
+      typeof attention.output !== "object" ||
+      !("agents" in attention.output) ||
+      // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+      !Array.isArray(attention.output["agents"])
+    ) {
+      throw new Error("Expected one current attention snapshot.");
+    }
+    // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+    const agent = attention.output["agents"][0] as {
+      readonly attention: { readonly attentionId: string };
+      readonly revision: number;
+    };
+    const pausedWindow = scheduled.at(-1);
+    expect(pausedWindow?.cancelled).toBe(true);
+    const schedulesWhilePaused = scheduled.length;
+    await expect(
+      manager.send({
+        agentId,
+        expectedRevision: agent.revision,
+        attentionId: agent.attention.attentionId,
+        callId: "current-parent-pause-reply",
+        message: "Prioritize the exact durable evidence.",
+      }),
+    ).resolves.toMatchObject({ status: "completed", output: { delivery: "enqueued" } });
+    await secondRequest.promise;
+    expect(scheduled.length).toBeGreaterThan(schedulesWhilePaused);
+    if (pausedWindow?.cancelled === false) {
+      pausedWindow.fire();
+    }
+    expect(
+      (await managedStore.read()).some((record) => record.type === "managed_agent_stalled"),
+    ).toBe(false);
+    expect(await managedStore.read()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "managed_agent_parent_reply_delivered" }),
+      ]),
+    );
+  } finally {
+    releaseCompletion.resolve();
+    await manager.close();
     await parentRoot.release();
     await domain.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -4576,6 +5542,166 @@ test("AgentManager starts one explicit follow-up attempt on the same terminal ch
   } finally {
     releaseFollowUp.resolve();
     await manager.waitForIdle();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("AgentManager retains the current context budget across exactly four child attempts", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-current-attempts-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let providerCalls = 0;
+  const childModel: ModelDriver = {
+    async *stream() {
+      providerCalls += 1;
+      yield { type: "text_delta", text: `Current attempt ${providerCalls} complete.` };
+      yield { type: "usage", inputTokens: 10, outputTokens: 3, reasoningTokens: 2 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentRoot = await domain.claimRoot({ rootId: "current-attempt-parent" });
+  const managedStore = createInMemoryManagedAgentStore();
+  const manager = createAgentManager({
+    builtInProfileVersion: 2,
+    childContextProfile: {
+      version: 2,
+      contextWindowTokens: 1_000_000,
+      maximumOutputTokens: 384_000,
+      ordinaryOutputReserveTokens: 4_096,
+      compactionSummaryMaximumOutputTokens: 32_768,
+      compactAtTokens: 900_000,
+      postCompactTargetTokens: 200_000,
+      retainedTargetTokens: 20_000,
+      estimatorVersion: 1,
+    },
+    childModel,
+    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+  });
+
+  try {
+    const first = await manager.spawnBackground({
+      callId: "current-attempt-1",
+      parentSessionId: manager.parentSessionId,
+      signal: new AbortController().signal,
+      task: "Complete current attempt one.",
+    });
+    if (
+      first.status !== "completed" ||
+      first.output === null ||
+      typeof first.output !== "object" ||
+      !("agentId" in first.output)
+    ) {
+      throw new Error("Expected one current child identity.");
+    }
+    // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+    const agentId = first.output["agentId"] as string;
+    await manager.waitForIdle();
+    for (let attempt = 2; attempt <= 4; attempt += 1) {
+      await expect(
+        manager.followUp({
+          agentId,
+          expectedRevision: (attempt - 1) * 2,
+          callId: `current-attempt-${attempt}`,
+          parentSessionId: manager.parentSessionId,
+          signal: new AbortController().signal,
+          task: `Complete current attempt ${attempt}.`,
+        }),
+      ).resolves.toMatchObject({
+        status: "completed",
+        output: { agentId, profile: "scout.v2", status: "running" },
+      });
+      await manager.waitForIdle();
+    }
+    await expect(
+      manager.followUp({
+        agentId,
+        expectedRevision: 8,
+        callId: "current-attempt-5",
+        parentSessionId: manager.parentSessionId,
+        signal: new AbortController().signal,
+        task: "The fifth attempt must be rejected.",
+      }),
+    ).resolves.toMatchObject({ status: "failed", error: { code: "invalid_tool_input" } });
+    expect(providerCalls).toBe(4);
+    const admissions = (await managedStore.read()).filter(
+      (record) => record.type === "managed_agent_admitted",
+    );
+    expect(admissions.map((admission) => admission.limits.maximumTokens)).toEqual([
+      1_000_000, 999_987, 999_974, 999_961,
+    ]);
+    expect(admissions.every((admission) => admission.profile === "scout.v2")).toBe(true);
+    expect(
+      admissions.every(
+        (admission) =>
+          admission.limits.maximumTurns === undefined &&
+          admission.deadlineAtUnixMilliseconds === undefined,
+      ),
+    ).toBe(true);
+    for (let identity = 2; identity <= 4; identity += 1) {
+      const admitted = await manager.spawnBackground({
+        callId: `current-identity-${identity}-attempt-1`,
+        parentSessionId: manager.parentSessionId,
+        signal: new AbortController().signal,
+        task: `Complete identity ${identity} attempt one.`,
+      });
+      if (
+        admitted.status !== "completed" ||
+        admitted.output === null ||
+        typeof admitted.output !== "object" ||
+        !("agentId" in admitted.output)
+      ) {
+        throw new Error("Expected one additional current child identity.");
+      }
+      // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
+      const nextAgentId = admitted.output["agentId"] as string;
+      await manager.waitForIdle();
+      for (let attempt = 2; attempt <= 4; attempt += 1) {
+        await expect(
+          manager.followUp({
+            agentId: nextAgentId,
+            expectedRevision: (attempt - 1) * 2,
+            callId: `current-identity-${identity}-attempt-${attempt}`,
+            parentSessionId: manager.parentSessionId,
+            signal: new AbortController().signal,
+            task: `Complete identity ${identity} attempt ${attempt}.`,
+          }),
+        ).resolves.toMatchObject({ status: "completed" });
+        await manager.waitForIdle();
+      }
+    }
+    expect(providerCalls).toBe(16);
+    await expect(
+      manager.spawnBackground({
+        callId: "current-parent-attempt-17",
+        parentSessionId: manager.parentSessionId,
+        signal: new AbortController().signal,
+        task: "The seventeenth aggregate attempt must be rejected.",
+      }),
+    ).resolves.toMatchObject({
+      status: "failed",
+      error: { code: "managed_agent_capacity_exceeded" },
+    });
+    expect(providerCalls).toBe(16);
+  } finally {
+    await manager.close();
     await parentRoot.release();
     await domain.close();
     await rm(testRoot, { recursive: true, force: true });

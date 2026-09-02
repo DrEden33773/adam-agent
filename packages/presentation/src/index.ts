@@ -923,10 +923,11 @@ export type AuthoritativePresentationSnapshot = {
     readonly agents: readonly {
       readonly agentId: string;
       readonly attemptId: string;
-      readonly profile: "scout.v1" | "research.v1";
+      readonly profile: "scout.v1" | "scout.v2" | "research.v1" | "research.v2";
       readonly mode: "foreground" | "background";
       readonly status:
         | "running"
+        | "stalled"
         | "waiting_for_parent"
         | "completed"
         | "failed"
@@ -957,6 +958,28 @@ export type AuthoritativePresentationSnapshot = {
         readonly messageByteCount: number;
         readonly messageTruncated: boolean;
       }[];
+      readonly context?: { readonly contextWindowTokens: number };
+      readonly usage?: {
+        readonly inputTokens: number;
+        readonly outputTokens: number;
+        readonly reasoningTokens: number;
+        readonly providerCalls: number;
+      };
+      readonly budget?: {
+        readonly maximumCumulativeTokens: number;
+        readonly usedTokens: number;
+        readonly remainingTokens: number;
+      };
+      readonly attempts?: {
+        readonly childAttempts: number;
+        readonly maximumChildAttempts: 4;
+        readonly parentAttempts: number;
+        readonly maximumParentAttempts: 16;
+      };
+      readonly watchdog?: {
+        readonly state: "running" | "paused_permission" | "paused_parent" | "stalled" | "terminal";
+        readonly maximumInactivityMilliseconds: 300000;
+      };
     }[];
   };
 };

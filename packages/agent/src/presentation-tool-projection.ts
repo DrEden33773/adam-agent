@@ -212,7 +212,7 @@ export function projectPendingPermissionCandidates(
             }
           : entry.record.event.subject?.type === "managed_agent_web_request"
             ? {
-                warning: `Allow ${entry.record.event.subject.agentId} (research.v1) to send this exact Web request to ${entry.record.event.subject.providerOrigin}: ${entry.record.event.subject.queryOrUrl}?`,
+                warning: `Allow ${entry.record.event.subject.agentId} (${entry.record.event.subject.profile}) to send this exact Web request to ${entry.record.event.subject.providerOrigin}: ${entry.record.event.subject.queryOrUrl}?`,
               }
             : entry.record.event.subject?.type === "web_request"
               ? {
@@ -448,7 +448,7 @@ function safeToolSubject(
   if (subject?.type === "managed_agent_web_request") {
     return {
       type: "generic",
-      value: `${subject.agentId} (research.v1) · ${subject.providerOrigin} · ${subject.operation} ${JSON.stringify(subject.queryOrUrl)}`,
+      value: `${subject.agentId} (${subject.profile}) · ${subject.providerOrigin} · ${subject.operation} ${JSON.stringify(subject.queryOrUrl)}`,
     };
   }
   if (subject?.type === "web_artifact") {

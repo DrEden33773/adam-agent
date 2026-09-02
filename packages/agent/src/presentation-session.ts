@@ -1491,9 +1491,9 @@ export async function createPresentationSession(
           effect: event.effect,
           subject: {
             type: "generic" as const,
-            value: `${event.subject.agentId} (research.v1) · ${event.subject.providerOrigin} · ${event.subject.operation} ${JSON.stringify(event.subject.queryOrUrl)}`,
+            value: `${event.subject.agentId} (${event.subject.profile}) · ${event.subject.providerOrigin} · ${event.subject.operation} ${JSON.stringify(event.subject.queryOrUrl)}`,
           },
-          warning: `Allow ${event.subject.agentId} (research.v1) to send this exact Web request to ${event.subject.providerOrigin}: ${event.subject.queryOrUrl}?`,
+          warning: `Allow ${event.subject.agentId} (${event.subject.profile}) to send this exact Web request to ${event.subject.providerOrigin}: ${event.subject.queryOrUrl}?`,
           canAllow: true,
           changePreviewRef: null,
         };

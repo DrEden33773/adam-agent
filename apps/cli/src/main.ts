@@ -323,7 +323,7 @@ function formatPermissionPrompt(
     return `Allow managed-child ${event.subject.operation} for its exact owning parent [y/N] `;
   }
   if (event.subject.type === "managed_agent_web_request") {
-    return `Allow ${event.subject.agentId} (research.v1) to send this exact Web request to ${quoteForTerminal(event.subject.providerOrigin)}: ${quoteForTerminal(event.subject.queryOrUrl)}? [y/N] `;
+    return `Allow ${event.subject.agentId} (${event.subject.profile}) to send this exact Web request to ${quoteForTerminal(event.subject.providerOrigin)}: ${quoteForTerminal(event.subject.queryOrUrl)}? [y/N] `;
   }
   if (event.subject.type === "web_request") {
     const target =
@@ -572,7 +572,7 @@ async function runCliCommand(activeCommand: CliCommand): Promise<void> {
 async function createRunLifecycle(modelTargets: ModelTargets): Promise<SessionLifecycle> {
   const artifactStore = createLazyFileArtifactStore(join(stateRoot, "artifacts"));
   return createSessionLifecycle({
-    managedAgentTools: "managed-agent-tools.a1.v1",
+    managedAgentTools: "managed-agent-tools.a1.v2",
     modelTargets,
     preferences: createPresentationPreferences({ environment: userConfigurationEnvironment }),
     workspaceTrust: createWorkspaceTrust({
