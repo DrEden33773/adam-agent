@@ -38,6 +38,7 @@ test("AgentNavigator renders responsive NO_COLOR list, detail and exact cancel i
             throughSequence: 2,
           },
         ],
+        messages: [],
       },
       {
         agentId: "123e4567-e89b-42d3-a456-426614174203",
@@ -68,6 +69,7 @@ test("AgentNavigator renders responsive NO_COLOR list, detail and exact cancel i
             throughSequence: 4,
           },
         ],
+        messages: [],
       },
     ],
   };
@@ -133,6 +135,7 @@ test("AgentNavigator renders one bounded attention question and emits its exact 
               throughSequence: 5,
             },
           ],
+          messages: [],
           attention: {
             attentionId: "123e4567-e89b-42d3-a456-426614174213",
             question: "Which exact source should I prioritize?",

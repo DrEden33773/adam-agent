@@ -492,6 +492,11 @@ export type ManagedAgentRecord =
       readonly childSessionId: string;
       readonly status: "failed";
       readonly error: { readonly code: string; readonly message: string };
+      readonly partialOutput?: {
+        readonly text: string;
+        readonly byteCount: number;
+        readonly truncated: boolean;
+      };
       readonly transcriptDigest?: `sha256:${string}`;
       readonly throughSequence?: number;
     }
@@ -518,6 +523,11 @@ export type ManagedAgentRecord =
       readonly recoveryPhase?: "pre_genesis" | "interrupted";
       readonly transcriptDigest?: `sha256:${string}`;
       readonly throughSequence?: number;
+      readonly partialOutput?: {
+        readonly text: string;
+        readonly byteCount: number;
+        readonly truncated: boolean;
+      };
       readonly error: {
         readonly code: "managed_agent_recovery_required";
         readonly message: string;
@@ -810,6 +820,13 @@ const managedAgentRecordSchema = z.union([
       code: z.string().min(1).max(128),
       message: z.string().min(1).max(4_096),
     }),
+    partialOutput: z
+      .strictObject({
+        text: z.string().refine((text) => Buffer.byteLength(text, "utf8") <= 16 * 1024),
+        byteCount: z.number().int().positive(),
+        truncated: z.boolean(),
+      })
+      .optional(),
     transcriptDigest: z
       .string()
       .regex(/^sha256:[0-9a-f]{64}$/u)
@@ -842,6 +859,13 @@ const managedAgentRecordSchema = z.union([
       .regex(/^sha256:[0-9a-f]{64}$/u)
       .optional(),
     throughSequence: z.number().int().nonnegative().optional(),
+    partialOutput: z
+      .strictObject({
+        text: z.string().refine((text) => Buffer.byteLength(text, "utf8") <= 16 * 1024),
+        byteCount: z.number().int().positive(),
+        truncated: z.boolean(),
+      })
+      .optional(),
     error: z.strictObject({
       code: z.literal("managed_agent_recovery_required"),
       message: z.string().min(1).max(4_096),
@@ -2064,6 +2088,11 @@ export type ManagedAgentSummary = {
     | { readonly text: string }
     | { readonly artifact: Pick<ArtifactReference, "id" | "mediaType" | "byteCount"> };
   readonly error?: { readonly code: string; readonly message: string };
+  readonly partialOutput?: {
+    readonly text: string;
+    readonly byteCount: number;
+    readonly truncated: boolean;
+  };
   readonly attention?: {
     readonly attentionId: string;
     readonly question: string;
@@ -2076,6 +2105,16 @@ export type ManagedAgentSummary = {
     readonly revision: number;
     readonly messageByteCount: number;
     readonly messageTruncated: boolean;
+  }[];
+  readonly messages: readonly {
+    readonly messageId: `sha256:${string}`;
+    readonly kind: "message" | "reply";
+    readonly message: string;
+    readonly messageByteCount: number;
+    readonly messageTruncated: boolean;
+    readonly status: "enqueued" | "delivered";
+    readonly revision: number;
+    readonly attentionId?: string;
   }[];
   readonly resultByteCount?: number;
   readonly resultTruncated?: boolean;
@@ -2112,7 +2151,7 @@ export type ManagedAgentSnapshot = {
   readonly agents: readonly ManagedAgentSummary[];
 };
 
-function isManagedAgentActiveStatus(status: ManagedAgentSummary["status"]): boolean {
+export function isManagedAgentActiveStatus(status: ManagedAgentSummary["status"]): boolean {
   return (
     status === "running" ||
     status === "permission_required" ||
@@ -2189,6 +2228,40 @@ export function managedAgentSnapshotFromRecords(
           revision: record.sequence,
           messageByteCount,
           messageTruncated: messageByteCount > 512,
+        };
+      });
+    const messages = records
+      .flatMap((record) =>
+        (record.type === "managed_agent_parent_message_enqueued" ||
+          record.type === "managed_agent_parent_reply_enqueued") &&
+        record.agentId === admission.agentId
+          ? [record]
+          : [],
+      )
+      .slice(-4)
+      .map((record) => {
+        const messageByteCount = Buffer.byteLength(record.message, "utf8");
+        return {
+          messageId: record.messageId,
+          kind:
+            record.type === "managed_agent_parent_reply_enqueued"
+              ? ("reply" as const)
+              : ("message" as const),
+          message: boundedUtf8Prefix(record.message, 512),
+          messageByteCount,
+          messageTruncated: messageByteCount > 512,
+          status: records.some(
+            (candidate) =>
+              (candidate.type === "managed_agent_parent_message_delivered" ||
+                candidate.type === "managed_agent_parent_reply_delivered") &&
+              candidate.messageId === record.messageId,
+          )
+            ? ("delivered" as const)
+            : ("enqueued" as const),
+          revision: record.sequence,
+          ...(record.type === "managed_agent_parent_reply_enqueued"
+            ? { attentionId: record.attentionId }
+            : {}),
         };
       });
     const identityAdmissions = admissions.filter(
@@ -2287,6 +2360,7 @@ export function managedAgentSnapshotFromRecords(
       },
       attemptHistory,
       reports,
+      messages,
       ...(inspection !== undefined ||
       terminal?.type !== "managed_agent_terminal" ||
       terminal.status !== "completed"
@@ -2299,6 +2373,11 @@ export function managedAgentSnapshotFromRecords(
             terminal.status === "cancelled"
           ? {}
           : { error: terminal.error }),
+      ...(terminal?.type === "managed_agent_terminal" &&
+      (terminal.status === "failed" || terminal.status === "recovery_required") &&
+      terminal.partialOutput !== undefined
+        ? { partialOutput: terminal.partialOutput }
+        : {}),
       ...(attention === undefined
         ? {}
         : {
@@ -2379,6 +2458,7 @@ export async function managedAgentSnapshotWithChildHistories(input: {
       );
       const currentHistory = histories.at(-1);
       const activeTool = currentManagedAgentTool(currentHistory ?? []);
+      const partialOutput = agent.partialOutput;
       const transcript = {
         ...agent.transcript,
         throughSequence: currentHistory?.at(-1)?.sequence ?? agent.transcript.throughSequence,
@@ -2417,6 +2497,10 @@ export async function managedAgentSnapshotWithChildHistories(input: {
                     : activeTool.status,
               },
             };
+      const projectedPartialOutput =
+        partialOutput === undefined || (status !== "failed" && status !== "recovery_required")
+          ? {}
+          : { partialOutput };
       const liveWatchdogState = input.watchdogState?.(agent.attemptId);
       const watchdog =
         liveWatchdogState === undefined || agent.watchdog === undefined
@@ -2430,6 +2514,7 @@ export async function managedAgentSnapshotWithChildHistories(input: {
           transcript,
           attemptHistory,
           ...projectedActiveTool,
+          ...projectedPartialOutput,
           ...watchdog,
         };
       }
@@ -2453,6 +2538,7 @@ export async function managedAgentSnapshotWithChildHistories(input: {
         transcript,
         attemptHistory,
         ...projectedActiveTool,
+        ...projectedPartialOutput,
         ...(agent.usage === undefined ? {} : { usage }),
         ...(agent.budget === undefined
           ? {}
@@ -3670,6 +3756,20 @@ export function createAgentManager(options: {
               });
             },
           );
+    let partialOutputText = "";
+    let partialOutputByteCount = 0;
+    const resetPartialOutput = () => {
+      partialOutputText = "";
+      partialOutputByteCount = 0;
+    };
+    const partialOutput = (): ManagedAgentSummary["partialOutput"] =>
+      partialOutputByteCount === 0
+        ? undefined
+        : {
+            text: partialOutputText,
+            byteCount: partialOutputByteCount,
+            truncated: partialOutputByteCount > Buffer.byteLength(partialOutputText, "utf8"),
+          };
     try {
       const readTools =
         profile === "reviewer.v1"
@@ -3925,6 +4025,12 @@ export function createAgentManager(options: {
       unsubscribeChildPermissions = child.subscribe((event) => {
         options.onChildRuntimeEvent?.({ agentId, attemptId, childSessionId, event });
         observeChildPermissionEvent(child, event);
+        if (event.type === "model_message_started" || event.type === "model_message_completed") {
+          resetPartialOutput();
+        } else if (event.type === "model_message_delta") {
+          partialOutputByteCount += Buffer.byteLength(event.text, "utf8");
+          partialOutputText = boundedUtf8Prefix(`${partialOutputText}${event.text}`, 16 * 1024);
+        }
         if (event.type === "tool_permission_requested") {
           pauseInactivity("permission");
           return;
@@ -4048,6 +4154,7 @@ export function createAgentManager(options: {
                 code: "model_output_truncated",
                 message: "The foreground scout reached its output limit.",
               };
+        const failedPartialOutput = partialOutput();
         terminalCommitStarted = true;
         await appendManagedRecord({
           type: "managed_agent_terminal",
@@ -4056,6 +4163,7 @@ export function createAgentManager(options: {
           childSessionId,
           status: "failed",
           error,
+          ...(failedPartialOutput === undefined ? {} : { partialOutput: failedPartialOutput }),
           transcriptDigest,
           throughSequence,
         });
@@ -4177,6 +4285,7 @@ export function createAgentManager(options: {
           } catch {
             recoveryRecords = undefined;
           }
+          const interruptedPartialOutput = partialOutput();
           await appendManagedRecord(
             deadlineExpired
               ? {
@@ -4203,6 +4312,9 @@ export function createAgentManager(options: {
                         transcriptDigest: digest(JSON.stringify(recoveryRecords)),
                         throughSequence: recoveryRecords.at(-1)?.sequence ?? 0,
                       }),
+                  ...(interruptedPartialOutput === undefined
+                    ? {}
+                    : { partialOutput: interruptedPartialOutput }),
                   error: {
                     code: "managed_agent_recovery_required",
                     message:
@@ -4330,7 +4442,15 @@ export function createAgentManager(options: {
     }
     pendingAdmissions.delete(pendingId);
     releaseAdmissionReservation(newIdentity);
-    const admittedRevision = (await options.managedStore.read()).filter(
+    const admittedRecords = await options.managedStore.read();
+    const admissionRecord = admittedRecords.find(
+      (record) =>
+        record.type === "managed_agent_admitted" && record.attemptId === identity.attemptId,
+    );
+    if (admissionRecord?.type !== "managed_agent_admitted") {
+      return toolFailure("managed_agent_unavailable", "The durable child admission is missing.");
+    }
+    const admittedRevision = admittedRecords.filter(
       (record) => record.agentId === identity.agentId,
     ).length;
     activeAttempts.set(identity.agentId, {
@@ -4377,6 +4497,7 @@ export function createAgentManager(options: {
         mode: "background",
         status: "running",
         revision: admittedRevision,
+        record: managedRecordReceipt(admissionRecord),
       },
     };
   };
@@ -4615,38 +4736,30 @@ export function createAgentManager(options: {
           childSessionId: admission.childSessionId,
           expectedRevision: input.expectedRevision,
         });
+        const cancelRecord = (await options.managedStore.read()).findLast(
+          (record) =>
+            record.type === "managed_agent_cancel_requested" &&
+            record.agentId === input.agentId &&
+            record.attemptId === active.attemptId,
+        );
+        if (cancelRecord?.type !== "managed_agent_cancel_requested") {
+          return toolFailure(
+            "managed_agent_unavailable",
+            "The exact managed-child cancellation receipt is unavailable.",
+          );
+        }
         active.controller.abort(new Error("Managed child cancelled by its parent."));
         await active.completion;
-        return manager.list().then((result) => {
-          if (
-            result.status !== "completed" ||
-            result.output === null ||
-            typeof result.output !== "object" ||
-            !("agents" in result.output)
-          ) {
-            return result;
-          }
-          // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
-          const agents = result.output["agents"];
-          const agent = Array.isArray(agents)
-            ? agents.find(
-                (candidate) =>
-                  candidate !== null &&
-                  typeof candidate === "object" &&
-                  "agentId" in candidate &&
-                  // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
-                  candidate["agentId"] === input.agentId,
-              )
-            : undefined;
-          return {
-            status: "completed",
-            output: agent ?? {
-              agentId: input.agentId,
-              status: "cancelled",
-              revision: input.expectedRevision + 2,
-            },
-          };
-        });
+        return {
+          status: "completed",
+          output: {
+            agentId: input.agentId,
+            attemptId: active.attemptId,
+            status: "cancelled",
+            revision: input.expectedRevision + 2,
+            record: managedRecordReceipt(cancelRecord),
+          },
+        };
       })();
       active.cancelPromise = cancellation;
       return cancellation;

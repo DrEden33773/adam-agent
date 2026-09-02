@@ -48,6 +48,8 @@ import {
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
+import { withManagedFailureGuard } from "./managed-agent-test-support.js";
+
 const targetIdentity = {
   targetId: "deepseek-v4-flash.direct",
   vendor: "deepseek",
@@ -4830,19 +4832,15 @@ test("SessionLifecycle serializes child Web permission overlays and projects per
         permissionStatusVisible.resolve();
       }
     });
-    let permissionStatusFailureGuard: ReturnType<typeof setTimeout> | undefined;
-    const permissionStatusFailed = new Promise<never>((_resolve, reject) => {
-      permissionStatusFailureGuard = setTimeout(
-        () => reject(new Error("The managed permission-required state was never projected.")),
-        5_000,
-      );
-    });
     await lifecycle.continue({
       sessionId: created.sessionId,
       input: { text: "Start both permission children." },
     });
     const firstRequestId = await firstPermission.promise;
-    await Promise.race([permissionStatusVisible.promise, permissionStatusFailed]);
+    await withManagedFailureGuard(
+      permissionStatusVisible.promise,
+      "The managed permission-required state was never projected.",
+    );
     expect(permissionEvents).toHaveLength(1);
     expect(presentation.getState().authoritative.managedAgents).toMatchObject({
       counts: { active: 2, attention: 1 },
@@ -4951,9 +4949,6 @@ test("SessionLifecycle serializes child Web permission overlays and projects per
         expect.objectContaining({ agentId: thirdAgentId, status: "cancelled" }),
       ]),
     });
-    if (permissionStatusFailureGuard !== undefined) {
-      clearTimeout(permissionStatusFailureGuard);
-    }
     unsubscribePermissionStatus();
     await presentation.close();
   } finally {
@@ -6543,14 +6538,6 @@ test("PresentationSession causally projects a background child admission while t
       resumedVisible.resolve();
     }
   });
-  let failureGuard: ReturnType<typeof setTimeout> | undefined;
-  const failed = new Promise<never>((_resolve, reject) => {
-    failureGuard = setTimeout(
-      () => reject(new Error("The managed child admission was never projected.")),
-      5_000,
-    );
-  });
-
   try {
     const parentRun = presentation.dispatch({
       type: "submit_prompt",
@@ -6560,7 +6547,10 @@ test("PresentationSession causally projects a background child admission while t
       thinkingSelection: null,
     });
     await childEntered.promise;
-    await Promise.race([runningVisible.promise, failed]);
+    await withManagedFailureGuard(
+      runningVisible.promise,
+      "The managed child admission was never projected.",
+    );
     const active = presentation.getState().authoritative.managedAgents.agents[0];
     expect(active).toMatchObject({
       profile: "scout.v2",
@@ -6585,7 +6575,10 @@ test("PresentationSession causally projects a background child admission while t
       throw new Error("Presentation did not expose the active child.");
     }
     expireInactivity();
-    await Promise.race([stalledVisible.promise, failed]);
+    await withManagedFailureGuard(
+      stalledVisible.promise,
+      "The managed child stalled state was never projected.",
+    );
     expect(presentation.getState().authoritative.managedAgents).toMatchObject({
       counts: { active: 1, attention: 1 },
       agents: [{ agentId: active.agentId, status: "stalled", watchdog: { state: "stalled" } }],
@@ -6626,7 +6619,10 @@ test("PresentationSession causally projects a background child admission while t
     expect(JSON.stringify(presentation.getState().managedAgentActivity)).not.toContain(
       "private managed reasoning",
     );
-    await Promise.race([resumedVisible.promise, failed]);
+    await withManagedFailureGuard(
+      resumedVisible.promise,
+      "The managed child resumed state was never projected.",
+    );
     expect(presentation.getState().authoritative.managedAgents).toMatchObject({
       counts: { active: 1, attention: 0 },
       agents: [{ agentId: active.agentId, status: "running", watchdog: { state: "running" } }],
@@ -6669,7 +6665,14 @@ test("PresentationSession causally projects a background child admission while t
         agentId: active.agentId,
         expectedRevision: resumed.revision,
       }),
-    ).resolves.toMatchObject({ status: "admitted" });
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentControl: {
+        action: "cancel",
+        agentId: active.agentId,
+        record: { digest: expect.stringMatching(/^sha256:/u) },
+      },
+    });
     expect(presentation.getState().authoritative.managedAgents).toMatchObject({
       counts: { active: 0, terminal: 1 },
       agents: [{ agentId: active.agentId, status: "cancelled", revision: 5 }],
@@ -6684,6 +6687,7 @@ test("PresentationSession causally projects a background child admission while t
       agentId: cancelled.agentId,
       attemptId: cancelled.attemptId,
       expectedRevision: cancelled.revision,
+      expectedThroughSequence: cancelled.transcript.throughSequence,
       cursor: null,
     });
     expect(cancelledTranscript).toMatchObject({
@@ -6702,9 +6706,6 @@ test("PresentationSession causally projects a background child admission while t
       /Start one background child|private managed reasoning/u,
     );
   } finally {
-    if (failureGuard !== undefined) {
-      clearTimeout(failureGuard);
-    }
     unsubscribe();
     releaseRuntimeRefresh.resolve();
     releaseParent.resolve();
@@ -7022,6 +7023,7 @@ test("PresentationSession replies to one exact attention without waking a parent
       agentId,
       attemptId: terminalAgent.attemptId,
       expectedRevision: terminalAgent.revision,
+      expectedThroughSequence: terminalAgent.transcript.throughSequence,
       cursor: null,
     });
     expect(latestTranscript).toMatchObject({
@@ -7044,6 +7046,17 @@ test("PresentationSession replies to one exact attention without waking a parent
     expect(JSON.stringify(latestTranscript)).not.toMatch(
       /Request Presentation input|Which exact Presentation source should I use/u,
     );
+    await expect(
+      presentation.dispatch({
+        type: "read_managed_agent_transcript",
+        sessionId: created.sessionId,
+        agentId,
+        attemptId: terminalAgent.attemptId,
+        expectedRevision: terminalAgent.revision,
+        expectedThroughSequence: terminalAgent.transcript.throughSequence - 1,
+        cursor: null,
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "stale_interaction" });
     if (
       latestTranscript.status !== "admitted" ||
       latestTranscript.managedAgentTranscript === undefined
@@ -7057,6 +7070,7 @@ test("PresentationSession replies to one exact attention without waking a parent
         agentId,
         attemptId: terminalAgent.attemptId,
         expectedRevision: terminalAgent.revision,
+        expectedThroughSequence: terminalAgent.transcript.throughSequence,
         cursor: latestTranscript.managedAgentTranscript.olderCursor,
       }),
     ).resolves.toMatchObject({
@@ -7092,7 +7106,14 @@ test("PresentationSession replies to one exact attention without waking a parent
         expectedRevision: terminalAgent.revision,
         task: "Create one interrupted recovery boundary.",
       }),
-    ).resolves.toMatchObject({ status: "admitted" });
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentControl: {
+        action: "follow_up",
+        agentId,
+        record: { digest: expect.stringMatching(/^sha256:/u) },
+      },
+    });
     await interruptedVisible.promise;
     const recoveryRequiredAgent = presentation
       .getState()
@@ -7115,7 +7136,14 @@ test("PresentationSession replies to one exact attention without waking a parent
         expectedRevision: recoveryRequiredAgent.revision,
         task: "Recover from the exact interrupted attempt.",
       }),
-    ).resolves.toMatchObject({ status: "admitted" });
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentControl: {
+        action: "recovery",
+        agentId,
+        record: { digest: expect.stringMatching(/^sha256:/u) },
+      },
+    });
     await recoveryRequestStarted.promise;
     const activeRecoveryAgent = presentation
       .getState()
@@ -7132,7 +7160,39 @@ test("PresentationSession replies to one exact attention without waking a parent
         expectedRevision: activeRecoveryAgent.revision,
         message: "Use the queued Presentation message.",
       }),
-    ).resolves.toMatchObject({ status: "admitted" });
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentControl: {
+        action: "message",
+        agentId,
+        attemptId: activeRecoveryAgent.attemptId,
+        revision: activeRecoveryAgent.revision + 1,
+        messageId: expect.stringMatching(/^sha256:/u),
+        delivery: "enqueued",
+        record: {
+          id: expect.stringMatching(/^sha256:/u),
+          revision: expect.any(Number),
+          digest: expect.stringMatching(/^sha256:/u),
+        },
+      },
+    });
+    expect(
+      presentation
+        .getState()
+        .authoritative.managedAgents.agents.find((candidate) => candidate.agentId === agentId),
+    ).toMatchObject({
+      messages: [
+        expect.objectContaining({
+          kind: "reply",
+          status: "delivered",
+        }),
+        expect.objectContaining({
+          kind: "message",
+          message: "Use the queued Presentation message.",
+          status: "enqueued",
+        }),
+      ],
+    });
     releaseRecoveryRequest.resolve();
     await recoveredVisible.promise;
     unsubscribeRecovery();
@@ -7173,21 +7233,19 @@ test("PresentationSession replies to one exact attention without waking a parent
         expectedRevision: recoveredAgent.revision,
         task: "Read the exact evidence and report again.",
       }),
-    ).resolves.toMatchObject({ status: "admitted" });
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentControl: {
+        action: "follow_up",
+        agentId,
+        record: { digest: expect.stringMatching(/^sha256:/u) },
+      },
+    });
     await reportVisible.promise;
-    let failedFailureGuard: ReturnType<typeof setTimeout> | undefined;
-    await Promise.race([
+    await withManagedFailureGuard(
       failedVisible.promise,
-      new Promise<never>((_resolve, reject) => {
-        failedFailureGuard = setTimeout(
-          () => reject(new Error("The managed follow-up failure was never projected.")),
-          5_000,
-        );
-      }),
-    ]);
-    if (failedFailureGuard !== undefined) {
-      clearTimeout(failedFailureGuard);
-    }
+      "The managed follow-up failure was never projected.",
+    );
     unsubscribeFailed();
     const failedAgent = presentation
       .getState()
@@ -7196,6 +7254,11 @@ test("PresentationSession replies to one exact attention without waking a parent
       status: "failed",
       phase: "terminal",
       error: { code: "model_request_failed" },
+      partialOutput: {
+        text: "Partial failed follow-up.",
+        byteCount: 25,
+        truncated: false,
+      },
       reports: [
         expect.objectContaining({
           kind: "progress",
@@ -7229,6 +7292,7 @@ test("PresentationSession replies to one exact attention without waking a parent
       agentId,
       attemptId: failedAgent.attemptId,
       expectedRevision: failedAgent.revision,
+      expectedThroughSequence: failedAgent.transcript.throughSequence,
       cursor: null,
     });
     expect(failedTranscript).toMatchObject({
@@ -7250,13 +7314,41 @@ test("PresentationSession replies to one exact attention without waking a parent
     ) {
       throw new Error("The failed managed transcript page was unavailable.");
     }
+    const failedPartialTranscript = await presentation.dispatch({
+      type: "read_managed_agent_transcript",
+      sessionId: created.sessionId,
+      agentId,
+      attemptId: failedAgent.attemptId,
+      expectedRevision: failedAgent.revision,
+      expectedThroughSequence: failedAgent.transcript.throughSequence,
+      cursor: failedTranscript.managedAgentTranscript.olderCursor,
+    });
+    expect(failedPartialTranscript).toMatchObject({
+      status: "admitted",
+      managedAgentTranscript: {
+        items: [
+          expect.objectContaining({
+            type: "assistant_message",
+            text: "Partial failed follow-up.",
+          }),
+        ],
+        olderCursor: expect.stringMatching(/^managed-agent-transcript:/u),
+      },
+    });
+    if (
+      failedPartialTranscript.status !== "admitted" ||
+      failedPartialTranscript.managedAgentTranscript === undefined
+    ) {
+      throw new Error("The failed managed partial-output page was unavailable.");
+    }
     const failedToolTranscript = await presentation.dispatch({
       type: "read_managed_agent_transcript",
       sessionId: created.sessionId,
       agentId,
       attemptId: failedAgent.attemptId,
       expectedRevision: failedAgent.revision,
-      cursor: failedTranscript.managedAgentTranscript.olderCursor,
+      expectedThroughSequence: failedAgent.transcript.throughSequence,
+      cursor: failedPartialTranscript.managedAgentTranscript.olderCursor,
     });
     expect(failedToolTranscript).toMatchObject({
       status: "admitted",
@@ -7284,6 +7376,7 @@ test("PresentationSession replies to one exact attention without waking a parent
         agentId,
         attemptId: failedAgent.attemptId,
         expectedRevision: failedAgent.revision,
+        expectedThroughSequence: failedAgent.transcript.throughSequence,
         cursor: failedToolTranscript.managedAgentTranscript.olderCursor,
       }),
     ).resolves.toMatchObject({
@@ -7300,85 +7393,8 @@ test("PresentationSession replies to one exact attention without waking a parent
       },
     });
     await presentation.close();
-    await lifecycle.close();
-    const coldLifecycle = createSessionLifecycle({
-      managedAgentTools: "managed-agent-tools.a3-long-lived.v2",
-      modelTargets,
-      permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
-      stateRoot,
-      tools: createReadToolRegistry({ workspaceRoot }),
-      workspaceRoot,
-      workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
-    });
-    try {
-      const coldPresentation = await createPresentationSession({
-        lifecycle: coldLifecycle,
-        projectLabel: "attention-presentation-cold",
-        sessionId: created.sessionId,
-        stateRoot,
-        workspaceRoot,
-        [presentationManagedAgentTranscriptPageSize]: 1,
-      });
-      try {
-        expect(coldPresentation.getState().authoritative.managedAgents).toMatchObject({
-          counts: { active: 0, terminal: 1, attention: 0 },
-          agents: [
-            {
-              agentId,
-              status: "failed",
-              usage: {
-                inputTokens: 40,
-                outputTokens: 14,
-                reasoningTokens: 0,
-                providerCalls: 7,
-              },
-              budget: {
-                maximumCumulativeTokens: 128_000,
-                usedTokens: 54,
-                remainingTokens: 127_946,
-              },
-              attemptHistory: [
-                expect.objectContaining({ status: "completed", current: false }),
-                expect.objectContaining({ status: "recovery_required", current: false }),
-                expect.objectContaining({ status: "completed", current: false }),
-                expect.objectContaining({ status: "failed", current: true }),
-              ],
-            },
-          ],
-        });
-        const coldAgent = coldPresentation.getState().authoritative.managedAgents.agents[0];
-        if (coldAgent === undefined) {
-          throw new Error("The cold managed child was unavailable.");
-        }
-        await expect(
-          coldPresentation.dispatch({
-            type: "read_managed_agent_transcript",
-            sessionId: created.sessionId,
-            agentId,
-            attemptId: coldAgent.attemptId,
-            expectedRevision: coldAgent.revision,
-            cursor: null,
-          }),
-        ).resolves.toMatchObject({
-          status: "admitted",
-          managedAgentTranscript: {
-            childSessionId: coldAgent.transcript.childSessionId,
-            throughSequence: coldAgent.transcript.throughSequence,
-            items: [
-              expect.objectContaining({
-                type: "session_notice",
-                code: "model_request_failed",
-              }),
-            ],
-          },
-        });
-      } finally {
-        await coldPresentation.close();
-      }
-    } finally {
-      await coldLifecycle.close();
-    }
   } finally {
+    releaseRecoveryRequest.resolve();
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }

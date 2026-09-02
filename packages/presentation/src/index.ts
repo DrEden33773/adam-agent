@@ -1003,6 +1003,11 @@ export type AuthoritativePresentationSnapshot = {
             };
           };
       readonly error?: { readonly code: string; readonly message: string };
+      readonly partialOutput?: {
+        readonly text: string;
+        readonly byteCount: number;
+        readonly truncated: boolean;
+      };
       readonly attention?: {
         readonly attentionId: string;
         readonly question: string;
@@ -1015,6 +1020,16 @@ export type AuthoritativePresentationSnapshot = {
         readonly revision: number;
         readonly messageByteCount: number;
         readonly messageTruncated: boolean;
+      }[];
+      readonly messages: readonly {
+        readonly messageId: `sha256:${string}`;
+        readonly kind: "message" | "reply";
+        readonly message: string;
+        readonly messageByteCount: number;
+        readonly messageTruncated: boolean;
+        readonly status: "enqueued" | "delivered";
+        readonly revision: number;
+        readonly attentionId?: string;
       }[];
       readonly context?: { readonly contextWindowTokens: number };
       readonly usage?: {
@@ -1113,6 +1128,19 @@ export type CommandReceipt =
       readonly draftText?: string;
       readonly todo?: TodoPageResource | TodoEntityResource;
       readonly managedAgentTranscript?: ManagedAgentTranscriptPageResource;
+      readonly managedAgentControl?: {
+        readonly action: "message" | "reply" | "cancel" | "follow_up" | "recovery";
+        readonly agentId: string;
+        readonly attemptId: string;
+        readonly revision: number;
+        readonly messageId?: `sha256:${string}`;
+        readonly delivery?: "enqueued" | "delivered";
+        readonly record?: {
+          readonly id: string;
+          readonly revision: number;
+          readonly digest: `sha256:${string}`;
+        };
+      };
     }
   | {
       readonly status: "rejected";
@@ -1182,6 +1210,7 @@ export type PresentationCommand =
       readonly agentId: string;
       readonly attemptId: string;
       readonly expectedRevision: number;
+      readonly expectedThroughSequence: number;
       readonly cursor: string | null;
     }
   | {
