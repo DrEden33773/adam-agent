@@ -13213,10 +13213,17 @@ test("PresentationSession degrades an admitted session when settlement and fallb
       stateRoot,
       workspaceRoot,
     });
-    const degraded = Promise.withResolvers<void>();
+    const degraded = Promise.withResolvers<{
+      readonly status: "degraded";
+      readonly fault: {
+        readonly code: "authoritative_state_unavailable";
+        readonly message: string;
+      };
+    }>();
     const unsubscribe = presentation.subscribe(() => {
-      if (presentation.getState().authoritative.continuity.status === "degraded") {
-        degraded.resolve();
+      const continuity = presentation.getState().authoritative.continuity;
+      if (continuity.status === "degraded") {
+        degraded.resolve(continuity);
       }
     });
     try {
@@ -13234,14 +13241,14 @@ test("PresentationSession degrades an admitted session when settlement and fallb
         }),
       ).resolves.toMatchObject({ status: "admitted", resource: null });
       await readFailure.readRejected;
-      await degraded.promise;
-      expect(presentation.getState().authoritative.continuity).toEqual({
+      await expect(degraded.promise).resolves.toEqual({
         status: "degraded",
         fault: {
           code: "authoritative_state_unavailable",
           message: "The durable session view is temporarily unavailable.",
         },
       });
+      expect(presentation.getState().authoritative.continuity.status).not.toBe("current");
       await expect(
         presentation.dispatch({
           type: "submit_prompt",
@@ -13323,10 +13330,17 @@ test("PresentationSession degrades an admitted draft Plan when settlement and fa
       stateRoot,
       workspaceRoot,
     });
-    const degraded = Promise.withResolvers<void>();
+    const degraded = Promise.withResolvers<{
+      readonly status: "degraded";
+      readonly fault: {
+        readonly code: "authoritative_state_unavailable";
+        readonly message: string;
+      };
+    }>();
     const unsubscribe = presentation.subscribe(() => {
-      if (presentation.getState().authoritative.continuity.status === "degraded") {
-        degraded.resolve();
+      const continuity = presentation.getState().authoritative.continuity;
+      if (continuity.status === "degraded") {
+        degraded.resolve(continuity);
       }
     });
     try {
@@ -13348,14 +13362,14 @@ test("PresentationSession degrades an admitted draft Plan when settlement and fa
         code: "persistence_failed",
         message: "The admitted draft session could not be read from durable history.",
       });
-      await degraded.promise;
-      expect(presentation.getState().authoritative.continuity).toEqual({
+      await expect(degraded.promise).resolves.toEqual({
         status: "degraded",
         fault: {
           code: "authoritative_state_unavailable",
           message: "The durable session view is temporarily unavailable.",
         },
       });
+      expect(presentation.getState().authoritative.continuity.status).not.toBe("current");
       await expect(
         presentation.dispatch({
           type: "submit_draft_prompt",
