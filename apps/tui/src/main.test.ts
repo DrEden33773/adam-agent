@@ -11,6 +11,9 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createJsonlManagedAgentStore } from "@adam-agent/agent";
+import { openJsonlSessionStore } from "@adam-agent/agent/internal-testing";
+import type { PresentationSession } from "@adam-agent/presentation";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, expect, test } from "vitest";
 import { AppliedViewportTerminal } from "./applied-viewport-terminal.test-support.js";
@@ -376,6 +379,146 @@ test("/exit remains available during a held run and closes without releasing the
       code: "ENOENT",
     });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash exit durably cancels a held run and its exact cold restart stays responsive", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-exit-cold-restart-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  const firstTerminal = new VirtualTerminal();
+  let firstExecution: Promise<void> | undefined;
+  let sessionId: string | undefined;
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    firstExecution = runTuiFixture({
+      controlRoot,
+      onPresentationReady(presentation) {
+        sessionId = presentation.getState().authoritative.active?.session.id;
+      },
+      scenario: "streaming",
+      stateRoot,
+      terminal: firstTerminal,
+      workspaceRoot,
+    });
+    await firstTerminal.whenStarted();
+    firstTerminal.input("Hold this run across exit and restart\r");
+    await waitForPath(join(controlRoot, "model-started"));
+    await firstTerminal.nextSynchronizedFrameContaining("Working");
+    firstTerminal.input("/exit\r");
+    await expect(firstExecution).resolves.toBeUndefined();
+    expect(firstTerminal.lifecycle()).toEqual(["started", "stopped"]);
+    if (sessionId === undefined) {
+      throw new Error("The held-run fixture did not expose its authoritative session identity.");
+    }
+    const closedSession = await openJsonlSessionStore({ sessionId, stateRoot, workspaceRoot });
+    expect(await closedSession.read()).toContainEqual(
+      expect.objectContaining({
+        record: expect.objectContaining({
+          type: "runtime_event",
+          event: expect.objectContaining({
+            type: "session_settled",
+            result: expect.objectContaining({ status: "cancelled" }),
+          }),
+        }),
+      }),
+    );
+    await expectColdRestartResponsive({
+      expectCancelledNotice: true,
+      expectedTerminalAgentCount: 0,
+      responsiveDraft: "Cold restart editor remains responsive",
+      sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+  } finally {
+    if (firstTerminal.running()) {
+      firstTerminal.input("\u0011");
+    }
+    await firstExecution?.catch(() => undefined);
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("slash exit terminalizes an attention child before the exact cold session reopens", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-exit-child-restart-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  const firstTerminal = new VirtualTerminal();
+  let firstExecution: Promise<void> | undefined;
+  let sessionId: string | undefined;
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    firstExecution = runTuiFixture({
+      controlRoot,
+      onPresentationReady(presentation) {
+        sessionId = presentation.getState().authoritative.active?.session.id;
+      },
+      scenario: "managed-attention",
+      stateRoot,
+      terminal: firstTerminal,
+      workspaceRoot,
+    });
+    await firstTerminal.whenStarted();
+    firstTerminal.input("Start one managed child before exit\r");
+    await waitForFileContents(join(controlRoot, "managed-attention-parent-settled"), "settled\n");
+    const beforeIdle = firstTerminal.output().length;
+    await firstTerminal.nextSynchronizedFrameContaining("Managed child needs exact input.");
+    await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
+    await firstTerminal.nextSynchronizedFrameContaining(" · idle", beforeIdle);
+    firstTerminal.input("/exit\r");
+    await expect(firstExecution).resolves.toBeUndefined();
+    expect(firstTerminal.lifecycle()).toEqual(["started", "stopped"]);
+    if (sessionId === undefined) {
+      throw new Error("The managed fixture did not expose its authoritative parent identity.");
+    }
+    const closedSession = await openJsonlSessionStore({ sessionId, stateRoot, workspaceRoot });
+    expect(await closedSession.read()).toContainEqual(
+      expect.objectContaining({
+        record: expect.objectContaining({
+          type: "runtime_event",
+          event: expect.objectContaining({
+            type: "session_settled",
+            result: expect.objectContaining({ status: "completed" }),
+          }),
+        }),
+      }),
+    );
+    const managedStore = await createJsonlManagedAgentStore({ stateRoot, workspaceRoot });
+    const managedRecords = await managedStore.read();
+    const admission = managedRecords.find(
+      (record) => record.type === "managed_agent_admitted" && record.parentSessionId === sessionId,
+    );
+    expect(admission).toBeDefined();
+    const terminal = managedRecords.find(
+      (record) => record.type === "managed_agent_terminal" && record.agentId === admission?.agentId,
+    );
+    if (terminal?.type !== "managed_agent_terminal") {
+      throw new Error("The managed child did not publish a terminal record before TUI exit.");
+    }
+    expect(terminal.status).toMatch(/^(?:cancelled|recovery_required)$/u);
+    await expectColdRestartResponsive({
+      controlRoot,
+      expectCancelledNotice: false,
+      expectedTerminalAgentCount: 1,
+      responsiveDraft: "Cold child restart editor remains responsive",
+      scenario: "managed-attention",
+      sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+  } finally {
+    if (firstTerminal.running()) {
+      firstTerminal.input("\u0011");
+    }
+    await firstExecution?.catch(() => undefined);
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -1130,6 +1273,94 @@ function latestSynchronizedFrame(output: string): readonly string[] {
       .replace(new RegExp(`${"\u001b"}\\[\\?25[hl]`, "gu"), "");
   }
   return Array.from({ length: lines.length }, (_, index) => lines[index] ?? "");
+}
+
+async function expectColdRestartResponsive(input: {
+  readonly controlRoot?: string;
+  readonly expectCancelledNotice: boolean;
+  readonly expectedTerminalAgentCount: 0 | 1;
+  readonly responsiveDraft: string;
+  readonly scenario?: "managed-attention";
+  readonly sessionId: string;
+  readonly stateRoot: string;
+  readonly workspaceRoot: string;
+}): Promise<void> {
+  const terminal = new VirtualTerminal();
+  let execution: Promise<void> | undefined;
+  let presentation: PresentationSession | undefined;
+
+  try {
+    execution = runTuiFixture({
+      ...(input.controlRoot === undefined ? {} : { controlRoot: input.controlRoot }),
+      onPresentationReady(value) {
+        presentation = value;
+      },
+      ...(input.scenario === undefined ? {} : { scenario: input.scenario }),
+      sessionId: input.sessionId,
+      stateRoot: input.stateRoot,
+      terminal,
+      workspaceRoot: input.workspaceRoot,
+    });
+    await terminal.whenStarted();
+    await terminal.nextSynchronizedFrameContaining("fake.local · Certified");
+
+    const coldPresentation = presentation;
+    if (coldPresentation === undefined) {
+      throw new Error("The cold fixture did not expose its Presentation session.");
+    }
+    const coldState = coldPresentation.getState();
+    expect(coldState.transient).toBeNull();
+    expect(coldState.authoritative.continuity).toMatchObject({ status: "current" });
+    expect(coldState.authoritative.active?.session).toMatchObject({
+      id: input.sessionId,
+      status: "settled",
+    });
+    if (input.expectCancelledNotice) {
+      expect(coldState.authoritative.active?.transcript.items).toContainEqual(
+        expect.objectContaining({
+          type: "session_notice",
+          status: "interrupted",
+          reason: "cancelled",
+        }),
+      );
+    }
+
+    const beforeSession = terminal.output().length;
+    terminal.input("/session\r");
+    await terminal.nextSynchronizedFrameContaining("Session facts", beforeSession);
+    expect(terminal.lines().join("\n")).toContain(input.sessionId);
+    const beforeSessionClose = terminal.output().length;
+    terminal.input("\u001b[27;1;27~");
+    await terminal.nextSynchronizedFrameContaining("fake.local · Certified", beforeSessionClose);
+    expect(terminal.lines().join("\n")).not.toContain("Session facts");
+
+    const beforeAgents = terminal.output().length;
+    terminal.input("/agents\r");
+    await terminal.nextSynchronizedFrameContaining("Agents ·", beforeAgents);
+    const managedAgents = coldPresentation.getState().authoritative.managedAgents;
+    expect(managedAgents.counts.active).toBe(0);
+    expect(managedAgents.agents).toHaveLength(input.expectedTerminalAgentCount);
+    if (input.expectedTerminalAgentCount === 1) {
+      expect(managedAgents.agents[0]?.status).toMatch(/^(?:cancelled|recovery_required)$/u);
+    }
+    const beforeAgentsClose = terminal.output().length;
+    terminal.input("\u001b[27;1;27~");
+    await terminal.nextSynchronizedFrameContaining("fake.local · Certified", beforeAgentsClose);
+    expect(terminal.lines().join("\n")).not.toContain("Agents ·");
+
+    const beforeDraft = terminal.output().length;
+    terminal.input(input.responsiveDraft);
+    await terminal.nextSynchronizedFrameContaining(input.responsiveDraft, beforeDraft);
+    expect(terminal.lines().join("\n").split(input.responsiveDraft)).toHaveLength(2);
+    terminal.input("\u0011");
+    await expect(execution).resolves.toBeUndefined();
+    expect(terminal.lifecycle()).toEqual(["started", "stopped"]);
+  } finally {
+    if (terminal.running()) {
+      terminal.input("\u0011");
+    }
+    await execution?.catch(() => undefined);
+  }
 }
 
 function containsColorSgrSequence(text: string): boolean {
