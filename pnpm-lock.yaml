@@ -15,8 +15,11 @@ importers:
         specifier: 2.5.8
         version: 2.5.8
       '@eve-reviewer/adam-extension':
+        specifier: 0.4.0
+        version: 0.4.0(@adam-agent/extension-api@0.4.0)
+      '@eve-reviewer/core':
         specifier: 0.3.0
-        version: 0.3.0(@adam-agent/extension-api@0.3.0)
+        version: 0.3.0
       '@types/node':
         specifier: 24.13.3
         version: 24.13.3
@@ -140,8 +143,8 @@ importers:
 
 packages:
 
-  '@adam-agent/extension-api@0.3.0':
-    resolution: {integrity: sha512-ijWL5/NhP0Gvd0fNJGkfzNoL6MSKmdo48RcQRnTN2GqhcJnnOaFqCBr3iywxekbstPe7wxx5bs59aCI2ETdxWA==}
+  '@adam-agent/extension-api@0.4.0':
+    resolution: {integrity: sha512-Z/BJekz1aA1skHaVaL0+3kEx8D8UMwuQAdOAWTcDezy0ef0CojkFNdGEDln6bLmGHpVumg1enKSbx+sAVVaMtw==}
     engines: {node: '>=24.0.0 <25'}
 
   '@ai-sdk/deepseek@3.0.30':
@@ -233,14 +236,14 @@ packages:
     resolution: {integrity: sha512-ds2TLihOnM5sLJB3VpXV6y0uR5efVuHf4MN7yDpsty6hA2DUO/EDVzjp/0od0G2JslzVLMjT8T8zavtxVb+qbg==}
     engines: {node: '>=22.19.0'}
 
-  '@eve-reviewer/adam-extension@0.3.0':
-    resolution: {integrity: sha512-VtOEsY5CMxmdj2Klkvo53dQiaWIsLnKsrgd16RQ9NNnwqqCPL+3YaeCP+s9eWzsVn5i/7tWkviK1ZQNVAf1m0g==}
+  '@eve-reviewer/adam-extension@0.4.0':
+    resolution: {integrity: sha512-BHqb2hQ8z46Wu5p3m99xz8D3yimHJdM3A7bnyOA3bHwM1jwfnesGa4QcJtvzdTitsSfOvtFoTCSwNUTwFvLggw==}
     engines: {node: '>=24.0.0 <25'}
     peerDependencies:
-      '@adam-agent/extension-api': 0.3.0
+      '@adam-agent/extension-api': 0.4.0
 
-  '@eve-reviewer/core@0.2.0':
-    resolution: {integrity: sha512-IYlTrWlno+z9GTK5dSOMfeWdEbwspfuKkHr5o/k31sCh8vw8S1Ii8ZSR7xx0+RKM3w0B/Kr3UgK1j2EibUAGqA==}
+  '@eve-reviewer/core@0.3.0':
+    resolution: {integrity: sha512-JsnwrNLPNAuoQERwj0AKrZMBBe8MN2MbtCBgIIJOkgDiRzOj9R6JN/cAGynFESIv7Ve3CvzC2dX9+foohReRSQ==}
     engines: {node: '>=24.0.0 <25'}
 
   '@jridgewell/sourcemap-codec@1.5.5':
@@ -1360,7 +1363,7 @@ packages:
 
 snapshots:
 
-  '@adam-agent/extension-api@0.3.0':
+  '@adam-agent/extension-api@0.4.0':
     dependencies:
       semver: 7.8.5
       zod: 4.4.3
@@ -1440,12 +1443,12 @@ snapshots:
       get-east-asian-width: 1.6.0
       marked: 18.0.5
 
-  '@eve-reviewer/adam-extension@0.3.0(@adam-agent/extension-api@0.3.0)':
+  '@eve-reviewer/adam-extension@0.4.0(@adam-agent/extension-api@0.4.0)':
     dependencies:
-      '@adam-agent/extension-api': 0.3.0
-      '@eve-reviewer/core': 0.2.0
+      '@adam-agent/extension-api': 0.4.0
+      '@eve-reviewer/core': 0.3.0
 
-  '@eve-reviewer/core@0.2.0':
+  '@eve-reviewer/core@0.3.0':
     dependencies:
       diff: 9.0.0
       typebox: 1.3.6

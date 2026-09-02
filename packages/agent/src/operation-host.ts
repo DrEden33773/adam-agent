@@ -88,6 +88,25 @@ export type RegisteredOperation = {
   readonly registration: ExtensionOperationRegistration;
 };
 
+export type ManagedSessionRuntime = {
+  readonly childContextProfile?: ContextProfile;
+  readonly childModel?: ModelDriver;
+  readonly childSessionStores: SessionStoreDirectory<SessionRecord>;
+  readonly managedStore: ManagedAgentStore;
+  readonly parentPermissions: PermissionPolicy;
+  resolveOrigin(input: {
+    readonly origin: OperationOrigin;
+    readonly projectId: `sha256:${string}`;
+    readonly signal: AbortSignal;
+  }): Promise<{
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
+    readonly childContextProfile?: ContextProfile;
+    readonly childModel?: ModelDriver;
+  }>;
+  readonly workspaceRoot: string;
+};
+
 export type OperationStartOptions = {
   readonly contributionId: string;
   readonly deadlineMs?: number;
@@ -284,21 +303,7 @@ export function createOperationHost(options: {
   readonly originAuthority?: OperationOriginAuthority;
   readonly projectRoot: string;
   readonly permissions?: PermissionPolicy;
-  readonly managedSession?: {
-    readonly childContextProfile: ContextProfile;
-    readonly childModel: ModelDriver;
-    readonly childSessionStores: SessionStoreDirectory<SessionRecord>;
-    readonly managedStore: ManagedAgentStore;
-    readonly parentPermissions: PermissionPolicy;
-    resolveOrigin(input: {
-      readonly origin: OperationOrigin;
-      readonly projectId: `sha256:${string}`;
-    }): Promise<{
-      readonly targetIdentity: ModelTargetIdentity;
-      readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
-    }>;
-    readonly workspaceRoot: string;
-  };
+  readonly managedSession?: ManagedSessionRuntime;
   readonly recordStore?: ExtensionRecordStore;
   readonly resolveOperation: (contributionId: string) => RegisteredOperation | undefined;
   readonly store?: OperationStore;
@@ -951,10 +956,16 @@ function createManagedSessionCapability(
         const resolved = await runtime.resolveOrigin({
           origin,
           projectId: active.projectId as `sha256:${string}`,
+          signal: active.abortController.signal,
         });
+        const childModel = resolved.childModel ?? runtime.childModel;
+        const childContextProfile = resolved.childContextProfile ?? runtime.childContextProfile;
+        if (childModel === undefined || childContextProfile === undefined) {
+          throw new TypeError("The managed session target is unavailable.");
+        }
         const manager = createAgentManager({
-          childContextProfile: runtime.childContextProfile,
-          childModel: runtime.childModel,
+          childContextProfile,
+          childModel,
           childSessionStores: runtime.childSessionStores,
           managedStore: runtime.managedStore,
           parentPermissions: runtime.parentPermissions,
