@@ -369,7 +369,7 @@ export type PermissionSubject =
       readonly type: "managed_agent_spawn";
       readonly parentRootId: string;
       readonly parentSessionId: string;
-      readonly profile: "scout.v1" | "research.v1";
+      readonly profile: "scout.v1" | "scout.v2" | "research.v1" | "research.v2";
       readonly mode?: "foreground" | "background";
       readonly profileDigest: `sha256:${string}`;
       readonly selectedSkills?: readonly {
@@ -392,11 +392,16 @@ export type PermissionSubject =
         readonly certification: "certified" | "experimental";
       };
       readonly taskDigest: `sha256:${string}`;
-      readonly limits: {
-        readonly maximumTurns: 8;
-        readonly maximumTokens: 128000;
-        readonly maximumDeadlineMilliseconds: 600000;
-      };
+      readonly limits:
+        | {
+            readonly maximumTurns: 8;
+            readonly maximumTokens: 128000;
+            readonly maximumDeadlineMilliseconds: 600000;
+          }
+        | {
+            readonly maximumTokens: number;
+            readonly maximumInactivityMilliseconds: 300000;
+          };
       readonly thinkingPolicy?: {
         readonly schemaVersion: 1;
         readonly requestedLevelId: string;
@@ -454,7 +459,7 @@ export type PermissionSubject =
       readonly agentId: string;
       readonly attemptId: string;
       readonly childSessionId: string;
-      readonly profile: "research.v1";
+      readonly profile: "research.v1" | "research.v2";
       readonly providerOrigin: string;
       readonly queryOrUrl: string;
       readonly argumentsDigest: `sha256:${string}`;

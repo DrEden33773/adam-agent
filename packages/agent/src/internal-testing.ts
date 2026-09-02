@@ -14,6 +14,7 @@ export {
   createAgentManager,
   createManagedAgentToolRegistry,
   type ManagedAgentDeadlineScheduler,
+  type ManagedAgentInactivityScheduler,
   type ManagedAgentRecord,
   type ManagedAgentStore,
   ManagedAgentStoreError,
@@ -21,7 +22,9 @@ export {
 } from "./managed-agent.js";
 export {
   researchManagedAgentProfileV1,
+  researchManagedAgentProfileV2,
   scoutManagedAgentProfileV1,
+  scoutManagedAgentProfileV2,
 } from "./managed-agent-profiles.js";
 export {
   createInMemoryManagedAgentStore,

@@ -10,6 +10,7 @@ import {
   recoverInterruptedManagedAgents,
   researchManagedAgentProfileV1,
   scoutManagedAgentProfileV1,
+  scoutManagedAgentProfileV2,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
@@ -110,6 +111,25 @@ test("ManagedAgentStore reopens A3 mailbox, report, attention and exact reply tr
   }
 });
 
+test("ManagedAgentStore reopens current capacity and stall-resume truth", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-store-current-jsonl-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const records = managedCurrentStoreRecords();
+
+  try {
+    const warm = await createJsonlManagedAgentStore({ stateRoot, workspaceRoot });
+    for (const record of records) {
+      await warm.append(record);
+    }
+    const cold = await createJsonlManagedAgentStore({ stateRoot, workspaceRoot });
+    await expect(cold.read()).resolves.toEqual(records);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("ManagedAgentStore folds a cold A2 background admission without provider replay", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-store-a2-restart-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -185,6 +205,72 @@ async function managedAgentLogPath(stateRoot: string, workspaceRoot: string): Pr
   const canonicalRoot = await realpath(workspaceRoot);
   const projectKey = createHash("sha256").update(canonicalRoot).digest("hex");
   return join(stateRoot, "projects", projectKey, "managed-agents", "events-v1.jsonl");
+}
+
+function managedCurrentStoreRecords() {
+  const parentSessionId = "123e4567-e89b-42d3-a456-426614174601";
+  const agentId = "123e4567-e89b-42d3-a456-426614174602";
+  const attemptId = "123e4567-e89b-42d3-a456-426614174603";
+  const childSessionId = "123e4567-e89b-42d3-a456-426614174604";
+  return [
+    {
+      schemaVersion: 1 as const,
+      type: "managed_agent_admitted" as const,
+      sequence: 1,
+      agentId,
+      attemptId,
+      childSessionId,
+      parentSessionId,
+      parentToolCallId: "current-jsonl-spawn",
+      parentRootId: `session:${parentSessionId}`,
+      projectId,
+      profile: "scout.v2" as const,
+      mode: "background" as const,
+      profileDigest: scoutManagedAgentProfileV2.digest,
+      usageAccountingVersion: 2 as const,
+      effectiveToolProfileDigest: `sha256:${"e".repeat(64)}` as const,
+      limits: {
+        maximumTokens: 1_000_000,
+        maximumInactivityMilliseconds: 300_000,
+      },
+      admittedAtUnixMilliseconds: 1_900_000_000_000,
+      taskDigest: sha256("Current JSONL task."),
+      childInputDigest: sha256(`Current JSONL task.\n\n${childLiveWorkspaceNotice}`),
+      targetIdentity,
+    },
+    {
+      schemaVersion: 1 as const,
+      type: "managed_agent_stalled" as const,
+      sequence: 2,
+      agentId,
+      attemptId,
+      childSessionId,
+      maximumInactivityMilliseconds: 300_000 as const,
+    },
+    {
+      schemaVersion: 1 as const,
+      type: "managed_agent_resumed" as const,
+      sequence: 3,
+      agentId,
+      attemptId,
+      childSessionId,
+    },
+    {
+      schemaVersion: 1 as const,
+      type: "managed_agent_terminal" as const,
+      sequence: 4,
+      agentId,
+      attemptId,
+      childSessionId,
+      status: "completed" as const,
+      result: { text: "Current JSONL result." },
+      transcriptDigest: `sha256:${"f".repeat(64)}` as const,
+      throughSequence: 5,
+      usage: { inputTokens: 10, outputTokens: 3, reasoningTokens: 2 },
+      providerCalls: 1,
+      cost: { status: "unavailable" as const },
+    },
+  ];
 }
 
 function managedStoreRecords() {

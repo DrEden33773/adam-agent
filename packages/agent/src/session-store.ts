@@ -141,7 +141,10 @@ export type SessionGenesisRecord = {
     readonly managedAgentTools?:
       | "managed-agent-tools.a1.v1"
       | "managed-agent-tools.a2-long-lived.v1"
-      | "managed-agent-tools.a3-long-lived.v1";
+      | "managed-agent-tools.a3-long-lived.v1"
+      | "managed-agent-tools.a1.v2"
+      | "managed-agent-tools.a2-long-lived.v2"
+      | "managed-agent-tools.a3-long-lived.v2";
     readonly webEvidence?: {
       readonly version: 1;
       readonly searchProvider: null | {
@@ -1433,7 +1436,7 @@ const managedAgentSpawnPermissionSubjectSchema = z.strictObject({
   type: z.literal("managed_agent_spawn"),
   parentRootId: z.string().min(1).max(256),
   parentSessionId: z.uuid(),
-  profile: z.enum(["scout.v1", "research.v1"]),
+  profile: z.enum(["scout.v1", "scout.v2", "research.v1", "research.v2"]),
   mode: z.enum(["foreground", "background"]).optional(),
   profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   selectedSkills: z
@@ -1463,11 +1466,17 @@ const managedAgentSpawnPermissionSubjectSchema = z.strictObject({
     certification: z.enum(["certified", "experimental"]),
   }),
   taskDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-  limits: z.strictObject({
-    maximumTurns: z.literal(8),
-    maximumTokens: z.literal(128_000),
-    maximumDeadlineMilliseconds: z.literal(600_000),
-  }),
+  limits: z.union([
+    z.strictObject({
+      maximumTurns: z.literal(8),
+      maximumTokens: z.literal(128_000),
+      maximumDeadlineMilliseconds: z.literal(600_000),
+    }),
+    z.strictObject({
+      maximumTokens: z.number().int().positive().safe(),
+      maximumInactivityMilliseconds: z.literal(300_000),
+    }),
+  ]),
   thinkingPolicy: z
     .strictObject({
       schemaVersion: z.literal(1),
@@ -1573,7 +1582,7 @@ const managedAgentWebRequestPermissionSubjectSchema = z.strictObject({
   agentId: z.uuid(),
   attemptId: z.uuid(),
   childSessionId: z.uuid(),
-  profile: z.literal("research.v1"),
+  profile: z.enum(["research.v1", "research.v2"]),
   providerOrigin: z.url(),
   queryOrUrl: z.string().min(1).max(4_096),
   argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
@@ -2093,6 +2102,9 @@ const sessionGenesisV1RecordSchema = z.strictObject({
       "managed-agent-tools.a1.v1",
       "managed-agent-tools.a2-long-lived.v1",
       "managed-agent-tools.a3-long-lived.v1",
+      "managed-agent-tools.a1.v2",
+      "managed-agent-tools.a2-long-lived.v2",
+      "managed-agent-tools.a3-long-lived.v2",
     ])
     .optional(),
   webEvidence: z

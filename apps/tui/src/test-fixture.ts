@@ -336,7 +336,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       : undefined;
   const lifecycle = createSessionLifecycle({
     ...(options.scenario === "managed-attention"
-      ? { managedAgentTools: "managed-agent-tools.a3-long-lived.v1" as const }
+      ? { managedAgentTools: "managed-agent-tools.a3-long-lived.v2" as const }
       : {}),
     ...(options.scenario === "plan-review-recovery"
       ? {
@@ -1330,7 +1330,7 @@ function createFixtureModelTargets(options: {
         const child = request.messages.some(
           (message) =>
             message.role === "developer" &&
-            message.content.startsWith("Managed child profile research.v1"),
+            message.content.startsWith("Managed child profile research.v2"),
         );
         if (child) {
           managedAttentionChildOrdinal += 1;
@@ -1376,7 +1376,7 @@ function createFixtureModelTargets(options: {
           yield {
             type: "tool_call_delta",
             id: "fixture-spawn-research",
-            json: '{"task":"Request exact fixture input.","profile":"research.v1","mode":"background"}',
+            json: '{"task":"Request exact fixture input.","profile":"research.v2","mode":"background"}',
           };
           yield { type: "tool_call_end", id: "fixture-spawn-research" };
           yield { type: "finish", reason: "tool_calls" };
