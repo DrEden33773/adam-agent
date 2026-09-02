@@ -170,8 +170,10 @@ export type TuiFixtureOptions = {
     readonly workspaceTrustMutation?: "reject";
   };
   readonly mouse?: boolean;
+  readonly onPresentationReady?: (presentation: PresentationSession) => void;
   readonly presentationCloseMarker?: string;
   readonly scenario?: FixtureScenario;
+  readonly sessionId?: string;
   readonly stateRoot: string;
   readonly terminal?: Terminal;
   readonly terminalProcessMarker?: string;
@@ -459,7 +461,8 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       });
     }
     const resumedSessionId =
-      options.scenario === "resume" ||
+      options.sessionId ??
+      (options.scenario === "resume" ||
       options.scenario === "history" ||
       options.scenario === "artifact-history" ||
       options.scenario === "copy-older-assistant" ||
@@ -550,7 +553,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
           })
         : options.launch === undefined && options.scenario !== "session-selection-history"
           ? await lifecycle.create({ targetIdentity }).then((created) => created.sessionId)
-          : undefined;
+          : undefined);
     const presentation = await createPresentationSession(
       options.launch !== undefined
         ? {
@@ -639,6 +642,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
                   : { [turnComposerStageBarrier]: composerBarrier }),
               },
     );
+    options.onPresentationReady?.(presentation);
     if (options.scenario === "target-connection-multiple" && options.controlRoot !== undefined) {
       const targetIds = ["deepseek-v4-flash.direct", "deepseek-v4-pro.direct"] as const;
       const started = targetIds.map((targetId) =>
