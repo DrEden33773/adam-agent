@@ -95,7 +95,10 @@ function managedAdmissionLimitsAreValid(
       admission.limits.maximumInactivityMilliseconds ===
         profile.limits.maximumInactivityMilliseconds &&
       admission.deadlineAtUnixMilliseconds === undefined &&
-      (contextWindowTokens === undefined || admission.limits.maximumTokens === contextWindowTokens)
+      contextWindowTokens !== undefined &&
+      (admission.resume === undefined
+        ? admission.limits.maximumTokens === contextWindowTokens
+        : admission.limits.maximumTokens <= contextWindowTokens)
     );
   }
   const profile =
@@ -559,6 +562,8 @@ export class ManagedAgentStoreError extends Error {
   }
 }
 
+class ManagedAgentCapacityError extends Error {}
+
 const managedAgentRecordSchema = z.union([
   z.strictObject({
     schemaVersion: z.literal(1),
@@ -914,7 +919,12 @@ export async function recoverInterruptedManagedAgents(
     const validAdmissionIdentity =
       admission.parentRootId === `session:${admission.parentSessionId}` &&
       admission.profileDigest === managedProfile.digest &&
-      managedAdmissionLimitsAreValid(admission);
+      managedAdmissionLimitsAreValid(
+        admission,
+        genesis?.schemaVersion === 3 && genesis.record.type === "session_genesis"
+          ? genesis.record.contextProfile?.contextWindowTokens
+          : undefined,
+      );
     const childCoordinationEvents = (childRecords ?? []).flatMap((record) => {
       const event =
         record.schemaVersion === 1 || record.schemaVersion === 2
@@ -1299,13 +1309,14 @@ export async function recoverInterruptedManagedAgents(
     if (existingTerminal?.type === "managed_agent_terminal") {
       if (
         existingTerminal.status !== "inspection_required" &&
-        childRecords !== undefined &&
         !records.some(
           (record) =>
             record.type === "managed_agent_inspection_required" &&
             record.attemptId === admission.attemptId,
         ) &&
-        (!validAdmissionIdentity || !validResume || !validGenesisIdentity)
+        ((isCurrentManagedAgentProfile(admission.profile) && childRecords === undefined) ||
+          (childRecords !== undefined &&
+            (!validAdmissionIdentity || !validResume || !validGenesisIdentity)))
       ) {
         const inspection: ManagedAgentRecord = {
           schemaVersion: 1,
@@ -1624,6 +1635,12 @@ export function validateManagedAgentRecord(
           record.attemptId === candidate.attemptId ||
           record.childSessionId === candidate.childSessionId,
       ) ||
+      (candidate.profile !== "reviewer.v1" &&
+        history.filter(
+          (record) =>
+            record.type === "managed_agent_admitted" &&
+            record.parentSessionId === candidate.parentSessionId,
+        ).length >= 16) ||
       previousAdmissions.length >= 4 ||
       (previous === undefined) !== (candidate.resume === undefined) ||
       (previous !== undefined && candidate.mode !== "background") ||
@@ -2452,6 +2469,17 @@ export function createAgentManager(options: {
   const appendManagedRecord = async (input: ManagedAgentRecordInput): Promise<void> => {
     const operation = appendQueue.then(async () => {
       const records = await options.managedStore.read();
+      if (
+        input.type === "managed_agent_admitted" &&
+        input.profile !== "reviewer.v1" &&
+        records.filter(
+          (record) =>
+            record.type === "managed_agent_admitted" &&
+            record.parentSessionId === input.parentSessionId,
+        ).length >= 16
+      ) {
+        throw new ManagedAgentCapacityError();
+      }
       await options.managedStore.append({
         ...input,
         schemaVersion: 1,
@@ -3186,6 +3214,7 @@ export function createAgentManager(options: {
     let deadlineOperation: Promise<void> | undefined;
     let inactivityTimer: { cancel(): void } | undefined;
     let inactivityPauseReason: "permission" | "parent" | undefined;
+    let inactivityGeneration = 0;
     let inactivitySettlement = Promise.resolve();
     let inactivityFailure: unknown;
     let lastAssistantDelta: string | undefined;
@@ -3258,8 +3287,8 @@ export function createAgentManager(options: {
       });
       return deadlineOperation;
     };
-    const commitInactivityStall = async (): Promise<void> => {
-      if (!currentProfile || terminalCommitStarted) {
+    const commitInactivityStall = async (generation: number): Promise<void> => {
+      if (!currentProfile || terminalCommitStarted || generation !== inactivityGeneration) {
         return;
       }
       const records = await options.managedStore.read();
@@ -3269,6 +3298,7 @@ export function createAgentManager(options: {
           record.attemptId === attemptId,
       );
       if (
+        generation !== inactivityGeneration ||
         latestLiveness?.type === "managed_agent_stalled" ||
         records.some(
           (record) => record.type === "managed_agent_terminal" && record.attemptId === attemptId,
@@ -3302,11 +3332,13 @@ export function createAgentManager(options: {
       if (maximumInactivityMilliseconds === undefined || inactivityPauseReason !== undefined) {
         return;
       }
+      inactivityGeneration += 1;
+      const generation = inactivityGeneration;
       inactivityTimer?.cancel();
       inactivityTimer = (options.inactivityScheduler ?? nodeManagedAgentDeadlineScheduler).schedule(
         maximumInactivityMilliseconds,
         () => {
-          void enqueueInactivity(commitInactivityStall).catch(() => undefined);
+          void enqueueInactivity(() => commitInactivityStall(generation)).catch(() => undefined);
         },
       );
     };
@@ -3315,6 +3347,7 @@ export function createAgentManager(options: {
         return;
       }
       inactivityPauseReason = reason;
+      inactivityGeneration += 1;
       inactivityTimer?.cancel();
       inactivityTimer = undefined;
     };
@@ -3933,6 +3966,12 @@ export function createAgentManager(options: {
           throw error;
         }
       }
+      if (error instanceof ManagedAgentCapacityError) {
+        return toolFailure(
+          "managed_agent_capacity_exceeded",
+          "This parent session already owns the maximum sixteen managed child attempts.",
+        );
+      }
       return toolFailure(
         "managed_agent_unavailable",
         "The foreground scout could not be started safely.",
@@ -3971,6 +4010,7 @@ export function createAgentManager(options: {
         publishNextChildPermission();
       }
       deadline.cancel();
+      inactivityGeneration += 1;
       inactivityTimer?.cancel();
       stalledAttemptIds.delete(attemptId);
       inactivityControls.delete(attemptId);
@@ -4261,24 +4301,31 @@ export function createAgentManager(options: {
                 const store = await options.childSessionStores.open(admission.childSessionId);
                 return (await store?.read()) ?? [];
               } catch {
-                return [];
+                return undefined;
               }
             }),
           );
+          const control = inactivityControls.get(agent.attemptId);
+          const watchdog =
+            control === undefined || agent.watchdog === undefined
+              ? {}
+              : { watchdog: { ...agent.watchdog, state: control.state() } };
+          if (histories.some((history) => history === undefined)) {
+            return { ...agent, ...watchdog };
+          }
           const usage = histories.reduce(
             (total, history) => {
-              const next = usageFromChildRecords(history);
+              const next = usageFromChildRecords(history ?? []);
               return {
                 inputTokens: total.inputTokens + next.inputTokens,
                 outputTokens: total.outputTokens + next.outputTokens,
                 reasoningTokens: total.reasoningTokens + next.reasoningTokens,
-                providerCalls: total.providerCalls + providerCallsFromChildRecords(history),
+                providerCalls: total.providerCalls + providerCallsFromChildRecords(history ?? []),
               };
             },
             { inputTokens: 0, outputTokens: 0, reasoningTokens: 0, providerCalls: 0 },
           );
           const usedTokens = usage.inputTokens + usage.outputTokens;
-          const control = inactivityControls.get(agent.attemptId);
           return {
             ...agent,
             ...(agent.usage === undefined ? {} : { usage }),
@@ -4291,9 +4338,7 @@ export function createAgentManager(options: {
                     remainingTokens: Math.max(0, agent.budget.maximumCumulativeTokens - usedTokens),
                   },
                 }),
-            ...(control === undefined || agent.watchdog === undefined
-              ? {}
-              : { watchdog: { ...agent.watchdog, state: control.state() } }),
+            ...watchdog,
           };
         }),
       );
@@ -4460,6 +4505,11 @@ export function createAgentManager(options: {
         terminal === undefined ||
         terminal.type !== "managed_agent_terminal" ||
         terminal.status === "inspection_required" ||
+        records.some(
+          (record) =>
+            record.type === "managed_agent_inspection_required" &&
+            record.attemptId === latest.attemptId,
+        ) ||
         attemptHistories.some((history) => !history.valid) ||
         input.expectedRevision !== expectedRevision ||
         admissions.length >= 4 ||

@@ -38,6 +38,7 @@ import {
   type SessionStore,
   type SessionStoreDirectory,
   scoutManagedAgentProfileV1,
+  scoutManagedAgentProfileV2,
   sessionDurableContext,
   sessionToolProfileNames,
 } from "@adam-agent/agent/internal-testing";
@@ -343,7 +344,19 @@ test("AgentManager current scout crosses the legacy token and provider-call boun
   const parentSessionId = "123e4567-e89b-42d3-a456-426614174501";
   const parentRoot = await domain.claimRoot({ rootId: `session:${parentSessionId}` });
   const managedStore = createInMemoryManagedAgentStore();
-  const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  const baseChildSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  let childReadsUnavailable = false;
+  const childSessionStores: SessionStoreDirectory<SessionRecord> = {
+    create: (sessionId) => baseChildSessionStores.create(sessionId),
+    async open(sessionId) {
+      if (childReadsUnavailable) {
+        throw new Error("Child transcript reads are unavailable.");
+      }
+      return baseChildSessionStores.open(sessionId);
+    },
+    listSessionEntries: () => baseChildSessionStores.listSessionEntries(),
+    listSessionIds: () => baseChildSessionStores.listSessionIds(),
+  };
   const currentProfileOptions = { builtInProfileVersion: 2 as const };
   const manager = createAgentManager({
     childContextProfile: currentContextProfile,
@@ -429,7 +442,22 @@ test("AgentManager current scout crosses the legacy token and provider-call boun
     const beforeRecovery = await managedStore.read();
     await recoverInterruptedManagedAgents(managedStore, childSessionStores);
     await expect(managedStore.read()).resolves.toEqual(beforeRecovery);
+    childReadsUnavailable = true;
+    await expect(manager.snapshot()).resolves.toMatchObject({
+      agents: [
+        {
+          usage: {
+            inputTokens: 160_000,
+            outputTokens: 44,
+            reasoningTokens: 21,
+            providerCalls: 10,
+          },
+          budget: { usedTokens: 160_044, remainingTokens: 839_956 },
+        },
+      ],
+    });
   } finally {
+    childReadsUnavailable = false;
     await manager.close();
     await parentRoot.release();
     await domain.close();
@@ -1359,9 +1387,7 @@ test("AgentManager resets current inactivity after one changed nonempty assistan
     expect(scheduled).toHaveLength(windowsBeforeDelta + 1);
     const preDeltaWindow = scheduled[windowsBeforeDelta - 1];
     expect(preDeltaWindow).toMatchObject({ delayMilliseconds: 300_000, cancelled: true });
-    if (preDeltaWindow?.cancelled === false) {
-      preDeltaWindow.fire();
-    }
+    preDeltaWindow?.fire();
     await expect(manager.snapshot()).resolves.toMatchObject({
       counts: { active: 1, attention: 0 },
       agents: [{ agentId, status: "running" }],
@@ -1642,9 +1668,7 @@ test("AgentManager pauses current inactivity for permission and resumes after th
     const pausedWindow = scheduled.at(-1);
     expect(pausedWindow?.cancelled).toBe(true);
     const schedulesWhilePaused = scheduled.length;
-    if (pausedWindow?.cancelled === false) {
-      pausedWindow.fire();
-    }
+    pausedWindow?.fire();
     await expect(manager.snapshot()).resolves.toMatchObject({
       agents: [
         {
@@ -2038,6 +2062,121 @@ test("ManagedAgentStore folds an admitted restart window without child provider 
       error: { code: "managed_agent_recovery_required" },
     },
   ]);
+});
+
+test("ManagedAgentStore fails closed for a current admission without its context genesis", async () => {
+  const managedStore = createInMemoryManagedAgentStore();
+  const parentSessionId = "123e4567-e89b-42d3-a456-426614174504";
+  const task = "Reject an unproven current capacity.";
+  await managedStore.append({
+    schemaVersion: 1,
+    type: "managed_agent_admitted",
+    sequence: 1,
+    agentId: "123e4567-e89b-42d3-a456-426614174501",
+    attemptId: "123e4567-e89b-42d3-a456-426614174502",
+    childSessionId: "123e4567-e89b-42d3-a456-426614174503",
+    parentSessionId,
+    parentToolCallId: "unproven-current-capacity",
+    parentRootId: `session:${parentSessionId}`,
+    projectId,
+    profile: "scout.v2",
+    mode: "background",
+    profileDigest: scoutManagedAgentProfileV2.digest,
+    usageAccountingVersion: 2,
+    limits: {
+      maximumTokens: 2_000_000,
+      maximumInactivityMilliseconds: 300_000,
+    },
+    admittedAtUnixMilliseconds: 1_800_000_000_000,
+    taskDigest: testTaskDigest(task),
+    childInputDigest: testTaskDigest(`${task}\n\n${childLiveWorkspaceNotice}`),
+    targetIdentity,
+  });
+  await managedStore.append({
+    schemaVersion: 1,
+    type: "managed_agent_terminal",
+    sequence: 2,
+    agentId: "123e4567-e89b-42d3-a456-426614174501",
+    attemptId: "123e4567-e89b-42d3-a456-426614174502",
+    childSessionId: "123e4567-e89b-42d3-a456-426614174503",
+    status: "recovery_required",
+    recoveryPhase: "pre_genesis",
+    error: {
+      code: "managed_agent_recovery_required",
+      message: "The current child stopped before its context genesis became durable.",
+    },
+  });
+
+  await recoverInterruptedManagedAgents(managedStore);
+
+  await expect(managedStore.read()).resolves.toMatchObject([
+    { type: "managed_agent_admitted", profile: "scout.v2" },
+    {
+      type: "managed_agent_terminal",
+      status: "recovery_required",
+    },
+    {
+      type: "managed_agent_inspection_required",
+      error: { code: "managed_agent_inspection_required" },
+    },
+  ]);
+  let providerCalls = 0;
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentRoot = await domain.claimRoot({ rootId: `session:${parentSessionId}` });
+  const manager = createAgentManager({
+    builtInProfileVersion: 2,
+    childContextProfile: {
+      version: 2,
+      contextWindowTokens: 1_000_000,
+      maximumOutputTokens: 384_000,
+      ordinaryOutputReserveTokens: 4_096,
+      compactionSummaryMaximumOutputTokens: 32_768,
+      compactAtTokens: 900_000,
+      postCompactTargetTokens: 200_000,
+      retainedTargetTokens: 20_000,
+      estimatorVersion: 1,
+    },
+    childModel: {
+      async *stream() {
+        providerCalls += 1;
+        yield { type: "finish", reason: "stop" };
+      },
+    },
+    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    parentSessionId,
+    projectId,
+    targetIdentity,
+    workspaceRoot: process.cwd(),
+  });
+  try {
+    await expect(
+      manager.followUp({
+        agentId: "123e4567-e89b-42d3-a456-426614174501",
+        expectedRevision: 3,
+        callId: "reject-unproven-current-follow-up",
+        parentSessionId,
+        signal: new AbortController().signal,
+        task: "Do not continue from an unproven current capacity.",
+      }),
+    ).resolves.toMatchObject({ status: "failed", error: { code: "invalid_tool_input" } });
+    expect(providerCalls).toBe(0);
+  } finally {
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+  }
 });
 
 test("ManagedAgentStore recovers an interrupted research profile without provider replay", async () => {
@@ -5571,8 +5710,32 @@ test("AgentManager retains the current context budget across exactly four child 
       },
     },
   });
-  const parentRoot = await domain.claimRoot({ rootId: "current-attempt-parent" });
-  const managedStore = createInMemoryManagedAgentStore();
+  const parentSessionId = "123e4567-e89b-42d3-a456-426614174551";
+  const parentRoot = await domain.claimRoot({ rootId: `session:${parentSessionId}` });
+  const baseManagedStore = createInMemoryManagedAgentStore();
+  let freezeConcurrentAdmissionReads = false;
+  let concurrentAdmissionReads = 0;
+  let concurrentAdmissionSnapshot: Awaited<ReturnType<typeof baseManagedStore.read>> | undefined;
+  const concurrentReadsReached = Promise.withResolvers<void>();
+  const managedStore = {
+    append: (record: Parameters<typeof baseManagedStore.append>[0]) =>
+      baseManagedStore.append(record),
+    async read() {
+      if (!freezeConcurrentAdmissionReads) {
+        return baseManagedStore.read();
+      }
+      concurrentAdmissionSnapshot ??= await baseManagedStore.read();
+      concurrentAdmissionReads += 1;
+      if (concurrentAdmissionReads === 2) {
+        freezeConcurrentAdmissionReads = false;
+        concurrentReadsReached.resolve();
+      } else {
+        await concurrentReadsReached.promise;
+      }
+      return concurrentAdmissionSnapshot;
+    },
+  };
+  const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
   const manager = createAgentManager({
     builtInProfileVersion: 2,
     childContextProfile: {
@@ -5587,10 +5750,11 @@ test("AgentManager retains the current context budget across exactly four child 
       estimatorVersion: 1,
     },
     childModel,
-    childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    childSessionStores,
     managedStore,
     parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     parentRoot,
+    parentSessionId,
     projectId,
     targetIdentity,
     workspaceRoot,
@@ -5655,6 +5819,9 @@ test("AgentManager retains the current context budget across exactly four child 
           admission.deadlineAtUnixMilliseconds === undefined,
       ),
     ).toBe(true);
+    const beforeFollowUpRecovery = await managedStore.read();
+    await recoverInterruptedManagedAgents(managedStore, childSessionStores);
+    await expect(managedStore.read()).resolves.toEqual(beforeFollowUpRecovery);
     for (let identity = 2; identity <= 4; identity += 1) {
       const admitted = await manager.spawnBackground({
         callId: `current-identity-${identity}-attempt-1`,
@@ -5673,7 +5840,8 @@ test("AgentManager retains the current context budget across exactly four child 
       // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
       const nextAgentId = admitted.output["agentId"] as string;
       await manager.waitForIdle();
-      for (let attempt = 2; attempt <= 4; attempt += 1) {
+      const maximumAttempt = identity === 4 ? 3 : 4;
+      for (let attempt = 2; attempt <= maximumAttempt; attempt += 1) {
         await expect(
           manager.followUp({
             agentId: nextAgentId,
@@ -5687,7 +5855,35 @@ test("AgentManager retains the current context budget across exactly four child 
         await manager.waitForIdle();
       }
     }
+    expect(providerCalls).toBe(15);
+    freezeConcurrentAdmissionReads = true;
+    const concurrentAdmissions = await Promise.all([
+      manager.spawnBackground({
+        callId: "current-parent-attempt-16-concurrent",
+        parentSessionId: manager.parentSessionId,
+        signal: new AbortController().signal,
+        task: "Admit the sixteenth aggregate attempt.",
+      }),
+      manager.spawnBackground({
+        callId: "current-parent-attempt-17-concurrent",
+        parentSessionId: manager.parentSessionId,
+        signal: new AbortController().signal,
+        task: "Reject the concurrent seventeenth aggregate attempt.",
+      }),
+    ]);
+    expect(concurrentAdmissions.filter((result) => result.status === "completed")).toHaveLength(1);
+    expect(concurrentAdmissions.filter((result) => result.status === "failed")).toMatchObject([
+      { error: { code: "managed_agent_capacity_exceeded" } },
+    ]);
+    await manager.waitForIdle();
     expect(providerCalls).toBe(16);
+    expect(
+      (await managedStore.read()).filter(
+        (record) =>
+          record.type === "managed_agent_admitted" &&
+          record.parentSessionId === manager.parentSessionId,
+      ),
+    ).toHaveLength(16);
     await expect(
       manager.spawnBackground({
         callId: "current-parent-attempt-17",
