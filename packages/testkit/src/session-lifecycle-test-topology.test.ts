@@ -202,13 +202,14 @@ test("SessionLifecycle behavior and OS contracts keep separate environment owner
 
   const behaviorNames = declaredTestNames(behaviorSource);
   const operatingSystemNames = declaredTestNames(operatingSystemSource);
-  expect.soft(behaviorNames).toHaveLength(120);
+  expect.soft(behaviorNames).toHaveLength(121);
   expect.soft(operatingSystemNames).toEqual([...operatingSystemTestNames].sort());
   expect.soft(operatingSystemNames).toHaveLength(29);
   expect
     .soft(behaviorNames.filter((name) => name.includes("Todo")))
     .toEqual([
       "SessionLifecycle Plan may read Todo but cannot mutate or materialize it",
+      "SessionLifecycle Todo rejects reopening a prerequisite while its direct dependent is in progress",
       "SessionLifecycle binds Todo reads to the exact folded store revision",
       "SessionLifecycle branches a Todo store larger than one record through bounded inheritance chunks",
       "SessionLifecycle folds Todo state across a deterministic restart",
