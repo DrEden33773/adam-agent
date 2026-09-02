@@ -25,6 +25,7 @@ import {
   type LocalInputResourceSelectionV1,
   type ModelDriver,
   type ModelMessage,
+  type ModelRequest,
   type ModelTargetIdentity,
   type ModelTargets,
   type ModelToolDefinition,
@@ -232,6 +233,199 @@ test("SessionLifecycle folds Todo state across a deterministic restart", async (
     await resumedLifecycle.close();
   } finally {
     await firstLifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle Todo rejects reopening a prerequisite while its direct dependent is in progress", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-todo-active-reopen-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const requests: ModelRequest[] = [];
+  let prerequisiteId: string | undefined;
+  let dependentId: string | undefined;
+  let call = 0;
+  const driver = new FakeModelDriver((request) => {
+    requests.push(request);
+    call += 1;
+    if (call === 1) {
+      return [
+        { type: "tool_call_start", id: "create-active-prerequisite", name: "create_todo" },
+        {
+          type: "tool_call_delta",
+          id: "create-active-prerequisite",
+          json: '{"title":"Active prerequisite"}',
+        },
+        { type: "tool_call_end", id: "create-active-prerequisite" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (call === 2) {
+      prerequisiteId = completedTodoItemId(request.messages, "create_todo");
+      if (prerequisiteId === undefined) {
+        throw new Error("Expected the prerequisite Todo identity.");
+      }
+      return [
+        { type: "tool_call_start", id: "create-active-dependent", name: "create_todo" },
+        {
+          type: "tool_call_delta",
+          id: "create-active-dependent",
+          json: JSON.stringify({ title: "Active dependent", dependencyIds: [prerequisiteId] }),
+        },
+        { type: "tool_call_end", id: "create-active-dependent" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (call === 3) {
+      dependentId = completedTodoItemId(request.messages, "create_todo");
+      if (dependentId === undefined) {
+        throw new Error("Expected the dependent Todo identity.");
+      }
+      return [
+        { type: "tool_call_start", id: "complete-active-prerequisite", name: "update_todo" },
+        {
+          type: "tool_call_delta",
+          id: "complete-active-prerequisite",
+          json: JSON.stringify({
+            id: prerequisiteId,
+            expectedItemRevision: 1,
+            expectedStoreRevision: 2,
+            status: "completed",
+          }),
+        },
+        { type: "tool_call_end", id: "complete-active-prerequisite" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (call === 4) {
+      return [
+        { type: "tool_call_start", id: "start-active-dependent", name: "update_todo" },
+        {
+          type: "tool_call_delta",
+          id: "start-active-dependent",
+          json: JSON.stringify({
+            id: dependentId,
+            expectedItemRevision: 1,
+            expectedStoreRevision: 3,
+            status: "in_progress",
+          }),
+        },
+        { type: "tool_call_end", id: "start-active-dependent" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (call === 5) {
+      return [
+        {
+          type: "tool_call_start",
+          id: "reject-active-prerequisite-reopen",
+          name: "update_todo",
+        },
+        {
+          type: "tool_call_delta",
+          id: "reject-active-prerequisite-reopen",
+          json: JSON.stringify({
+            id: prerequisiteId,
+            expectedItemRevision: 2,
+            expectedStoreRevision: 4,
+            status: "pending",
+          }),
+        },
+        { type: "tool_call_end", id: "reject-active-prerequisite-reopen" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (call === 6) {
+      return [
+        { type: "tool_call_start", id: "read-unchanged-prerequisite", name: "get_todo" },
+        {
+          type: "tool_call_delta",
+          id: "read-unchanged-prerequisite",
+          json: JSON.stringify({ id: prerequisiteId }),
+        },
+        { type: "tool_call_end", id: "read-unchanged-prerequisite" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    return [
+      { type: "text_delta", text: "The active dependent kept its prerequisite closed." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: modelTargetsWithDriver(driver),
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    const continued = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Reject reopening a prerequisite needed by active work." },
+    });
+
+    expect(continued).toMatchObject({
+      result: {
+        status: "completed",
+        answer: "The active dependent kept its prerequisite closed.",
+      },
+      snapshot: {
+        todo: {
+          storeRevision: 4,
+          counts: { pending: 0, inProgress: 1, completed: 1 },
+          blockedCount: 0,
+        },
+      },
+    });
+    expect(
+      requests[5]?.messages.findLast(
+        (message) => message.role === "tool" && message.name === "update_todo",
+      ),
+    ).toMatchObject({
+      result: {
+        status: "failed",
+        error: {
+          code: "todo_completed_dependent",
+          message:
+            "In-progress or completed dependent Todos must return to pending before this prerequisite can be reopened.",
+        },
+      },
+    });
+    expect(
+      requests[5]?.messages.find(
+        (message) =>
+          message.role === "assistant" &&
+          message.content.startsWith("Adam runtime Todo summary v1"),
+      )?.content,
+    ).toContain(
+      '"storeRevision":4,"counts":{"pending":0,"inProgress":1,"completed":1},"blockedCount":0',
+    );
+    expect(
+      requests[6]?.messages.findLast(
+        (message) => message.role === "tool" && message.name === "get_todo",
+      ),
+    ).toMatchObject({
+      result: {
+        status: "completed",
+        output: {
+          storeRevision: 4,
+          item: { id: prerequisiteId, itemRevision: 2, status: "completed" },
+        },
+      },
+    });
+    expect(prerequisiteId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(dependentId).toMatch(/^[0-9a-f-]{36}$/u);
+    const records = await (await harness.sessions.open(created.sessionId))?.read();
+    expect(
+      records?.filter((entry) => entry.schemaVersion === 3 && entry.record.type === "todo_updated"),
+    ).toHaveLength(2);
+  } finally {
+    await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }
 });

@@ -388,13 +388,14 @@ export function updateTodoMutationV1(
   if (
     current.status === "completed" &&
     status !== "completed" &&
-    hasCompletedTodoDependentV1(snapshot, current.id)
+    hasNonPendingTodoDependentV1(snapshot, current.id)
   ) {
     return {
       status: "failed",
       error: {
         code: "todo_completed_dependent",
-        message: "Completed dependent Todos must be reopened before this prerequisite.",
+        message:
+          "In-progress or completed dependent Todos must return to pending before this prerequisite can be reopened.",
       },
     };
   }
@@ -721,13 +722,13 @@ export function wouldCreateTodoDependencyCycleV1(
   return false;
 }
 
-export function hasCompletedTodoDependentV1(
+function hasNonPendingTodoDependentV1(
   snapshot: TodoStoreSnapshotV1,
   dependencyId: string,
 ): boolean {
   const dependenciesById = new Map(snapshot.items.map((item) => [item.id, item.dependencyIds]));
   return snapshot.items.some((item) => {
-    if (item.status !== "completed" || item.id === dependencyId) {
+    if (item.status === "pending" || item.id === dependencyId) {
       return false;
     }
     const visited = new Set<string>();

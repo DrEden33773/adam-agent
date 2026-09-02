@@ -4,6 +4,7 @@ import type { SessionRecord } from "./session-store.js";
 
 import {
   createTodoMutationV1,
+  isTodoStoreSnapshotV1Valid,
   listTodosV1,
   type TodoStoreSnapshotV1,
   todoLimitsV1,
@@ -191,6 +192,71 @@ describe("Todo v1", () => {
     });
     expect(snapshot).toEqual({ ...snapshot, storeRevision: 7, items: [item] });
   });
+
+  test.each([
+    ["in_progress", "pending"],
+    ["completed", "in_progress"],
+  ] as const)(
+    "update rejects reopening across transitive dependent status %s without a cascade",
+    (transitiveStatus, reopenedStatus) => {
+      const snapshot: TodoStoreSnapshotV1 = {
+        policyVersion: todoPolicyVersionV1,
+        storeRevision: 6,
+        items: [
+          {
+            id: todoId(0),
+            createdOrdinal: 1,
+            itemRevision: 2,
+            status: "completed",
+            title: "Root prerequisite",
+            dependencyIds: [],
+          },
+          {
+            id: todoId(1),
+            createdOrdinal: 2,
+            itemRevision: 2,
+            status: "completed",
+            title: "Completed middle dependent",
+            dependencyIds: [todoId(0)],
+          },
+          {
+            id: todoId(2),
+            createdOrdinal: 3,
+            itemRevision: 2,
+            status: transitiveStatus,
+            title: "Transitive dependent",
+            dependencyIds: [todoId(1)],
+          },
+        ],
+      };
+      expect(isTodoStoreSnapshotV1Valid(snapshot)).toBe(true);
+
+      expect(
+        updateTodoMutationV1(snapshot, {
+          id: todoId(0),
+          expectedItemRevision: 2,
+          expectedStoreRevision: 6,
+          status: reopenedStatus,
+        }),
+      ).toEqual({
+        status: "failed",
+        error: {
+          code: "todo_completed_dependent",
+          message:
+            "In-progress or completed dependent Todos must return to pending before this prerequisite can be reopened.",
+        },
+      });
+      expect(snapshot).toEqual({
+        policyVersion: todoPolicyVersionV1,
+        storeRevision: 6,
+        items: [
+          expect.objectContaining({ id: todoId(0), itemRevision: 2, status: "completed" }),
+          expect.objectContaining({ id: todoId(1), itemRevision: 2, status: "completed" }),
+          expect.objectContaining({ id: todoId(2), itemRevision: 2, status: transitiveStatus }),
+        ],
+      });
+    },
+  );
 
   test("list enforces the 16 KiB page bound and resumes from a stateless cursor", () => {
     const items = Array.from({ length: 50 }, (_, index) => ({
