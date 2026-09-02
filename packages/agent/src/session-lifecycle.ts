@@ -124,6 +124,7 @@ import {
   hasSkillPromptContext,
   isPromptContextCompatible,
   isPromptContextRecordCompatible,
+  type PromptContextRecord,
   type PromptContextRecordV1,
   type PromptContextRecordV3,
   replacePromptRepositoryV1,
@@ -1512,6 +1513,113 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     }
     return runWithOwner(operation, rootId);
   };
+  const managedResearchContextForSession = async (input: {
+    readonly sessionId: string;
+    readonly projectId: string;
+    readonly managedAgentTools: ManagedAgentToolsProfile | undefined;
+    readonly promptContext: PromptContextRecord | undefined;
+    readonly skillContext: SkillContextRecordV1 | undefined;
+    readonly sessionTools: ToolRegistry;
+    readonly contextProfile: ContextProfile;
+    readonly extensionSources: readonly ExtensionSkillSourceV1[];
+    readonly workspaceTrusted: boolean;
+    readonly artifactStore: ArtifactStore;
+  }): Promise<ManagedAgentResearchContext | undefined> => {
+    if (!hasManagedAgentCoordination(input.managedAgentTools)) {
+      return input.promptContext === undefined
+        ? undefined
+        : { repository: input.promptContext.repository };
+    }
+    const researchToolNames = new Set([
+      "read_skill_resource",
+      "web_search",
+      "web_fetch",
+      "web_open",
+      "web_find",
+    ]);
+    return {
+      ...(input.promptContext === undefined ? {} : { repository: input.promptContext.repository }),
+      skillIdentities:
+        input.skillContext?.registry.candidates.map((candidate) => ({
+          qualifiedId: candidate.qualifiedId,
+          digest: candidate.skillMdDigest,
+        })) ?? [],
+      tools: {
+        definitions: () =>
+          input.sessionTools
+            .definitions()
+            .filter((definition) => researchToolNames.has(definition.name)),
+        resolve: (name) =>
+          researchToolNames.has(name) ? input.sessionTools.resolve(name) : undefined,
+      },
+      async resolveSkills(selection) {
+        const skillContext = await createInitialSkillContextV1({
+          artifactStore: input.artifactStore,
+          effectiveContextTokens: input.contextProfile.contextWindowTokens,
+          estimatorVersion: input.contextProfile.estimatorVersion,
+          projectId: input.projectId,
+          sessionId: selection.childSessionId,
+          userHome: homedir(),
+          workspaceRoot: options.workspaceRoot,
+          extensionSources: input.extensionSources,
+          includeProjectSources: input.workspaceTrusted,
+        });
+        let selectedContext = skillContext;
+        for (const [index, qualifiedId] of selection.skills.entries()) {
+          const candidate = selectedContext.registry.candidates.find(
+            (entry) => entry.qualifiedId === qualifiedId,
+          );
+          if (candidate === undefined) {
+            throw new SessionLifecycleError("session_skill_unavailable");
+          }
+          const manifest = await buildSkillResourceManifestV1({
+            candidate,
+            workspaceRoot: options.workspaceRoot,
+            userHome: homedir(),
+            userHomeDigest: selectedContext.userHomeDigest,
+            ...(input.extensionSources.length === 0
+              ? {}
+              : { extensionSources: input.extensionSources }),
+          });
+          selectedContext = activateSkillContextV1({
+            context: selectedContext,
+            qualifiedId,
+            reason: "user_explicit",
+            runId: selection.attemptId,
+            requestId: `${selection.attemptId}:skill:${index + 1}`,
+            manifest,
+          }).context;
+        }
+        return {
+          context: selectedContext,
+          contents: await materializeActiveSkillContents(options, selectedContext),
+        };
+      },
+      authorizeProjectContextLoad: async () => (await inspectWorkspaceTrust()).status === "trusted",
+      ...(input.extensionSources.length === 0
+        ? {}
+        : { extensionSkillSources: input.extensionSources }),
+      ...(options.extensionHost === undefined
+        ? {}
+        : {
+            withCurrentExtensionSkillSources: <T>(
+              sources: readonly ExtensionSkillSourceV1[],
+              operation: () => Promise<T>,
+            ) =>
+              withInternalExtensionSkillSourcesCurrent(
+                options.extensionHost as ExtensionHost,
+                sources.map((source) => ({
+                  extensionId: source.locator.extensionId,
+                  packageName: source.locator.packageName,
+                  packageVersion: source.locator.packageVersion,
+                  lifecycleRevision: source.lifecycleRevision,
+                  lifecycleDigest: source.lifecycleDigest,
+                })),
+                operation,
+              ),
+          }),
+    };
+  };
   const ensureManagedAgentManagerForControl = async (
     sessionId: string,
     parentRoot: ProjectExecutionRootClaim,
@@ -1572,6 +1680,38 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       recordedThinking === undefined
         ? undefined
         : requireRecoveredThinkingPolicy(resolved, recordedThinking);
+    const promptContext = promptContextRecordFromRecords(genesis, records);
+    const extensionSources = await resolveExtensionSkillSources(options);
+    const storedSkillContext = skillContextRecordFromRecords(genesis, records);
+    const skillContext =
+      promptContext !== undefined &&
+      hasSkillPromptContext(promptContext) &&
+      storedSkillContext !== undefined
+        ? reconcileExtensionSkillContextV1({
+            context: storedSkillContext,
+            currentSources: extensionSources,
+          }).context
+        : storedSkillContext;
+    const workspaceTrusted = (await inspectWorkspaceTrust()).status === "trusted";
+    const sessionTools = await toolsForSession(
+      sessionId,
+      snapshot.targetIdentity,
+      thinkingPolicy,
+      genesis.record.managedAgentTools,
+      genesis.record.webEvidence,
+    );
+    const researchContext = await managedResearchContextForSession({
+      sessionId,
+      projectId: snapshot.projectId,
+      managedAgentTools: genesis.record.managedAgentTools,
+      promptContext,
+      skillContext,
+      sessionTools,
+      contextProfile: childContextProfile,
+      extensionSources,
+      workspaceTrusted,
+      artifactStore: sharedArtifactStore,
+    });
     const manager = createAgentManager({
       artifactStore: sharedArtifactStore,
       childContextProfile,
@@ -1618,6 +1758,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       ...(thinkingPolicy === undefined ? {} : { thinkingPolicy }),
       workspaceRoot: options.workspaceRoot,
     });
+    manager.rebindResearchContext(researchContext);
     activeAgentManagers.set(sessionId, manager);
     await manager.snapshot();
     return manager;
@@ -4120,111 +4261,18 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ),
           ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
         };
-        const researchContext: ManagedAgentResearchContext | undefined =
-          !hasManagedAgentCoordination(first.record.managedAgentTools)
-            ? activePromptContext === undefined
-              ? undefined
-              : { repository: activePromptContext.repository }
-            : {
-                ...(activePromptContext === undefined
-                  ? {}
-                  : { repository: activePromptContext.repository }),
-                skillIdentities:
-                  activeSkillContext?.registry.candidates.map((candidate) => ({
-                    qualifiedId: candidate.qualifiedId,
-                    digest: candidate.skillMdDigest,
-                  })) ?? [],
-                tools: {
-                  definitions: () =>
-                    sessionTools
-                      .definitions()
-                      .filter((definition) =>
-                        [
-                          "read_skill_resource",
-                          "web_search",
-                          "web_fetch",
-                          "web_open",
-                          "web_find",
-                        ].includes(definition.name),
-                      ),
-                  resolve(name) {
-                    return [
-                      "read_skill_resource",
-                      "web_search",
-                      "web_fetch",
-                      "web_open",
-                      "web_find",
-                    ].includes(name)
-                      ? sessionTools.resolve(name)
-                      : undefined;
-                  },
-                },
-                async resolveSkills(selection) {
-                  const skillContext = await createInitialSkillContextV1({
-                    artifactStore,
-                    effectiveContextTokens: resolved.contextProfile.contextWindowTokens,
-                    estimatorVersion: resolved.contextProfile.estimatorVersion,
-                    projectId: resumed.snapshot.projectId,
-                    sessionId: selection.childSessionId,
-                    userHome: homedir(),
-                    workspaceRoot: options.workspaceRoot,
-                    extensionSources,
-                    includeProjectSources: (await inspectWorkspaceTrust()).status === "trusted",
-                  });
-                  let selectedContext = skillContext;
-                  for (const [index, qualifiedId] of selection.skills.entries()) {
-                    const candidate = selectedContext.registry.candidates.find(
-                      (entry) => entry.qualifiedId === qualifiedId,
-                    );
-                    if (candidate === undefined) {
-                      throw new SessionLifecycleError("session_skill_unavailable");
-                    }
-                    const manifest = await buildSkillResourceManifestV1({
-                      candidate,
-                      workspaceRoot: options.workspaceRoot,
-                      userHome: homedir(),
-                      userHomeDigest: selectedContext.userHomeDigest,
-                      ...(extensionSources.length === 0 ? {} : { extensionSources }),
-                    });
-                    selectedContext = activateSkillContextV1({
-                      context: selectedContext,
-                      qualifiedId,
-                      reason: "user_explicit",
-                      runId: selection.attemptId,
-                      requestId: `${selection.attemptId}:skill:${index + 1}`,
-                      manifest,
-                    }).context;
-                  }
-                  return {
-                    context: selectedContext,
-                    contents: await materializeActiveSkillContents(options, selectedContext),
-                  };
-                },
-                authorizeProjectContextLoad: async () =>
-                  (await inspectWorkspaceTrust()).status === "trusted",
-                ...(extensionSources.length === 0
-                  ? {}
-                  : { extensionSkillSources: extensionSources }),
-                ...(options.extensionHost === undefined
-                  ? {}
-                  : {
-                      withCurrentExtensionSkillSources: <T>(
-                        sources: readonly ExtensionSkillSourceV1[],
-                        operation: () => Promise<T>,
-                      ) =>
-                        withInternalExtensionSkillSourcesCurrent(
-                          options.extensionHost as ExtensionHost,
-                          sources.map((source) => ({
-                            extensionId: source.locator.extensionId,
-                            packageName: source.locator.packageName,
-                            packageVersion: source.locator.packageVersion,
-                            lifecycleRevision: source.lifecycleRevision,
-                            lifecycleDigest: source.lifecycleDigest,
-                          })),
-                          operation,
-                        ),
-                    }),
-              };
+        const researchContext = await managedResearchContextForSession({
+          sessionId: input.sessionId,
+          projectId: resumed.snapshot.projectId,
+          managedAgentTools: first.record.managedAgentTools,
+          promptContext: activePromptContext,
+          skillContext: activeSkillContext,
+          sessionTools,
+          contextProfile: resolved.contextProfile,
+          extensionSources,
+          workspaceTrusted,
+          artifactStore,
+        });
         const existingAgentManager = activeAgentManagers.get(input.sessionId);
         const agentManager =
           isLongLivedManagedAgentTools(first.record.managedAgentTools) &&
@@ -4248,77 +4296,6 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                   ? {
                       parentCoordination: {
                         interactive: () => managedAgentEventListeners.size > 0,
-                      },
-                      researchSkillIdentities:
-                        activeSkillContext?.registry.candidates.map((candidate) => ({
-                          qualifiedId: candidate.qualifiedId,
-                          digest: candidate.skillMdDigest,
-                        })) ?? [],
-                      researchTools: {
-                        definitions: () =>
-                          sessionTools
-                            .definitions()
-                            .filter((definition) =>
-                              [
-                                "read_skill_resource",
-                                "web_search",
-                                "web_fetch",
-                                "web_open",
-                                "web_find",
-                              ].includes(definition.name),
-                            ),
-                        resolve(name) {
-                          return [
-                            "read_skill_resource",
-                            "web_search",
-                            "web_fetch",
-                            "web_open",
-                            "web_find",
-                          ].includes(name)
-                            ? sessionTools.resolve(name)
-                            : undefined;
-                        },
-                      },
-                      async resolveResearchSkills(selection) {
-                        const skillContext = await createInitialSkillContextV1({
-                          artifactStore,
-                          effectiveContextTokens: resolved.contextProfile.contextWindowTokens,
-                          estimatorVersion: resolved.contextProfile.estimatorVersion,
-                          projectId: resumed.snapshot.projectId,
-                          sessionId: selection.childSessionId,
-                          userHome: homedir(),
-                          workspaceRoot: options.workspaceRoot,
-                          extensionSources,
-                          includeProjectSources: workspaceTrusted,
-                        });
-                        let selectedContext = skillContext;
-                        for (const [index, qualifiedId] of selection.skills.entries()) {
-                          const candidate = selectedContext.registry.candidates.find(
-                            (entry) => entry.qualifiedId === qualifiedId,
-                          );
-                          if (candidate === undefined) {
-                            throw new SessionLifecycleError("session_skill_unavailable");
-                          }
-                          const manifest = await buildSkillResourceManifestV1({
-                            candidate,
-                            workspaceRoot: options.workspaceRoot,
-                            userHome: homedir(),
-                            userHomeDigest: selectedContext.userHomeDigest,
-                            ...(extensionSources.length === 0 ? {} : { extensionSources }),
-                          });
-                          selectedContext = activateSkillContextV1({
-                            context: selectedContext,
-                            qualifiedId,
-                            reason: "user_explicit",
-                            runId: selection.attemptId,
-                            requestId: `${selection.attemptId}:skill:${index + 1}`,
-                            manifest,
-                          }).context;
-                        }
-                        return {
-                          context: selectedContext,
-                          contents: await materializeActiveSkillContents(options, selectedContext),
-                        };
                       },
                       onChildPermissionEvent(event) {
                         for (const listener of listeners) {

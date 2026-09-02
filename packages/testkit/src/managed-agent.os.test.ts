@@ -4,11 +4,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  createCodingToolRegistry,
   createPermissionPolicy,
   createPresentationSession,
-  createReadToolRegistry,
   createSessionLifecycle,
   type ModelDriver,
+  type ModelRequest,
   type ModelTargets,
 } from "@adam-agent/agent";
 import {
@@ -76,8 +77,17 @@ test("PresentationSession recovers one exact managed attempt after a JSONL resta
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
+  const skillRoot = join(workspaceRoot, ".agents", "skills", "cold-research-guide");
+  await mkdir(skillRoot, { recursive: true });
+  await writeFile(
+    join(skillRoot, "SKILL.md"),
+    "---\nname: cold-research-guide\ndescription: Preserves exact cold managed research guidance.\n---\nCOLD_RESEARCH_SKILL_BODY\n",
+    "utf8",
+  );
+  const endpoint = "https://search.example.test/search";
   let childCalls = 0;
   let parentCalls = 0;
+  let recoveredRequest: ModelRequest | undefined;
   const driver: ModelDriver = {
     async *stream(request) {
       if (request.purpose !== "ordinary") {
@@ -88,13 +98,14 @@ test("PresentationSession recovers one exact managed attempt after a JSONL resta
       const child = request.messages.some(
         (message) =>
           message.role === "developer" &&
-          message.content.startsWith("Managed child profile scout.v2"),
+          message.content.startsWith("Managed child profile research.v2"),
       );
       if (child) {
         childCalls += 1;
         if (childCalls === 1) {
           throw new Error("injected interrupted child");
         }
+        recoveredRequest = request;
         yield { type: "text_delta", text: "Cold managed recovery completed." };
         yield { type: "usage", inputTokens: 6, outputTokens: 3 };
         yield { type: "finish", reason: "stop" };
@@ -106,7 +117,7 @@ test("PresentationSession recovers one exact managed attempt after a JSONL resta
         yield {
           type: "tool_call_delta",
           id: "spawn-cold-recovery",
-          json: '{"task":"Create one cold recovery boundary.","mode":"background"}',
+          json: '{"task":"Create one cold recovery boundary.","profile":"research.v2","skills":["skill:v1:project:.:cold-research-guide"],"mode":"background"}',
         };
         yield { type: "tool_call_end", id: "spawn-cold-recovery" };
         yield { type: "finish", reason: "tool_calls" };
@@ -134,11 +145,37 @@ test("PresentationSession recovers one exact managed attempt after a JSONL resta
   };
   const createLifecycle = () =>
     createSessionLifecycle({
-      managedAgentTools: "managed-agent-tools.a2-long-lived.v2",
+      managedAgentTools: "managed-agent-tools.a3-long-lived.v2",
       modelTargets,
       permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
       stateRoot,
-      tools: createReadToolRegistry({ workspaceRoot }),
+      tools: createCodingToolRegistry({ workspaceRoot }),
+      webHttp: {
+        async fetch(input) {
+          return {
+            status: 200,
+            url: input.url,
+            mediaType: "application/json",
+            body: Buffer.from('{"results":[]}', "utf8"),
+          };
+        },
+      },
+      webSearchConfiguration: {
+        async load() {
+          return {
+            status: "configured",
+            provider: {
+              kind: "searxng",
+              endpoint,
+              activation: {
+                protocol: "searxng-json.v1",
+                endpointDigest: `sha256:${createHash("sha256").update(endpoint).digest("hex")}`,
+              },
+            },
+            diagnostic: null,
+          };
+        },
+      },
       workspaceRoot,
       workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
     });
@@ -205,7 +242,7 @@ test("PresentationSession recovers one exact managed attempt after a JSONL resta
         const recovered = Promise.withResolvers<void>();
         const unsubscribeCold = coldPresentation.subscribe(() => {
           const agent = coldPresentation.getState().authoritative.managedAgents.agents[0];
-          if (agent?.status === "completed" && agent.attemptHistory.length === 2) {
+          if (agent?.phase === "terminal" && agent.attemptHistory.length === 2) {
             recovered.resolve();
           }
         });
@@ -244,6 +281,10 @@ test("PresentationSession recovers one exact managed attempt after a JSONL resta
         });
         expect(parentCalls).toBe(2);
         expect(childCalls).toBe(2);
+        expect(recoveredRequest?.tools.map((tool) => tool.name)).toEqual(
+          expect.arrayContaining(["read_skill_resource", "web_search"]),
+        );
+        expect(JSON.stringify(recoveredRequest?.messages)).toContain("COLD_RESEARCH_SKILL_BODY");
       } finally {
         await coldPresentation.close();
       }
