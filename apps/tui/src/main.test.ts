@@ -8079,6 +8079,13 @@ test("slash Todos opens the authoritative read-only list and exact detail", asyn
     const fixture = startFixture({ scenario: "todo", stateRoot, workspaceRoot });
     await fixture.waitFor("Adam · New session");
     fixture.write("Create the exact Todo fixture\r");
+    await fixture.waitFor("Permission required");
+    const permissionFrame = (fixture.screen()?.join("\n") ?? "").replace(/\s+/gu, " ");
+    expect(permissionFrame).toContain("Action write · Subject .");
+    expect(permissionFrame).toContain("No preview available.");
+    expect(permissionFrame).toContain("Allow");
+    expect(permissionFrame).not.toContain("Allow unavailable");
+    fixture.write("\r");
     await fixture.waitFor("Todo fixture created.");
     await fixture.waitFor("Todo 1/0/0 · 0 blocked");
     const beforeTodos = fixture.output().length;

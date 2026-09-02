@@ -832,7 +832,13 @@ function ordinaryScriptedMcpServer(): ScriptedMcpServer {
   };
 }
 
-async function openActivatedMcpPresentationFixture(prefix: string) {
+async function openActivatedMcpPresentationFixture(
+  prefix: string,
+  options: {
+    readonly modelTargets?: ModelTargets;
+    readonly permissions?: ReturnType<typeof createPermissionPolicy>;
+  } = {},
+) {
   const testRoot = await mkdtemp(join(tmpdir(), prefix));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -841,6 +847,8 @@ async function openActivatedMcpPresentationFixture(prefix: string) {
   const peer = createScriptedMcpTransportFactory({ fixture: ordinaryScriptedMcpServer() });
   const lifecycle = createSessionLifecycle({
     [mcpTransportFactory]: peer,
+    ...(options.modelTargets === undefined ? {} : { modelTargets: options.modelTargets }),
+    ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
     stateRoot,
     workspaceRoot,
   });
@@ -1017,6 +1025,225 @@ test("PresentationSession exposes authoritative read-only Todo summary, list, an
       },
     });
     await presentation.close();
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession allows create_todo without a workspace change preview", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-todo-permission-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const driver = new FakeModelDriver((request) => {
+    const latestUser = request.messages.findLast((message) => message.role === "user");
+    const latest = request.messages.at(-1);
+    if (
+      latestUser?.role === "user" &&
+      latestUser.content === "Create one Todo through ordinary permission." &&
+      latest?.role === "user"
+    ) {
+      return [
+        { type: "tool_call_start", id: "create-permitted-todo", name: "create_todo" },
+        {
+          type: "tool_call_delta",
+          id: "create-permitted-todo",
+          json: '{"title":"Permission Todo","details":"Allow exact Todo mutation"}',
+        },
+        { type: "tool_call_end", id: "create-permitted-todo" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    if (
+      latestUser?.role === "user" &&
+      latestUser.content === "Move the Todo into progress through ordinary permission." &&
+      latest?.role === "user"
+    ) {
+      const created = request.messages.findLast(
+        (message) => message.role === "tool" && message.name === "create_todo",
+      );
+      const output =
+        created?.role === "tool" && created.result.status === "completed"
+          ? created.result.output
+          : undefined;
+      const item =
+        typeof output === "object" && output !== null ? Reflect.get(output, "item") : null;
+      const id = typeof item === "object" && item !== null ? Reflect.get(item, "id") : undefined;
+      if (typeof id !== "string") {
+        throw new Error("Expected the created Todo identity before update.");
+      }
+      return [
+        { type: "tool_call_start", id: "update-permitted-todo", name: "update_todo" },
+        {
+          type: "tool_call_delta",
+          id: "update-permitted-todo",
+          json: JSON.stringify({
+            id,
+            expectedItemRevision: 1,
+            expectedStoreRevision: 1,
+            status: "in_progress",
+          }),
+        },
+        { type: "tool_call_end", id: "update-permitted-todo" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    return [
+      {
+        type: "text_delta",
+        text:
+          latestUser?.role === "user" &&
+          latestUser.content === "Move the Todo into progress through ordinary permission."
+            ? "Todo update permission accepted."
+            : "Todo permission accepted.",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read"], askedEffects: ["write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [sessionAutomaticTitlesEnabled]: false,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const pendingVisible = Promise.withResolvers<void>();
+    const todoVisible = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (presentation.getState().authoritative.active?.pendingInteractions.length === 1) {
+        pendingVisible.resolve();
+      }
+      if (
+        presentation.getState().authoritative.active?.todo?.storeRevision === 1 &&
+        presentation.getState().authoritative.active?.session.status === "settled" &&
+        presentation.getState().transient === null
+      ) {
+        todoVisible.resolve();
+      }
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      const completed = waitForAssistantMessage(presentation, "Todo permission accepted.");
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId,
+          text: "Create one Todo through ordinary permission.",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await pendingVisible.promise;
+      const pending = presentation.getState().authoritative.active?.pendingInteractions[0];
+      expect(pending).toEqual({
+        type: "permission",
+        requestId: expect.any(String),
+        callId: "create-permitted-todo",
+        effect: "write",
+        subject: { type: "path", value: "." },
+        canAllow: true,
+        changePreviewRef: null,
+      });
+      await expect(
+        presentation.dispatch({
+          type: "decide_permission",
+          requestId: pending?.requestId ?? "missing-request",
+          decision: "allow",
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await completed;
+      await todoVisible.promise;
+      expect(presentation.getState().authoritative.active?.todo).toMatchObject({
+        storeRevision: 1,
+        counts: { pending: 1, inProgress: 0, completed: 0 },
+      });
+
+      const updatePendingVisible = Promise.withResolvers<void>();
+      const updateTodoVisible = Promise.withResolvers<void>();
+      const unsubscribeUpdate = presentation.subscribe(() => {
+        if (
+          presentation.getState().authoritative.active?.pendingInteractions[0]?.callId ===
+          "update-permitted-todo"
+        ) {
+          updatePendingVisible.resolve();
+        }
+        if (
+          presentation.getState().authoritative.active?.todo?.storeRevision === 2 &&
+          presentation.getState().authoritative.active?.session.status === "settled" &&
+          presentation.getState().transient === null
+        ) {
+          updateTodoVisible.resolve();
+        }
+      });
+      try {
+        const updated = waitForAssistantMessage(presentation, "Todo update permission accepted.");
+        expect(
+          await presentation.dispatch({
+            type: "submit_prompt",
+            sessionId,
+            text: "Move the Todo into progress through ordinary permission.",
+            skills: [],
+            thinkingSelection: null,
+          }),
+        ).toEqual({ status: "admitted", commandId: expect.any(String), resource: null });
+        await updatePendingVisible.promise;
+        const updatePending = presentation.getState().authoritative.active?.pendingInteractions[0];
+        expect(updatePending).toMatchObject({
+          callId: "update-permitted-todo",
+          effect: "write",
+          canAllow: true,
+          changePreviewRef: null,
+        });
+        await expect(
+          presentation.dispatch({
+            type: "decide_permission",
+            requestId: updatePending?.requestId ?? "missing-update-request",
+            decision: "allow",
+          }),
+        ).resolves.toMatchObject({ status: "admitted", resource: null });
+        await updated;
+        await updateTodoVisible.promise;
+        expect(presentation.getState().authoritative.active?.todo).toMatchObject({
+          storeRevision: 2,
+          counts: { pending: 0, inProgress: 1, completed: 0 },
+        });
+      } finally {
+        unsubscribeUpdate();
+      }
+      await presentation.close();
+    } finally {
+      unsubscribe();
+    }
   } finally {
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
@@ -6238,6 +6465,139 @@ test("PresentationSession commits one discovery-bound immutable MCP Tool Profile
         ],
       },
     });
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("PresentationSession allows an exact-call MCP write without a workspace change preview", async () => {
+  let qualifiedName: string | undefined;
+  const driver = new FakeModelDriver((request) => {
+    const latest = request.messages.at(-1);
+    if (
+      latest?.role === "user" &&
+      qualifiedName !== undefined &&
+      request.tools.some((tool) => tool.name === qualifiedName)
+    ) {
+      return [
+        { type: "tool_call_start", id: "mcp-write-permission", name: qualifiedName },
+        {
+          type: "tool_call_delta",
+          id: "mcp-write-permission",
+          json: '{"value":"approved write"}',
+        },
+        { type: "tool_call_end", id: "mcp-write-permission" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    return [
+      {
+        type: "text_delta",
+        text:
+          latest?.role === "tool" && latest.name === qualifiedName
+            ? "MCP write permission accepted."
+            : "MCP permission fixture",
+      },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const fixture = await openActivatedMcpPresentationFixture(
+    "adam-agent-presentation-mcp-write-permission-",
+    {
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read"], askedEffects: ["write"] }),
+    },
+  );
+  try {
+    const active = fixture.presentation.getState().authoritative.active;
+    const tool = active?.mcp?.catalog?.tools.find((candidate) => candidate.originalName === "echo");
+    const generationId = active?.mcp?.activation?.generationId;
+    if (
+      active?.mcp === null ||
+      active?.mcp === undefined ||
+      tool === undefined ||
+      generationId === undefined
+    ) {
+      throw new Error("Expected an activated MCP catalog.");
+    }
+    qualifiedName = tool.qualifiedName;
+    await expect(
+      fixture.presentation.dispatch({
+        type: "commit_mcp_tool_profile",
+        sessionId: active.session.id,
+        generationId,
+        selections: [
+          {
+            qualifiedName,
+            definitionDigest: tool.definitionDigest,
+            effect: "write",
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ status: "admitted", resource: null });
+
+    const pendingVisible = Promise.withResolvers<void>();
+    const unsubscribe = fixture.presentation.subscribe(() => {
+      if (
+        fixture.presentation.getState().authoritative.active?.pendingInteractions[0]?.callId ===
+        "mcp-write-permission"
+      ) {
+        pendingVisible.resolve();
+      }
+    });
+    try {
+      const completed = waitForAssistantMessage(
+        fixture.presentation,
+        "MCP write permission accepted.",
+      );
+      await expect(
+        fixture.presentation.dispatch({
+          type: "submit_prompt",
+          sessionId: active.session.id,
+          text: "Run the exact MCP write call.",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await pendingVisible.promise;
+      const pending = fixture.presentation.getState().authoritative.active?.pendingInteractions[0];
+      expect(pending).toMatchObject({
+        callId: "mcp-write-permission",
+        effect: "write",
+        subject: { type: "generic", value: "mcp_tool" },
+        canAllow: true,
+        changePreviewRef: null,
+      });
+      await expect(
+        fixture.presentation.dispatch({
+          type: "decide_permission",
+          requestId: pending?.requestId ?? "missing-mcp-write-request",
+          decision: "allow",
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await completed;
+      expect(
+        fixture.peer.requests("fixture").filter((request) => request.method === "tools/call"),
+      ).toHaveLength(1);
+    } finally {
+      unsubscribe();
+    }
   } finally {
     await fixture.close();
   }

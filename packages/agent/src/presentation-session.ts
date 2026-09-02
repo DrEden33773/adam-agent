@@ -3437,7 +3437,7 @@ export async function createPresentationSession(
         }
         if (
           command.decision === "allow" &&
-          pending.effect === "write" &&
+          pending.changePreviewRef !== null &&
           state.authoritative.active !== null &&
           !(await isCurrentActionableChangePreview(
             options,
