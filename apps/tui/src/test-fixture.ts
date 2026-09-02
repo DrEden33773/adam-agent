@@ -22,6 +22,7 @@ import {
   type WorkspaceTrustController,
 } from "@adam-agent/agent";
 import {
+  createInMemorySessionStoreDirectory,
   createTrustedWorkspaceTrustForTesting,
   mcpCloseConfirmation,
   type PresentationArtifactReadBarrier,
@@ -29,6 +30,10 @@ import {
   preparedDirectDeepSeekV2ContextProfile,
   presentationArtifactReadBarrier,
   presentationHistoryPageSize,
+  type SessionRecord,
+  type SessionStore,
+  type SessionStoreDirectory,
+  sessionStoreDirectory,
   turnComposerStageBarrier,
 } from "@adam-agent/agent/internal-testing";
 import type { PresentationSession } from "@adam-agent/presentation";
@@ -173,6 +178,57 @@ export type TuiFixtureOptions = {
   readonly workspaceRoot: string;
 };
 
+function createPostSettlementReadFailureDirectory(
+  failureMarker?: string,
+): SessionStoreDirectory<SessionRecord> {
+  const backing = createInMemorySessionStoreDirectory<SessionRecord>();
+  const wrappedStores = new Map<string, SessionStore<SessionRecord>>();
+  return {
+    async create(sessionId) {
+      const store = await backing.create(sessionId);
+      let rejectReads = false;
+      const wrapped: SessionStore<SessionRecord> = {
+        async append(record) {
+          await store.append(record);
+          rejectReads ||=
+            record.schemaVersion === 3 &&
+            (record.record.type === "run_settled" ||
+              (record.record.type === "runtime_event" &&
+                record.record.event.type === "session_settled"));
+        },
+        async appendBatch(records) {
+          await store.appendBatch(records);
+          rejectReads ||= records.some(
+            (record) =>
+              record.schemaVersion === 3 &&
+              (record.record.type === "run_settled" ||
+                (record.record.type === "runtime_event" &&
+                  record.record.event.type === "session_settled")),
+          );
+        },
+        async read() {
+          if (rejectReads) {
+            if (failureMarker !== undefined) {
+              writeFileSync(failureMarker, "failed\n", "utf8");
+            }
+            throw new Error("Injected post-admission session read failure.");
+          }
+          return store.read();
+        },
+      };
+      wrappedStores.set(sessionId, wrapped);
+      return wrapped;
+    },
+    listSessionEntries: () => backing.listSessionEntries(),
+    listSessionIds: () => backing.listSessionIds(),
+    async open(sessionId) {
+      return (await backing.open(sessionId)) === undefined
+        ? undefined
+        : wrappedStores.get(sessionId);
+    },
+  };
+}
+
 class TerminalRestorationFailure extends ProcessTerminal {
   readonly #failureMarker: string | undefined;
 
@@ -277,6 +333,15 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
               throw new Error("Injected stop after durable Plan approval intent.");
             },
           },
+        }
+      : {}),
+    ...(options.scenario === "plan-settlement-read-failure"
+      ? {
+          [sessionStoreDirectory]: createPostSettlementReadFailureDirectory(
+            options.controlRoot === undefined
+              ? undefined
+              : join(options.controlRoot, "plan-settlement-read-failed"),
+          ),
         }
       : {}),
     ...(options.scenario === "mcp-close-unconfirmed"
@@ -1299,7 +1364,11 @@ function createFixtureModelTargets(options: {
         yield { type: "finish", reason: "stop" };
         return;
       }
-      if (options.scenario === "plan-review" || options.scenario === "plan-review-recovery") {
+      if (
+        options.scenario === "plan-review" ||
+        options.scenario === "plan-review-recovery" ||
+        options.scenario === "plan-settlement-read-failure"
+      ) {
         if (request.approvedPlan !== undefined) {
           yield { type: "text_delta", text: "Approved Plan implementation complete." };
         } else {
@@ -1312,6 +1381,10 @@ function createFixtureModelTargets(options: {
           }
           planSubmissionOrdinal += 1;
           const callId = `submit-plan-review-${planSubmissionOrdinal}`;
+          yield {
+            type: "text_delta",
+            text: `Fixture Plan ${planSubmissionOrdinal} is ready for external review.`,
+          };
           yield { type: "tool_call_start", id: callId, name: "submit_plan" };
           yield {
             type: "tool_call_delta",

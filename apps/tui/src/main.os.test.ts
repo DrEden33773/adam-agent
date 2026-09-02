@@ -39,6 +39,20 @@ afterEach(async () => {
   await cleanupActiveTuiFixtures();
 });
 
+function expectEveryTerminalInputModeRestored(result: { readonly stdout: string }): void {
+  expect(result.stdout).toContain("\u001b[?2004h");
+  expect(result.stdout).toContain("\u001b[?2004l");
+  expect(result.stdout).toContain("\u001b[?2026l");
+  expect(result.stdout).toContain("\u001b[?25h");
+  for (const mode of ["1000", "1002", "1003", "1004", "1006"]) {
+    expect(result.stdout).toContain(`\u001b[?${mode}h`);
+    expect(result.stdout).toContain(`\u001b[?${mode}l`);
+    expect(result.stdout.indexOf(`\u001b[?${mode}h`)).toBeLessThan(
+      result.stdout.lastIndexOf(`\u001b[?${mode}l`),
+    );
+  }
+}
+
 test("the real TUI process restores the terminal after staging one input resource", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-resource-process-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -349,6 +363,74 @@ test("real PTY streams Ctrl+T reasoning and restores application mouse modes on 
     expect(result.stdout).toContain("\u001b[?1006h");
     expect(result.stdout).toContain("\u001b[?1000l");
     expect(result.stdout).toContain("\u001b[?1006l");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("real PTY submits a Plan with assistant preamble and restores every terminal input mode", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-preamble-pty-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({
+      external: true,
+      scenario: "plan-review",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforePlan = fixture.output().length;
+    fixture.write("/plan\r");
+    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforePlan);
+    const beforeSubmission = fixture.output().length;
+    fixture.write("Create the exact PTY Plan\r");
+    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeSubmission);
+    expect(fixture.output().slice(beforeSubmission)).toContain(
+      "Fixture Plan 1 is ready for external review.",
+    );
+
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).not.toContain("session_invalid");
+    expectEveryTerminalInputModeRestored(result);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("real PTY restores every terminal input mode after Plan settlement and refresh both fail", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-settlement-failure-pty-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      external: true,
+      scenario: "plan-settlement-read-failure",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    const beforePlan = fixture.output().length;
+    fixture.write("/plan\r");
+    await fixture.waitForCompleteFrameAfter("Plan exploring · read-only", beforePlan);
+    fixture.write("Create the failing-refresh PTY Plan\r");
+    await waitForFileContents(join(controlRoot, "plan-settlement-read-failed"), "failed\n");
+
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(result.stdout).not.toContain("SessionLifecycleError");
+    expect(result.stdout).not.toContain("UnhandledPromiseRejection");
+    expectEveryTerminalInputModeRestored(result);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

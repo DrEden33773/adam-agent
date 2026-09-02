@@ -739,6 +739,63 @@ function readInMemoryPresentationRecords(directory: SessionStoreDirectory<Sessio
   return async (sessionId: string): Promise<readonly SessionRecord[]> =>
     (await directory.open(sessionId))?.read() ?? [];
 }
+
+function createSessionReadFailureDirectory(trigger: "logical_run_started" | "run_settlement"): {
+  readonly directory: SessionStoreDirectory<SessionRecord>;
+  readonly readRejected: Promise<void>;
+} {
+  const backing = createInMemorySessionStoreDirectory<SessionRecord>();
+  const wrappedStores = new Map<string, SessionStore<SessionRecord>>();
+  const readRejected = Promise.withResolvers<void>();
+  const wrap = (store: SessionStore<SessionRecord>): SessionStore<SessionRecord> => {
+    let rejectReads = false;
+    const isFailureTrigger = (record: SessionRecord): boolean => {
+      if (record.schemaVersion !== 3) {
+        return false;
+      }
+      if (trigger === "logical_run_started") {
+        return record.record.type === "logical_run_started";
+      }
+      return (
+        record.record.type === "run_settled" ||
+        (record.record.type === "runtime_event" && record.record.event.type === "session_settled")
+      );
+    };
+    return {
+      async append(record) {
+        await store.append(record);
+        rejectReads ||= isFailureTrigger(record);
+      },
+      async appendBatch(records) {
+        await store.appendBatch(records);
+        rejectReads ||= records.some(isFailureTrigger);
+      },
+      async read() {
+        if (rejectReads) {
+          readRejected.resolve();
+          throw new Error("Injected durable session read failure after run settlement.");
+        }
+        return store.read();
+      },
+    };
+  };
+  const directory: SessionStoreDirectory<SessionRecord> = {
+    async create(sessionId) {
+      const wrapped = wrap(await backing.create(sessionId));
+      wrappedStores.set(sessionId, wrapped);
+      return wrapped;
+    },
+    listSessionEntries: () => backing.listSessionEntries(),
+    listSessionIds: () => backing.listSessionIds(),
+    async open(sessionId) {
+      return (await backing.open(sessionId)) === undefined
+        ? undefined
+        : wrappedStores.get(sessionId);
+    },
+  };
+  return { directory, readRejected: readRejected.promise };
+}
+
 const testEnvironment = process.env as NodeJS.ProcessEnv & { HOME?: string };
 async function writeScriptedMcpConfiguration(
   testRoot: string,
@@ -13103,6 +13160,218 @@ test("PresentationSession recovers after one authoritative runtime refresh failu
     } finally {
       unsubscribe();
       await expect(presentation.close()).resolves.toBeUndefined();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession degrades an admitted session when settlement and fallback inspection fail", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-settlement-failure-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  let modelCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    modelCalls += 1;
+    return [
+      { type: "text_delta", text: "The durable run completed before refresh failed." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const readFailure = createSessionReadFailureDirectory("run_settlement");
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionAutomaticTitlesEnabled]: false,
+    [sessionStoreDirectory]: readFailure.directory,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+    });
+    const degraded = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (presentation.getState().authoritative.continuity.status === "degraded") {
+        degraded.resolve();
+      }
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId,
+          text: "Complete one durable run before refresh fails.",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await readFailure.readRejected;
+      await degraded.promise;
+      expect(presentation.getState().authoritative.continuity).toEqual({
+        status: "degraded",
+        fault: {
+          code: "authoritative_state_unavailable",
+          message: "The durable session view is temporarily unavailable.",
+        },
+      });
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId,
+          text: "This command must remain blocked while continuity is degraded.",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).resolves.toEqual({
+        status: "rejected",
+        code: "stale_interaction",
+        message: "The active session boundary is no longer available for this command.",
+      });
+      expect(modelCalls).toBe(1);
+      await expect(presentation.close()).resolves.toBeUndefined();
+    } finally {
+      unsubscribe();
+    }
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession degrades an admitted draft Plan when settlement and fallback inspection fail", async () => {
+  const testRoot = await mkdtemp(
+    join(tmpdir(), "adam-agent-presentation-draft-settlement-failure-"),
+  );
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const markdown = "# Draft Plan\n\n1. Admit the draft.\n2. Preserve terminal ownership.\n";
+  let modelCalls = 0;
+  const driver = new FakeModelDriver(() => {
+    modelCalls += 1;
+    return [
+      { type: "text_delta", text: "The draft Plan is ready for review." },
+      { type: "tool_call_start", id: "submit-draft-plan", name: "submit_plan" },
+      {
+        type: "tool_call_delta",
+        id: "submit-draft-plan",
+        json: JSON.stringify({ title: "Draft Plan", markdown }),
+      },
+      { type: "tool_call_end", id: "submit-draft-plan" },
+      { type: "finish", reason: "tool_calls" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const readFailure = createSessionReadFailureDirectory("logical_run_started");
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [sessionAutomaticTitlesEnabled]: false,
+    [sessionStoreDirectory]: readFailure.directory,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+    });
+    const degraded = Promise.withResolvers<void>();
+    const unsubscribe = presentation.subscribe(() => {
+      if (presentation.getState().authoritative.continuity.status === "degraded") {
+        degraded.resolve();
+      }
+    });
+    try {
+      await expect(
+        presentation.dispatch({ type: "create_session", targetId: targetIdentity.targetId }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await expect(
+        presentation.dispatch({ type: "set_draft_mode", mode: "plan" }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      const submission = presentation.dispatch({
+        type: "submit_draft_prompt",
+        text: "Publish the first durable Plan.",
+        skills: [],
+        thinkingSelection: null,
+      });
+      await readFailure.readRejected;
+      await expect(submission).resolves.toEqual({
+        status: "rejected",
+        code: "persistence_failed",
+        message: "The admitted draft session could not be read from durable history.",
+      });
+      await degraded.promise;
+      expect(presentation.getState().authoritative.continuity).toEqual({
+        status: "degraded",
+        fault: {
+          code: "authoritative_state_unavailable",
+          message: "The durable session view is temporarily unavailable.",
+        },
+      });
+      await expect(
+        presentation.dispatch({
+          type: "submit_draft_prompt",
+          text: "This draft command must remain blocked while continuity is degraded.",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).resolves.toEqual({
+        status: "rejected",
+        code: "stale_interaction",
+        message: "The active session boundary is no longer available for this command.",
+      });
+      expect(modelCalls).toBe(1);
+      await expect(presentation.close()).resolves.toBeUndefined();
+    } finally {
+      unsubscribe();
     }
   } finally {
     await lifecycle.close();

@@ -187,6 +187,8 @@ export function validateCurrentSessionHistory(
   let activePlanApprovalCommandId: string | undefined;
   let activePlanKickoffRunId: string | undefined;
   let planSubmissionTerminal = false;
+  const isCompletedRunFinishReason = (finishReason: unknown): boolean =>
+    finishReason === "stop" || (planSubmissionTerminal && finishReason === "tool_calls");
   let activePlanPolicyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1" | undefined;
   let activePlanShellPolicyVersion: "plan-shell-policy.v1" | undefined;
   let activePlanShellEnvironmentDigest: string | undefined;
@@ -1593,7 +1595,7 @@ export function validateCurrentSessionHistory(
     if (record.type === "run_settled") {
       const finishReason = attemptState?.response?.response.finishReason;
       const settlementMatchesResponse =
-        (record.status === "completed" && finishReason === "stop") ||
+        (record.status === "completed" && isCompletedRunFinishReason(finishReason)) ||
         (record.status === "incomplete" &&
           record.reason === "output_limit" &&
           finishReason === "length");
@@ -1795,12 +1797,12 @@ export function validateCurrentSessionHistory(
           JSON.stringify(terminalIntent) !== JSON.stringify(event.result)) ||
         (event.result.status === "completed" &&
           (attemptState?.status !== "completed" ||
-            (attemptState.response?.response.finishReason !== "stop" &&
-              !(
-                planSubmissionTerminal &&
-                attemptState.response?.response.finishReason === "tool_calls"
-              )) ||
-            inlineModelResponseField(attemptState.response.response.text) !== event.result.answer ||
+            attemptState.response === undefined ||
+            !isCompletedRunFinishReason(attemptState.response.response.finishReason) ||
+            (planSubmissionTerminal
+              ? event.result.answer !== ""
+              : inlineModelResponseField(attemptState.response.response.text) !==
+                event.result.answer) ||
             !sawModelCompletion)) ||
         (event.result.status === "incomplete" &&
           (attemptState?.status !== "completed" ||
