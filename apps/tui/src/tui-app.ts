@@ -2125,7 +2125,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         selectedSkills.size === 0
           ? ""
           : ` · ${selectedSkills.size} Skill${selectedSkills.size === 1 ? "" : "s"} selected`;
-      const planSummary = draft.mode === "plan" ? " · Plan exploring · read-only" : "";
+      const planSummary = draft.mode === "plan" ? " · Plan exploring" : "";
       footer.setText({
         wide: theme.muted(
           `${safeTerminalText(state.authoritative.project.label)} · New session draft${planSummary} · idle\n${safeTerminalText(draft.targetId)} · ${target?.certification ?? "Experimental"}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary} · /help · Tab complete`,
@@ -2169,7 +2169,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         active.plan === undefined
           ? ""
           : active.plan.state === "exploring"
-            ? " · Plan exploring · read-only"
+            ? " · Plan exploring"
             : active.plan.state === "ready"
               ? ` · Plan ready r${active.plan.revision} · review required`
               : " · Plan approved · not started";
@@ -2181,7 +2181,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         active.plan === undefined
           ? ""
           : active.plan.state === "exploring"
-            ? " · plan read-only"
+            ? " · plan"
             : active.plan.state === "ready"
               ? " · plan ready"
               : " · plan pending";
@@ -2196,15 +2196,23 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           : ` · Agents ${managedAgents.active} active/${managedAgents.completed} completed`;
       const compactAgentSummary =
         managedAgents.active === 0 ? "" : ` · agents ${managedAgents.active}`;
+      const planPolicySummary =
+        active.plan?.state === "exploring"
+          ? planPolicyFooterSummary(active.plan.policyVersion, "standard")
+          : null;
+      const compactPlanPolicySummary =
+        active.plan?.state === "exploring"
+          ? planPolicyFooterSummary(active.plan.policyVersion, "compact")
+          : null;
       footer.setText({
         wide: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}${agentSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}${agentSummary}\n${planPolicySummary === null ? "" : `${planPolicySummary}\n`}${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · ${commandRegistry.footerHint()}`,
         ),
         standard: theme.muted(
-          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}${agentSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
+          `${safeTerminalText(state.authoritative.project.label)} · ${footerContextText(active)}${planSummary} · ${runStatus}${todoSummary}${agentSummary}\n${planPolicySummary === null ? "" : `${planPolicySummary}\n`}${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}${connectionSummary}${thinkingSummary}${selectedSkillSummary}${olderHistorySummary} · /help · Tab complete`,
         ),
         narrow: theme.muted(
-          `${runStatus}${compactPlanSummary} · ${footerContextCompactText(active)}${compactTodoSummary}${compactAgentSummary}\n${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}\n/help · Tab complete`,
+          `${runStatus}${compactPlanSummary} · ${footerContextCompactText(active)}${compactTodoSummary}${compactAgentSummary}\n${compactPlanPolicySummary === null ? "" : `${compactPlanPolicySummary}\n`}${safeTerminalText(active.session.targetId)} · ${targetCertification}${upstreamSummary}\n/help · Tab complete`,
         ),
       });
     }
@@ -3811,7 +3819,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         editor.setText("");
         const planActionId = showNotice(
           "progress",
-          entering ? "Entering read-only Plan…" : "Exiting read-only Plan…",
+          entering ? "Entering Plan…" : "Exiting Plan…",
           "until_replaced",
         );
         void options.presentation
@@ -3821,7 +3829,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
               settleNotice(
                 planActionId,
                 "success",
-                entering ? "Entered read-only Plan." : "Exited read-only Plan.",
+                entering ? "Entered Plan." : "Exited Plan.",
                 "until_next_action",
               );
             } else {
@@ -4076,7 +4084,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       const entering = plan === undefined;
       const planActionId = showNotice(
         "progress",
-        entering ? "Entering read-only Plan…" : "Exiting read-only Plan…",
+        entering ? "Entering Plan…" : "Exiting Plan…",
         "until_replaced",
         active.session.id,
       );
@@ -4097,7 +4105,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             settleNotice(
               planActionId,
               "success",
-              entering ? "Entered read-only Plan." : "Exited read-only Plan.",
+              entering ? "Entered Plan." : "Exited Plan.",
               "until_next_action",
               active.session.id,
             );
@@ -4109,9 +4117,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           settleNotice(
             planActionId,
             "error",
-            entering
-              ? "Read-only Plan could not be entered."
-              : "Read-only Plan could not be exited.",
+            entering ? "Plan could not be entered." : "Plan could not be exited.",
             "until_edit",
             active.session.id,
           );
@@ -5885,6 +5891,18 @@ async function readCompleteArtifact(
     throw new TypeError("The complete artifact is unavailable for copy.");
   }
   return receipt.resource.text;
+}
+
+function planPolicyFooterSummary(
+  policyVersion: NonNullable<ActiveSessionDisplay["plan"]>["policyVersion"],
+  density: "compact" | "standard",
+): string {
+  if (policyVersion === "plan-policy.read-v1") {
+    return density === "compact" ? "plan read-only" : "plan-policy.read-v1 · read-only";
+  }
+  return density === "compact"
+    ? "inspect:auto · ambig:ask · mutate:deny"
+    : "plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies";
 }
 
 function footerContextText(active: ActiveSessionDisplay): string {

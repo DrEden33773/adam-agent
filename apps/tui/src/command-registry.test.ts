@@ -4,6 +4,16 @@ import {
   createAdamCommandRegistryFromContributions,
 } from "./command-registry.js";
 
+test("Plan Registry copy stays policy-neutral", () => {
+  const parsed = adamCommandRegistry.parse("/plan");
+  expect(parsed).toMatchObject({
+    kind: "known",
+    command: {
+      summary: "Enter or exit the authoritative Plan cycle.",
+    },
+  });
+});
+
 test("the TUI Registry hides attachment actions for a historical text-only session", () => {
   const attachmentCommands = adamCommandRegistry
     .entries()

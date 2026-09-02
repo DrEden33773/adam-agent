@@ -4858,7 +4858,8 @@ test("SessionLifecycle enforces the exact eight MiB materialized-output budget p
       };
     },
   };
-  const lifecycle = createSessionLifecycle({ modelTargets, stateRoot, workspaceRoot });
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
 
   try {
     const created = await lifecycle.create({ targetIdentity });
@@ -4892,11 +4893,10 @@ test("SessionLifecycle enforces the exact eight MiB materialized-output budget p
     ).resolves.toMatchObject({
       result: { status: "completed", answer: "The lineage quota rejected another page." },
     });
-    const store = await openJsonlSessionStore({
-      stateRoot,
-      workspaceRoot,
-      sessionId: created.sessionId,
-    });
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the materialized-output lineage store.");
+    }
     const records = await store.read();
     expect(
       records.filter(

@@ -360,7 +360,7 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     availability: "idle",
     id: "plan",
     name: "plan",
-    summary: "Enter or exit the authoritative read-only Plan cycle.",
+    summary: "Enter or exit the authoritative Plan cycle.",
     usage: "/plan",
   },
   {
