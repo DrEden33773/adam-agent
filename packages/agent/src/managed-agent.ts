@@ -214,6 +214,7 @@ export type ManagedAgentRecord =
       readonly profile: "reviewer.v1" | "scout.v1" | "research.v1";
       readonly mode?: "foreground" | "background";
       readonly profileDigest: `sha256:${string}`;
+      readonly usageAccountingVersion?: 2;
       readonly effectiveToolProfileDigest?: `sha256:${string}`;
       readonly skillActivationDigest?: `sha256:${string}`;
       readonly selectedSkills?: readonly {
@@ -598,6 +599,7 @@ const managedAgentRecordSchema = z.union([
     profile: z.enum(["reviewer.v1", "scout.v1", "research.v1"]),
     mode: z.enum(["foreground", "background"]).optional(),
     profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+    usageAccountingVersion: z.literal(2).optional(),
     effectiveToolProfileDigest: z
       .string()
       .regex(/^sha256:[0-9a-f]{64}$/u)
@@ -1064,13 +1066,9 @@ export async function recoverInterruptedManagedAgents(
           managedAttemptHistory(source, records, childSessionStores),
         ),
       );
-      const cumulativeTokens = sourceHistories.reduce(
-        (total, history) =>
-          total +
-          history.usage.inputTokens +
-          history.usage.outputTokens +
-          history.usage.reasoningTokens,
-        0,
+      const cumulativeTokens = managedCumulativeTokens(
+        sourceHistories,
+        admission.usageAccountingVersion ?? 1,
       );
       const sourceTranscriptDigest = digest(JSON.stringify(sourceRecords ?? []));
       const sourceThroughSequence = sourceRecords?.at(-1)?.sequence ?? 0;
@@ -1524,6 +1522,7 @@ export function validateManagedAgentRecord(
           previous.projectId !== candidate.projectId ||
           previous.profile !== candidate.profile ||
           previous.profileDigest !== candidate.profileDigest ||
+          (previous.usageAccountingVersion === 2 && candidate.usageAccountingVersion !== 2) ||
           previous.effectiveToolProfileDigest !== candidate.effectiveToolProfileDigest ||
           previous.skillActivationDigest !== candidate.skillActivationDigest ||
           !isDeepStrictEqual(previous.selectedSkills, candidate.selectedSkills) ||
@@ -3090,6 +3089,7 @@ export function createAgentManager(options: {
         profile,
         mode: input.mode,
         profileDigest: managedProfile.digest,
+        usageAccountingVersion: 2,
         ...(input.preserveLegacyProfile === true
           ? {}
           : { effectiveToolProfileDigest: childPromptContext.toolProfile.digest }),
@@ -3918,14 +3918,7 @@ export function createAgentManager(options: {
           managedAttemptHistory(admission, records, options.childSessionStores),
         ),
       );
-      const cumulativeTokens = attemptHistories.reduce(
-        (total, history) =>
-          total +
-          history.usage.inputTokens +
-          history.usage.outputTokens +
-          history.usage.reasoningTokens,
-        0,
-      );
+      const cumulativeTokens = managedCumulativeTokens(attemptHistories, 2);
       const deadlineAtUnixMilliseconds = admissions[0]?.deadlineAtUnixMilliseconds;
       const followUpNow = (options.now ?? Date.now)();
       const followUpProfile =
@@ -4889,6 +4882,26 @@ function usageFromChildRecords(records: readonly SessionRecord[]): {
           };
     },
     { inputTokens: 0, outputTokens: 0, reasoningTokens: 0 },
+  );
+}
+
+function managedCumulativeTokens(
+  histories: readonly {
+    readonly usage: {
+      readonly inputTokens: number;
+      readonly outputTokens: number;
+      readonly reasoningTokens: number;
+    };
+  }[],
+  usageAccountingVersion: 1 | 2,
+): number {
+  return histories.reduce(
+    (total, history) =>
+      total +
+      history.usage.inputTokens +
+      history.usage.outputTokens +
+      (usageAccountingVersion === 1 ? history.usage.reasoningTokens : 0),
+    0,
   );
 }
 

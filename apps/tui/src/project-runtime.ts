@@ -106,19 +106,7 @@ export async function createProductionProjectRuntime(
       parentPermissions: options.permissions,
       async resolveOrigin({ origin, signal }) {
         if (lifecycle === undefined) throw new Error("The session lifecycle is unavailable.");
-        const snapshot = await lifecycle.inspect({ sessionId: origin.sessionId });
-        if (snapshot.schemaVersion !== 3) throw new Error("The origin session is unavailable.");
-        const resolved = await options.modelTargets.resolve({
-          allowExperimental: true,
-          signal,
-          targetId: snapshot.targetIdentity.targetId,
-          targetIdentity: snapshot.targetIdentity,
-        });
-        return {
-          childContextProfile: resolved.contextProfile,
-          childModel: resolved.driver,
-          targetIdentity: resolved.identity,
-        };
+        return lifecycle.resolveManagedSessionOrigin({ origin, signal });
       },
       workspaceRoot: options.workspaceRoot,
     },

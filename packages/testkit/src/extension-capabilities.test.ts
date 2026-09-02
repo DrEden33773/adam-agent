@@ -4,19 +4,31 @@ import { join } from "node:path";
 
 import {
   type ArtifactStore,
+  type ContextProfile,
   createBiomeExecutionAdapter,
   createExtensionHost,
   createFileArtifactStore,
   createInMemoryOperationStore,
+  createModelTargets,
   createPermissionPolicy,
+  createReadToolRegistry,
+  createSessionLifecycle,
   type ModelDriver,
+  type ModelRequest,
+  type ModelTargetIdentity,
+  type ModelTargets,
+  type SessionLifecycle,
 } from "@adam-agent/agent";
 import {
   createInMemoryManagedAgentStore,
   createInMemorySessionStoreDirectory,
   createObservedBiomeExecutionAdapter,
+  createTrustedWorkspaceTrustForTesting,
   type ObservedBiomeProcess,
+  preparedDirectDeepSeekV2ContextProfile,
   type SessionRecord,
+  sessionAutomaticTitlesEnabled,
+  sessionStoreDirectory,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
@@ -314,6 +326,221 @@ test("ExtensionHost forces typed failure when a caught managed output codec reje
       },
     });
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost preserves the exact historical origin policy for one managed reviewer", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-review-origin-policy-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const stateRoot = join(testRoot, "state");
+  const artifactStore = await createFileArtifactStore({ root: join(testRoot, "artifacts") });
+  const managedStore = createInMemoryManagedAgentStore();
+  const originSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  const targetIdentity: ModelTargetIdentity = {
+    targetId: "deepseek-v4-flash.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash",
+    route: "direct",
+    profileVersion: 3,
+    certification: "certified",
+  };
+  const productionTargets = createModelTargets({
+    environment: { DEEPSEEK_API_KEY: "deterministic-non-network-fixture" },
+  });
+  const productionSnapshot = await productionTargets.snapshot({
+    signal: new AbortController().signal,
+  });
+  const thinkingCapability = productionSnapshot.targets.find(
+    (target) =>
+      target.identity.targetId === targetIdentity.targetId &&
+      target.identity.profileVersion === targetIdentity.profileVersion,
+  )?.thinkingCapability;
+  if (thinkingCapability === undefined) {
+    throw new Error("Expected the exact Direct DeepSeek thinking capability.");
+  }
+  const tightenedContextProfile: ContextProfile = {
+    ...preparedDirectDeepSeekV2ContextProfile,
+    contextWindowTokens: 500_000,
+    maximumOutputTokens: 64_000,
+    compactAtTokens: 400_000,
+  };
+  const requests: ModelRequest[] = [];
+  let currentSupportIncludesOriginPolicy = true;
+  const childModel: ModelDriver = {
+    async *stream(request) {
+      requests.push(request);
+      yield {
+        type: "text_delta",
+        text: requests.length === 1 ? "Origin settled." : '{"verdict":"verified"}',
+      };
+      yield { type: "usage", inputTokens: 10, outputTokens: 3, reasoningTokens: 2 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: targetIdentity,
+        driver: childModel,
+        contextProfile: preparedDirectDeepSeekV2ContextProfile,
+        ...(currentSupportIncludesOriginPolicy ? { thinkingCapability } : {}),
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: {
+              status: "available",
+              credentialSource: "deterministic test adapter",
+            },
+            contextProfile: preparedDirectDeepSeekV2ContextProfile,
+            thinkingCapability,
+          },
+        ],
+      };
+    },
+  };
+  let useTightenedPreferences = true;
+  let lifecycle: SessionLifecycle | undefined;
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeManagedSessionRunExtension(packageRoot);
+    const host = createExtensionHost({
+      artifactStore,
+      capabilities: [
+        { id: "adam.artifact.publish@1", version: "1.0.0" },
+        { id: "adam.managed-session@1", version: "1.0.0" },
+      ],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.managed-review",
+          grants: [
+            { id: "adam.artifact.publish@1", version: "^1.0.0" },
+            { id: "adam.managed-session@1", version: "^1.0.0" },
+          ],
+          packageName: "@fixture/managed-review-extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      managedSession: {
+        childSessionStores,
+        managedStore,
+        parentPermissions: createPermissionPolicy({ allowedEffects: [] }),
+        async resolveOrigin(input) {
+          if (lifecycle === undefined) {
+            throw new Error("The session lifecycle is unavailable.");
+          }
+          return lifecycle.resolveManagedSessionOrigin(input);
+        },
+        workspaceRoot,
+      },
+      operationOriginAuthority: {
+        async validateBoundary({ origin, projectId }) {
+          if (lifecycle === undefined) return false;
+          const snapshot = await lifecycle.inspect({ sessionId: origin.sessionId });
+          return (
+            snapshot.schemaVersion === 3 &&
+            snapshot.projectId === projectId &&
+            origin.sourceSequence <= snapshot.lastSequence
+          );
+        },
+      },
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot,
+    });
+    await host.loadConfiguredExtensions();
+    lifecycle = createSessionLifecycle({
+      extensionHost: host,
+      modelTargets,
+      preferences: {
+        async resolveContextProfile(profile) {
+          return useTightenedPreferences ? tightenedContextProfile : profile;
+        },
+      },
+      stateRoot,
+      tools: createReadToolRegistry({ workspaceRoot }),
+      workspaceRoot,
+      workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+      [sessionAutomaticTitlesEnabled]: false,
+      [sessionStoreDirectory]: originSessionStores,
+    });
+    const origin = await lifecycle.admit({
+      targetIdentity,
+      input: { text: "Create the immutable review origin." },
+      thinkingSelection: {
+        requestedLevelId: "max",
+        capability: {
+          id: thinkingCapability.capabilityId,
+          version: thinkingCapability.capabilityVersion,
+          digest: thinkingCapability.capabilityDigest,
+        },
+      },
+    });
+    useTightenedPreferences = false;
+
+    const started = await host.operations.startLinked({
+      contributionId: "fixture.managed-review",
+      idempotencyKey: "managed-review-origin-policy-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: origin.snapshot.sessionId,
+        sourceSequence: origin.snapshot.lastSequence,
+      },
+    });
+    const events = await collectOperationEvents(host, started.operationId);
+    expect(events.at(-1)).toMatchObject({ event: { type: "operation_completed" } });
+    expect(requests).toHaveLength(2);
+    expect(requests[1]).toMatchObject({
+      maximumOutputTokens: tightenedContextProfile.maximumOutputTokens,
+      thinkingPolicy: requests[0]?.thinkingPolicy,
+    });
+    const admission = (await managedStore.read()).find(
+      (record) => record.type === "managed_agent_admitted",
+    );
+    expect(admission).toMatchObject({ thinkingPolicy: requests[0]?.thinkingPolicy });
+    if (admission?.type !== "managed_agent_admitted") {
+      throw new Error("Expected the managed reviewer admission.");
+    }
+    const childStore = await childSessionStores.open(admission.childSessionId);
+    const childGenesis = (await childStore?.read())?.[0];
+    expect(childGenesis).toMatchObject({
+      record: {
+        type: "session_genesis",
+        contextProfile: tightenedContextProfile,
+      },
+    });
+
+    currentSupportIncludesOriginPolicy = false;
+    const unsupported = await host.operations.startLinked({
+      contributionId: "fixture.managed-review",
+      idempotencyKey: "managed-review-origin-policy-unsupported-1",
+      input: { revision: "unsupported" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: origin.snapshot.sessionId,
+        sourceSequence: origin.snapshot.lastSequence,
+      },
+    });
+    const unsupportedEvents = await collectOperationEvents(host, unsupported.operationId);
+    expect(unsupportedEvents.at(-1)).toMatchObject({
+      event: {
+        error: { code: "operation_capability_execution_failed" },
+        type: "operation_failed",
+      },
+    });
+    expect(requests).toHaveLength(2);
+  } finally {
+    await lifecycle?.close();
     await rm(testRoot, { recursive: true, force: true });
   }
 });
