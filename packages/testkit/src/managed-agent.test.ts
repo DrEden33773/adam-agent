@@ -4635,6 +4635,7 @@ test("SessionLifecycle serializes child Web permission overlays and projects per
   const firstPermission = Promise.withResolvers<string>();
   const secondPermission = Promise.withResolvers<string>();
   const thirdPermission = Promise.withResolvers<string>();
+  const releaseSecondPermissionRequest = Promise.withResolvers<void>();
   let expectedThirdRequestId: string | undefined;
   const bothChildrenCompleted = Promise.withResolvers<void>();
   let completedChildren = 0;
@@ -4657,6 +4658,9 @@ test("SessionLifecycle serializes child Web permission overlays and projects per
         const call = (childCalls.get(childId) ?? 0) + 1;
         childCalls.set(childId, call);
         if (call === 1) {
+          if (childId === "permission-child-2") {
+            await releaseSecondPermissionRequest.promise;
+          }
           yield { type: "tool_call_start", id: `${childId}-search`, name: "web_search" };
           yield {
             type: "tool_call_delta",
@@ -4881,6 +4885,7 @@ test("SessionLifecycle serializes child Web permission overlays and projects per
         decision: "allow",
       }),
     ).resolves.toMatchObject({ status: "admitted" });
+    releaseSecondPermissionRequest.resolve();
     const secondRequestId = await secondPermission.promise;
     expect(permissionEvents).toHaveLength(2);
     expect(presentation.getState().authoritative.active?.pendingInteractions).toMatchObject([
@@ -4955,6 +4960,7 @@ test("SessionLifecycle serializes child Web permission overlays and projects per
     unsubscribePermissionStatus();
     await presentation.close();
   } finally {
+    releaseSecondPermissionRequest.resolve();
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }
