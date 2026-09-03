@@ -1,6 +1,9 @@
+import { createHash } from "node:crypto";
+import { realpath } from "node:fs/promises";
 import { join } from "node:path";
 
 import {
+  type ArtifactStore,
   createBiomeExecutionAdapter,
   createExtensionHost,
   createFileArtifactStore,
@@ -15,6 +18,7 @@ import {
   loadExtensionConfiguration,
   type ManagedAgentStore,
   type ModelTargets,
+  type OperationStore,
   type PermissionPolicy,
   type PresentationPreferences,
   type SessionRecord,
@@ -32,6 +36,7 @@ export type ProductionProjectRuntimeOptions = {
   readonly preferences: PresentationPreferences;
   readonly projectLabel: string;
   readonly reservedCommandNames: readonly string[];
+  readonly resumeSessionId?: string;
   readonly stateRoot: string;
   readonly workspaceRoot: string;
   readonly workspaceTrust: WorkspaceTrustController;
@@ -66,23 +71,62 @@ export async function createProductionProjectRuntime(
     }
     throw error;
   });
-  const artifactStore = await createFileArtifactStore({
-    root: join(options.stateRoot, "artifacts"),
-  });
-  const operationStore = await createJsonlOperationStore({
-    stateRoot: options.stateRoot,
-    workspaceRoot: options.workspaceRoot,
-  });
-  const managedStorePromise = createJsonlManagedAgentStore({
-    stateRoot: options.stateRoot,
-    workspaceRoot: options.workspaceRoot,
-  });
+  let artifactStorePromise: Promise<ArtifactStore> | undefined;
+  const resolveArtifactStore = () => {
+    artifactStorePromise ??= createFileArtifactStore({
+      root: join(options.stateRoot, "artifacts"),
+    });
+    return artifactStorePromise;
+  };
+  const artifactStore: ArtifactStore = {
+    async write(input) {
+      return (await resolveArtifactStore()).write(input);
+    },
+    async read(id, readOptions) {
+      return (await resolveArtifactStore()).read(id, readOptions);
+    },
+  };
+  const canonicalWorkspaceRoot = await realpath(options.workspaceRoot);
+  const operationProjectId = `sha256:${createHash("sha256")
+    .update(canonicalWorkspaceRoot)
+    .digest("hex")}`;
+  let operationStorePromise: Promise<OperationStore> | undefined;
+  const resolveOperationStore = () => {
+    operationStorePromise ??= createJsonlOperationStore({
+      stateRoot: options.stateRoot,
+      workspaceRoot: options.workspaceRoot,
+    });
+    return operationStorePromise;
+  };
+  const operationStore: OperationStore = {
+    projectId: operationProjectId,
+    async append(record) {
+      return (await resolveOperationStore()).append(record);
+    },
+    async findByIdempotency(scope) {
+      return (await resolveOperationStore()).findByIdempotency(scope);
+    },
+    async listLinkedStarts(listOptions) {
+      return (await resolveOperationStore()).listLinkedStarts(listOptions);
+    },
+    async read(operationId) {
+      return (await resolveOperationStore()).read(operationId);
+    },
+  };
+  let managedStorePromise: Promise<ManagedAgentStore> | undefined;
+  const resolveManagedStore = () => {
+    managedStorePromise ??= createJsonlManagedAgentStore({
+      stateRoot: options.stateRoot,
+      workspaceRoot: options.workspaceRoot,
+    });
+    return managedStorePromise;
+  };
   const managedStore: ManagedAgentStore = {
     async append(record) {
-      return (await managedStorePromise).append(record);
+      return (await resolveManagedStore()).append(record);
     },
     async read() {
-      return (await managedStorePromise).read();
+      return (await resolveManagedStore()).read();
     },
   };
   const managedChildSessionStores = createJsonlSessionStoreDirectory<SessionRecord>({
@@ -130,7 +174,6 @@ export async function createProductionProjectRuntime(
     reservedCommandNames: options.reservedCommandNames,
     stateRoot: options.stateRoot,
   });
-  const extensionSnapshot = await host.loadConfiguredExtensions();
   lifecycle = createSessionLifecycle({
     extensionHost: host,
     managedAgentTools: "managed-agent-tools.a3-long-lived.v2",
@@ -142,6 +185,19 @@ export async function createProductionProjectRuntime(
     workspaceRoot: options.workspaceRoot,
     workspaceTrust: options.workspaceTrust,
   });
+  let extensionSnapshot: Awaited<ReturnType<typeof host.loadConfiguredExtensions>>;
+  try {
+    if (options.resumeSessionId !== undefined) {
+      await lifecycle.inspect({ sessionId: options.resumeSessionId });
+    }
+    await resolveArtifactStore();
+    await resolveOperationStore();
+    await resolveManagedStore();
+    extensionSnapshot = await host.loadConfiguredExtensions();
+  } catch (error) {
+    await closeProjectRuntime(undefined, lifecycle);
+    throw error;
+  }
   let presentationPromise: Promise<PresentationSession> | undefined;
   let closePromise: Promise<void> | undefined;
 

@@ -31,6 +31,8 @@ import {
   type ModelToolDefinition,
   type RuntimeEvent,
   resolveThinkingPolicy,
+  SessionLifecycleError,
+  SessionStoreError,
   type ThinkingPolicySelectionV1,
 } from "@adam-agent/agent";
 import {
@@ -1634,6 +1636,449 @@ test("SessionLifecycle cold recovery preserves a historical read-v1 Plan profile
   } finally {
     await warm.close();
     await cold?.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle cold-inspects the exact historical managed-agent v1 Plan profile", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-managed-v1-plan-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelTargets = modelTargetsWithDriver(new FakeModelDriver([]));
+  const tools = createCodingToolRegistry({ workspaceRoot });
+  const warm = createSessionLifecycle({
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+    modelTargets,
+    stateRoot,
+    tools,
+    workspaceRoot,
+  });
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const created = await warm.create({ targetIdentity });
+    await warm.enterPlan({ sessionId: created.sessionId });
+    await warm.close();
+    await rewriteManagedAgentPlanFixture({
+      stateRoot,
+      projectId: created.projectId,
+      sessionId: created.sessionId,
+      definitionDigest: "sha256:9d14f9c71a4a4aeff84c8061c2e7eb74e04a2275a2d67dcf31a2a0983703b32a",
+    });
+
+    cold = createSessionLifecycle({
+      managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+      modelTargets,
+      stateRoot,
+      tools,
+      workspaceRoot,
+    });
+
+    await expect(cold.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      schemaVersion: 3,
+      sessionId: created.sessionId,
+      plan: { policyVersion: "plan-policy.hybrid-v1", state: "exploring" },
+    });
+  } finally {
+    await warm.close();
+    await cold?.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle accepts only the exact managed-agent v1 transition digest", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-managed-v1-transition-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const modelTargets = modelTargetsWithDriver(new FakeModelDriver([]));
+  const tools = createCodingToolRegistry({ workspaceRoot });
+  const warm = createSessionLifecycle({
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+    modelTargets,
+    stateRoot,
+    tools,
+    workspaceRoot,
+  });
+  let cold: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const exact = await warm.create({ targetIdentity });
+    await warm.enterPlan({ sessionId: exact.sessionId });
+    const adjacent = await warm.create({ targetIdentity });
+    await warm.enterPlan({ sessionId: adjacent.sessionId });
+    const changed = await warm.create({ targetIdentity });
+    await warm.enterPlan({ sessionId: changed.sessionId });
+    await warm.close();
+
+    await rewriteManagedAgentPlanFixture({
+      stateRoot,
+      projectId: exact.projectId,
+      sessionId: exact.sessionId,
+      definitionDigest: "sha256:e0e4309944c389e7970262f5d1ad30cc44a147f22ecc72a5338ea93ef234b1b6",
+    });
+    await rewriteManagedAgentPlanFixture({
+      stateRoot,
+      projectId: exact.projectId,
+      sessionId: adjacent.sessionId,
+      definitionDigest: "sha256:e0e4309944c389e7970262f5d1ad30cc44a147f22ecc72a5338ea93ef234b1b7",
+    });
+    await rewriteManagedAgentPlanFixture({
+      stateRoot,
+      projectId: exact.projectId,
+      sessionId: changed.sessionId,
+      definitionDigest: "sha256:e0e4309944c389e7970262f5d1ad30cc44a147f22ecc72a5338ea93ef234b1b6",
+      sourceDigest: `sha256:${"0".repeat(64)}`,
+    });
+
+    cold = createSessionLifecycle({
+      managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+      modelTargets,
+      stateRoot,
+      tools,
+      workspaceRoot,
+    });
+
+    await expect(cold.inspect({ sessionId: exact.sessionId })).resolves.toMatchObject({
+      schemaVersion: 3,
+      sessionId: exact.sessionId,
+      plan: { policyVersion: "plan-policy.hybrid-v1", state: "exploring" },
+    });
+    await expect(cold.inspect({ sessionId: adjacent.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+    await expect(cold.inspect({ sessionId: changed.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+  } finally {
+    await warm.close();
+    await cold?.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle keeps managed-agent v1 and v2 list definitions version-exact", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-managed-list-versions-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+
+  const exerciseProfile = async (
+    profile: "managed-agent-tools.a3-long-lived.v1" | "managed-agent-tools.a3-long-lived.v2",
+  ) => {
+    let requestCount = 0;
+    let observedResult:
+      | { readonly status: "completed" }
+      | { readonly status: "failed"; readonly code: string }
+      | undefined;
+    const driver = new FakeModelDriver((request) => {
+      requestCount += 1;
+      if (requestCount === 1) {
+        return [
+          { type: "tool_call_start", id: `list-${profile}`, name: "list_agents" },
+          {
+            type: "tool_call_delta",
+            id: `list-${profile}`,
+            json: '{"status":"stalled"}',
+          },
+          { type: "tool_call_end", id: `list-${profile}` },
+          { type: "finish", reason: "tool_calls" },
+        ];
+      }
+      const result = request.messages.findLast(
+        (message) => message.role === "tool" && message.name === "list_agents",
+      );
+      if (result?.role !== "tool") {
+        throw new Error("Expected the list_agents result.");
+      }
+      observedResult =
+        result.result.status === "completed"
+          ? { status: "completed" }
+          : { status: "failed", code: result.result.error.code };
+      return [
+        { type: "text_delta", text: "Observed the versioned list result." },
+        { type: "finish", reason: "stop" },
+      ];
+    });
+    const lifecycle = harness.createLifecycle({
+      managedAgentTools: profile,
+      modelTargets: modelTargetsWithDriver(driver),
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+      tools: createCodingToolRegistry({ workspaceRoot }),
+      workspaceRoot,
+    });
+
+    try {
+      const created = await lifecycle.create({ targetIdentity });
+      const entered = await lifecycle.enterPlan({ sessionId: created.sessionId });
+      await expect(
+        lifecycle.continue({
+          sessionId: created.sessionId,
+          input: { text: "List only stalled managed agents." },
+        }),
+      ).resolves.toMatchObject({
+        result: { status: "completed", answer: "Observed the versioned list result." },
+      });
+      const definition = entered.plan?.eligibleToolProfile.definitions.find(
+        (candidate) => candidate.name === "list_agents",
+      );
+      if (definition === undefined || observedResult === undefined) {
+        throw new Error("Expected the versioned list_agents definition and result.");
+      }
+      return { definitionDigest: definition.definitionDigest, result: observedResult };
+    } finally {
+      await lifecycle.close();
+    }
+  };
+
+  try {
+    await expect(exerciseProfile("managed-agent-tools.a3-long-lived.v1")).resolves.toEqual({
+      definitionDigest: "sha256:9d14f9c71a4a4aeff84c8061c2e7eb74e04a2275a2d67dcf31a2a0983703b32a",
+      result: { status: "failed", code: "invalid_tool_input" },
+    });
+    await expect(exerciseProfile("managed-agent-tools.a3-long-lived.v2")).resolves.toEqual({
+      definitionDigest: "sha256:e0e4309944c389e7970262f5d1ad30cc44a147f22ecc72a5338ea93ef234b1b6",
+      result: { status: "completed" },
+    });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle isolates one invalid session from the project catalog", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-catalog-isolation-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets: modelTargetsWithDriver(
+      new FakeModelDriver([
+        { type: "text_delta", text: "Catalog fixture admitted." },
+        { type: "finish", reason: "stop" },
+      ]),
+    ),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+  });
+  let systemic: ReturnType<typeof createSessionLifecycle> | undefined;
+  let disappearing: ReturnType<typeof createSessionLifecycle> | undefined;
+
+  try {
+    const valid = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: valid.sessionId,
+      input: { text: "Keep this valid catalog entry." },
+    });
+    const invalid = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: invalid.sessionId,
+      input: { text: "Make this catalog entry semantically invalid." },
+    });
+    await lifecycle.enterPlan({ sessionId: invalid.sessionId });
+    const invalidStore = await harness.sessions.open(invalid.sessionId);
+    const invalidRecords = await invalidStore?.read();
+    const entered = invalidRecords?.find(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "plan_cycle_entered",
+    );
+    if (
+      invalidStore === undefined ||
+      invalidRecords === undefined ||
+      entered?.schemaVersion !== 3 ||
+      entered.record.type !== "plan_cycle_entered"
+    ) {
+      throw new Error("Expected the invalid catalog fixture Plan entry.");
+    }
+    const invalidProfileWithoutDigest = {
+      version: 1 as const,
+      source: {
+        ...entered.record.eligibleToolProfile.source,
+        digest: `sha256:${"0".repeat(64)}` as `sha256:${string}`,
+      },
+      definitions: entered.record.eligibleToolProfile.definitions,
+    };
+    Object.assign(entered.record, {
+      eligibleToolProfile: {
+        ...invalidProfileWithoutDigest,
+        digest: `sha256:${createHash("sha256")
+          .update(canonicalFixtureJson(invalidProfileWithoutDigest))
+          .digest("hex")}`,
+      },
+    });
+
+    const page = await lifecycle.listProjectSessions();
+    expect(page.items.map((item) => item.sessionId)).toEqual([valid.sessionId]);
+    expect(page).toMatchObject({
+      projectId: valid.projectId,
+      diagnostics: {
+        items: [
+          {
+            sessionId: invalid.sessionId,
+            stage: "validate",
+            code: "invalid_history",
+            retained: true,
+            message: "The session history is invalid. The original local session was retained.",
+          },
+        ],
+        totalCount: 1,
+        truncated: false,
+      },
+    });
+
+    const directoryFailure = new Error("systemic session directory failure");
+    systemic = createSessionLifecycle({
+      modelTargets: modelTargetsWithDriver(new FakeModelDriver([])),
+      stateRoot,
+      tools: createCodingToolRegistry({ workspaceRoot }),
+      workspaceRoot,
+      [sessionStoreDirectory]: {
+        create: (sessionId) => harness.sessions.create(sessionId),
+        async listSessionEntries() {
+          throw directoryFailure;
+        },
+        listSessionIds: () => harness.sessions.listSessionIds(),
+        open: (sessionId) => harness.sessions.open(sessionId),
+      },
+    });
+    await expect(systemic.listProjectSessions()).rejects.toBe(directoryFailure);
+
+    const validEntry = (await harness.sessions.listSessionEntries()).find(
+      (entry) => entry.sessionId === valid.sessionId,
+    );
+    if (validEntry === undefined) {
+      throw new Error("Expected the valid catalog directory entry.");
+    }
+    let validOpenCount = 0;
+    disappearing = createSessionLifecycle({
+      modelTargets: modelTargetsWithDriver(new FakeModelDriver([])),
+      stateRoot,
+      tools: createCodingToolRegistry({ workspaceRoot }),
+      workspaceRoot,
+      [sessionStoreDirectory]: {
+        create: (sessionId) => harness.sessions.create(sessionId),
+        async listSessionEntries() {
+          return [validEntry];
+        },
+        listSessionIds: () => harness.sessions.listSessionIds(),
+        async open(sessionId) {
+          validOpenCount += 1;
+          return validOpenCount === 1 ? harness.sessions.open(sessionId) : undefined;
+        },
+      },
+    });
+    await expect(disappearing.listProjectSessions()).resolves.toEqual({
+      projectId: valid.projectId,
+      items: [],
+      nextCursor: null,
+      diagnostics: { items: [], totalCount: 0, truncated: false },
+    });
+  } finally {
+    await lifecycle.close();
+    await systemic?.close();
+    await disappearing?.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("SessionLifecycle catalog isolation recognizes only frozen entry-local errors", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-catalog-error-policy-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const sessionId = "123e4567-e89b-42d3-a456-426614176200";
+  const lifecycleFor = (error: Error) =>
+    createSessionLifecycle({
+      workspaceRoot,
+      [sessionStoreDirectory]: {
+        async create() {
+          throw new Error("Catalog error-policy fixtures are read-only.");
+        },
+        async listSessionEntries() {
+          return [{ sessionId, modifiedAtMilliseconds: 1 }];
+        },
+        async listSessionIds() {
+          return [sessionId];
+        },
+        async open() {
+          return {
+            async append() {
+              throw new Error("Catalog error-policy fixtures are read-only.");
+            },
+            async appendBatch() {
+              throw new Error("Catalog error-policy fixtures are read-only.");
+            },
+            async read() {
+              throw error;
+            },
+          };
+        },
+      },
+    });
+
+  try {
+    for (const expected of [
+      {
+        error: new SessionLifecycleError("session_invalid"),
+        diagnostic: {
+          sessionId,
+          stage: "validate",
+          code: "invalid_history",
+          retained: true,
+          message: "The session history is invalid. The original local session was retained.",
+        },
+      },
+      {
+        error: new SessionStoreError("session_log_invalid"),
+        diagnostic: {
+          sessionId,
+          stage: "read",
+          code: "invalid_log",
+          retained: true,
+          message:
+            "The session log contains an invalid record. The original local session was retained.",
+        },
+      },
+      {
+        error: new SessionStoreError("session_log_too_large"),
+        diagnostic: {
+          sessionId,
+          stage: "read",
+          code: "log_too_large",
+          retained: true,
+          message:
+            "The session log exceeds its read limit. The original local session was retained.",
+        },
+      },
+    ] as const) {
+      const lifecycle = lifecycleFor(expected.error);
+      try {
+        await expect(lifecycle.listProjectSessions()).resolves.toMatchObject({
+          items: [],
+          diagnostics: {
+            items: [expected.diagnostic],
+            totalCount: 1,
+            truncated: false,
+          },
+        });
+      } finally {
+        await lifecycle.close();
+      }
+    }
+
+    for (const error of [
+      new SessionStoreError("session_log_exists"),
+      new SessionLifecycleError("session_project_mismatch"),
+      new Error("unknown systemic catalog failure"),
+    ]) {
+      const lifecycle = lifecycleFor(error);
+      try {
+        await expect(lifecycle.listProjectSessions()).rejects.toBe(error);
+      } finally {
+        await lifecycle.close();
+      }
+    }
+  } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -3476,6 +3921,57 @@ test("SessionLifecycle close joins title admission before returning", async () =
     await rm(testRoot, { recursive: true, force: true });
   }
 });
+
+async function rewriteManagedAgentPlanFixture(input: {
+  readonly stateRoot: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly definitionDigest: `sha256:${string}`;
+  readonly sourceDigest?: `sha256:${string}`;
+}): Promise<void> {
+  const sessionPath = join(
+    input.stateRoot,
+    "projects",
+    input.projectId.replace(/^sha256:/u, ""),
+    "sessions",
+    `${input.sessionId}.jsonl`,
+  );
+  const records = (await readFile(sessionPath, "utf8"))
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line) as SessionRecord);
+  const entered = records.find(
+    (entry) => entry.schemaVersion === 3 && entry.record.type === "plan_cycle_entered",
+  );
+  if (entered?.schemaVersion !== 3 || entered.record.type !== "plan_cycle_entered") {
+    throw new Error("Expected the durable managed-agent Plan entry.");
+  }
+  const profileWithoutDigest = {
+    version: 1 as const,
+    source: {
+      ...entered.record.eligibleToolProfile.source,
+      ...(input.sourceDigest === undefined ? {} : { digest: input.sourceDigest }),
+    },
+    definitions: entered.record.eligibleToolProfile.definitions.map((definition) =>
+      definition.name === "list_agents"
+        ? { ...definition, definitionDigest: input.definitionDigest }
+        : definition,
+    ),
+  };
+  Object.assign(entered.record, {
+    eligibleToolProfile: {
+      ...profileWithoutDigest,
+      digest: `sha256:${createHash("sha256")
+        .update(canonicalFixtureJson(profileWithoutDigest))
+        .digest("hex")}`,
+    },
+  });
+  await writeFile(
+    sessionPath,
+    `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
+    "utf8",
+  );
+}
 
 function canonicalFixtureJson(value: unknown): string {
   if (

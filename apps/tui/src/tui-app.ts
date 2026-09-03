@@ -1446,6 +1446,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       const picker = new SessionPicker({
         sessions: state.authoritative.sessions.items,
         hasMore: state.authoritative.sessions.nextCursor !== null,
+        ...(state.authoritative.sessions.diagnostics === undefined
+          ? {}
+          : { diagnostics: state.authoritative.sessions.diagnostics }),
         theme,
         onClose: () => close(),
         onNewSession() {

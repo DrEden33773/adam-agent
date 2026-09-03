@@ -197,6 +197,21 @@ export type SessionNaming = {
 export type SessionSummaryPage = {
   readonly items: readonly SessionSummary[];
   readonly nextCursor: string | null;
+  readonly diagnostics?: SessionHistoryDiagnosticsDisplay;
+};
+
+export type SessionHistoryDiagnosticDisplay = {
+  readonly sessionId: string;
+  readonly stage: "read" | "validate";
+  readonly code: "invalid_history" | "invalid_log" | "log_too_large";
+  readonly retained: true;
+  readonly message: string;
+};
+
+export type SessionHistoryDiagnosticsDisplay = {
+  readonly items: readonly SessionHistoryDiagnosticDisplay[];
+  readonly totalCount: number;
+  readonly truncated: boolean;
 };
 
 export type AssistantMessageDisplay = {

@@ -196,6 +196,7 @@ import {
   type SessionRecord,
   type SessionStore,
   type SessionStoreDirectory,
+  SessionStoreError,
   type SessionTodoStoreInheritedRecord,
 } from "./session-store.js";
 import {
@@ -498,6 +499,23 @@ export type ProjectSessionCatalogPage = {
   readonly projectId: string;
   readonly items: readonly SessionSnapshot[];
   readonly nextCursor: string | null;
+  readonly diagnostics: SessionHistoryDiagnostics;
+};
+
+export type SessionHistoryDiagnosticCode = "invalid_history" | "invalid_log" | "log_too_large";
+
+export type SessionHistoryDiagnostic = {
+  readonly sessionId: string;
+  readonly stage: "read" | "validate";
+  readonly code: SessionHistoryDiagnosticCode;
+  readonly retained: true;
+  readonly message: string;
+};
+
+export type SessionHistoryDiagnostics = {
+  readonly items: readonly SessionHistoryDiagnostic[];
+  readonly totalCount: number;
+  readonly truncated: boolean;
 };
 
 export type SessionMetadataEvent =
@@ -3400,84 +3418,90 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         await drainTitleOperations();
         await drainOwnerOperations();
         let durable = true;
-        try {
-          await runWithOwner(async () => {
-            for (const closedSession of hostResult.closedSessions) {
-              await flushPendingMcpCatalogChanges(closedSession.sessionId);
-              const records = await readSessionRecords(options, closedSession.sessionId);
-              const existing = new Set(
-                records.flatMap((entry) =>
-                  entry.schemaVersion === 3 &&
-                  entry.record.type === "mcp_server_closed" &&
-                  entry.record.generationId === closedSession.generationId
-                    ? [entry.record.serverId]
-                    : [],
-                ),
-              );
-              const missing = closedSession.servers.filter(
-                (server) => !existing.has(server.serverId),
-              );
-              if (missing.length === 0) {
-                continue;
+        if (
+          hostResult.closedSessions.length > 0 ||
+          hostResult.unconfirmedSessions.length > 0 ||
+          metadataListeners.size > 0
+        ) {
+          try {
+            await runWithOwner(async () => {
+              for (const closedSession of hostResult.closedSessions) {
+                await flushPendingMcpCatalogChanges(closedSession.sessionId);
+                const records = await readSessionRecords(options, closedSession.sessionId);
+                const existing = new Set(
+                  records.flatMap((entry) =>
+                    entry.schemaVersion === 3 &&
+                    entry.record.type === "mcp_server_closed" &&
+                    entry.record.generationId === closedSession.generationId
+                      ? [entry.record.serverId]
+                      : [],
+                  ),
+                );
+                const missing = closedSession.servers.filter(
+                  (server) => !existing.has(server.serverId),
+                );
+                if (missing.length === 0) {
+                  continue;
+                }
+                const store = await openSessionStore(options, closedSession.sessionId);
+                for (const [index, server] of missing.entries()) {
+                  await store.append({
+                    schemaVersion: 3,
+                    sequence: (records.at(-1)?.sequence ?? 0) + index + 1,
+                    record: {
+                      type: "mcp_server_closed",
+                      recordVersion: 1,
+                      generationId: closedSession.generationId,
+                      attempt: closedSession.attempt,
+                      serverId: server.serverId,
+                      definitionDigest: server.definitionDigest,
+                      reason: "session_close",
+                    },
+                  });
+                }
               }
-              const store = await openSessionStore(options, closedSession.sessionId);
-              for (const [index, server] of missing.entries()) {
-                await store.append({
-                  schemaVersion: 3,
-                  sequence: (records.at(-1)?.sequence ?? 0) + index + 1,
-                  record: {
-                    type: "mcp_server_closed",
-                    recordVersion: 1,
-                    generationId: closedSession.generationId,
-                    attempt: closedSession.attempt,
-                    serverId: server.serverId,
-                    definitionDigest: server.definitionDigest,
-                    reason: "session_close",
-                  },
-                });
+              for (const unconfirmed of hostResult.unconfirmedSessions) {
+                if (unconfirmed.catalogDigest === undefined || unconfirmed.servers.length === 0) {
+                  continue;
+                }
+                const records = await readSessionRecords(options, unconfirmed.sessionId);
+                const existing = new Set(
+                  records.flatMap((entry) =>
+                    entry.schemaVersion === 3 &&
+                    entry.record.type === "mcp_catalog_state_changed" &&
+                    entry.record.generationId === unconfirmed.generationId &&
+                    entry.record.reason === "shutdown_unconfirmed"
+                      ? [entry.record.serverId]
+                      : [],
+                  ),
+                );
+                const missing = unconfirmed.servers.filter(
+                  (server) => !existing.has(server.serverId),
+                );
+                if (missing.length === 0) {
+                  continue;
+                }
+                const store = await openSessionStore(options, unconfirmed.sessionId);
+                for (const [index, server] of missing.entries()) {
+                  await store.append({
+                    schemaVersion: 3,
+                    sequence: (records.at(-1)?.sequence ?? 0) + index + 1,
+                    record: {
+                      type: "mcp_catalog_state_changed",
+                      recordVersion: 1,
+                      generationId: unconfirmed.generationId,
+                      serverId: server.serverId,
+                      catalogDigest: unconfirmed.catalogDigest,
+                      status: "stale",
+                      reason: "shutdown_unconfirmed",
+                    },
+                  });
+                }
               }
-            }
-            for (const unconfirmed of hostResult.unconfirmedSessions) {
-              if (unconfirmed.catalogDigest === undefined || unconfirmed.servers.length === 0) {
-                continue;
-              }
-              const records = await readSessionRecords(options, unconfirmed.sessionId);
-              const existing = new Set(
-                records.flatMap((entry) =>
-                  entry.schemaVersion === 3 &&
-                  entry.record.type === "mcp_catalog_state_changed" &&
-                  entry.record.generationId === unconfirmed.generationId &&
-                  entry.record.reason === "shutdown_unconfirmed"
-                    ? [entry.record.serverId]
-                    : [],
-                ),
-              );
-              const missing = unconfirmed.servers.filter(
-                (server) => !existing.has(server.serverId),
-              );
-              if (missing.length === 0) {
-                continue;
-              }
-              const store = await openSessionStore(options, unconfirmed.sessionId);
-              for (const [index, server] of missing.entries()) {
-                await store.append({
-                  schemaVersion: 3,
-                  sequence: (records.at(-1)?.sequence ?? 0) + index + 1,
-                  record: {
-                    type: "mcp_catalog_state_changed",
-                    recordVersion: 1,
-                    generationId: unconfirmed.generationId,
-                    serverId: server.serverId,
-                    catalogDigest: unconfirmed.catalogDigest,
-                    status: "stale",
-                    reason: "shutdown_unconfirmed",
-                  },
-                });
-              }
-            }
-          });
-        } catch {
-          durable = false;
+            });
+          } catch {
+            durable = false;
+          }
         }
         await executionDomain.close();
         return {
@@ -5313,17 +5337,44 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       const catalogEntries: Array<{
         readonly sessionId: string;
         readonly modifiedAtMilliseconds: number;
+        readonly snapshot: SessionSnapshot;
       }> = [];
+      const diagnostics: SessionHistoryDiagnostic[] = [];
       for (const entry of directoryEntries) {
-        const records = await readSessionRecords(options, entry.sessionId);
+        let records: readonly SessionRecord[];
+        try {
+          records = await readSessionRecords(options, entry.sessionId);
+        } catch (error) {
+          const diagnostic = sessionHistoryDiagnosticFromError(entry.sessionId, error);
+          if (diagnostic === undefined) {
+            throw error;
+          }
+          diagnostics.push(diagnostic);
+          continue;
+        }
         if (
-          records.some((entry) =>
+          !records.some((entry) =>
             entry.schemaVersion === 3
               ? entry.record.type === "logical_run_started"
               : entry.event.type === "user_message",
           )
         ) {
-          catalogEntries.push(entry);
+          continue;
+        }
+        try {
+          catalogEntries.push({
+            ...entry,
+            snapshot: await inspectSession({ sessionId: entry.sessionId }),
+          });
+        } catch (error) {
+          if (error instanceof SessionLifecycleError && error.code === "session_not_found") {
+            continue;
+          }
+          const diagnostic = sessionHistoryDiagnosticFromError(entry.sessionId, error);
+          if (diagnostic === undefined) {
+            throw error;
+          }
+          diagnostics.push(diagnostic);
         }
       }
       catalogEntries.sort(
@@ -5341,20 +5392,24 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           : cursorIndex < 0
             ? catalogEntries.length
             : cursorIndex + 1;
-      const selectedIds = catalogEntries
-        .slice(start, start + limit)
-        .map((entry) => entry.sessionId);
-      const items = await Promise.all(
-        selectedIds.map((sessionId) => inspectSession({ sessionId })),
-      );
+      const selectedEntries = catalogEntries.slice(start, start + limit);
+      const selectedIds = selectedEntries.map((entry) => entry.sessionId);
       const lastSessionId = selectedIds.at(-1);
+      diagnostics.sort((left, right) =>
+        left.sessionId < right.sessionId ? -1 : left.sessionId > right.sessionId ? 1 : 0,
+      );
       return {
         projectId,
-        items,
+        items: selectedEntries.map((entry) => entry.snapshot),
         nextCursor:
           lastSessionId !== undefined && start + selectedIds.length < catalogEntries.length
             ? encodeProjectSessionCatalogCursor(lastSessionId)
             : null,
+        diagnostics: {
+          items: diagnostics.slice(0, 100),
+          totalCount: diagnostics.length,
+          truncated: diagnostics.length > 100,
+        },
       };
     },
     async previewNewSession(input) {
@@ -8535,6 +8590,41 @@ function sessionStoreDirectoryFrom(
   return directory;
 }
 
+function sessionHistoryDiagnosticFromError(
+  sessionId: string,
+  error: unknown,
+): SessionHistoryDiagnostic | undefined {
+  if (error instanceof SessionLifecycleError && error.code === "session_invalid") {
+    return {
+      sessionId,
+      stage: "validate",
+      code: "invalid_history",
+      retained: true,
+      message: "The session history is invalid. The original local session was retained.",
+    };
+  }
+  if (error instanceof SessionStoreError && error.code === "session_log_invalid") {
+    return {
+      sessionId,
+      stage: "read",
+      code: "invalid_log",
+      retained: true,
+      message:
+        "The session log contains an invalid record. The original local session was retained.",
+    };
+  }
+  if (error instanceof SessionStoreError && error.code === "session_log_too_large") {
+    return {
+      sessionId,
+      stage: "read",
+      code: "log_too_large",
+      retained: true,
+      message: "The session log exceeds its read limit. The original local session was retained.",
+    };
+  }
+  return undefined;
+}
+
 async function readSessionRecords(
   options: SessionLifecycleOptions,
   sessionId: string,
@@ -8691,7 +8781,25 @@ async function validatePlanToolProfilesFromLineage(
       mcpProfile,
       entry.record.policyVersion,
     );
-    if (!isDeepStrictEqual(entry.record.eligibleToolProfile, expected)) {
+    const transitionExpected =
+      genesis.record.managedAgentTools === "managed-agent-tools.a3-long-lived.v1"
+        ? createPlanToolProfileV1({
+            source: expected.source,
+            definitions: expected.definitions.map((definition) =>
+              definition.name === "list_agents"
+                ? {
+                    ...definition,
+                    definitionDigest:
+                      "sha256:e0e4309944c389e7970262f5d1ad30cc44a147f22ecc72a5338ea93ef234b1b6",
+                  }
+                : definition,
+            ),
+          })
+        : undefined;
+    if (
+      !isDeepStrictEqual(entry.record.eligibleToolProfile, expected) &&
+      !isDeepStrictEqual(entry.record.eligibleToolProfile, transitionExpected)
+    ) {
       throw new SessionLifecycleError("session_invalid");
     }
   }

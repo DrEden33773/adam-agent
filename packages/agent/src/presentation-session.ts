@@ -13,6 +13,7 @@ import type {
   PresentationDisplayState,
   PresentationSession,
   RepositoryInstructionsDisplay,
+  SessionHistoryDiagnosticsDisplay,
   SessionNaming,
   SessionSummary,
   SkillCatalogDisplay,
@@ -72,6 +73,7 @@ import {
   type ManagedAgentNotification,
   type ManagedAgentTranscriptRecords,
   type SessionContextUsageSnapshot,
+  type SessionHistoryDiagnostics,
   type SessionLifecycle,
   SessionLifecycleError,
   type SessionMetadataEvent,
@@ -565,7 +567,11 @@ export async function createPresentationSession(
               },
             }),
       },
-      sessions: { items: initialCatalogItems, nextCursor: catalogPage.nextCursor },
+      sessions: {
+        items: initialCatalogItems,
+        nextCursor: catalogPage.nextCursor,
+        diagnostics: projectSessionHistoryDiagnostics(catalogPage.diagnostics),
+      },
       managedAgents: initialManagedAgents,
       active:
         created === undefined || summary === undefined
@@ -3985,6 +3991,7 @@ export async function createPresentationSession(
                   ...additions.filter((session) => !knownSessionIds.has(session.id)),
                 ],
                 nextCursor: page.nextCursor,
+                diagnostics: projectSessionHistoryDiagnostics(page.diagnostics),
               },
             },
             draft: state.draft,
@@ -5049,6 +5056,22 @@ type SourcedSessionRecord = {
   readonly sessionId: string;
   readonly entry: SessionRecord;
 };
+
+function projectSessionHistoryDiagnostics(
+  diagnostics: SessionHistoryDiagnostics,
+): SessionHistoryDiagnosticsDisplay {
+  return {
+    items: diagnostics.items.map((item) => ({
+      sessionId: item.sessionId,
+      stage: item.stage,
+      code: item.code,
+      retained: true,
+      message: item.message,
+    })),
+    totalCount: diagnostics.totalCount,
+    truncated: diagnostics.truncated,
+  };
+}
 
 function sessionSummaryFromSnapshot(
   snapshot: CurrentSessionSnapshot,

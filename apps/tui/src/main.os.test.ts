@@ -1,5 +1,16 @@
 import { execFile as execFileCallback } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rmdir,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -96,6 +107,39 @@ async function trustWorkspace(configRoot: string, workspaceRoot: string): Promis
     throw new Error("The production TUI fixture requires one canonical project identity.");
   }
   await workspaceTrust.setTrusted({ projectId: snapshot.projectId, trusted: true });
+}
+
+async function snapshotFileTree(
+  root: string,
+  relativeRoot = "",
+): Promise<
+  Record<
+    string,
+    | { readonly type: "directory"; readonly mode: number }
+    | { readonly type: "file"; readonly mode: number; readonly contents: string }
+  >
+> {
+  const snapshot: Record<
+    string,
+    | { readonly type: "directory"; readonly mode: number }
+    | { readonly type: "file"; readonly mode: number; readonly contents: string }
+  > = {};
+  const entries = await readdir(join(root, relativeRoot), { withFileTypes: true });
+  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+    const relativePath = join(relativeRoot, entry.name);
+    const metadata = await stat(join(root, relativePath));
+    if (entry.isDirectory()) {
+      snapshot[relativePath] = { type: "directory", mode: metadata.mode & 0o777 };
+      Object.assign(snapshot, await snapshotFileTree(root, relativePath));
+    } else if (entry.isFile()) {
+      snapshot[relativePath] = {
+        type: "file",
+        mode: metadata.mode & 0o777,
+        contents: await readFile(join(root, relativePath), "utf8"),
+      };
+    }
+  }
+  return snapshot;
 }
 
 async function writeRecoverableReviewPackage(packageRoot: string): Promise<void> {
@@ -637,6 +681,89 @@ test("the production TUI entry rejects conflicting target and resume arguments",
     expect(result).toMatchObject({ code: 1, signal: null, stderr: "" });
     expect(result.stdout).toContain("--resume and --target cannot be combined.");
     expect(result.stdout).toContain("Usage: adam-agent-tui");
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the TUI --resume path reports the exact invalid session without exposing data", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-invalid-resume-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  await mkdir(workspaceRoot);
+  const environment = {
+    DEEPSEEK_API_KEY: "deterministic-non-network-fixture",
+    XDG_CONFIG_HOME: configRoot,
+  } as const;
+
+  try {
+    await trustWorkspace(configRoot, workspaceRoot);
+    const modelTargets = createModelTargets({
+      environment,
+      fetch: async () =>
+        new Response(
+          'data: {"id":"invalid-resume","object":"chat.completion.chunk","created":1,"model":"deepseek-v4-flash","choices":[{"index":0,"delta":{"content":"Invalid resume seed."},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+          { headers: { "content-type": "text/event-stream" }, status: 200 },
+        ),
+    });
+    const targetIdentity = (
+      await modelTargets.snapshot({ signal: new AbortController().signal })
+    ).targets.find(({ identity }) => identity.targetId === "deepseek-v4-flash.direct")?.identity;
+    if (targetIdentity === undefined) {
+      throw new Error("The invalid-resume fixture requires the DeepSeek Flash target.");
+    }
+    const seedLifecycle = createSessionLifecycle({
+      modelTargets,
+      stateRoot,
+      workspaceRoot,
+      workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+    });
+    const created = await seedLifecycle.create({ targetIdentity });
+    await seedLifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Create one retained invalid resume fixture." },
+    });
+    await seedLifecycle.close();
+    const sessionPath = join(
+      stateRoot,
+      "projects",
+      created.projectId.replace(/^sha256:/u, ""),
+      "sessions",
+      `${created.sessionId}.jsonl`,
+    );
+    const validHistory = await readFile(sessionPath, "utf8");
+    const invalidHistory = validHistory.replace('"schemaVersion":3', '"schemaVersion":99');
+    if (invalidHistory === validHistory) {
+      throw new Error("Expected a schema-v3 record for the invalid-resume fixture.");
+    }
+    await writeFile(sessionPath, invalidHistory, "utf8");
+    const projectRoot = join(stateRoot, "projects", created.projectId.replace(/^sha256:/u, ""));
+    await unlink(join(projectRoot, "managed-agents", "events-v1.jsonl"));
+    await unlink(join(projectRoot, "lifecycle.lock"));
+    await rmdir(join(projectRoot, "managed-agents"));
+    await rmdir(join(stateRoot, "artifacts"));
+    const beforeState = await snapshotFileTree(stateRoot);
+
+    const fixture = startFixture({
+      program: {
+        arguments: ["--resume", created.sessionId, "--state-root", stateRoot],
+        cwd: workspaceRoot,
+        entrypoint: productionPath,
+        environment,
+      },
+      stateRoot,
+      workspaceRoot,
+    });
+    const result = await fixture.closed;
+
+    expect(result).toMatchObject({ code: 1, signal: null, stderr: "" });
+    expect(result.stdout).toContain(
+      `Session ${created.sessionId} could not be opened because its log contains an invalid record. The original local session was retained. Start without --resume and open /resume to review it.`,
+    );
+    expect(result.stdout).not.toContain("Create one retained invalid resume fixture.");
+    await expect(readFile(sessionPath, "utf8")).resolves.toBe(invalidHistory);
+    await expect(snapshotFileTree(stateRoot)).resolves.toEqual(beforeState);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
