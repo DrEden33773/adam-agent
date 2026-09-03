@@ -112,7 +112,7 @@ test("/agents replies through one exact attention barrier without starting a par
     fixture.write("/agents");
     await fixture.waitForCompleteFrameAfter("/agents", beforeAgents);
     fixture.write("\r\r");
-    await fixture.waitFor("Agents · 1 active · 0 completed");
+    await fixture.waitFor("Agents · 1 active · 0 terminal");
     fixture.write("\r");
     await fixture.waitFor("Which exact fixture source should I use?");
     fixture.write("r");

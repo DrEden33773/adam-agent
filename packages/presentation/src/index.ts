@@ -917,7 +917,7 @@ export type AuthoritativePresentationSnapshot = {
   readonly managedAgents: {
     readonly counts: {
       readonly active: number;
-      readonly completed: number;
+      readonly terminal: number;
       readonly attention: number;
     };
     readonly agents: readonly {
@@ -925,8 +925,34 @@ export type AuthoritativePresentationSnapshot = {
       readonly attemptId: string;
       readonly profile: "scout.v1" | "scout.v2" | "research.v1" | "research.v2";
       readonly mode: "foreground" | "background";
+      readonly targetIdentity: {
+        readonly targetId: string;
+        readonly vendor: string;
+        readonly modelId: string;
+        readonly route: string;
+        readonly profileVersion: number;
+        readonly certification: "certified" | "experimental";
+        readonly upstreamId?: string;
+      };
+      readonly thinkingPolicy?: {
+        readonly schemaVersion: 1;
+        readonly requestedLevelId: string;
+        readonly effectiveLevelId: string;
+        readonly capability: {
+          readonly id: string;
+          readonly version: number;
+          readonly digest: `sha256:${string}`;
+        };
+        readonly mapping: {
+          readonly requestPath: string;
+          readonly thinkingType: string;
+          readonly reasoningEffort?: string;
+        };
+        readonly reasoningArtifact: "provider_reasoning";
+      };
       readonly status:
         | "running"
+        | "permission_required"
         | "stalled"
         | "waiting_for_parent"
         | "completed"
@@ -935,6 +961,38 @@ export type AuthoritativePresentationSnapshot = {
         | "recovery_required"
         | "inspection_required";
       readonly revision: number;
+      readonly phase:
+        | "model"
+        | "tool"
+        | "permission_required"
+        | "waiting_for_parent"
+        | "stalled"
+        | "terminal";
+      readonly activeTool?: {
+        readonly callId: string;
+        readonly name: string;
+        readonly status: "requested" | "running" | "permission_required";
+      };
+      readonly transcript: {
+        readonly childSessionId: string;
+        readonly throughSequence: number;
+      };
+      readonly attemptHistory: readonly {
+        readonly attemptId: string;
+        readonly childSessionId: string;
+        readonly status:
+          | "running"
+          | "permission_required"
+          | "stalled"
+          | "waiting_for_parent"
+          | "completed"
+          | "failed"
+          | "cancelled"
+          | "recovery_required"
+          | "inspection_required";
+        readonly current: boolean;
+        readonly throughSequence: number;
+      }[];
       readonly result?:
         | { readonly text: string }
         | {
@@ -945,6 +1003,11 @@ export type AuthoritativePresentationSnapshot = {
             };
           };
       readonly error?: { readonly code: string; readonly message: string };
+      readonly partialOutput?: {
+        readonly text: string;
+        readonly byteCount: number;
+        readonly truncated: boolean;
+      };
       readonly attention?: {
         readonly attentionId: string;
         readonly question: string;
@@ -957,6 +1020,16 @@ export type AuthoritativePresentationSnapshot = {
         readonly revision: number;
         readonly messageByteCount: number;
         readonly messageTruncated: boolean;
+      }[];
+      readonly messages: readonly {
+        readonly messageId: `sha256:${string}`;
+        readonly kind: "message" | "reply";
+        readonly message: string;
+        readonly messageByteCount: number;
+        readonly messageTruncated: boolean;
+        readonly status: "enqueued" | "delivered";
+        readonly revision: number;
+        readonly attentionId?: string;
       }[];
       readonly context?: { readonly contextWindowTokens: number };
       readonly usage?: {
@@ -1008,6 +1081,26 @@ export type PresentationDisplayState = {
   readonly draft: NewSessionDraftDisplay | null;
   readonly composer: TurnComposerDisplay;
   readonly transient: PresentationTransientState | null;
+  readonly managedAgentActivity?: readonly {
+    readonly agentId: string;
+    readonly attemptId: string;
+    readonly childSessionId: string;
+    readonly activity: "thinking" | "replying" | "using_tool";
+    readonly assistant?: {
+      readonly itemId: string;
+      readonly text: string;
+    };
+    readonly reasoning?: {
+      readonly itemId: string;
+      readonly status: "active" | "completed" | "interrupted" | "failed";
+      readonly hasContent: boolean;
+    };
+    readonly tool?: {
+      readonly callId: string;
+      readonly name: string;
+      readonly status: "requested" | "running";
+    };
+  }[];
 };
 
 export type PresentationUpdate =
@@ -1034,6 +1127,20 @@ export type CommandReceipt =
       readonly resource: ArtifactChunk | null;
       readonly draftText?: string;
       readonly todo?: TodoPageResource | TodoEntityResource;
+      readonly managedAgentTranscript?: ManagedAgentTranscriptPageResource;
+      readonly managedAgentControl?: {
+        readonly action: "message" | "reply" | "cancel" | "follow_up" | "recovery";
+        readonly agentId: string;
+        readonly attemptId: string;
+        readonly revision: number;
+        readonly messageId?: `sha256:${string}`;
+        readonly delivery?: "enqueued" | "delivered";
+        readonly record?: {
+          readonly id: string;
+          readonly revision: number;
+          readonly digest: `sha256:${string}`;
+        };
+      };
     }
   | {
       readonly status: "rejected";
@@ -1085,8 +1192,27 @@ export type TodoEntityResource = {
   };
 };
 
+export type ManagedAgentTranscriptPageResource = {
+  readonly type: "managed_agent_transcript_page";
+  readonly agentId: string;
+  readonly attemptId: string;
+  readonly childSessionId: string;
+  readonly throughSequence: number;
+  readonly items: readonly TranscriptItem[];
+  readonly olderCursor: string | null;
+};
+
 export type PresentationCommand =
   | { readonly type: "refresh_managed_agents"; readonly sessionId: string }
+  | {
+      readonly type: "read_managed_agent_transcript";
+      readonly sessionId: string;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly expectedRevision: number;
+      readonly expectedThroughSequence: number;
+      readonly cursor: string | null;
+    }
   | {
       readonly type: "cancel_managed_agent";
       readonly sessionId: string;
@@ -1100,6 +1226,20 @@ export type PresentationCommand =
       readonly expectedRevision: number;
       readonly message: string;
       readonly attentionId?: string;
+    }
+  | {
+      readonly type: "follow_up_managed_agent";
+      readonly sessionId: string;
+      readonly agentId: string;
+      readonly expectedRevision: number;
+      readonly task: string;
+    }
+  | {
+      readonly type: "recover_managed_agent";
+      readonly sessionId: string;
+      readonly agentId: string;
+      readonly expectedRevision: number;
+      readonly task: string;
     }
   | {
       readonly type: "select_session";

@@ -7,23 +7,69 @@ import { createAdamTuiTheme } from "./theme.js";
 
 test("AgentNavigator renders responsive NO_COLOR list, detail and exact cancel intent", () => {
   const managedAgents: AuthoritativePresentationSnapshot["managedAgents"] = {
-    counts: { active: 1, completed: 1, attention: 0 },
+    counts: { active: 1, terminal: 1, attention: 0 },
     agents: [
       {
         agentId: "123e4567-e89b-42d3-a456-426614174201",
         attemptId: "123e4567-e89b-42d3-a456-426614174202",
         profile: "scout.v1",
         mode: "background",
+        targetIdentity: {
+          targetId: "deepseek-v4-flash.direct",
+          vendor: "deepseek",
+          modelId: "deepseek-v4-flash",
+          route: "direct",
+          profileVersion: 1,
+          certification: "certified",
+        },
         status: "running",
         revision: 1,
+        phase: "model",
+        transcript: {
+          childSessionId: "123e4567-e89b-42d3-a456-426614174205",
+          throughSequence: 2,
+        },
+        attemptHistory: [
+          {
+            attemptId: "123e4567-e89b-42d3-a456-426614174202",
+            childSessionId: "123e4567-e89b-42d3-a456-426614174205",
+            status: "running",
+            current: true,
+            throughSequence: 2,
+          },
+        ],
+        messages: [],
       },
       {
         agentId: "123e4567-e89b-42d3-a456-426614174203",
         attemptId: "123e4567-e89b-42d3-a456-426614174204",
         profile: "scout.v1",
         mode: "background",
+        targetIdentity: {
+          targetId: "deepseek-v4-flash.direct",
+          vendor: "deepseek",
+          modelId: "deepseek-v4-flash",
+          route: "direct",
+          profileVersion: 1,
+          certification: "certified",
+        },
         status: "completed",
         revision: 2,
+        phase: "terminal",
+        transcript: {
+          childSessionId: "123e4567-e89b-42d3-a456-426614174206",
+          throughSequence: 4,
+        },
+        attemptHistory: [
+          {
+            attemptId: "123e4567-e89b-42d3-a456-426614174204",
+            childSessionId: "123e4567-e89b-42d3-a456-426614174206",
+            status: "completed",
+            current: true,
+            throughSequence: 4,
+          },
+        ],
+        messages: [],
       },
     ],
   };
@@ -38,7 +84,7 @@ test("AgentNavigator renders responsive NO_COLOR list, detail and exact cancel i
   });
 
   const listed = navigator.render(80).join("\n");
-  expect(listed).toContain("Agents · 1 active · 1 completed");
+  expect(listed).toContain("Agents · 1 active · 1 terminal");
   expect(listed).toContain("scout.v1 · running");
   expect(navigator.render(40).join("\n")).not.toContain("\u001b[");
   navigator.handleInput("\r");
@@ -58,15 +104,38 @@ test("AgentNavigator renders one bounded attention question and emits its exact 
   const onCancel = vi.fn();
   const navigator = new AgentNavigator({
     managedAgents: {
-      counts: { active: 1, completed: 0, attention: 1 },
+      counts: { active: 1, terminal: 0, attention: 1 },
       agents: [
         {
           agentId: "123e4567-e89b-42d3-a456-426614174211",
           attemptId: "123e4567-e89b-42d3-a456-426614174212",
           profile: "research.v1",
           mode: "background",
+          targetIdentity: {
+            targetId: "deepseek-v4-flash.direct",
+            vendor: "deepseek",
+            modelId: "deepseek-v4-flash",
+            route: "direct",
+            profileVersion: 1,
+            certification: "certified",
+          },
           status: "waiting_for_parent",
           revision: 3,
+          phase: "waiting_for_parent",
+          transcript: {
+            childSessionId: "123e4567-e89b-42d3-a456-426614174214",
+            throughSequence: 5,
+          },
+          attemptHistory: [
+            {
+              attemptId: "123e4567-e89b-42d3-a456-426614174212",
+              childSessionId: "123e4567-e89b-42d3-a456-426614174214",
+              status: "waiting_for_parent",
+              current: true,
+              throughSequence: 5,
+            },
+          ],
+          messages: [],
           attention: {
             attentionId: "123e4567-e89b-42d3-a456-426614174213",
             question: "Which exact source should I prioritize?",

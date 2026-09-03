@@ -4,8 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  createCodingToolRegistry,
+  createPermissionPolicy,
+  createPresentationSession,
+  createSessionLifecycle,
+  type ModelDriver,
+  type ModelRequest,
+  type ModelTargets,
+} from "@adam-agent/agent";
+import {
   createInMemoryManagedAgentStore,
   createJsonlManagedAgentStore,
+  createTrustedWorkspaceTrustForTesting,
   ManagedAgentStoreError,
   recoverInterruptedManagedAgents,
   researchManagedAgentProfileV1,
@@ -13,6 +23,8 @@ import {
   scoutManagedAgentProfileV2,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
+
+import { withManagedFailureGuard } from "./managed-agent-test-support.js";
 
 const targetIdentity = {
   targetId: "deepseek-v4-flash.direct",
@@ -49,6 +61,241 @@ const managedLimits = {
 const durableTask = "Persist one durable scout result.";
 const childLiveWorkspaceNotice =
   "This child reads the live workspace. Parent changes may alter what it observes; isolated transcript does not mean repository snapshot or sandbox.";
+
+const contextProfile = {
+  version: 1,
+  contextWindowTokens: 128_000,
+  maximumOutputTokens: 4_096,
+  compactAtTokens: 96_000,
+  postCompactTargetTokens: 32_000,
+  retainedTargetTokens: 8_000,
+  estimatorVersion: 1,
+} as const;
+
+test("PresentationSession recovers one exact managed attempt after a JSONL restart", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-presentation-restart-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const skillRoot = join(workspaceRoot, ".agents", "skills", "cold-research-guide");
+  await mkdir(skillRoot, { recursive: true });
+  await writeFile(
+    join(skillRoot, "SKILL.md"),
+    "---\nname: cold-research-guide\ndescription: Preserves exact cold managed research guidance.\n---\nCOLD_RESEARCH_SKILL_BODY\n",
+    "utf8",
+  );
+  const endpoint = "https://search.example.test/search";
+  let childCalls = 0;
+  let parentCalls = 0;
+  let recoveredRequest: ModelRequest | undefined;
+  const driver: ModelDriver = {
+    async *stream(request) {
+      if (request.purpose !== "ordinary") {
+        yield { type: "text_delta", text: "Managed restart" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      const child = request.messages.some(
+        (message) =>
+          message.role === "developer" &&
+          message.content.startsWith("Managed child profile research.v2"),
+      );
+      if (child) {
+        childCalls += 1;
+        if (childCalls === 1) {
+          throw new Error("injected interrupted child");
+        }
+        recoveredRequest = request;
+        yield { type: "text_delta", text: "Cold managed recovery completed." };
+        yield { type: "usage", inputTokens: 6, outputTokens: 3 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      parentCalls += 1;
+      if (parentCalls === 1) {
+        yield { type: "tool_call_start", id: "spawn-cold-recovery", name: "spawn_agent" };
+        yield {
+          type: "tool_call_delta",
+          id: "spawn-cold-recovery",
+          json: '{"task":"Create one cold recovery boundary.","profile":"research.v2","skills":["skill:v1:project:.:cold-research-guide"],"mode":"background"}',
+        };
+        yield { type: "tool_call_end", id: "spawn-cold-recovery" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Managed child started." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const createLifecycle = () =>
+    createSessionLifecycle({
+      managedAgentTools: "managed-agent-tools.a3-long-lived.v2",
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+      stateRoot,
+      tools: createCodingToolRegistry({ workspaceRoot }),
+      webHttp: {
+        async fetch(input) {
+          return {
+            status: 200,
+            url: input.url,
+            mediaType: "application/json",
+            body: Buffer.from('{"results":[]}', "utf8"),
+          };
+        },
+      },
+      webSearchConfiguration: {
+        async load() {
+          return {
+            status: "configured",
+            provider: {
+              kind: "searxng",
+              endpoint,
+              activation: {
+                protocol: "searxng-json.v1",
+                endpointDigest: `sha256:${createHash("sha256").update(endpoint).digest("hex")}`,
+              },
+            },
+            diagnostic: null,
+          };
+        },
+      },
+      workspaceRoot,
+      workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+    });
+  const warmLifecycle = createLifecycle();
+
+  try {
+    const created = await warmLifecycle.create({ targetIdentity });
+    const warmPresentation = await createPresentationSession({
+      lifecycle: warmLifecycle,
+      projectLabel: "managed-restart-warm",
+      sessionId: created.sessionId,
+      stateRoot,
+      workspaceRoot,
+    });
+    const recoveryRequired = Promise.withResolvers<void>();
+    const unsubscribeWarm = warmPresentation.subscribe(() => {
+      if (
+        warmPresentation
+          .getState()
+          .authoritative.managedAgents.agents.some((agent) => agent.phase === "terminal")
+      ) {
+        recoveryRequired.resolve();
+      }
+    });
+    await warmPresentation.dispatch({
+      type: "submit_prompt",
+      sessionId: created.sessionId,
+      text: "Start one interrupted managed child.",
+      skills: [],
+      thinkingSelection: null,
+    });
+    await withManagedFailureGuard(
+      recoveryRequired.promise,
+      "The warm managed recovery-required state was never published.",
+    );
+    unsubscribeWarm();
+    const warmAgent = warmPresentation.getState().authoritative.managedAgents.agents[0];
+    if (warmAgent === undefined) {
+      throw new Error("The warm managed child was unavailable.");
+    }
+    expect(warmAgent.status).toBe("recovery_required");
+    await warmPresentation.close();
+    await warmLifecycle.close();
+
+    const coldLifecycle = createLifecycle();
+    try {
+      const coldPresentation = await createPresentationSession({
+        lifecycle: coldLifecycle,
+        projectLabel: "managed-restart-cold",
+        sessionId: created.sessionId,
+        stateRoot,
+        workspaceRoot,
+      });
+      try {
+        const coldAgent = coldPresentation.getState().authoritative.managedAgents.agents[0];
+        expect(coldAgent).toMatchObject({
+          agentId: warmAgent.agentId,
+          status: "recovery_required",
+          attemptHistory: [expect.objectContaining({ status: "recovery_required" })],
+        });
+        if (coldAgent === undefined) {
+          throw new Error("The cold managed child was unavailable.");
+        }
+        const recovered = Promise.withResolvers<void>();
+        const unsubscribeCold = coldPresentation.subscribe(() => {
+          const agent = coldPresentation.getState().authoritative.managedAgents.agents[0];
+          if (agent?.phase === "terminal" && agent.attemptHistory.length === 2) {
+            recovered.resolve();
+          }
+        });
+        await expect(
+          coldPresentation.dispatch({
+            type: "recover_managed_agent",
+            sessionId: created.sessionId,
+            agentId: coldAgent.agentId,
+            expectedRevision: coldAgent.revision,
+            task: "Recover the exact interrupted child.",
+          }),
+        ).resolves.toMatchObject({
+          status: "admitted",
+          managedAgentControl: {
+            action: "recovery",
+            agentId: coldAgent.agentId,
+          },
+        });
+        await withManagedFailureGuard(
+          recovered.promise,
+          "The cold managed recovery never reached terminal state.",
+        );
+        unsubscribeCold();
+        expect(coldPresentation.getState().authoritative.managedAgents).toMatchObject({
+          counts: { active: 0, terminal: 1, attention: 0 },
+          agents: [
+            {
+              agentId: coldAgent.agentId,
+              status: "completed",
+              attemptHistory: [
+                expect.objectContaining({ status: "recovery_required", current: false }),
+                expect.objectContaining({ status: "completed", current: true }),
+              ],
+            },
+          ],
+        });
+        expect(parentCalls).toBe(2);
+        expect(childCalls).toBe(2);
+        expect(recoveredRequest?.tools.map((tool) => tool.name)).toEqual(
+          expect.arrayContaining(["read_skill_resource", "web_search"]),
+        );
+        expect(JSON.stringify(recoveredRequest?.messages)).toContain("COLD_RESEARCH_SKILL_BODY");
+      } finally {
+        await coldPresentation.close();
+      }
+    } finally {
+      await coldLifecycle.close();
+    }
+  } finally {
+    await warmLifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
 
 test("ManagedAgentStore preserves one admitted and terminal identity across JSONL reopen", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-store-jsonl-"));

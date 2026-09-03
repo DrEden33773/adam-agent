@@ -14,6 +14,7 @@ import {
   createReadToolRegistry,
   createSessionLifecycle,
   type ModelDriver,
+  ModelDriverError,
   type ModelRequest,
   type ModelTargets,
   type RuntimeEvent,
@@ -32,6 +33,8 @@ import {
   ManagedAgentStoreError,
   managedAgentPromptSummary,
   type ProjectLifecycleOwner,
+  presentationManagedAgentTranscriptPageSize,
+  presentationRuntimeRefreshBarrier,
   recoverInterruptedManagedAgents,
   researchManagedAgentProfileV1,
   type SessionRecord,
@@ -40,9 +43,12 @@ import {
   scoutManagedAgentProfileV1,
   scoutManagedAgentProfileV2,
   sessionDurableContext,
+  sessionManagedAgentInactivityScheduler,
   sessionToolProfileNames,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
+
+import { withManagedFailureGuard } from "./managed-agent-test-support.js";
 
 const targetIdentity = {
   targetId: "deepseek-v4-flash.direct",
@@ -1673,7 +1679,7 @@ test("AgentManager pauses current inactivity for permission and resumes after th
       agents: [
         {
           agentId,
-          status: "running",
+          status: "permission_required",
           watchdog: { state: "paused_permission" },
           usage: {
             inputTokens: 10,
@@ -2328,7 +2334,7 @@ test("AgentManager starts an explicit post-restart attempt from recovery-require
   try {
     expect(providerCalls).toBe(0);
     await manager.snapshot();
-    expect(manager.promptSummary()).toContain("0 active, 1 completed");
+    expect(manager.promptSummary()).toContain("0 active, 1 terminal");
     expect(manager.promptSummary()).toContain(agentId);
     await expect(
       manager.followUp({
@@ -3716,7 +3722,7 @@ test("AgentSession holds one attention barrier until the exact parent reply", as
     expect(attention).toMatchObject({
       status: "completed",
       output: {
-        counts: { active: 1, completed: 0, attention: 1 },
+        counts: { active: 1, terminal: 0, attention: 1 },
         agents: [
           {
             agentId,
@@ -4054,7 +4060,7 @@ test("AgentSession keeps the aggregate deadline active while waiting for parent 
     await manager.waitForIdle();
     expect(providerCalls).toBe(1);
     await expect(manager.snapshot()).resolves.toMatchObject({
-      counts: { active: 0, completed: 1, attention: 0 },
+      counts: { active: 0, terminal: 1, attention: 0 },
       agents: [
         {
           agentId,
@@ -4612,7 +4618,7 @@ test("SessionLifecycle denies a research Web ask when no Presentation sink is re
   }
 });
 
-test("SessionLifecycle serializes child Web permission overlays without granting a standing effect", async () => {
+test("SessionLifecycle serializes child Web permission overlays and projects permission-required state", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-web-permissions-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -4814,12 +4820,50 @@ test("SessionLifecycle serializes child Web permission overlays without granting
       stateRoot,
       workspaceRoot,
     });
+    const permissionStatusVisible = Promise.withResolvers<void>();
+    const unsubscribePermissionStatus = presentation.subscribe(() => {
+      if (
+        presentation
+          .getState()
+          .authoritative.managedAgents.agents.some(
+            (agent) => agent.status === "permission_required",
+          )
+      ) {
+        permissionStatusVisible.resolve();
+      }
+    });
     await lifecycle.continue({
       sessionId: created.sessionId,
       input: { text: "Start both permission children." },
     });
     const firstRequestId = await firstPermission.promise;
+    await withManagedFailureGuard(
+      permissionStatusVisible.promise,
+      "The managed permission-required state was never projected.",
+    );
     expect(permissionEvents).toHaveLength(1);
+    expect(presentation.getState().authoritative.managedAgents).toMatchObject({
+      counts: { active: 2, attention: 1 },
+      agents: expect.arrayContaining([
+        expect.objectContaining({
+          status: "permission_required",
+          phase: "permission_required",
+          activeTool: {
+            callId: expect.stringMatching(/-search$/u),
+            name: "web_search",
+            status: "permission_required",
+          },
+        }),
+      ]),
+    });
+    expect(presentation.getState().managedAgentActivity).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          activity: "using_tool",
+          tool: expect.objectContaining({ name: "web_search", status: "requested" }),
+        }),
+      ]),
+    );
     expect(presentation.getState().authoritative.active?.pendingInteractions).toMatchObject([
       {
         requestId: firstRequestId,
@@ -4854,7 +4898,7 @@ test("SessionLifecycle serializes child Web permission overlays without granting
     await expect(
       lifecycle.inspectManagedAgents({ sessionId: created.sessionId }),
     ).resolves.toMatchObject({
-      counts: { active: 0, completed: 2, attention: 0 },
+      counts: { active: 0, terminal: 2, attention: 0 },
     });
     const thirdOverlayVisible = Promise.withResolvers<void>();
     const unsubscribeThirdOverlay = presentation.subscribe(() => {
@@ -4900,11 +4944,12 @@ test("SessionLifecycle serializes child Web permission overlays without granting
     await expect(
       lifecycle.inspectManagedAgents({ sessionId: created.sessionId }),
     ).resolves.toMatchObject({
-      counts: { active: 0, completed: 3, attention: 0 },
+      counts: { active: 0, terminal: 3, attention: 0 },
       agents: expect.arrayContaining([
         expect.objectContaining({ agentId: thirdAgentId, status: "cancelled" }),
       ]),
     });
+    unsubscribePermissionStatus();
     await presentation.close();
   } finally {
     await lifecycle.close();
@@ -5677,7 +5722,7 @@ test("AgentManager starts one explicit follow-up attempt on the same terminal ch
     expect(admissions[1]?.limits.maximumDeadlineMilliseconds).toBeLessThanOrEqual(600_000);
     await expect(manager.list()).resolves.toMatchObject({
       status: "completed",
-      output: { counts: { active: 0, completed: 1 } },
+      output: { counts: { active: 0, terminal: 1 } },
     });
   } finally {
     releaseFollowUp.resolve();
@@ -5972,7 +6017,7 @@ test("AgentSession injects only the bounded O(1) managed-child summary into the 
     store: createInMemorySessionStore(),
     tools: createReadToolRegistry({ workspaceRoot: process.cwd() }),
     [managedAgentPromptSummary]: () =>
-      "Managed agents: 1 active, 1 completed, 0 need attention; IDs: child-a, child-b",
+      "Managed agents: 1 active, 1 terminal, 0 need attention; IDs: child-a, child-b",
   };
   const session = new AgentSession(dependencies);
 
@@ -5983,7 +6028,7 @@ test("AgentSession injects only the bounded O(1) managed-child summary into the 
   expect(requests).toHaveLength(1);
   expect(requests[0]?.messages).toContainEqual({
     role: "developer",
-    content: "Managed agents: 1 active, 1 completed, 0 need attention; IDs: child-a, child-b",
+    content: "Managed agents: 1 active, 1 terminal, 0 need attention; IDs: child-a, child-b",
   });
   expect(JSON.stringify(requests[0]?.messages)).not.toContain("full child result secret");
 });
@@ -6340,13 +6385,20 @@ test("AgentManager close fences a manager-admitted child before logical-run publ
   }
 });
 
-test("PresentationSession refreshes agent cards and cancels one exact active child", async () => {
+test("PresentationSession causally projects a background child admission while the parent run remains active", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-presentation-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
   const childEntered = Promise.withResolvers<void>();
+  const releaseChildProgress = Promise.withResolvers<void>();
+  const childProgressed = Promise.withResolvers<void>();
+  const releaseChildReasoning = Promise.withResolvers<void>();
+  const childReasoningChanged = Promise.withResolvers<void>();
+  const releaseParent = Promise.withResolvers<void>();
+  const releaseRuntimeRefresh = Promise.withResolvers<void>();
   let parentCalls = 0;
+  let expireInactivity = () => {};
   const driver: ModelDriver = {
     async *stream(request) {
       const child = request.messages.some(
@@ -6355,6 +6407,21 @@ test("PresentationSession refreshes agent cards and cancels one exact active chi
       );
       if (child) {
         childEntered.resolve();
+        await releaseChildProgress.promise;
+        yield { type: "text_delta", text: "Causal child progress." };
+        childProgressed.resolve();
+        await releaseChildReasoning.promise;
+        yield {
+          type: "reasoning_start",
+          id: "managed-causal-reasoning",
+          artifactType: "provider_reasoning",
+        };
+        yield {
+          type: "reasoning_delta",
+          id: "managed-causal-reasoning",
+          text: "private managed reasoning",
+        };
+        childReasoningChanged.resolve();
         await new Promise<void>((resolve) => {
           request.signal.addEventListener("abort", () => resolve(), { once: true });
         });
@@ -6384,6 +6451,7 @@ test("PresentationSession refreshes agent cards and cancels one exact active chi
         yield { type: "finish", reason: "tool_calls" };
         return;
       }
+      await releaseParent.promise;
       yield { type: "text_delta", text: "Background scout started." };
       yield { type: "finish", reason: "stop" };
     },
@@ -6405,13 +6473,28 @@ test("PresentationSession refreshes agent cards and cancels one exact active chi
     },
   };
   const lifecycle = createSessionLifecycle({
-    managedAgentTools: "managed-agent-tools.a2-long-lived.v1",
+    managedAgentTools: "managed-agent-tools.a2-long-lived.v2",
     modelTargets,
     permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
     stateRoot,
     tools: createReadToolRegistry({ workspaceRoot }),
     workspaceRoot,
     workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+    [sessionManagedAgentInactivityScheduler]: {
+      schedule(_delayMilliseconds, onInactivity) {
+        let cancelled = false;
+        expireInactivity = () => {
+          if (!cancelled) {
+            onInactivity();
+          }
+        };
+        return {
+          cancel() {
+            cancelled = true;
+          },
+        };
+      },
+    },
   });
   const created = await lifecycle.create({ targetIdentity });
   const presentation = await createPresentationSession({
@@ -6420,9 +6503,12 @@ test("PresentationSession refreshes agent cards and cancels one exact active chi
     sessionId: created.sessionId,
     stateRoot,
     workspaceRoot,
+    [presentationRuntimeRefreshBarrier]: {
+      beforeRead: () => releaseRuntimeRefresh.promise,
+    },
   });
   const observerLifecycle = createSessionLifecycle({
-    managedAgentTools: "managed-agent-tools.a2-long-lived.v1",
+    managedAgentTools: "managed-agent-tools.a2-long-lived.v2",
     modelTargets,
     permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
     stateRoot,
@@ -6430,26 +6516,120 @@ test("PresentationSession refreshes agent cards and cancels one exact active chi
     workspaceRoot,
     workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
   });
-
+  const runningVisible = Promise.withResolvers<void>();
+  const stalledVisible = Promise.withResolvers<void>();
+  const resumedVisible = Promise.withResolvers<void>();
+  let sawStalled = false;
+  const unsubscribe = presentation.subscribe(() => {
+    if (
+      presentation.getState().authoritative.managedAgents.counts.active === 1 &&
+      presentation.getState().authoritative.managedAgents.agents[0]?.status === "running"
+    ) {
+      runningVisible.resolve();
+    }
+    if (presentation.getState().authoritative.managedAgents.agents[0]?.status === "stalled") {
+      sawStalled = true;
+      stalledVisible.resolve();
+    }
+    if (
+      sawStalled &&
+      presentation.getState().authoritative.managedAgents.agents[0]?.status === "running"
+    ) {
+      resumedVisible.resolve();
+    }
+  });
   try {
-    await expect(
-      presentation.dispatch({
-        type: "submit_prompt",
-        sessionId: created.sessionId,
-        text: "Start one background child.",
-        skills: [],
-        thinkingSelection: null,
-      }),
-    ).resolves.toMatchObject({ status: "admitted" });
-    await childEntered.promise;
-    await presentation.dispatch({
-      type: "refresh_managed_agents",
+    const parentRun = presentation.dispatch({
+      type: "submit_prompt",
       sessionId: created.sessionId,
+      text: "Start one background child.",
+      skills: [],
+      thinkingSelection: null,
     });
+    await childEntered.promise;
+    await withManagedFailureGuard(
+      runningVisible.promise,
+      "The managed child admission was never projected.",
+    );
     const active = presentation.getState().authoritative.managedAgents.agents[0];
-    expect(active).toMatchObject({ status: "running", revision: 1 });
+    expect(active).toMatchObject({
+      profile: "scout.v2",
+      status: "running",
+      revision: 1,
+      targetIdentity,
+      transcript: {
+        childSessionId: expect.any(String),
+        throughSequence: expect.any(Number),
+      },
+      attemptHistory: [
+        {
+          attemptId: expect.any(String),
+          childSessionId: expect.any(String),
+          status: "running",
+          current: true,
+          throughSequence: expect.any(Number),
+        },
+      ],
+    });
     if (active === undefined) {
       throw new Error("Presentation did not expose the active child.");
+    }
+    expireInactivity();
+    await withManagedFailureGuard(
+      stalledVisible.promise,
+      "The managed child stalled state was never projected.",
+    );
+    expect(presentation.getState().authoritative.managedAgents).toMatchObject({
+      counts: { active: 1, attention: 1 },
+      agents: [{ agentId: active.agentId, status: "stalled", watchdog: { state: "stalled" } }],
+    });
+    const stalled = presentation.getState().authoritative.managedAgents.agents[0];
+    if (stalled === undefined) {
+      throw new Error("Presentation did not expose the stalled child.");
+    }
+    releaseChildProgress.resolve();
+    await childProgressed.promise;
+    expect(presentation.getState().managedAgentActivity).toMatchObject([
+      {
+        agentId: active.agentId,
+        attemptId: active.attemptId,
+        childSessionId: active.transcript.childSessionId,
+        activity: "replying",
+        assistant: {
+          itemId: expect.any(String),
+          text: "Causal child progress.",
+        },
+      },
+    ]);
+    releaseChildReasoning.resolve();
+    await childReasoningChanged.promise;
+    expect(presentation.getState().managedAgentActivity).toMatchObject([
+      {
+        agentId: active.agentId,
+        attemptId: active.attemptId,
+        childSessionId: active.transcript.childSessionId,
+        activity: "thinking",
+        reasoning: {
+          itemId: expect.stringMatching(/managed-causal-reasoning$/u),
+          status: "active",
+          hasContent: true,
+        },
+      },
+    ]);
+    expect(JSON.stringify(presentation.getState().managedAgentActivity)).not.toContain(
+      "private managed reasoning",
+    );
+    await withManagedFailureGuard(
+      resumedVisible.promise,
+      "The managed child resumed state was never projected.",
+    );
+    expect(presentation.getState().authoritative.managedAgents).toMatchObject({
+      counts: { active: 1, attention: 0 },
+      agents: [{ agentId: active.agentId, status: "running", watchdog: { state: "running" } }],
+    });
+    const resumed = presentation.getState().authoritative.managedAgents.agents[0];
+    if (resumed === undefined) {
+      throw new Error("Presentation did not expose the resumed child.");
     }
     await expect(
       observerLifecycle.inspectManagedAgents({ sessionId: created.sessionId }),
@@ -6464,7 +6644,7 @@ test("PresentationSession refreshes agent cards and cancels one exact active chi
       lifecycle.sendManagedAgentMessage({
         sessionId: created.sessionId,
         agentId: active.agentId,
-        expectedRevision: active.revision,
+        expectedRevision: resumed.revision,
         callId: "a2-send-must-stay-unavailable",
         message: "Historical A2 must not gain a mailbox.",
       }),
@@ -6475,19 +6655,62 @@ test("PresentationSession refreshes agent cards and cancels one exact active chi
     await expect(
       lifecycle.branch({ parentSessionId: created.sessionId, atSequence: 1 }),
     ).rejects.toMatchObject({ code: "project_in_use" });
+    releaseRuntimeRefresh.resolve();
+    releaseParent.resolve();
+    await expect(parentRun).resolves.toMatchObject({ status: "admitted" });
     await expect(
       presentation.dispatch({
         type: "cancel_managed_agent",
         sessionId: created.sessionId,
         agentId: active.agentId,
-        expectedRevision: active.revision,
+        expectedRevision: resumed.revision,
       }),
-    ).resolves.toMatchObject({ status: "admitted" });
-    expect(presentation.getState().authoritative.managedAgents).toMatchObject({
-      counts: { active: 0, completed: 1 },
-      agents: [{ agentId: active.agentId, status: "cancelled", revision: 3 }],
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentControl: {
+        action: "cancel",
+        agentId: active.agentId,
+        record: { digest: expect.stringMatching(/^sha256:/u) },
+      },
     });
+    expect(presentation.getState().authoritative.managedAgents).toMatchObject({
+      counts: { active: 0, terminal: 1 },
+      agents: [{ agentId: active.agentId, status: "cancelled", revision: 5 }],
+    });
+    const cancelled = presentation.getState().authoritative.managedAgents.agents[0];
+    if (cancelled === undefined) {
+      throw new Error("Presentation did not expose the cancelled child transcript.");
+    }
+    const cancelledTranscript = await presentation.dispatch({
+      type: "read_managed_agent_transcript",
+      sessionId: created.sessionId,
+      agentId: cancelled.agentId,
+      attemptId: cancelled.attemptId,
+      expectedRevision: cancelled.revision,
+      expectedThroughSequence: cancelled.transcript.throughSequence,
+      cursor: null,
+    });
+    expect(cancelledTranscript).toMatchObject({
+      status: "admitted",
+      managedAgentTranscript: {
+        items: expect.arrayContaining([
+          expect.objectContaining({
+            type: "reasoning_block",
+            text: null,
+            artifact: null,
+          }),
+        ]),
+      },
+    });
+    expect(JSON.stringify(cancelledTranscript)).not.toMatch(
+      /Start one background child|private managed reasoning/u,
+    );
   } finally {
+    unsubscribe();
+    releaseRuntimeRefresh.resolve();
+    releaseParent.resolve();
+    releaseChildProgress.resolve();
+    releaseChildReasoning.resolve();
     await observerLifecycle.close();
     await presentation.close();
     await lifecycle.close();
@@ -6500,11 +6723,14 @@ test("PresentationSession replies to one exact attention without waking a parent
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
   await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "evidence.txt"), "managed transcript evidence\n", "utf8");
   let parentCalls = 0;
   let agentId = "";
   let attentionId = "";
   let attentionRevision = 0;
   const childReplyObserved = Promise.withResolvers<void>();
+  const recoveryRequestStarted = Promise.withResolvers<void>();
+  const releaseRecoveryRequest = Promise.withResolvers<void>();
   const childRequests: ModelRequest[] = [];
   const driver: ModelDriver = {
     async *stream(request) {
@@ -6516,7 +6742,7 @@ test("PresentationSession replies to one exact attention without waking a parent
       const child = request.messages.some(
         (message) =>
           message.role === "developer" &&
-          message.content.startsWith("Managed child profile research.v1"),
+          message.content.startsWith("Managed child profile research.v2"),
       );
       if (child) {
         childRequests.push(request);
@@ -6536,19 +6762,74 @@ test("PresentationSession replies to one exact attention without waking a parent
           yield { type: "finish", reason: "tool_calls" };
           return;
         }
-        expect(request.messages.findLast((message) => message.role === "tool")).toMatchObject({
-          role: "tool",
-          callId: "presentation-attention",
-          result: {
-            status: "completed",
-            output: { reply: "Use the immutable Presentation source." },
-          },
+        if (childRequests.length === 2) {
+          expect(request.messages.findLast((message) => message.role === "tool")).toMatchObject({
+            role: "tool",
+            callId: "presentation-attention",
+            result: {
+              status: "completed",
+              output: { reply: "Use the immutable Presentation source." },
+            },
+          });
+          childReplyObserved.resolve();
+          yield { type: "text_delta", text: "Presentation reply observed." };
+          yield { type: "usage", inputTokens: 12, outputTokens: 4 };
+          yield { type: "finish", reason: "stop" };
+          return;
+        }
+        if (childRequests.length === 3) {
+          throw new Error("injected interrupted follow-up");
+        }
+        if (childRequests.length === 4) {
+          recoveryRequestStarted.resolve();
+          await releaseRecoveryRequest.promise;
+          yield { type: "tool_call_start", id: "presentation-recovery-read", name: "read_file" };
+          yield {
+            type: "tool_call_delta",
+            id: "presentation-recovery-read",
+            json: '{"path":"evidence.txt"}',
+          };
+          yield { type: "tool_call_end", id: "presentation-recovery-read" };
+          yield { type: "usage", inputTokens: 6, outputTokens: 2 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        if (childRequests.length === 5) {
+          expect(JSON.stringify(request.messages)).toContain(
+            "Use the queued Presentation message.",
+          );
+          yield { type: "text_delta", text: "Recovered Presentation follow-up." };
+          yield { type: "usage", inputTokens: 7, outputTokens: 3 };
+          yield { type: "finish", reason: "stop" };
+          return;
+        }
+        if (childRequests.length === 6) {
+          yield {
+            type: "tool_call_start",
+            id: "presentation-follow-up-report",
+            name: "report_to_parent",
+          };
+          yield {
+            type: "tool_call_delta",
+            id: "presentation-follow-up-report",
+            json: '{"kind":"progress","message":"Follow-up evidence is being verified."}',
+          };
+          yield { type: "tool_call_end", id: "presentation-follow-up-report" };
+          yield { type: "tool_call_start", id: "presentation-follow-up-read", name: "read_file" };
+          yield {
+            type: "tool_call_delta",
+            id: "presentation-follow-up-read",
+            json: '{"path":"evidence.txt"}',
+          };
+          yield { type: "tool_call_end", id: "presentation-follow-up-read" };
+          yield { type: "usage", inputTokens: 5, outputTokens: 2 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: "Partial failed follow-up." };
+        throw new ModelDriverError("transport", "injected follow-up provider failure", {
+          cause: new Error("private injected failure"),
         });
-        childReplyObserved.resolve();
-        yield { type: "text_delta", text: "Presentation reply observed." };
-        yield { type: "usage", inputTokens: 12, outputTokens: 4 };
-        yield { type: "finish", reason: "stop" };
-        return;
       }
       parentCalls += 1;
       if (parentCalls === 1) {
@@ -6556,7 +6837,7 @@ test("PresentationSession replies to one exact attention without waking a parent
         yield {
           type: "tool_call_delta",
           id: "spawn-presentation-attention",
-          json: '{"task":"Request Presentation input.","profile":"research.v1","mode":"background"}',
+          json: '{"task":"Request Presentation input.","profile":"research.v2","mode":"background"}',
         };
         yield { type: "tool_call_end", id: "spawn-presentation-attention" };
         yield { type: "finish", reason: "tool_calls" };
@@ -6652,7 +6933,7 @@ test("PresentationSession replies to one exact attention without waking a parent
     },
   };
   const lifecycle = createSessionLifecycle({
-    managedAgentTools: "managed-agent-tools.a3-long-lived.v1",
+    managedAgentTools: "managed-agent-tools.a3-long-lived.v2",
     modelTargets,
     permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
     stateRoot,
@@ -6669,15 +6950,28 @@ test("PresentationSession replies to one exact attention without waking a parent
       sessionId: created.sessionId,
       stateRoot,
       workspaceRoot,
+      [presentationManagedAgentTranscriptPageSize]: 1,
+    });
+    const attentionVisible = Promise.withResolvers<void>();
+    const unsubscribeAttention = presentation.subscribe(() => {
+      if (
+        presentation
+          .getState()
+          .authoritative.managedAgents.agents.some(
+            (agent) => agent.status === "waiting_for_parent" && agent.attention !== undefined,
+          )
+      ) {
+        attentionVisible.resolve();
+      }
     });
     await lifecycle.continue({
       sessionId: created.sessionId,
       input: { text: "Start and wait for one attention request." },
     });
     expect(parentCalls).toBe(3);
-    await presentation.dispatch({ type: "refresh_managed_agents", sessionId: created.sessionId });
+    await attentionVisible.promise;
     expect(presentation.getState().authoritative.managedAgents).toMatchObject({
-      counts: { active: 1, completed: 0, attention: 1 },
+      counts: { active: 1, terminal: 0, attention: 1 },
       agents: [
         {
           agentId,
@@ -6690,6 +6984,7 @@ test("PresentationSession replies to one exact attention without waking a parent
         },
       ],
     });
+    unsubscribeAttention();
     await expect(
       presentation.dispatch({
         type: "send_managed_agent_message",
@@ -6708,11 +7003,398 @@ test("PresentationSession replies to one exact attention without waking a parent
     });
     await presentation.dispatch({ type: "refresh_managed_agents", sessionId: created.sessionId });
     expect(presentation.getState().authoritative.managedAgents).toMatchObject({
-      counts: { active: 0, completed: 1, attention: 0 },
+      counts: { active: 0, terminal: 1, attention: 0 },
       agents: [{ agentId, status: "completed" }],
+    });
+    expect(presentation.getState().authoritative.managedAgents.counts).toEqual({
+      active: 0,
+      terminal: 1,
+      attention: 0,
+    });
+    const terminalAgent = presentation
+      .getState()
+      .authoritative.managedAgents.agents.find((agent) => agent.agentId === agentId);
+    if (terminalAgent === undefined) {
+      throw new Error("The terminal managed child was unavailable for transcript inspection.");
+    }
+    const latestTranscript = await presentation.dispatch({
+      type: "read_managed_agent_transcript",
+      sessionId: created.sessionId,
+      agentId,
+      attemptId: terminalAgent.attemptId,
+      expectedRevision: terminalAgent.revision,
+      expectedThroughSequence: terminalAgent.transcript.throughSequence,
+      cursor: null,
+    });
+    expect(latestTranscript).toMatchObject({
+      status: "admitted",
+      managedAgentTranscript: {
+        type: "managed_agent_transcript_page",
+        agentId,
+        attemptId: terminalAgent.attemptId,
+        childSessionId: terminalAgent.transcript.childSessionId,
+        throughSequence: terminalAgent.transcript.throughSequence,
+        items: [
+          expect.objectContaining({
+            type: "assistant_message",
+            text: "Presentation reply observed.",
+          }),
+        ],
+        olderCursor: expect.stringMatching(/^managed-agent-transcript:/u),
+      },
+    });
+    expect(JSON.stringify(latestTranscript)).not.toMatch(
+      /Request Presentation input|Which exact Presentation source should I use/u,
+    );
+    await expect(
+      presentation.dispatch({
+        type: "read_managed_agent_transcript",
+        sessionId: created.sessionId,
+        agentId,
+        attemptId: terminalAgent.attemptId,
+        expectedRevision: terminalAgent.revision,
+        expectedThroughSequence: terminalAgent.transcript.throughSequence - 1,
+        cursor: null,
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "stale_interaction" });
+    if (
+      latestTranscript.status !== "admitted" ||
+      latestTranscript.managedAgentTranscript === undefined
+    ) {
+      throw new Error("The latest managed transcript page was unavailable.");
+    }
+    await expect(
+      presentation.dispatch({
+        type: "read_managed_agent_transcript",
+        sessionId: created.sessionId,
+        agentId,
+        attemptId: terminalAgent.attemptId,
+        expectedRevision: terminalAgent.revision,
+        expectedThroughSequence: terminalAgent.transcript.throughSequence,
+        cursor: latestTranscript.managedAgentTranscript.olderCursor,
+      }),
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentTranscript: {
+        items: [
+          expect.objectContaining({
+            type: "tool_call",
+            qualifiedName: "request_parent_input",
+          }),
+        ],
+        olderCursor: null,
+      },
+    });
+    const interruptedVisible = Promise.withResolvers<void>();
+    const recoveredVisible = Promise.withResolvers<void>();
+    const unsubscribeRecovery = presentation.subscribe(() => {
+      const agent = presentation
+        .getState()
+        .authoritative.managedAgents.agents.find((candidate) => candidate.agentId === agentId);
+      if (agent?.status === "recovery_required" && agent.attemptHistory.length === 2) {
+        interruptedVisible.resolve();
+      }
+      if (agent?.status === "completed" && agent.attemptHistory.length === 3) {
+        recoveredVisible.resolve();
+      }
+    });
+    await expect(
+      presentation.dispatch({
+        type: "follow_up_managed_agent",
+        sessionId: created.sessionId,
+        agentId,
+        expectedRevision: terminalAgent.revision,
+        task: "Create one interrupted recovery boundary.",
+      }),
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentControl: {
+        action: "follow_up",
+        agentId,
+        record: { digest: expect.stringMatching(/^sha256:/u) },
+      },
+    });
+    await interruptedVisible.promise;
+    const recoveryRequiredAgent = presentation
+      .getState()
+      .authoritative.managedAgents.agents.find((candidate) => candidate.agentId === agentId);
+    expect(recoveryRequiredAgent).toMatchObject({
+      status: "recovery_required",
+      attemptHistory: [
+        expect.objectContaining({ status: "completed", current: false }),
+        expect.objectContaining({ status: "recovery_required", current: true }),
+      ],
+    });
+    if (recoveryRequiredAgent === undefined) {
+      throw new Error("The recovery-required managed child was unavailable.");
+    }
+    await expect(
+      presentation.dispatch({
+        type: "recover_managed_agent",
+        sessionId: created.sessionId,
+        agentId,
+        expectedRevision: recoveryRequiredAgent.revision,
+        task: "Recover from the exact interrupted attempt.",
+      }),
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentControl: {
+        action: "recovery",
+        agentId,
+        record: { digest: expect.stringMatching(/^sha256:/u) },
+      },
+    });
+    await recoveryRequestStarted.promise;
+    const activeRecoveryAgent = presentation
+      .getState()
+      .authoritative.managedAgents.agents.find((candidate) => candidate.agentId === agentId);
+    expect(activeRecoveryAgent).toMatchObject({ status: "running" });
+    if (activeRecoveryAgent === undefined) {
+      throw new Error("The active managed recovery attempt was unavailable.");
+    }
+    await expect(
+      presentation.dispatch({
+        type: "send_managed_agent_message",
+        sessionId: created.sessionId,
+        agentId,
+        expectedRevision: activeRecoveryAgent.revision,
+        message: "Use the queued Presentation message.",
+      }),
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentControl: {
+        action: "message",
+        agentId,
+        attemptId: activeRecoveryAgent.attemptId,
+        revision: activeRecoveryAgent.revision + 1,
+        messageId: expect.stringMatching(/^sha256:/u),
+        delivery: "enqueued",
+        record: {
+          id: expect.stringMatching(/^sha256:/u),
+          revision: expect.any(Number),
+          digest: expect.stringMatching(/^sha256:/u),
+        },
+      },
+    });
+    expect(
+      presentation
+        .getState()
+        .authoritative.managedAgents.agents.find((candidate) => candidate.agentId === agentId),
+    ).toMatchObject({
+      messages: [
+        expect.objectContaining({
+          kind: "reply",
+          status: "delivered",
+        }),
+        expect.objectContaining({
+          kind: "message",
+          message: "Use the queued Presentation message.",
+          status: "enqueued",
+        }),
+      ],
+    });
+    releaseRecoveryRequest.resolve();
+    await recoveredVisible.promise;
+    unsubscribeRecovery();
+    const recoveredAgent = presentation
+      .getState()
+      .authoritative.managedAgents.agents.find((candidate) => candidate.agentId === agentId);
+    expect(recoveredAgent).toMatchObject({
+      status: "completed",
+      attemptHistory: [
+        expect.objectContaining({ status: "completed", current: false }),
+        expect.objectContaining({ status: "recovery_required", current: false }),
+        expect.objectContaining({ status: "completed", current: true }),
+      ],
+    });
+    if (recoveredAgent === undefined) {
+      throw new Error("The recovered managed child was unavailable for follow-up.");
+    }
+    const failedVisible = Promise.withResolvers<void>();
+    const reportVisible = Promise.withResolvers<void>();
+    const unsubscribeFailed = presentation.subscribe(() => {
+      const agent = presentation
+        .getState()
+        .authoritative.managedAgents.agents.find((candidate) => candidate.agentId === agentId);
+      if (agent?.status === "failed") {
+        failedVisible.resolve();
+      }
+      if (
+        agent?.reports?.some((report) => report.message === "Follow-up evidence is being verified.")
+      ) {
+        reportVisible.resolve();
+      }
+    });
+    await expect(
+      presentation.dispatch({
+        type: "follow_up_managed_agent",
+        sessionId: created.sessionId,
+        agentId,
+        expectedRevision: recoveredAgent.revision,
+        task: "Read the exact evidence and report again.",
+      }),
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentControl: {
+        action: "follow_up",
+        agentId,
+        record: { digest: expect.stringMatching(/^sha256:/u) },
+      },
+    });
+    await reportVisible.promise;
+    await withManagedFailureGuard(
+      failedVisible.promise,
+      "The managed follow-up failure was never projected.",
+    );
+    unsubscribeFailed();
+    const failedAgent = presentation
+      .getState()
+      .authoritative.managedAgents.agents.find((candidate) => candidate.agentId === agentId);
+    expect(failedAgent).toMatchObject({
+      status: "failed",
+      phase: "terminal",
+      error: { code: "model_request_failed" },
+      partialOutput: {
+        text: "Partial failed follow-up.",
+        byteCount: 25,
+        truncated: false,
+      },
+      reports: [
+        expect.objectContaining({
+          kind: "progress",
+          message: "Follow-up evidence is being verified.",
+        }),
+      ],
+      attemptHistory: [
+        expect.objectContaining({ status: "completed", current: false }),
+        expect.objectContaining({ status: "recovery_required", current: false }),
+        expect.objectContaining({ status: "completed", current: false }),
+        expect.objectContaining({ status: "failed", current: true }),
+      ],
+      usage: {
+        inputTokens: 40,
+        outputTokens: 14,
+        reasoningTokens: 0,
+        providerCalls: 7,
+      },
+      budget: {
+        maximumCumulativeTokens: 128_000,
+        usedTokens: 54,
+        remainingTokens: 127_946,
+      },
+    });
+    if (failedAgent === undefined) {
+      throw new Error("The failed managed child was unavailable for transcript inspection.");
+    }
+    const failedTranscript = await presentation.dispatch({
+      type: "read_managed_agent_transcript",
+      sessionId: created.sessionId,
+      agentId,
+      attemptId: failedAgent.attemptId,
+      expectedRevision: failedAgent.revision,
+      expectedThroughSequence: failedAgent.transcript.throughSequence,
+      cursor: null,
+    });
+    expect(failedTranscript).toMatchObject({
+      status: "admitted",
+      managedAgentTranscript: {
+        items: [
+          expect.objectContaining({
+            type: "session_notice",
+            status: "failed",
+            code: "model_request_failed",
+          }),
+        ],
+        olderCursor: expect.stringMatching(/^managed-agent-transcript:/u),
+      },
+    });
+    if (
+      failedTranscript.status !== "admitted" ||
+      failedTranscript.managedAgentTranscript === undefined
+    ) {
+      throw new Error("The failed managed transcript page was unavailable.");
+    }
+    const failedPartialTranscript = await presentation.dispatch({
+      type: "read_managed_agent_transcript",
+      sessionId: created.sessionId,
+      agentId,
+      attemptId: failedAgent.attemptId,
+      expectedRevision: failedAgent.revision,
+      expectedThroughSequence: failedAgent.transcript.throughSequence,
+      cursor: failedTranscript.managedAgentTranscript.olderCursor,
+    });
+    expect(failedPartialTranscript).toMatchObject({
+      status: "admitted",
+      managedAgentTranscript: {
+        items: [
+          expect.objectContaining({
+            type: "assistant_message",
+            text: "Partial failed follow-up.",
+          }),
+        ],
+        olderCursor: expect.stringMatching(/^managed-agent-transcript:/u),
+      },
+    });
+    if (
+      failedPartialTranscript.status !== "admitted" ||
+      failedPartialTranscript.managedAgentTranscript === undefined
+    ) {
+      throw new Error("The failed managed partial-output page was unavailable.");
+    }
+    const failedToolTranscript = await presentation.dispatch({
+      type: "read_managed_agent_transcript",
+      sessionId: created.sessionId,
+      agentId,
+      attemptId: failedAgent.attemptId,
+      expectedRevision: failedAgent.revision,
+      expectedThroughSequence: failedAgent.transcript.throughSequence,
+      cursor: failedPartialTranscript.managedAgentTranscript.olderCursor,
+    });
+    expect(failedToolTranscript).toMatchObject({
+      status: "admitted",
+      managedAgentTranscript: {
+        items: [
+          expect.objectContaining({
+            type: "tool_call",
+            qualifiedName: "read_file",
+            status: "completed",
+          }),
+        ],
+        olderCursor: expect.stringMatching(/^managed-agent-transcript:/u),
+      },
+    });
+    if (
+      failedToolTranscript.status !== "admitted" ||
+      failedToolTranscript.managedAgentTranscript === undefined
+    ) {
+      throw new Error("The failed managed tool page was unavailable.");
+    }
+    await expect(
+      presentation.dispatch({
+        type: "read_managed_agent_transcript",
+        sessionId: created.sessionId,
+        agentId,
+        attemptId: failedAgent.attemptId,
+        expectedRevision: failedAgent.revision,
+        expectedThroughSequence: failedAgent.transcript.throughSequence,
+        cursor: failedToolTranscript.managedAgentTranscript.olderCursor,
+      }),
+    ).resolves.toMatchObject({
+      status: "admitted",
+      managedAgentTranscript: {
+        items: [
+          expect.objectContaining({
+            type: "tool_call",
+            qualifiedName: "report_to_parent",
+            status: "completed",
+          }),
+        ],
+        olderCursor: null,
+      },
     });
     await presentation.close();
   } finally {
+    releaseRecoveryRequest.resolve();
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
   }

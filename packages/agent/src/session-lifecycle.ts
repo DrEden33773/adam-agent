@@ -44,10 +44,12 @@ import {
   type AgentManager,
   createAgentManager,
   createManagedAgentToolRegistry,
+  isManagedAgentActiveStatus,
+  type ManagedAgentInactivityScheduler,
   type ManagedAgentResearchContext,
   type ManagedAgentSnapshot,
   type ManagedAgentStore,
-  managedAgentSnapshotFromRecords,
+  managedAgentSnapshotWithChildHistories,
   recoverInterruptedManagedAgents,
 } from "./managed-agent.js";
 import { createJsonlManagedAgentStore } from "./managed-agent-store.js";
@@ -122,6 +124,7 @@ import {
   hasSkillPromptContext,
   isPromptContextCompatible,
   isPromptContextRecordCompatible,
+  type PromptContextRecord,
   type PromptContextRecordV1,
   type PromptContextRecordV3,
   replacePromptRepositoryV1,
@@ -349,6 +352,44 @@ export const sessionRuntimeNotificationTransform = Symbol(
   "adam-agent.session-runtime-notification-transform",
 );
 
+/** Tests only. Production managed children use the Node inactivity scheduler. */
+export const sessionManagedAgentInactivityScheduler = Symbol(
+  "adam-agent.session-managed-agent-inactivity-scheduler",
+);
+
+export const sessionManagedAgentTranscriptReader = Symbol(
+  "adam-agent.session-managed-agent-transcript-reader",
+);
+
+export type ManagedAgentTranscriptRecords = {
+  readonly childSessionId: string;
+  readonly records: readonly SessionRecord[];
+  readonly partialOutput?: {
+    readonly text: string;
+    readonly byteCount: number;
+    readonly truncated: boolean;
+  };
+};
+
+export type ManagedAgentControlReceipt = {
+  readonly action: "message" | "reply" | "cancel" | "follow_up" | "recovery";
+  readonly agentId: string;
+  readonly attemptId: string;
+  readonly revision: number;
+  readonly messageId?: `sha256:${string}`;
+  readonly delivery?: "enqueued" | "delivered";
+  readonly record?: {
+    readonly id: string;
+    readonly revision: number;
+    readonly digest: `sha256:${string}`;
+  };
+};
+
+export type ManagedAgentControlResult = {
+  readonly snapshot: ManagedAgentSnapshot;
+  readonly receipt: ManagedAgentControlReceipt;
+};
+
 export type SessionRuntimeNotificationTransform = {
   project(notification: SessionRuntimeNotification): readonly SessionRuntimeNotification[];
 };
@@ -410,6 +451,7 @@ export type SessionLifecycleOptions = {
   readonly [sessionProjectLifecycleOwner]?: ProjectLifecycleOwner;
   readonly [sessionStoreDirectory]?: SessionStoreDirectory<SessionRecord>;
   readonly [sessionRuntimeNotificationTransform]?: SessionRuntimeNotificationTransform;
+  readonly [sessionManagedAgentInactivityScheduler]?: ManagedAgentInactivityScheduler;
   readonly [inputResourceIngestBarrier]?: InputResourceIngestBarrier;
   readonly [workspaceMcpLeaseTransitionBarrier]?: WorkspaceMcpLeaseTransitionBarrier;
 };
@@ -478,10 +520,26 @@ export type SessionRuntimeNotification = RuntimeEventNotification & {
 };
 
 export type SessionRuntimeNotificationListener = (notification: SessionRuntimeNotification) => void;
-export type ManagedAgentRuntimeEventListener = (input: {
-  readonly parentSessionId: string;
-  readonly event: RuntimeEvent;
-}) => void;
+export type ManagedAgentNotification =
+  | {
+      readonly type: "state_changed";
+      readonly parentSessionId: string;
+    }
+  | {
+      readonly type: "runtime_event";
+      readonly parentSessionId: string;
+      readonly event: RuntimeEvent;
+    }
+  | {
+      readonly type: "child_runtime_event";
+      readonly parentSessionId: string;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly childSessionId: string;
+      readonly event: RuntimeEvent;
+    };
+
+export type ManagedAgentRuntimeEventListener = (input: ManagedAgentNotification) => void;
 
 export type RepositoryInstructionsReloadResult =
   | {
@@ -630,6 +688,13 @@ export type SessionCommand =
   | McpConfigurationCommand;
 
 export interface SessionLifecycle {
+  readonly [sessionManagedAgentTranscriptReader]: (input: {
+    readonly sessionId: string;
+    readonly agentId: string;
+    readonly attemptId: string;
+    readonly expectedRevision: number;
+    readonly expectedThroughSequence: number;
+  }) => Promise<ManagedAgentTranscriptRecords>;
   admit(input: {
     readonly targetIdentity: ModelTargetIdentity;
     readonly input: UserInput;
@@ -696,7 +761,7 @@ export interface SessionLifecycle {
     readonly sessionId: string;
     readonly agentId: string;
     readonly expectedRevision: number;
-  }): Promise<ManagedAgentSnapshot>;
+  }): Promise<ManagedAgentControlResult>;
   sendManagedAgentMessage(input: {
     readonly sessionId: string;
     readonly agentId: string;
@@ -704,7 +769,23 @@ export interface SessionLifecycle {
     readonly callId: string;
     readonly message: string;
     readonly attentionId?: string;
-  }): Promise<ManagedAgentSnapshot>;
+  }): Promise<ManagedAgentControlResult>;
+  followUpManagedAgent(input: {
+    readonly sessionId: string;
+    readonly agentId: string;
+    readonly expectedRevision: number;
+    readonly callId: string;
+    readonly task: string;
+    readonly signal: AbortSignal;
+  }): Promise<ManagedAgentControlResult>;
+  recoverManagedAgent(input: {
+    readonly sessionId: string;
+    readonly agentId: string;
+    readonly expectedRevision: number;
+    readonly callId: string;
+    readonly task: string;
+    readonly signal: AbortSignal;
+  }): Promise<ManagedAgentControlResult>;
   inspectWorkspaceTrust(): Promise<WorkspaceTrustSnapshot>;
   inspectContextUsage(input: {
     readonly sessionId: string;
@@ -905,6 +986,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   const listeners = new Set<RuntimeEventListener>();
   const sessionEventListeners = new Set<SessionRuntimeNotificationListener>();
   const managedAgentEventListeners = new Set<ManagedAgentRuntimeEventListener>();
+  const publishManagedAgentNotification = (notification: ManagedAgentNotification): void => {
+    for (const listener of managedAgentEventListeners) {
+      try {
+        listener(notification);
+      } catch {
+        // Presentation observers cannot change durable managed-child outcomes.
+      }
+    }
+  };
   const metadataListeners = new Set<SessionMetadataListener>();
   let activeSession: AgentSession | undefined;
   let activeSessionSettlement: Promise<void> | undefined;
@@ -1097,7 +1187,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       promptSummary() {
         return (
           activeAgentManagers.get(sessionId)?.promptSummary() ??
-          "Managed agents: 0 active, 0 completed, 0 need attention; IDs: "
+          "Managed agents: 0 active, 0 terminal, 0 need attention; IDs: "
         );
       },
       selectedSkillIdentities(skills) {
@@ -1117,7 +1207,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       async snapshot() {
         return (
           (await activeAgentManagers.get(sessionId)?.snapshot()) ?? {
-            counts: { active: 0, completed: 0, attention: 0 },
+            counts: { active: 0, terminal: 0, attention: 0 },
             agents: [],
           }
         );
@@ -1422,6 +1512,372 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       throw new SessionLifecycleError("session_invalid");
     }
     return runWithOwner(operation, rootId);
+  };
+  const managedResearchContextForSession = async (input: {
+    readonly sessionId: string;
+    readonly projectId: string;
+    readonly managedAgentTools: ManagedAgentToolsProfile | undefined;
+    readonly promptContext: PromptContextRecord | undefined;
+    readonly skillContext: SkillContextRecordV1 | undefined;
+    readonly sessionTools: ToolRegistry;
+    readonly contextProfile: ContextProfile;
+    readonly extensionSources: readonly ExtensionSkillSourceV1[];
+    readonly workspaceTrusted: boolean;
+    readonly artifactStore: ArtifactStore;
+  }): Promise<ManagedAgentResearchContext | undefined> => {
+    if (!hasManagedAgentCoordination(input.managedAgentTools)) {
+      return input.promptContext === undefined
+        ? undefined
+        : { repository: input.promptContext.repository };
+    }
+    const researchToolNames = new Set([
+      "read_skill_resource",
+      "web_search",
+      "web_fetch",
+      "web_open",
+      "web_find",
+    ]);
+    return {
+      ...(input.promptContext === undefined ? {} : { repository: input.promptContext.repository }),
+      skillIdentities:
+        input.skillContext?.registry.candidates.map((candidate) => ({
+          qualifiedId: candidate.qualifiedId,
+          digest: candidate.skillMdDigest,
+        })) ?? [],
+      tools: {
+        definitions: () =>
+          input.sessionTools
+            .definitions()
+            .filter((definition) => researchToolNames.has(definition.name)),
+        resolve: (name) =>
+          researchToolNames.has(name) ? input.sessionTools.resolve(name) : undefined,
+      },
+      async resolveSkills(selection) {
+        const skillContext = await createInitialSkillContextV1({
+          artifactStore: input.artifactStore,
+          effectiveContextTokens: input.contextProfile.contextWindowTokens,
+          estimatorVersion: input.contextProfile.estimatorVersion,
+          projectId: input.projectId,
+          sessionId: selection.childSessionId,
+          userHome: homedir(),
+          workspaceRoot: options.workspaceRoot,
+          extensionSources: input.extensionSources,
+          includeProjectSources: input.workspaceTrusted,
+        });
+        let selectedContext = skillContext;
+        for (const [index, qualifiedId] of selection.skills.entries()) {
+          const candidate = selectedContext.registry.candidates.find(
+            (entry) => entry.qualifiedId === qualifiedId,
+          );
+          if (candidate === undefined) {
+            throw new SessionLifecycleError("session_skill_unavailable");
+          }
+          const manifest = await buildSkillResourceManifestV1({
+            candidate,
+            workspaceRoot: options.workspaceRoot,
+            userHome: homedir(),
+            userHomeDigest: selectedContext.userHomeDigest,
+            ...(input.extensionSources.length === 0
+              ? {}
+              : { extensionSources: input.extensionSources }),
+          });
+          selectedContext = activateSkillContextV1({
+            context: selectedContext,
+            qualifiedId,
+            reason: "user_explicit",
+            runId: selection.attemptId,
+            requestId: `${selection.attemptId}:skill:${index + 1}`,
+            manifest,
+          }).context;
+        }
+        return {
+          context: selectedContext,
+          contents: await materializeActiveSkillContents(options, selectedContext),
+        };
+      },
+      authorizeProjectContextLoad: async () => (await inspectWorkspaceTrust()).status === "trusted",
+      ...(input.extensionSources.length === 0
+        ? {}
+        : { extensionSkillSources: input.extensionSources }),
+      ...(options.extensionHost === undefined
+        ? {}
+        : {
+            withCurrentExtensionSkillSources: <T>(
+              sources: readonly ExtensionSkillSourceV1[],
+              operation: () => Promise<T>,
+            ) =>
+              withInternalExtensionSkillSourcesCurrent(
+                options.extensionHost as ExtensionHost,
+                sources.map((source) => ({
+                  extensionId: source.locator.extensionId,
+                  packageName: source.locator.packageName,
+                  packageVersion: source.locator.packageVersion,
+                  lifecycleRevision: source.lifecycleRevision,
+                  lifecycleDigest: source.lifecycleDigest,
+                })),
+                operation,
+              ),
+          }),
+    };
+  };
+  const ensureManagedAgentManagerForControl = async (
+    sessionId: string,
+    parentRoot: ProjectExecutionRootClaim,
+    signal: AbortSignal,
+  ): Promise<AgentManager> => {
+    const existing = activeAgentManagers.get(sessionId);
+    if (existing !== undefined) {
+      existing.rebindParentRoot(parentRoot);
+      return existing;
+    }
+    if (options.modelTargets === undefined) {
+      throw new SessionLifecycleError("session_model_target_unavailable");
+    }
+    const snapshot = await inspectSession({ sessionId });
+    const records = await readSessionRecords(options, sessionId);
+    const genesis = records[0];
+    const admission = (await managedAgentStore.read()).findLast(
+      (record) =>
+        record.type === "managed_agent_admitted" &&
+        record.parentSessionId === sessionId &&
+        record.profile !== "reviewer.v1",
+    );
+    if (
+      snapshot.schemaVersion !== 3 ||
+      genesis === undefined ||
+      !isGenesisRecord(genesis) ||
+      admission?.type !== "managed_agent_admitted" ||
+      !isLongLivedManagedAgentTools(genesis.record.managedAgentTools)
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const resolved = await options.modelTargets.resolve({
+      targetId: snapshot.targetIdentity.targetId,
+      targetIdentity: snapshot.targetIdentity,
+      allowExperimental: snapshot.targetIdentity.certification === "experimental",
+      signal,
+    });
+    const childContextProfile = historicalContextProfile(
+      genesis,
+      contextSnapshotFromRecords(records)?.profile,
+      resolved.contextProfile,
+    );
+    if (
+      !sameModelTargetIdentity(resolved.identity, snapshot.targetIdentity) ||
+      !modelTargetUsesContextProfile(snapshot.targetIdentity, childContextProfile) ||
+      !isHistoricalContextProfileSupported(resolved.contextProfile, childContextProfile)
+    ) {
+      throw new SessionLifecycleError("session_model_target_incompatible");
+    }
+    const sourceRun = records.findLast(
+      (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
+    );
+    const recordedThinking =
+      sourceRun?.schemaVersion === 3 && sourceRun.record.type === "logical_run_started"
+        ? sourceRun.record.thinkingPolicy
+        : undefined;
+    const thinkingPolicy =
+      recordedThinking === undefined
+        ? undefined
+        : requireRecoveredThinkingPolicy(resolved, recordedThinking);
+    const promptContext = promptContextRecordFromRecords(genesis, records);
+    const extensionSources = await resolveExtensionSkillSources(options);
+    const storedSkillContext = skillContextRecordFromRecords(genesis, records);
+    const skillContext =
+      promptContext !== undefined &&
+      hasSkillPromptContext(promptContext) &&
+      storedSkillContext !== undefined
+        ? reconcileExtensionSkillContextV1({
+            context: storedSkillContext,
+            currentSources: extensionSources,
+          }).context
+        : storedSkillContext;
+    const workspaceTrusted = (await inspectWorkspaceTrust()).status === "trusted";
+    const sessionTools = await toolsForSession(
+      sessionId,
+      snapshot.targetIdentity,
+      thinkingPolicy,
+      genesis.record.managedAgentTools,
+      genesis.record.webEvidence,
+    );
+    const researchContext = await managedResearchContextForSession({
+      sessionId,
+      projectId: snapshot.projectId,
+      managedAgentTools: genesis.record.managedAgentTools,
+      promptContext,
+      skillContext,
+      sessionTools,
+      contextProfile: childContextProfile,
+      extensionSources,
+      workspaceTrusted,
+      artifactStore: sharedArtifactStore,
+    });
+    const manager = createAgentManager({
+      artifactStore: sharedArtifactStore,
+      childContextProfile,
+      childModel: resolved.driver,
+      builtInProfileVersion: admission.profile.endsWith(".v2") ? 2 : 1,
+      childSessionStores: managedChildSessionStores,
+      managedStore: managedAgentStore,
+      parentPermissions: options.permissions ?? createPermissionPolicy({ allowedEffects: [] }),
+      ...(hasManagedAgentCoordination(genesis.record.managedAgentTools)
+        ? {
+            parentCoordination: { interactive: () => managedAgentEventListeners.size > 0 },
+            onChildPermissionEvent(event: RuntimeEvent) {
+              for (const listener of listeners) {
+                listener(event);
+              }
+              publishManagedAgentNotification({
+                type: "runtime_event",
+                parentSessionId: sessionId,
+                event,
+              });
+            },
+          }
+        : {}),
+      onManagedAgentStateChanged() {
+        publishManagedAgentNotification({ type: "state_changed", parentSessionId: sessionId });
+      },
+      onChildRuntimeEvent(event) {
+        publishManagedAgentNotification({
+          type: "child_runtime_event",
+          parentSessionId: sessionId,
+          ...event,
+        });
+      },
+      ...(options[sessionManagedAgentInactivityScheduler] === undefined
+        ? {}
+        : { inactivityScheduler: options[sessionManagedAgentInactivityScheduler] }),
+      parentRoot,
+      parentSessionId: sessionId,
+      projectId: snapshot.projectId as `sha256:${string}`,
+      ...(genesis.record.promptContext?.repository === undefined
+        ? {}
+        : { repository: genesis.record.promptContext.repository }),
+      targetIdentity: snapshot.targetIdentity,
+      ...(thinkingPolicy === undefined ? {} : { thinkingPolicy }),
+      workspaceRoot: options.workspaceRoot,
+    });
+    manager.rebindResearchContext(researchContext);
+    activeAgentManagers.set(sessionId, manager);
+    await manager.snapshot();
+    return manager;
+  };
+  const managedAgentControlReceiptFromOutput = (
+    action: ManagedAgentControlReceipt["action"],
+    output: unknown,
+  ): ManagedAgentControlReceipt => {
+    if (output === null || typeof output !== "object" || Array.isArray(output)) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const projected = output as {
+      readonly agentId?: unknown;
+      readonly attemptId?: unknown;
+      readonly revision?: unknown;
+      readonly messageId?: unknown;
+      readonly delivery?: unknown;
+      readonly record?: unknown;
+    };
+    const record = projected.record;
+    if (
+      typeof projected.agentId !== "string" ||
+      typeof projected.attemptId !== "string" ||
+      typeof projected.revision !== "number" ||
+      record === null ||
+      typeof record !== "object" ||
+      Array.isArray(record)
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const projectedRecord = record as {
+      readonly id?: unknown;
+      readonly revision?: unknown;
+      readonly digest?: unknown;
+    };
+    if (
+      typeof projectedRecord.id !== "string" ||
+      typeof projectedRecord.revision !== "number" ||
+      typeof projectedRecord.digest !== "string" ||
+      !/^sha256:[0-9a-f]{64}$/u.test(projectedRecord.digest)
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const messageReceipt = action === "message" || action === "reply";
+    if (
+      messageReceipt &&
+      (typeof projected.messageId !== "string" ||
+        !/^sha256:[0-9a-f]{64}$/u.test(projected.messageId) ||
+        (projected.delivery !== "enqueued" && projected.delivery !== "delivered"))
+    ) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    return {
+      action,
+      agentId: projected.agentId,
+      attemptId: projected.attemptId,
+      revision: projected.revision,
+      ...(messageReceipt
+        ? {
+            messageId: projected.messageId as `sha256:${string}`,
+            delivery: projected.delivery as "enqueued" | "delivered",
+          }
+        : {}),
+      record: {
+        id: projectedRecord.id,
+        revision: projectedRecord.revision,
+        digest: projectedRecord.digest as `sha256:${string}`,
+      },
+    };
+  };
+  const continueManagedAgent = async (
+    input: {
+      readonly sessionId: string;
+      readonly agentId: string;
+      readonly expectedRevision: number;
+      readonly callId: string;
+      readonly task: string;
+      readonly signal: AbortSignal;
+    },
+    kind: "follow_up" | "recovery",
+  ): Promise<ManagedAgentControlResult> => {
+    return withOwner(async (parentRoot) => {
+      const manager = await ensureManagedAgentManagerForControl(
+        input.sessionId,
+        parentRoot,
+        input.signal,
+      );
+      const agent = (await manager.snapshot()).agents.find(
+        (candidate) => candidate.agentId === input.agentId,
+      );
+      const statusAccepted =
+        kind === "recovery"
+          ? agent?.status === "recovery_required"
+          : agent !== undefined &&
+            !isManagedAgentActiveStatus(agent.status) &&
+            agent.status !== "recovery_required" &&
+            agent.status !== "inspection_required";
+      if (agent === undefined || agent.revision !== input.expectedRevision || !statusAccepted) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const result = await manager.followUp({
+        agentId: input.agentId,
+        expectedRevision: input.expectedRevision,
+        callId: input.callId,
+        parentSessionId: input.sessionId,
+        signal: input.signal,
+        task: input.task,
+      });
+      if (result.status !== "completed") {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return {
+        snapshot: await manager.snapshot(),
+        receipt: managedAgentControlReceiptFromOutput(
+          kind === "recovery" ? "recovery" : "follow_up",
+          result.output,
+        ),
+      };
+    }, `session:${input.sessionId}`);
   };
   const drainOwnerOperations = async (): Promise<void> => {
     while (trackedOwnerOperations.size > 0) {
@@ -3685,7 +4141,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             : {
                 [managedAgentPromptSummary]: () =>
                   activeAgentManagers.get(input.sessionId)?.promptSummary() ??
-                  "Managed agents: 0 active, 0 completed, 0 need attention; IDs: ",
+                  "Managed agents: 0 active, 0 terminal, 0 need attention; IDs: ",
               }),
           [sessionDurableContext]: {
             ...(initialMessages.length === 0 ? {} : { hasInheritedMessages: true }),
@@ -3805,111 +4261,18 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ),
           ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
         };
-        const researchContext: ManagedAgentResearchContext | undefined =
-          !hasManagedAgentCoordination(first.record.managedAgentTools)
-            ? activePromptContext === undefined
-              ? undefined
-              : { repository: activePromptContext.repository }
-            : {
-                ...(activePromptContext === undefined
-                  ? {}
-                  : { repository: activePromptContext.repository }),
-                skillIdentities:
-                  activeSkillContext?.registry.candidates.map((candidate) => ({
-                    qualifiedId: candidate.qualifiedId,
-                    digest: candidate.skillMdDigest,
-                  })) ?? [],
-                tools: {
-                  definitions: () =>
-                    sessionTools
-                      .definitions()
-                      .filter((definition) =>
-                        [
-                          "read_skill_resource",
-                          "web_search",
-                          "web_fetch",
-                          "web_open",
-                          "web_find",
-                        ].includes(definition.name),
-                      ),
-                  resolve(name) {
-                    return [
-                      "read_skill_resource",
-                      "web_search",
-                      "web_fetch",
-                      "web_open",
-                      "web_find",
-                    ].includes(name)
-                      ? sessionTools.resolve(name)
-                      : undefined;
-                  },
-                },
-                async resolveSkills(selection) {
-                  const skillContext = await createInitialSkillContextV1({
-                    artifactStore,
-                    effectiveContextTokens: resolved.contextProfile.contextWindowTokens,
-                    estimatorVersion: resolved.contextProfile.estimatorVersion,
-                    projectId: resumed.snapshot.projectId,
-                    sessionId: selection.childSessionId,
-                    userHome: homedir(),
-                    workspaceRoot: options.workspaceRoot,
-                    extensionSources,
-                    includeProjectSources: (await inspectWorkspaceTrust()).status === "trusted",
-                  });
-                  let selectedContext = skillContext;
-                  for (const [index, qualifiedId] of selection.skills.entries()) {
-                    const candidate = selectedContext.registry.candidates.find(
-                      (entry) => entry.qualifiedId === qualifiedId,
-                    );
-                    if (candidate === undefined) {
-                      throw new SessionLifecycleError("session_skill_unavailable");
-                    }
-                    const manifest = await buildSkillResourceManifestV1({
-                      candidate,
-                      workspaceRoot: options.workspaceRoot,
-                      userHome: homedir(),
-                      userHomeDigest: selectedContext.userHomeDigest,
-                      ...(extensionSources.length === 0 ? {} : { extensionSources }),
-                    });
-                    selectedContext = activateSkillContextV1({
-                      context: selectedContext,
-                      qualifiedId,
-                      reason: "user_explicit",
-                      runId: selection.attemptId,
-                      requestId: `${selection.attemptId}:skill:${index + 1}`,
-                      manifest,
-                    }).context;
-                  }
-                  return {
-                    context: selectedContext,
-                    contents: await materializeActiveSkillContents(options, selectedContext),
-                  };
-                },
-                authorizeProjectContextLoad: async () =>
-                  (await inspectWorkspaceTrust()).status === "trusted",
-                ...(extensionSources.length === 0
-                  ? {}
-                  : { extensionSkillSources: extensionSources }),
-                ...(options.extensionHost === undefined
-                  ? {}
-                  : {
-                      withCurrentExtensionSkillSources: <T>(
-                        sources: readonly ExtensionSkillSourceV1[],
-                        operation: () => Promise<T>,
-                      ) =>
-                        withInternalExtensionSkillSourcesCurrent(
-                          options.extensionHost as ExtensionHost,
-                          sources.map((source) => ({
-                            extensionId: source.locator.extensionId,
-                            packageName: source.locator.packageName,
-                            packageVersion: source.locator.packageVersion,
-                            lifecycleRevision: source.lifecycleRevision,
-                            lifecycleDigest: source.lifecycleDigest,
-                          })),
-                          operation,
-                        ),
-                    }),
-              };
+        const researchContext = await managedResearchContextForSession({
+          sessionId: input.sessionId,
+          projectId: resumed.snapshot.projectId,
+          managedAgentTools: first.record.managedAgentTools,
+          promptContext: activePromptContext,
+          skillContext: activeSkillContext,
+          sessionTools,
+          contextProfile: resolved.contextProfile,
+          extensionSources,
+          workspaceTrusted,
+          artifactStore,
+        });
         const existingAgentManager = activeAgentManagers.get(input.sessionId);
         const agentManager =
           isLongLivedManagedAgentTools(first.record.managedAgentTools) &&
@@ -3922,6 +4285,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                 builtInProfileVersion: managedAgentToolsVersion(first.record.managedAgentTools),
                 childSessionStores: managedChildSessionStores,
                 managedStore: managedAgentStore,
+                ...(options[sessionManagedAgentInactivityScheduler] === undefined
+                  ? {}
+                  : {
+                      inactivityScheduler: options[sessionManagedAgentInactivityScheduler],
+                    }),
                 parentPermissions:
                   options.permissions ?? createPermissionPolicy({ allowedEffects: [] }),
                 ...(hasManagedAgentCoordination(first.record.managedAgentTools)
@@ -3929,87 +4297,31 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                       parentCoordination: {
                         interactive: () => managedAgentEventListeners.size > 0,
                       },
-                      researchSkillIdentities:
-                        activeSkillContext?.registry.candidates.map((candidate) => ({
-                          qualifiedId: candidate.qualifiedId,
-                          digest: candidate.skillMdDigest,
-                        })) ?? [],
-                      researchTools: {
-                        definitions: () =>
-                          sessionTools
-                            .definitions()
-                            .filter((definition) =>
-                              [
-                                "read_skill_resource",
-                                "web_search",
-                                "web_fetch",
-                                "web_open",
-                                "web_find",
-                              ].includes(definition.name),
-                            ),
-                        resolve(name) {
-                          return [
-                            "read_skill_resource",
-                            "web_search",
-                            "web_fetch",
-                            "web_open",
-                            "web_find",
-                          ].includes(name)
-                            ? sessionTools.resolve(name)
-                            : undefined;
-                        },
-                      },
-                      async resolveResearchSkills(selection) {
-                        const skillContext = await createInitialSkillContextV1({
-                          artifactStore,
-                          effectiveContextTokens: resolved.contextProfile.contextWindowTokens,
-                          estimatorVersion: resolved.contextProfile.estimatorVersion,
-                          projectId: resumed.snapshot.projectId,
-                          sessionId: selection.childSessionId,
-                          userHome: homedir(),
-                          workspaceRoot: options.workspaceRoot,
-                          extensionSources,
-                          includeProjectSources: workspaceTrusted,
-                        });
-                        let selectedContext = skillContext;
-                        for (const [index, qualifiedId] of selection.skills.entries()) {
-                          const candidate = selectedContext.registry.candidates.find(
-                            (entry) => entry.qualifiedId === qualifiedId,
-                          );
-                          if (candidate === undefined) {
-                            throw new SessionLifecycleError("session_skill_unavailable");
-                          }
-                          const manifest = await buildSkillResourceManifestV1({
-                            candidate,
-                            workspaceRoot: options.workspaceRoot,
-                            userHome: homedir(),
-                            userHomeDigest: selectedContext.userHomeDigest,
-                            ...(extensionSources.length === 0 ? {} : { extensionSources }),
-                          });
-                          selectedContext = activateSkillContextV1({
-                            context: selectedContext,
-                            qualifiedId,
-                            reason: "user_explicit",
-                            runId: selection.attemptId,
-                            requestId: `${selection.attemptId}:skill:${index + 1}`,
-                            manifest,
-                          }).context;
-                        }
-                        return {
-                          context: selectedContext,
-                          contents: await materializeActiveSkillContents(options, selectedContext),
-                        };
-                      },
                       onChildPermissionEvent(event) {
                         for (const listener of listeners) {
                           listener(event);
                         }
-                        for (const listener of managedAgentEventListeners) {
-                          listener({ parentSessionId: input.sessionId, event });
-                        }
+                        publishManagedAgentNotification({
+                          type: "runtime_event",
+                          parentSessionId: input.sessionId,
+                          event,
+                        });
                       },
                     }
                   : {}),
+                onManagedAgentStateChanged() {
+                  publishManagedAgentNotification({
+                    type: "state_changed",
+                    parentSessionId: input.sessionId,
+                  });
+                },
+                onChildRuntimeEvent(event) {
+                  publishManagedAgentNotification({
+                    type: "child_runtime_event",
+                    parentSessionId: input.sessionId,
+                    ...event,
+                  });
+                },
                 parentRoot,
                 parentSessionId: input.sessionId,
                 projectId: resumed.snapshot.projectId as `sha256:${string}`,
@@ -4811,7 +5123,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         return manager.snapshot();
       }
       if (options.managedAgentTools === undefined) {
-        return { counts: { active: 0, completed: 0, attention: 0 }, agents: [] };
+        return { counts: { active: 0, terminal: 0, attention: 0 }, agents: [] };
       }
       const session = await inspectSession({ sessionId: input.sessionId });
       if (session.schemaVersion !== 3) {
@@ -4828,7 +5140,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         return event?.type === "tool_requested" && event.name === "spawn_agent";
       });
       if (!hasManagedAgentAdmission) {
-        return { counts: { active: 0, completed: 0, attention: 0 }, agents: [] };
+        return { counts: { active: 0, terminal: 0, attention: 0 }, agents: [] };
       }
       if (isLongLivedManagedAgentTools(options.managedAgentTools)) {
         try {
@@ -4852,7 +5164,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           }
         }
       }
-      return managedAgentSnapshotFromRecords(await managedAgentStore.read(), input.sessionId);
+      const records = await managedAgentStore.read();
+      return managedAgentSnapshotWithChildHistories({
+        records,
+        parentSessionId: input.sessionId,
+        childSessionStores: managedChildSessionStores,
+      });
     },
     async cancelManagedAgent(input) {
       const manager = activeAgentManagers.get(input.sessionId);
@@ -4863,7 +5180,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       if (result.status !== "completed") {
         throw new SessionLifecycleError("session_invalid");
       }
-      return manager.snapshot();
+      return {
+        snapshot: await manager.snapshot(),
+        receipt: managedAgentControlReceiptFromOutput("cancel", result.output),
+      };
     },
     async sendManagedAgentMessage(input) {
       const manager = activeAgentManagers.get(input.sessionId);
@@ -4887,7 +5207,58 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       if (result.status !== "completed") {
         throw new SessionLifecycleError("session_invalid");
       }
-      return manager.snapshot();
+      return {
+        snapshot: await manager.snapshot(),
+        receipt: managedAgentControlReceiptFromOutput(
+          input.attentionId === undefined ? "message" : "reply",
+          result.output,
+        ),
+      };
+    },
+    async followUpManagedAgent(input) {
+      return continueManagedAgent(input, "follow_up");
+    },
+    async recoverManagedAgent(input) {
+      return continueManagedAgent(input, "recovery");
+    },
+    async [sessionManagedAgentTranscriptReader](input) {
+      const records = await managedAgentStore.read();
+      const agentRecords = records.filter((record) => record.agentId === input.agentId);
+      const admission = records.find(
+        (record) =>
+          record.type === "managed_agent_admitted" &&
+          record.parentSessionId === input.sessionId &&
+          record.agentId === input.agentId &&
+          record.attemptId === input.attemptId &&
+          record.profile !== "reviewer.v1",
+      );
+      const terminal = records.find(
+        (record) =>
+          record.type === "managed_agent_terminal" && record.attemptId === input.attemptId,
+      );
+      if (
+        admission?.type !== "managed_agent_admitted" ||
+        agentRecords.length !== input.expectedRevision
+      ) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const childStore = await managedChildSessionStores.open(admission.childSessionId);
+      if (childStore === undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      const childRecords = await childStore.read();
+      if ((childRecords.at(-1)?.sequence ?? 0) !== input.expectedThroughSequence) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      return {
+        childSessionId: admission.childSessionId,
+        records: childRecords,
+        ...(terminal?.type === "managed_agent_terminal" &&
+        (terminal.status === "failed" || terminal.status === "recovery_required") &&
+        terminal.partialOutput !== undefined
+          ? { partialOutput: terminal.partialOutput }
+          : {}),
+      };
     },
     async inspectWorkspaceTrust() {
       return inspectWorkspaceTrust();
