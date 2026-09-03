@@ -1047,8 +1047,12 @@ function createManagedSessionCapability(
           projectId: active.projectId as `sha256:${string}`,
           signal: active.abortController.signal,
         });
-        const childModel = resolved.childModel ?? runtime.childModel;
-        const childContextProfile = resolved.childContextProfile ?? runtime.childContextProfile;
+        const childModel =
+          policyVersion === 2 ? resolved.childModel : (resolved.childModel ?? runtime.childModel);
+        const childContextProfile =
+          policyVersion === 2
+            ? resolved.childContextProfile
+            : (resolved.childContextProfile ?? runtime.childContextProfile);
         if (childModel === undefined || childContextProfile === undefined) {
           throw new TypeError("The managed session target is unavailable.");
         }
@@ -1338,23 +1342,7 @@ function validateManagedSessionRequest(
       "maximumCumulativeTokens",
       "maximumTurns",
     ]) ||
-    !hasExactKeys(input.output, ["id", "version"]) ||
-    !hasExactKeys(input.profile, ["id", "version"]) ||
-    !Array.isArray(input.evidence) ||
-    input.evidence.length === 0 ||
-    input.evidence.length > 8 ||
-    input.profile?.id !== "reviewer.v1" ||
-    input.profile.version !== 1 ||
-    !Array.isArray(input.selectedSkills) ||
-    input.selectedSkills.length !== 0 ||
-    typeof input.managedRole !== "string" ||
-    input.managedRole.length === 0 ||
-    !isStrictUnicode(input.managedRole) ||
-    Buffer.byteLength(input.managedRole, "utf8") > 16 * 1024 ||
-    typeof input.task !== "string" ||
-    input.task.length === 0 ||
-    !isStrictUnicode(input.task) ||
-    Buffer.byteLength(input.task, "utf8") > 16 * 1024 ||
+    managedSessionEnvelopeIsInvalid(input, outputCodec) ||
     !Number.isSafeInteger(input.limits.maximumTurns) ||
     input.limits.maximumTurns <= 0 ||
     input.limits.maximumTurns > 8 ||
@@ -1364,10 +1352,7 @@ function validateManagedSessionRequest(
     !Number.isSafeInteger(input.limits.deadlineMilliseconds) ||
     input.limits.deadlineMilliseconds <= 0 ||
     input.limits.deadlineMilliseconds > 300_000 ||
-    input.limits.deadlineMilliseconds > Date.parse(operationDeadlineAt) - Date.now() ||
-    outputCodec === undefined ||
-    input.output.id !== outputCodec.id ||
-    input.output.version !== outputCodec.version
+    input.limits.deadlineMilliseconds > Date.parse(operationDeadlineAt) - Date.now()
   ) {
     throw new TypeError("The managed session request is invalid.");
   }
@@ -1401,6 +1386,19 @@ function validateManagedSessionV2Request(
       (!hasExactKeys(input.limits, ["maximumCumulativeTokens"]) ||
         !Number.isSafeInteger(input.limits.maximumCumulativeTokens) ||
         input.limits.maximumCumulativeTokens <= 0)) ||
+    managedSessionEnvelopeIsInvalid(input, outputCodec)
+  ) {
+    throw new TypeError("The managed session request is invalid.");
+  }
+}
+
+function managedSessionEnvelopeIsInvalid(
+  input: ExtensionManagedSessionRequest | ExtensionManagedSessionV2Request,
+  outputCodec: ExtensionOperationRegistration["managedOutput"],
+): boolean {
+  return (
+    typeof input !== "object" ||
+    input === null ||
     !hasExactKeys(input.output, ["id", "version"]) ||
     !hasExactKeys(input.profile, ["id", "version"]) ||
     !Array.isArray(input.evidence) ||
@@ -1421,9 +1419,7 @@ function validateManagedSessionV2Request(
     outputCodec === undefined ||
     input.output.id !== outputCodec.id ||
     input.output.version !== outputCodec.version
-  ) {
-    throw new TypeError("The managed session request is invalid.");
-  }
+  );
 }
 
 function isStrictUnicode(value: string): boolean {

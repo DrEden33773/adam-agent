@@ -580,6 +580,7 @@ test("ExtensionHost v2 reviewer inherits origin policy and the Host default cumu
     reasoningArtifact: "provider_reasoning" as const,
   } as const;
   const requests: ModelRequest[] = [];
+  let resolveExactOrigin = true;
   const childModel: ModelDriver = {
     async *stream(request) {
       requests.push(request);
@@ -620,16 +621,20 @@ test("ExtensionHost v2 reviewer inherits origin policy and the Host default cumu
         },
       ],
       managedSession: {
+        childContextProfile: preparedDirectDeepSeekV2ContextProfile,
+        childModel,
         childSessionStores,
         managedStore,
         parentPermissions: createPermissionPolicy({ allowedEffects: [] }),
         async resolveOrigin() {
-          return {
-            targetIdentity,
-            childContextProfile: contextProfile,
-            childModel,
-            thinkingPolicy,
-          };
+          return resolveExactOrigin
+            ? {
+                targetIdentity,
+                childContextProfile: contextProfile,
+                childModel,
+                thinkingPolicy,
+              }
+            : { targetIdentity };
         },
         workspaceRoot,
       },
@@ -672,6 +677,26 @@ test("ExtensionHost v2 reviewer inherits origin policy and the Host default cumu
         }),
       ]),
     );
+
+    resolveExactOrigin = false;
+    const incomplete = await host.operations.startLinked({
+      contributionId: "fixture.managed-review-v2",
+      idempotencyKey: "managed-review-v2-incomplete-origin-1",
+      input: { revision: "incomplete-origin" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: "00000000-0000-4000-8000-000000000001",
+        sourceSequence: 3,
+      },
+    });
+    const incompleteEvents = await collectOperationEvents(host, incomplete.operationId);
+    expect(incompleteEvents.at(-1)).toMatchObject({
+      event: {
+        error: { code: "operation_capability_execution_failed" },
+        type: "operation_failed",
+      },
+    });
+    expect(requests).toHaveLength(1);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
@@ -888,7 +913,11 @@ test("ExtensionHost v2 auto-aborts an inactive reviewer with a typed stalled ter
         managedStore,
         parentPermissions: createPermissionPolicy({ allowedEffects: [] }),
         async resolveOrigin() {
-          return { targetIdentity };
+          return {
+            targetIdentity,
+            childContextProfile: preparedDirectDeepSeekV2ContextProfile,
+            childModel,
+          };
         },
         workspaceRoot,
       } as NonNullable<Parameters<typeof createExtensionHost>[0]["managedSession"]>,
@@ -1037,7 +1066,11 @@ test("ExtensionHost v2 pauses only managed wait and resumes the remaining operat
         managedStore: createInMemoryManagedAgentStore(),
         parentPermissions: createPermissionPolicy({ allowedEffects: [] }),
         async resolveOrigin() {
-          return { targetIdentity };
+          return {
+            targetIdentity,
+            childContextProfile: preparedDirectDeepSeekV2ContextProfile,
+            childModel,
+          };
         },
         workspaceRoot,
       },
@@ -1182,7 +1215,11 @@ test("ExtensionHost v2 cancellation settles the managed wait without restarting 
         managedStore,
         parentPermissions: createPermissionPolicy({ allowedEffects: [] }),
         async resolveOrigin() {
-          return { targetIdentity };
+          return {
+            targetIdentity,
+            childContextProfile: preparedDirectDeepSeekV2ContextProfile,
+            childModel,
+          };
         },
         workspaceRoot,
       },
@@ -1299,7 +1336,11 @@ test("ExtensionHost runs one codec-validated reviewer child from immutable opera
         managedStore,
         parentPermissions: createPermissionPolicy({ allowedEffects: [] }),
         async resolveOrigin() {
-          return { targetIdentity };
+          return {
+            targetIdentity,
+            childContextProfile: preparedDirectDeepSeekV2ContextProfile,
+            childModel,
+          };
         },
         workspaceRoot,
       },

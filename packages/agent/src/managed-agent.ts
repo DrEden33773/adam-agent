@@ -2670,17 +2670,27 @@ export type AgentManager = {
       readonly digest: `sha256:${string}`;
     }[];
   }): Promise<ToolResult>;
-  runReviewer(input: {
-    readonly callId: string;
-    readonly managedRole: string;
-    readonly maximumDeadlineMilliseconds?: number;
-    readonly maximumTokens: number;
-    readonly maximumTurns?: number;
-    readonly parentSessionId: string;
-    readonly policyVersion?: 1 | 2;
-    readonly signal: AbortSignal;
-    readonly task: string;
-  }): Promise<ToolResult>;
+  runReviewer(
+    input: {
+      readonly callId: string;
+      readonly managedRole: string;
+      readonly maximumTokens: number;
+      readonly parentSessionId: string;
+      readonly signal: AbortSignal;
+      readonly task: string;
+    } & (
+      | {
+          readonly maximumDeadlineMilliseconds: number;
+          readonly maximumTurns: number;
+          readonly policyVersion?: 1;
+        }
+      | {
+          readonly maximumDeadlineMilliseconds?: never;
+          readonly maximumTurns?: never;
+          readonly policyVersion: 2;
+        }
+    ),
+  ): Promise<ToolResult>;
   list(input?: {
     readonly status?: "active" | "terminal" | ManagedAgentSummary["status"];
     readonly limit?: number;
