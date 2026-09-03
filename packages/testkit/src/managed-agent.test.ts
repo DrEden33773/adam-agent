@@ -7020,6 +7020,60 @@ test("PresentationSession replies to one exact attention without waking a parent
     if (terminalAgent === undefined) {
       throw new Error("The terminal managed child was unavailable for transcript inspection.");
     }
+    const absentManagedArtifact = {
+      id: `sha256:${"f".repeat(64)}`,
+      mediaType: "text/plain",
+      byteCount: 8,
+      source: "tool_output" as const,
+    };
+    await expect(
+      presentation.dispatch({
+        type: "read_managed_agent_artifact",
+        sessionId: created.sessionId,
+        agentId,
+        attemptId: terminalAgent.attemptId,
+        expectedRevision: terminalAgent.revision - 1,
+        expectedThroughSequence: terminalAgent.transcript.throughSequence,
+        artifact: absentManagedArtifact,
+        range: { offset: 0, maximumBytes: 16 * 1024 },
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "stale_interaction" });
+    await expect(
+      presentation.dispatch({
+        type: "read_managed_agent_artifact",
+        sessionId: created.sessionId,
+        agentId,
+        attemptId: terminalAgent.attemptId,
+        expectedRevision: terminalAgent.revision,
+        expectedThroughSequence: terminalAgent.transcript.throughSequence - 1,
+        artifact: absentManagedArtifact,
+        range: { offset: 0, maximumBytes: 16 * 1024 },
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "stale_interaction" });
+    await expect(
+      presentation.dispatch({
+        type: "read_managed_agent_artifact",
+        sessionId: created.sessionId,
+        agentId,
+        attemptId: terminalAgent.attemptId,
+        expectedRevision: terminalAgent.revision,
+        expectedThroughSequence: terminalAgent.transcript.throughSequence,
+        artifact: absentManagedArtifact,
+        range: { offset: 0, maximumBytes: 16 * 1024 + 1 },
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "not_available" });
+    await expect(
+      presentation.dispatch({
+        type: "read_managed_agent_artifact",
+        sessionId: created.sessionId,
+        agentId,
+        attemptId: terminalAgent.attemptId,
+        expectedRevision: terminalAgent.revision,
+        expectedThroughSequence: terminalAgent.transcript.throughSequence,
+        artifact: absentManagedArtifact,
+        range: { offset: 0, maximumBytes: 16 * 1024 },
+      }),
+    ).resolves.toMatchObject({ status: "rejected", code: "stale_interaction" });
     const latestTranscript = await presentation.dispatch({
       type: "read_managed_agent_transcript",
       sessionId: created.sessionId,
