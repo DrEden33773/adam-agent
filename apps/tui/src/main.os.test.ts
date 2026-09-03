@@ -838,9 +838,9 @@ test("the production TUI reviews real Git changes through the exact public Eve a
   const corePackage = JSON.parse(await readFile(join(coreRoot, "package.json"), "utf8"));
   expect(adapterPackage).toMatchObject({
     name: "@eve-reviewer/adam-extension",
-    version: "0.4.0",
+    version: "0.5.0",
     dependencies: { "@eve-reviewer/core": "0.3.0" },
-    peerDependencies: { "@adam-agent/extension-api": "0.4.0" },
+    peerDependencies: { "@adam-agent/extension-api": "0.5.0" },
   });
   expect(corePackage).toMatchObject({ name: "@eve-reviewer/core", version: "0.3.0" });
   await mkdir(configDirectory, { recursive: true, mode: 0o700 });
@@ -858,11 +858,11 @@ test("the production TUI reviews real Git changes through the exact public Eve a
             { id: "adam.analyzer-execution.biome@1", version: "1.0.0" },
             { id: "adam.artifact.publish@1", version: "1.0.0" },
             { id: "adam.storage.records@1", version: "1.0.0" },
-            { id: "adam.managed-session@1", version: "1.0.0" },
+            { id: "adam.managed-session@2", version: "2.0.0" },
           ],
           packageName: "@eve-reviewer/adam-extension",
           packageRoot: adapterRoot,
-          packageVersion: "0.4.0",
+          packageVersion: "0.5.0",
         },
       ],
     }),
@@ -904,7 +904,7 @@ test("the production TUI reviews real Git changes through the exact public Eve a
     await fixture.waitFor("Adam · New session");
     await fixture.resize(120, 40);
     fixture.write("/review\r");
-    await fixture.waitFor("eve-reviewer@0.4.0");
+    await fixture.waitFor("eve-reviewer@0.5.0");
     await fixture.waitFor("Completed");
     await fixture.waitFor("Report · eve-reviewer.review-result@1 · application/json");
 
