@@ -3,6 +3,9 @@ import {
   type Component,
   fuzzyFilter,
   getKeybindings,
+  isKeyRelease,
+  isKeyRepeat,
+  matchesKey,
   truncateToWidth,
   visibleWidth,
   wrapTextWithAnsi,
@@ -10,6 +13,7 @@ import {
 
 import { adamCommandRegistry } from "./command-registry.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
+import { textKeyInput } from "./text-key-input.js";
 import type { AdamTuiTheme } from "./theme.js";
 
 export class TargetPicker implements Component {
@@ -130,7 +134,10 @@ export class TargetPicker implements Component {
       );
       return;
     }
-    if (this.#focus === "details" && data === "c") {
+    if (this.#focus === "details" && matchesKey(data, "c")) {
+      if (isKeyRepeat(data) || isKeyRelease(data)) {
+        return;
+      }
       const action = this.#connectionAction();
       if (action !== null) {
         this.#onCheckConnection(action.target);
@@ -559,8 +566,9 @@ class TargetSearchList {
       this.#restoreSelection(selectedTargetId);
       return;
     }
-    if (isSearchText(data)) {
-      this.#query += safeTerminalText(data);
+    const text = textKeyInput(data);
+    if (text !== undefined) {
+      this.#query += safeTerminalText(text);
       this.#restoreSelection(null);
       return;
     }
@@ -730,8 +738,4 @@ function sideBySide(
     );
   }
   return lines;
-}
-
-function isSearchText(data: string): boolean {
-  return data.length > 0 && !/[\p{Cc}\p{Cf}]/u.test(data);
 }

@@ -25,6 +25,7 @@ export type SearxngSearchConfigurationV1 = {
 export type WebSearchConfigurationSnapshot = {
   readonly status: "configured" | "invalid" | "unconfigured" | "unsafe";
   readonly provider: SearxngSearchConfigurationV1 | null;
+  readonly syntheticDnsRange?: string | null;
   readonly diagnostic: {
     readonly code: "web_search_configuration_invalid" | "web_search_configuration_unsafe";
     readonly message: string;
@@ -43,6 +44,11 @@ export type WebSearchConfigurationController = WebSearchConfiguration & {
     readonly signal: AbortSignal;
   }): Promise<WebSearchConfigurationSnapshot>;
   clear(): Promise<WebSearchConfigurationSnapshot>;
+  setSyntheticDnsRange(range: string | null): Promise<WebSearchConfigurationSnapshot>;
+};
+
+type WebConfigurationStorage = UserConfigurationStorage & {
+  runExclusive?<T>(operation: () => Promise<T>): Promise<T>;
 };
 
 export function createWebSearchConfiguration(options: {
@@ -74,14 +80,26 @@ export function createWebSearchConfigurationController(options: {
 
 /** Tests only through the internal-testing entry. */
 export function createWebSearchConfigurationWithStorageForTesting(
-  storage: UserConfigurationStorage,
+  storage: WebConfigurationStorage,
 ): WebSearchConfigurationController {
   return createWebSearchConfigurationFromStorage(storage);
 }
 
 function createWebSearchConfigurationFromStorage(
-  storage: UserConfigurationStorage,
+  storage: WebConfigurationStorage,
 ): WebSearchConfigurationController {
+  let mutationTail: Promise<unknown> = Promise.resolve();
+  const runMutation = <T>(operation: () => Promise<T>): Promise<T> => {
+    if (storage.runExclusive !== undefined) {
+      return storage.runExclusive(operation);
+    }
+    const result = mutationTail.then(operation, operation);
+    mutationTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
   const load = async (): Promise<WebSearchConfigurationSnapshot> => {
     const stored = await storage.read().catch(() => ({ status: "unsafe" as const }));
     if (stored.status === "missing") {
@@ -108,12 +126,16 @@ function createWebSearchConfigurationFromStorage(
         endpointDigest: endpointDigest(normalized),
       },
     };
-    const serialized = serializeWebSearchConfiguration(provider);
-    if (Buffer.byteLength(serialized, "utf8") > maximumWebConfigurationBytes) {
-      throw new TypeError("The Web Search configuration exceeds its byte limit.");
-    }
-    await storage.write(serialized, { beforeCommit });
-    return { status: "configured", provider, diagnostic: null };
+    return runMutation(async () => {
+      const current = await load();
+      const syntheticDnsRange = current.syntheticDnsRange ?? null;
+      const serialized = serializeWebSearchConfiguration(provider, syntheticDnsRange);
+      if (Buffer.byteLength(serialized, "utf8") > maximumWebConfigurationBytes) {
+        throw new TypeError("The Web Search configuration exceeds its byte limit.");
+      }
+      await storage.write(serialized, { beforeCommit });
+      return { status: "configured", provider, syntheticDnsRange, diagnostic: null };
+    });
   };
   return {
     load,
@@ -133,8 +155,30 @@ function createWebSearchConfigurationFromStorage(
       return activateSearxng(normalized, () => signal.throwIfAborted());
     },
     async clear() {
-      await storage.write(serializeWebSearchConfiguration(null));
-      return unconfiguredSnapshot();
+      return runMutation(async () => {
+        const current = await load();
+        await storage.write(
+          serializeWebSearchConfiguration(null, current.syntheticDnsRange ?? null),
+        );
+        return unconfiguredSnapshot(current.syntheticDnsRange ?? null);
+      });
+    },
+    async setSyntheticDnsRange(range) {
+      const normalized = range === null ? null : normalizeWebSyntheticDnsRange(range);
+      if (range !== null && normalized === undefined) {
+        throw new TypeError(
+          "The synthetic DNS range must be an IPv4 CIDR subnet inside 198.18.0.0/15.",
+        );
+      }
+      const admittedRange = normalized ?? null;
+      return runMutation(async () => {
+        const current = await load();
+        const provider = current.status === "configured" ? current.provider : null;
+        await storage.write(serializeWebSearchConfiguration(provider, admittedRange));
+        return provider === null
+          ? unconfiguredSnapshot(admittedRange)
+          : { status: "configured", provider, syntheticDnsRange: admittedRange, diagnostic: null };
+      });
     },
   };
 }
@@ -156,12 +200,27 @@ function parseWebSearchConfiguration(text: string): WebSearchConfigurationSnapsh
   if (!isPlainRecord(parsed)) {
     return invalidSnapshot();
   }
-  const { schemaVersion, searchProvider } = parsed;
-  if (Object.keys(parsed).length !== 2 || schemaVersion !== 1) {
+  const { schemaVersion, searchProvider, syntheticDnsRange: storedSyntheticDnsRange } = parsed;
+  let syntheticDnsRange: string | null;
+  if (schemaVersion === 1 && Object.keys(parsed).length === 2) {
+    syntheticDnsRange = null;
+  } else if (
+    schemaVersion === 2 &&
+    Object.keys(parsed).length === 3 &&
+    (storedSyntheticDnsRange === null || typeof storedSyntheticDnsRange === "string")
+  ) {
+    syntheticDnsRange =
+      storedSyntheticDnsRange === null
+        ? null
+        : (normalizeWebSyntheticDnsRange(storedSyntheticDnsRange) ?? null);
+    if (storedSyntheticDnsRange !== null && syntheticDnsRange !== storedSyntheticDnsRange) {
+      return invalidSnapshot();
+    }
+  } else {
     return invalidSnapshot();
   }
   if (searchProvider === null) {
-    return unconfiguredSnapshot();
+    return unconfiguredSnapshot(syntheticDnsRange);
   }
   if (!isPlainRecord(searchProvider) || Object.keys(searchProvider).length !== 3) {
     return invalidSnapshot();
@@ -197,8 +256,25 @@ function parseWebSearchConfiguration(text: string): WebSearchConfigurationSnapsh
         endpointDigest: activatedEndpointDigest as `sha256:${string}`,
       },
     },
+    syntheticDnsRange,
     diagnostic: null,
   };
+}
+
+export function normalizeWebSyntheticDnsRange(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (Buffer.byteLength(trimmed, "utf8") > 64 || !ipaddr.IPv4.isValidCIDRFourPartDecimal(trimmed)) {
+    return undefined;
+  }
+  const [, prefix] = ipaddr.IPv4.parseCIDR(trimmed);
+  if (prefix < 15) {
+    return undefined;
+  }
+  const network = ipaddr.IPv4.networkAddressFromCIDR(trimmed);
+  if (!network.match(ipaddr.IPv4.parseCIDR("198.18.0.0/15"))) {
+    return undefined;
+  }
+  return `${network.toString()}/${prefix}`;
 }
 
 export function normalizeSearxngEndpoint(value: string): string | undefined {
@@ -241,18 +317,24 @@ function endpointDigest(endpoint: string): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(endpoint).digest("hex")}`;
 }
 
-function serializeWebSearchConfiguration(provider: SearxngSearchConfigurationV1 | null): string {
-  return `${JSON.stringify({ schemaVersion: 1, searchProvider: provider })}\n`;
+function serializeWebSearchConfiguration(
+  provider: SearxngSearchConfigurationV1 | null,
+  syntheticDnsRange: string | null,
+): string {
+  return `${JSON.stringify({ schemaVersion: 2, searchProvider: provider, syntheticDnsRange })}\n`;
 }
 
-function unconfiguredSnapshot(): WebSearchConfigurationSnapshot {
-  return { status: "unconfigured", provider: null, diagnostic: null };
+function unconfiguredSnapshot(
+  syntheticDnsRange: string | null = null,
+): WebSearchConfigurationSnapshot {
+  return { status: "unconfigured", provider: null, syntheticDnsRange, diagnostic: null };
 }
 
 function invalidSnapshot(): WebSearchConfigurationSnapshot {
   return {
     status: "invalid",
     provider: null,
+    syntheticDnsRange: null,
     diagnostic: {
       code: "web_search_configuration_invalid",
       message: "The saved Web Search configuration is invalid.",
@@ -264,6 +346,7 @@ function unsafeSnapshot(): WebSearchConfigurationSnapshot {
   return {
     status: "unsafe",
     provider: null,
+    syntheticDnsRange: null,
     diagnostic: {
       code: "web_search_configuration_unsafe",
       message: "The saved Web Search configuration is not an owner-only ordinary file.",

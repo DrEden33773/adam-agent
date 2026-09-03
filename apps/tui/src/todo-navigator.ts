@@ -3,7 +3,15 @@ import type {
   TodoEntityResource,
   TodoPageResource,
 } from "@adam-agent/presentation";
-import { type Component, getKeybindings } from "@earendil-works/pi-tui";
+import {
+  type Component,
+  getKeybindings,
+  isKeyRelease,
+  isKeyRepeat,
+  matchesKey,
+  truncateToWidth,
+  wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { type SearchableSelectItem, SearchableSelectList } from "./searchable-select-list.js";
@@ -12,10 +20,14 @@ import type { AdamTuiTheme } from "./theme.js";
 type TodoSummary = NonNullable<ActiveSessionDisplay["todo"]>;
 
 export class TodoNavigator implements Component {
+  #detailMaximumScroll = 0;
+  #detailPageSize = 1;
+  #detailScrollTop = 0;
   readonly #onChange: () => void;
   readonly #onClose: () => void;
   readonly #onGet: (id: string) => Promise<TodoEntityResource>;
   readonly #onList: (cursor: string | null) => Promise<TodoPageResource>;
+  readonly #maximumContentHeight: () => number;
   readonly #onCompactCollapseChange: ((collapsed: boolean) => void) | undefined;
   readonly #summary: TodoSummary;
   readonly #theme: AdamTuiTheme;
@@ -30,6 +42,7 @@ export class TodoNavigator implements Component {
 
   constructor(options: {
     readonly initialPage: TodoPageResource;
+    readonly maximumContentHeight?: () => number;
     readonly compactCollapsed?: boolean;
     readonly onChange: () => void;
     readonly onClose: () => void;
@@ -39,6 +52,7 @@ export class TodoNavigator implements Component {
     readonly summary: TodoSummary;
     readonly theme: AdamTuiTheme;
   }) {
+    this.#maximumContentHeight = options.maximumContentHeight ?? (() => 22);
     this.#onChange = options.onChange;
     this.#onClose = options.onClose;
     this.#onGet = options.onGet;
@@ -55,14 +69,31 @@ export class TodoNavigator implements Component {
     if (this.#detail !== null && getKeybindings().matches(data, "tui.select.cancel")) {
       this.#generation += 1;
       this.#detail = null;
+      this.#detailScrollTop = 0;
       this.#notice = null;
       this.#onChange();
       return;
     }
     if (this.#detail !== null) {
+      if (getKeybindings().matches(data, "tui.select.pageUp")) {
+        this.#detailScrollTop = Math.max(0, this.#detailScrollTop - this.#detailPageSize);
+        this.#onChange();
+        return;
+      }
+      if (getKeybindings().matches(data, "tui.select.pageDown")) {
+        this.#detailScrollTop = Math.min(
+          this.#detailMaximumScroll,
+          this.#detailScrollTop + this.#detailPageSize,
+        );
+        this.#onChange();
+        return;
+      }
       return;
     }
-    if (data === "c" && this.#onCompactCollapseChange !== undefined) {
+    if (matchesKey(data, "c") && this.#onCompactCollapseChange !== undefined) {
+      if (isKeyRepeat(data) || isKeyRelease(data)) {
+        return;
+      }
       this.#compactCollapsed = !this.#compactCollapsed;
       this.#onCompactCollapseChange(this.#compactCollapsed);
       this.#onChange();
@@ -91,10 +122,10 @@ export class TodoNavigator implements Component {
   }
 
   render(width: number): string[] {
+    const maximumContentHeight = Math.max(8, Math.floor(this.#maximumContentHeight()));
     if (this.#detail !== null) {
       const { item } = this.#detail;
-      return [
-        this.#theme.toolTitle("Todo detail · read-only"),
+      const bodyLines = [
         safeTerminalText(item.title),
         `${item.status} · item revision ${item.itemRevision} · created ${item.createdOrdinal}`,
         `ID ${item.id}`,
@@ -106,22 +137,35 @@ export class TodoNavigator implements Component {
         item.dependencyIds.length === 0
           ? this.#theme.muted("Dependencies: none")
           : `Dependencies: ${item.dependencyIds.join(", ")}`,
-        "",
-        this.#theme.muted("Esc back · Ctrl+Q exit"),
-      ];
+      ].flatMap((line) => (line === "" ? [""] : wrapTextWithAnsi(line, Math.max(1, width))));
+      this.#detailPageSize = Math.max(1, maximumContentHeight - 2);
+      this.#detailMaximumScroll = Math.max(0, bodyLines.length - this.#detailPageSize);
+      this.#detailScrollTop = Math.min(this.#detailScrollTop, this.#detailMaximumScroll);
+      const pageCount = Math.max(1, Math.ceil(bodyLines.length / this.#detailPageSize));
+      const page = Math.min(pageCount, Math.ceil(this.#detailScrollTop / this.#detailPageSize) + 1);
+      return [
+        this.#theme.toolTitle("Todo detail · read-only"),
+        ...bodyLines.slice(this.#detailScrollTop, this.#detailScrollTop + this.#detailPageSize),
+        this.#theme.muted(`${page}/${pageCount} · PgUp/PgDn · Esc back`),
+      ].map((line) => truncateToWidth(line, width));
     }
     const counts = this.#summary.counts;
+    const noticeLines = this.#notice === null ? [] : [this.#theme.muted(this.#notice)];
+    const listHeight = Math.max(1, maximumContentHeight - 4 - noticeLines.length);
+    this.#list.setMaximumVisible(Math.min(8, Math.max(1, listHeight - 3)));
+    const listLines = this.#list.render(width, listHeight);
     return [
       this.#theme.toolTitle(`Todos · revision ${this.#summary.storeRevision}`),
       `${counts.pending} pending · ${counts.inProgress} in progress · ${counts.completed} completed · ${this.#summary.blockedCount} blocked`,
-      "",
-      ...this.#list.render(width),
-      ...(this.#notice === null ? [] : ["", this.#theme.muted(this.#notice)]),
-      "",
+      this.#theme.muted("Enter detail · type filter"),
       this.#theme.muted(
-        `type to filter current page · Enter detail · PageUp/PageDown page · c ${this.#compactCollapsed ? "expand" : "collapse"} compact overlay · Esc close · Ctrl+Q exit`,
+        `Esc close · c ${this.#compactCollapsed ? "expand" : "collapse"} compact · PgUp/PgDn · Ctrl+Q`,
       ),
-    ];
+      ...listLines,
+      ...noticeLines,
+    ]
+      .slice(0, maximumContentHeight)
+      .map((line) => truncateToWidth(line, width));
   }
 
   #createList(page: TodoPageResource): SearchableSelectList {
@@ -155,6 +199,7 @@ export class TodoNavigator implements Component {
           return;
         }
         this.#detail = detail;
+        this.#detailScrollTop = 0;
         this.#notice = null;
         this.#onChange();
       },

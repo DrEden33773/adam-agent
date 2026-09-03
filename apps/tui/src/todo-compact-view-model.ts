@@ -79,9 +79,15 @@ export class TodoCompactViewModel {
   }): void {
     this.advanceTurn(input.sessionId, input.turnKey);
     const currentIds = new Set(input.items.map((item) => item.id));
-    for (const [id, item] of this.#previousUnfinished) {
-      if (!currentIds.has(id)) {
-        this.#lingeringCompleted.set(id, { ...item, status: "completed" });
+    const unfinishedCount = input.summary.counts.pending + input.summary.counts.inProgress;
+    const completeUnfinishedProjection = input.items.length === unfinishedCount;
+    if (!completeUnfinishedProjection) {
+      this.#lingeringCompleted.clear();
+    } else {
+      for (const [id, item] of this.#previousUnfinished) {
+        if (!currentIds.has(id)) {
+          this.#lingeringCompleted.set(id, { ...item, status: "completed" });
+        }
       }
     }
     for (const id of currentIds) {

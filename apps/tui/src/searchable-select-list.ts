@@ -7,6 +7,7 @@ import {
 } from "@earendil-works/pi-tui";
 
 import { safeTerminalText } from "./safe-terminal-text.js";
+import { textKeyInput } from "./text-key-input.js";
 
 export type SearchableSelectItem = {
   readonly item: SelectItem;
@@ -16,7 +17,7 @@ export type SearchableSelectItem = {
 
 export class SearchableSelectList {
   #items: readonly SearchableSelectItem[];
-  readonly #maxVisible: number;
+  #maxVisible: number;
   readonly #onCancel: () => void;
   readonly #onSelect: (item: SelectItem) => void;
   readonly #theme: SelectListTheme;
@@ -48,8 +49,9 @@ export class SearchableSelectList {
       this.#list = this.#createList();
       return;
     }
-    if (isSearchText(data)) {
-      this.#query += safeTerminalText(data);
+    const text = textKeyInput(data);
+    if (text !== undefined) {
+      this.#query += safeTerminalText(text);
       this.#list = this.#createList();
       return;
     }
@@ -63,19 +65,25 @@ export class SearchableSelectList {
   setItems(items: readonly SearchableSelectItem[]): void {
     const selectedValue = this.#list.getSelectedItem()?.value;
     this.#items = items;
-    this.#list = this.#createList();
-    if (selectedValue !== undefined) {
-      const selectedIndex = this.#visibleItems().findIndex(
-        (candidate) => candidate.value === selectedValue,
-      );
-      if (selectedIndex >= 0) {
-        this.#list.setSelectedIndex(selectedIndex);
-      }
-    }
+    this.#rebuildList(selectedValue);
   }
 
-  render(width: number): string[] {
-    return [`Search: ${safeTerminalText(this.#query)}`, "", ...this.#list.render(width)];
+  setMaximumVisible(maxVisible: number): void {
+    const normalized = Math.max(1, Math.floor(maxVisible));
+    if (normalized === this.#maxVisible) {
+      return;
+    }
+    const selectedValue = this.#list.getSelectedItem()?.value;
+    this.#maxVisible = normalized;
+    this.#rebuildList(selectedValue);
+  }
+
+  render(width: number, maximumLines = Number.POSITIVE_INFINITY): string[] {
+    const prefix =
+      maximumLines <= 3
+        ? [`Search: ${safeTerminalText(this.#query)}`]
+        : [`Search: ${safeTerminalText(this.#query)}`, ""];
+    return [...prefix, ...this.#list.render(width)].slice(0, maximumLines);
   }
 
   #createList(): SelectList {
@@ -86,6 +94,19 @@ export class SearchableSelectList {
     return list;
   }
 
+  #rebuildList(selectedValue: string | undefined): void {
+    this.#list = this.#createList();
+    if (selectedValue === undefined) {
+      return;
+    }
+    const selectedIndex = this.#visibleItems().findIndex(
+      (candidate) => candidate.value === selectedValue,
+    );
+    if (selectedIndex >= 0) {
+      this.#list.setSelectedIndex(selectedIndex);
+    }
+  }
+
   #visibleItems(): SelectItem[] {
     const searchable = this.#items.filter((item) => item.alwaysVisible !== true);
     const filtered = fuzzyFilter([...searchable], this.#query, (item) => item.searchText);
@@ -94,8 +115,4 @@ export class SearchableSelectList {
       ...this.#items.filter((item) => item.alwaysVisible === true).map((item) => item.item),
     ];
   }
-}
-
-function isSearchText(data: string): boolean {
-  return data.length > 0 && !/[\p{Cc}\p{Cf}]/u.test(data);
 }

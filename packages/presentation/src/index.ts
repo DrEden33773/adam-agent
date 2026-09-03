@@ -152,6 +152,7 @@ export type TargetCatalogDisplay = {
     readonly webSearch?: {
       readonly status: "Configured" | "Invalid" | "Unconfigured" | "Unsafe";
       readonly endpoint: string | null;
+      readonly syntheticDnsRange: string | null;
       readonly diagnostic: { readonly code: string; readonly message: string } | null;
     };
   };
@@ -1359,6 +1360,7 @@ export type PresentationCommand =
   | { readonly type: "test_and_set_web_search"; readonly endpoint: string }
   | { readonly type: "cancel_web_search_test" }
   | { readonly type: "clear_web_search" }
+  | { readonly type: "set_web_synthetic_dns_range"; readonly range: string | null }
   | {
       readonly type: "test_target_connection" | "cancel_target_connection_test";
       readonly targetId: string;

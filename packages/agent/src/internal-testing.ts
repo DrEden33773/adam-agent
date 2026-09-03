@@ -143,6 +143,8 @@ export {
   sessionRuntimeNotificationTransform,
   sessionStoreDirectory,
   sessionTitleDeadlineScheduler,
+  sessionWebHttpAdapterFactory,
+  validateCurrentSessionHistoryForTesting,
   type WorkspaceMcpLeaseTransitionBarrier,
   workspaceMcpLeaseTransitionBarrier,
 } from "./session-lifecycle.js";

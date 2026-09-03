@@ -198,3 +198,83 @@ test("the MCP overlay family renders its authority title inside the shared frame
   expect(lines.at(0)).toContain("┌");
   expect(lines.at(-1)).toContain("└");
 });
+
+test("the MCP wizard accepts Kitty printable classification and commit keys", () => {
+  const digest = `sha256:${"0".repeat(64)}` as const;
+  let height = 8;
+  const onCommit = vi.fn();
+  const wizard = new McpWizard({
+    state: {
+      schemaVersion: 1,
+      status: "tool_selection_required",
+      workspaceConfirmed: true,
+      source: { path: ".mcp.json", digest },
+      servers: [
+        {
+          serverId: "fixture",
+          status: "ready",
+          transport: "stdio",
+          command: { kind: "executable", path: "/usr/bin/fixture" },
+          arguments: [],
+          cwd: ".",
+          requestedEnvironmentNames: [],
+          startupEffects: ["execute"],
+          definitionDigest: digest,
+        },
+        {
+          serverId: "fixture-two",
+          status: "ready",
+          transport: "stdio",
+          command: { kind: "executable", path: "/usr/bin/fixture-two" },
+          arguments: [],
+          cwd: ".",
+          requestedEnvironmentNames: [],
+          startupEffects: ["execute"],
+          definitionDigest: digest,
+        },
+      ],
+      activation: { attempt: 1, generationId: "generation-1", status: "ready" },
+      catalog: {
+        status: "ready",
+        digest,
+        tools: [
+          {
+            serverId: "fixture",
+            originalName: "inspect",
+            qualifiedName: "fixture.inspect",
+            description: "Inspect one exact source.",
+            rawSchemaDigest: digest,
+            modelProjectionDigest: digest,
+            definitionDigest: digest,
+          },
+        ],
+      },
+      profile: null,
+      diagnostics: [],
+    },
+    theme: createAdamTuiTheme(true),
+    maximumContentHeight: () => height,
+    onAdvance: vi.fn(),
+    onClose: vi.fn(),
+    onCommit,
+  });
+
+  wizard.handleInput("\u001b[49;1:1u");
+  for (height of [8, 12, 13, 14]) {
+    const frame = wizard.render(36);
+    const rendered = frame.join("\n");
+    expect(frame.length, `height ${height}`).toBeLessThanOrEqual(height);
+    expect(rendered, `height ${height}`).toContain("fixture.inspect");
+    expect(rendered, `height ${height}`).toContain("1 read");
+    expect(rendered, `height ${height}`).toContain("6 administrative");
+    expect(rendered, `height ${height}`).toContain("c commit");
+  }
+  wizard.handleInput("\u001b[99;1:1u");
+  wizard.handleInput("\u001b[99;1:2u");
+  wizard.handleInput("\u001b[99;1:3u");
+  expect(onCommit).toHaveBeenCalledTimes(1);
+  expect(onCommit).toHaveBeenCalledWith(
+    expect.objectContaining({ status: "tool_selection_required" }),
+    [expect.objectContaining({ qualifiedName: "fixture.inspect", effect: "read" })],
+  );
+});

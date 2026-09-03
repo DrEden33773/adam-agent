@@ -34,6 +34,7 @@ export class PlanReviewSelector implements Component {
   readonly #contentDigest: `sha256:${string}`;
   readonly #list: SelectList;
   readonly #markdown: string;
+  readonly #maximumContentHeight: () => number;
   readonly #theme: AdamTuiTheme;
   readonly #title: string | undefined;
   #page = 0;
@@ -41,6 +42,7 @@ export class PlanReviewSelector implements Component {
   constructor(options: {
     readonly contentDigest: `sha256:${string}`;
     readonly markdown: string;
+    readonly maximumContentHeight?: () => number;
     readonly onClose: () => void;
     readonly onSelect: (action: PlanReviewAction) => void;
     readonly theme: AdamTuiTheme;
@@ -48,6 +50,7 @@ export class PlanReviewSelector implements Component {
   }) {
     this.#contentDigest = options.contentDigest;
     this.#markdown = options.markdown;
+    this.#maximumContentHeight = options.maximumContentHeight ?? (() => Number.POSITIVE_INFINITY);
     this.#theme = options.theme;
     this.#title = options.title;
     this.#list = new SelectList([...actions], actions.length, options.theme.editor.selectList);
@@ -73,24 +76,25 @@ export class PlanReviewSelector implements Component {
 
   render(width: number): string[] {
     const planLines = wrapTextWithAnsi(safeTerminalText(this.#markdown), Math.max(1, width));
-    const pageSize = 8;
+    const listLines = this.#list.render(width);
+    const requestedHeight = Math.floor(this.#maximumContentHeight());
+    const maximumContentHeight = Number.isFinite(requestedHeight)
+      ? Math.max(1, requestedHeight)
+      : planLines.length + listLines.length + 4;
+    const pageSize = Math.max(1, maximumContentHeight - listLines.length - 4);
     const pageCount = Math.max(1, Math.ceil(planLines.length / pageSize));
     this.#page = Math.min(this.#page, pageCount - 1);
     const pageStart = this.#page * pageSize;
     return [
-      this.#theme.toolTitle("Review exact submitted plan"),
-      ...(this.#title === undefined
-        ? []
-        : [truncateToWidth(this.#theme.keyword(safeTerminalText(this.#title)), width)]),
-      truncateToWidth(this.#theme.muted(safeTerminalText(this.#contentDigest)), width),
-      "",
+      this.#theme.toolTitle(
+        `Review exact submitted plan${this.#title === undefined ? "" : ` · ${safeTerminalText(this.#title)}`}`,
+      ),
+      this.#theme.muted(safeTerminalText(this.#contentDigest)),
       ...planLines.slice(pageStart, pageStart + pageSize),
-      this.#theme.muted(`Plan page ${this.#page + 1}/${pageCount} · PageUp/PageDown inspect`),
-      "",
-      ...this.#list.render(width),
-      "",
+      this.#theme.muted(`Plan ${this.#page + 1}/${pageCount} · PgUp/PgDn inspect`),
+      ...listLines,
       this.#theme.muted("Enter choose · Esc keep ready · Ctrl+Q exit"),
-    ];
+    ].map((line) => truncateToWidth(line, width));
   }
 }
 

@@ -10,6 +10,7 @@ import {
 
 import { adamCommandRegistry } from "./command-registry.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
+import { textKeyInput } from "./text-key-input.js";
 import type { AdamTuiTheme } from "./theme.js";
 
 type SessionPickerItem =
@@ -98,8 +99,9 @@ export class SessionPicker implements Component {
       this.#selectFirstSearchResult();
       return;
     }
-    if (isSearchText(data)) {
-      this.#query += safeTerminalText(data);
+    const text = textKeyInput(data);
+    if (text !== undefined) {
+      this.#query += safeTerminalText(text);
       this.#selectFirstSearchResult();
       return;
     }
@@ -283,8 +285,4 @@ function renderColumns(
     "",
   );
   return prefix + labelText + spacing + descriptionText;
-}
-
-function isSearchText(data: string): boolean {
-  return data.length > 0 && !/[\p{Cc}\p{Cf}]/u.test(data);
 }

@@ -1,5 +1,13 @@
 import type { McpDisplay } from "@adam-agent/presentation";
-import { type Component, Key, matchesKey, SelectList } from "@earendil-works/pi-tui";
+import {
+  type Component,
+  isKeyRelease,
+  isKeyRepeat,
+  Key,
+  matchesKey,
+  SelectList,
+  truncateToWidth,
+} from "@earendil-works/pi-tui";
 
 import { safeTerminalText } from "./safe-terminal-text.js";
 import type { AdamTuiTheme } from "./theme.js";
@@ -11,16 +19,17 @@ type McpSelection = {
   readonly effect: McpEffect;
 };
 
-const effectKeys: Readonly<Record<string, McpEffect>> = {
+const effectKeys = {
   "1": "read",
   "2": "write",
   "3": "execute",
   "4": "network",
   "5": "delegate",
   "6": "administrative",
-};
+} as const satisfies Readonly<Record<"1" | "2" | "3" | "4" | "5" | "6", McpEffect>>;
 
 export class McpWizard implements Component {
+  readonly #maximumContentHeight: () => number;
   readonly #onAdvance: (state: McpDisplay) => void;
   readonly #onClose: () => void;
   readonly #onCommit: (state: McpDisplay, selections: readonly McpSelection[]) => void;
@@ -31,12 +40,14 @@ export class McpWizard implements Component {
   #tools: SelectList;
 
   constructor(options: {
+    readonly maximumContentHeight?: () => number;
     readonly state: McpDisplay;
     readonly onAdvance: (state: McpDisplay) => void;
     readonly onClose: () => void;
     readonly onCommit: (state: McpDisplay, selections: readonly McpSelection[]) => void;
     readonly theme: AdamTuiTheme;
   }) {
+    this.#maximumContentHeight = options.maximumContentHeight ?? (() => 22);
     this.#state = options.state;
     this.#onAdvance = options.onAdvance;
     this.#onClose = options.onClose;
@@ -69,8 +80,14 @@ export class McpWizard implements Component {
       }
       return;
     }
-    const effect = effectKeys[data];
+    const effectKey = (Object.keys(effectKeys) as (keyof typeof effectKeys)[]).find((key) =>
+      matchesKey(data, key),
+    );
+    const effect = effectKey === undefined ? undefined : effectKeys[effectKey];
     if (effect !== undefined) {
+      if (isKeyRepeat(data) || isKeyRelease(data)) {
+        return;
+      }
       const selected = this.#tools.getSelectedItem();
       const tool = this.#state.catalog?.tools.find(
         (candidate) => candidate.qualifiedName === selected?.value,
@@ -85,7 +102,10 @@ export class McpWizard implements Component {
       }
       return;
     }
-    if (data === "c") {
+    if (matchesKey(data, "c")) {
+      if (isKeyRepeat(data) || isKeyRelease(data)) {
+        return;
+      }
       if (this.#selections.size === 0) {
         this.#notice = "Select and classify at least one exact tool before commit.";
       } else {
@@ -101,6 +121,39 @@ export class McpWizard implements Component {
   }
 
   render(width: number): string[] {
+    const maximumContentHeight = Math.max(4, Math.floor(this.#maximumContentHeight()));
+    if (this.#state.status === "tool_selection_required") {
+      const selected = this.#tools.getSelectedItem();
+      const tool = this.#state.catalog?.tools.find(
+        (candidate) => candidate.qualifiedName === selected?.value,
+      );
+      const selection = tool === undefined ? undefined : this.#selections.get(tool.qualifiedName);
+      const coreLines = [
+        this.#theme.toolTitle("MCP authority · tool selection required"),
+        this.#theme.muted(
+          `${safeTerminalText(this.#state.source.path)} · ${this.#state.source.digest}`,
+        ),
+        tool === undefined ? "Tool unavailable" : `Tool > ${safeTerminalText(tool.qualifiedName)}`,
+        tool === undefined
+          ? this.#theme.muted("No exact catalog tool is selected.")
+          : this.#theme.muted(
+              `${safeTerminalText(tool.originalName)} · ${selection?.effect ?? "unclassified"} · ${safeTerminalText(tool.description)}`,
+            ),
+        ...(this.#notice === null ? [] : [this.#theme.muted(this.#notice)]),
+        this.#theme.muted("↑↓ tool · 1 read · 2 write"),
+        this.#theme.muted("3 execute · 4 network · 5 delegate"),
+        this.#theme.muted("6 administrative · c commit · Esc"),
+      ];
+      const evidenceLines = this.#state.servers.flatMap((server) => [
+        `${safeTerminalText(server.serverId)} · ${server.status} · ${commandLabel(server.command)}`,
+        this.#theme.muted(
+          `effects ${server.startupEffects.join("+")} · ${server.definitionDigest}`,
+        ),
+      ]);
+      return [...coreLines, ...evidenceLines]
+        .slice(0, maximumContentHeight)
+        .map((line) => truncateToWidth(line, width));
+    }
     const lines = [
       this.#theme.toolTitle(`MCP authority · ${statusLabel(this.#state.status)}`),
       this.#theme.muted(`${this.#state.source.path} · ${this.#state.source.digest}`),
@@ -144,7 +197,14 @@ export class McpWizard implements Component {
       lines.push("", this.#theme.muted(this.#notice));
     }
     lines.push("", this.#theme.muted(actionLabel(this.#state.status)));
-    return lines;
+    if (lines.length <= maximumContentHeight) {
+      return lines;
+    }
+    return [
+      ...lines.slice(0, Math.max(1, maximumContentHeight - 2)),
+      this.#theme.muted("Additional MCP evidence hidden; enlarge the terminal."),
+      this.#theme.muted(actionLabel(this.#state.status)),
+    ].slice(0, maximumContentHeight);
   }
 
   #createToolList(): SelectList {

@@ -7,7 +7,15 @@ import type {
   PresentationDisplayState,
   TranscriptItem,
 } from "@adam-agent/presentation";
-import { type Component, getKeybindings, Markdown, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+  type Component,
+  getKeybindings,
+  isKeyRelease,
+  isKeyRepeat,
+  Markdown,
+  matchesKey,
+  truncateToWidth,
+} from "@earendil-works/pi-tui";
 
 import { artifactPageRange } from "./artifact-navigator.js";
 import { reasoningFoldTitle } from "./reasoning-fold.js";
@@ -176,7 +184,13 @@ export class AgentNavigator implements Component {
       return;
     }
     if (this.#detail !== null) {
-      if (data !== "c") {
+      if (
+        (isKeyRepeat(data) || isKeyRelease(data)) &&
+        (["a", "m", "f", "r", "c"] as const).some((key) => matchesKey(data, key))
+      ) {
+        return;
+      }
+      if (!matchesKey(data, "c")) {
         this.#cancelConfirmation = null;
       }
       if (getKeybindings().matches(data, "tui.select.up")) {
@@ -217,21 +231,25 @@ export class AgentNavigator implements Component {
         this.#onChange();
         return;
       }
-      if (data === "a" && this.#onReadArtifact !== undefined) {
+      if (matchesKey(data, "a") && this.#onReadArtifact !== undefined) {
         const artifact = managedTranscriptArtifacts(this.#transcript).at(-1);
         if (artifact !== undefined) {
           void this.#loadArtifact(artifact, artifactPageRange(0));
         }
         return;
       }
-      if (data === "m" && isActiveManagedAgent(this.#detail) && this.#onMessage !== undefined) {
+      if (
+        matchesKey(data, "m") &&
+        isActiveManagedAgent(this.#detail) &&
+        this.#onMessage !== undefined
+      ) {
         this.#onMessage({
           agentId: this.#detail.agentId,
           expectedRevision: this.#detail.revision,
         });
         return;
       }
-      if (data === "f" && canFollowUp(this.#detail) && this.#onFollowUp !== undefined) {
+      if (matchesKey(data, "f") && canFollowUp(this.#detail) && this.#onFollowUp !== undefined) {
         this.#onFollowUp({
           agentId: this.#detail.agentId,
           expectedRevision: this.#detail.revision,
@@ -239,7 +257,7 @@ export class AgentNavigator implements Component {
         return;
       }
       if (
-        data === "r" &&
+        matchesKey(data, "r") &&
         this.#detail.status === "recovery_required" &&
         this.#onRecovery !== undefined
       ) {
@@ -249,7 +267,7 @@ export class AgentNavigator implements Component {
         });
         return;
       }
-      if (data === "c" && isActiveManagedAgent(this.#detail)) {
+      if (matchesKey(data, "c") && isActiveManagedAgent(this.#detail)) {
         const confirmation = `${this.#detail.agentId}:${this.#detail.revision}`;
         if (this.#cancelConfirmation === confirmation) {
           this.#cancelConfirmation = null;
@@ -264,7 +282,7 @@ export class AgentNavigator implements Component {
         return;
       }
       if (
-        data === "r" &&
+        matchesKey(data, "r") &&
         this.#detail.status === "waiting_for_parent" &&
         this.#detail.attention !== undefined
       ) {
@@ -323,10 +341,9 @@ export class AgentNavigator implements Component {
     if (this.#detail !== null) {
       const detail = this.#detail;
       const maximumContentHeight = Math.max(8, Math.floor(this.#maximumContentHeight()));
-      const compactHeight = maximumContentHeight <= 12;
       const hasArtifact = managedTranscriptArtifacts(this.#transcript).length > 0;
       const rosterLines =
-        compactHeight || width < 80 || this.#managedAgents.counts.active === 0
+        width < 80 || this.#managedAgents.counts.active === 0
           ? []
           : [
               this.#theme.toolTitle(
@@ -336,7 +353,7 @@ export class AgentNavigator implements Component {
                 .render(width)
                 .slice(0, 3),
             ];
-      const evidenceLines = [
+      const allEvidenceLines = [
         ...(detail.attention === undefined
           ? []
           : [
@@ -352,76 +369,78 @@ export class AgentNavigator implements Component {
             (report) =>
               `${report.kind} r${report.revision} · ${safeTerminalText(report.message)}${report.messageTruncated ? ` · ${report.messageByteCount} bytes total` : ""}`,
           ),
-      ].slice(0, compactHeight ? 1 : 2);
-      const actionLines = compactHeight
-        ? [
-            this.#theme.muted(
-              compactAgentActions(detail, this.#cancelConfirmation, {
-                artifact: hasArtifact && this.#onReadArtifact !== undefined,
-                followUp: this.#onFollowUp !== undefined,
-                message: this.#onMessage !== undefined,
-                recovery: this.#onRecovery !== undefined,
-              }),
-            ),
-          ]
-        : [
-            ...(isActiveManagedAgent(detail) && this.#onMessage !== undefined
-              ? [
-                  this.#theme.muted(
-                    "m message at next safe boundary; delivery does not imply compliance",
-                  ),
-                ]
-              : []),
-            ...(this.#cancelConfirmation === `${detail.agentId}:${detail.revision}`
-              ? [this.#theme.statusWarning("Press c again to stop this exact child")]
-              : []),
-            ...(canFollowUp(detail) && this.#onFollowUp !== undefined
-              ? [this.#theme.muted("f follow-up from exact terminal evidence")]
-              : []),
-            ...(detail.status === "recovery_required" && this.#onRecovery !== undefined
-              ? [this.#theme.muted("r recover from exact durable evidence")]
-              : []),
-            ...(hasArtifact && this.#onReadArtifact !== undefined
-              ? [this.#theme.muted("a read artifact")]
-              : []),
-            this.#theme.muted(
-              isActiveManagedAgent(detail) && detail.status !== "waiting_for_parent"
-                ? "↑↓ scroll · PgUp older · c cancel exact revision · Esc back · Ctrl+Q exit"
-                : detail.status === "waiting_for_parent"
-                  ? "↑↓ scroll · PgUp older · r reply exact attention · c cancel exact revision · Esc back · Ctrl+Q exit"
-                  : "Terminal child · Esc back · Ctrl+Q exit",
-            ),
-          ];
-      const headerLines = compactHeight
-        ? [
-            this.#theme.toolTitle("Agent detail"),
-            `${detail.profile} · ${detail.status} · revision ${detail.revision} · ${detail.phase}`,
-            `${safeTerminalText(detail.targetIdentity.modelId)} · ${detail.context?.contextWindowTokens ?? "unknown"} context · ${managedContextOccupancy(detail)}`,
-          ]
-        : [
-            this.#theme.toolTitle("Agent detail"),
-            `${detail.profile} · ${detail.mode} · ${detail.status} · revision ${detail.revision} · ${detail.phase}${detail.activeTool === undefined ? "" : ` · ${detail.activeTool.name} ${detail.activeTool.status}`}`,
-            `${safeTerminalText(detail.targetIdentity.targetId)} · ${safeTerminalText(detail.targetIdentity.modelId)} · ${safeTerminalText(detail.targetIdentity.route)}${detail.thinkingPolicy === undefined ? "" : ` · thinking ${safeTerminalText(detail.thinkingPolicy.effectiveLevelId)}`}`,
-            `Context ${detail.context?.contextWindowTokens ?? "unknown"} capacity · ${managedContextOccupancy(detail)}`,
-            detail.usage === undefined
-              ? "Usage unavailable"
-              : `Usage ${detail.usage.inputTokens} in + ${detail.usage.outputTokens} out · ${detail.usage.reasoningTokens} reasoning · ${detail.usage.providerCalls} calls`,
-            detail.budget === undefined
-              ? "Budget unavailable"
-              : `Budget ${detail.budget.usedTokens}/${detail.budget.maximumCumulativeTokens} · ${detail.budget.remainingTokens} left`,
-            `${detail.watchdog === undefined ? "Watchdog unavailable" : `Watchdog ${detail.watchdog.state} · ${detail.watchdog.maximumInactivityMilliseconds} ms`}${detail.attempts === undefined ? "" : ` · attempts ${detail.attempts.childAttempts}/${detail.attempts.maximumChildAttempts} child ${detail.attempts.parentAttempts}/${detail.attempts.maximumParentAttempts} parent`}`,
-            `Agent ${safeTerminalText(detail.agentId)} · Attempt ${safeTerminalText(detail.attemptId)}`,
-          ];
-      const prefixLines = [
-        ...rosterLines,
-        ...headerLines,
-        ...evidenceLines,
-        ...actionLines,
-        "",
-        this.#theme.toolTitle(
-          this.#artifactView === null ? "Transcript · read-only" : "Artifact · read-only",
+      ];
+      const fullActionLines = [
+        ...(isActiveManagedAgent(detail) && this.#onMessage !== undefined
+          ? [
+              this.#theme.muted(
+                "m message at next safe boundary; delivery does not imply compliance",
+              ),
+            ]
+          : []),
+        ...(this.#cancelConfirmation === `${detail.agentId}:${detail.revision}`
+          ? [this.#theme.statusWarning("Press c again to stop this exact child")]
+          : []),
+        ...(canFollowUp(detail) && this.#onFollowUp !== undefined
+          ? [this.#theme.muted("f follow-up from exact terminal evidence")]
+          : []),
+        ...(detail.status === "recovery_required" && this.#onRecovery !== undefined
+          ? [this.#theme.muted("r recover from exact durable evidence")]
+          : []),
+        ...(hasArtifact && this.#onReadArtifact !== undefined
+          ? [this.#theme.muted("a read artifact")]
+          : []),
+        this.#theme.muted(
+          isActiveManagedAgent(detail) && detail.status !== "waiting_for_parent"
+            ? "↑↓ scroll · PgUp older · c cancel exact revision · Esc back · Ctrl+Q exit"
+            : detail.status === "waiting_for_parent"
+              ? "↑↓ scroll · PgUp older · r reply exact attention · c cancel exact revision · Esc back · Ctrl+Q exit"
+              : "Terminal child · Esc back · Ctrl+Q exit",
         ),
       ];
+      const fullHeaderLines = [
+        this.#theme.toolTitle("Agent detail"),
+        `${detail.profile} · ${detail.mode} · ${detail.status} · revision ${detail.revision} · ${detail.phase}${detail.activeTool === undefined ? "" : ` · ${detail.activeTool.name} ${detail.activeTool.status}`}`,
+        `${safeTerminalText(detail.targetIdentity.targetId)} · ${safeTerminalText(detail.targetIdentity.modelId)} · ${safeTerminalText(detail.targetIdentity.route)}${detail.thinkingPolicy === undefined ? "" : ` · thinking ${safeTerminalText(detail.thinkingPolicy.effectiveLevelId)}`}`,
+        `Context ${detail.context?.contextWindowTokens ?? "unknown"} capacity · ${managedContextOccupancy(detail)}`,
+        detail.usage === undefined
+          ? "Usage unavailable"
+          : `Usage ${detail.usage.inputTokens} in + ${detail.usage.outputTokens} out · ${detail.usage.reasoningTokens} reasoning · ${detail.usage.providerCalls} calls`,
+        detail.budget === undefined
+          ? "Budget unavailable"
+          : `Budget ${detail.budget.usedTokens}/${detail.budget.maximumCumulativeTokens} · ${detail.budget.remainingTokens} left`,
+        `${detail.watchdog === undefined ? "Watchdog unavailable" : `Watchdog ${detail.watchdog.state} · ${detail.watchdog.maximumInactivityMilliseconds} ms`}${detail.attempts === undefined ? "" : ` · attempts ${detail.attempts.childAttempts}/${detail.attempts.maximumChildAttempts} child ${detail.attempts.parentAttempts}/${detail.attempts.maximumParentAttempts} parent`}`,
+        `Agent ${safeTerminalText(detail.agentId)} · Attempt ${safeTerminalText(detail.attemptId)}`,
+      ];
+      const transcriptTitle = this.#theme.toolTitle(
+        this.#artifactView === null ? "Transcript · read-only" : "Artifact · read-only",
+      );
+      const fullPrefixLines = [
+        ...rosterLines,
+        ...fullHeaderLines,
+        ...allEvidenceLines.slice(0, 2),
+        ...fullActionLines,
+        "",
+        transcriptTitle,
+      ];
+      const compactPrefixLines = [
+        this.#theme.toolTitle("Agent detail"),
+        `${detail.profile} · ${detail.status} · revision ${detail.revision} · ${detail.phase}`,
+        `${safeTerminalText(detail.targetIdentity.modelId)} · ${detail.context?.contextWindowTokens ?? "unknown"} context · ${managedContextOccupancy(detail)}`,
+        ...allEvidenceLines.slice(0, 1),
+        this.#theme.muted(
+          compactAgentActions(detail, this.#cancelConfirmation, {
+            artifact: hasArtifact && this.#onReadArtifact !== undefined,
+            followUp: this.#onFollowUp !== undefined,
+            message: this.#onMessage !== undefined,
+            recovery: this.#onRecovery !== undefined,
+          }),
+        ),
+        "",
+        transcriptTitle,
+      ];
+      const prefixLines =
+        fullPrefixLines.length + 1 <= maximumContentHeight ? fullPrefixLines : compactPrefixLines;
       const transcriptHeight = Math.max(1, maximumContentHeight - prefixLines.length);
       return [
         ...prefixLines,
@@ -430,15 +449,18 @@ export class AgentNavigator implements Component {
           : this.#renderArtifactLines(width, transcriptHeight)),
       ].map((line) => boundedLine(line, width));
     }
+    const maximumContentHeight = Math.max(8, Math.floor(this.#maximumContentHeight()));
+    const listHeight = Math.max(1, maximumContentHeight - 2);
+    this.#list.setMaximumVisible(Math.min(8, Math.max(1, listHeight - 3)));
     return [
       this.#theme.toolTitle(
         `Agents · ${this.#managedAgents.counts.active} active · ${this.#managedAgents.counts.terminal} terminal`,
       ),
-      "",
-      ...this.#list.render(width),
-      "",
       this.#theme.muted("type search · Enter detail · Esc close · Ctrl+Q exit"),
-    ].map((line) => boundedLine(line, width));
+      ...this.#list.render(width, listHeight),
+    ]
+      .slice(0, maximumContentHeight)
+      .map((line) => boundedLine(line, width));
   }
 
   async #loadTranscript(cursor: string | null): Promise<void> {

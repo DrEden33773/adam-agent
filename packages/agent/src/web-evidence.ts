@@ -1187,6 +1187,16 @@ function classifyWebFailure(
       return webFailure("web_provider_unavailable", "The Web provider is unavailable.");
     case "web_address_disallowed":
       return webFailure("web_response_invalid", "The Web target address is not admitted.");
+    case "web_synthetic_dns_unconfigured":
+      return webFailure(
+        "web_response_invalid",
+        "The Web target uses 198.18.0.0/15 synthetic DNS. If this host intentionally uses an Owner-trusted TUN/fake-IP proxy, configure its exact subnet from the TUI with /config web-fake-ip, then retry.",
+      );
+    case "web_synthetic_dns_https_required":
+      return webFailure(
+        "web_response_invalid",
+        "Synthetic DNS admission is restricted to HTTPS hostname URLs.",
+      );
     default:
       return toolIoFailure(fallbackMessage);
   }

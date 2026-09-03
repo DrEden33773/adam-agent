@@ -95,10 +95,14 @@ test("AgentNavigator renders responsive NO_COLOR list, detail and exact cancel i
     expect(navigator.render(width).every((line) => visibleWidth(line) <= width)).toBe(true);
     expect(navigator.render(width).join("\n")).not.toContain("\u001b[");
   }
-  navigator.handleInput("c");
+  navigator.handleInput("\u001b[99;1:1u");
   expect(onCancel).not.toHaveBeenCalled();
   expect(navigator.render(80).join("\n")).toContain("Press c again to stop this exact child");
-  navigator.handleInput("c");
+  navigator.handleInput("\u001b[99;1:2u");
+  navigator.handleInput("\u001b[99;1:3u");
+  expect(onCancel).not.toHaveBeenCalled();
+  expect(navigator.render(80).join("\n")).toContain("Press c again to stop this exact child");
+  navigator.handleInput("\u001b[99;1:1u");
   expect(onCancel).toHaveBeenCalledWith({
     agentId: "123e4567-e89b-42d3-a456-426614174201",
     expectedRevision: 1,
@@ -718,9 +722,10 @@ test("manual managed transcript scroll pauses live-tail following and PageDown r
 
 test("Agent detail preserves controls and one transcript row inside the minimum overlay height", () => {
   const agent = managedAgentFixture({ status: "stalled", phase: "stalled" });
+  let height = 8;
   const navigator = new AgentNavigator({
     managedAgents: { counts: { active: 1, terminal: 0, attention: 1 }, agents: [agent] },
-    maximumContentHeight: () => 8,
+    maximumContentHeight: () => height,
     onCancel: vi.fn(),
     onChange: vi.fn(),
     onClose: vi.fn(),
@@ -730,12 +735,52 @@ test("Agent detail preserves controls and one transcript row inside the minimum 
   });
   navigator.handleInput("\r");
 
+  for (height of [8, 12, 13, 14, 17, 20]) {
+    const lines = navigator.render(104);
+    const rendered = lines.join("\n");
+    expect(lines.length, `height ${height}`).toBeLessThanOrEqual(height);
+    expect(rendered, `height ${height}`).toContain("Agent detail");
+    expect(rendered, `height ${height}`).toContain("m message");
+    expect(rendered, `height ${height}`).toContain("Esc back");
+    expect(rendered, `height ${height}`).toContain("Transcript · read-only");
+    expect(rendered, `height ${height}`).toContain("Transcript is unavailable");
+  }
+});
+
+test("Agent roster keeps the focused child visible inside the minimum overlay height", () => {
+  const agents = Array.from({ length: 6 }, (_, index) =>
+    managedAgentFixture({
+      agentId: `123e4567-e89b-42d3-a456-${String(index + 1).padStart(12, "0")}`,
+      attemptId: `123e4567-e89b-42d3-a457-${String(index + 1).padStart(12, "0")}`,
+      profile: index === 5 ? "research.v2" : "scout.v1",
+    }),
+  );
+  const navigator = new AgentNavigator({
+    managedAgents: { counts: { active: 6, terminal: 0, attention: 0 }, agents },
+    maximumContentHeight: () => 8,
+    onCancel: vi.fn(),
+    onChange: vi.fn(),
+    onClose: vi.fn(),
+    onReply: vi.fn(),
+    theme: createAdamTuiTheme(true),
+  });
+
+  for (let index = 0; index < 5; index += 1) {
+    navigator.handleInput("\u001b[B");
+  }
   const lines = navigator.render(40);
+
   expect(lines.length).toBeLessThanOrEqual(8);
-  expect(lines.join("\n")).toContain("Agent detail");
-  expect(lines.join("\n")).toContain("m message");
-  expect(lines.join("\n")).toContain("Transcript · read-only");
-  expect(lines.join("\n")).toContain("Transcript is unavailable");
+  expect(lines.join("\n")).toContain("Enter detail");
+  expect(lines.join("\n")).toContain("Esc close");
+  expect(lines.join("\n")).toContain(agents[5]?.agentId);
+  expect(lines.some((line) => line.startsWith("> "))).toBe(true);
+
+  navigator.handleInput("\u001b[118;1:1u");
+  navigator.handleInput("\u001b[50;1:1u");
+  const filtered = navigator.render(40).join("\n");
+  expect(filtered).toContain("Search: v2");
+  expect(filtered).toContain(agents[5]?.agentId);
 });
 
 function managedAgentFixture(

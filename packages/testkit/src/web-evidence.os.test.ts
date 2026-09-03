@@ -14,11 +14,20 @@ import { createServer, request as nodeHttpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createWebSearchConfiguration } from "@adam-agent/agent";
+import {
+  createPermissionPolicy,
+  createSessionLifecycle,
+  createWebSearchConfiguration,
+  type ModelDriver,
+  type ModelTargets,
+} from "@adam-agent/agent";
 import {
   createJsonlWebEvidenceStore,
   createSafeWebHttpAdapter,
+  createTrustedWorkspaceTrustForTesting,
   createWebSearchConfigurationController,
+  sessionAutomaticTitlesEnabled,
+  sessionWebHttpAdapterFactory,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
@@ -118,6 +127,7 @@ test("the real HTTP Adapter pins exact loopback origin and sends no ambient auth
 
 test("the HTTP transport passes its validated public address into the real request lookup seam", async () => {
   const observedHosts: Array<string | undefined> = [];
+  const reusedSockets: boolean[] = [];
   const server = createServer((request, response) => {
     observedHosts.push(request.headers.host);
     response.writeHead(200, { "content-type": "text/plain" });
@@ -131,14 +141,17 @@ test("the HTTP transport passes its validated public address into the real reque
   if (address === null || typeof address === "string") {
     throw new Error("The pinned-lookup fixture did not expose a TCP address.");
   }
-  const localUrl = `http://127.0.0.1:${address.port}/bound`;
   const pinned: Array<{ readonly address: string; readonly family: number }> = [];
   const requestHttps = ((
     url: URL,
     requestOptions: Record<string, unknown>,
     onResponse: unknown,
   ) => {
-    const { headers, lookup: requestLookup, signal } = requestOptions;
+    const { agent, family, headers, lookup: requestLookup, signal } = requestOptions;
+    const handleResponse = onResponse as NonNullable<Parameters<typeof nodeHttpRequest>[2]>;
+    if (family !== 4) {
+      throw new Error("The production request did not pin the selected address family.");
+    }
     const lookup = requestLookup as
       | ((
           hostname: string,
@@ -149,23 +162,41 @@ test("the HTTP transport passes its validated public address into the real reque
     if (lookup === undefined) {
       throw new Error("The production request omitted its pinned lookup callback.");
     }
-    lookup(url.hostname, {}, (error, selectedAddress, family) => {
-      if (error !== null) {
-        throw error;
-      }
-      pinned.push({ address: selectedAddress, family });
-    });
-    return nodeHttpRequest(
-      localUrl,
+    const mappedUrl = new URL(url);
+    mappedUrl.protocol = "http:";
+    mappedUrl.port = String(address.port);
+    let request!: ReturnType<typeof nodeHttpRequest>;
+    request = nodeHttpRequest(
+      mappedUrl,
       {
+        agent: agent as false | undefined,
+        family: family as number,
         headers: {
           ...(headers as Record<string, string>),
           host: url.host,
         },
+        lookup(hostname, lookupOptions, callback) {
+          lookup(
+            hostname,
+            lookupOptions as Record<string, unknown>,
+            (error, selectedAddress, selectedFamily) => {
+              if (error !== null) {
+                callback(error, selectedAddress, selectedFamily);
+                return;
+              }
+              pinned.push({ address: selectedAddress, family: selectedFamily });
+              callback(null, "127.0.0.1", 4);
+            },
+          );
+        },
         signal: signal as AbortSignal,
       },
-      onResponse as Parameters<typeof nodeHttpRequest>[2],
+      (response) => {
+        reusedSockets.push(request.reusedSocket);
+        handleResponse(response);
+      },
     );
+    return request;
   }) as unknown as typeof import("node:https").request;
   const adapter = createSafeWebHttpAdapter({
     requestHttps,
@@ -184,13 +215,175 @@ test("the HTTP transport passes its validated public address into the real reque
         signal: new AbortController().signal,
       }),
     ).resolves.toMatchObject({ status: 200, body: Buffer.from("pinned public evidence") });
-    expect(pinned).toEqual([{ address: "93.184.216.34", family: 4 }]);
-    expect(observedHosts).toEqual(["public.example.test"]);
+    await expect(
+      adapter.fetch({
+        url: "https://public.example.test/evidence",
+        maximumBytes: 1024,
+        signal: new AbortController().signal,
+      }),
+    ).resolves.toMatchObject({ status: 200, body: Buffer.from("pinned public evidence") });
+    expect(pinned).toEqual([
+      { address: "93.184.216.34", family: 4 },
+      { address: "93.184.216.34", family: 4 },
+    ]);
+    expect(reusedSockets).toEqual([false, false]);
+    expect(observedHosts).toEqual(["public.example.test", "public.example.test"]);
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => {
       server.close((error) => (error === undefined ? resolve() : reject(error)));
     });
+  }
+});
+
+test("Lifecycle Web composition reloads persisted synthetic DNS admission for each exact fetch", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-web-dynamic-config-os-"));
+  const configRoot = join(testRoot, "config");
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const environment = { XDG_CONFIG_HOME: configRoot };
+  const controller = createWebSearchConfigurationController({ environment });
+  await controller.setSyntheticDnsRange("198.18.0.0/16");
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.end("dynamic synthetic DNS evidence");
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("The dynamic Web fixture did not expose a TCP address.");
+  }
+  const localUrl = `http://127.0.0.1:${address.port}/evidence`;
+  const requestHttps = ((
+    url: URL,
+    requestOptions: {
+      readonly headers: Record<string, string>;
+      readonly signal: AbortSignal;
+    },
+    onResponse: unknown,
+  ) =>
+    nodeHttpRequest(
+      localUrl,
+      {
+        headers: {
+          ...requestOptions.headers,
+          host: url.host,
+        },
+        signal: requestOptions.signal,
+      },
+      onResponse as Parameters<typeof nodeHttpRequest>[2],
+    )) as unknown as typeof import("node:https").request;
+  const targetIdentity = {
+    targetId: "fake.local",
+    vendor: "adam",
+    modelId: "fake-local",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+  const toolResults: unknown[] = [];
+  const model: ModelDriver = {
+    async *stream(request) {
+      const toolResult = request.messages.findLast((message) => message.role === "tool");
+      if (toolResult === undefined) {
+        yield { type: "tool_call_start", id: "dynamic-web-fetch", name: "web_fetch" };
+        yield {
+          type: "tool_call_delta",
+          id: "dynamic-web-fetch",
+          json: '{"url":"https://synthetic.example.test/evidence"}',
+        };
+        yield { type: "tool_call_end", id: "dynamic-web-fetch" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      toolResults.push(toolResult);
+      yield { type: "text_delta", text: "Web fetch settled." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const contextProfile = {
+    version: 1,
+    contextWindowTokens: 128_000,
+    maximumOutputTokens: 4_096,
+    compactAtTokens: 96_000,
+    postCompactTargetTokens: 32_000,
+    retainedTargetTokens: 8_000,
+    estimatorVersion: 1,
+  } as const;
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver: model, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "network"] }),
+    stateRoot,
+    webSearchConfiguration: createWebSearchConfiguration({ environment }),
+    workspaceRoot,
+    workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+    [sessionAutomaticTitlesEnabled]: false,
+    [sessionWebHttpAdapterFactory]: (options) =>
+      createSafeWebHttpAdapter({
+        ...options,
+        requestHttps,
+        resolver: {
+          async lookup() {
+            return [{ address: "198.18.5.220", family: 4 }];
+          },
+        },
+      }),
+  });
+
+  try {
+    const admitted = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: admitted.sessionId,
+      input: { text: "Fetch through the configured synthetic DNS proxy." },
+    });
+    expect(toolResults[0]).toMatchObject({
+      role: "tool",
+      result: { status: "completed", output: { text: "dynamic synthetic DNS evidence" } },
+    });
+
+    await controller.setSyntheticDnsRange(null);
+    const revoked = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: revoked.sessionId,
+      input: { text: "Retry after revoking synthetic DNS admission." },
+    });
+    expect(toolResults[1]).toMatchObject({
+      role: "tool",
+      result: {
+        status: "failed",
+        error: {
+          code: "web_response_invalid",
+          message: expect.stringContaining("Owner-trusted TUN/fake-IP proxy"),
+        },
+      },
+    });
+  } finally {
+    await lifecycle.close();
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => (error === undefined ? resolve() : reject(error)));
+    });
+    await rm(testRoot, { recursive: true, force: true });
   }
 });
 

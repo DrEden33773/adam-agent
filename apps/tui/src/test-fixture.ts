@@ -1128,7 +1128,8 @@ function observeTuiDispatch(
       if (
         (command.type === "test_and_set_web_search" ||
           command.type === "cancel_web_search_test" ||
-          command.type === "clear_web_search") &&
+          command.type === "clear_web_search" ||
+          command.type === "set_web_synthetic_dns_range") &&
         controlRoot !== undefined
       ) {
         await Promise.all([

@@ -1,4 +1,9 @@
-/** Adam-owned DNS/IP binding and HTTP transport for immutable Web evidence. */
+/**
+ * Adam-owned DNS/IP binding and HTTP transport for immutable Web evidence.
+ * The explicit synthetic-DNS range pattern is informed by pi-web-access at
+ * 7ca5cdce4fdf33ddec3da4b1858215dcd0c0e382 (MIT); Adam keeps hostname-only
+ * admission, exact address/family binding, and its own redirect/evidence contracts.
+ */
 import { lookup } from "node:dns/promises";
 import { request as requestHttp } from "node:http";
 import { request as requestHttps } from "node:https";
@@ -23,6 +28,8 @@ export class SafeWebHttpError extends Error {
       | "web_deadline_exceeded"
       | "web_redirect_limit"
       | "web_request_failed"
+      | "web_synthetic_dns_https_required"
+      | "web_synthetic_dns_unconfigured"
       | "web_url_invalid",
     message: string,
   ) {
@@ -33,9 +40,11 @@ export class SafeWebHttpError extends Error {
 
 export function createSafeWebHttpAdapter(
   options: {
+    readonly allowedHostnameRanges?: readonly string[];
     readonly deadlineSignal?: AbortSignal;
     readonly requestHttp?: typeof requestHttp;
     readonly requestHttps?: typeof requestHttps;
+    readonly resolveAllowedHostnameRanges?: () => Promise<readonly string[]>;
     readonly resolver?: WebDnsResolver;
   } = {},
 ): WebHttpAdapter {
@@ -45,9 +54,14 @@ export function createSafeWebHttpAdapter(
     deadlineSignal: AbortSignal,
   ): ReturnType<WebHttpAdapter["fetch"]> => {
     const signal = AbortSignal.any([input.signal, deadlineSignal]);
+    const allowedHostnameRanges =
+      options.resolveAllowedHostnameRanges === undefined
+        ? (options.allowedHostnameRanges ?? [])
+        : await raceWebAbort(options.resolveAllowedHostnameRanges(), input.signal, deadlineSignal);
     const target = await raceWebAbort(
       resolveWebTarget({
         url: input.url,
+        allowedHostnameRanges,
         ...(input.allowedLoopbackOrigin === undefined
           ? {}
           : { allowedLoopbackOrigin: input.allowedLoopbackOrigin }),
@@ -65,6 +79,8 @@ export function createSafeWebHttpAdapter(
       const request = makeRequest(
         target.url,
         {
+          agent: false,
+          family: target.family,
           headers: { accept: "text/plain, text/html, application/json" },
           lookup(_hostname, _options, callback) {
             callback(null, target.address, target.family);
@@ -216,6 +232,7 @@ function webAbortError(callerSignal: AbortSignal, deadlineSignal: AbortSignal): 
 
 export async function resolveWebTarget(options: {
   readonly url: string;
+  readonly allowedHostnameRanges?: readonly string[];
   readonly allowedLoopbackOrigin?: string;
   readonly resolver?: WebDnsResolver;
 }): Promise<{
@@ -289,12 +306,30 @@ export async function resolveWebTarget(options: {
   } catch {
     throw new SafeWebHttpError("web_dns_failed", "The Web hostname could not be resolved.");
   }
-  if (
-    addresses.length === 0 ||
-    addresses.some(
-      ({ address }) => !ipaddr.isValid(address) || ipaddr.parse(address).range() !== "unicast",
-    )
-  ) {
+  if (addresses.length === 0) {
+    throw new SafeWebHttpError("web_dns_failed", "The Web hostname had no usable address.");
+  }
+  const allowedHostnameRanges =
+    url.protocol === "https:" ? (options.allowedHostnameRanges ?? []) : [];
+  const disallowed = addresses.filter(
+    ({ address }) =>
+      !ipaddr.isValid(address) ||
+      (ipaddr.parse(address).range() !== "unicast" &&
+        !addressMatchesAllowedHostnameRange(address, allowedHostnameRanges)),
+  );
+  if (disallowed.length > 0) {
+    if (disallowed.some(({ address }) => isSyntheticDnsIpv4Address(address))) {
+      if (url.protocol !== "https:") {
+        throw new SafeWebHttpError(
+          "web_synthetic_dns_https_required",
+          "Synthetic DNS admission is available only for HTTPS hostname URLs.",
+        );
+      }
+      throw new SafeWebHttpError(
+        "web_synthetic_dns_unconfigured",
+        "The Web target resolved through synthetic DNS in 198.18.0.0/15. Configure /config web-fake-ip with the exact proxy subnet, then retry.",
+      );
+    }
     throw new SafeWebHttpError(
       "web_address_disallowed",
       "Every resolved Web address must be public unicast.",
@@ -319,6 +354,32 @@ const productionWebDnsResolver: WebDnsResolver = {
 function hostnameLiteral(hostname: string): string | undefined {
   const candidate = hostname.startsWith("[") ? hostname.slice(1, -1) : hostname;
   return ipaddr.isValid(candidate) ? candidate : undefined;
+}
+
+function addressMatchesAllowedHostnameRange(
+  address: string,
+  allowedHostnameRanges: readonly string[],
+): boolean {
+  if (!ipaddr.isValid(address)) {
+    return false;
+  }
+  const parsed = ipaddr.parse(address);
+  return allowedHostnameRanges.some((range) => {
+    try {
+      const cidr = ipaddr.parseCIDR(range);
+      return parsed.kind() === cidr[0].kind() && parsed.match(cidr);
+    } catch {
+      return false;
+    }
+  });
+}
+
+function isSyntheticDnsIpv4Address(address: string): boolean {
+  if (!ipaddr.IPv4.isValidFourPartDecimal(address)) {
+    return false;
+  }
+  const [first, second] = address.split(".").map(Number);
+  return first === 198 && (second === 18 || second === 19);
 }
 
 function headerValue(value: string | readonly string[] | undefined): string | undefined {
