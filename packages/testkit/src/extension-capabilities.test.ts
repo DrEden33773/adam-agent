@@ -32,6 +32,8 @@ import {
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
+import { withManagedFailureGuard } from "./managed-agent-test-support.js";
+
 test("ExtensionHost gives one ordinary operation only the declared managed-session run capability", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-session-capability-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -541,6 +543,695 @@ test("ExtensionHost preserves the exact historical origin policy for one managed
     expect(requests).toHaveLength(2);
   } finally {
     await lifecycle?.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost v2 reviewer inherits origin policy and the Host default cumulative ceiling", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-review-v2-origin-policy-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const artifactStore = await createFileArtifactStore({ root: join(testRoot, "artifacts") });
+  const managedStore = createInMemoryManagedAgentStore();
+  const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  const contextProfile: ContextProfile = {
+    version: 1,
+    contextWindowTokens: 500_000,
+    maximumOutputTokens: 64_000,
+    compactAtTokens: 400_000,
+    postCompactTargetTokens: 128_000,
+    retainedTargetTokens: 32_000,
+    estimatorVersion: 1,
+  };
+  const thinkingPolicy = {
+    schemaVersion: 1,
+    requestedLevelId: "max",
+    effectiveLevelId: "max",
+    capability: {
+      id: "fixture-thinking.v1",
+      version: 1,
+      digest: `sha256:${"a".repeat(64)}` as const,
+    },
+    mapping: {
+      requestPath: "reasoning.effort" as const,
+      thinkingType: "enabled" as const,
+      reasoningEffort: "max" as const,
+    },
+    reasoningArtifact: "provider_reasoning" as const,
+  } as const;
+  const requests: ModelRequest[] = [];
+  const childModel: ModelDriver = {
+    async *stream(request) {
+      requests.push(request);
+      yield { type: "text_delta", text: '{"verdict":"verified"}' };
+      yield { type: "usage", inputTokens: 10, outputTokens: 3, reasoningTokens: 2 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const targetIdentity = {
+    targetId: "fixture.review.direct",
+    vendor: "fixture",
+    modelId: "review-model",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeManagedSessionV2RunExtension(packageRoot);
+    const host = createExtensionHost({
+      artifactStore,
+      capabilities: [
+        { id: "adam.artifact.publish@1", version: "1.0.0" },
+        { id: "adam.managed-session@2", version: "2.0.0" },
+      ],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.managed-review-v2",
+          grants: [
+            { id: "adam.artifact.publish@1", version: "^1.0.0" },
+            { id: "adam.managed-session@2", version: "^2.0.0" },
+          ],
+          packageName: "@fixture/managed-review-v2-extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      managedSession: {
+        childSessionStores,
+        managedStore,
+        parentPermissions: createPermissionPolicy({ allowedEffects: [] }),
+        async resolveOrigin() {
+          return {
+            targetIdentity,
+            childContextProfile: contextProfile,
+            childModel,
+            thinkingPolicy,
+          };
+        },
+        workspaceRoot,
+      },
+      operationOriginAuthority: { validateBoundary: async () => true },
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await expect(host.loadConfiguredExtensions()).resolves.toMatchObject({
+      extensions: [{ extensionId: "fixture.managed-review-v2", status: "active" }],
+    });
+    const started = await host.operations.startLinked({
+      contributionId: "fixture.managed-review-v2",
+      idempotencyKey: "managed-review-v2-origin-policy-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: "00000000-0000-4000-8000-000000000001",
+        sourceSequence: 3,
+      },
+    });
+
+    const events = await collectOperationEvents(host, started.operationId);
+    expect(events.at(-1)).toMatchObject({ event: { type: "operation_completed" } });
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      maximumOutputTokens: contextProfile.maximumOutputTokens,
+      thinkingPolicy,
+    });
+    expect(await managedStore.read()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          limits: {
+            maximumInactivityMilliseconds: 300_000,
+            maximumTokens: contextProfile.contextWindowTokens,
+          },
+          profile: "reviewer.v1",
+          thinkingPolicy,
+          type: "managed_agent_admitted",
+        }),
+      ]),
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost v2 permits only cumulative token tightening below the origin ceiling", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-review-v2-token-limit-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const artifactStore = await createFileArtifactStore({ root: join(testRoot, "artifacts") });
+  const managedStore = createInMemoryManagedAgentStore();
+  const contextProfile: ContextProfile = {
+    version: 1,
+    contextWindowTokens: 500_000,
+    maximumOutputTokens: 64_000,
+    compactAtTokens: 400_000,
+    postCompactTargetTokens: 128_000,
+    retainedTargetTokens: 32_000,
+    estimatorVersion: 1,
+  };
+  const childModel: ModelDriver = {
+    async *stream() {
+      yield { type: "text_delta", text: '{"verdict":"verified"}' };
+      yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const targetIdentity = {
+    targetId: "fixture.review.direct",
+    vendor: "fixture",
+    modelId: "review-model",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeManagedSessionV2RunExtension(packageRoot);
+    const host = createExtensionHost({
+      artifactStore,
+      capabilities: [
+        { id: "adam.artifact.publish@1", version: "1.0.0" },
+        { id: "adam.managed-session@2", version: "2.0.0" },
+      ],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.managed-review-v2",
+          grants: [
+            { id: "adam.artifact.publish@1", version: "^1.0.0" },
+            { id: "adam.managed-session@2", version: "^2.0.0" },
+          ],
+          packageName: "@fixture/managed-review-v2-extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      managedSession: {
+        childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+        managedStore,
+        parentPermissions: createPermissionPolicy({ allowedEffects: [] }),
+        async resolveOrigin() {
+          return { targetIdentity, childContextProfile: contextProfile, childModel };
+        },
+        workspaceRoot,
+      },
+      operationOriginAuthority: { validateBoundary: async () => true },
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+    const origin = {
+      invocation: {
+        id: "review" as const,
+        kind: "presentation_command" as const,
+        version: 1 as const,
+      },
+      sessionId: "00000000-0000-4000-8000-000000000001",
+      sourceSequence: 3,
+    };
+    const tightened = await host.operations.startLinked({
+      contributionId: "fixture.managed-review-v2",
+      idempotencyKey: "managed-review-v2-token-tightening-1",
+      input: { maximumCumulativeTokens: 250_000 },
+      origin,
+    });
+    await expect(collectOperationEvents(host, tightened.operationId)).resolves.toMatchObject([
+      { event: { type: "operation_started" } },
+      { event: { type: "operation_artifact_published" } },
+      { event: { type: "operation_managed_wait_started" } },
+      { event: { type: "operation_managed_wait_settled" } },
+      { event: { type: "operation_completed" } },
+    ]);
+    expect(await managedStore.read()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          limits: {
+            maximumInactivityMilliseconds: 300_000,
+            maximumTokens: 250_000,
+          },
+          type: "managed_agent_admitted",
+        }),
+      ]),
+    );
+
+    const enlarged = await host.operations.startLinked({
+      contributionId: "fixture.managed-review-v2",
+      idempotencyKey: "managed-review-v2-token-enlargement-1",
+      input: { maximumCumulativeTokens: 500_001 },
+      origin,
+    });
+    const enlargedEvents = await collectOperationEvents(host, enlarged.operationId);
+    expect(enlargedEvents.at(-1)).toMatchObject({
+      event: {
+        error: { code: "operation_capability_input_invalid" },
+        type: "operation_failed",
+      },
+    });
+    expect(
+      (await managedStore.read()).filter((record) => record.type === "managed_agent_admitted"),
+    ).toHaveLength(1);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost v2 auto-aborts an inactive reviewer with a typed stalled terminal", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-review-v2-stalled-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const artifactStore = await createFileArtifactStore({ root: join(testRoot, "artifacts") });
+  const backingManagedStore = createInMemoryManagedAgentStore();
+  const stalledAppended = Promise.withResolvers<void>();
+  const terminalAppended = Promise.withResolvers<void>();
+  const managedStore = {
+    append: async (record: Parameters<typeof backingManagedStore.append>[0]) => {
+      await backingManagedStore.append(record);
+      if (record.type === "managed_agent_stalled") stalledAppended.resolve();
+      if (record.type === "managed_agent_terminal") terminalAppended.resolve();
+    },
+    read: () => backingManagedStore.read(),
+  };
+  let signalModelStarted = () => {};
+  const modelStarted = new Promise<void>((resolve) => {
+    signalModelStarted = resolve;
+  });
+  const scheduled: Array<{
+    readonly delayMilliseconds: number;
+    readonly fire: () => void;
+    cancelled: boolean;
+  }> = [];
+  const childModel: ModelDriver = {
+    async *stream(request) {
+      signalModelStarted();
+      await new Promise<never>((_resolve, reject) => {
+        const rejectAbort = () => reject(request.signal.reason);
+        if (request.signal.aborted) rejectAbort();
+        else request.signal.addEventListener("abort", rejectAbort, { once: true });
+      });
+    },
+  };
+  const targetIdentity = {
+    targetId: "fixture.review.direct",
+    vendor: "fixture",
+    modelId: "review-model",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeManagedSessionV2RunExtension(packageRoot);
+    const host = createExtensionHost({
+      artifactStore,
+      capabilities: [
+        { id: "adam.artifact.publish@1", version: "1.0.0" },
+        { id: "adam.managed-session@2", version: "2.0.0" },
+      ],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.managed-review-v2",
+          grants: [
+            { id: "adam.artifact.publish@1", version: "^1.0.0" },
+            { id: "adam.managed-session@2", version: "^2.0.0" },
+          ],
+          packageName: "@fixture/managed-review-v2-extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      managedSession: {
+        childContextProfile: preparedDirectDeepSeekV2ContextProfile,
+        childModel,
+        childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+        inactivityScheduler: {
+          schedule(delayMilliseconds: number, onInactivity: () => void) {
+            const entry = {
+              delayMilliseconds,
+              fire: onInactivity,
+              cancelled: false,
+            };
+            scheduled.push(entry);
+            return {
+              cancel() {
+                entry.cancelled = true;
+              },
+            };
+          },
+        },
+        managedStore,
+        parentPermissions: createPermissionPolicy({ allowedEffects: [] }),
+        async resolveOrigin() {
+          return { targetIdentity };
+        },
+        workspaceRoot,
+      } as NonNullable<Parameters<typeof createExtensionHost>[0]["managedSession"]>,
+      operationOriginAuthority: { validateBoundary: async () => true },
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+    const started = await host.operations.startLinked({
+      contributionId: "fixture.managed-review-v2",
+      idempotencyKey: "managed-review-v2-stalled-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: "00000000-0000-4000-8000-000000000001",
+        sourceSequence: 3,
+      },
+    });
+    const eventsPromise = collectOperationEvents(host, started.operationId);
+    await modelStarted;
+    const activeWindows = scheduled.filter((entry) => !entry.cancelled);
+    expect(activeWindows).toHaveLength(1);
+    const inactivity = activeWindows[0];
+    if (inactivity === undefined) {
+      await host.operations.cancel(started.operationId);
+      await eventsPromise;
+      throw new Error("The managed reviewer did not register its inactivity supervisor.");
+    }
+    expect(inactivity.delayMilliseconds).toBe(300_000);
+    expect(inactivity.cancelled).toBe(false);
+    inactivity.fire();
+    await withManagedFailureGuard(
+      stalledAppended.promise,
+      "The v2 reviewer did not durably publish stalled attention.",
+    );
+    await withManagedFailureGuard(
+      terminalAppended.promise,
+      "The stalled v2 reviewer did not durably publish its terminal.",
+    );
+    const events = await eventsPromise;
+
+    expect(events.at(-1)).toMatchObject({
+      event: {
+        output: {
+          terminal: {
+            error: {
+              code: "managed_session_stalled",
+              message: "The managed review stalled without causal progress.",
+            },
+            status: "failed",
+          },
+        },
+        type: "operation_completed",
+      },
+    });
+    expect(await managedStore.read()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "managed_agent_stalled" }),
+        expect.objectContaining({
+          error: expect.objectContaining({ code: "managed_session_stalled" }),
+          status: "failed",
+          type: "managed_agent_terminal",
+        }),
+      ]),
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost v2 pauses only managed wait and resumes the remaining operation deadline", async () => {
+  const testRoot = await mkdtemp(
+    join(tmpdir(), "adam-agent-managed-review-v2-operation-deadline-"),
+  );
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const artifactStore = await createFileArtifactStore({ root: join(testRoot, "artifacts") });
+  const operationStore = createInMemoryOperationStore();
+  const releaseModel = Promise.withResolvers<void>();
+  const managedSettled = Promise.withResolvers<void>();
+  const releasePostProcessing = Promise.withResolvers<void>();
+  const controlKey = `__adamManagedV2Deadline${Date.now()}${Math.random()}`;
+  (globalThis as Record<string, unknown>)[controlKey] = {
+    managedSettled: () => managedSettled.resolve(),
+    releasePostProcessing: releasePostProcessing.promise,
+  };
+  const modelStarted = Promise.withResolvers<void>();
+  const childModel: ModelDriver = {
+    async *stream() {
+      modelStarted.resolve();
+      await releaseModel.promise;
+      yield { type: "text_delta", text: '{"verdict":"verified"}' };
+      yield { type: "usage", inputTokens: 10, outputTokens: 3 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const targetIdentity = {
+    targetId: "fixture.review.direct",
+    vendor: "fixture",
+    modelId: "review-model",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+  let now = Date.now();
+  const scheduled: Array<{
+    readonly delayMilliseconds: number;
+    readonly fire: () => void;
+    cancelled: boolean;
+  }> = [];
+  const operationDeadlineScheduler = {
+    schedule(delayMilliseconds: number, onDeadline: () => void) {
+      const entry = { delayMilliseconds, fire: onDeadline, cancelled: false };
+      scheduled.push(entry);
+      return { cancel: () => (entry.cancelled = true) };
+    },
+  };
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeManagedSessionV2DeadlineExtension(packageRoot, controlKey);
+    const host = createExtensionHost({
+      artifactStore,
+      capabilities: [
+        { id: "adam.artifact.publish@1", version: "1.0.0" },
+        { id: "adam.managed-session@2", version: "2.0.0" },
+      ],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.managed-review-v2",
+          grants: [
+            { id: "adam.artifact.publish@1", version: "^1.0.0" },
+            { id: "adam.managed-session@2", version: "^2.0.0" },
+          ],
+          packageName: "@fixture/managed-review-v2-extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      managedSession: {
+        childContextProfile: preparedDirectDeepSeekV2ContextProfile,
+        childModel,
+        childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+        managedStore: createInMemoryManagedAgentStore(),
+        parentPermissions: createPermissionPolicy({ allowedEffects: [] }),
+        async resolveOrigin() {
+          return { targetIdentity };
+        },
+        workspaceRoot,
+      },
+      operationDeadlineMs: 1_000,
+      operationDeadlineScheduler,
+      operationNow: () => now,
+      operationOriginAuthority: { validateBoundary: async () => true },
+      operationStore,
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    } as Parameters<typeof createExtensionHost>[0]);
+    await host.loadConfiguredExtensions();
+    const started = await host.operations.startLinked({
+      contributionId: "fixture.managed-review-v2",
+      idempotencyKey: "managed-review-v2-operation-deadline-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: "00000000-0000-4000-8000-000000000001",
+        sourceSequence: 3,
+      },
+    });
+    const eventsPromise = collectOperationEvents(host, started.operationId);
+    await modelStarted.promise;
+    const waitingRecords = await operationStore.read(started.operationId);
+    if (
+      !waitingRecords.some(
+        (record) => String(record.event.type) === "operation_managed_wait_started",
+      )
+    ) {
+      await host.operations.cancel(started.operationId);
+      releaseModel.resolve();
+      releasePostProcessing.resolve();
+      await eventsPromise;
+    }
+    expect(waitingRecords).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: {
+            remainingDeadlineMilliseconds: 1_000,
+            type: "operation_managed_wait_started",
+          },
+        }),
+      ]),
+    );
+    expect(scheduled.filter((entry) => !entry.cancelled)).toHaveLength(0);
+
+    now += 60_000;
+    releaseModel.resolve();
+    await withManagedFailureGuard(
+      managedSettled.promise,
+      "The v2 capability did not return after its managed terminal.",
+    );
+    const settledRecords = await operationStore.read(started.operationId);
+    expect(settledRecords).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: {
+            deadlineAt: new Date(now + 1_000).toISOString(),
+            remainingDeadlineMilliseconds: 1_000,
+            type: "operation_managed_wait_settled",
+          },
+        }),
+      ]),
+    );
+    await expect(host.operations.query(started.operationId)).resolves.toMatchObject({
+      deadlineAt: new Date(now + 1_000).toISOString(),
+      status: "running",
+    });
+    const resumedDeadline = scheduled.filter((entry) => !entry.cancelled);
+    expect(resumedDeadline).toHaveLength(1);
+    expect(resumedDeadline[0]?.delayMilliseconds).toBe(1_000);
+    resumedDeadline[0]?.fire();
+    const events = await eventsPromise;
+    expect(events.at(-1)).toMatchObject({
+      event: {
+        error: { code: "operation_deadline_exceeded" },
+        type: "operation_failed",
+      },
+    });
+  } finally {
+    releaseModel.resolve();
+    releasePostProcessing.resolve();
+    delete (globalThis as Record<string, unknown>)[controlKey];
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ExtensionHost v2 cancellation settles the managed wait without restarting its deadline", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-review-v2-cancel-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const packageRoot = join(testRoot, "extension");
+  const artifactStore = await createFileArtifactStore({ root: join(testRoot, "artifacts") });
+  const managedStore = createInMemoryManagedAgentStore();
+  const modelStarted = Promise.withResolvers<void>();
+  const childModel: ModelDriver = {
+    async *stream(request) {
+      modelStarted.resolve();
+      await new Promise<never>((_resolve, reject) => {
+        const rejectAbort = () => reject(request.signal.reason);
+        if (request.signal.aborted) rejectAbort();
+        else request.signal.addEventListener("abort", rejectAbort, { once: true });
+      });
+    },
+  };
+  const targetIdentity = {
+    targetId: "fixture.review.direct",
+    vendor: "fixture",
+    modelId: "review-model",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  } as const;
+  const scheduled: Array<{ readonly fire: () => void; cancelled: boolean }> = [];
+
+  try {
+    await mkdir(workspaceRoot);
+    await writeManagedSessionV2RunExtension(packageRoot);
+    const host = createExtensionHost({
+      artifactStore,
+      capabilities: [
+        { id: "adam.artifact.publish@1", version: "1.0.0" },
+        { id: "adam.managed-session@2", version: "2.0.0" },
+      ],
+      extensions: [
+        {
+          enabled: true,
+          extensionId: "fixture.managed-review-v2",
+          grants: [
+            { id: "adam.artifact.publish@1", version: "^1.0.0" },
+            { id: "adam.managed-session@2", version: "^2.0.0" },
+          ],
+          packageName: "@fixture/managed-review-v2-extension",
+          packageRoot,
+          packageVersion: "1.0.0",
+        },
+      ],
+      managedSession: {
+        childContextProfile: preparedDirectDeepSeekV2ContextProfile,
+        childModel,
+        childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+        managedStore,
+        parentPermissions: createPermissionPolicy({ allowedEffects: [] }),
+        async resolveOrigin() {
+          return { targetIdentity };
+        },
+        workspaceRoot,
+      },
+      operationDeadlineScheduler: {
+        schedule(_delayMilliseconds: number, onDeadline: () => void) {
+          const entry = { fire: onDeadline, cancelled: false };
+          scheduled.push(entry);
+          return { cancel: () => (entry.cancelled = true) };
+        },
+      },
+      operationOriginAuthority: { validateBoundary: async () => true },
+      operationStore: createInMemoryOperationStore(),
+      projectRoot: workspaceRoot,
+      stateRoot: join(testRoot, "state"),
+    });
+    await host.loadConfiguredExtensions();
+    const started = await host.operations.startLinked({
+      contributionId: "fixture.managed-review-v2",
+      idempotencyKey: "managed-review-v2-cancel-1",
+      input: { revision: "abc123" },
+      origin: {
+        invocation: { id: "review", kind: "presentation_command", version: 1 },
+        sessionId: "00000000-0000-4000-8000-000000000001",
+        sourceSequence: 3,
+      },
+    });
+    const eventsPromise = collectOperationEvents(host, started.operationId);
+    await modelStarted.promise;
+    await host.operations.cancel(started.operationId);
+    const events = await eventsPromise;
+
+    expect(events.map((record) => record.event.type)).toEqual([
+      "operation_started",
+      "operation_artifact_published",
+      "operation_managed_wait_started",
+      "operation_cancel_requested",
+      "operation_managed_wait_settled",
+      "operation_cancelled",
+    ]);
+    expect(events.at(-1)).toMatchObject({
+      event: { reason: "caller", type: "operation_cancelled" },
+    });
+    expect(await managedStore.read()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ status: "cancelled", type: "managed_agent_terminal" }),
+      ]),
+    );
+    expect(scheduled.filter((entry) => !entry.cancelled)).toHaveLength(0);
+  } finally {
     await rm(testRoot, { recursive: true, force: true });
   }
 });
@@ -2065,6 +2756,82 @@ async function writeManagedSessionRunExtension(packageRoot: string): Promise<voi
   });
 }
 `,
+    "utf8",
+  );
+}
+
+async function writeManagedSessionV2RunExtension(packageRoot: string): Promise<void> {
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(
+    join(packageRoot, "package.json"),
+    JSON.stringify({
+      name: "@fixture/managed-review-v2-extension",
+      version: "1.0.0",
+      type: "module",
+      adamAgent: {
+        id: "fixture.managed-review-v2",
+        apiVersion: "^0.5.0",
+        runtime: { entry: "./runtime.js" },
+        capabilities: {
+          required: [
+            { id: "adam.artifact.publish@1", version: "^1.0.0" },
+            { id: "adam.managed-session@2", version: "^2.0.0" },
+          ],
+          optional: [],
+        },
+        contributions: [
+          {
+            kind: "operation",
+            id: "fixture.managed-review-v2",
+            input: { id: "fixture.input", version: 1 },
+            output: { id: "fixture.output", version: 1 },
+            progress: { id: "fixture.progress", version: 1 },
+            managedOutput: { id: "fixture.managed-output", version: 1 },
+          },
+        ],
+      },
+    }),
+    "utf8",
+  );
+  await writeFile(
+    join(packageRoot, "runtime.js"),
+    `export function activate(context) {
+  const codec = (id) => ({ id, version: 1, decode(value) { return { ok: true, value }; }, encode(value) { return { ok: true, value }; } });
+  const managedOutput = { id: "fixture.managed-output", version: 1, decode(value) { return value?.verdict === "verified" ? { ok: true, value } : { ok: false, issues: [] }; }, encode(value) { return this.decode(value); } };
+  context.registerOperation({
+    id: "fixture.managed-review-v2",
+    input: codec("fixture.input"), output: codec("fixture.output"), progress: codec("fixture.progress"), managedOutput,
+    async execute(input, operation) {
+      const evidence = await operation.capabilities["adam.artifact.publish@1"].publish({ bytes: new TextEncoder().encode("immutable review evidence"), contract: { id: "fixture.review-evidence", version: 1 }, mediaType: "text/plain; charset=utf-8" });
+      const limits = Number.isSafeInteger(input?.maximumCumulativeTokens) ? { limits: { maximumCumulativeTokens: input.maximumCumulativeTokens } } : {};
+      const terminal = await operation.capabilities["adam.managed-session@2"].run({ evidence: [{ type: "artifact", artifact: evidence }], ...limits, managedRole: "Review immutable evidence.", output: { id: "fixture.managed-output", version: 1 }, profile: { id: "reviewer.v1", version: 1 }, selectedSkills: [], task: "Return candidates." });
+      return { terminal };
+    },
+  });
+}
+`,
+    "utf8",
+  );
+}
+
+async function writeManagedSessionV2DeadlineExtension(
+  packageRoot: string,
+  controlKey: string,
+): Promise<void> {
+  await writeManagedSessionV2RunExtension(packageRoot);
+  const runtimePath = join(packageRoot, "runtime.js");
+  const runtime = await import("node:fs/promises").then(({ readFile }) =>
+    readFile(runtimePath, "utf8"),
+  );
+  await writeFile(
+    runtimePath,
+    runtime.replace(
+      "      return { terminal };",
+      `      const control = globalThis[${JSON.stringify(controlKey)}];
+      control.managedSettled();
+      await control.releasePostProcessing;
+      return { terminal };`,
+    ),
     "utf8",
   );
 }

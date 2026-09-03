@@ -132,6 +132,7 @@ export type ToolResult =
               | "managed_agent_deadline_exceeded"
               | "managed_agent_failed"
               | "managed_agent_result_too_large"
+              | "managed_agent_stalled"
               | "managed_agent_unavailable"
               | "web_cancelled"
               | "web_deadline_exceeded"

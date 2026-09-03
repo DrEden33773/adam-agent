@@ -10,6 +10,7 @@ import {
   EXTENSION_BIOME_CAPABILITY_ID,
   EXTENSION_ID_MAX_LENGTH,
   EXTENSION_MANAGED_SESSION_CAPABILITY_ID,
+  EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID,
   EXTENSION_OPERATION_DEADLINE_MAX_MS,
   EXTENSION_PACKAGE_NAME_MAX_LENGTH,
   EXTENSION_PACKAGE_VERSION_MAX_LENGTH,
@@ -89,6 +90,10 @@ export type ExtensionHostOptions = {
   readonly capabilities: readonly ExtensionCapabilityAvailability[];
   readonly extensions: readonly ConfiguredExtension[];
   readonly operationDeadlineMs?: number;
+  readonly operationDeadlineScheduler?: Parameters<
+    typeof createOperationHost
+  >[0]["deadlineScheduler"];
+  readonly operationNow?: Parameters<typeof createOperationHost>[0]["now"];
   readonly operationDisableGraceMs?: number;
   readonly operationOriginAuthority?: OperationOriginAuthority;
   readonly operationStore?: OperationStore;
@@ -415,7 +420,9 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
     (options.capabilities.some((capability) => capability.id === EXTENSION_BIOME_CAPABILITY_ID) &&
       (options.biomeExecution === undefined || options.permissions === undefined)) ||
     (options.capabilities.some(
-      (capability) => capability.id === EXTENSION_MANAGED_SESSION_CAPABILITY_ID,
+      (capability) =>
+        capability.id === EXTENSION_MANAGED_SESSION_CAPABILITY_ID ||
+        capability.id === EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID,
     ) &&
       options.managedSession === undefined) ||
     (options.operationDeadlineMs !== undefined &&
@@ -466,6 +473,10 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
     ...(options.operationDeadlineMs === undefined
       ? {}
       : { defaultDeadlineMs: options.operationDeadlineMs }),
+    ...(options.operationDeadlineScheduler === undefined
+      ? {}
+      : { deadlineScheduler: options.operationDeadlineScheduler }),
+    ...(options.operationNow === undefined ? {} : { now: options.operationNow }),
     ...(options.biomeExecution === undefined ? {} : { biomeExecution: options.biomeExecution }),
     projectRoot: options.projectRoot ?? process.cwd(),
     executionDomain: projectExecutionDomain,
@@ -751,7 +762,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
               continue;
             }
             if (
-              !["0.3.0", EXTENSION_API_VERSION].some((version) =>
+              !["0.3.0", "0.4.0", EXTENSION_API_VERSION].some((version) =>
                 satisfies(version, manifest.adamAgent.apiVersion),
               )
             ) {

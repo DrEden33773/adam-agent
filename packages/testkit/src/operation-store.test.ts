@@ -62,6 +62,70 @@ test("OperationStore adapters append and read a versioned start record", async (
   }
 });
 
+test("OperationStore preserves managed v2 wait ordering across JSONL reopen", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-managed-wait-store-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const start: OperationEventRecord = {
+    schemaVersion: 3,
+    operationId,
+    sequence: 1,
+    recordedAt: "2026-09-03T08:00:00.000Z",
+    origin: {
+      invocation: { id: "review", kind: "presentation_command", version: 1 },
+      sessionId: "123e4567-e89b-42d3-a456-426614174010",
+      sourceSequence: 3,
+    },
+    event: {
+      type: "operation_started",
+      contributionId: "fixture.review",
+      deadlineAt: "2026-09-03T08:01:00.000Z",
+      definitionDigest: `sha256:${"a".repeat(64)}`,
+      extensionId: "fixture.extension",
+      extensionVersion: "1.0.0",
+      idempotencyKey: "managed-wait-store-1",
+      input: { revision: "abc123" },
+      inputDigest: canonicalInputDigest,
+      projectId: projectIdForWorkspace(workspaceRoot),
+    },
+  };
+  const waitStarted: OperationEventRecord = {
+    schemaVersion: 2,
+    operationId,
+    sequence: 2,
+    recordedAt: "2026-09-03T08:00:10.000Z",
+    event: {
+      type: "operation_managed_wait_started",
+      remainingDeadlineMilliseconds: 50_000,
+    },
+  };
+  const waitSettled: OperationEventRecord = {
+    schemaVersion: 2,
+    operationId,
+    sequence: 3,
+    recordedAt: "2026-09-03T09:00:00.000Z",
+    event: {
+      type: "operation_managed_wait_settled",
+      deadlineAt: "2026-09-03T09:00:50.000Z",
+      remainingDeadlineMilliseconds: 50_000,
+    },
+  };
+
+  try {
+    await mkdir(workspaceRoot);
+    const initial = await createJsonlOperationStore({ stateRoot, workspaceRoot });
+    await initial.append(start);
+    await initial.append(waitStarted);
+    const waitingReopen = await createJsonlOperationStore({ stateRoot, workspaceRoot });
+    expect(await waitingReopen.read(operationId)).toEqual([start, waitStarted]);
+    await waitingReopen.append(waitSettled);
+    const settledReopen = await createJsonlOperationStore({ stateRoot, workspaceRoot });
+    expect(await settledReopen.read(operationId)).toEqual([start, waitStarted, waitSettled]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("OperationStore adapters reject an unbounded linked-start query", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-operation-linked-query-"));
   const workspaceRoot = join(testRoot, "workspace");

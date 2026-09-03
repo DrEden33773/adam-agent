@@ -98,6 +98,7 @@ export async function createProductionProjectRuntime(
       { id: "adam.artifact.publish@1", version: "1.0.0" },
       { id: "adam.storage.records@1", version: "1.0.0" },
       { id: "adam.managed-session@1", version: "1.0.0" },
+      { id: "adam.managed-session@2", version: "2.0.0" },
     ],
     extensions,
     managedSession: {

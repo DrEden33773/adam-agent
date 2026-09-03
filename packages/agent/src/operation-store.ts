@@ -16,6 +16,8 @@ import type {
   ExtensionOperationFailedEvent,
   ExtensionOperationFailure,
   ExtensionOperationInspectionRequiredEvent,
+  ExtensionOperationManagedWaitSettledEvent,
+  ExtensionOperationManagedWaitStartedEvent,
   ExtensionOperationProgressEvent,
   ExtensionOperationReconciliationStartedEvent,
   ExtensionOperationStartedEvent,
@@ -83,6 +85,10 @@ export type OperationFailure = ExtensionOperationFailure;
 export type OperationFailedEvent = ExtensionOperationFailedEvent;
 
 export type OperationInspectionRequiredEvent = ExtensionOperationInspectionRequiredEvent;
+
+export type OperationManagedWaitStartedEvent = ExtensionOperationManagedWaitStartedEvent;
+
+export type OperationManagedWaitSettledEvent = ExtensionOperationManagedWaitSettledEvent;
 
 export type OperationReconciliationStartedEvent = ExtensionOperationReconciliationStartedEvent;
 
@@ -205,6 +211,23 @@ const operationReconciliationStartedEventSchema = z.strictObject({
   attemptNumber: z.number().int().positive(),
   definitionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
 });
+const operationManagedWaitStartedEventSchema = z.strictObject({
+  type: z.literal("operation_managed_wait_started"),
+  remainingDeadlineMilliseconds: z
+    .number()
+    .int()
+    .positive()
+    .max(EXTENSION_OPERATION_DEADLINE_MAX_MS),
+});
+const operationManagedWaitSettledEventSchema = z.strictObject({
+  type: z.literal("operation_managed_wait_settled"),
+  deadlineAt: canonicalTimestampSchema,
+  remainingDeadlineMilliseconds: z
+    .number()
+    .int()
+    .positive()
+    .max(EXTENSION_OPERATION_DEADLINE_MAX_MS),
+});
 const operationProgressEventSchema = z.strictObject({
   type: z.literal("operation_progress"),
   value: z.json(),
@@ -322,6 +345,8 @@ const operationEventRecordSchema: z.ZodType<OperationEventRecord> = z.union([
       operationStartedEventSchema,
       operationArtifactPublishedEventSchema,
       operationReconciliationStartedEventSchema,
+      operationManagedWaitStartedEventSchema,
+      operationManagedWaitSettledEventSchema,
       operationProgressEventSchema,
       operationCancelRequestedEventSchema,
       operationCompletedEventSchema,
@@ -745,6 +770,35 @@ function validateNextRecord(
           record.event.type === "operation_reconciliation_started" &&
           record.event.attemptId === attemptId,
       )
+    ) {
+      throw new OperationStoreError();
+    }
+  }
+  if (candidate.event.type === "operation_managed_wait_started") {
+    const started = history[0]?.event;
+    if (
+      started?.type !== "operation_started" ||
+      history.some(
+        (record) =>
+          record.event.type === "operation_managed_wait_started" ||
+          record.event.type === "operation_cancel_requested",
+      ) ||
+      candidate.event.remainingDeadlineMilliseconds >
+        Date.parse(started.deadlineAt) - Date.parse(history[0]?.recordedAt ?? "")
+    ) {
+      throw new OperationStoreError();
+    }
+  }
+  if (candidate.event.type === "operation_managed_wait_settled") {
+    const wait = history.find(
+      (record) => record.event.type === "operation_managed_wait_started",
+    )?.event;
+    if (
+      wait?.type !== "operation_managed_wait_started" ||
+      history.some((record) => record.event.type === "operation_managed_wait_settled") ||
+      candidate.event.remainingDeadlineMilliseconds !== wait.remainingDeadlineMilliseconds ||
+      Date.parse(candidate.event.deadlineAt) - Date.parse(candidate.recordedAt) !==
+        candidate.event.remainingDeadlineMilliseconds
     ) {
       throw new OperationStoreError();
     }

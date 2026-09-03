@@ -161,3 +161,30 @@ export const reviewerManagedAgentProfileV1 = {
 };
 
 export type ReviewerManagedAgentProfileV1 = typeof reviewerManagedAgentProfileV1;
+
+const reviewerManagedAgentProfileDefinitionV2 = {
+  id: "reviewer.v1",
+  version: 2,
+  toolNames: [],
+  allowedEffects: [],
+  limits: {
+    maximumCumulativeTokens: "inherited_context_window",
+    maximumInactivityMilliseconds: 300_000 as const,
+  },
+  capabilities: {
+    background: false,
+    selectedSkills: false,
+    ambientExtensions: false,
+    parentCoordination: false,
+    nestedAgents: false,
+  },
+} as const;
+
+export const reviewerManagedAgentProfileV2 = {
+  ...reviewerManagedAgentProfileDefinitionV2,
+  digest: `sha256:${createHash("sha256")
+    .update(JSON.stringify(reviewerManagedAgentProfileDefinitionV2))
+    .digest("hex")}` as const,
+};
+
+export type ReviewerManagedAgentProfileV2 = typeof reviewerManagedAgentProfileV2;
