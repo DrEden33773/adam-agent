@@ -60,6 +60,79 @@ test("TodoCompactViewModel preserves three-row unfinished priority and one-turn 
   expect(viewModel.snapshot()).toMatchObject({ visible: true, collapsed: true, rows: [] });
 });
 
+test("TodoCompactViewModel never invents completion from an incomplete unfinished projection", () => {
+  const viewModel = new TodoCompactViewModel();
+  const displaced = todoItem(
+    "10000000-0000-4000-8000-000000000021",
+    "Displaced unfinished item",
+    "in_progress",
+  );
+  viewModel.setState({
+    items: [displaced],
+    sessionId: "session-a",
+    summary: todoSummary({ pending: 0, inProgress: 1, completed: 0 }, 1),
+    turnKey: "turn-a",
+  });
+
+  const firstTwentyPending = Array.from({ length: 20 }, (_, index) =>
+    todoItem(
+      `10000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      `Pending item ${index + 1}`,
+      "pending",
+    ),
+  );
+  viewModel.setState({
+    items: firstTwentyPending,
+    sessionId: "session-a",
+    summary: todoSummary({ pending: 21, inProgress: 0, completed: 0 }, 2),
+    turnKey: "turn-a",
+  });
+
+  expect(viewModel.snapshot()).toMatchObject({
+    visible: true,
+    hiddenCompleted: 0,
+    hiddenUnfinished: 18,
+  });
+});
+
+test("TodoCompactViewModel removes a completed linger when the same item reopens outside an incomplete page", () => {
+  const viewModel = new TodoCompactViewModel();
+  const firstTwentyPending = Array.from({ length: 20 }, (_, index) =>
+    todoItem(
+      `10000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      `Pending item ${index + 1}`,
+      "pending",
+    ),
+  );
+  const displaced = todoItem(
+    "10000000-0000-4000-8000-000000000021",
+    "Reopened outside the first page",
+    "in_progress",
+  );
+  viewModel.setState({
+    items: [...firstTwentyPending, displaced],
+    sessionId: "session-a",
+    summary: todoSummary({ pending: 20, inProgress: 1, completed: 0 }, 1),
+    turnKey: "turn-a",
+  });
+  viewModel.setState({
+    items: firstTwentyPending,
+    sessionId: "session-a",
+    summary: todoSummary({ pending: 20, inProgress: 0, completed: 1 }, 2),
+    turnKey: "turn-a",
+  });
+  expect(viewModel.snapshot()).toMatchObject({ hiddenCompleted: 1 });
+
+  viewModel.setState({
+    items: firstTwentyPending,
+    sessionId: "session-a",
+    summary: todoSummary({ pending: 21, inProgress: 0, completed: 0 }, 3),
+    turnKey: "turn-a",
+  });
+
+  expect(viewModel.snapshot()).toMatchObject({ hiddenCompleted: 0 });
+});
+
 function todoSummary(
   counts: NonNullable<ActiveSessionDisplay["todo"]>["counts"],
   storeRevision: number,

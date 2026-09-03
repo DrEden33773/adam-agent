@@ -31,20 +31,26 @@ export class ConfigurationPage implements Component {
       | {
           readonly status: "Configured" | "Invalid" | "Unconfigured" | "Unsafe";
           readonly endpoint: string | null;
+          readonly syntheticDnsRange: string | null;
           readonly diagnostic: { readonly code: string; readonly message: string } | null;
         }
       | undefined;
   }) {
     this.#theme = options.theme;
+    const syntheticDnsNotice =
+      options.webSearch?.syntheticDnsRange === null ||
+      options.webSearch?.syntheticDnsRange === undefined
+        ? "Synthetic DNS: strict public addresses"
+        : `Synthetic DNS: Owner-trusted TUN/proxy ${safeTerminalText(options.webSearch.syntheticDnsRange)} for HTTPS hostnames; final upstream IP is proxy-enforced`;
     this.#webNotice =
       options.webSearch === undefined
         ? null
         : options.webSearch.status === "Unconfigured"
-          ? "Web Search is not configured. Fetch, open, and find remain available; configure an Owner-selected SearXNG endpoint to enable search for new sessions."
+          ? `Web Search is not configured. Fetch, open, and find remain available; configure an Owner-selected SearXNG endpoint to enable search for new sessions. ${syntheticDnsNotice}.`
           : (options.webSearch.diagnostic?.message ??
             (options.webSearch.endpoint === null
-              ? `Web Search is ${options.webSearch.status}.`
-              : `Web Search ${options.webSearch.status}: ${safeTerminalText(options.webSearch.endpoint)}`));
+              ? `Web Search is ${options.webSearch.status}. ${syntheticDnsNotice}.`
+              : `Web Search ${options.webSearch.status}: ${safeTerminalText(options.webSearch.endpoint)}. ${syntheticDnsNotice}.`));
     this.#targetId = safeTerminalText(options.target?.targetId ?? "no available target");
     this.#notice =
       options.diagnostic === null
@@ -141,7 +147,7 @@ export class ConfigurationPage implements Component {
       "",
       this.#theme.muted("Enter reset selected or edit Web Search · Esc close · Ctrl+Q exit"),
       this.#theme.muted(
-        "Set values with /config context|output|compaction <tokens|default> or /config web <endpoint|clear>",
+        "Set model values with /config context|output|compaction; Web uses /config web or /config web-fake-ip.",
       ),
     ];
   }

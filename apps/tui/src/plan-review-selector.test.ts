@@ -35,6 +35,28 @@ test("the ready Plan selector presents approve, revise, and cancel as equal-leve
   expect(onClose).toHaveBeenCalledOnce();
 });
 
+test("the ready Plan keeps every decision visible at every supported intermediate height", () => {
+  let height = 8;
+  const selector = new PlanReviewSelector({
+    contentDigest: `sha256:${"b".repeat(64)}`,
+    markdown: Array.from({ length: 24 }, (_, index) => `${index + 1}. Exact step`).join("\n"),
+    maximumContentHeight: () => height,
+    onClose: vi.fn(),
+    onSelect: vi.fn(),
+    theme: createAdamTuiTheme(true),
+  });
+
+  for (height of [8, 11, 12, 13, 16, 17, 20]) {
+    const lines = selector.render(40);
+    const rendered = lines.join("\n");
+    expect(lines.length, `height ${height}`).toBeLessThanOrEqual(height);
+    expect(rendered, `height ${height}`).toContain("Approve and implement");
+    expect(rendered, `height ${height}`).toContain("Request changes…");
+    expect(rendered, `height ${height}`).toContain("Cancel plan");
+    expect(rendered, `height ${height}`).toContain("Enter choose");
+  }
+});
+
 test("the recovered approval selector requires an explicit Continue implementation action", () => {
   const onClose = vi.fn();
   const onContinue = vi.fn();

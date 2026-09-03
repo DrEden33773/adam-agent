@@ -362,6 +362,22 @@ export const sessionManagedAgentTranscriptReader = Symbol(
   "adam-agent.session-managed-agent-transcript-reader",
 );
 
+/** Tests only. Production configured Web transport uses createSafeWebHttpAdapter directly. */
+export const sessionWebHttpAdapterFactory = Symbol("adam-agent.session-web-http-adapter-factory");
+
+export type SessionWebHttpAdapterFactory = (options: {
+  readonly resolveAllowedHostnameRanges: () => Promise<readonly string[]>;
+}) => WebHttpAdapter;
+
+/** Tests only. SessionLifecycle remains the owner of current-history validation. */
+export function validateCurrentSessionHistoryForTesting(
+  genesis: SessionGenesisRecord,
+  records: readonly SessionRecord[],
+  workspaceRoot: string,
+): void {
+  validateCurrentSessionHistory(genesis, records, workspaceRoot);
+}
+
 export type ManagedAgentTranscriptRecords = {
   readonly childSessionId: string;
   readonly records: readonly SessionRecord[];
@@ -453,6 +469,7 @@ export type SessionLifecycleOptions = {
   readonly [sessionStoreDirectory]?: SessionStoreDirectory<SessionRecord>;
   readonly [sessionRuntimeNotificationTransform]?: SessionRuntimeNotificationTransform;
   readonly [sessionManagedAgentInactivityScheduler]?: ManagedAgentInactivityScheduler;
+  readonly [sessionWebHttpAdapterFactory]?: SessionWebHttpAdapterFactory;
   readonly [inputResourceIngestBarrier]?: InputResourceIngestBarrier;
   readonly [workspaceMcpLeaseTransitionBarrier]?: WorkspaceMcpLeaseTransitionBarrier;
 };
@@ -977,7 +994,17 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     ...(providedOptions.webSearchConfiguration === undefined
       ? {}
       : {
-          webHttp: providedOptions.webHttp ?? createSafeWebHttpAdapter(),
+          webHttp:
+            providedOptions.webHttp ??
+            (providedOptions[sessionWebHttpAdapterFactory] ?? createSafeWebHttpAdapter)({
+              async resolveAllowedHostnameRanges() {
+                const snapshot = await providedOptions.webSearchConfiguration?.load();
+                return snapshot?.syntheticDnsRange === null ||
+                  snapshot?.syntheticDnsRange === undefined
+                  ? []
+                  : [snapshot.syntheticDnsRange];
+              },
+            }),
           webSearchConfiguration: providedOptions.webSearchConfiguration,
         }),
     [sessionStoreDirectory]: storeDirectory,
@@ -1171,8 +1198,18 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         artifactStore: sharedArtifactStore,
         configuration:
           desiredProvider === null
-            ? { status: "unconfigured", provider: null, diagnostic: null }
-            : { status: "configured", provider: desiredProvider, diagnostic: null },
+            ? {
+                status: "unconfigured",
+                provider: null,
+                syntheticDnsRange: currentConfiguration.syntheticDnsRange ?? null,
+                diagnostic: null,
+              }
+            : {
+                status: "configured",
+                provider: desiredProvider,
+                syntheticDnsRange: currentConfiguration.syntheticDnsRange ?? null,
+                diagnostic: null,
+              },
         http: options.webHttp,
         ...(desiredProvider === null ? {} : { searchAvailable }),
         store: webEvidenceStore,
@@ -5658,7 +5695,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       try {
         const started = await withOwner(async () => {
           const inspected = await inspectSession({ sessionId: input.sessionId });
-          if (inspected.schemaVersion !== 3 || options.modelTargets === undefined) {
+          if (!isSessionNamingMutable(inspected) || options.modelTargets === undefined) {
             throw new SessionLifecycleError("session_invalid");
           }
           const records = await readSessionRecords(options, input.sessionId);
@@ -5863,7 +5900,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
       return withOwner(async () => {
         const inspected = await inspectSession({ sessionId: input.sessionId });
-        if (inspected.schemaVersion !== 3) {
+        if (!isSessionNamingMutable(inspected)) {
           throw new SessionLifecycleError("session_invalid");
         }
         const records = await readSessionRecords(options, input.sessionId);
@@ -6013,7 +6050,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           throw new SessionLifecycleError("session_invalid");
         }
         const inspected = await inspectSession({ sessionId: input.sessionId });
-        if (inspected.schemaVersion !== 3) {
+        if (!isSessionNamingMutable(inspected)) {
           throw new SessionLifecycleError("session_invalid");
         }
         const records = await readSessionRecords(options, input.sessionId);
@@ -8814,6 +8851,12 @@ function draftSkillSelectionsAreValid(selections: readonly string[]): boolean {
         Buffer.byteLength(selection, "utf8") <= 16_384 &&
         /^[\x20-\x7e]+$/u.test(selection),
     )
+  );
+}
+
+function isSessionNamingMutable(snapshot: SessionSnapshot): snapshot is CurrentSessionSnapshot {
+  return (
+    snapshot.schemaVersion === 3 && (snapshot.status === "idle" || snapshot.status === "settled")
   );
 }
 

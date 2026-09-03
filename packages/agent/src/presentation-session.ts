@@ -93,6 +93,7 @@ import type { WebHttpAdapter } from "./web-evidence.js";
 import { createSafeWebHttpAdapter } from "./web-safe-http.js";
 import {
   createWebSearchConfigurationController,
+  normalizeWebSyntheticDnsRange,
   type WebSearchConfigurationSnapshot,
 } from "./web-search-configuration.js";
 
@@ -187,7 +188,16 @@ export async function createPresentationSession(
     options.webSearchEnvironment === undefined
       ? undefined
       : createWebSearchConfigurationController({ environment: options.webSearchEnvironment });
-  const webHttp = options.webHttp ?? createSafeWebHttpAdapter();
+  const webHttp =
+    options.webHttp ??
+    createSafeWebHttpAdapter({
+      async resolveAllowedHostnameRanges() {
+        const snapshot = await webSearchConfiguration?.load();
+        return snapshot?.syntheticDnsRange === null || snapshot?.syntheticDnsRange === undefined
+          ? []
+          : [snapshot.syntheticDnsRange];
+      },
+    });
   const managedAgentTranscriptPageSize = Math.min(
     100,
     Math.max(1, options[presentationManagedAgentTranscriptPageSize] ?? 20),
@@ -2850,6 +2860,45 @@ export async function createPresentationSession(
             status: "rejected",
             code: "persistence_failed",
             message: "The Web Search configuration could not be cleared.",
+          };
+        }
+      }
+      if (command.type === "set_web_synthetic_dns_range") {
+        const conflict = configurationMutationConflict();
+        if (conflict !== null) {
+          return conflict;
+        }
+        if (webSearchConfiguration === undefined) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "Web transport configuration is not available in this Presentation session.",
+          };
+        }
+        if (command.range !== null && normalizeWebSyntheticDnsRange(command.range) === undefined) {
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "The synthetic DNS range must be an IPv4 CIDR subnet inside 198.18.0.0/15.",
+          };
+        }
+        try {
+          await webSearchConfiguration.setSyntheticDnsRange(command.range);
+          const targets = await refreshConfiguredTargets();
+          state = {
+            revision: state.revision + 1,
+            authoritative: { ...state.authoritative, targets },
+            draft: state.draft,
+            composer: state.composer,
+            transient: state.transient,
+          };
+          publishStateChange();
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message: "The Web synthetic DNS configuration could not be saved.",
           };
         }
       }
@@ -5612,6 +5661,7 @@ function projectWebSearchConfiguration(snapshot: WebSearchConfigurationSnapshot)
             ? ("Unsafe" as const)
             : ("Unconfigured" as const),
     endpoint: snapshot.provider?.endpoint ?? null,
+    syntheticDnsRange: snapshot.syntheticDnsRange ?? null,
     diagnostic: snapshot.diagnostic,
   };
 }

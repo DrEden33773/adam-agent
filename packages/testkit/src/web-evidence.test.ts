@@ -799,12 +799,14 @@ test("Web Search configuration fails closed for missing, null, unsafe, or invali
   await expect(configuration.load()).resolves.toEqual({
     status: "unconfigured",
     provider: null,
+    syntheticDnsRange: null,
     diagnostic: null,
   });
   stored = { status: "available", text: '{"schemaVersion":1,"searchProvider":null}\n' };
   await expect(configuration.load()).resolves.toEqual({
     status: "unconfigured",
     provider: null,
+    syntheticDnsRange: null,
     diagnostic: null,
   });
   stored = { status: "unsafe" };
@@ -853,21 +855,138 @@ test("a tested SearXNG endpoint activates atomically for restart and clear write
         endpointDigest: `sha256:${createHash("sha256").update(endpoint).digest("hex")}`,
       },
     },
+    syntheticDnsRange: null,
     diagnostic: null,
   });
   await expect(createWebSearchConfigurationWithStorageForTesting(storage).load()).resolves.toEqual(
     activated,
   );
   expect(text).toBe(
-    `${JSON.stringify({ schemaVersion: 1, searchProvider: activated.provider })}\n`,
+    `${JSON.stringify({ schemaVersion: 2, searchProvider: activated.provider, syntheticDnsRange: null })}\n`,
   );
 
   await expect(configuration.clear()).resolves.toEqual({
     status: "unconfigured",
     provider: null,
+    syntheticDnsRange: null,
     diagnostic: null,
   });
-  expect(text).toBe('{"schemaVersion":1,"searchProvider":null}\n');
+  expect(text).toBe('{"schemaVersion":2,"searchProvider":null,"syntheticDnsRange":null}\n');
+});
+
+test("owner Web configuration admits only a normalized 198.18/15 synthetic DNS subnet", async () => {
+  let text: string | undefined;
+  const storage = {
+    async read() {
+      return text === undefined
+        ? ({ status: "missing" } as const)
+        : ({ status: "available", text } as const);
+    },
+    async write(next: string) {
+      text = next;
+    },
+  };
+  const configuration = createWebSearchConfigurationWithStorageForTesting(storage);
+
+  await expect(configuration.setSyntheticDnsRange("198.18.5.220/16")).resolves.toEqual({
+    status: "unconfigured",
+    provider: null,
+    syntheticDnsRange: "198.18.0.0/16",
+    diagnostic: null,
+  });
+  expect(text).toBe(
+    '{"schemaVersion":2,"searchProvider":null,"syntheticDnsRange":"198.18.0.0/16"}\n',
+  );
+  await expect(createWebSearchConfigurationWithStorageForTesting(storage).load()).resolves.toEqual({
+    status: "unconfigured",
+    provider: null,
+    syntheticDnsRange: "198.18.0.0/16",
+    diagnostic: null,
+  });
+  const endpoint = "https://search.example.test/search";
+  await expect(configuration.activateSearxng(endpoint)).resolves.toMatchObject({
+    status: "configured",
+    provider: { endpoint },
+    syntheticDnsRange: "198.18.0.0/16",
+  });
+  await expect(configuration.clear()).resolves.toMatchObject({
+    status: "unconfigured",
+    provider: null,
+    syntheticDnsRange: "198.18.0.0/16",
+  });
+
+  for (const range of [
+    "198.18.0.0/14",
+    "10.0.0.0/8",
+    "127.0.0.0/8",
+    "0.0.0.0/0",
+    "fd00::/8",
+    "not-a-cidr",
+  ]) {
+    await expect(configuration.setSyntheticDnsRange(range), range).rejects.toThrow(
+      "inside 198.18.0.0/15",
+    );
+  }
+  await expect(configuration.setSyntheticDnsRange(null)).resolves.toMatchObject({
+    syntheticDnsRange: null,
+  });
+});
+
+test("concurrent Web provider activation cannot resurrect a revoked synthetic DNS range", async () => {
+  let text = '{"schemaVersion":2,"searchProvider":null,"syntheticDnsRange":"198.18.0.0/16"}\n';
+  let reads = 0;
+  let exclusiveCalls = 0;
+  let exclusiveTail: Promise<unknown> = Promise.resolve();
+  const bothUnlockedReads = Promise.withResolvers<void>();
+  const revokedWrite = Promise.withResolvers<void>();
+  const storage = {
+    async runExclusive<T>(operation: () => Promise<T>): Promise<T> {
+      exclusiveCalls += 1;
+      const result = exclusiveTail.then(operation, operation);
+      exclusiveTail = result.then(
+        () => undefined,
+        () => undefined,
+      );
+      return result;
+    },
+    async read() {
+      const captured = text;
+      if (exclusiveCalls === 0) {
+        reads += 1;
+        if (reads === 2) {
+          bothUnlockedReads.resolve();
+        }
+        await bothUnlockedReads.promise;
+      }
+      return { status: "available" as const, text: captured };
+    },
+    async write(next: string) {
+      const parsed = JSON.parse(next) as {
+        readonly searchProvider: unknown;
+        readonly syntheticDnsRange: string | null;
+      };
+      if (exclusiveCalls === 0 && parsed.searchProvider !== null) {
+        await revokedWrite.promise;
+      }
+      text = next;
+      if (parsed.searchProvider === null && parsed.syntheticDnsRange === null) {
+        revokedWrite.resolve();
+      }
+    },
+  };
+  const configuration = createWebSearchConfigurationWithStorageForTesting(storage);
+
+  await Promise.all([
+    configuration.activateSearxng("https://search.example.test/search"),
+    configuration.setSyntheticDnsRange(null),
+  ]);
+
+  expect(exclusiveCalls).toBe(2);
+  await expect(configuration.load()).resolves.toMatchObject({
+    status: "configured",
+    provider: { endpoint: "https://search.example.test/search" },
+    syntheticDnsRange: null,
+  });
 });
 
 test("SearXNG endpoint admission permits only public HTTPS or exact literal loopback HTTP", async () => {
@@ -1266,6 +1385,26 @@ test("Presentation exposes Web Search configuration and commits only an explicit
     expect(presentation.getState().authoritative.targets.configuration?.webSearch).toMatchObject({
       status: "Unconfigured",
       endpoint: null,
+      syntheticDnsRange: null,
+    });
+    await expect(
+      presentation.dispatch({
+        type: "set_web_synthetic_dns_range",
+        range: "198.18.0.0/14",
+      }),
+    ).resolves.toEqual({
+      status: "rejected",
+      code: "invalid_command",
+      message: "The synthetic DNS range must be an IPv4 CIDR subnet inside 198.18.0.0/15.",
+    });
+    await expect(
+      presentation.dispatch({
+        type: "set_web_synthetic_dns_range",
+        range: "198.18.0.0/16",
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    expect(presentation.getState().authoritative.targets.configuration?.webSearch).toMatchObject({
+      syntheticDnsRange: "198.18.0.0/16",
     });
     await expect(
       presentation.dispatch({ type: "test_and_set_web_search", endpoint }),
@@ -1273,6 +1412,7 @@ test("Presentation exposes Web Search configuration and commits only an explicit
     expect(presentation.getState().authoritative.targets.configuration?.webSearch).toMatchObject({
       status: "Configured",
       endpoint,
+      syntheticDnsRange: "198.18.0.0/16",
     });
     await expect(presentation.dispatch({ type: "clear_web_search" })).resolves.toMatchObject({
       status: "admitted",
@@ -1280,7 +1420,11 @@ test("Presentation exposes Web Search configuration and commits only an explicit
     expect(presentation.getState().authoritative.targets.configuration?.webSearch).toMatchObject({
       status: "Unconfigured",
       endpoint: null,
+      syntheticDnsRange: "198.18.0.0/16",
     });
+    await expect(
+      presentation.dispatch({ type: "set_web_synthetic_dns_range", range: null }),
+    ).resolves.toMatchObject({ status: "admitted" });
   } finally {
     await presentation.close();
     await lifecycle.close();
@@ -1679,7 +1823,7 @@ test("the production WebEvidence factory has one closed searxng branch and no im
   ]);
 });
 
-test("Web transport binds only an all-public DNS answer or the exact configured loopback origin", async () => {
+test("Web transport binds public DNS, explicit hostname-only synthetic DNS, or exact loopback", async () => {
   const lookups: string[] = [];
   const resolver = {
     async lookup(hostname: string) {
@@ -1717,6 +1861,75 @@ test("Web transport binds only an all-public DNS answer or the exact configured 
     }),
   ).resolves.toMatchObject({ address: "127.0.0.1", family: 4 });
   expect(lookups).toEqual(["public.example.test", "mixed.example.test"]);
+
+  const syntheticResolver = {
+    async lookup() {
+      return [{ address: "198.18.5.220", family: 4 as const }];
+    },
+  };
+  await expect(
+    resolveWebTargetForTesting({
+      url: "https://synthetic.example.test/evidence",
+      resolver: syntheticResolver,
+    }),
+  ).rejects.toMatchObject({ code: "web_synthetic_dns_unconfigured" });
+  await expect(
+    resolveWebTargetForTesting({
+      url: "https://synthetic.example.test/evidence",
+      allowedHostnameRanges: ["198.18.0.0/16"],
+      resolver: syntheticResolver,
+    }),
+  ).resolves.toMatchObject({ address: "198.18.5.220", family: 4 });
+  await expect(
+    resolveWebTargetForTesting({
+      url: "http://synthetic.example.test/evidence",
+      allowedHostnameRanges: ["198.18.0.0/16"],
+      resolver: syntheticResolver,
+    }),
+  ).rejects.toMatchObject({ code: "web_synthetic_dns_https_required" });
+  await expect(
+    resolveWebTargetForTesting({
+      url: "https://198.18.5.220/evidence",
+      allowedHostnameRanges: ["198.18.0.0/16"],
+      resolver: syntheticResolver,
+    }),
+  ).rejects.toMatchObject({ code: "web_address_disallowed" });
+});
+
+test("web_fetch explains the exact synthetic DNS opt-in before making a request", async () => {
+  const registry = await createWebEvidenceToolRegistry({
+    artifactStore: createInMemoryArtifactStoreForWebTest(),
+    http: createSafeWebHttpAdapter({
+      resolver: {
+        async lookup() {
+          return [{ address: "198.18.5.220", family: 4 }];
+        },
+      },
+    }),
+  });
+  const prepared = registry
+    .resolve("web_fetch")
+    ?.prepare(JSON.stringify({ url: "https://synthetic.example.test/evidence" }));
+  if (prepared?.status !== "ready") {
+    throw new Error("The synthetic-DNS URL did not reach Web transport execution.");
+  }
+
+  await expect(
+    prepared.execute({
+      callId: "synthetic-dns-guidance",
+      sessionId: "123e4567-e89b-42d3-a456-426614174000",
+      signal: new AbortController().signal,
+      toolName: "web_fetch",
+      toolProfileDigest: `sha256:${"c".repeat(64)}`,
+    }),
+  ).resolves.toEqual({
+    status: "failed",
+    error: {
+      code: "web_response_invalid",
+      message:
+        "The Web target uses 198.18.0.0/15 synthetic DNS. If this host intentionally uses an Owner-trusted TUN/fake-IP proxy, configure its exact subnet from the TUI with /config web-fake-ip, then retry.",
+    },
+  });
 });
 
 test("the aggregate Web deadline includes DNS resolution before any connection", async () => {

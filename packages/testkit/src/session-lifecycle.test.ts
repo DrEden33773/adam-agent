@@ -46,6 +46,7 @@ import {
   type ProjectLifecycleOwner,
   planApprovalIntentBarrier,
   preparedDirectDeepSeekV2ContextProfile,
+  type SessionGenesisRecord,
   type SessionRecord,
   type SessionStoreDirectory,
   sessionAutomaticTitlesEnabled,
@@ -54,6 +55,7 @@ import {
   sessionLogicalRunStartedBarrier,
   sessionProjectLifecycleOwner,
   sessionStoreDirectory,
+  validateCurrentSessionHistoryForTesting,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { createInMemorySessionLifecycleHarness, FakeModelDriver } from "./index.js";
@@ -10257,7 +10259,7 @@ test("SessionLifecycle settles a started unsafe tool effect as indeterminate wit
   }
 });
 
-test("SessionLifecycle explicitly replays one exact safe read after revalidating its durable allow", async () => {
+test("SessionLifecycle rejects interrupted naming without corrupting one replayable safe read", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-lifecycle-safe-replay-"));
   const stateRoot = join(testRoot, "state");
   const workspaceRoot = join(testRoot, "workspace");
@@ -10404,6 +10406,129 @@ test("SessionLifecycle explicitly replays one exact safe read after revalidating
       await store.append({ ...record, sequence: index + 2 } as SessionRecord);
     }
 
+    const interruptedRecords = await store.read();
+    const genesis = interruptedRecords[0];
+    if (genesis?.schemaVersion !== 3 || genesis.record.type !== "session_genesis") {
+      throw new Error("Expected the current session genesis.");
+    }
+    const currentGenesis = genesis as SessionGenesisRecord;
+    const legacyNaming = {
+      schemaVersion: 3,
+      sequence: 11,
+      record: {
+        type: "session_manual_name_set",
+        recordVersion: 1,
+        name: "Historical interrupted name",
+      },
+    } as const satisfies SessionRecord;
+    expect(() =>
+      validateCurrentSessionHistoryForTesting(
+        currentGenesis,
+        [...interruptedRecords, legacyNaming],
+        workspaceRoot,
+      ),
+    ).not.toThrow();
+
+    const unsafeReplayRecords = interruptedRecords.map((entry) => {
+      if (entry.schemaVersion !== 3 || entry.record.type !== "model_response_completed") {
+        return entry;
+      }
+      return {
+        ...entry,
+        record: {
+          ...entry.record,
+          response: {
+            ...entry.record.response,
+            toolIntents: entry.record.response.toolIntents.map((intent) => ({
+              ...intent,
+              replay: "never" as const,
+            })),
+          },
+        },
+      } as SessionRecord;
+    });
+    expect(() =>
+      validateCurrentSessionHistoryForTesting(
+        currentGenesis,
+        [...unsafeReplayRecords, legacyNaming],
+        workspaceRoot,
+      ),
+    ).toThrowError(SessionLifecycleError);
+
+    const parallelCall = {
+      id: "parallel-read-after-restart",
+      name: call.name,
+      argumentsJson: call.argumentsJson,
+    } as const;
+    const parallelRecords = interruptedRecords.map((entry) => {
+      if (entry.schemaVersion !== 3 || entry.record.type !== "model_response_completed") {
+        return entry;
+      }
+      return {
+        ...entry,
+        record: {
+          ...entry.record,
+          response: {
+            ...entry.record.response,
+            toolCalls: [...entry.record.response.toolCalls, parallelCall],
+            toolIntents: [
+              ...entry.record.response.toolIntents,
+              {
+                callId: parallelCall.id,
+                name: parallelCall.name,
+                argumentsDigest: `sha256:${createHash("sha256")
+                  .update(parallelCall.argumentsJson)
+                  .digest("hex")}`,
+                effect: "read" as const,
+                definitionDigest: readTool.definitionDigest,
+                replay: "safe" as const,
+              },
+            ],
+          },
+        },
+      } as SessionRecord;
+    });
+    expect(() =>
+      validateCurrentSessionHistoryForTesting(
+        currentGenesis,
+        [...parallelRecords, legacyNaming],
+        workspaceRoot,
+      ),
+    ).toThrowError(SessionLifecycleError);
+    expect(() =>
+      validateCurrentSessionHistoryForTesting(
+        currentGenesis,
+        [
+          ...interruptedRecords,
+          legacyNaming,
+          {
+            ...legacyNaming,
+            sequence: 12,
+            record: { ...legacyNaming.record, name: "Second interleaved name" },
+          },
+        ],
+        workspaceRoot,
+      ),
+    ).toThrowError(SessionLifecycleError);
+
+    const beforeNaming = await store.read();
+    await expect(
+      lifecycle.setSessionManualName({
+        sessionId: created.sessionId,
+        name: "Must wait for interrupted normalization",
+      }),
+    ).rejects.toMatchObject({ code: "session_invalid" });
+    expect(await store.read()).toEqual(beforeNaming);
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "interrupted",
+      lastSequence: 10,
+    });
+    await store.append(legacyNaming);
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      status: "interrupted",
+      lastSequence: 11,
+    });
+
     const hydrated = await lifecycle.resume({ sessionId: created.sessionId });
     const continued = await lifecycle.continue({ sessionId: created.sessionId });
     const persisted = await store.read();
@@ -10418,7 +10543,7 @@ test("SessionLifecycle explicitly replays one exact safe read after revalidating
     expect({ hydrated, continued, requests, publicToolEvents }).toEqual({
       hydrated: expect.objectContaining({
         status: "ready",
-        snapshot: expect.objectContaining({ status: "interrupted", lastSequence: 10 }),
+        snapshot: expect.objectContaining({ status: "interrupted", lastSequence: 11 }),
       }),
       continued: expect.objectContaining({
         result: { status: "completed", answer: "Hello, Adam." },

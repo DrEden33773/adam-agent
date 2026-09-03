@@ -178,6 +178,54 @@ test("active-run /agents opens the live managed overlay without ending the paren
   }
 });
 
+test("terminal managed follow-up restores responsive editor input before admission", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-follow-up-input-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "managed-active",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Start one terminal managed child.\r");
+    await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
+    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
+    await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
+    await fixture.waitFor("Managed active parent completed.");
+    await fixture.waitFor("Agents 0 active/1 terminal");
+
+    fixture.write("/agents\r");
+    await fixture.waitFor("Agents · 0 active · 1 terminal");
+    fixture.write("\r");
+    await fixture.waitFor("f follow-up from exact terminal evidence");
+    fixture.write("\u001b[102;1:1u");
+    fixture.write("\u001b[102;1:2u");
+    fixture.write("\u001b[102;1:3u");
+    await fixture.resize(81, 24);
+    expect(fixture.screen()?.join("\n") ?? "").toContain(
+      "Enter one bounded follow-up task for the exact terminal child.",
+    );
+
+    const beforeDraft = fixture.output().length;
+    fixture.write("Preserve exact follow-up evidence.");
+    await fixture.resize(82, 24);
+    expect(fixture.output().slice(beforeDraft)).toContain("Preserve exact follow-up evidence.");
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("fPreserve exact follow-up evidence.");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("active managed viewer sends one exact ordinary message without a Main turn", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-message-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -243,13 +291,26 @@ test("active managed viewer requires two exact cancel inputs before causal settl
     await fixture.waitFor("Agents · 1 active · 0 terminal");
     fixture.write("\r");
     await fixture.resize(81, 24);
-    fixture.write("c");
+    fixture.write("\u001b[99;1:1u");
     await fixture.resize(82, 24);
     expect(fixture.screen()?.join("\n") ?? "").toContain("Press c again to stop this exact child");
 
-    fixture.write("c");
+    fixture.write("\u001b[99;1:2u");
+    fixture.write("\u001b[99;1:3u");
+    await fixture.resize(81, 24);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("Press c again to stop this exact child");
+
+    fixture.write("\u001b[99;1:1u");
     await fixture.waitFor("Managed child cancelled after causal settlement.");
     await fixture.waitFor("Managed active parent completed.");
+
+    fixture.write("\u001b[99;1:2u");
+    fixture.write("\u001b[99;1:3u");
+    const beforeDraft = fixture.output().length;
+    fixture.write("CANCEL_HANDOFF_DRAFT");
+    await fixture.resize(82, 24);
+    expect(fixture.output().slice(beforeDraft)).toContain("CANCEL_HANDOFF_DRAFT");
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("cCANCEL_HANDOFF_DRAFT");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -2036,7 +2097,9 @@ test("the production target picker checks the focused API without turning connec
     await fixture.waitFor("Details [focused]");
     fixture.write("x");
     expect((fixture.screen() ?? []).join("\n")).toContain("Search: direct");
-    fixture.write("c");
+    fixture.write("\u001b[99;1:1u");
+    await fixture.resize(81, 24);
+    expect((fixture.screen() ?? []).join("\n")).toMatch(/Checking API|Reachable/u);
     await fixture.waitFor("Reachable");
     const settled = (fixture.screen() ?? []).join("\n");
     expect(settled).toContain("Connection  Reachable");
@@ -3166,7 +3229,7 @@ test("the production TUI tests and persists one explicit public SearXNG endpoint
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     await expect(readFile(join(configRoot, "adam-agent", "web.json"), "utf8")).resolves.toBe(
       `${JSON.stringify({
-        schemaVersion: 1,
+        schemaVersion: 2,
         searchProvider: {
           kind: "searxng",
           endpoint,
@@ -3175,10 +3238,45 @@ test("the production TUI tests and persists one explicit public SearXNG endpoint
             endpointDigest: `sha256:${createHash("sha256").update(endpoint).digest("hex")}`,
           },
         },
+        syntheticDnsRange: null,
       })}\n`,
     );
   } finally {
     await rm(testRoot);
+  }
+});
+
+test("the production TUI explicitly admits one narrow fake-IP DNS subnet", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-web-fake-ip-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const configRoot = join(testRoot, "config");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      launch: { configRoot, startupTargetId: "deepseek-v4-flash.direct" },
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("/config web-fake-ip 198.18.5.220/16\r");
+    await waitForFileContents(
+      join(controlRoot, "set_web_synthetic_dns_range-settled"),
+      "admitted\n",
+    );
+    await fixture.waitFor("Web DNS now trusts the Owner-managed TUN/proxy");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+
+    await expect(readFile(join(configRoot, "adam-agent", "web.json"), "utf8")).resolves.toBe(
+      '{"schemaVersion":2,"searchProvider":null,"syntheticDnsRange":"198.18.0.0/16"}\n',
+    );
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
   }
 });
 
@@ -4878,6 +4976,38 @@ test("the production TUI reviews, revises, and implements the exact ready Plan",
     frame = latestSynchronizedFrame(fixture.output().slice(beforeArtifactDetail)).join("\n");
     expect(frame).toContain("# Fixture plan 2");
     expect(frame).toContain("Implement the exact reviewed change.");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the minimum supported Plan review never hides executable approval actions", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-review-minimum-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ launch: {}, scenario: "plan-review", stateRoot, workspaceRoot });
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    await fixture.waitFor("New session draft · idle");
+    fixture.write("/plan\r");
+    await fixture.waitFor("Plan exploring");
+    await fixture.resize(40, 12);
+
+    const beforeSubmission = fixture.output().length;
+    fixture.write("Create a safely visible implementation plan\r");
+    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeSubmission);
+    const frame = latestSynchronizedFrame(fixture.output().slice(beforeSubmission)).join("\n");
+    expect(frame).toContain("Approve and implement");
+    expect(frame).toContain("Request changes…");
+    expect(frame).toContain("Cancel plan");
+    expect(frame).toContain("Enter choose");
 
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -8899,13 +9029,16 @@ test("slash Todos opens the authoritative read-only list and exact detail", asyn
     fixture.write("\r");
     await fixture.waitFor("Todo fixture created.");
     await fixture.waitFor("Todo 1/0/0 · 0 blocked");
+    await fixture.resize(40, 12);
     const beforeTodos = fixture.output().length;
     fixture.write("/todos\r");
     await fixture.waitForCompleteFrameAfter("Todos · revision 1", beforeTodos);
     const listFrame = fixture.output().slice(beforeTodos);
     expectFramedOverlay(listFrame, "Todos · revision 1");
     expect(listFrame).toContain("Exact Todo fixture");
-    expect(listFrame).toContain("pending · ready · revision 1");
+    expect(listFrame).toContain("Enter detail");
+    expect(listFrame).toContain("Esc close");
+    await fixture.resize(80, 24);
     const beforeDetail = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter("Todo detail · read-only", beforeDetail);
@@ -8945,7 +9078,9 @@ test("active-run /todos reads the causally refreshed exact Todo revision", async
     await fixture.waitForCompleteFrameAfter("Todos · revision 1", beforeTodos);
     expect(fixture.output().slice(beforeTodos)).toContain("Active Todo fixture");
 
-    fixture.write("c");
+    fixture.write("\u001b[99;1:1u");
+    fixture.write("\u001b[99;1:2u");
+    fixture.write("\u001b[99;1:3u");
     const beforeClose = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
     await fixture.waitForCompleteFrameAfter("Todos · 1 unfinished · collapsed", beforeClose);

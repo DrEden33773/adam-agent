@@ -82,6 +82,7 @@ type ValidatedToolState = {
   readonly intent: {
     readonly definitionDigest?: string | undefined;
     readonly effect?: string | undefined;
+    readonly replay?: string | undefined;
   };
   decision?: "allow" | "deny";
   changePreviewRef?: ArtifactReference<ChangePreviewArtifactSource>;
@@ -170,8 +171,32 @@ export function validateCurrentSessionHistory(
   let skillResourceRunBytes = 0;
   let inputResourceRunBytes = 0;
   let manualSessionName: string | null = null;
+  let sawLegacyInterruptedNaming = false;
   let automaticTitleEligible = false;
   let automaticTitleSlotClosed = false;
+  const isLegacyInterruptedNamingBoundary = (): boolean => {
+    if (
+      sawLegacyInterruptedNaming ||
+      attemptState?.status !== "completed" ||
+      attemptState.response?.response.finishReason !== "tool_calls" ||
+      terminalIntent !== undefined ||
+      sawSettlement
+    ) {
+      return false;
+    }
+    const unsettled = [...toolStates.values()].filter((tool) => !tool.terminal);
+    if (unsettled.length !== 1) {
+      return false;
+    }
+    const tool = unsettled[0];
+    return (
+      tool?.requested === true &&
+      tool.started &&
+      tool.decision === "allow" &&
+      tool.intent.replay === "safe" &&
+      tool.intent.effect === "read"
+    );
+  };
   let activeTitleGeneration:
     | {
         readonly generationId: string;
@@ -1401,16 +1426,18 @@ export function validateCurrentSessionHistory(
       continue;
     }
     if (record.type === "session_manual_name_set") {
-      if (run !== undefined) {
+      if (run !== undefined && !isLegacyInterruptedNamingBoundary()) {
         throw new SessionLifecycleError("session_invalid");
       }
+      sawLegacyInterruptedNaming ||= run !== undefined;
       manualSessionName = record.name;
       continue;
     }
     if (record.type === "session_manual_name_cleared") {
-      if (run !== undefined) {
+      if (run !== undefined && !isLegacyInterruptedNamingBoundary()) {
         throw new SessionLifecycleError("session_invalid");
       }
+      sawLegacyInterruptedNaming ||= run !== undefined;
       manualSessionName = null;
       continue;
     }

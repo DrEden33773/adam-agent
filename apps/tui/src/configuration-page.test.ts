@@ -90,7 +90,12 @@ function createPage(
     onReset,
     target,
     theme: createAdamTuiTheme(true),
-    webSearch: { status: "Unconfigured", endpoint: null, diagnostic: null },
+    webSearch: {
+      status: "Unconfigured",
+      endpoint: null,
+      syntheticDnsRange: null,
+      diagnostic: null,
+    },
   });
 }
 

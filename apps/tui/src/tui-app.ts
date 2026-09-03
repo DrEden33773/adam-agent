@@ -29,6 +29,7 @@ import {
   isKeyRepeat,
   Loader,
   Markdown,
+  matchesKey,
   type OverlayOptions,
   ProcessTerminal,
   Spacer,
@@ -469,6 +470,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly attentionId?: string;
       }
     | undefined;
+  let managedAgentFocusHandoffKey: "c" | "f" | "m" | "r" | null = null;
   let todoNavigatorGeneration = 0;
   let planActionOverlay:
     | {
@@ -1051,9 +1053,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         }
         let handle: { hide(): void } | undefined;
         const close = () => hidePlanActionOverlay(true, true);
+        const overlayOptions: OverlayOptions = {
+          width: "80%",
+          minWidth: 48,
+          maxHeight: "100%",
+          margin: 1,
+        };
         const selector = new PlanReviewSelector({
           contentDigest: submission.contentDigest,
           markdown: receipt.resource.text,
+          maximumContentHeight: () =>
+            Math.max(
+              1,
+              (resolveOverlayMaximumHeight(overlayOptions, terminal.rows) ?? terminal.rows) - 2,
+            ),
           onClose: close,
           onSelect(action) {
             if (action === "approve") {
@@ -1104,12 +1117,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           theme,
           ...(submission.title === undefined ? {} : { title: submission.title }),
         });
-        handle = showOverlay(selector, {
-          width: "80%",
-          minWidth: 48,
-          maxHeight: "80%",
-          margin: 1,
-        });
+        handle = showOverlay(selector, overlayOptions);
         planActionOverlay = { close, draft, hide: () => handle?.hide(), subjectKey };
         clearNotice();
         tui.requestRender();
@@ -2928,6 +2936,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           managedAgents: current.managedAgents,
           maximumContentHeight: () => Math.max(8, Math.floor(physicalTerminal.rows * 0.9) - 2),
           onCancel(input) {
+            managedAgentFocusHandoffKey = "c";
             void options.presentation
               .dispatch({
                 type: "cancel_managed_agent",
@@ -2948,6 +2957,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
               });
           },
           onMessage(input) {
+            managedAgentFocusHandoffKey = "m";
             close();
             pendingManagedAgentInput = {
               action: "message",
@@ -2964,6 +2974,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             renderState();
           },
           onFollowUp(input) {
+            managedAgentFocusHandoffKey = "f";
             close();
             pendingManagedAgentInput = {
               action: "follow_up",
@@ -2980,6 +2991,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             renderState();
           },
           onRecovery(input) {
+            managedAgentFocusHandoffKey = "r";
             close();
             pendingManagedAgentInput = {
               action: "recovery",
@@ -2996,6 +3008,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             renderState();
           },
           onReply(input) {
+            managedAgentFocusHandoffKey = "r";
             close();
             pendingManagedAgentInput = {
               action: "reply",
@@ -3148,6 +3161,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         const navigator = new TodoNavigator({
           compactCollapsed: todoCompactViewModel.collapsed,
           initialPage: receipt.todo,
+          maximumContentHeight: () => Math.max(8, physicalTerminal.rows - 4),
           onChange: () => tui.requestRender(),
           onClose: close,
           onCompactCollapseChange(collapsed) {
@@ -3194,7 +3208,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         handle = showOverlay(navigator, {
           width: "90%",
           minWidth: 36,
-          maxHeight: "80%",
+          maxHeight: "100%",
           margin: 1,
         });
         todoNavigator = {
@@ -3434,9 +3448,57 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         renderState();
       });
   };
+  const applyWebSyntheticDnsConfiguration = (range: string | null): void => {
+    clearExitWindow();
+    editor.disableSubmit = true;
+    const actionId = showNotice(
+      "progress",
+      range === null
+        ? "Restoring strict public-address Web DNS admission…"
+        : `Trusting the exact local TUN/fake-IP proxy subnet ${safeTerminalText(range)} for HTTPS hostnames…`,
+      "until_replaced",
+    );
+    void options.presentation
+      .dispatch({ type: "set_web_synthetic_dns_range", range })
+      .then((receipt) => {
+        if (receipt.status === "admitted") {
+          editor.setText("");
+          const admittedRange =
+            options.presentation.getState().authoritative.targets.configuration?.webSearch
+              ?.syntheticDnsRange ?? range;
+          settleNotice(
+            actionId,
+            "success",
+            range === null
+              ? "Web DNS admission restored to strict public addresses."
+              : `Web DNS now trusts the Owner-managed TUN/proxy for HTTPS hostname resolutions inside ${safeTerminalText(admittedRange ?? range)}. Adam cannot verify that proxy's final upstream IP; literal reserved IP URLs remain blocked.`,
+            "until_next_action",
+          );
+        } else {
+          settleNotice(actionId, "error", receipt.message, "until_edit");
+        }
+      })
+      .catch(() => {
+        settleNotice(
+          actionId,
+          "error",
+          "The Web synthetic DNS configuration could not be saved.",
+          "until_edit",
+        );
+      })
+      .finally(() => {
+        editor.disableSubmit = false;
+        renderState();
+      });
+  };
   const handleConfigurationCommand = (argumentsText: string): void => {
     if (argumentsText.length === 0) {
       showConfigurationPage();
+      return;
+    }
+    const syntheticDnsMutation = parseWebSyntheticDnsConfigurationMutation(argumentsText);
+    if (syntheticDnsMutation !== undefined) {
+      applyWebSyntheticDnsConfiguration(syntheticDnsMutation.range);
       return;
     }
     const webMutation = parseWebSearchConfigurationMutation(argumentsText);
@@ -3448,7 +3510,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (mutation === null) {
       showNotice(
         "warning",
-        "Usage: /config [context|output|compaction <tokens|default>|web <endpoint|clear>]",
+        "Usage: /config [context|output|compaction <tokens|default>|web <endpoint|clear>|web-fake-ip <cidr|clear>]",
         "until_edit",
       );
       editor.disableSubmit = false;
@@ -5067,6 +5129,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           });
       };
       const wizard = new McpWizard({
+        maximumContentHeight: () => Math.max(4, Math.floor(physicalTerminal.rows * 0.9) - 2),
         state: active.mcp,
         theme,
         onClose: close,
@@ -5258,10 +5321,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           if (receipt.status === "admitted") {
             editor.setText("");
           } else {
+            showNotice("error", receipt.message, "until_edit", active.session.id);
             editor.disableSubmit = false;
           }
         })
         .catch(() => {
+          showNotice(
+            "error",
+            "The session name could not be updated safely.",
+            "until_edit",
+            active.session.id,
+          );
           editor.disableSubmit = false;
         })
         .finally(() => {
@@ -5459,6 +5529,18 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     handleTerminationSignal("SIGTERM");
   }
   tui.addInputListener((data) => {
+    if (managedAgentFocusHandoffKey !== null) {
+      if (
+        matchesKey(data, managedAgentFocusHandoffKey) &&
+        (isKeyRepeat(data) || isKeyRelease(data))
+      ) {
+        if (isKeyRelease(data)) {
+          managedAgentFocusHandoffKey = null;
+        }
+        return { consume: true };
+      }
+      managedAgentFocusHandoffKey = null;
+    }
     if (commandRegistry.matchesInput(data, "exit")) {
       void stop(true);
       return { consume: true };
@@ -5813,6 +5895,17 @@ function parseWebSearchConfigurationMutation(
     return undefined;
   }
   return { endpoint: value === "clear" ? null : value };
+}
+
+function parseWebSyntheticDnsConfigurationMutation(
+  argumentsText: string,
+): { readonly range: string | null } | undefined {
+  const match = /^web-fake-ip[ \t]+([^\s]+)$/u.exec(argumentsText);
+  const value = match?.[1];
+  if (value === undefined) {
+    return undefined;
+  }
+  return { range: value === "clear" ? null : value };
 }
 
 function webSearchEndpointWarning(endpoint: string): string {
