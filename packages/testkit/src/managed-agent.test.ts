@@ -423,7 +423,10 @@ test("AgentManager current scout crosses the legacy token and provider-call boun
       agents: [
         {
           profile: "scout.v2",
-          context: { contextWindowTokens: 1_000_000 },
+          context: {
+            contextWindowTokens: 1_000_000,
+            occupancy: { source: "provider_reported", tokens: 16_000 },
+          },
           usage: {
             inputTokens: 160_000,
             outputTokens: 44,

@@ -35,6 +35,7 @@ import {
   type SessionRecord,
   type SessionStore,
   type SessionStoreDirectory,
+  sessionManagedAgentInactivityScheduler,
   sessionStoreDirectory,
   turnComposerStageBarrier,
 } from "@adam-agent/agent/internal-testing";
@@ -335,8 +336,29 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       ? createInMemorySessionStoreDirectory<SessionRecord>()
       : undefined;
   const lifecycle = createSessionLifecycle({
-    ...(options.scenario === "managed-attention" || options.scenario === "managed-active"
+    ...(options.scenario === "managed-attention" ||
+    options.scenario === "managed-active" ||
+    options.scenario === "managed-live-scroll" ||
+    options.scenario === "managed-parent-permission" ||
+    options.scenario === "managed-stalled"
       ? { managedAgentTools: "managed-agent-tools.a3-long-lived.v2" as const }
+      : {}),
+    ...(options.scenario === "managed-stalled" && options.controlRoot !== undefined
+      ? {
+          [sessionManagedAgentInactivityScheduler]: {
+            schedule(_delayMilliseconds: number, onInactivity: () => void) {
+              const controller = new AbortController();
+              void waitForFile(
+                options.controlRoot as string,
+                "trigger-managed-stall",
+                controller.signal,
+              ).then((triggered) => {
+                if (triggered) onInactivity();
+              });
+              return { cancel: () => controller.abort() };
+            },
+          },
+        }
       : {}),
     ...(options.scenario === "plan-review-recovery"
       ? {
@@ -373,7 +395,11 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     ...(historicalPlanRegistry === undefined ? {} : { tools: historicalPlanRegistry }),
     permissions: createPermissionPolicy({
       allowedEffects:
-        options.scenario === "managed-attention" || options.scenario === "managed-active"
+        options.scenario === "managed-attention" ||
+        options.scenario === "managed-active" ||
+        options.scenario === "managed-live-scroll" ||
+        options.scenario === "managed-parent-permission" ||
+        options.scenario === "managed-stalled"
           ? ["read", "delegate"]
           : options.scenario === "todo-active"
             ? ["read", "write"]
@@ -1015,6 +1041,9 @@ function observeTuiDispatch(
       options.scenario === "artifact-page-race" ||
       options.scenario === "managed-active" ||
       options.scenario === "managed-attention" ||
+      options.scenario === "managed-live-scroll" ||
+      options.scenario === "managed-parent-permission" ||
+      options.scenario === "managed-stalled" ||
       options.scenario === "reasoning-artifact" ||
       options.scenario === "reasoning-artifact-race" ||
       options.scenario === "reasoning-artifact-reorder" ||
@@ -1116,7 +1145,11 @@ function observeTuiDispatch(
         return settled;
       }
       if (
-        (options.scenario === "managed-attention" || options.scenario === "managed-active") &&
+        (options.scenario === "managed-attention" ||
+          options.scenario === "managed-active" ||
+          options.scenario === "managed-live-scroll" ||
+          options.scenario === "managed-parent-permission" ||
+          options.scenario === "managed-stalled") &&
         controlRoot !== undefined &&
         (command.type === "submit_prompt" ||
           command.type === "refresh_managed_agents" ||
@@ -1329,7 +1362,84 @@ function createFixtureModelTargets(options: {
         yield { type: "finish", reason: "stop" };
         return;
       }
-      if (options.scenario === "managed-active") {
+      if (options.scenario === "managed-parent-permission") {
+        const child = request.messages.some(
+          (message) =>
+            message.role === "developer" &&
+            message.content.startsWith("Managed child profile research.v2"),
+        );
+        if (child) {
+          if (options.controlRoot === undefined) {
+            throw new TypeError("The managed parent-permission fixture requires a control root.");
+          }
+          await writeFile(
+            join(options.controlRoot, "managed-parent-permission-child-held"),
+            "held\n",
+            "utf8",
+          );
+          if (
+            !(await waitForFile(
+              options.controlRoot,
+              "release-managed-parent-permission-child",
+              request.signal,
+            ))
+          ) {
+            throw request.signal.reason;
+          }
+          yield { type: "text_delta", text: "Managed permission child completed." };
+          yield { type: "finish", reason: "stop" };
+          return;
+        }
+        managedAttentionParentOrdinal += 1;
+        if (managedAttentionParentOrdinal === 1) {
+          yield { type: "tool_call_start", id: "fixture-spawn-permission", name: "spawn_agent" };
+          yield {
+            type: "tool_call_delta",
+            id: "fixture-spawn-permission",
+            json: '{"task":"Hold during parent permission.","profile":"research.v2","mode":"background"}',
+          };
+          yield { type: "tool_call_end", id: "fixture-spawn-permission" };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        if (managedAttentionParentOrdinal === 2 && options.controlRoot !== undefined) {
+          await writeFile(
+            join(options.controlRoot, "managed-parent-permission-ready"),
+            "ready\n",
+            "utf8",
+          );
+          if (
+            !(await waitForFile(
+              options.controlRoot,
+              "release-managed-parent-permission-call",
+              request.signal,
+            ))
+          ) {
+            throw request.signal.reason;
+          }
+          yield {
+            type: "tool_call_start",
+            id: "managed-viewer-permission",
+            name: "create_todo",
+          };
+          yield {
+            type: "tool_call_delta",
+            id: "managed-viewer-permission",
+            json: '{"title":"Managed viewer permission"}',
+          };
+          yield { type: "tool_call_end", id: "managed-viewer-permission" };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: "Managed parent permission completed." };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      if (
+        options.scenario === "managed-active" ||
+        options.scenario === "managed-live-scroll" ||
+        options.scenario === "managed-stalled"
+      ) {
         const child = request.messages.some(
           (message) =>
             message.role === "developer" &&
@@ -1338,6 +1448,36 @@ function createFixtureModelTargets(options: {
         if (child) {
           if (options.controlRoot === undefined) {
             throw new TypeError("The managed active fixture requires one control root.");
+          }
+          if (options.scenario === "managed-live-scroll") {
+            yield {
+              type: "text_delta",
+              text: Array.from({ length: 8 }, (_, index) => `live-${index}`).join("\n"),
+            };
+            await writeFile(join(options.controlRoot, "managed-live-ready"), "ready\n", "utf8");
+            if (
+              !(await waitForFile(
+                options.controlRoot,
+                "release-managed-live-growth",
+                request.signal,
+              ))
+            ) {
+              throw request.signal.reason;
+            }
+            yield { type: "text_delta", text: "\nlive-8" };
+            await writeFile(join(options.controlRoot, "managed-live-grown"), "grown\n", "utf8");
+            if (
+              !(await waitForFile(
+                options.controlRoot,
+                "release-managed-live-completion",
+                request.signal,
+              ))
+            ) {
+              throw request.signal.reason;
+            }
+            yield { type: "usage", inputTokens: 8, outputTokens: 8 };
+            yield { type: "finish", reason: "stop" };
+            return;
           }
           await writeFile(join(options.controlRoot, "managed-active-child-held"), "held\n", "utf8");
           if (
@@ -1381,6 +1521,13 @@ function createFixtureModelTargets(options: {
           }
           // biome-ignore lint/complexity/useLiteralKeys: narrowed JsonValue index signatures require bracket access.
           managedAttentionAgentId = String(spawn.result.output["agentId"]);
+          if (options.controlRoot !== undefined) {
+            await writeFile(
+              join(options.controlRoot, "managed-active-parent-waiting"),
+              "waiting\n",
+              "utf8",
+            );
+          }
           yield { type: "tool_call_start", id: "fixture-wait-active", name: "wait_agents" };
           yield {
             type: "tool_call_delta",
@@ -1444,6 +1591,21 @@ function createFixtureModelTargets(options: {
           yield { type: "text_delta", text: "Managed attention reply observed." };
           yield { type: "usage", inputTokens: 12, outputTokens: 4 };
           yield { type: "finish", reason: "stop" };
+          return;
+        }
+        if (
+          latestUser?.role === "user" &&
+          latestUser.content === "Trigger one parent permission." &&
+          request.messages.at(-1)?.role === "user"
+        ) {
+          yield { type: "tool_call_start", id: "managed-viewer-permission", name: "create_todo" };
+          yield {
+            type: "tool_call_delta",
+            id: "managed-viewer-permission",
+            json: '{"title":"Managed viewer permission"}',
+          };
+          yield { type: "tool_call_end", id: "managed-viewer-permission" };
+          yield { type: "finish", reason: "tool_calls" };
           return;
         }
         managedAttentionParentOrdinal += 1;

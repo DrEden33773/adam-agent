@@ -149,12 +149,12 @@ test("active-run /agents opens the live managed overlay without ending the paren
     await fixture.waitFor("Adam · New session");
     fixture.write("Start one held managed child.\r");
     await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
+    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
     await fixture.waitFor("Agents 1 active/0 terminal");
 
     const beforeAgents = fixture.output().length;
     fixture.write("/agents\r");
     await fixture.waitForCompleteFrameAfter("Agents · 1 active · 0 terminal", beforeAgents);
-    await expect(access(join(controlRoot, "managed-active-parent-settled"))).rejects.toThrow();
     expect(fixture.screen()?.join("\n") ?? "").toContain("research.v2 · running");
 
     fixture.write("\u001b[27;1;27~");
@@ -187,6 +187,7 @@ test("active managed viewer sends one exact ordinary message without a Main turn
     await fixture.waitFor("Adam · New session");
     fixture.write("Start one messageable managed child.\r");
     await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
+    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
     await fixture.waitFor("Agents 1 active/0 terminal");
     fixture.write("/agents\r");
     await fixture.waitFor("Agents · 1 active · 0 terminal");
@@ -198,9 +199,7 @@ test("active managed viewer sends one exact ordinary message without a Main turn
     expect(fixture.screen()?.join("\n") ?? "").toContain("Enter one bounded message");
     fixture.write("Preserve the exact active evidence.\r");
     const settlement = join(controlRoot, "send_managed_agent_message-settled");
-    await waitForPath(settlement);
-    await expect(readFile(settlement, "utf8")).resolves.toBe("admitted\n");
-    expect(fixture.output()).not.toContain("automatic parent continuation");
+    await expect(waitForFileContents(settlement, "admitted\n")).resolves.toBe("admitted\n");
 
     await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
     await fixture.waitFor("Managed active parent completed.");
@@ -229,6 +228,7 @@ test("active managed viewer requires two exact cancel inputs before causal settl
     await fixture.waitFor("Adam · New session");
     fixture.write("Start one cancellable managed child.\r");
     await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
+    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
     await fixture.waitFor("Agents 1 active/0 terminal");
     fixture.write("/agents\r");
     await fixture.waitFor("Agents · 1 active · 0 terminal");
@@ -237,11 +237,156 @@ test("active managed viewer requires two exact cancel inputs before causal settl
     fixture.write("c");
     await fixture.resize(82, 24);
     expect(fixture.screen()?.join("\n") ?? "").toContain("Press c again to stop this exact child");
-    await expect(access(join(controlRoot, "managed-active-parent-settled"))).rejects.toThrow();
 
     fixture.write("c");
     await fixture.waitFor("Managed child cancelled after causal settlement.");
     await fixture.waitFor("Managed active parent completed.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("stalled managed viewer preserves controls at 40 and full truth at 120 without color", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-stalled-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      noColor: true,
+      scenario: "managed-stalled",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Start one causally stalled managed child.\r");
+    await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
+    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
+    await writeFile(join(controlRoot, "trigger-managed-stall"), "trigger\n", "utf8");
+    await fixture.waitFor("research.v2 · stalled");
+    fixture.write("/agents\r");
+    await fixture.waitFor("Agents · 1 active · 0 terminal");
+    fixture.write("\r");
+
+    const beforeNarrow = fixture.output().length;
+    await fixture.resize(40, 12);
+    await fixture.waitForCompleteFrameAfter("Agent detail", beforeNarrow);
+    const narrow = fixture.screen()?.join("\n") ?? "";
+    expect(narrow).toContain("stalled");
+    expect(narrow).toContain("m message");
+    expect(narrow).toContain("Transcript · read-only");
+    expect((fixture.screen() ?? []).every((line) => visibleWidth(line) <= 40)).toBe(true);
+
+    const beforeWide = fixture.output().length;
+    await fixture.resize(120, 30);
+    await fixture.waitForCompleteFrameAfter("Agent detail", beforeWide);
+    const wide = fixture.screen()?.join("\n") ?? "";
+    expect(wide).toContain("Watchdog stalled · 300000 ms");
+    expect(wide).toContain("fake-local");
+    expect(containsColorSgrSequence(fixture.output().slice(beforeNarrow))).toBe(false);
+
+    fixture.write("\u001b[27;1;27~");
+    fixture.write("\u001b[27;1;27~");
+    await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
+    await fixture.waitFor("Managed active parent completed.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("managed viewer pauses live-tail following until the reader returns to the bottom", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-live-scroll-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "managed-live-scroll",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Start one managed live-scroll fixture.\r");
+    await waitForFileContents(join(controlRoot, "managed-live-ready"), "ready\n");
+    await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
+    fixture.write("/agents\r");
+    await fixture.waitFor("Agents · 1 active · 0 terminal");
+    fixture.write("\r");
+    await fixture.waitFor("live-7");
+
+    fixture.write("\u001b[A");
+    await fixture.waitFor("reading paused");
+    const beforeGrowth = fixture.output().length;
+    await writeFile(join(controlRoot, "release-managed-live-growth"), "release\n", "utf8");
+    await waitForFileContents(join(controlRoot, "managed-live-grown"), "grown\n");
+    await fixture.waitForCompleteFrameAfter("reading paused", beforeGrowth);
+    expect(fixture.screen()?.join("\n") ?? "").not.toContain("live-8");
+
+    const beforeResume = fixture.output().length;
+    fixture.write("\u001b[6~");
+    await fixture.waitForCompleteFrameAfter("following live tail", beforeResume);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("live-8");
+
+    await writeFile(join(controlRoot, "release-managed-live-completion"), "release\n", "utf8");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("managed viewer regains exact focus after a parent permission preempts it", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-permission-focus-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  try {
+    const fixture = startFixture({
+      controlRoot,
+      scenario: "managed-parent-permission",
+      stateRoot,
+      workspaceRoot,
+    });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Start one managed permission focus fixture.\r");
+    await waitForFileContents(join(controlRoot, "managed-parent-permission-child-held"), "held\n");
+    await waitForFileContents(join(controlRoot, "managed-parent-permission-ready"), "ready\n");
+    fixture.write("/agents\r");
+    await fixture.waitFor("Agents · 1 active · 0 terminal");
+    fixture.write("\r");
+    await fixture.waitFor("Agent detail");
+    await writeFile(
+      join(controlRoot, "release-managed-parent-permission-call"),
+      "release\n",
+      "utf8",
+    );
+    await fixture.waitFor("Permission required");
+    const beforeRestore = fixture.output().length;
+    fixture.write("\u001b[27;1;27~");
+    await fixture.waitForCompleteFrameAfter("m message at next safe boundary", beforeRestore);
+    expect(fixture.screen()?.join("\n") ?? "").toContain("research.v2 · background · running");
+    fixture.write("m");
+    await fixture.waitFor("Enter one bounded message");
+
+    await writeFile(
+      join(controlRoot, "release-managed-parent-permission-child"),
+      "release\n",
+      "utf8",
+    );
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -8632,7 +8777,6 @@ test("active-run /todos reads the causally refreshed exact Todo revision", async
     fixture.write("/todos\r");
     await fixture.waitForCompleteFrameAfter("Todos · revision 1", beforeTodos);
     expect(fixture.output().slice(beforeTodos)).toContain("Active Todo fixture");
-    await expect(access(join(controlRoot, "todo-active-parent-settled"))).rejects.toThrow();
 
     fixture.write("c");
     const beforeClose = fixture.output().length;

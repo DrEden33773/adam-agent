@@ -2921,6 +2921,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         };
         const navigator = new AgentNavigator({
           managedAgents: current.managedAgents,
+          maximumContentHeight: () => Math.max(8, Math.floor(physicalTerminal.rows * 0.9) - 2),
           onCancel(input) {
             void options.presentation
               .dispatch({
@@ -3007,6 +3008,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           },
           onChange: () => tui.requestRender(),
           onClose: close,
+          async onReadArtifact(artifact, range) {
+            const artifactReceipt = await options.presentation.dispatch({
+              type: "read_artifact",
+              artifact,
+              range,
+            });
+            if (artifactReceipt.status === "rejected" || artifactReceipt.resource === null) {
+              throw new Error(
+                artifactReceipt.status === "rejected"
+                  ? artifactReceipt.message
+                  : "The managed-child artifact page is unavailable.",
+              );
+            }
+            return artifactReceipt.resource;
+          },
           async onReadTranscript(input) {
             const transcriptReceipt = await options.presentation.dispatch({
               type: "read_managed_agent_transcript",

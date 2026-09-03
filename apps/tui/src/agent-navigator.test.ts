@@ -243,7 +243,10 @@ test("causal managed updates preserve exact detail identity and bound the active
 
 test("AgentNavigator reads one bounded sanitized transcript page and renders exact capacity truth", async () => {
   const agent = managedAgentFixture({
-    context: { contextWindowTokens: 1_000_000 },
+    context: {
+      contextWindowTokens: 1_000_000,
+      occupancy: { source: "provider_reported", tokens: 96_000 },
+    },
     usage: { inputTokens: 120, outputTokens: 30, reasoningTokens: 10, providerCalls: 2 },
     budget: { maximumCumulativeTokens: 2_000_000, usedTokens: 150, remainingTokens: 1_999_850 },
     attempts: {
@@ -273,10 +276,17 @@ test("AgentNavigator reads one bounded sanitized transcript page and renders exa
     ],
     olderCursor: "older-1",
   });
+  const firstPageLoaded = Promise.withResolvers<void>();
+  const olderPageLoaded = Promise.withResolvers<void>();
+  let changeCount = 0;
   const navigator = new AgentNavigator({
     managedAgents: { counts: { active: 1, terminal: 0, attention: 0 }, agents: [agent] },
     onCancel: vi.fn(),
-    onChange: vi.fn(),
+    onChange() {
+      changeCount += 1;
+      if (changeCount === 3) firstPageLoaded.resolve();
+      if (changeCount === 5) olderPageLoaded.resolve();
+    },
     onClose: vi.fn(),
     onReadTranscript,
     onReply: vi.fn(),
@@ -284,12 +294,11 @@ test("AgentNavigator reads one bounded sanitized transcript page and renders exa
   });
 
   navigator.handleInput("\r");
-  await vi.waitFor(() =>
-    expect(navigator.render(120).join("\n")).toContain("Bounded child evidence."),
-  );
+  await firstPageLoaded.promise;
+  expect(navigator.render(120).join("\n")).toContain("Bounded child evidence.");
   const detail = navigator.render(120).join("\n");
   expect(detail).toContain("deepseek-v4-flash.direct · deepseek-v4-flash");
-  expect(detail).toContain("Context 1000000 capacity · occupancy not reported");
+  expect(detail).toContain("Context 1000000 capacity · occupancy 96000 · provider_reported");
   expect(detail).toContain("Usage 120 in + 30 out · 10 reasoning · 2 calls");
   expect(detail).toContain("Budget 150/2000000 · 1999850 left");
   expect(detail).toContain("Watchdog running · 300000 ms");
@@ -302,15 +311,114 @@ test("AgentNavigator reads one bounded sanitized transcript page and renders exa
     cursor: null,
   });
   navigator.handleInput("\u001b[5~");
-  await vi.waitFor(() =>
-    expect(onReadTranscript).toHaveBeenLastCalledWith({
-      agentId: agent.agentId,
-      attemptId: agent.attemptId,
-      expectedRevision: agent.revision,
-      expectedThroughSequence: agent.transcript.throughSequence,
-      cursor: "older-1",
-    }),
-  );
+  await olderPageLoaded.promise;
+  expect(onReadTranscript).toHaveBeenLastCalledWith({
+    agentId: agent.agentId,
+    attemptId: agent.attemptId,
+    expectedRevision: agent.revision,
+    expectedThroughSequence: agent.transcript.throughSequence,
+    cursor: "older-1",
+  });
+});
+
+test("AgentNavigator reuses sanitized reasoning, tool preview and bounded artifact surfaces", async () => {
+  const agent = managedAgentFixture({
+    transcript: { childSessionId: "child-surface", throughSequence: 4 },
+  });
+  const artifact = {
+    id: "sha256:managed-tool-artifact",
+    mediaType: "text/plain",
+    byteCount: 18,
+    source: "tool_output" as const,
+  };
+  const onReadArtifact = vi.fn().mockResolvedValue({
+    mediaType: "text/plain",
+    offset: 0,
+    byteCount: 18,
+    totalByteCount: 18,
+    eof: true,
+    nextRange: null,
+    text: "Bounded artifact.\n",
+  });
+  const onReadTranscript = vi.fn().mockResolvedValue({
+    type: "managed_agent_transcript_page",
+    agentId: agent.agentId,
+    attemptId: agent.attemptId,
+    childSessionId: agent.transcript.childSessionId,
+    throughSequence: agent.transcript.throughSequence,
+    items: [
+      {
+        type: "reasoning_block",
+        id: "reasoning-1",
+        sequence: 1,
+        sourceSessionId: agent.transcript.childSessionId,
+        branchBoundary: null,
+        artifactType: "provider_reasoning",
+        disclosure: "owner_only",
+        provider: "DeepSeek",
+        status: "completed",
+        text: null,
+        artifact: null,
+      },
+      {
+        type: "tool_call",
+        id: "tool-1",
+        sequence: 2,
+        sourceSessionId: agent.transcript.childSessionId,
+        branchBoundary: null,
+        callId: "call-1",
+        qualifiedName: "read_file",
+        kind: "read",
+        effect: "read",
+        label: "Read file",
+        subject: null,
+        source: null,
+        durationMs: 4,
+        status: "completed",
+        outcome: { status: "completed" },
+        resultSummary: "1 line",
+        artifacts: [artifact],
+        changePreviewRef: null,
+        preview: {
+          kind: "read_text",
+          language: null,
+          lines: [{ number: 1, text: "tool preview line" }],
+          omittedBytes: 0,
+          sourceTruncated: false,
+        },
+      },
+    ],
+    olderCursor: null,
+  });
+  const transcriptLoaded = Promise.withResolvers<void>();
+  const artifactLoaded = Promise.withResolvers<void>();
+  let changeCount = 0;
+  const navigator = new AgentNavigator({
+    managedAgents: { counts: { active: 1, terminal: 0, attention: 0 }, agents: [agent] },
+    onCancel: vi.fn(),
+    onChange() {
+      changeCount += 1;
+      if (changeCount === 3) transcriptLoaded.resolve();
+      if (changeCount === 5) artifactLoaded.resolve();
+    },
+    onClose: vi.fn(),
+    onReadArtifact,
+    onReadTranscript,
+    onReply: vi.fn(),
+    theme: createAdamTuiTheme(true),
+  });
+  navigator.handleInput("\r");
+  await transcriptLoaded.promise;
+  const transcript = navigator.render(120).join("\n");
+  expect(transcript).toContain("Thinking done · DeepSeek");
+  expect(transcript).toContain("owner-only content undisclosed");
+  expect(transcript).toContain("tool preview line");
+  expect(transcript).toContain("a read artifact");
+
+  navigator.handleInput("a");
+  await artifactLoaded.promise;
+  expect(navigator.render(120).join("\n")).toContain("Bounded artifact.");
+  expect(onReadArtifact).toHaveBeenCalledWith(artifact, null);
 });
 
 test("a stalled Agent detail offers an exact ordinary message with safe-boundary delivery copy", () => {
@@ -384,7 +492,7 @@ test("manual managed transcript scroll pauses live-tail following and PageDown r
   const agent = managedAgentFixture({
     transcript: { childSessionId: "child-live", throughSequence: 9 },
   });
-  const onReadTranscript = vi.fn().mockResolvedValue({
+  const initialPage = {
     type: "managed_agent_transcript_page",
     agentId: agent.agentId,
     attemptId: agent.attemptId,
@@ -400,21 +508,49 @@ test("manual managed transcript scroll pauses live-tail following and PageDown r
       artifact: null,
     })),
     olderCursor: null,
-  });
+  } as const;
+  const onReadTranscript = vi
+    .fn()
+    .mockResolvedValueOnce(initialPage)
+    .mockResolvedValueOnce({
+      ...initialPage,
+      throughSequence: 10,
+      items: Array.from({ length: 5 }, (_, index) => ({
+        type: "assistant_message" as const,
+        id: `assistant-${index + 5}`,
+        sequence: index + 6,
+        sourceSessionId: agent.transcript.childSessionId,
+        branchBoundary: null,
+        text: `durable-${index + 5}`,
+        artifact: null,
+      })),
+    });
+  const transcriptLoaded = Promise.withResolvers<void>();
+  const transcriptRefreshed = Promise.withResolvers<void>();
+  let changeCount = 0;
   const navigator = new AgentNavigator({
     managedAgents: { counts: { active: 1, terminal: 0, attention: 0 }, agents: [agent] },
     onCancel: vi.fn(),
-    onChange: vi.fn(),
+    onChange() {
+      changeCount += 1;
+      if (changeCount === 3) transcriptLoaded.resolve();
+      if (changeCount === 5) transcriptRefreshed.resolve();
+    },
     onClose: vi.fn(),
     onReadTranscript,
     onReply: vi.fn(),
     theme: createAdamTuiTheme(true),
   });
   navigator.handleInput("\r");
-  await vi.waitFor(() => expect(navigator.render(80).join("\n")).toContain("durable-7"));
+  await transcriptLoaded.promise;
+  expect(navigator.render(80).join("\n")).toContain("durable-7");
   navigator.handleInput("\u001b[A");
+  const updatedAgent = {
+    ...agent,
+    transcript: { ...agent.transcript, throughSequence: 10 },
+  };
   navigator.setManagedAgents(
-    { counts: { active: 1, terminal: 0, attention: 0 }, agents: [agent] },
+    { counts: { active: 1, terminal: 0, attention: 0 }, agents: [updatedAgent] },
     [
       {
         agentId: agent.agentId,
@@ -425,13 +561,38 @@ test("manual managed transcript scroll pauses live-tail following and PageDown r
       },
     ],
   );
+  await transcriptRefreshed.promise;
   const paused = navigator.render(80).join("\n");
   expect(paused).toContain("reading paused");
+  expect(paused).toContain("durable-2");
+  expect(paused).not.toContain("durable-9");
   expect(paused).not.toContain("live child tail");
   navigator.handleInput("\u001b[6~");
   const resumed = navigator.render(80).join("\n");
   expect(resumed).toContain("following live tail");
   expect(resumed).toContain("live child tail");
+});
+
+test("Agent detail preserves controls and one transcript row inside the minimum overlay height", () => {
+  const agent = managedAgentFixture({ status: "stalled", phase: "stalled" });
+  const navigator = new AgentNavigator({
+    managedAgents: { counts: { active: 1, terminal: 0, attention: 1 }, agents: [agent] },
+    maximumContentHeight: () => 8,
+    onCancel: vi.fn(),
+    onChange: vi.fn(),
+    onClose: vi.fn(),
+    onMessage: vi.fn(),
+    onReply: vi.fn(),
+    theme: createAdamTuiTheme(true),
+  });
+  navigator.handleInput("\r");
+
+  const lines = navigator.render(40);
+  expect(lines.length).toBeLessThanOrEqual(8);
+  expect(lines.join("\n")).toContain("Agent detail");
+  expect(lines.join("\n")).toContain("m message");
+  expect(lines.join("\n")).toContain("Transcript · read-only");
+  expect(lines.join("\n")).toContain("Transcript is unavailable");
 });
 
 function managedAgentFixture(

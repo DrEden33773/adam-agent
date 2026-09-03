@@ -9,14 +9,17 @@ type ReasoningStatus =
 
 export function reasoningFoldTitle(options: {
   readonly expanded: boolean;
+  readonly interactive?: boolean;
   readonly provider: string;
   readonly status: ReasoningStatus;
   readonly theme: AdamTuiTheme;
 }): string {
   const marker = options.expanded ? "▾" : "▸";
   const provider = safeTerminalText(options.provider);
-  const action = `Ctrl+T ${options.expanded ? "fold" : "expand"}`;
-  const hint = options.theme.text(` · ${action}`);
+  const hint =
+    options.interactive === false
+      ? options.theme.text(" · owner-only content undisclosed")
+      : options.theme.text(` · Ctrl+T ${options.expanded ? "fold" : "expand"}`);
   if (options.status === "active") {
     return `${marker} Thinking · provider reasoning · ${provider}${hint}`;
   }

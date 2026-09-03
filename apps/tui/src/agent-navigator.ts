@@ -1,14 +1,19 @@
 import type {
+  ArtifactChunk,
+  ArtifactRange,
+  ArtifactReference,
   AuthoritativePresentationSnapshot,
   ManagedAgentTranscriptPageResource,
   PresentationDisplayState,
   TranscriptItem,
 } from "@adam-agent/presentation";
-import { type Component, getKeybindings, truncateToWidth } from "@earendil-works/pi-tui";
+import { type Component, getKeybindings, Markdown, truncateToWidth } from "@earendil-works/pi-tui";
 
+import { reasoningFoldTitle } from "./reasoning-fold.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { type SearchableSelectItem, SearchableSelectList } from "./searchable-select-list.js";
 import type { AdamTuiTheme } from "./theme.js";
+import { ToolPreview } from "./tool-preview.js";
 
 type ManagedAgents = AuthoritativePresentationSnapshot["managedAgents"];
 type ManagedAgent = ManagedAgents["agents"][number];
@@ -16,7 +21,11 @@ type ManagedAgentActivity = NonNullable<PresentationDisplayState["managedAgentAc
 
 export class AgentNavigator implements Component {
   #activity: ManagedAgentActivity = [];
+  #artifactGeneration = 0;
+  #artifactView: { readonly artifact: ArtifactReference; readonly chunk: ArtifactChunk } | null =
+    null;
   #managedAgents: ManagedAgents;
+  readonly #maximumContentHeight: () => number;
   readonly #onCancel: (input: {
     readonly agentId: string;
     readonly expectedRevision: number;
@@ -28,6 +37,9 @@ export class AgentNavigator implements Component {
     | undefined;
   readonly #onMessage:
     | ((input: { readonly agentId: string; readonly expectedRevision: number }) => void)
+    | undefined;
+  readonly #onReadArtifact:
+    | ((artifact: ArtifactReference, range: ArtifactRange | null) => Promise<ArtifactChunk>)
     | undefined;
   readonly #onReply: (input: {
     readonly agentId: string;
@@ -59,6 +71,7 @@ export class AgentNavigator implements Component {
 
   constructor(options: {
     readonly managedAgents: ManagedAgents;
+    readonly maximumContentHeight?: () => number;
     readonly onCancel: (input: {
       readonly agentId: string;
       readonly expectedRevision: number;
@@ -73,6 +86,10 @@ export class AgentNavigator implements Component {
       readonly agentId: string;
       readonly expectedRevision: number;
     }) => void;
+    readonly onReadArtifact?: (
+      artifact: ArtifactReference,
+      range: ArtifactRange | null,
+    ) => Promise<ArtifactChunk>;
     readonly onReadTranscript?: (input: {
       readonly agentId: string;
       readonly attemptId: string;
@@ -92,11 +109,13 @@ export class AgentNavigator implements Component {
     readonly theme: AdamTuiTheme;
   }) {
     this.#managedAgents = options.managedAgents;
+    this.#maximumContentHeight = options.maximumContentHeight ?? (() => 22);
     this.#onCancel = options.onCancel;
     this.#onChange = options.onChange;
     this.#onClose = options.onClose;
     this.#onFollowUp = options.onFollowUp;
     this.#onMessage = options.onMessage;
+    this.#onReadArtifact = options.onReadArtifact;
     this.#onReadTranscript = options.onReadTranscript;
     this.#onRecovery = options.onRecovery;
     this.#onReply = options.onReply;
@@ -127,8 +146,16 @@ export class AgentNavigator implements Component {
   }
 
   handleInput(data: string): void {
+    if (this.#artifactView !== null && getKeybindings().matches(data, "tui.select.cancel")) {
+      this.#artifactGeneration += 1;
+      this.#artifactView = null;
+      this.#onChange();
+      return;
+    }
     if (this.#detail !== null && getKeybindings().matches(data, "tui.select.cancel")) {
       this.#transcriptGeneration += 1;
+      this.#artifactGeneration += 1;
+      this.#artifactView = null;
       this.#cancelConfirmation = null;
       this.#detail = null;
       this.#onChange();
@@ -164,12 +191,23 @@ export class AgentNavigator implements Component {
         return;
       }
       if (getKeybindings().matches(data, "tui.select.pageDown")) {
+        if (this.#artifactView !== null && this.#artifactView.chunk.nextRange !== null) {
+          void this.#loadArtifact(this.#artifactView.artifact, this.#artifactView.chunk.nextRange);
+          return;
+        }
         this.#transcriptScrollTop = Math.min(
           this.#transcriptMaximumScroll,
           this.#transcriptScrollTop + 5,
         );
         this.#transcriptFollowingTail = this.#transcriptScrollTop === this.#transcriptMaximumScroll;
         this.#onChange();
+        return;
+      }
+      if (data === "a" && this.#onReadArtifact !== undefined) {
+        const artifact = managedTranscriptArtifacts(this.#transcript).at(-1);
+        if (artifact !== undefined) {
+          void this.#loadArtifact(artifact, null);
+        }
         return;
       }
       if (data === "m" && isActiveManagedAgent(this.#detail) && this.#onMessage !== undefined) {
@@ -259,8 +297,11 @@ export class AgentNavigator implements Component {
   render(width: number): string[] {
     if (this.#detail !== null) {
       const detail = this.#detail;
+      const maximumContentHeight = Math.max(8, Math.floor(this.#maximumContentHeight()));
+      const compactHeight = maximumContentHeight <= 12;
+      const hasArtifact = managedTranscriptArtifacts(this.#transcript).length > 0;
       const rosterLines =
-        width < 80 || this.#managedAgents.counts.active === 0
+        compactHeight || width < 80 || this.#managedAgents.counts.active === 0
           ? []
           : [
               this.#theme.toolTitle(
@@ -286,51 +327,82 @@ export class AgentNavigator implements Component {
             (report) =>
               `${report.kind} r${report.revision} · ${safeTerminalText(report.message)}${report.messageTruncated ? ` · ${report.messageByteCount} bytes total` : ""}`,
           ),
-      ].slice(0, 3);
-      const actionLines = [
-        ...(isActiveManagedAgent(detail) && this.#onMessage !== undefined
-          ? [
-              this.#theme.muted(
-                "m message at next safe boundary; delivery does not imply compliance",
-              ),
-            ]
-          : []),
-        ...(this.#cancelConfirmation === `${detail.agentId}:${detail.revision}`
-          ? [this.#theme.statusWarning("Press c again to stop this exact child")]
-          : []),
-        ...(canFollowUp(detail) && this.#onFollowUp !== undefined
-          ? [this.#theme.muted("f follow-up from exact terminal evidence")]
-          : []),
-        ...(detail.status === "recovery_required" && this.#onRecovery !== undefined
-          ? [this.#theme.muted("r recover from exact durable evidence")]
-          : []),
-        this.#theme.muted(
-          isActiveManagedAgent(detail) && detail.status !== "waiting_for_parent"
-            ? "↑↓ scroll · PgUp older · c cancel exact revision · Esc back · Ctrl+Q exit"
-            : detail.status === "waiting_for_parent"
-              ? "↑↓ scroll · PgUp older · r reply exact attention · c cancel exact revision · Esc back · Ctrl+Q exit"
-              : "Terminal child · Esc back · Ctrl+Q exit",
-        ),
-      ];
-      return [
+      ].slice(0, compactHeight ? 1 : 2);
+      const actionLines = compactHeight
+        ? [
+            this.#theme.muted(
+              compactAgentActions(detail, this.#cancelConfirmation, {
+                artifact: hasArtifact && this.#onReadArtifact !== undefined,
+                followUp: this.#onFollowUp !== undefined,
+                message: this.#onMessage !== undefined,
+                recovery: this.#onRecovery !== undefined,
+              }),
+            ),
+          ]
+        : [
+            ...(isActiveManagedAgent(detail) && this.#onMessage !== undefined
+              ? [
+                  this.#theme.muted(
+                    "m message at next safe boundary; delivery does not imply compliance",
+                  ),
+                ]
+              : []),
+            ...(this.#cancelConfirmation === `${detail.agentId}:${detail.revision}`
+              ? [this.#theme.statusWarning("Press c again to stop this exact child")]
+              : []),
+            ...(canFollowUp(detail) && this.#onFollowUp !== undefined
+              ? [this.#theme.muted("f follow-up from exact terminal evidence")]
+              : []),
+            ...(detail.status === "recovery_required" && this.#onRecovery !== undefined
+              ? [this.#theme.muted("r recover from exact durable evidence")]
+              : []),
+            ...(hasArtifact && this.#onReadArtifact !== undefined
+              ? [this.#theme.muted("a read artifact")]
+              : []),
+            this.#theme.muted(
+              isActiveManagedAgent(detail) && detail.status !== "waiting_for_parent"
+                ? "↑↓ scroll · PgUp older · c cancel exact revision · Esc back · Ctrl+Q exit"
+                : detail.status === "waiting_for_parent"
+                  ? "↑↓ scroll · PgUp older · r reply exact attention · c cancel exact revision · Esc back · Ctrl+Q exit"
+                  : "Terminal child · Esc back · Ctrl+Q exit",
+            ),
+          ];
+      const headerLines = compactHeight
+        ? [
+            this.#theme.toolTitle("Agent detail"),
+            `${detail.profile} · ${detail.status} · revision ${detail.revision} · ${detail.phase}`,
+            `${safeTerminalText(detail.targetIdentity.modelId)} · ${detail.context?.contextWindowTokens ?? "unknown"} context · ${managedContextOccupancy(detail)}`,
+          ]
+        : [
+            this.#theme.toolTitle("Agent detail"),
+            `${detail.profile} · ${detail.mode} · ${detail.status} · revision ${detail.revision} · ${detail.phase}${detail.activeTool === undefined ? "" : ` · ${detail.activeTool.name} ${detail.activeTool.status}`}`,
+            `${safeTerminalText(detail.targetIdentity.targetId)} · ${safeTerminalText(detail.targetIdentity.modelId)} · ${safeTerminalText(detail.targetIdentity.route)}${detail.thinkingPolicy === undefined ? "" : ` · thinking ${safeTerminalText(detail.thinkingPolicy.effectiveLevelId)}`}`,
+            `Context ${detail.context?.contextWindowTokens ?? "unknown"} capacity · ${managedContextOccupancy(detail)}`,
+            detail.usage === undefined
+              ? "Usage unavailable"
+              : `Usage ${detail.usage.inputTokens} in + ${detail.usage.outputTokens} out · ${detail.usage.reasoningTokens} reasoning · ${detail.usage.providerCalls} calls`,
+            detail.budget === undefined
+              ? "Budget unavailable"
+              : `Budget ${detail.budget.usedTokens}/${detail.budget.maximumCumulativeTokens} · ${detail.budget.remainingTokens} left`,
+            `${detail.watchdog === undefined ? "Watchdog unavailable" : `Watchdog ${detail.watchdog.state} · ${detail.watchdog.maximumInactivityMilliseconds} ms`}${detail.attempts === undefined ? "" : ` · attempts ${detail.attempts.childAttempts}/${detail.attempts.maximumChildAttempts} child ${detail.attempts.parentAttempts}/${detail.attempts.maximumParentAttempts} parent`}`,
+            `Agent ${safeTerminalText(detail.agentId)} · Attempt ${safeTerminalText(detail.attemptId)}`,
+          ];
+      const prefixLines = [
         ...rosterLines,
-        this.#theme.toolTitle("Agent detail"),
-        `${detail.profile} · ${detail.mode} · ${detail.status} · revision ${detail.revision} · ${detail.phase}${detail.activeTool === undefined ? "" : ` · ${detail.activeTool.name} ${detail.activeTool.status}`}`,
-        `${safeTerminalText(detail.targetIdentity.targetId)} · ${safeTerminalText(detail.targetIdentity.modelId)} · ${safeTerminalText(detail.targetIdentity.route)}${detail.thinkingPolicy === undefined ? "" : ` · thinking ${safeTerminalText(detail.thinkingPolicy.effectiveLevelId)}`}`,
-        `Context ${detail.context?.contextWindowTokens ?? "unknown"} capacity · occupancy not reported`,
-        detail.usage === undefined
-          ? "Usage unavailable"
-          : `Usage ${detail.usage.inputTokens} in + ${detail.usage.outputTokens} out · ${detail.usage.reasoningTokens} reasoning · ${detail.usage.providerCalls} calls`,
-        detail.budget === undefined
-          ? "Budget unavailable"
-          : `Budget ${detail.budget.usedTokens}/${detail.budget.maximumCumulativeTokens} · ${detail.budget.remainingTokens} left`,
-        `${detail.watchdog === undefined ? "Watchdog unavailable" : `Watchdog ${detail.watchdog.state} · ${detail.watchdog.maximumInactivityMilliseconds} ms`}${detail.attempts === undefined ? "" : ` · attempts ${detail.attempts.childAttempts}/${detail.attempts.maximumChildAttempts} child ${detail.attempts.parentAttempts}/${detail.attempts.maximumParentAttempts} parent`}`,
-        `Agent ${safeTerminalText(detail.agentId)} · Attempt ${safeTerminalText(detail.attemptId)}`,
+        ...headerLines,
         ...evidenceLines,
         ...actionLines,
         "",
-        this.#theme.toolTitle("Transcript · read-only"),
-        ...this.#renderTranscriptLines(width),
+        this.#theme.toolTitle(
+          this.#artifactView === null ? "Transcript · read-only" : "Artifact · read-only",
+        ),
+      ];
+      const transcriptHeight = Math.max(1, maximumContentHeight - prefixLines.length);
+      return [
+        ...prefixLines,
+        ...(this.#artifactView === null
+          ? this.#renderTranscriptLines(width, transcriptHeight)
+          : this.#renderArtifactLines(width, transcriptHeight)),
       ].map((line) => boundedLine(line, width));
     }
     return [
@@ -369,7 +441,13 @@ export class AgentNavigator implements Component {
       }
       this.#transcript =
         cursor === null || this.#transcript === null
-          ? page
+          ? cursor === null && this.#transcript !== null && !this.#transcriptFollowingTail
+            ? {
+                ...page,
+                items: mergeTranscriptItems(this.#transcript.items, page.items),
+                olderCursor: this.#transcript.olderCursor,
+              }
+            : page
           : { ...page, items: [...page.items, ...this.#transcript.items] };
       this.#transcriptNotice = null;
       if (this.#transcriptFollowingTail) {
@@ -384,8 +462,45 @@ export class AgentNavigator implements Component {
     this.#onChange();
   }
 
-  #renderTranscriptLines(width: number): string[] {
-    if (this.#transcriptNotice !== null) {
+  async #loadArtifact(artifact: ArtifactReference, range: ArtifactRange | null): Promise<void> {
+    if (this.#onReadArtifact === undefined) {
+      return;
+    }
+    const generation = ++this.#artifactGeneration;
+    this.#transcriptNotice = range === null ? "Loading artifact…" : "Loading next artifact page…";
+    this.#onChange();
+    try {
+      const chunk = await this.#onReadArtifact(artifact, range);
+      if (generation !== this.#artifactGeneration || this.#detail === null) {
+        return;
+      }
+      this.#artifactView = { artifact, chunk };
+      this.#transcriptNotice = null;
+    } catch (error) {
+      if (generation === this.#artifactGeneration) {
+        this.#transcriptNotice =
+          error instanceof Error ? safeTerminalText(error.message) : "Artifact unavailable.";
+      }
+    }
+    this.#onChange();
+  }
+
+  #renderArtifactLines(width: number, maximumVisible: number): string[] {
+    const view = this.#artifactView;
+    if (view === null) {
+      return [];
+    }
+    return [
+      `${safeTerminalText(view.artifact.mediaType)} · bytes ${view.chunk.offset}-${view.chunk.offset + view.chunk.byteCount}/${view.chunk.totalByteCount}`,
+      ...safeTerminalText(view.chunk.text).split("\n"),
+      ...(view.chunk.nextRange === null ? [] : ["PageDown next artifact page"]),
+    ]
+      .slice(0, Math.max(1, maximumVisible))
+      .map((line) => boundedLine(line, width));
+  }
+
+  #renderTranscriptLines(width: number, maximumVisible = 5): string[] {
+    if (this.#transcriptNotice !== null && this.#transcript === null) {
       return [this.#transcriptNotice];
     }
     if (this.#transcript === null) {
@@ -398,9 +513,20 @@ export class AgentNavigator implements Component {
           activity.attemptId === this.#detail.attemptId,
       )
       .flatMap(managedActivityLines);
-    const lines = [...this.#transcript.items.flatMap(transcriptItemLines), ...liveLines];
-    const maximumVisible = 5;
-    this.#transcriptMaximumScroll = Math.max(0, lines.length - maximumVisible);
+    const lines = [
+      ...this.#transcript.items.flatMap((item) => transcriptItemLines(item, width, this.#theme)),
+      ...liveLines,
+    ];
+    const contentHeight = Math.max(1, maximumVisible);
+    const markers = [
+      ...(this.#transcript.olderCursor === null ? [] : ["Older transcript available"]),
+      ...(liveLines.length === 0
+        ? []
+        : [this.#transcriptFollowingTail ? "following live tail" : "reading paused"]),
+      ...(this.#transcriptNotice === null ? [] : [this.#transcriptNotice]),
+    ];
+    const visibleHeight = Math.max(1, contentHeight - markers.length);
+    this.#transcriptMaximumScroll = Math.max(0, lines.length - visibleHeight);
     if (this.#transcriptFollowingTail || !Number.isFinite(this.#transcriptScrollTop)) {
       this.#transcriptScrollTop = this.#transcriptMaximumScroll;
     } else {
@@ -411,15 +537,14 @@ export class AgentNavigator implements Component {
     }
     const visible = lines.slice(
       this.#transcriptScrollTop,
-      this.#transcriptScrollTop + maximumVisible,
+      this.#transcriptScrollTop + visibleHeight,
     );
     return [
       ...(visible.length === 0 ? ["No retained child transcript items."] : visible),
-      ...(this.#transcript.olderCursor === null ? [] : ["Older transcript available"]),
-      ...(liveLines.length === 0
-        ? []
-        : [this.#transcriptFollowingTail ? "following live tail" : "reading paused"]),
-    ].map((line) => boundedLine(line, width));
+      ...markers,
+    ]
+      .slice(0, contentHeight)
+      .map((line) => boundedLine(line, width));
   }
 }
 
@@ -439,13 +564,7 @@ export class ManagedAgentRoster implements Component {
   }
 
   render(width: number): string[] {
-    const active = this.#managedAgents.agents.filter(
-      (agent) =>
-        agent.status === "running" ||
-        agent.status === "permission_required" ||
-        agent.status === "stalled" ||
-        agent.status === "waiting_for_parent",
-    );
+    const active = this.#managedAgents.agents.filter(isActiveManagedAgent);
     const visible = active.slice(0, 3);
     return visible.map((agent, index) => {
       const hidden = index === visible.length - 1 ? active.length - visible.length : 0;
@@ -474,12 +593,10 @@ function agentSelectItems(managedAgents: ManagedAgents): SearchableSelectItem[] 
   }));
 }
 
-function transcriptItemLines(item: TranscriptItem): string[] {
+function transcriptItemLines(item: TranscriptItem, width: number, theme: AdamTuiTheme): string[] {
   if (item.type === "assistant_message") {
     if (item.text !== null) {
-      return safeTerminalText(item.text)
-        .split("\n")
-        .map((line) => `Assistant · ${line}`);
+      return new Markdown(safeTerminalText(item.text), 0, 0, theme.markdown).render(width);
     }
     return item.artifact === null
       ? ["Assistant · retained content unavailable"]
@@ -487,12 +604,22 @@ function transcriptItemLines(item: TranscriptItem): string[] {
   }
   if (item.type === "reasoning_block") {
     return [
-      `Reasoning · ${safeTerminalText(item.provider)} · ${item.status} · content undisclosed`,
+      reasoningFoldTitle({
+        expanded: false,
+        interactive: false,
+        provider: item.provider,
+        status: item.status,
+        theme,
+      }),
     ];
   }
   if (item.type === "tool_call") {
     return [
       `Tool · ${safeTerminalText(item.label)} · ${item.status}${item.resultSummary === null ? "" : ` · ${safeTerminalText(item.resultSummary)}`}`,
+      ...(item.preview === null ? [] : new ToolPreview(item.preview, false, theme).render(width)),
+      ...item.artifacts.map(
+        (artifact) => `Artifact · ${artifact.mediaType} · ${artifact.byteCount} bytes`,
+      ),
     ];
   }
   if (item.type === "session_notice") {
@@ -512,6 +639,19 @@ function transcriptItemLines(item: TranscriptItem): string[] {
     return [`Plan · ${item.status} · revision ${item.submission.revision}`];
   }
   return [`Operation · ${safeTerminalText(item.operationId)}`];
+}
+
+function mergeTranscriptItems(
+  previous: readonly TranscriptItem[],
+  next: readonly TranscriptItem[],
+): readonly TranscriptItem[] {
+  const items = new Map(previous.map((item) => [item.id, item]));
+  for (const item of next) {
+    items.set(item.id, item);
+  }
+  return [...items.values()].sort(
+    (left, right) => left.sequence - right.sequence || left.id.localeCompare(right.id),
+  );
 }
 
 function managedActivityLines(activity: ManagedAgentActivity[number]): string[] {
@@ -558,6 +698,67 @@ function managedResultLines(agent: ManagedAgent): string[] {
     ...lines.slice(0, 2).map((line) => `Result · ${line}`),
     ...(lines.length > 2 ? [`Result · +${lines.length - 2} lines hidden`] : []),
   ];
+}
+
+function managedContextOccupancy(agent: ManagedAgent): string {
+  const occupancy = agent.context?.occupancy;
+  if (occupancy === undefined) {
+    return "occupancy not reported";
+  }
+  return occupancy.source === "unknown"
+    ? "occupancy unknown"
+    : `occupancy ${occupancy.tokens} · ${occupancy.source}`;
+}
+
+function compactAgentActions(
+  agent: ManagedAgent,
+  confirmation: string | null,
+  available: {
+    readonly artifact: boolean;
+    readonly followUp: boolean;
+    readonly message: boolean;
+    readonly recovery: boolean;
+  },
+): string {
+  if (confirmation === `${agent.agentId}:${agent.revision}`) {
+    return "c again cancel · Esc back";
+  }
+  if (isActiveManagedAgent(agent)) {
+    return [
+      ...(available.message ? ["m message"] : []),
+      ...(agent.status === "waiting_for_parent" ? ["r reply"] : []),
+      ...(available.artifact ? ["a artifact"] : []),
+      "c twice cancel",
+      "↑↓ scroll",
+      "Esc back",
+    ].join(" · ");
+  }
+  return [
+    ...(canFollowUp(agent) && available.followUp ? ["f follow-up"] : []),
+    ...(agent.status === "recovery_required" && available.recovery ? ["r recover"] : []),
+    ...(available.artifact ? ["a artifact"] : []),
+    "↑↓ scroll",
+    "Esc back",
+  ].join(" · ");
+}
+
+function managedTranscriptArtifacts(
+  transcript: ManagedAgentTranscriptPageResource | null,
+): readonly ArtifactReference[] {
+  return (
+    transcript?.items.flatMap((item) => {
+      if (item.type === "assistant_message" || item.type === "reasoning_block") {
+        return item.artifact === null ? [] : [item.artifact];
+      }
+      if (item.type === "tool_call") {
+        return [
+          ...item.artifacts,
+          ...(item.changePreviewRef === null ? [] : [item.changePreviewRef]),
+        ];
+      }
+      return [];
+    }) ?? []
+  );
 }
 
 function boundedLine(line: string, width: number): string {

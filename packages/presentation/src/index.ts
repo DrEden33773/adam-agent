@@ -1031,7 +1031,12 @@ export type AuthoritativePresentationSnapshot = {
         readonly revision: number;
         readonly attentionId?: string;
       }[];
-      readonly context?: { readonly contextWindowTokens: number };
+      readonly context?: {
+        readonly contextWindowTokens: number;
+        readonly occupancy?:
+          | { readonly source: "provider_reported" | "estimated"; readonly tokens: number }
+          | { readonly source: "unknown" };
+      };
       readonly usage?: {
         readonly inputTokens: number;
         readonly outputTokens: number;

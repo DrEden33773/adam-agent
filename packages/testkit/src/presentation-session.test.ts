@@ -1075,7 +1075,8 @@ test("PresentationSession causally projects a Todo mutation before the parent ru
       };
     },
   };
-  const lifecycle = createSessionLifecycle({
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
     modelTargets,
     permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
     stateRoot,
@@ -1091,6 +1092,7 @@ test("PresentationSession causally projects a Todo mutation before the parent ru
       targetIdentity,
       stateRoot,
       workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
     });
     const todoAtCompletedTool =
       Promise.withResolvers<
