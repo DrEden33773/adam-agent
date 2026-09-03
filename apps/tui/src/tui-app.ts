@@ -99,6 +99,7 @@ import { TargetPicker } from "./target-picker.js";
 import { type AdamTuiTheme, createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
 import { TodoCompactOverlay } from "./todo-compact-overlay.js";
+import { TodoCompactViewModel } from "./todo-compact-view-model.js";
 import { TodoNavigator } from "./todo-navigator.js";
 import { ToolPreview } from "./tool-preview.js";
 import { TranscriptViewport } from "./transcript-viewport.js";
@@ -339,7 +340,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     managedAgents: options.presentation.getState().authoritative.managedAgents,
     theme,
   });
-  const todoCompactOverlay = new TodoCompactOverlay(theme);
+  const todoCompactViewModel = new TodoCompactViewModel();
+  const todoCompactOverlay = new TodoCompactOverlay(todoCompactViewModel, theme);
   let todoCompactReadGeneration = 0;
   let todoCompactReadKey: string | null = null;
   const working = new Loader(tui, theme.toolTitle, theme.muted, "Working", { intervalMs: 80 });
@@ -1248,7 +1250,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const turnKey =
       active.transcript.items.findLast((item) => item.type === "user_message")?.id ??
       `${active.session.id}:genesis`;
-    todoCompactOverlay.advanceTurn(active.session.id, turnKey);
+    todoCompactViewModel.advanceTurn(active.session.id, turnKey);
     const readKey = `${active.session.id}:${summary.storeRevision}:${turnKey}`;
     if (todoCompactReadKey === readKey) {
       return;
@@ -1283,7 +1285,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         ) {
           return;
         }
-        todoCompactOverlay.setState({
+        todoCompactViewModel.setState({
           items: [...inProgress, ...pending],
           sessionId: active.session.id,
           summary,
@@ -1295,7 +1297,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         if (generation !== todoCompactReadGeneration) {
           return;
         }
-        todoCompactOverlay.setUnavailable({
+        todoCompactViewModel.setUnavailable({
           sessionId: active.session.id,
           summary,
           turnKey,
@@ -3008,11 +3010,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           },
           onChange: () => tui.requestRender(),
           onClose: close,
-          async onReadArtifact(artifact, range) {
+          async onReadArtifact(input) {
             const artifactReceipt = await options.presentation.dispatch({
-              type: "read_artifact",
-              artifact,
-              range,
+              type: "read_managed_agent_artifact",
+              sessionId: expectedSessionId,
+              ...input,
             });
             if (artifactReceipt.status === "rejected" || artifactReceipt.resource === null) {
               throw new Error(
@@ -3141,12 +3143,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           tui.requestRender();
         };
         const navigator = new TodoNavigator({
-          compactCollapsed: todoCompactOverlay.collapsed,
+          compactCollapsed: todoCompactViewModel.collapsed,
           initialPage: receipt.todo,
           onChange: () => tui.requestRender(),
           onClose: close,
           onCompactCollapseChange(collapsed) {
-            todoCompactOverlay.setCollapsed(collapsed);
+            todoCompactViewModel.setCollapsed(collapsed);
             tui.requestRender();
           },
           async onGet(id) {

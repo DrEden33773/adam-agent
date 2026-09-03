@@ -248,6 +248,34 @@ test("active managed viewer requires two exact cancel inputs before causal settl
   }
 });
 
+test("managed viewer reads a bounded artifact through exact child transcript authority", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-artifact-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+
+  try {
+    const fixture = startFixture({ scenario: "managed-artifact", stateRoot, workspaceRoot });
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Create one managed artifact fixture.\r");
+    await fixture.waitFor("Managed active parent completed.");
+    await fixture.waitFor("Agents 0 active/1 terminal");
+
+    fixture.write("/agents\r");
+    await fixture.waitFor("Agents · 0 active · 1 terminal");
+    fixture.write("\r");
+    await fixture.waitFor("a read artifact");
+    fixture.write("a");
+    await fixture.waitFor("Managed artifact production evidence.");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("Artifact · read-only");
+
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("stalled managed viewer preserves controls at 40 and full truth at 120 without color", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-managed-stalled-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -332,7 +360,8 @@ test("managed viewer pauses live-tail following until the reader returns to the 
     await writeFile(join(controlRoot, "release-managed-live-growth"), "release\n", "utf8");
     await waitForFileContents(join(controlRoot, "managed-live-grown"), "grown\n");
     await fixture.waitForCompleteFrameAfter("reading paused", beforeGrowth);
-    expect(fixture.screen()?.join("\n") ?? "").not.toContain("live-8");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("live-2");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("live-6");
 
     const beforeResume = fixture.output().length;
     fixture.write("\u001b[6~");

@@ -9,6 +9,7 @@ import type {
 } from "@adam-agent/presentation";
 import { type Component, getKeybindings, Markdown, truncateToWidth } from "@earendil-works/pi-tui";
 
+import { artifactPageRange } from "./artifact-navigator.js";
 import { reasoningFoldTitle } from "./reasoning-fold.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { type SearchableSelectItem, SearchableSelectList } from "./searchable-select-list.js";
@@ -39,7 +40,14 @@ export class AgentNavigator implements Component {
     | ((input: { readonly agentId: string; readonly expectedRevision: number }) => void)
     | undefined;
   readonly #onReadArtifact:
-    | ((artifact: ArtifactReference, range: ArtifactRange | null) => Promise<ArtifactChunk>)
+    | ((input: {
+        readonly agentId: string;
+        readonly attemptId: string;
+        readonly expectedRevision: number;
+        readonly expectedThroughSequence: number;
+        readonly artifact: ArtifactReference;
+        readonly range: ArtifactRange;
+      }) => Promise<ArtifactChunk>)
     | undefined;
   readonly #onReply: (input: {
     readonly agentId: string;
@@ -86,10 +94,14 @@ export class AgentNavigator implements Component {
       readonly agentId: string;
       readonly expectedRevision: number;
     }) => void;
-    readonly onReadArtifact?: (
-      artifact: ArtifactReference,
-      range: ArtifactRange | null,
-    ) => Promise<ArtifactChunk>;
+    readonly onReadArtifact?: (input: {
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly expectedRevision: number;
+      readonly expectedThroughSequence: number;
+      readonly artifact: ArtifactReference;
+      readonly range: ArtifactRange;
+    }) => Promise<ArtifactChunk>;
     readonly onReadTranscript?: (input: {
       readonly agentId: string;
       readonly attemptId: string;
@@ -135,6 +147,8 @@ export class AgentNavigator implements Component {
       onSelect: (selected) => {
         this.#detail =
           this.#managedAgents.agents.find((agent) => agent.agentId === selected.value) ?? null;
+        this.#artifactGeneration += 1;
+        this.#artifactView = null;
         this.#transcript = null;
         this.#transcriptScrollTop = 0;
         this.#transcriptFollowingTail = true;
@@ -206,7 +220,7 @@ export class AgentNavigator implements Component {
       if (data === "a" && this.#onReadArtifact !== undefined) {
         const artifact = managedTranscriptArtifacts(this.#transcript).at(-1);
         if (artifact !== undefined) {
-          void this.#loadArtifact(artifact, null);
+          void this.#loadArtifact(artifact, artifactPageRange(0));
         }
         return;
       }
@@ -277,11 +291,22 @@ export class AgentNavigator implements Component {
     this.#list.setItems(agentSelectItems(managedAgents));
     if (detailAgentId !== undefined) {
       this.#detail = managedAgents.agents.find((agent) => agent.agentId === detailAgentId) ?? null;
-      if (
-        this.#detail !== null &&
-        (this.#detail.attemptId !== previousDetail?.attemptId ||
-          this.#detail.transcript.throughSequence !== previousDetail?.transcript.throughSequence)
-      ) {
+      const attemptChanged = this.#detail?.attemptId !== previousDetail?.attemptId;
+      const transcriptChanged =
+        this.#detail?.transcript.throughSequence !== previousDetail?.transcript.throughSequence;
+      if (this.#detail !== null && attemptChanged) {
+        this.#transcriptGeneration += 1;
+        this.#artifactGeneration += 1;
+        this.#artifactView = null;
+        this.#transcript = null;
+        this.#transcriptNotice = null;
+        this.#transcriptScrollTop = 0;
+        this.#transcriptFollowingTail = true;
+        this.#cancelConfirmation = null;
+        void this.#loadTranscript(null);
+      } else if (this.#detail !== null && transcriptChanged) {
+        this.#artifactGeneration += 1;
+        this.#artifactView = null;
         this.#cancelConfirmation = null;
         void this.#loadTranscript(null);
       }
@@ -445,10 +470,10 @@ export class AgentNavigator implements Component {
             ? {
                 ...page,
                 items: mergeTranscriptItems(this.#transcript.items, page.items),
-                olderCursor: this.#transcript.olderCursor,
+                olderCursor: page.olderCursor,
               }
             : page
-          : { ...page, items: [...page.items, ...this.#transcript.items] };
+          : { ...page, items: mergeTranscriptItems(page.items, this.#transcript.items) };
       this.#transcriptNotice = null;
       if (this.#transcriptFollowingTail) {
         this.#transcriptScrollTop = Number.POSITIVE_INFINITY;
@@ -462,20 +487,37 @@ export class AgentNavigator implements Component {
     this.#onChange();
   }
 
-  async #loadArtifact(artifact: ArtifactReference, range: ArtifactRange | null): Promise<void> {
+  async #loadArtifact(artifact: ArtifactReference, range: ArtifactRange): Promise<void> {
     if (this.#onReadArtifact === undefined) {
       return;
     }
+    const detail = this.#detail;
+    if (detail === null) {
+      return;
+    }
     const generation = ++this.#artifactGeneration;
-    this.#transcriptNotice = range === null ? "Loading artifact…" : "Loading next artifact page…";
+    this.#transcriptNotice =
+      range.offset === 0 ? "Loading artifact…" : "Loading next artifact page…";
     this.#onChange();
     try {
-      const chunk = await this.#onReadArtifact(artifact, range);
-      if (generation !== this.#artifactGeneration || this.#detail === null) {
-        return;
+      const chunk = await this.#onReadArtifact({
+        agentId: detail.agentId,
+        attemptId: detail.attemptId,
+        expectedRevision: detail.revision,
+        expectedThroughSequence: detail.transcript.throughSequence,
+        artifact,
+        range,
+      });
+      const stale =
+        generation !== this.#artifactGeneration ||
+        this.#detail?.agentId !== detail.agentId ||
+        this.#detail.attemptId !== detail.attemptId ||
+        this.#detail.revision !== detail.revision ||
+        this.#detail.transcript.throughSequence !== detail.transcript.throughSequence;
+      if (!stale) {
+        this.#artifactView = { artifact, chunk };
+        this.#transcriptNotice = null;
       }
-      this.#artifactView = { artifact, chunk };
-      this.#transcriptNotice = null;
     } catch (error) {
       if (generation === this.#artifactGeneration) {
         this.#transcriptNotice =

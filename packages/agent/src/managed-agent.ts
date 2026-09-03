@@ -3986,6 +3986,7 @@ export function createAgentManager(options: {
         },
       };
       const childDependencies = {
+        ...(options.artifactStore === undefined ? {} : { artifactStore: options.artifactStore }),
         contextProfile: options.childContextProfile,
         model: options.childModel,
         permissions: childPermissions,

@@ -338,6 +338,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
   const lifecycle = createSessionLifecycle({
     ...(options.scenario === "managed-attention" ||
     options.scenario === "managed-active" ||
+    options.scenario === "managed-artifact" ||
     options.scenario === "managed-live-scroll" ||
     options.scenario === "managed-parent-permission" ||
     options.scenario === "managed-stalled"
@@ -397,6 +398,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       allowedEffects:
         options.scenario === "managed-attention" ||
         options.scenario === "managed-active" ||
+        options.scenario === "managed-artifact" ||
         options.scenario === "managed-live-scroll" ||
         options.scenario === "managed-parent-permission" ||
         options.scenario === "managed-stalled"
@@ -1437,6 +1439,7 @@ function createFixtureModelTargets(options: {
       }
       if (
         options.scenario === "managed-active" ||
+        options.scenario === "managed-artifact" ||
         options.scenario === "managed-live-scroll" ||
         options.scenario === "managed-stalled"
       ) {
@@ -1446,6 +1449,15 @@ function createFixtureModelTargets(options: {
             message.content.startsWith("Managed child profile research.v2"),
         );
         if (child) {
+          if (options.scenario === "managed-artifact") {
+            yield {
+              type: "text_delta",
+              text: `Managed artifact production evidence.\n${"x".repeat(270_000)}`,
+            };
+            yield { type: "usage", inputTokens: 8, outputTokens: 4_096 };
+            yield { type: "finish", reason: "stop" };
+            return;
+          }
           if (options.controlRoot === undefined) {
             throw new TypeError("The managed active fixture requires one control root.");
           }

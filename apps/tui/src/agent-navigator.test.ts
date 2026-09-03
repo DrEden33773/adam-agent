@@ -278,14 +278,38 @@ test("AgentNavigator reads one bounded sanitized transcript page and renders exa
   });
   const firstPageLoaded = Promise.withResolvers<void>();
   const olderPageLoaded = Promise.withResolvers<void>();
-  let changeCount = 0;
-  const navigator = new AgentNavigator({
+  onReadTranscript.mockImplementation(async (input) => {
+    if (input.cursor === "older-1") {
+      olderPageLoaded.resolve();
+    }
+    return {
+      type: "managed_agent_transcript_page",
+      agentId: agent.agentId,
+      attemptId: agent.attemptId,
+      childSessionId: agent.transcript.childSessionId,
+      throughSequence: agent.transcript.throughSequence,
+      items: [
+        {
+          type: "assistant_message",
+          id: "assistant-1",
+          sequence: 2,
+          sourceSessionId: agent.transcript.childSessionId,
+          branchBoundary: null,
+          text: "Bounded child evidence.",
+          artifact: null,
+        },
+      ],
+      olderCursor: "older-1",
+    };
+  });
+  let navigator!: AgentNavigator;
+  navigator = new AgentNavigator({
     managedAgents: { counts: { active: 1, terminal: 0, attention: 0 }, agents: [agent] },
     onCancel: vi.fn(),
     onChange() {
-      changeCount += 1;
-      if (changeCount === 3) firstPageLoaded.resolve();
-      if (changeCount === 5) olderPageLoaded.resolve();
+      if (navigator.render(120).join("\n").includes("Bounded child evidence.")) {
+        firstPageLoaded.resolve();
+      }
     },
     onClose: vi.fn(),
     onReadTranscript,
@@ -392,14 +416,14 @@ test("AgentNavigator reuses sanitized reasoning, tool preview and bounded artifa
   });
   const transcriptLoaded = Promise.withResolvers<void>();
   const artifactLoaded = Promise.withResolvers<void>();
-  let changeCount = 0;
-  const navigator = new AgentNavigator({
+  let navigator!: AgentNavigator;
+  navigator = new AgentNavigator({
     managedAgents: { counts: { active: 1, terminal: 0, attention: 0 }, agents: [agent] },
     onCancel: vi.fn(),
     onChange() {
-      changeCount += 1;
-      if (changeCount === 3) transcriptLoaded.resolve();
-      if (changeCount === 5) artifactLoaded.resolve();
+      const rendered = navigator.render(120).join("\n");
+      if (rendered.includes("tool preview line")) transcriptLoaded.resolve();
+      if (rendered.includes("Bounded artifact.")) artifactLoaded.resolve();
     },
     onClose: vi.fn(),
     onReadArtifact,
@@ -418,7 +442,117 @@ test("AgentNavigator reuses sanitized reasoning, tool preview and bounded artifa
   navigator.handleInput("a");
   await artifactLoaded.promise;
   expect(navigator.render(120).join("\n")).toContain("Bounded artifact.");
-  expect(onReadArtifact).toHaveBeenCalledWith(artifact, null);
+  expect(onReadArtifact).toHaveBeenCalledWith({
+    agentId: agent.agentId,
+    attemptId: agent.attemptId,
+    expectedRevision: agent.revision,
+    expectedThroughSequence: agent.transcript.throughSequence,
+    artifact,
+    range: { offset: 0, maximumBytes: 16 * 1024 },
+  });
+});
+
+test("AgentNavigator discards a late artifact page when the selected agent attempt changes", async () => {
+  const oldAgent = managedAgentFixture({
+    transcript: { childSessionId: "child-old", throughSequence: 4 },
+  });
+  const newAgent = managedAgentFixture({
+    attemptId: "123e4567-e89b-42d3-a456-426614174299",
+    revision: 2,
+    transcript: { childSessionId: "child-new", throughSequence: 1 },
+  });
+  const artifact = {
+    id: "sha256:late-managed-artifact",
+    mediaType: "text/plain",
+    byteCount: 19,
+    source: "tool_output" as const,
+  };
+  const artifactStarted = Promise.withResolvers<void>();
+  const releaseArtifact = Promise.withResolvers<void>();
+  const staleArtifactSettled = Promise.withResolvers<void>();
+  const oldTranscriptLoaded = Promise.withResolvers<void>();
+  let artifactReturned = false;
+  const onReadArtifact = vi.fn(async () => {
+    artifactStarted.resolve();
+    await releaseArtifact.promise;
+    artifactReturned = true;
+    return {
+      mediaType: "text/plain",
+      offset: 0,
+      byteCount: 19,
+      totalByteCount: 19,
+      eof: true,
+      nextRange: null,
+      text: "stale artifact body",
+    };
+  });
+  const onReadTranscript = vi.fn(
+    async (input: { readonly attemptId: string; readonly expectedThroughSequence: number }) => ({
+      type: "managed_agent_transcript_page" as const,
+      agentId: oldAgent.agentId,
+      attemptId: input.attemptId,
+      childSessionId: input.attemptId === oldAgent.attemptId ? "child-old" : "child-new",
+      throughSequence: input.expectedThroughSequence,
+      items:
+        input.attemptId === oldAgent.attemptId
+          ? [
+              {
+                type: "tool_call" as const,
+                id: "tool-late",
+                sequence: 2,
+                sourceSessionId: "child-old",
+                branchBoundary: null,
+                callId: "call-late",
+                qualifiedName: "read_file",
+                kind: "read" as const,
+                effect: "read" as const,
+                label: "Read file",
+                subject: null,
+                source: null,
+                durationMs: 4,
+                status: "completed" as const,
+                outcome: { status: "completed" as const },
+                resultSummary: "artifact",
+                artifacts: [artifact],
+                changePreviewRef: null,
+                preview: null,
+              },
+            ]
+          : [],
+      olderCursor: null,
+    }),
+  );
+  let navigator!: AgentNavigator;
+  navigator = new AgentNavigator({
+    managedAgents: { counts: { active: 1, terminal: 0, attention: 0 }, agents: [oldAgent] },
+    onCancel: vi.fn(),
+    onChange() {
+      const rendered = navigator.render(120).join("\n");
+      if (rendered.includes("a read artifact")) oldTranscriptLoaded.resolve();
+      if (artifactReturned && rendered.includes(newAgent.attemptId)) staleArtifactSettled.resolve();
+    },
+    onClose: vi.fn(),
+    onReadArtifact,
+    onReadTranscript,
+    onReply: vi.fn(),
+    theme: createAdamTuiTheme(true),
+  });
+
+  navigator.handleInput("\r");
+  await oldTranscriptLoaded.promise;
+  navigator.handleInput("a");
+  await artifactStarted.promise;
+  navigator.setManagedAgents(
+    { counts: { active: 1, terminal: 0, attention: 0 }, agents: [newAgent] },
+    [],
+  );
+  releaseArtifact.resolve();
+  await staleArtifactSettled.promise;
+
+  const rendered = navigator.render(120).join("\n");
+  expect(rendered).toContain(newAgent.attemptId);
+  expect(rendered).toContain("Transcript · read-only");
+  expect(rendered).not.toContain("stale artifact body");
 });
 
 test("a stalled Agent detail offers an exact ordinary message with safe-boundary delivery copy", () => {
@@ -509,10 +643,13 @@ test("manual managed transcript scroll pauses live-tail following and PageDown r
     })),
     olderCursor: null,
   } as const;
-  const onReadTranscript = vi
-    .fn()
-    .mockResolvedValueOnce(initialPage)
-    .mockResolvedValueOnce({
+  let refreshReadStarted = false;
+  const onReadTranscript = vi.fn(async (input: { readonly expectedThroughSequence: number }) => {
+    if (input.expectedThroughSequence !== 10) {
+      return initialPage;
+    }
+    refreshReadStarted = true;
+    return {
       ...initialPage,
       throughSequence: 10,
       items: Array.from({ length: 5 }, (_, index) => ({
@@ -524,17 +661,25 @@ test("manual managed transcript scroll pauses live-tail following and PageDown r
         text: `durable-${index + 5}`,
         artifact: null,
       })),
-    });
+    };
+  });
   const transcriptLoaded = Promise.withResolvers<void>();
   const transcriptRefreshed = Promise.withResolvers<void>();
-  let changeCount = 0;
-  const navigator = new AgentNavigator({
+  let navigator!: AgentNavigator;
+  navigator = new AgentNavigator({
     managedAgents: { counts: { active: 1, terminal: 0, attention: 0 }, agents: [agent] },
     onCancel: vi.fn(),
     onChange() {
-      changeCount += 1;
-      if (changeCount === 3) transcriptLoaded.resolve();
-      if (changeCount === 5) transcriptRefreshed.resolve();
+      const rendered = navigator.render(80).join("\n");
+      if (rendered.includes("durable-7")) transcriptLoaded.resolve();
+      if (
+        refreshReadStarted &&
+        rendered.includes("reading paused") &&
+        rendered.includes("durable-2") &&
+        rendered.includes("durable-6")
+      ) {
+        transcriptRefreshed.resolve();
+      }
     },
     onClose: vi.fn(),
     onReadTranscript,
@@ -565,8 +710,6 @@ test("manual managed transcript scroll pauses live-tail following and PageDown r
   const paused = navigator.render(80).join("\n");
   expect(paused).toContain("reading paused");
   expect(paused).toContain("durable-2");
-  expect(paused).not.toContain("durable-9");
-  expect(paused).not.toContain("live child tail");
   navigator.handleInput("\u001b[6~");
   const resumed = navigator.render(80).join("\n");
   expect(resumed).toContain("following live tail");

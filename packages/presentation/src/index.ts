@@ -1219,6 +1219,16 @@ export type PresentationCommand =
       readonly cursor: string | null;
     }
   | {
+      readonly type: "read_managed_agent_artifact";
+      readonly sessionId: string;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly expectedRevision: number;
+      readonly expectedThroughSequence: number;
+      readonly artifact: ArtifactReference;
+      readonly range: ArtifactRange;
+    }
+  | {
       readonly type: "cancel_managed_agent";
       readonly sessionId: string;
       readonly agentId: string;

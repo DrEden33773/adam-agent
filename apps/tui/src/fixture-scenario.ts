@@ -13,6 +13,7 @@ export const fixtureScenarios = [
   "input-resource-copying",
   "mcp-close-unconfirmed",
   "managed-active",
+  "managed-artifact",
   "managed-attention",
   "managed-parent-permission",
   "managed-live-scroll",
