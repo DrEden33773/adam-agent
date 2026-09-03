@@ -1031,6 +1031,121 @@ test("PresentationSession exposes authoritative read-only Todo summary, list, an
   }
 });
 
+test("PresentationSession causally projects a Todo mutation before the parent run settles", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-todo-causal-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const secondModelStarted = Promise.withResolvers<void>();
+  const releaseSecondModel = Promise.withResolvers<void>();
+  let modelCall = 0;
+  const driver: ModelDriver = {
+    async *stream() {
+      modelCall += 1;
+      if (modelCall === 1) {
+        yield { type: "tool_call_start", id: "create-causal-todo", name: "create_todo" };
+        yield {
+          type: "tool_call_delta",
+          id: "create-causal-todo",
+          json: '{"title":"Causal Todo","details":"Visible before settlement"}',
+        };
+        yield { type: "tool_call_end", id: "create-causal-todo" };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      secondModelStarted.resolve();
+      await releaseSecondModel.promise;
+      yield { type: "text_delta", text: "Causal Todo parent settled." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [sessionAutomaticTitlesEnabled]: false,
+  });
+
+  try {
+    const presentation = await createPresentationSession({
+      lifecycle,
+      projectLabel: "workspace",
+      targetIdentity,
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+    });
+    const todoAtCompletedTool =
+      Promise.withResolvers<
+        ReturnType<typeof presentation.getState>["authoritative"]["active"] extends infer Active
+          ? Active extends { readonly todo?: infer Todo }
+            ? Todo | undefined
+            : never
+          : never
+      >();
+    const unsubscribe = presentation.subscribe(() => {
+      const active = presentation.getState().authoritative.active;
+      if (
+        active?.transcript.items.some(
+          (item) =>
+            item.type === "tool_call" &&
+            item.callId === "create-causal-todo" &&
+            item.status === "completed",
+        )
+      ) {
+        todoAtCompletedTool.resolve(active.todo);
+      }
+    });
+    try {
+      const sessionId = presentation.getState().authoritative.active?.session.id;
+      if (sessionId === undefined) {
+        throw new Error("Expected an active session.");
+      }
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId,
+          text: "Create one Todo and remain active.",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).resolves.toMatchObject({ status: "admitted", resource: null });
+      await secondModelStarted.promise;
+      await expect(todoAtCompletedTool.promise).resolves.toMatchObject({
+        storeRevision: 1,
+        counts: { pending: 1, inProgress: 0, completed: 0 },
+      });
+    } finally {
+      unsubscribe();
+      releaseSecondModel.resolve();
+      await presentation.close();
+    }
+  } finally {
+    releaseSecondModel.resolve();
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("PresentationSession allows create_todo without a workspace change preview", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-todo-permission-"));
   const stateRoot = join(testRoot, "state");

@@ -125,6 +125,18 @@ The above copyright notice and this permission notice shall be included in all c
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+## `@juicesharp/rpiv-todo` 2.9.0 selected presentation hierarchy
+
+Adam Agent selectively adapts the compact Todo glyph, completed-row linger, completed-first overflow, hidden-count, and pure row-selection presentation hierarchy from [`@juicesharp/rpiv-todo@2.9.0`](https://github.com/juicesharp/rpiv-mono/tree/f3291e1ea14729d42aafd5f0f713e63c813e1f2e/packages/rpiv-todo) at commit `f3291e1ea14729d42aafd5f0f713e63c813e1f2e`, specifically `state/selectors.ts`, `view/format.ts`, and `todo-overlay.ts`. Adam does not include the package, its store, reducer, numeric IDs, delete/clear behavior, replay format, continuation semantics, or runtime dependencies. The selected source is licensed under the MIT License.
+
+Copyright (c) 2026 juicesharp
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
 ## npm CLI 11.6.2, `@npmcli/config` 10.4.2, and `nopt` 8.1.0 selected grammar data and parser semantics
 
 Adam Agent freezes npm CLI 11.6.2's public commands, aliases, and abbreviation behavior from [`lib/utils/cmd-list.js` lines 3-177](https://github.com/npm/cli/blob/v11.6.2/lib/utils/cmd-list.js); freezes `@npmcli/config` 10.4.2's public option names, shorthands, and type arity from [`workspaces/config/lib/definitions/index.js` lines 24-60](https://github.com/npm/cli/blob/v11.6.2/workspaces/config/lib/definitions/index.js) and [`workspaces/config/lib/definitions/definitions.js` lines 87-2316](https://github.com/npm/cli/blob/v11.6.2/workspaces/config/lib/definitions/definitions.js); and independently reimplements the relevant equals, shorthand, single-character cluster, definition-vs-shorthand precedence, unique-prefix, negation, Boolean-secondary-type, and value-consumption semantics of [`nopt` 8.1.0 `lib/nopt-lib.js` lines 249-504](https://github.com/npm/nopt/blob/v8.1.0/lib/nopt-lib.js). Adam does not include or execute npm, `@npmcli/config`, or `nopt` in Plan command assessment; Adam adds its own bounded command-position resolver, mutation classification, resource limits, and fail-closed result. npm CLI is licensed under the Artistic License 2.0; `@npmcli/config` and `nopt` are licensed under the ISC License.

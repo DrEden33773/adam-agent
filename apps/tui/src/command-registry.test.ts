@@ -34,23 +34,24 @@ test("the TUI Registry hides attachment actions for a historical text-only sessi
   ).toBe(true);
 });
 
-test("the TUI Registry exposes the read-only Todo navigator", () => {
+test("the TUI Registry exposes the active-run read-only Todo navigator", () => {
   expect(adamCommandRegistry.parse("/todos")).toMatchObject({
     kind: "known",
     argumentsText: "",
     command: {
       id: "todos",
+      availability: "always",
       usage: "/todos",
       summary: "Browse the authoritative Todo store without mutation.",
     },
   });
 });
 
-test("the TUI Registry exposes the idle managed-child navigator", () => {
+test("the TUI Registry exposes the active-run managed-child navigator", () => {
   const parsed = adamCommandRegistry.parse("/agents");
   expect(parsed).toMatchObject({
     kind: "known",
-    command: { id: "agents", availability: "idle", usage: "/agents" },
+    command: { id: "agents", availability: "always", usage: "/agents" },
   });
 });
 

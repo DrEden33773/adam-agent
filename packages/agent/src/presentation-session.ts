@@ -2,6 +2,9 @@ import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 import type {
+  ArtifactChunk,
+  ArtifactRange,
+  ArtifactReference,
   AuthoritativePresentationSnapshot,
   CommandReceipt,
   McpDisplay,
@@ -67,6 +70,7 @@ import {
   effectiveSessionStateRoot,
   type ManagedAgentControlReceipt,
   type ManagedAgentNotification,
+  type ManagedAgentTranscriptRecords,
   type SessionContextUsageSnapshot,
   type SessionLifecycle,
   SessionLifecycleError,
@@ -75,6 +79,7 @@ import {
   sessionManagedAgentTranscriptReader,
 } from "./session-lifecycle.js";
 import { readJsonlSessionRecords, type SessionRecord } from "./session-store.js";
+import { todoStoreSnapshotFromRecordsV1, todoSummaryV1 } from "./todo.js";
 import {
   createTurnComposer,
   type TurnComposer,
@@ -1916,6 +1921,16 @@ export async function createPresentationSession(
             if (closed || latest === null || latest.session.id !== active.session.id) {
               return;
             }
+            const refreshedTodo =
+              latest.todo === undefined
+                ? undefined
+                : todoSummaryV1(
+                    todoStoreSnapshotFromRecordsV1(
+                      refreshedRecords.flatMap((record) =>
+                        record.sessionId === active.session.id ? [record.entry] : [],
+                      ),
+                    ),
+                  );
             const effectiveOperations = refreshedOperations.map((operation) => {
               const previousSequence = operationCursors.get(operation.display.operationId) ?? 0;
               if (operation.throughSequence >= previousSequence) {
@@ -1965,6 +1980,7 @@ export async function createPresentationSession(
                     ),
                   ),
                   pendingInteractions,
+                  ...(refreshedTodo === undefined ? {} : { todo: refreshedTodo }),
                 },
               },
               draft: state.draft,
@@ -2304,40 +2320,7 @@ export async function createPresentationSession(
         }
         try {
           const child = await options.lifecycle[sessionManagedAgentTranscriptReader](command);
-          const history = child.records.map((entry) => ({
-            sessionId: child.childSessionId,
-            entry,
-          }));
-          const projected: TranscriptItem[] = [];
-          for (const item of projectTranscript(
-            history,
-            [],
-            projectToolDisplays(history, new Map()),
-          )) {
-            if (item.type === "user_message") {
-              continue;
-            }
-            if (item.type === "reasoning_block") {
-              projected.push({ ...item, text: null, artifact: null });
-              continue;
-            }
-            projected.push(item);
-          }
-          const { partialOutput } = child;
-          if (partialOutput !== undefined) {
-            const terminalNoticeIndex = projected.findIndex(
-              (item) => item.type === "session_notice",
-            );
-            projected.splice(terminalNoticeIndex < 0 ? projected.length : terminalNoticeIndex, 0, {
-              type: "assistant_message",
-              id: `${child.childSessionId}:partial:${child.records.at(-1)?.sequence ?? 0}`,
-              sequence: child.records.at(-1)?.sequence ?? 0,
-              sourceSessionId: child.childSessionId,
-              branchBoundary: null,
-              text: partialOutput.text,
-              artifact: null,
-            });
-          }
+          const projected = projectManagedAgentTranscript(child);
           const cursorPrefix = `managed-agent-transcript:${command.attemptId}:${command.expectedThroughSequence}:`;
           const end =
             command.cursor === null
@@ -2373,6 +2356,59 @@ export async function createPresentationSession(
             status: "rejected",
             code: "authority_rejected",
             message: "The managed-child transcript changed or became unavailable.",
+          };
+        }
+      }
+      if (command.type === "read_managed_agent_artifact") {
+        const agent = state.authoritative.managedAgents.agents.find(
+          (candidate) => candidate.agentId === command.agentId,
+        );
+        if (
+          state.authoritative.active?.session.id !== command.sessionId ||
+          agent === undefined ||
+          agent.attemptId !== command.attemptId ||
+          agent.revision !== command.expectedRevision ||
+          agent.transcript.throughSequence !== command.expectedThroughSequence
+        ) {
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected managed-child artifact is no longer current.",
+          };
+        }
+        const { range } = command;
+        if (options.stateRoot === undefined || !isBoundedPresentationArtifactRange(range)) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "The managed-child artifact range is unavailable.",
+          };
+        }
+        try {
+          const child = await options.lifecycle[sessionManagedAgentTranscriptReader](command);
+          const projected = projectManagedAgentTranscript(child);
+          if (!managedTranscriptContainsArtifact(projected, command.artifact)) {
+            return {
+              status: "rejected",
+              code: "stale_interaction",
+              message: "The requested artifact is not part of the managed-child transcript.",
+            };
+          }
+          return {
+            status: "admitted",
+            commandId: randomUUID(),
+            resource: await readPresentationArtifact({
+              artifact: command.artifact,
+              barrier: options[presentationArtifactReadBarrier],
+              range,
+              stateRoot: options.stateRoot,
+            }),
+          };
+        } catch {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "The managed-child artifact could not be read safely.",
           };
         }
       }
@@ -3984,12 +4020,7 @@ export async function createPresentationSession(
         if (
           options.stateRoot === undefined ||
           (range === null && !completeReadAvailable) ||
-          (range !== null &&
-            (!Number.isSafeInteger(range.offset) ||
-              range.offset < 0 ||
-              !Number.isSafeInteger(range.maximumBytes) ||
-              range.maximumBytes <= 0 ||
-              range.maximumBytes > presentationArtifactPageMaximumBytes))
+          (range !== null && !isBoundedPresentationArtifactRange(range))
         ) {
           return {
             status: "rejected",
@@ -3998,56 +4029,15 @@ export async function createPresentationSession(
           };
         }
         try {
-          await options[presentationArtifactReadBarrier]?.beforeRead();
-          const page =
-            range === null
-              ? await readFileArtifact({
-                  root: join(options.stateRoot, "artifacts"),
-                  id: command.artifact.id,
-                  maximumBytes: command.artifact.byteCount,
-                }).then((bytes) =>
-                  bytes === undefined
-                    ? undefined
-                    : {
-                        bytes,
-                        totalByteCount: bytes.byteLength,
-                        eof: true,
-                      },
-                )
-              : await readFileArtifactRange({
-                  root: join(options.stateRoot, "artifacts"),
-                  id: command.artifact.id,
-                  expectedByteCount: command.artifact.byteCount,
-                  offset: range.offset,
-                  maximumBytes: range.maximumBytes,
-                });
-          if (page === undefined || page.totalByteCount !== command.artifact.byteCount) {
-            throw new TypeError("The artifact bytes are unavailable.");
-          }
-          const decoded = decodeArtifactPage(page.bytes, page.eof);
-          const eof = page.eof && decoded.byteCount === page.bytes.byteLength;
-          if (!eof && decoded.byteCount === 0) {
-            throw new TypeError("The artifact page did not make UTF-8 progress.");
-          }
-          await options[presentationArtifactReadBarrier]?.afterRead?.();
           return {
             status: "admitted",
             commandId: randomUUID(),
-            resource: {
-              mediaType: command.artifact.mediaType,
-              offset: range?.offset ?? 0,
-              byteCount: decoded.byteCount,
-              totalByteCount: page.totalByteCount,
-              eof,
-              nextRange:
-                range === null || eof
-                  ? null
-                  : {
-                      offset: range.offset + decoded.byteCount,
-                      maximumBytes: presentationArtifactPageMaximumBytes,
-                    },
-              text: decoded.text,
-            },
+            resource: await readPresentationArtifact({
+              artifact: command.artifact,
+              barrier: options[presentationArtifactReadBarrier],
+              range,
+              stateRoot: options.stateRoot,
+            }),
           };
         } catch {
           return {
@@ -4773,9 +4763,109 @@ function decodeArtifactPage(
   throw new TypeError("The artifact page is not valid UTF-8.");
 }
 
+function isBoundedPresentationArtifactRange(range: ArtifactRange): boolean {
+  return (
+    Number.isSafeInteger(range.offset) &&
+    range.offset >= 0 &&
+    Number.isSafeInteger(range.maximumBytes) &&
+    range.maximumBytes > 0 &&
+    range.maximumBytes <= presentationArtifactPageMaximumBytes
+  );
+}
+
+async function readPresentationArtifact(input: {
+  readonly artifact: ArtifactReference;
+  readonly barrier: PresentationArtifactReadBarrier | undefined;
+  readonly range: ArtifactRange | null;
+  readonly stateRoot: string;
+}): Promise<ArtifactChunk> {
+  await input.barrier?.beforeRead();
+  const page =
+    input.range === null
+      ? await readFileArtifact({
+          root: join(input.stateRoot, "artifacts"),
+          id: input.artifact.id,
+          maximumBytes: input.artifact.byteCount,
+        }).then((bytes) =>
+          bytes === undefined ? undefined : { bytes, totalByteCount: bytes.byteLength, eof: true },
+        )
+      : await readFileArtifactRange({
+          root: join(input.stateRoot, "artifacts"),
+          id: input.artifact.id,
+          expectedByteCount: input.artifact.byteCount,
+          offset: input.range.offset,
+          maximumBytes: input.range.maximumBytes,
+        });
+  if (page === undefined || page.totalByteCount !== input.artifact.byteCount) {
+    throw new TypeError("The artifact bytes are unavailable.");
+  }
+  const decoded = decodeArtifactPage(page.bytes, page.eof);
+  const eof = page.eof && decoded.byteCount === page.bytes.byteLength;
+  if (!eof && decoded.byteCount === 0) {
+    throw new TypeError("The artifact page did not make UTF-8 progress.");
+  }
+  await input.barrier?.afterRead?.();
+  return {
+    mediaType: input.artifact.mediaType,
+    offset: input.range?.offset ?? 0,
+    byteCount: decoded.byteCount,
+    totalByteCount: page.totalByteCount,
+    eof,
+    nextRange:
+      input.range === null || eof
+        ? null
+        : {
+            offset: input.range.offset + decoded.byteCount,
+            maximumBytes: presentationArtifactPageMaximumBytes,
+          },
+    text: decoded.text,
+  };
+}
+
+function projectManagedAgentTranscript(child: ManagedAgentTranscriptRecords): TranscriptItem[] {
+  const history = child.records.map((entry) => ({
+    sessionId: child.childSessionId,
+    entry,
+  }));
+  const projected: TranscriptItem[] = [];
+  for (const item of projectTranscript(history, [], projectToolDisplays(history, new Map()))) {
+    if (item.type === "user_message") {
+      continue;
+    }
+    if (item.type === "reasoning_block") {
+      projected.push({ ...item, text: null, artifact: null });
+      continue;
+    }
+    projected.push(item);
+  }
+  const { partialOutput } = child;
+  if (partialOutput !== undefined) {
+    const terminalNoticeIndex = projected.findIndex((item) => item.type === "session_notice");
+    projected.splice(terminalNoticeIndex < 0 ? projected.length : terminalNoticeIndex, 0, {
+      type: "assistant_message",
+      id: `${child.childSessionId}:partial:${child.records.at(-1)?.sequence ?? 0}`,
+      sequence: child.records.at(-1)?.sequence ?? 0,
+      sourceSessionId: child.childSessionId,
+      branchBoundary: null,
+      text: partialOutput.text,
+      artifact: null,
+    });
+  }
+  return projected;
+}
+
+function managedTranscriptContainsArtifact(
+  items: readonly TranscriptItem[],
+  artifact: ArtifactReference,
+): boolean {
+  return transcriptArtifactReferences(items).some((candidate) =>
+    sameArtifactReference(candidate, artifact),
+  );
+}
+
 function isKnownArtifact(
   active: import("@adam-agent/presentation").ActiveSessionDisplay,
-  artifact: import("@adam-agent/presentation").ArtifactReference,
+  artifact: ArtifactReference,
 ): boolean {
   const candidates = [
     ...(active.plan?.submission === undefined
@@ -4794,38 +4884,44 @@ function isKnownArtifact(
     ...active.pendingInteractions.flatMap((interaction) =>
       interaction.changePreviewRef === null ? [] : [interaction.changePreviewRef],
     ),
-    ...active.transcript.items.flatMap((item) => {
-      if (item.type === "assistant_message") {
-        return item.artifact === null ? [] : [item.artifact];
-      }
-      if (item.type === "reasoning_block") {
-        return item.artifact === null ? [] : [item.artifact];
-      }
-      if (item.type === "tool_call") {
-        return [
-          ...item.artifacts,
-          ...(item.changePreviewRef === null ? [] : [item.changePreviewRef]),
-        ];
-      }
-      if (item.type === "plan_submission") {
-        return [
-          {
-            id: item.submission.artifact.id,
-            mediaType: item.submission.artifact.mediaType,
-            byteCount: item.submission.artifact.byteCount,
-            source: "plan" as const,
-          },
-        ];
-      }
-      return [];
-    }),
+    ...transcriptArtifactReferences(active.transcript.items),
   ];
-  return candidates.some(
-    (candidate) =>
-      candidate.id === artifact.id &&
-      candidate.mediaType === artifact.mediaType &&
-      candidate.byteCount === artifact.byteCount &&
-      candidate.source === artifact.source,
+  return candidates.some((candidate) => sameArtifactReference(candidate, artifact));
+}
+
+function transcriptArtifactReferences(
+  items: readonly TranscriptItem[],
+): readonly ArtifactReference[] {
+  return items.flatMap((item) => {
+    if (item.type === "assistant_message" || item.type === "reasoning_block") {
+      return item.artifact === null ? [] : [item.artifact];
+    }
+    if (item.type === "tool_call") {
+      return [
+        ...item.artifacts,
+        ...(item.changePreviewRef === null ? [] : [item.changePreviewRef]),
+      ];
+    }
+    if (item.type === "plan_submission") {
+      return [
+        {
+          id: item.submission.artifact.id,
+          mediaType: item.submission.artifact.mediaType,
+          byteCount: item.submission.artifact.byteCount,
+          source: "plan" as const,
+        },
+      ];
+    }
+    return [];
+  });
+}
+
+function sameArtifactReference(left: ArtifactReference, right: ArtifactReference): boolean {
+  return (
+    left.id === right.id &&
+    left.mediaType === right.mediaType &&
+    left.byteCount === right.byteCount &&
+    left.source === right.source
   );
 }
 

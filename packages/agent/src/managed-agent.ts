@@ -32,6 +32,7 @@ import {
   type AgentSessionDurableContext,
   sessionDurableContext,
 } from "./session-durable-context.js";
+import { contextUsageSnapshotFromRecords } from "./session-history-folds.js";
 import { modelMessagesFromCompleteRecords } from "./session-history-replay.js";
 import type { SessionRecord, SessionStore, SessionStoreDirectory } from "./session-store.js";
 import type { SkillContextRecordV1 } from "./skills.js";
@@ -2118,7 +2119,12 @@ export type ManagedAgentSummary = {
   }[];
   readonly resultByteCount?: number;
   readonly resultTruncated?: boolean;
-  readonly context?: { readonly contextWindowTokens: number };
+  readonly context?: {
+    readonly contextWindowTokens: number;
+    readonly occupancy?:
+      | { readonly source: "provider_reported" | "estimated"; readonly tokens: number }
+      | { readonly source: "unknown" };
+  };
   readonly usage?: {
     readonly inputTokens: number;
     readonly outputTokens: number;
@@ -2458,6 +2464,7 @@ export async function managedAgentSnapshotWithChildHistories(input: {
       );
       const currentHistory = histories.at(-1);
       const activeTool = currentManagedAgentTool(currentHistory ?? []);
+      const occupancy = currentManagedAgentContextOccupancy(currentHistory ?? []);
       const partialOutput = agent.partialOutput;
       const transcript = {
         ...agent.transcript,
@@ -2506,6 +2513,15 @@ export async function managedAgentSnapshotWithChildHistories(input: {
         liveWatchdogState === undefined || agent.watchdog === undefined
           ? {}
           : { watchdog: { ...agent.watchdog, state: liveWatchdogState } };
+      const context =
+        agent.context === undefined
+          ? {}
+          : {
+              context: {
+                ...agent.context,
+                ...(occupancy === undefined ? {} : { occupancy }),
+              },
+            };
       if (histories.some((history) => history === undefined)) {
         return {
           ...agent,
@@ -2515,6 +2531,7 @@ export async function managedAgentSnapshotWithChildHistories(input: {
           attemptHistory,
           ...projectedActiveTool,
           ...projectedPartialOutput,
+          ...context,
           ...watchdog,
         };
       }
@@ -2539,6 +2556,7 @@ export async function managedAgentSnapshotWithChildHistories(input: {
         attemptHistory,
         ...projectedActiveTool,
         ...projectedPartialOutput,
+        ...context,
         ...(agent.usage === undefined ? {} : { usage }),
         ...(agent.budget === undefined
           ? {}
@@ -3968,6 +3986,7 @@ export function createAgentManager(options: {
         },
       };
       const childDependencies = {
+        ...(options.artifactStore === undefined ? {} : { artifactStore: options.artifactStore }),
         contextProfile: options.childContextProfile,
         model: options.childModel,
         permissions: childPermissions,
@@ -5779,6 +5798,19 @@ function providerCallsFromChildRecords(records: readonly SessionRecord[]): numbe
   return records.filter(
     (record) => record.schemaVersion === 3 && record.record.type === "provider_attempt_started",
   ).length;
+}
+
+function currentManagedAgentContextOccupancy(
+  records: readonly SessionRecord[],
+):
+  | { readonly source: "provider_reported" | "estimated"; readonly tokens: number }
+  | { readonly source: "unknown" }
+  | undefined {
+  const active = contextUsageSnapshotFromRecords(records)?.active;
+  if (active === undefined || active.source === "unknown") {
+    return active === undefined ? undefined : { source: "unknown" };
+  }
+  return { source: active.source, tokens: active.tokens };
 }
 
 function currentManagedAgentTool(

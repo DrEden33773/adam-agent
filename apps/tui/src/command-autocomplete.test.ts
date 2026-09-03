@@ -1,5 +1,32 @@
 import { expect, test } from "vitest";
 import { AdamAutocompleteProvider } from "./command-autocomplete.js";
+import { adamCommandRegistry } from "./command-registry.js";
+
+test("active-run slash completion keeps the complete Registry with availability annotations", async () => {
+  const provider = new AdamAutocompleteProvider({
+    getProjectPaths: () => [],
+    getRunActive: () => true,
+    getSkills: () => [],
+  });
+
+  const suggestions = await provider.getSuggestions(["/"], 0, 1, {
+    signal: new AbortController().signal,
+  });
+  expect(suggestions?.items).toHaveLength(adamCommandRegistry.entries().length);
+  const agents = suggestions?.items.find((item) => item.value === "/agents");
+  const name = suggestions?.items.find((item) => item.value === "/name");
+  expect(agents?.description).not.toContain("unavailable");
+  expect(name?.description).toContain("unavailable · idle only");
+  const firstUnavailable = suggestions?.items.findIndex((item) =>
+    item.description?.includes("unavailable"),
+  );
+  expect(firstUnavailable).toBeGreaterThan(0);
+  expect(
+    suggestions?.items
+      .slice(firstUnavailable)
+      .every((item) => item.description?.includes("unavailable")),
+  ).toBe(true);
+});
 
 test("Skill mention rows expose deterministic source labels without qualified IDs", async () => {
   const provider = new AdamAutocompleteProvider({

@@ -1031,7 +1031,12 @@ export type AuthoritativePresentationSnapshot = {
         readonly revision: number;
         readonly attentionId?: string;
       }[];
-      readonly context?: { readonly contextWindowTokens: number };
+      readonly context?: {
+        readonly contextWindowTokens: number;
+        readonly occupancy?:
+          | { readonly source: "provider_reported" | "estimated"; readonly tokens: number }
+          | { readonly source: "unknown" };
+      };
       readonly usage?: {
         readonly inputTokens: number;
         readonly outputTokens: number;
@@ -1212,6 +1217,16 @@ export type PresentationCommand =
       readonly expectedRevision: number;
       readonly expectedThroughSequence: number;
       readonly cursor: string | null;
+    }
+  | {
+      readonly type: "read_managed_agent_artifact";
+      readonly sessionId: string;
+      readonly agentId: string;
+      readonly attemptId: string;
+      readonly expectedRevision: number;
+      readonly expectedThroughSequence: number;
+      readonly artifact: ArtifactReference;
+      readonly range: ArtifactRange;
     }
   | {
       readonly type: "cancel_managed_agent";
