@@ -17,7 +17,11 @@ import {
 import { createLinuxClipboardAdapter } from "./linux-clipboard.js";
 import { createProductionProjectRuntime } from "./project-runtime.js";
 import { runTui } from "./tui-app.js";
-import { TuiConfigurationError, tuiProcessFailureMessage } from "./tui-process-failure.js";
+import {
+  TuiConfigurationError,
+  tuiExplicitResumeFailureMessage,
+  tuiProcessFailureMessage,
+} from "./tui-process-failure.js";
 
 try {
   const command = parseCommand(process.argv.slice(2));
@@ -53,6 +57,10 @@ try {
       askedEffects: ["write", "execute", "network", "delegate", "administrative"],
     });
     const extensionPermissions = createPermissionPolicy({ allowedEffects: ["execute"] });
+    if (command.resumeSessionId !== undefined && command.targetId !== undefined) {
+      throw new TuiConfigurationError("--resume and --target cannot be combined.");
+    }
+    const resumeSessionId = command.resumeSessionId;
     const runtime = await createProductionProjectRuntime({
       environment: userConfigurationEnvironment,
       extensionPermissions,
@@ -63,9 +71,19 @@ try {
       reservedCommandNames: adamCommandRegistry
         .entries()
         .flatMap((entry) => [entry.name, ...entry.aliases]),
+      ...(resumeSessionId === undefined ? {} : { resumeSessionId }),
       stateRoot,
       workspaceRoot,
       workspaceTrust,
+    }).catch((error) => {
+      if (resumeSessionId === undefined) {
+        throw error;
+      }
+      const message = tuiExplicitResumeFailureMessage(resumeSessionId, error);
+      if (message === undefined) {
+        throw error;
+      }
+      throw new TuiConfigurationError(message);
     });
     const commandRegistry = createAdamCommandRegistryFromContributions(runtime.contributions);
     const startupNotice = runtime.extensionAvailability.configurationUnavailable
@@ -79,16 +97,19 @@ try {
       await runtime.close();
     };
     try {
-      if (command.resumeSessionId !== undefined && command.targetId !== undefined) {
-        throw new TuiConfigurationError("--resume and --target cannot be combined.");
-      }
-      if (command.resumeSessionId !== undefined) {
-        const snapshot = await runtime.inspectSession(command.resumeSessionId);
+      if (resumeSessionId !== undefined) {
+        const snapshot = await runtime.inspectSession(resumeSessionId).catch((error) => {
+          const message = tuiExplicitResumeFailureMessage(resumeSessionId, error);
+          if (message === undefined) {
+            throw error;
+          }
+          throw new TuiConfigurationError(message);
+        });
         if (snapshot.schemaVersion !== 3) {
           throw new TuiConfigurationError("The selected session cannot be opened by this TUI.");
         }
         const presentation = await runtime.createPresentation({
-          sessionId: command.resumeSessionId,
+          sessionId: resumeSessionId,
         });
         await runTui({
           clipboard,

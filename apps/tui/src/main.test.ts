@@ -11,8 +11,17 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createJsonlManagedAgentStore } from "@adam-agent/agent";
-import { openJsonlSessionStore } from "@adam-agent/agent/internal-testing";
+import {
+  createJsonlManagedAgentStore,
+  createSessionLifecycle,
+  type ModelTargetIdentity,
+  type ModelTargets,
+} from "@adam-agent/agent";
+import {
+  createTrustedWorkspaceTrustForTesting,
+  openJsonlSessionStore,
+  preparedDirectDeepSeekV2ContextProfile,
+} from "@adam-agent/agent/internal-testing";
 import type { PresentationSession } from "@adam-agent/presentation";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import { afterEach, expect, test } from "vitest";
@@ -3821,6 +3830,135 @@ test("the production session picker opens the exact focused existing session", a
     await fixture.waitForAfter("deepseek-v4-flash.direct · Certified", beforeSelection);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("the production TUI starts and resumes a valid session beside invalid history", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-invalid-session-catalog-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  const targetIdentity: ModelTargetIdentity = {
+    targetId: "deepseek-v4-flash.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash",
+    route: "direct",
+    profileVersion: 3,
+    certification: "certified",
+  };
+  const contextProfile = preparedDirectDeepSeekV2ContextProfile;
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity: targetIdentity,
+        contextProfile,
+        driver: {
+          async *stream() {
+            yield { type: "text_delta", text: "TUI catalog fixture valid." } as const;
+            yield { type: "finish", reason: "stop" } as const;
+          },
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile,
+          },
+        ],
+      };
+    },
+  };
+
+  try {
+    const seedLifecycle = createSessionLifecycle({
+      modelTargets,
+      stateRoot,
+      workspaceRoot,
+      workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+    });
+    const valid = await seedLifecycle.create({ targetIdentity });
+    await seedLifecycle.continue({
+      sessionId: valid.sessionId,
+      input: { text: "Keep this exact valid session." },
+    });
+    const invalid = await seedLifecycle.create({ targetIdentity });
+    await seedLifecycle.continue({
+      sessionId: invalid.sessionId,
+      input: { text: "Retain this invalid local session." },
+    });
+    await seedLifecycle.close();
+    const invalidPath = join(
+      stateRoot,
+      "projects",
+      invalid.projectId.replace(/^sha256:/u, ""),
+      "sessions",
+      `${invalid.sessionId}.jsonl`,
+    );
+    const invalidHistory = await readFile(invalidPath, "utf8");
+    const invalidFixture = invalidHistory.replace('"schemaVersion":3', '"schemaVersion":99');
+    if (invalidFixture === invalidHistory) {
+      throw new Error("Expected a schema-v3 record for the invalid TUI fixture.");
+    }
+    await writeFile(invalidPath, invalidFixture, "utf8");
+
+    const fixture = startFixture({ launch: {}, noColor: true, stateRoot, workspaceRoot });
+    await fixture.waitForCompleteFrameAfter("Invalid sessions", 0);
+    fixture.write("\r");
+    await fixture.waitFor("Select an exact model target");
+    fixture.write("\r");
+    await fixture.waitFor("Adam · New session");
+    const beforeResume = fixture.output().length;
+    fixture.write("/resume\r");
+    await fixture.waitForCompleteFrameAfter("Invalid sessions", beforeResume);
+    const frames: string[] = [];
+    for (const [columns, rows] of [
+      [120, 40],
+      [80, 24],
+      [40, 24],
+    ] as const) {
+      const beforeResize = fixture.output().length;
+      await fixture.resize(columns, rows);
+      await fixture.waitForCompleteFrameAfter("Invalid sessions", beforeResize);
+      const frame = fixture.screen()?.join("\n") ?? "";
+      frames.push(frame);
+      expect(frame).toContain("New Session");
+      expect(frame).toContain("Invalid sessions");
+      const copy = frame.replace(/│/gu, " ").replace(/\s+/gu, " ");
+      expect(copy).toContain(
+        "Skipped 1 invalid session; its local data was retained. Open /resume to review it.",
+      );
+      if (columns > 40) {
+        expect(copy).toContain("1 retained · Enter review");
+      }
+      expect(frame).not.toContain("\u001b[38;");
+      expect(frame).not.toContain("\u001b[48;");
+    }
+
+    const beforeReviewWidth = fixture.output().length;
+    await fixture.resize(80, 24);
+    await fixture.waitForCompleteFrameAfter("Invalid sessions", beforeReviewWidth);
+    const beforeReview = fixture.output().length;
+    fixture.write("\u001b[B\u001b[B\r");
+    await fixture.waitForAfter(invalid.sessionId, beforeReview);
+    const diagnosticFrame = (fixture.screen()?.join(" ") ?? "")
+      .replace(/│/gu, " ")
+      .replace(/\s+/gu, " ");
+    expect(diagnosticFrame).toContain("Invalid sessions");
+    expect(diagnosticFrame).toContain(
+      "The session log contains an invalid record. The original local session was retained.",
+    );
+
+    fixture.write("\u001b[27;1;27~\u001b[A\r");
+    await fixture.waitFor("TUI catalog fixture valid.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    expect(frames).toHaveLength(3);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
   }

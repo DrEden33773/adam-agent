@@ -168,20 +168,34 @@ const managedAgentA3SpawnSchemaV2 = managedAgentTaskSchema
       context.addIssue({ code: "custom", message: "Only research.v2 accepts selected Skills." });
     }
   });
-const managedAgentListSchema = z.strictObject({
-  status: z
-    .enum([
-      "active",
-      "terminal",
-      "running",
-      "stalled",
-      "completed",
-      "failed",
-      "cancelled",
-      "recovery_required",
-      "inspection_required",
-    ])
-    .optional(),
+const managedAgentListStatusSchemaV1 = z.enum([
+  "active",
+  "terminal",
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+  "recovery_required",
+  "inspection_required",
+]);
+const managedAgentListStatusSchemaV2 = z.enum([
+  "active",
+  "terminal",
+  "running",
+  "stalled",
+  "completed",
+  "failed",
+  "cancelled",
+  "recovery_required",
+  "inspection_required",
+]);
+const managedAgentListSchemaV1 = z.strictObject({
+  status: managedAgentListStatusSchemaV1.optional(),
+  limit: z.number().int().min(1).max(8).optional(),
+  cursor: z.string().min(1).max(256).optional(),
+});
+const managedAgentListSchemaV2 = z.strictObject({
+  status: managedAgentListStatusSchemaV2.optional(),
   limit: z.number().int().min(1).max(8).optional(),
   cursor: z.string().min(1).max(256).optional(),
 });
@@ -5432,6 +5446,7 @@ export function createManagedAgentToolRegistry(options: {
   const current = profile.endsWith(".v2");
   const a3 = profile.includes(".a3-long-lived.");
   const a2 = profile.includes(".a2-long-lived.");
+  const listSchema = current ? managedAgentListSchemaV2 : managedAgentListSchemaV1;
   const spawnSchema = a3
     ? current
       ? managedAgentA3SpawnSchemaV2
@@ -5578,14 +5593,14 @@ export function createManagedAgentToolRegistry(options: {
         name: "list_agents",
         description:
           "List bounded managed-child status and result summaries for this exact parent session.",
-        inputSchema: z.toJSONSchema(managedAgentListSchema),
+        inputSchema: z.toJSONSchema(listSchema),
       },
       outputSchema: z.custom<JsonValue>(),
       effect: "read",
       cancellation: "unsupported",
       maximumResult: { maximumBytes: maximumManagedAgentResultBytes },
       prepare(argumentsJson) {
-        const parsed = managedAgentListSchema.safeParse(parseJson(argumentsJson));
+        const parsed = listSchema.safeParse(parseJson(argumentsJson));
         if (!parsed.success) {
           return toolFailure("invalid_tool_input", "Tool input is invalid.");
         }

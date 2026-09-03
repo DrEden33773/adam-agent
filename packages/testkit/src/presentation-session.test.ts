@@ -35,11 +35,13 @@ import {
   type OperationSnapshot,
   type OperationStore,
   type SessionLifecycle,
+  SessionStoreError,
   type ToolRegistry,
 } from "@adam-agent/agent";
 import {
   assemblePromptMessagesV1,
   createInMemorySessionStoreDirectory,
+  createPlanToolProfileV1,
   createTrustedWorkspaceTrustForTesting,
   createUnavailablePlanShellEnvironmentV1,
   digestPromptRequestV1,
@@ -1397,7 +1399,11 @@ test("PresentationSession opens an empty project catalog without creating a sess
           workspaceTrust: { status: "trusted", diagnostic: null },
         },
         targets: { items: [], defaultTargetId: null, diagnostic: null },
-        sessions: { items: [], nextCursor: null },
+        sessions: {
+          items: [],
+          nextCursor: null,
+          diagnostics: { items: [], totalCount: 0, truncated: false },
+        },
         managedAgents: { counts: { active: 0, terminal: 0, attention: 0 }, agents: [] },
         active: null,
       },
@@ -5877,7 +5883,11 @@ test("PresentationSession opens an exact target as a recoverable draft", async (
           defaultTargetId: null,
           diagnostic: null,
         },
-        sessions: { items: [], nextCursor: null },
+        sessions: {
+          items: [],
+          nextCursor: null,
+          diagnostics: { items: [], totalCount: 0, truncated: false },
+        },
         managedAgents: { counts: { active: 0, terminal: 0, attention: 0 }, agents: [] },
         active: null,
       },
@@ -12593,6 +12603,157 @@ test("PresentationSession discovers and selects cold sibling project sessions", 
     }
   } finally {
     await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession exposes bounded retained invalid-session diagnostics", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-invalid-history-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const backing = createInMemorySessionStoreDirectory<SessionRecord>();
+  const modelTargets = settledModelTargets("Catalog fixture admitted.");
+  const fixtureLifecycle = createSessionLifecycle({
+    modelTargets,
+    stateRoot,
+    tools: createCodingToolRegistry({ workspaceRoot }),
+    workspaceRoot,
+    [sessionStoreDirectory]: backing,
+  });
+  let lifecycle: ReturnType<typeof createSessionLifecycle> | undefined;
+  let presentation: Awaited<ReturnType<typeof createProductPresentationSession>> | undefined;
+
+  try {
+    const valid = await fixtureLifecycle.create({ targetIdentity });
+    await fixtureLifecycle.continue({
+      sessionId: valid.sessionId,
+      input: { text: "Keep this valid catalog item." },
+    });
+    const invalid = await fixtureLifecycle.create({ targetIdentity });
+    await fixtureLifecycle.continue({
+      sessionId: invalid.sessionId,
+      input: {
+        text: "private transcript reasoning tool arguments credential artifact contents",
+      },
+    });
+    await fixtureLifecycle.enterPlan({ sessionId: invalid.sessionId });
+    const invalidRecords = await backing.open(invalid.sessionId).then((store) => store?.read());
+    const entered = invalidRecords?.find(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "plan_cycle_entered",
+    );
+    if (entered?.schemaVersion !== 3 || entered.record.type !== "plan_cycle_entered") {
+      throw new Error("Expected the invalid Presentation catalog fixture Plan entry.");
+    }
+    const invalidProfile = createPlanToolProfileV1({
+      source: {
+        ...entered.record.eligibleToolProfile.source,
+        digest: `sha256:${"0".repeat(64)}` as `sha256:${string}`,
+      },
+      definitions: entered.record.eligibleToolProfile.definitions,
+    });
+    Object.assign(entered.record, { eligibleToolProfile: invalidProfile });
+    await fixtureLifecycle.close();
+
+    const injectedIds = Array.from(
+      { length: 100 },
+      (_, index) => `ffffffff-ffff-4fff-8fff-${index.toString(16).padStart(12, "0")}`,
+    );
+    const unsafePath = "/private/owner/state/session.jsonl";
+    const directory: SessionStoreDirectory<SessionRecord> = {
+      create: (sessionId) => backing.create(sessionId),
+      async listSessionEntries() {
+        return [
+          ...(await backing.listSessionEntries()),
+          ...injectedIds.map((sessionId, index) => ({
+            sessionId,
+            modifiedAtMilliseconds: index,
+          })),
+        ];
+      },
+      listSessionIds: () => backing.listSessionIds(),
+      async open(sessionId) {
+        if (!injectedIds.includes(sessionId)) {
+          return backing.open(sessionId);
+        }
+        return {
+          async append() {
+            throw new Error("The diagnostic fixture is read-only.");
+          },
+          async appendBatch() {
+            throw new Error("The diagnostic fixture is read-only.");
+          },
+          async read() {
+            const error = new SessionStoreError(
+              sessionId === injectedIds[0] ? "session_log_too_large" : "session_log_invalid",
+            );
+            Object.assign(error, {
+              path: unsafePath,
+              cause: new Error("private cause payload credential"),
+              payload: { prompt: "private prompt", artifact: "private artifact" },
+            });
+            throw error;
+          },
+        };
+      },
+    };
+    lifecycle = createSessionLifecycle({
+      modelTargets,
+      stateRoot,
+      tools: createCodingToolRegistry({ workspaceRoot }),
+      workspaceRoot,
+      [sessionStoreDirectory]: directory,
+    });
+    presentation = await createProductPresentationSession({
+      lifecycle,
+      openProject: true,
+      projectLabel: "workspace",
+      stateRoot,
+      workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(backing),
+    });
+
+    const sessions = presentation.getState().authoritative.sessions;
+    expect(sessions).toMatchObject({
+      items: [{ id: valid.sessionId }],
+      diagnostics: { totalCount: 101, truncated: true },
+    });
+    const diagnostics = Reflect.get(sessions, "diagnostics") as {
+      readonly items: readonly {
+        readonly sessionId: string;
+        readonly stage: "read" | "validate";
+        readonly code: "invalid_history" | "invalid_log" | "log_too_large";
+        readonly retained: true;
+        readonly message: string;
+      }[];
+      readonly totalCount: number;
+      readonly truncated: boolean;
+    };
+    expect(diagnostics.items).toHaveLength(100);
+    expect(diagnostics.items.map((item) => item.sessionId)).toEqual(
+      [invalid.sessionId, ...injectedIds].sort().slice(0, 100),
+    );
+    expect(diagnostics.items).toContainEqual({
+      sessionId: invalid.sessionId,
+      stage: "validate",
+      code: "invalid_history",
+      retained: true,
+      message: "The session history is invalid. The original local session was retained.",
+    });
+    expect(diagnostics.items).toContainEqual({
+      sessionId: injectedIds[0],
+      stage: "read",
+      code: "log_too_large",
+      retained: true,
+      message: "The session log exceeds its read limit. The original local session was retained.",
+    });
+    expect(JSON.stringify(diagnostics)).not.toMatch(
+      /private|owner|state\/session|prompt|transcript|reasoning|tool arguments|credential|artifact|cause/iu,
+    );
+  } finally {
+    await presentation?.close();
+    await fixtureLifecycle.close();
+    await lifecycle?.close();
     await rm(testRoot, { recursive: true, force: true });
   }
 });
