@@ -75,6 +75,7 @@ import {
   sessionManagedAgentTranscriptReader,
 } from "./session-lifecycle.js";
 import { readJsonlSessionRecords, type SessionRecord } from "./session-store.js";
+import { todoStoreSnapshotFromRecordsV1, todoSummaryV1 } from "./todo.js";
 import {
   createTurnComposer,
   type TurnComposer,
@@ -1916,6 +1917,16 @@ export async function createPresentationSession(
             if (closed || latest === null || latest.session.id !== active.session.id) {
               return;
             }
+            const refreshedTodo =
+              latest.todo === undefined
+                ? undefined
+                : todoSummaryV1(
+                    todoStoreSnapshotFromRecordsV1(
+                      refreshedRecords.flatMap((record) =>
+                        record.sessionId === active.session.id ? [record.entry] : [],
+                      ),
+                    ),
+                  );
             const effectiveOperations = refreshedOperations.map((operation) => {
               const previousSequence = operationCursors.get(operation.display.operationId) ?? 0;
               if (operation.throughSequence >= previousSequence) {
@@ -1965,6 +1976,7 @@ export async function createPresentationSession(
                     ),
                   ),
                   pendingInteractions,
+                  ...(refreshedTodo === undefined ? {} : { todo: refreshedTodo }),
                 },
               },
               draft: state.draft,

@@ -61,8 +61,17 @@ export class SearchableSelectList {
   }
 
   setItems(items: readonly SearchableSelectItem[]): void {
+    const selectedValue = this.#list.getSelectedItem()?.value;
     this.#items = items;
     this.#list = this.#createList();
+    if (selectedValue !== undefined) {
+      const selectedIndex = this.#visibleItems().findIndex(
+        (candidate) => candidate.value === selectedValue,
+      );
+      if (selectedIndex >= 0) {
+        this.#list.setSelectedIndex(selectedIndex);
+      }
+    }
   }
 
   render(width: number): string[] {
@@ -70,16 +79,20 @@ export class SearchableSelectList {
   }
 
   #createList(): SelectList {
-    const searchable = this.#items.filter((item) => item.alwaysVisible !== true);
-    const filtered = fuzzyFilter([...searchable], this.#query, (item) => item.searchText);
-    const items = [
-      ...filtered.map((candidate) => candidate.item),
-      ...this.#items.filter((item) => item.alwaysVisible === true).map((item) => item.item),
-    ];
+    const items = this.#visibleItems();
     const list = new SelectList(items, this.#maxVisible, this.#theme);
     list.onCancel = this.#onCancel;
     list.onSelect = this.#onSelect;
     return list;
+  }
+
+  #visibleItems(): SelectItem[] {
+    const searchable = this.#items.filter((item) => item.alwaysVisible !== true);
+    const filtered = fuzzyFilter([...searchable], this.#query, (item) => item.searchText);
+    return [
+      ...filtered.map((candidate) => candidate.item),
+      ...this.#items.filter((item) => item.alwaysVisible === true).map((item) => item.item),
+    ];
   }
 }
 

@@ -8,6 +8,7 @@ import type {
   BranchSourceBoundary,
   DraftPoint,
   OperationDisplay,
+  PresentationCommand,
   PresentationSession,
   PresentationTransientState,
   ReasoningBlockDisplay,
@@ -15,6 +16,7 @@ import type {
   TargetDisplay,
   ThinkingCapabilityDisplay,
   ThinkingPolicySelectionDisplay,
+  TodoPageResource,
 } from "@adam-agent/presentation";
 import {
   Box,
@@ -37,7 +39,7 @@ import {
   VStack,
 } from "@earendil-works/pi-tui";
 import PQueue from "p-queue";
-import { AgentNavigator } from "./agent-navigator.js";
+import { AgentNavigator, ManagedAgentRoster } from "./agent-navigator.js";
 import {
   ArtifactNavigator,
   activeChronologyArtifacts,
@@ -96,9 +98,11 @@ import { createAdamStructuredEditorCompletion } from "./structured-editor-comple
 import { TargetPicker } from "./target-picker.js";
 import { type AdamTuiTheme, createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
+import { TodoCompactOverlay } from "./todo-compact-overlay.js";
 import { TodoNavigator } from "./todo-navigator.js";
 import { ToolPreview } from "./tool-preview.js";
 import { TranscriptViewport } from "./transcript-viewport.js";
+import { isTuiRunActive } from "./tui-run-state.js";
 import { WorkspaceTrustPage } from "./workspace-trust-page.js";
 
 export type { ClipboardAdapter, DeadlineScheduler } from "./exit-policy.js";
@@ -285,10 +289,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           [],
         getRunActive: () => {
           const state = options.presentation.getState();
-          return (
-            state.transient !== null ||
-            (state.authoritative.active?.pendingInteractions.length ?? 0) > 0
-          );
+          return isTuiRunActive({
+            cancelSettling,
+            pendingInteractionCount: state.authoritative.active?.pendingInteractions.length ?? 0,
+            transient: state.transient,
+          });
         },
         getThinkingLevelIds: () => {
           const state = options.presentation.getState();
@@ -330,6 +335,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   let projectedHistorySessionId = options.presentation.getState().authoritative.active?.session.id;
   const statusLine = new Text();
   const footer = new ResponsiveText(() => physicalTerminal.columns);
+  const managedAgentRoster = new ManagedAgentRoster({
+    managedAgents: options.presentation.getState().authoritative.managedAgents,
+    theme,
+  });
+  const todoCompactOverlay = new TodoCompactOverlay(theme);
+  let todoCompactReadGeneration = 0;
+  let todoCompactReadKey: string | null = null;
   const working = new Loader(tui, theme.toolTitle, theme.muted, "Working", { intervalMs: 80 });
   const thinking = new Loader(tui, theme.keyword, theme.muted, "Thinking", { intervalMs: 80 });
   thinking.stop();
@@ -443,14 +455,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     | {
         readonly close: () => void;
         readonly hide: () => void;
+        readonly navigator: AgentNavigator;
       }
     | undefined;
-  let pendingAgentReply:
+  let pendingManagedAgentInput:
     | {
+        readonly action: "message" | "reply" | "follow_up" | "recovery";
         readonly sessionId: string;
         readonly agentId: string;
         readonly expectedRevision: number;
-        readonly attentionId: string;
+        readonly attentionId?: string;
       }
     | undefined;
   let todoNavigatorGeneration = 0;
@@ -570,6 +584,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       basis: 0,
       grow: 1,
       minSize: 1,
+    },
+    {
+      component: managedAgentRoster,
+      basis: "auto",
+      minSize: 0,
+      visible: () => options.presentation.getState().authoritative.managedAgents.counts.active > 0,
+    },
+    {
+      component: todoCompactOverlay,
+      basis: "auto",
+      minSize: 0,
+      visible: () => {
+        const todo = options.presentation.getState().authoritative.active?.todo;
+        return todo !== undefined && todo.counts.pending + todo.counts.inProgress > 0;
+      },
     },
     {
       component: new VStack([
@@ -1205,9 +1234,86 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     tui.requestRender();
   };
 
+  const synchronizeTodoCompactOverlay = (active: ActiveSessionDisplay | null): void => {
+    const summary = active?.todo;
+    if (
+      active === null ||
+      summary === undefined ||
+      summary.counts.pending + summary.counts.inProgress === 0
+    ) {
+      todoCompactReadKey = null;
+      todoCompactReadGeneration += 1;
+      return;
+    }
+    const turnKey =
+      active.transcript.items.findLast((item) => item.type === "user_message")?.id ??
+      `${active.session.id}:genesis`;
+    todoCompactOverlay.advanceTurn(active.session.id, turnKey);
+    const readKey = `${active.session.id}:${summary.storeRevision}:${turnKey}`;
+    if (todoCompactReadKey === readKey) {
+      return;
+    }
+    todoCompactReadKey = readKey;
+    const generation = ++todoCompactReadGeneration;
+    const readStatus = async (
+      status: "pending" | "in_progress",
+    ): Promise<TodoPageResource["items"]> => {
+      const receipt = await options.presentation.dispatch({
+        type: "list_todos",
+        sessionId: active.session.id,
+        expectedStoreRevision: summary.storeRevision,
+        filter: { status, titleContains: null },
+        limit: 20,
+        cursor: null,
+      });
+      if (receipt.status === "rejected" || receipt.todo?.type !== "todo_page") {
+        throw new Error(
+          receipt.status === "rejected" ? receipt.message : "The compact Todo page is unavailable.",
+        );
+      }
+      return receipt.todo.items;
+    };
+    void Promise.all([readStatus("in_progress"), readStatus("pending")]).then(
+      ([inProgress, pending]) => {
+        const current = options.presentation.getState().authoritative.active;
+        if (
+          generation !== todoCompactReadGeneration ||
+          current?.session.id !== active.session.id ||
+          current.todo?.storeRevision !== summary.storeRevision
+        ) {
+          return;
+        }
+        todoCompactOverlay.setState({
+          items: [...inProgress, ...pending],
+          sessionId: active.session.id,
+          summary,
+          turnKey,
+        });
+        tui.requestRender();
+      },
+      () => {
+        if (generation !== todoCompactReadGeneration) {
+          return;
+        }
+        todoCompactOverlay.setUnavailable({
+          sessionId: active.session.id,
+          summary,
+          turnKey,
+        });
+        tui.requestRender();
+      },
+    );
+  };
+
   const renderState = () => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
+    synchronizeTodoCompactOverlay(active);
+    managedAgentRoster.setManagedAgents(state.authoritative.managedAgents);
+    agentNavigator?.navigator.setManagedAgents(
+      state.authoritative.managedAgents,
+      state.managedAgentActivity,
+    );
     targetPicker?.picker.setTargets(
       state.authoritative.targets.items,
       state.authoritative.targets.defaultTargetId,
@@ -2033,7 +2139,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     ) {
       cancelSettling = false;
     }
-    const runActive = state.transient !== null || pending !== undefined || cancelSettling;
+    const runActive = isTuiRunActive({
+      cancelSettling,
+      pendingInteractionCount: active?.pendingInteractions.length ?? 0,
+      transient: state.transient,
+    });
     if (previousRunActive !== undefined && previousRunActive !== runActive) {
       clearExitWindow();
     }
@@ -2831,9 +2941,61 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                 renderState();
               });
           },
+          onMessage(input) {
+            close();
+            pendingManagedAgentInput = {
+              action: "message",
+              sessionId: expectedSessionId,
+              ...input,
+            };
+            editor.setText("");
+            showNotice(
+              "info",
+              "Enter one bounded message. Delivery occurs only at the child’s next safe boundary and does not imply compliance.",
+              "until_next_action",
+              expectedSessionId,
+            );
+            renderState();
+          },
+          onFollowUp(input) {
+            close();
+            pendingManagedAgentInput = {
+              action: "follow_up",
+              sessionId: expectedSessionId,
+              ...input,
+            };
+            editor.setText("");
+            showNotice(
+              "info",
+              "Enter one bounded follow-up task for the exact terminal child.",
+              "until_next_action",
+              expectedSessionId,
+            );
+            renderState();
+          },
+          onRecovery(input) {
+            close();
+            pendingManagedAgentInput = {
+              action: "recovery",
+              sessionId: expectedSessionId,
+              ...input,
+            };
+            editor.setText("");
+            showNotice(
+              "info",
+              "Enter one bounded recovery task for the exact durable child evidence.",
+              "until_next_action",
+              expectedSessionId,
+            );
+            renderState();
+          },
           onReply(input) {
             close();
-            pendingAgentReply = { sessionId: expectedSessionId, ...input };
+            pendingManagedAgentInput = {
+              action: "reply",
+              sessionId: expectedSessionId,
+              ...input,
+            };
             editor.setText("");
             showNotice(
               "info",
@@ -2845,15 +3007,37 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           },
           onChange: () => tui.requestRender(),
           onClose: close,
+          async onReadTranscript(input) {
+            const transcriptReceipt = await options.presentation.dispatch({
+              type: "read_managed_agent_transcript",
+              sessionId: expectedSessionId,
+              ...input,
+            });
+            if (
+              transcriptReceipt.status === "rejected" ||
+              transcriptReceipt.managedAgentTranscript === undefined
+            ) {
+              throw new Error(
+                transcriptReceipt.status === "rejected"
+                  ? transcriptReceipt.message
+                  : "The managed-child transcript page is unavailable.",
+              );
+            }
+            return transcriptReceipt.managedAgentTranscript;
+          },
           theme,
         });
+        navigator.setManagedAgents(
+          current.managedAgents,
+          options.presentation.getState().managedAgentActivity,
+        );
         handle = showOverlay(navigator, {
           width: "90%",
           minWidth: 36,
-          maxHeight: "80%",
+          maxHeight: "90%",
           margin: 1,
         });
-        agentNavigator = { close, hide: () => handle?.hide() };
+        agentNavigator = { close, hide: () => handle?.hide(), navigator };
         settleNoticeClear(actionId);
         tui.requestRender();
       })
@@ -2941,9 +3125,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           tui.requestRender();
         };
         const navigator = new TodoNavigator({
+          compactCollapsed: todoCompactOverlay.collapsed,
           initialPage: receipt.todo,
           onChange: () => tui.requestRender(),
           onClose: close,
+          onCompactCollapseChange(collapsed) {
+            todoCompactOverlay.setCollapsed(collapsed);
+            tui.requestRender();
+          },
           async onGet(id) {
             const detailReceipt = await options.presentation.dispatch({
               type: "get_todo",
@@ -3719,52 +3908,90 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     ) {
       return;
     }
-    if (pendingAgentReply !== undefined) {
-      const reply = pendingAgentReply;
-      if (active === null || active.session.id !== reply.sessionId) {
-        pendingAgentReply = undefined;
+    if (pendingManagedAgentInput !== undefined) {
+      const managedInput = pendingManagedAgentInput;
+      if (active === null || active.session.id !== managedInput.sessionId) {
+        pendingManagedAgentInput = undefined;
         editor.disableSubmit = false;
-        showNotice("error", "The managed-child reply target is no longer active.", "until_edit");
+        showNotice("error", "The managed-child target is no longer active.", "until_edit");
         renderState();
         return;
       }
-      const replyActionId = showNotice(
+      const managedActionId = showNotice(
         "progress",
-        "Sending the exact managed-child reply…",
+        managedInput.action === "message"
+          ? "Sending the exact managed-child message…"
+          : managedInput.action === "reply"
+            ? "Sending the exact managed-child reply…"
+            : managedInput.action === "follow_up"
+              ? "Starting the exact managed-child follow-up…"
+              : "Recovering the exact managed child…",
         "until_replaced",
         active.session.id,
       );
+      const command: PresentationCommand =
+        managedInput.action === "message" || managedInput.action === "reply"
+          ? {
+              type: "send_managed_agent_message",
+              sessionId: active.session.id,
+              agentId: managedInput.agentId,
+              expectedRevision: managedInput.expectedRevision,
+              ...(managedInput.attentionId === undefined
+                ? {}
+                : { attentionId: managedInput.attentionId }),
+              message: text,
+            }
+          : managedInput.action === "follow_up"
+            ? {
+                type: "follow_up_managed_agent",
+                sessionId: active.session.id,
+                agentId: managedInput.agentId,
+                expectedRevision: managedInput.expectedRevision,
+                task: text,
+              }
+            : {
+                type: "recover_managed_agent",
+                sessionId: active.session.id,
+                agentId: managedInput.agentId,
+                expectedRevision: managedInput.expectedRevision,
+                task: text,
+              };
       void options.presentation
-        .dispatch({
-          type: "send_managed_agent_message",
-          sessionId: active.session.id,
-          agentId: reply.agentId,
-          expectedRevision: reply.expectedRevision,
-          attentionId: reply.attentionId,
-          message: text,
-        })
+        .dispatch(command)
         .then((receipt) => {
           if (receipt.status === "admitted") {
-            pendingAgentReply = undefined;
+            pendingManagedAgentInput = undefined;
             editor.setText("");
             settleNotice(
-              replyActionId,
+              managedActionId,
               "success",
-              "Managed-child reply enqueued for exact delivery.",
+              managedInput.action === "message"
+                ? `Managed-child message ${receipt.managedAgentControl?.delivery ?? "accepted"}; delivery occurs only at the next safe boundary and does not imply compliance.`
+                : managedInput.action === "reply"
+                  ? "Managed-child reply enqueued for exact delivery."
+                  : managedInput.action === "follow_up"
+                    ? "Managed-child follow-up started from exact terminal evidence."
+                    : "Managed child recovered from exact durable evidence.",
               "until_next_action",
               active.session.id,
             );
           } else {
             editor.disableSubmit = false;
-            settleNotice(replyActionId, "error", receipt.message, "until_edit", active.session.id);
+            settleNotice(
+              managedActionId,
+              "error",
+              receipt.message,
+              "until_edit",
+              active.session.id,
+            );
           }
         })
         .catch(() => {
           editor.disableSubmit = false;
           settleNotice(
-            replyActionId,
+            managedActionId,
             "error",
-            "The managed-child reply could not be admitted safely.",
+            "The managed-child control could not be admitted safely.",
             "until_edit",
             active.session.id,
           );
@@ -4006,8 +4233,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         });
       return;
     }
-    const runActive =
-      state.transient !== null || active.pendingInteractions.length > 0 || cancelSettling;
+    const runActive = isTuiRunActive({
+      cancelSettling,
+      pendingInteractionCount: active.pendingInteractions.length,
+      transient: state.transient,
+    });
     clearExitWindow();
     editor.disableSubmit = true;
     const parsedCommand = commandRegistry.parse(text);
@@ -5409,15 +5639,18 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         closeOverlay.close();
         return { consume: true };
       }
-      const active = options.presentation.getState().authoritative.active;
+      const runState = options.presentation.getState();
+      const active = runState.authoritative.active;
       if (webSearchConfigurationPending) {
         clearExitWindow();
         void options.presentation.dispatch({ type: "cancel_web_search_test" });
         return { consume: true };
       }
-      const runActive =
-        options.presentation.getState().transient !== null ||
-        (active?.pendingInteractions.length ?? 0) > 0;
+      const runActive = isTuiRunActive({
+        cancelSettling,
+        pendingInteractionCount: active?.pendingInteractions.length ?? 0,
+        transient: runState.transient,
+      });
       const cancellableOperation = active?.linkedOperations.findLast(
         (candidate) => candidate.status === "running" && candidate.actions.includes("cancel"),
       );

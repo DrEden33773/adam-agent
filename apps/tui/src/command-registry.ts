@@ -194,10 +194,20 @@ export class AdamCommandRegistry {
     command: AdamCommandDefinition,
     state: { readonly attachmentsAvailable?: boolean; readonly runActive: boolean },
   ): boolean {
+    return this.availabilityReason(command, state) === null;
+  }
+
+  availabilityReason(
+    command: AdamCommandDefinition,
+    state: { readonly attachmentsAvailable?: boolean; readonly runActive: boolean },
+  ): string | null {
     if (composerCommandIds.has(command.id) && state.attachmentsAvailable === false) {
-      return false;
+      return "input resources unavailable";
     }
-    return command.availability === "always" || !state.runActive;
+    if (command.availability === "idle" && state.runActive) {
+      return "idle only";
+    }
+    return null;
   }
 
   matchesInput(data: string, action: Exclude<AdamKeybindingDefinition["action"], null>): boolean {
@@ -229,7 +239,7 @@ const composerCommandIds = new Set<AdamCommandDefinition["id"]>([
 const builtInCommands: readonly AdamCommandDefinition[] = [
   {
     aliases: [],
-    availability: "idle",
+    availability: "always",
     id: "agents",
     name: "agents",
     summary: "Inspect, reply to, or cancel managed children for the active session.",
@@ -277,7 +287,7 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
   },
   {
     aliases: [],
-    availability: "idle",
+    availability: "always",
     id: "todos",
     name: "todos",
     summary: "Browse the authoritative Todo store without mutation.",

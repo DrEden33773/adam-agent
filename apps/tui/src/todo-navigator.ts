@@ -16,9 +16,11 @@ export class TodoNavigator implements Component {
   readonly #onClose: () => void;
   readonly #onGet: (id: string) => Promise<TodoEntityResource>;
   readonly #onList: (cursor: string | null) => Promise<TodoPageResource>;
+  readonly #onCompactCollapseChange: ((collapsed: boolean) => void) | undefined;
   readonly #summary: TodoSummary;
   readonly #theme: AdamTuiTheme;
   #cursor: string | null = null;
+  #compactCollapsed: boolean;
   #detail: TodoEntityResource | null = null;
   #generation = 0;
   #list: SearchableSelectList;
@@ -28,10 +30,12 @@ export class TodoNavigator implements Component {
 
   constructor(options: {
     readonly initialPage: TodoPageResource;
+    readonly compactCollapsed?: boolean;
     readonly onChange: () => void;
     readonly onClose: () => void;
     readonly onGet: (id: string) => Promise<TodoEntityResource>;
     readonly onList: (cursor: string | null) => Promise<TodoPageResource>;
+    readonly onCompactCollapseChange?: (collapsed: boolean) => void;
     readonly summary: TodoSummary;
     readonly theme: AdamTuiTheme;
   }) {
@@ -39,9 +43,11 @@ export class TodoNavigator implements Component {
     this.#onClose = options.onClose;
     this.#onGet = options.onGet;
     this.#onList = options.onList;
+    this.#onCompactCollapseChange = options.onCompactCollapseChange;
     this.#page = options.initialPage;
     this.#summary = options.summary;
     this.#theme = options.theme;
+    this.#compactCollapsed = options.compactCollapsed ?? false;
     this.#list = this.#createList(options.initialPage);
   }
 
@@ -54,6 +60,12 @@ export class TodoNavigator implements Component {
       return;
     }
     if (this.#detail !== null) {
+      return;
+    }
+    if (data === "c" && this.#onCompactCollapseChange !== undefined) {
+      this.#compactCollapsed = !this.#compactCollapsed;
+      this.#onCompactCollapseChange(this.#compactCollapsed);
+      this.#onChange();
       return;
     }
     if (this.#page.nextCursor !== null && getKeybindings().matches(data, "tui.select.pageDown")) {
@@ -107,7 +119,7 @@ export class TodoNavigator implements Component {
       ...(this.#notice === null ? [] : ["", this.#theme.muted(this.#notice)]),
       "",
       this.#theme.muted(
-        "type search · Enter detail · PageUp/PageDown page · Esc close · Ctrl+Q exit",
+        `type to filter current page · Enter detail · PageUp/PageDown page · c ${this.#compactCollapsed ? "expand" : "collapse"} compact overlay · Esc close · Ctrl+Q exit`,
       ),
     ];
   }

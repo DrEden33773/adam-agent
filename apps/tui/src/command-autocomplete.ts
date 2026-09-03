@@ -99,26 +99,34 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
       !beforeCursor.includes("\t")
     ) {
       const query = beforeCursor.slice(1);
-      const availableCommands = this.#registry.entries().filter((command) =>
-        this.#registry.isAvailable(command, {
-          attachmentsAvailable: this.#getAttachmentsAvailable(),
-          runActive: this.#getRunActive(),
-        }),
-      );
-      const prefixMatches = availableCommands.filter(
-        (command) =>
-          command.name.startsWith(query) ||
-          command.aliases.some((alias) => alias.startsWith(query)),
-      );
-      const commands =
-        prefixMatches.length > 0
-          ? prefixMatches
-          : this.#registry.suggest(query).filter((command) => availableCommands.includes(command));
-      const items = commands.map<AutocompleteItem>((command) => ({
-        value: `/${command.name}`,
-        label: this.#keyword(`/${command.name}`),
-        description: `${command.usage} · ${command.summary}`,
-      }));
+      const availability = {
+        attachmentsAvailable: this.#getAttachmentsAvailable(),
+        runActive: this.#getRunActive(),
+      };
+      const prefixMatches = this.#registry
+        .entries()
+        .filter(
+          (command) =>
+            command.name.startsWith(query) ||
+            command.aliases.some((alias) => alias.startsWith(query)),
+        );
+      const commands = prefixMatches.length > 0 ? prefixMatches : this.#registry.suggest(query);
+      const items = commands
+        .map((command, index) => ({
+          command,
+          index,
+          reason: this.#registry.availabilityReason(command, availability),
+        }))
+        .sort(
+          (left, right) =>
+            Number(left.reason !== null) - Number(right.reason !== null) ||
+            left.index - right.index,
+        )
+        .map<AutocompleteItem>(({ command, reason }) => ({
+          value: `/${command.name}`,
+          label: this.#keyword(`/${command.name}`),
+          description: `${command.usage}${reason === null ? "" : ` · unavailable · ${reason}`} · ${command.summary}`,
+        }));
       return Promise.resolve(items.length === 0 ? null : { items, prefix: beforeCursor });
     }
     const helpPrefix =
