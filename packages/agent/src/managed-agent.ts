@@ -16,6 +16,7 @@ import {
   researchManagedAgentProfileV1,
   researchManagedAgentProfileV2,
   reviewerManagedAgentProfileV1,
+  reviewerManagedAgentProfileV2,
   scoutManagedAgentProfileV1,
   scoutManagedAgentProfileV2,
 } from "./managed-agent-profiles.js";
@@ -81,15 +82,27 @@ function managedAgentProfile(profile: ManagedAgentProfileId) {
           : scoutManagedAgentProfileV1;
 }
 
+function isCurrentManagedAgentAdmission(
+  admission: Extract<ManagedAgentRecord, { readonly type: "managed_agent_admitted" }>,
+): boolean {
+  return (
+    isCurrentManagedAgentProfile(admission.profile) ||
+    (admission.profile === "reviewer.v1" &&
+      admission.profileDigest === reviewerManagedAgentProfileV2.digest)
+  );
+}
+
 function managedAdmissionLimitsAreValid(
   admission: Extract<ManagedAgentRecord, { readonly type: "managed_agent_admitted" }>,
   contextWindowTokens?: number,
 ): boolean {
-  if (isCurrentManagedAgentProfile(admission.profile)) {
+  if (isCurrentManagedAgentAdmission(admission)) {
     const profile =
       admission.profile === "research.v2"
         ? researchManagedAgentProfileV2
-        : scoutManagedAgentProfileV2;
+        : admission.profile === "scout.v2"
+          ? scoutManagedAgentProfileV2
+          : reviewerManagedAgentProfileV2;
     return (
       admission.limits.maximumTurns === undefined &&
       admission.limits.maximumDeadlineMilliseconds === undefined &&
@@ -1970,7 +1983,7 @@ export function validateManagedAgentRecord(
     );
     if (
       admission === undefined ||
-      !isCurrentManagedAgentProfile(admission.profile) ||
+      !isCurrentManagedAgentAdmission(admission) ||
       admission.agentId !== candidate.agentId ||
       admission.childSessionId !== candidate.childSessionId ||
       (candidate.type === "managed_agent_stalled" &&
@@ -2657,16 +2670,27 @@ export type AgentManager = {
       readonly digest: `sha256:${string}`;
     }[];
   }): Promise<ToolResult>;
-  runReviewer(input: {
-    readonly callId: string;
-    readonly managedRole: string;
-    readonly maximumDeadlineMilliseconds: number;
-    readonly maximumTokens: number;
-    readonly maximumTurns: number;
-    readonly parentSessionId: string;
-    readonly signal: AbortSignal;
-    readonly task: string;
-  }): Promise<ToolResult>;
+  runReviewer(
+    input: {
+      readonly callId: string;
+      readonly managedRole: string;
+      readonly maximumTokens: number;
+      readonly parentSessionId: string;
+      readonly signal: AbortSignal;
+      readonly task: string;
+    } & (
+      | {
+          readonly maximumDeadlineMilliseconds: number;
+          readonly maximumTurns: number;
+          readonly policyVersion?: 1;
+        }
+      | {
+          readonly maximumDeadlineMilliseconds?: never;
+          readonly maximumTurns?: never;
+          readonly policyVersion: 2;
+        }
+    ),
+  ): Promise<ToolResult>;
   list(input?: {
     readonly status?: "active" | "terminal" | ManagedAgentSummary["status"];
     readonly limit?: number;
@@ -2861,6 +2885,7 @@ export function createAgentManager(options: {
     readonly revision?: number;
     readonly maximumTokens?: number;
     readonly maximumDeadlineMilliseconds?: number;
+    readonly reviewerPolicyVersion?: 2;
     readonly deadlineAtUnixMilliseconds?: number;
     readonly admittedAtUnixMilliseconds?: number;
     readonly resume?: Extract<
@@ -3460,8 +3485,13 @@ export function createAgentManager(options: {
     const childSessionId = randomUUID();
     coordinationStates.set(attemptId, createCoordinationState());
     const taskDigest = digest(input.task);
-    const managedProfile = managedAgentProfile(profile);
-    const currentProfile = isCurrentManagedAgentProfile(profile);
+    const currentProfile =
+      isCurrentManagedAgentProfile(profile) ||
+      (profile === "reviewer.v1" && input.reviewerPolicyVersion === 2);
+    const managedProfile =
+      profile === "reviewer.v1" && input.reviewerPolicyVersion === 2
+        ? reviewerManagedAgentProfileV2
+        : managedAgentProfile(profile);
     const legacyProfile = currentProfile
       ? undefined
       : profile === "research.v1"
@@ -3536,7 +3566,9 @@ export function createAgentManager(options: {
     const maximumInactivityMilliseconds = currentProfile
       ? profile === "research.v2"
         ? researchManagedAgentProfileV2.limits.maximumInactivityMilliseconds
-        : scoutManagedAgentProfileV2.limits.maximumInactivityMilliseconds
+        : profile === "scout.v2"
+          ? scoutManagedAgentProfileV2.limits.maximumInactivityMilliseconds
+          : reviewerManagedAgentProfileV2.limits.maximumInactivityMilliseconds
       : undefined;
     const admittedAtUnixMilliseconds =
       input.admittedAtUnixMilliseconds ?? (options.now ?? Date.now)();
@@ -3555,6 +3587,7 @@ export function createAgentManager(options: {
     let inactivityGeneration = 0;
     let inactivitySettlement = Promise.resolve();
     let inactivityFailure: unknown;
+    let reviewerStalled = false;
     let lastAssistantDelta: string | undefined;
     const lastReasoningDeltas = new Map<string, string>();
     let admissionCommitted = false;
@@ -3664,6 +3697,10 @@ export function createAgentManager(options: {
       }
       if (generation === inactivityGeneration) {
         coordinationStates.get(attemptId)?.notifyAttention();
+      }
+      if (profile === "reviewer.v1" && input.reviewerPolicyVersion === 2) {
+        reviewerStalled = true;
+        childController.abort(new Error("The managed review stalled without causal progress."));
       }
     };
     const enqueueInactivity = (operation: () => Promise<void>): Promise<void> => {
@@ -4152,6 +4189,26 @@ export function createAgentManager(options: {
       }
       if (result.status === "cancelled") {
         terminalCommitStarted = true;
+        if (reviewerStalled) {
+          await appendManagedRecord({
+            type: "managed_agent_terminal",
+            agentId,
+            attemptId,
+            childSessionId,
+            status: "failed",
+            error: {
+              code: "managed_session_stalled",
+              message: "The managed review stalled without causal progress.",
+            },
+            transcriptDigest,
+            throughSequence,
+          });
+          terminalCommitted = true;
+          return toolFailure(
+            "managed_agent_stalled",
+            "The managed review stalled without causal progress.",
+          );
+        }
         await appendManagedRecord({
           type: "managed_agent_terminal",
           agentId,
@@ -4599,15 +4656,33 @@ export function createAgentManager(options: {
     }
   };
   const runReviewer: AgentManager["runReviewer"] = async (input) => {
+    if (input.policyVersion === 2) {
+      if (
+        !Number.isSafeInteger(input.maximumTokens) ||
+        input.maximumTokens <= 0 ||
+        input.maximumTokens > options.childContextProfile.contextWindowTokens
+      ) {
+        return toolFailure("invalid_tool_input", "The managed reviewer limits are invalid.");
+      }
+      return runAttempt({
+        ...input,
+        mode: "foreground",
+        profile: "reviewer.v1",
+        reviewerPolicyVersion: 2,
+      });
+    }
+    const maximumTurns = input.maximumTurns;
     if (
-      !Number.isSafeInteger(input.maximumTurns) ||
-      input.maximumTurns <= 0 ||
-      input.maximumTurns > reviewerManagedAgentProfileV1.limits.maximumTurnsPerAttempt
+      maximumTurns === undefined ||
+      !Number.isSafeInteger(maximumTurns) ||
+      maximumTurns <= 0 ||
+      maximumTurns > reviewerManagedAgentProfileV1.limits.maximumTurnsPerAttempt
     ) {
       return toolFailure("invalid_tool_input", "The managed reviewer limits are invalid.");
     }
     return runAttempt({
       ...input,
+      maximumTurns,
       mode: "foreground",
       profile: "reviewer.v1",
     });
@@ -5935,6 +6010,7 @@ function toolFailure(
     | "managed_agent_deadline_exceeded"
     | "managed_agent_failed"
     | "managed_agent_result_too_large"
+    | "managed_agent_stalled"
     | "managed_agent_unavailable",
   message: string,
 ): Extract<ToolResult, { readonly status: "failed" }> {

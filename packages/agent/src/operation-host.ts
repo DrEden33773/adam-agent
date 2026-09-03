@@ -7,8 +7,12 @@ import type {
   ExtensionBiomeAnalysis,
   ExtensionBiomeFileSnapshot,
   ExtensionJsonValue,
+  ExtensionManagedSessionCapability,
   ExtensionManagedSessionRequest,
   ExtensionManagedSessionTerminal,
+  ExtensionManagedSessionV2Capability,
+  ExtensionManagedSessionV2Request,
+  ExtensionManagedSessionV2Terminal,
   ExtensionOperationBudgetSnapshot,
   ExtensionOperationCapabilities,
   ExtensionOperationContext,
@@ -35,6 +39,7 @@ import {
   EXTENSION_BIOME_MAX_STDOUT_BYTES,
   EXTENSION_BIOME_PROFILE,
   EXTENSION_MANAGED_SESSION_CAPABILITY_ID,
+  EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID,
   EXTENSION_OPERATION_DEADLINE_DEFAULT_MS,
   EXTENSION_OPERATION_DEADLINE_MAX_MS,
   EXTENSION_OPERATION_INPUT_MAX_BYTES,
@@ -54,7 +59,11 @@ import type { ArtifactStore } from "./artifact-store.js";
 import type { BiomeExecutionAdapter, BiomeExecutionOutput } from "./biome-execution.js";
 import type { ContextProfile } from "./context-profile.js";
 import { type ExtensionRecordStore, ExtensionRecordStoreError } from "./extension-record-store.js";
-import { createAgentManager, type ManagedAgentStore } from "./managed-agent.js";
+import {
+  createAgentManager,
+  type ManagedAgentInactivityScheduler,
+  type ManagedAgentStore,
+} from "./managed-agent.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import {
   createInMemoryOperationStore,
@@ -93,6 +102,7 @@ export type ManagedSessionRuntime = {
   readonly childModel?: ModelDriver;
   readonly childSessionStores: SessionStoreDirectory<SessionRecord>;
   readonly managedStore: ManagedAgentStore;
+  readonly inactivityScheduler?: ManagedAgentInactivityScheduler;
   readonly parentPermissions: PermissionPolicy;
   resolveOrigin(input: {
     readonly origin: OperationOrigin;
@@ -105,6 +115,18 @@ export type ManagedSessionRuntime = {
     readonly childModel?: ModelDriver;
   }>;
   readonly workspaceRoot: string;
+};
+
+export type OperationDeadlineScheduler = {
+  schedule(delayMilliseconds: number, onDeadline: () => void): { cancel(): void };
+};
+
+const nodeOperationDeadlineScheduler: OperationDeadlineScheduler = {
+  schedule(delayMilliseconds, onDeadline) {
+    const timer = setTimeout(onDeadline, delayMilliseconds);
+    timer.unref();
+    return { cancel: () => clearTimeout(timer) };
+  },
 };
 
 export type OperationStartOptions = {
@@ -241,14 +263,20 @@ export class OperationHostError extends Error {
 }
 
 type ActiveOperation = {
+  readonly activeOperations: Map<string, ActiveOperation>;
   readonly abortController: AbortController;
   managedSessionRun?: {
     readonly digest: string;
-    readonly terminal: Promise<ExtensionManagedSessionTerminal>;
+    readonly terminal: Promise<ExtensionManagedSessionTerminal | ExtensionManagedSessionV2Terminal>;
   };
   artifactBytes: number;
   readonly artifacts: ExtensionArtifactSummary[];
-  readonly deadlineAt: string;
+  deadlineAt: string;
+  deadlineRemainingMilliseconds: number;
+  deadlineStartedAtUnixMilliseconds: number;
+  deadlineTimer: { cancel(): void } | undefined;
+  readonly deadlineScheduler: OperationDeadlineScheduler;
+  deadlinePausedForManagedSessionV2: boolean;
   artifactCount: number;
   capabilityCalls: number;
   readonly operationId: string;
@@ -266,6 +294,7 @@ type ActiveOperation = {
   readonly handlerSettled: Promise<void>;
   readonly inputBytes: number;
   nextSequence: number;
+  readonly now: () => number;
   progressBytes: number;
   progressRecords: number;
   recordBytes: number;
@@ -304,6 +333,8 @@ export function createOperationHost(options: {
   readonly projectRoot: string;
   readonly permissions?: PermissionPolicy;
   readonly managedSession?: ManagedSessionRuntime;
+  readonly deadlineScheduler?: OperationDeadlineScheduler;
+  readonly now?: () => number;
   readonly recordStore?: ExtensionRecordStore;
   readonly resolveOperation: (contributionId: string) => RegisteredOperation | undefined;
   readonly store?: OperationStore;
@@ -444,7 +475,7 @@ export function createOperationHost(options: {
         if (normalizedInput === undefined || !inputDecoded) {
           throw new OperationHostError("operation_input_invalid");
         }
-        const now = Date.now();
+        const now = (options.now ?? Date.now)();
         const recordedAt = new Date(now).toISOString();
         const deadlineAt = new Date(now + deadlineMs).toISOString();
         const startedEvent: OperationStartedEvent = {
@@ -508,6 +539,7 @@ export function createOperationHost(options: {
           signalOwnerSettled = resolve;
         });
         const active: ActiveOperation = {
+          activeOperations,
           abortController: new AbortController(),
           artifactBytes: 0,
           artifacts: [],
@@ -515,10 +547,16 @@ export function createOperationHost(options: {
           capabilityCalls: 0,
           appendQueue: Promise.resolve(),
           deadlineAt,
+          deadlineRemainingMilliseconds: deadlineMs,
+          deadlineStartedAtUnixMilliseconds: now,
+          deadlineScheduler: options.deadlineScheduler ?? nodeOperationDeadlineScheduler,
+          deadlinePausedForManagedSessionV2: false,
+          deadlineTimer: undefined,
           handlerDidSettle: false,
           handlerSettled,
           inputBytes: normalizedInput.byteLength,
           nextSequence: 2,
+          now: options.now ?? Date.now,
           operationId,
           ...(origin === undefined ? {} : { origin }),
           ownerDidSettle: false,
@@ -895,7 +933,27 @@ function createOperationCapabilities(
     active.registered.capabilityIds.includes(EXTENSION_MANAGED_SESSION_CAPABILITY_ID) &&
     active.registered.registration.managedOutput !== undefined &&
     managedSession !== undefined
-      ? createManagedSessionCapability(active, managedSession, artifactStore, recordStore)
+      ? createManagedSessionCapability(
+          active,
+          managedSession,
+          artifactStore,
+          recordStore,
+          appendAndPublish,
+          1,
+        )
+      : undefined;
+  const managedSessionV2Capability =
+    active.registered.capabilityIds.includes(EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID) &&
+    active.registered.registration.managedOutput !== undefined &&
+    managedSession !== undefined
+      ? createManagedSessionCapability(
+          active,
+          managedSession,
+          artifactStore,
+          recordStore,
+          appendAndPublish,
+          2,
+        )
       : undefined;
   return Object.freeze({
     ...(biomeCapability === undefined ? {} : { [EXTENSION_BIOME_CAPABILITY_ID]: biomeCapability }),
@@ -908,6 +966,9 @@ function createOperationCapabilities(
     ...(managedSessionCapability === undefined
       ? {}
       : { [EXTENSION_MANAGED_SESSION_CAPABILITY_ID]: managedSessionCapability }),
+    ...(managedSessionV2Capability === undefined
+      ? {}
+      : { [EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID]: managedSessionV2Capability }),
   });
 }
 
@@ -916,9 +977,29 @@ function createManagedSessionCapability(
   runtime: NonNullable<Parameters<typeof createOperationHost>[0]["managedSession"]>,
   artifactStore: ArtifactStore | undefined,
   recordStore: ExtensionRecordStore | undefined,
-) {
+  appendAndPublish: (record: OperationEventRecord) => Promise<void>,
+  policyVersion: 1,
+): ExtensionManagedSessionCapability;
+function createManagedSessionCapability(
+  active: ActiveOperation,
+  runtime: NonNullable<Parameters<typeof createOperationHost>[0]["managedSession"]>,
+  artifactStore: ArtifactStore | undefined,
+  recordStore: ExtensionRecordStore | undefined,
+  appendAndPublish: (record: OperationEventRecord) => Promise<void>,
+  policyVersion: 2,
+): ExtensionManagedSessionV2Capability;
+function createManagedSessionCapability(
+  active: ActiveOperation,
+  runtime: NonNullable<Parameters<typeof createOperationHost>[0]["managedSession"]>,
+  artifactStore: ArtifactStore | undefined,
+  recordStore: ExtensionRecordStore | undefined,
+  appendAndPublish: (record: OperationEventRecord) => Promise<void>,
+  policyVersion: 1 | 2,
+): ExtensionManagedSessionCapability | ExtensionManagedSessionV2Capability {
   return Object.freeze({
-    async run(input: ExtensionManagedSessionRequest): Promise<ExtensionManagedSessionTerminal> {
+    async run(
+      input: ExtensionManagedSessionRequest | ExtensionManagedSessionV2Request,
+    ): Promise<ExtensionManagedSessionTerminal | ExtensionManagedSessionV2Terminal> {
       assertCapabilityActive(active);
       const origin = active.origin;
       const outputCodec = active.registered.registration.managedOutput;
@@ -926,7 +1007,15 @@ function createManagedSessionCapability(
         throw new TypeError("The managed session requires a linked ordinary operation.");
       }
       try {
-        validateManagedSessionRequest(input, outputCodec, active.deadlineAt);
+        if (policyVersion === 1) {
+          validateManagedSessionRequest(
+            input as ExtensionManagedSessionRequest,
+            outputCodec,
+            active.deadlineAt,
+          );
+        } else {
+          validateManagedSessionV2Request(input, outputCodec);
+        }
       } catch (error) {
         active.forcedFailure ??= {
           code: "operation_capability_input_invalid",
@@ -958,16 +1047,37 @@ function createManagedSessionCapability(
           projectId: active.projectId as `sha256:${string}`,
           signal: active.abortController.signal,
         });
-        const childModel = resolved.childModel ?? runtime.childModel;
-        const childContextProfile = resolved.childContextProfile ?? runtime.childContextProfile;
+        const childModel =
+          policyVersion === 2 ? resolved.childModel : (resolved.childModel ?? runtime.childModel);
+        const childContextProfile =
+          policyVersion === 2
+            ? resolved.childContextProfile
+            : (resolved.childContextProfile ?? runtime.childContextProfile);
         if (childModel === undefined || childContextProfile === undefined) {
           throw new TypeError("The managed session target is unavailable.");
+        }
+        const requestedV2MaximumTokens =
+          policyVersion === 2
+            ? (input as ExtensionManagedSessionV2Request).limits?.maximumCumulativeTokens
+            : undefined;
+        if (
+          requestedV2MaximumTokens !== undefined &&
+          requestedV2MaximumTokens > childContextProfile.contextWindowTokens
+        ) {
+          active.forcedFailure ??= {
+            code: "operation_capability_input_invalid",
+            message: "The operation supplied invalid capability input.",
+          };
+          throw new TypeError("The managed session token limit exceeds the origin ceiling.");
         }
         const manager = createAgentManager({
           childContextProfile,
           childModel,
           childSessionStores: runtime.childSessionStores,
           managedStore: runtime.managedStore,
+          ...(runtime.inactivityScheduler === undefined
+            ? {}
+            : { inactivityScheduler: runtime.inactivityScheduler }),
           parentPermissions: runtime.parentPermissions,
           parentRoot: active.parentRoot,
           parentSessionId: origin.sessionId,
@@ -979,20 +1089,49 @@ function createManagedSessionCapability(
           workspaceRoot: runtime.workspaceRoot,
         });
         try {
-          const result = await manager.runReviewer({
-            callId: `${active.operationId}:managed-session`,
-            managedRole: input.managedRole,
-            maximumDeadlineMilliseconds: Math.min(
-              input.limits.deadlineMilliseconds,
-              Math.max(1, Date.parse(active.deadlineAt) - Date.now()),
-            ),
-            maximumTokens: input.limits.maximumCumulativeTokens,
-            maximumTurns: input.limits.maximumTurns,
-            parentSessionId: origin.sessionId,
-            signal: active.abortController.signal,
-            task: `${input.task}\n\nImmutable review evidence:\n${evidenceText}`,
-          });
+          if (policyVersion === 2) {
+            await pauseOperationDeadlineForManagedSessionV2(active, appendAndPublish);
+          }
+          let result: Awaited<ReturnType<typeof manager.runReviewer>>;
+          try {
+            result = await manager.runReviewer({
+              callId: `${active.operationId}:managed-session`,
+              managedRole: input.managedRole,
+              ...(policyVersion === 1
+                ? {
+                    maximumDeadlineMilliseconds: Math.min(
+                      (input as ExtensionManagedSessionRequest).limits.deadlineMilliseconds,
+                      Math.max(1, Date.parse(active.deadlineAt) - Date.now()),
+                    ),
+                    maximumTokens: (input as ExtensionManagedSessionRequest).limits
+                      .maximumCumulativeTokens,
+                    maximumTurns: (input as ExtensionManagedSessionRequest).limits.maximumTurns,
+                  }
+                : {
+                    maximumTokens:
+                      requestedV2MaximumTokens ?? childContextProfile.contextWindowTokens,
+                    policyVersion: 2 as const,
+                  }),
+              parentSessionId: origin.sessionId,
+              signal: active.abortController.signal,
+              task: `${input.task}\n\nImmutable review evidence:\n${evidenceText}`,
+            });
+          } finally {
+            if (policyVersion === 2) {
+              await resumeOperationDeadlineAfterManagedSessionV2(active, appendAndPublish);
+            }
+          }
           if (result.status !== "completed") {
+            if (policyVersion === 2 && result.error.code === "managed_agent_stalled") {
+              assertCapabilityActive(active);
+              return Object.freeze({
+                error: {
+                  code: "managed_session_stalled" as const,
+                  message: "The managed review stalled without causal progress." as const,
+                },
+                status: "failed" as const,
+              });
+            }
             throw new Error(result.error.message);
           }
           const terminal = result.output as {
@@ -1073,7 +1212,7 @@ function createManagedSessionCapability(
       active.managedSessionRun = { digest: inputDigest, terminal };
       return terminal;
     },
-  });
+  }) as ExtensionManagedSessionCapability | ExtensionManagedSessionV2Capability;
 }
 
 function rejectManagedSessionOutput(
@@ -1203,6 +1342,63 @@ function validateManagedSessionRequest(
       "maximumCumulativeTokens",
       "maximumTurns",
     ]) ||
+    managedSessionEnvelopeIsInvalid(input, outputCodec) ||
+    !Number.isSafeInteger(input.limits.maximumTurns) ||
+    input.limits.maximumTurns <= 0 ||
+    input.limits.maximumTurns > 8 ||
+    !Number.isSafeInteger(input.limits.maximumCumulativeTokens) ||
+    input.limits.maximumCumulativeTokens <= 0 ||
+    input.limits.maximumCumulativeTokens > 128_000 ||
+    !Number.isSafeInteger(input.limits.deadlineMilliseconds) ||
+    input.limits.deadlineMilliseconds <= 0 ||
+    input.limits.deadlineMilliseconds > 300_000 ||
+    input.limits.deadlineMilliseconds > Date.parse(operationDeadlineAt) - Date.now()
+  ) {
+    throw new TypeError("The managed session request is invalid.");
+  }
+}
+
+function validateManagedSessionV2Request(
+  input: ExtensionManagedSessionRequest | ExtensionManagedSessionV2Request,
+  outputCodec: ExtensionOperationRegistration["managedOutput"],
+): asserts input is ExtensionManagedSessionV2Request {
+  if (
+    typeof input !== "object" ||
+    input === null ||
+    (!hasExactKeys(input, [
+      "evidence",
+      "managedRole",
+      "output",
+      "profile",
+      "selectedSkills",
+      "task",
+    ]) &&
+      !hasExactKeys(input, [
+        "evidence",
+        "limits",
+        "managedRole",
+        "output",
+        "profile",
+        "selectedSkills",
+        "task",
+      ])) ||
+    ("limits" in input &&
+      (!hasExactKeys(input.limits, ["maximumCumulativeTokens"]) ||
+        !Number.isSafeInteger(input.limits.maximumCumulativeTokens) ||
+        input.limits.maximumCumulativeTokens <= 0)) ||
+    managedSessionEnvelopeIsInvalid(input, outputCodec)
+  ) {
+    throw new TypeError("The managed session request is invalid.");
+  }
+}
+
+function managedSessionEnvelopeIsInvalid(
+  input: ExtensionManagedSessionRequest | ExtensionManagedSessionV2Request,
+  outputCodec: ExtensionOperationRegistration["managedOutput"],
+): boolean {
+  return (
+    typeof input !== "object" ||
+    input === null ||
     !hasExactKeys(input.output, ["id", "version"]) ||
     !hasExactKeys(input.profile, ["id", "version"]) ||
     !Array.isArray(input.evidence) ||
@@ -1220,22 +1416,10 @@ function validateManagedSessionRequest(
     input.task.length === 0 ||
     !isStrictUnicode(input.task) ||
     Buffer.byteLength(input.task, "utf8") > 16 * 1024 ||
-    !Number.isSafeInteger(input.limits.maximumTurns) ||
-    input.limits.maximumTurns <= 0 ||
-    input.limits.maximumTurns > 8 ||
-    !Number.isSafeInteger(input.limits.maximumCumulativeTokens) ||
-    input.limits.maximumCumulativeTokens <= 0 ||
-    input.limits.maximumCumulativeTokens > 128_000 ||
-    !Number.isSafeInteger(input.limits.deadlineMilliseconds) ||
-    input.limits.deadlineMilliseconds <= 0 ||
-    input.limits.deadlineMilliseconds > 300_000 ||
-    input.limits.deadlineMilliseconds > Date.parse(operationDeadlineAt) - Date.now() ||
     outputCodec === undefined ||
     input.output.id !== outputCodec.id ||
     input.output.version !== outputCodec.version
-  ) {
-    throw new TypeError("The managed session request is invalid.");
-  }
+  );
 }
 
 function isStrictUnicode(value: string): boolean {
@@ -2046,6 +2230,124 @@ function provenanceMatchesOperation(
   );
 }
 
+function scheduleOperationDeadline(
+  active: ActiveOperation,
+  appendAndPublish: (record: OperationEventRecord) => Promise<void>,
+  activeOperations: Map<string, ActiveOperation>,
+): void {
+  const now = active.now();
+  active.deadlineRemainingMilliseconds = Math.max(0, Date.parse(active.deadlineAt) - now);
+  active.deadlineStartedAtUnixMilliseconds = now;
+  active.deadlineTimer = active.deadlineScheduler.schedule(
+    active.deadlineRemainingMilliseconds,
+    () => {
+      active.deadlineTimer = undefined;
+      active.deadlineRemainingMilliseconds = 0;
+      active.abortController.abort(new Error("The operation deadline elapsed."));
+      void settleFailed(
+        active,
+        {
+          code: "operation_deadline_exceeded",
+          message: "The operation exceeded its deadline.",
+        },
+        appendAndPublish,
+        activeOperations,
+      ).catch(() => undefined);
+    },
+  );
+}
+
+async function appendManagedWaitEvent(
+  active: ActiveOperation,
+  event:
+    | {
+        readonly type: "operation_managed_wait_started";
+        readonly remainingDeadlineMilliseconds: number;
+      }
+    | {
+        readonly type: "operation_managed_wait_settled";
+        readonly deadlineAt: string;
+        readonly remainingDeadlineMilliseconds: number;
+      },
+  recordedAt: string,
+  appendAndPublish: (record: OperationEventRecord) => Promise<void>,
+): Promise<void> {
+  const append = active.appendQueue.then(async () => {
+    await appendAndPublish({
+      schemaVersion: 2,
+      operationId: active.operationId,
+      sequence: active.nextSequence,
+      recordedAt,
+      event,
+    });
+    active.nextSequence += 1;
+  });
+  active.appendQueue = append.catch(() => undefined);
+  try {
+    await append;
+  } catch (error) {
+    active.forcedFailure ??= {
+      code: "operation_capability_persistence_failed",
+      message: "The managed-session wait state could not be persisted.",
+    };
+    throw error;
+  }
+}
+
+async function pauseOperationDeadlineForManagedSessionV2(
+  active: ActiveOperation,
+  appendAndPublish: (record: OperationEventRecord) => Promise<void>,
+): Promise<void> {
+  if (active.deadlinePausedForManagedSessionV2 || active.deadlineTimer === undefined) {
+    throw new TypeError("The operation deadline cannot enter another managed wait.");
+  }
+  const now = active.now();
+  const elapsed = Math.max(0, now - active.deadlineStartedAtUnixMilliseconds);
+  const remaining = active.deadlineRemainingMilliseconds - elapsed;
+  if (!Number.isSafeInteger(remaining) || remaining <= 0) {
+    throw new TypeError("The operation has no ordinary deadline remaining.");
+  }
+  active.deadlineTimer.cancel();
+  active.deadlineTimer = undefined;
+  active.deadlineRemainingMilliseconds = remaining;
+  active.deadlinePausedForManagedSessionV2 = true;
+  await appendManagedWaitEvent(
+    active,
+    { type: "operation_managed_wait_started", remainingDeadlineMilliseconds: remaining },
+    new Date(now).toISOString(),
+    appendAndPublish,
+  );
+}
+
+async function resumeOperationDeadlineAfterManagedSessionV2(
+  active: ActiveOperation,
+  appendAndPublish: (record: OperationEventRecord) => Promise<void>,
+): Promise<void> {
+  if (!active.deadlinePausedForManagedSessionV2) {
+    return;
+  }
+  const now = active.now();
+  active.deadlineAt = new Date(now + active.deadlineRemainingMilliseconds).toISOString();
+  await appendManagedWaitEvent(
+    active,
+    {
+      type: "operation_managed_wait_settled",
+      deadlineAt: active.deadlineAt,
+      remainingDeadlineMilliseconds: active.deadlineRemainingMilliseconds,
+    },
+    new Date(now).toISOString(),
+    appendAndPublish,
+  );
+  active.deadlinePausedForManagedSessionV2 = false;
+  if (
+    active.cancelReason === undefined &&
+    !active.abortController.signal.aborted &&
+    !active.settling
+  ) {
+    scheduleOperationDeadline(active, appendAndPublish, active.activeOperations);
+  }
+}
+
 async function executeOperation(
   active: ActiveOperation,
   input: unknown,
@@ -2057,20 +2359,7 @@ async function executeOperation(
   recordStore: ExtensionRecordStore | undefined,
   managedSession: Parameters<typeof createOperationHost>[0]["managedSession"],
 ): Promise<void> {
-  const deadlineDelay = Math.max(0, Date.parse(active.deadlineAt) - Date.now());
-  const deadline = setTimeout(() => {
-    active.abortController.abort(new Error("The operation deadline elapsed."));
-    void settleFailed(
-      active,
-      {
-        code: "operation_deadline_exceeded",
-        message: "The operation exceeded its deadline.",
-      },
-      appendAndPublish,
-      activeOperations,
-    ).catch(() => undefined);
-  }, deadlineDelay);
-  deadline.unref();
+  scheduleOperationDeadline(active, appendAndPublish, activeOperations);
   const context: ExtensionOperationContext = Object.freeze({
     budget: Object.freeze({
       inputBytes: active.inputBytes,
@@ -2087,7 +2376,9 @@ async function executeOperation(
       appendAndPublish,
       managedSession,
     ),
-    deadlineAt: active.deadlineAt,
+    get deadlineAt() {
+      return active.deadlineAt;
+    },
     diagnostics: Object.freeze(
       active.registered.diagnostics.map((diagnostic) => Object.freeze({ ...diagnostic })),
     ),
@@ -2215,7 +2506,7 @@ async function executeOperation(
       activeOperations,
     );
   } finally {
-    clearTimeout(deadline);
+    active.deadlineTimer?.cancel();
     active.handlerDidSettle = true;
     active.signalHandlerSettled();
     releaseActiveOperation(active, activeOperations);
@@ -2522,10 +2813,16 @@ function createSnapshot(
   if (first?.event.type !== "operation_started") {
     throw new OperationHostError("operation_persistence_failed");
   }
+  const managedWaitSettlement = records.findLast(
+    (record) => record.event.type === "operation_managed_wait_settled",
+  )?.event;
   const base: OperationSnapshotBase = {
     budget: createBudgetSnapshot(records),
     contributionId: first.event.contributionId,
-    deadlineAt: first.event.deadlineAt,
+    deadlineAt:
+      managedWaitSettlement?.type === "operation_managed_wait_settled"
+        ? managedWaitSettlement.deadlineAt
+        : first.event.deadlineAt,
     extensionId: first.event.extensionId,
     extensionVersion: first.event.extensionVersion,
     operationId: first.operationId,

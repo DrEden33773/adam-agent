@@ -1,8 +1,9 @@
 import { valid, validRange } from "semver";
 import { z } from "zod";
 
-export const EXTENSION_API_VERSION = "0.4.0";
+export const EXTENSION_API_VERSION = "0.5.0";
 export const EXTENSION_MANAGED_SESSION_CAPABILITY_ID = "adam.managed-session@1";
+export const EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID = "adam.managed-session@2";
 export const EXTENSION_BIOME_CAPABILITY_ID = "adam.analyzer-execution.biome@1";
 export const EXTENSION_BIOME_MAX_FILES = 100;
 export const EXTENSION_BIOME_MAX_FILE_BYTES = 1024 * 1024;
@@ -458,6 +459,10 @@ export interface ExtensionManagedSessionCapability {
   run(input: ExtensionManagedSessionRequest): Promise<ExtensionManagedSessionTerminal>;
 }
 
+export interface ExtensionManagedSessionV2Capability {
+  run(input: ExtensionManagedSessionV2Request): Promise<ExtensionManagedSessionV2Terminal>;
+}
+
 export type ExtensionManagedSessionRequest = {
   readonly evidence: readonly ExtensionOperationEvidenceReference[];
   readonly limits: {
@@ -506,11 +511,34 @@ export type ExtensionManagedSessionTerminal = {
   };
 };
 
+export type ExtensionManagedSessionV2Request = {
+  readonly evidence: readonly ExtensionOperationEvidenceReference[];
+  readonly limits?: {
+    readonly maximumCumulativeTokens: number;
+  };
+  readonly managedRole: string;
+  readonly output: ExtensionContractReference;
+  readonly profile: { readonly id: "reviewer.v1"; readonly version: 1 };
+  readonly selectedSkills: readonly [];
+  readonly task: string;
+};
+
+export type ExtensionManagedSessionV2Terminal =
+  | ExtensionManagedSessionTerminal
+  | {
+      readonly error: {
+        readonly code: "managed_session_stalled";
+        readonly message: "The managed review stalled without causal progress.";
+      };
+      readonly status: "failed";
+    };
+
 export type ExtensionOperationCapabilities = {
   readonly [EXTENSION_BIOME_CAPABILITY_ID]?: ExtensionBiomeCapability;
   readonly [EXTENSION_ARTIFACT_CAPABILITY_ID]?: ExtensionArtifactPublishCapability;
   readonly [EXTENSION_RECORDS_CAPABILITY_ID]?: ExtensionRecordCapability;
   readonly [EXTENSION_MANAGED_SESSION_CAPABILITY_ID]?: ExtensionManagedSessionCapability;
+  readonly [EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID]?: ExtensionManagedSessionV2Capability;
 };
 
 export type ExtensionOperationContext = {
@@ -653,6 +681,17 @@ export type ExtensionOperationInspectionRequiredEvent = {
   readonly message: string;
 };
 
+export type ExtensionOperationManagedWaitStartedEvent = {
+  readonly type: "operation_managed_wait_started";
+  readonly remainingDeadlineMilliseconds: number;
+};
+
+export type ExtensionOperationManagedWaitSettledEvent = {
+  readonly type: "operation_managed_wait_settled";
+  readonly deadlineAt: string;
+  readonly remainingDeadlineMilliseconds: number;
+};
+
 export type ExtensionOperationEvent =
   | ExtensionOperationArtifactPublishedEvent
   | ExtensionOperationCancelRequestedEvent
@@ -660,6 +699,8 @@ export type ExtensionOperationEvent =
   | ExtensionOperationCompletedEvent
   | ExtensionOperationFailedEvent
   | ExtensionOperationInspectionRequiredEvent
+  | ExtensionOperationManagedWaitSettledEvent
+  | ExtensionOperationManagedWaitStartedEvent
   | ExtensionOperationProgressEvent
   | ExtensionOperationReconciliationStartedEvent
   | ExtensionOperationStartedEvent;
