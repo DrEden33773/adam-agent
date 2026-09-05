@@ -4,6 +4,8 @@
 
 Build a lightweight, inspectable local coding agent. Make the core coding path reliable and pleasant before expanding automation, orchestration, or presentation features.
 
+The runtime, mechanism, security, and session rules below govern the Adam product being developed. The development agent uses its host's tools and permissions to carry out the user's authorized task.
+
 ## Engineering rules
 
 - Deliver working end-to-end slices and keep the CLI runnable after every merged slice.
@@ -15,7 +17,7 @@ Build a lightweight, inspectable local coding agent. Make the core coding path r
 - Fail closed on authorization and unknown effect classes. Keep model approval, user confirmation, permission policy, and OS sandbox enforcement as separate controls.
 - Do not claim production readiness, sandbox strength, or model improvement from deterministic fixtures or synthetic evaluation data.
 - Keep source provenance and third-party license notices at file or module level for reused or adapted code.
-- Every behavior change and bug fix must include proportionate tests at a pre-agreed caller-visible seam.
+- Verify behavior changes and bug fixes through observable interfaces using the [testing guide](docs/testing.md). Choose the test scope and development cadence to fit the risk; follow any task-specific acceptance contract without reconfirming settled decisions.
 - Linux is the only required platform until the first portfolio release is complete.
 
 ## Runtime ownership
@@ -65,20 +67,19 @@ Build a lightweight, inspectable local coding agent. Make the core coding path r
 
 ## Testing and toolchain
 
-- Before writing a behavior test, name the public interface and observable result under test. Work one failing behavior test and the minimum implementation to pass it at a time.
-- Do not pre-write a horizontal test suite, test private internals, or mock Adam-owned modules. Fake external providers, clocks, processes, filesystems, MCP servers, and Web sources only at their real seams.
-- Test through module interfaces and observable runtime events rather than private implementation state.
-- Synchronize concurrent and process tests on causal observables such as events, IPC, filesystem notifications, stream output, or child closure. Never use polling intervals, arbitrary sleeps, elapsed-time assertions, or wait-then-assert-absence as success criteria; timeouts are failure and cleanup guards only.
-- Test deadline and backoff policy with a fake clock. Use real time only when timer or OS-process integration is itself under test and no causal fake-clock seam exists; block fixtures on events or open streams instead of finite sleeps.
-- Keep semantic behavior suites below expensive OS adapters whenever the behavior does not require the adapter itself. Real JSONL/fsync, child-process, MCP stdio, and PTY tests must each prove a unique external contract; do not make them the default fixture for catalog projection, lifecycle policy, Presentation projection, or renderer state.
-- Require every test to pass independently under focused name selection. Correctness must not depend on suite order, a shared live `beforeAll` fixture, state leaked by another test, or batching several behavior cases behind one external process.
-- Treat test duration and aggregate runtime only as diagnostic telemetry. A duration threshold, timeout increase, worker-count cap, or changed-path CI skip cannot establish correctness or repay architectural test debt.
-- Use deterministic provider streams for tool ordering, rejection, cancellation, malformed output, compaction, and retry tests.
-- Add real-process tests for shell cancellation, MCP lifecycle, path confinement, and signal handling when the corresponding adapters exist.
-- Add PTY or real-terminal coverage for resize, bracketed paste, wide-character input, permission prompts, interrupt, and cleanup when the interactive terminal exists.
-- Keep live-provider, live-Web, and external MCP tests opt-in; ordinary CI must not require credentials or network access.
-- Run focused tests while iterating and the complete Linux check once before merge.
 - Use Node.js 24 LTS, ESM, strict TypeScript, and the exact pnpm 11 release declared by `packageManager`. Commit `pnpm-lock.yaml`; do not use npm, Yarn, or Bun lockfiles.
 - Use Biome for TypeScript and JavaScript formatting and linting, and markdownlint-cli2 for Markdown. Keep hooks check-only; use explicit `*:fix` commands for intentional rewrites. Treat `useLiteralKeys` as a required check: prefer dot access after narrowing known fields, but retain `noPropertyAccessFromIndexSignature` and use a narrowly explained suppression when an intentionally dynamic key cannot be typed safely.
-- Run `pnpm quality:check` before merge. Keep one Linux quality workflow until product behavior creates a demonstrated need for another job.
+- Keep Markdown paragraphs and individual list items on one physical source line; separate paragraphs with blank lines. `MD013` is disabled.
+- Run focused checks during iteration and `pnpm quality:check` on the final candidate before a product PR. Require the single Linux hosted `quality` job before merge. Repeat or broaden checks only for subsequent changes, failures, unresolved concerns, or an explicit acceptance gate.
 - Do not introduce Nx, Turborepo, or another task orchestrator while pnpm workspaces and TypeScript project references are sufficient.
+
+Run commands from the product root:
+
+| Purpose | Command |
+| --- | --- |
+| Install pinned dependencies | `pnpm install --frozen-lockfile` |
+| Launch TUI / CLI help | `pnpm tui` / `pnpm --silent adam --help` (see [setup and target selection](README.md)) |
+| Refresh generated package output | `pnpm build` |
+| Focused behavior tests | After building, `pnpm exec vitest run <test-file> -t '<test name>'` |
+| Markdown / code checks | `pnpm markdown:check` / `pnpm code:check` |
+| Complete Linux gate | `pnpm quality:check` |
