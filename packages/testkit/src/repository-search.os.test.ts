@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, open, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
@@ -8,9 +8,11 @@ import {
   AgentSession,
   createCodingToolRegistry,
   createInMemorySessionStore,
+  createJsonlSessionStore,
   createPermissionPolicy,
 } from "@adam-agent/agent";
 import {
+  createCodingToolRegistryForTesting,
   createRepositorySearchToolAdapterForTesting,
   repositorySearchBackendForTesting,
 } from "@adam-agent/agent/internal-testing";
@@ -511,6 +513,115 @@ test("repository search resolves the pinned absolute application-local Linux bac
     absolute: true,
     version: "ripgrep 15.0.0 (rev 3a612f88b8)",
   });
+});
+
+test("large-tree search cancellation closes ripgrep before durable AgentSession cancellation", async () => {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-large-tree-cancel-"));
+  const controller = new AbortController();
+  let records = 0;
+  let closed = false;
+  let providerCalls = 0;
+  try {
+    execFileSync("git", ["init", "--quiet"], { cwd: workspaceRoot });
+    await mkdir(join(workspaceRoot, "large"));
+    await Promise.all(
+      Array.from({ length: 1024 }, (_value, index) =>
+        writeFile(join(workspaceRoot, "large", `${index}.txt`), "bounded candidate\n"),
+      ),
+    );
+    const backend = repositorySearchBackendForTesting();
+    const store = await createJsonlSessionStore({
+      workspaceRoot,
+      stateRoot: join(workspaceRoot, ".state"),
+      sessionId: "123e4567-e89b-42d3-a456-426614174099",
+    });
+    const session = new AgentSession({
+      model: new FakeModelDriver(() => {
+        providerCalls += 1;
+        return [
+          { type: "tool_call_start", id: "large-search", name: "search_repository" },
+          {
+            type: "tool_call_delta",
+            id: "large-search",
+            json: '{"kind":"path","mode":"glob","query":"*"}',
+          },
+          { type: "tool_call_end", id: "large-search" },
+          { type: "finish", reason: "tool_calls" },
+        ];
+      }),
+      tools: createCodingToolRegistryForTesting({
+        workspaceRoot,
+        repositorySearchBackend: backend.create({
+          rgExecutablePath: backend.rgPath,
+          processObserver: {
+            spawned() {},
+            recorded() {
+              if (++records === 32) controller.abort();
+            },
+            closed() {
+              closed = true;
+            },
+          },
+        }),
+      }),
+      permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+      maximumOutputTokens: 4096,
+      store,
+    });
+    session.subscribe((event) => {
+      if (event.type === "session_settled") expect(closed).toBe(true);
+    });
+    await expect(
+      session.run({ text: "Search large tree" }, { signal: controller.signal }),
+    ).resolves.toMatchObject({ status: "cancelled" });
+    expect(closed).toBe(true);
+    expect(providerCalls).toBe(1);
+    const durable = await store.read();
+    expect(durable).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event: expect.objectContaining({ type: "tool_failed", name: "search_repository" }),
+        }),
+        expect.objectContaining({
+          event: expect.objectContaining({
+            type: "session_settled",
+            result: expect.objectContaining({ status: "cancelled" }),
+          }),
+        }),
+      ]),
+    );
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
+});
+
+test("repository search aborts candidate probing after the first opened file", async () => {
+  const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-search-probe-cancel-"));
+  const controller = new AbortController();
+  const cancellation = new Error("Cancel during candidate open");
+  let opened = 0;
+  try {
+    await writeFile(join(workspaceRoot, "a.txt"), "first\n");
+    await writeFile(join(workspaceRoot, "b.txt"), "second\n");
+    const adapter = createRepositorySearchToolAdapterForTesting({
+      workspaceRoot,
+      probeFileSystemForTesting: {
+        lstat,
+        async open(path, flags, mode) {
+          const handle = await open(path, flags, mode);
+          opened += 1;
+          controller.abort(cancellation);
+          return handle;
+        },
+      },
+    });
+    await expect(
+      executeSearch(adapter, { kind: "path", mode: "glob", query: "*" }, controller.signal),
+    ).rejects.toBe(cancellation);
+    expect(opened).toBe(1);
+  } finally {
+    await rm(workspaceRoot, { recursive: true, force: true });
+  }
 });
 
 test("repository search cancellation settles only after the owned ripgrep child closes", async () => {

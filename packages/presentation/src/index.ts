@@ -503,6 +503,11 @@ export type ContextUsageDisplay = {
 };
 
 export type ActiveSessionDisplay = {
+  readonly parentRun?: {
+    readonly phase: "ready" | "running" | "interrupted" | "recovering" | "cancelling";
+    readonly editor: "ready" | "blocked";
+  };
+  readonly recovery?: { readonly runId: string; readonly canResume: boolean };
   readonly session: SessionSummary;
   readonly transcript: TranscriptPage;
   readonly linkedOperations: readonly OperationDisplay[];
@@ -1502,6 +1507,11 @@ export type PresentationCommand =
   | {
       readonly type: "cancel_run";
       readonly sessionId: string | null;
+    }
+  | {
+      readonly type: "resume_interrupted_session" | "cancel_interrupted_session";
+      readonly sessionId: string;
+      readonly runId: string;
     }
   | {
       readonly type: "start_project_changes";

@@ -1033,6 +1033,103 @@ test("PresentationSession exposes authoritative read-only Todo summary, list, an
   }
 });
 
+test("PresentationSession never replaces settled Run truth with delayed draft admission", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-presentation-admission-order-"));
+  const workspaceRoot = join(root, "workspace");
+  const stateRoot = join(root, "state");
+  await mkdir(workspaceRoot);
+  const releaseModel = Promise.withResolvers<void>();
+  const terminalVisible = Promise.withResolvers<void>();
+  let ordinaryCalls = 0;
+  const driver: ModelDriver = {
+    async *stream(request) {
+      if (request.tools.length === 0) {
+        yield { type: "text_delta", text: "Admission ordering" };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      ordinaryCalls += 1;
+      if (ordinaryCalls === 1) await releaseModel.promise;
+      yield { type: "text_delta", text: "The parent completed." };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            contextProfile,
+            readiness: { status: "available", credentialSource: "test" },
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({ modelTargets, workspaceRoot, stateRoot });
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+  try {
+    presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      workspaceRoot,
+      stateRoot,
+      projectLabel: "workspace",
+      openProject: true,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(harness.sessions),
+      [presentationHydrationBarrier]: {
+        async afterHydrate() {},
+        async afterAdmissionSnapshot() {
+          releaseModel.resolve();
+          await terminalVisible.promise;
+        },
+      },
+    });
+    const view = presentation;
+    const unsubscribe = view.subscribe(() => {
+      const state = view.getState();
+      if (state.authoritative.active?.session.status === "settled" && state.transient === null)
+        terminalVisible.resolve();
+    });
+    await view.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+    await expect(
+      view.dispatch({
+        type: "submit_draft_prompt",
+        text: "Complete before admission projection",
+        skills: [],
+        thinkingSelection: null,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+    unsubscribe();
+    expect(view.getState().authoritative.active).toMatchObject({
+      session: { status: "settled" },
+      parentRun: { phase: "ready", editor: "ready" },
+    });
+    const sessionId = view.getState().authoritative.active?.session.id;
+    if (sessionId === undefined) throw new Error("Expected admitted parent");
+    await expect(
+      view.dispatch({
+        type: "submit_prompt",
+        sessionId,
+        text: "Ordinary next turn",
+        skills: [],
+        thinkingSelection: null,
+      }),
+    ).resolves.toMatchObject({ status: "admitted" });
+  } finally {
+    releaseModel.resolve();
+    terminalVisible.resolve();
+    await presentation?.close();
+    await lifecycle.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("PresentationSession causally projects a Todo mutation before the parent run settles", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-presentation-todo-causal-"));
   const stateRoot = join(testRoot, "state");

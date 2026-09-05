@@ -9,6 +9,8 @@ export class SessionLifecycleError extends Error {
     | "session_thinking_policy_unsupported"
     | "session_persistence_failed"
     | "session_plan_unavailable"
+    | "session_plan_approval_pending"
+    | "session_recovery_required"
     | "session_todo_unavailable"
     | "session_skill_confirmation_required"
     | "session_skill_policy_rejected"
@@ -84,6 +86,10 @@ function sessionLifecycleErrorMessage(code: SessionLifecycleError["code"]): stri
       return "The new session could not be persisted.";
     case "session_plan_unavailable":
       return "Plan is unavailable in this historical Tool Profile. Start a new session to use Plan.";
+    case "session_recovery_required":
+      return "Resolve interrupted work before sending another turn.";
+    case "session_plan_approval_pending":
+      return "Continue the approved Plan implementation before sending another turn.";
     case "session_todo_unavailable":
       return "Todo is unavailable in this historical Tool Profile. Start a new session to use Todo.";
     case "session_skill_unavailable":

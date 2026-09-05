@@ -2491,14 +2491,25 @@ export class AgentSession {
         ? { planGitAttestation: this.#planGitAttestation }
         : {}),
     } as const;
-    const result =
-      call.name === "activate_skill"
-        ? await this.#activateModelSelectedSkill(call)
-        : call.name === "read_skill_resource"
-          ? await this.#readSkillResource(call)
-          : call.name === "read_input_resource"
-            ? await this.#readInputResource(call, () => preparedCall.execute(executionContext))
-            : await preparedCall.execute(executionContext);
+    let result: ToolResult;
+    try {
+      result =
+        call.name === "activate_skill"
+          ? await this.#activateModelSelectedSkill(call)
+          : call.name === "read_skill_resource"
+            ? await this.#readSkillResource(call)
+            : call.name === "read_input_resource"
+              ? await this.#readInputResource(call, () => preparedCall.execute(executionContext))
+              : await preparedCall.execute(executionContext);
+    } catch (error) {
+      if (call.name !== "search_repository" || !signal.aborted) throw error;
+      // The search adapter reclaims its process/file handles before rejecting cancellation.
+      // Commit that tool terminal before the run's existing cancellation settlement.
+      result = {
+        status: "failed",
+        error: { code: "tool_io_failed", message: "Repository search was cancelled." },
+      };
+    }
     toolResultsById.set(call.id, { call, result });
     await this.#appendToolResult(messages, call, result);
     await this.#commitPlanGitAttestation(call, result);

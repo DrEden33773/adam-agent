@@ -5,6 +5,9 @@ import { safeTerminalText } from "./safe-terminal-text.js";
 import type { AdamTuiTheme } from "./theme.js";
 
 export type SessionRunStatus =
+  | "Cancelling interrupted work"
+  | "Interrupted session"
+  | "Recovering interrupted work"
   | "cancelling"
   | "idle"
   | "permission required"

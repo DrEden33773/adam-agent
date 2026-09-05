@@ -13,6 +13,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createJsonlManagedAgentStore,
+  createJsonlSessionStore,
+  createPermissionPolicy,
+  createPresentationSession,
   createSessionLifecycle,
   type ModelTargetIdentity,
   type ModelTargets,
@@ -21,6 +24,8 @@ import {
   createTrustedWorkspaceTrustForTesting,
   openJsonlSessionStore,
   preparedDirectDeepSeekV2ContextProfile,
+  type SessionRecord,
+  sessionAutomaticTitlesEnabled,
 } from "@adam-agent/agent/internal-testing";
 import type { PresentationSession } from "@adam-agent/presentation";
 import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
@@ -28,6 +33,7 @@ import { afterEach, expect, test } from "vitest";
 import { AppliedViewportTerminal } from "./applied-viewport-terminal.test-support.js";
 import { copySelectionToClipboard, selectionCopyMaximumBytes } from "./exit-policy.js";
 import { runTuiFixture } from "./test-fixture.js";
+import { runTui } from "./tui-app.js";
 import {
   readFilesRecursively,
   removeTuiFixtureRoot as rm,
@@ -40,6 +46,261 @@ import {
   startTuiFixture as startFixture,
 } from "./tui-fixture.test-support.js";
 import { VirtualTerminal } from "./virtual-terminal.test-support.js";
+
+test("cold search interruption exposes recovery and accepts Main input after explicit resume", () =>
+  exerciseColdParentRecovery("search_repository", "resume"));
+test("cold interrupted search cancels durably without replay and restores Main input", () =>
+  exerciseColdParentRecovery("search_repository", "cancel"));
+test("cold unsafe effect refuses replay before explicit cancellation and Main continuation", () =>
+  exerciseColdParentRecovery("write_file", "cancel"));
+
+test("cold unknown tool intent exposes only inspection and cancellation", () =>
+  exerciseColdParentRecovery("missing_tool", "cancel", undefined, "tool_requested"));
+
+test("cold completed search boundary resumes before the next provider request", () =>
+  exerciseColdParentRecovery("search_repository", "resume", undefined, "tool_completed"));
+
+test.each([
+  { columns: 40, rows: 12, noColor: false },
+  { columns: 120, rows: 24, noColor: false },
+  { columns: 80, rows: 16, noColor: true },
+])(
+  "interrupted recovery remains actionable at $columns columns and $rows rows with NO_COLOR=$noColor",
+  (viewport) => exerciseColdParentRecovery("search_repository", "resume", viewport),
+);
+
+async function exerciseColdParentRecovery(
+  toolName: "search_repository" | "write_file" | "missing_tool",
+  action: "resume" | "cancel",
+  viewport = { columns: 80, rows: 24, noColor: false },
+  boundary: "tool_started" | "tool_completed" | "tool_requested" = "tool_started",
+) {
+  const root = await mkdtemp(join(tmpdir(), "adam-parent-recovery-"));
+  const workspaceRoot = join(root, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "README.md"), "Recovery evidence\n");
+  const identity: ModelTargetIdentity = {
+    targetId: "deepseek-v4-flash.direct",
+    vendor: "deepseek",
+    modelId: "deepseek-v4-flash",
+    route: "direct",
+    profileVersion: 1,
+    certification: "certified",
+  };
+  const contextProfile = {
+    version: 1 as const,
+    contextWindowTokens: 1000000,
+    maximumOutputTokens: 32768,
+    compactAtTokens: 800000,
+    postCompactTargetTokens: 200000,
+    retainedTargetTokens: 20000,
+    estimatorVersion: 1 as const,
+  };
+  const recovering = Promise.withResolvers<void>();
+  const releaseRecovery = Promise.withResolvers<void>();
+  let calls = 0;
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return {
+        identity,
+        contextProfile,
+        driver: {
+          async *stream(request) {
+            calls += 1;
+            if (calls === 1) {
+              yield { type: "tool_call_start", id: "search-cold", name: toolName };
+              yield {
+                type: "tool_call_delta",
+                id: "search-cold",
+                json:
+                  toolName === "search_repository"
+                    ? '{"kind":"path","mode":"glob","query":"*"}'
+                    : '{"path":"result.txt","content":"one effect\\n"}',
+              };
+              yield { type: "tool_call_end", id: "search-cold" };
+              yield { type: "finish", reason: "tool_calls" };
+            } else {
+              if (calls === 3 && action === "resume") {
+                recovering.resolve();
+                await releaseRecovery.promise;
+              }
+              yield {
+                type: "text_delta",
+                text:
+                  request.messages.at(-1)?.role === "user"
+                    ? "Ordinary Main prompt completed."
+                    : "Safe search recovered.",
+              };
+              yield { type: "finish", reason: "stop" };
+            }
+          },
+        },
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity,
+            contextProfile,
+            readiness: { status: "available", credentialSource: "test" },
+          },
+        ],
+      };
+    },
+  };
+  const makeLifecycle = (stateRoot: string) =>
+    createSessionLifecycle({
+      workspaceRoot,
+      stateRoot,
+      modelTargets,
+      permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+      workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
+      [sessionAutomaticTitlesEnabled]: false,
+    });
+  const seedRoot = join(root, "seed");
+  const stateRoot = join(root, "cold");
+  const seed = makeLifecycle(seedRoot);
+  const colorEnvironment = process.env as NodeJS.ProcessEnv & { NO_COLOR?: string };
+  const priorColor = colorEnvironment.NO_COLOR;
+  if (viewport.noColor) colorEnvironment.NO_COLOR = "1";
+  else delete colorEnvironment.NO_COLOR;
+  const terminal = new VirtualTerminal(viewport);
+  let running: Promise<void> | undefined;
+  let lifecycle: ReturnType<typeof makeLifecycle> | undefined;
+  try {
+    const created = await seed.create({ targetIdentity: identity });
+    await seed.setSessionManualName({ sessionId: created.sessionId, name: "Recovery fixture" });
+    await seed.continue({ sessionId: created.sessionId, input: { text: "Search repository" } });
+    const records = await (
+      await openJsonlSessionStore<SessionRecord>({
+        workspaceRoot,
+        stateRoot: seedRoot,
+        sessionId: created.sessionId,
+      })
+    ).read();
+    const started = records.findIndex(
+      (entry) =>
+        entry.schemaVersion === 3 &&
+        entry.record.type === "runtime_event" &&
+        entry.record.event.type === boundary &&
+        entry.record.event.name === toolName,
+    );
+    expect(started).toBeGreaterThan(0);
+    await seed.close();
+    const coldStore = await createJsonlSessionStore<SessionRecord>({
+      workspaceRoot,
+      stateRoot,
+      sessionId: created.sessionId,
+    });
+    for (const entry of records.slice(0, started + 1)) await coldStore.append(entry);
+    lifecycle = makeLifecycle(stateRoot);
+    const presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      workspaceRoot,
+      stateRoot,
+      sessionId: created.sessionId,
+      projectLabel: "workspace",
+    });
+    running = runTui({
+      terminal,
+      presentation,
+      closeRuntime: async () => {
+        await presentation.close();
+        await lifecycle?.close();
+      },
+    });
+    await terminal.nextOutputContaining("\u001b[?2026l", 0);
+    const screen = terminal.lines().join("\n");
+    expect(screen).toContain("Interrupted session");
+    if (toolName === "search_repository") expect(screen).toContain("Resume safe work");
+    else {
+      expect(screen).toContain("cannot be replayed safely");
+      expect(screen).not.toContain("Resume safe work");
+      const recovery = presentation.getState().authoritative.active?.recovery;
+      if (recovery === undefined) throw new Error("Expected exact recovery identity");
+      const before = await coldStore.read();
+      await expect(
+        presentation.dispatch({
+          type: "submit_prompt",
+          sessionId: created.sessionId,
+          text: "Bypass interruption",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).resolves.toMatchObject({ status: "rejected", code: "not_available" });
+      expect(await coldStore.read()).toEqual(before);
+      await expect(
+        lifecycle.continue({
+          sessionId: created.sessionId,
+          input: { text: "Bypass Lifecycle interruption" },
+        }),
+      ).rejects.toMatchObject({ code: "session_recovery_required" });
+      expect(await coldStore.read()).toEqual(before);
+
+      await expect(
+        presentation.dispatch({
+          type: "resume_interrupted_session",
+          sessionId: created.sessionId,
+          runId: recovery.runId,
+        }),
+      ).resolves.toMatchObject({ status: "rejected", code: "not_available" });
+      expect(await coldStore.read()).toEqual(before);
+    }
+    expect(screen).toContain("Cancel interrupted work");
+    expect(screen).toContain("Inspect durable state");
+    expect(calls).toBe(2);
+    terminal.input(viewport.noColor ? "\u001b[105u" : "i");
+    await terminal.nextSynchronizedFrameContaining("Session facts", 0);
+    terminal.input("\u001b[27;1;27~");
+    const phases: string[] = [];
+    const unsubscribe = presentation.subscribe(() => {
+      const phase = presentation.getState().authoritative.active?.parentRun?.phase;
+      if (phase !== undefined) phases.push(phase);
+    });
+    terminal.input(
+      viewport.noColor
+        ? "\u001b[114;1:1u\u001b[114;1:2u\u001b[114;1:3u"
+        : action === "resume"
+          ? "r"
+          : "c",
+    );
+    if (action === "resume") {
+      await recovering.promise;
+      expect(presentation.getState().authoritative.active?.parentRun).toEqual({
+        phase: "recovering",
+        editor: "blocked",
+      });
+      releaseRecovery.resolve();
+      await terminal.nextSynchronizedFrameContaining("Safe search recovered.", 0);
+    }
+
+    await terminal.nextSynchronizedFrameContaining(
+      viewport.columns === 40 ? "idle · ctx" : " · idle",
+      0,
+    );
+    expect(phases).toContain(action === "resume" ? "recovering" : "cancelling");
+    expect(presentation.getState().authoritative.active?.parentRun).toEqual({
+      phase: "ready",
+      editor: "ready",
+    });
+    unsubscribe();
+    terminal.input("Ordinary Main prompt\r");
+    await terminal.nextSynchronizedFrameContaining("Ordinary Main prompt completed.", 0);
+    expect(calls).toBe(action === "resume" ? 4 : 3);
+    expect((await lifecycle.inspect({ sessionId: created.sessionId })).status).toBe("settled");
+  } finally {
+    releaseRecovery.resolve();
+    if (terminal.running()) terminal.input("\u0011");
+    await running;
+    await lifecycle?.close();
+    await seed.close();
+    if (priorColor === undefined) delete colorEnvironment.NO_COLOR;
+    else colorEnvironment.NO_COLOR = priorColor;
+    await rm(root, { recursive: true, force: true });
+  }
+}
 
 afterEach(async () => {
   await cleanupActiveTuiFixtures();
