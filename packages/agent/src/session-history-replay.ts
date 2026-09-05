@@ -8,6 +8,7 @@ import { SessionLifecycleError } from "./session-lifecycle-error.js";
 import type {
   SessionLogicalRunStartedRecord,
   SessionModelResponseField,
+  SessionProviderAttemptStartedRecord,
   SessionRecord,
 } from "./session-store.js";
 import {
@@ -56,6 +57,18 @@ export function modelMessagesFromCanonicalRecords(
 ): ModelMessage[] {
   const messages: ModelMessage[] = [];
   for (const record of currentRecords) {
+    if (
+      record.record.type === "provider_attempt_started" &&
+      record.record.managedAgentDeliveryVersion === 3
+    ) {
+      messages.push(
+        ...managedDeliveryMessagesFromReceipt(
+          currentRecords,
+          record as SessionProviderAttemptStartedRecord,
+        ),
+      );
+      continue;
+    }
     if (record.record.type === "logical_run_started") {
       messages.push(createLogicalRunUserMessageV1(record.record));
       continue;
@@ -101,6 +114,28 @@ export function modelMessagesFromCanonicalRecords(
     }
   }
   return messages;
+}
+
+export function managedDeliveryMessagesFromReceipt(
+  records: readonly SessionRecord[],
+  receipt: SessionProviderAttemptStartedRecord,
+): ModelMessage[] {
+  if (receipt.record.managedAgentDeliveryVersion !== 3) return [];
+  const deliveries = receipt.record.managedAgentDeliveries ?? [];
+  return deliveries.map((delivery, index) => {
+    const message = records.find(
+      (record) => record.sequence === receipt.sequence - deliveries.length + index,
+    );
+    if (
+      message?.schemaVersion !== 3 ||
+      message.record.type !== "runtime_event" ||
+      message.record.event.type !== "user_message" ||
+      message.record.runId !== receipt.record.runId ||
+      !message.record.event.text.startsWith(`Parent message (${delivery.id}): `)
+    )
+      throw new SessionLifecycleError("session_invalid");
+    return { role: "user", content: message.record.event.text };
+  });
 }
 
 export function createLogicalRunUserMessageV1(

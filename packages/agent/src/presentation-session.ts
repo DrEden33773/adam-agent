@@ -101,6 +101,9 @@ import {
 export const presentationHydrationBarrier = Symbol("adam-agent.presentation-hydration-barrier");
 export const presentationHistoryPageSize = Symbol("adam-agent.presentation-history-page-size");
 export const presentationCatalogPageSize = Symbol("adam-agent.presentation-catalog-page-size");
+
+import { sessionManagedControl } from "./session-lifecycle.js";
+
 export const presentationManagedAgentTranscriptPageSize = Symbol(
   "adam-agent.presentation-managed-agent-transcript-page-size",
 );
@@ -651,6 +654,9 @@ export async function createPresentationSession(
     }
     const listeners = new Set<() => void>();
     let closed = false;
+    let controlObserver: AbortController | undefined;
+    let controlObserverParent: string | undefined;
+    let controlObservation = Promise.resolve();
     const publishStateChange = (): void => {
       for (const listener of listeners) {
         try {
@@ -660,6 +666,33 @@ export async function createPresentationSession(
         }
       }
     };
+    const observeManagedControl = async (parentSessionId: string) => {
+      if (controlObserverParent === parentSessionId) return;
+      controlObserver?.abort();
+      const observer = new AbortController();
+      controlObserver = observer;
+      controlObserverParent = parentSessionId;
+      const control = await options.lifecycle[sessionManagedControl](parentSessionId);
+      if (control === undefined || observer.signal.aborted) return;
+      controlObservation = (async () => {
+        for await (const frame of control.observe({ parentSessionId, signal: observer.signal })) {
+          if (
+            closed ||
+            observer.signal.aborted ||
+            state.authoritative.active?.session.id !== parentSessionId
+          )
+            return;
+          state = {
+            ...state,
+            revision: state.revision + 1,
+            authoritative: { ...state.authoritative, managedControl: frame.snapshot },
+          };
+          publishStateChange();
+        }
+      })();
+      void controlObservation.catch(() => undefined);
+    };
+    if (created !== undefined) await observeManagedControl(created.sessionId);
     type TargetConnection = NonNullable<
       AuthoritativePresentationSnapshot["targets"]["items"][number]["connection"]
     >;
@@ -2279,6 +2312,31 @@ export async function createPresentationSession(
           message: "The presentation session is closed.",
         };
       }
+      if (command.type === "managed_control") {
+        const parentSessionId = command.command.parentSessionId;
+        if (state.authoritative.active?.session.id !== parentSessionId)
+          return {
+            status: "rejected",
+            code: "stale_revision",
+            message: "The selected parent Session is no longer active.",
+          };
+        const control = await options.lifecycle[sessionManagedControl](parentSessionId);
+        if (control === undefined)
+          return {
+            status: "rejected",
+            code: "action_unavailable",
+            message: "Managed control is unavailable for this Session.",
+          };
+        await observeManagedControl(parentSessionId);
+        const receipt = await control.dispatch(command.command);
+        if (receipt.status === "rejected") return receipt;
+        return {
+          status: "admitted",
+          commandId: command.commandId,
+          resource: null,
+          control: receipt,
+        };
+      }
       if (
         command.type === "refresh_managed_agents" ||
         command.type === "cancel_managed_agent" ||
@@ -2343,7 +2401,12 @@ export async function createPresentationSession(
             resource: null,
             ...(managedAgentControl === undefined ? {} : { managedAgentControl }),
           };
-        } catch {
+        } catch (error) {
+          if (
+            error instanceof SessionLifecycleError &&
+            error.code === "session_managed_control_read_only"
+          )
+            return { status: "rejected", code: "action_unavailable", message: error.message };
           return {
             status: "rejected",
             code: "authority_rejected",
@@ -4790,6 +4853,8 @@ export async function createPresentationSession(
         }
         await persistSettledCurrentTurnDraft();
         closed = true;
+        controlObserver?.abort();
+        await controlObservation;
         activeRun?.controller.abort();
         const connectionSettlements = [...activeConnectionTests.values()].flatMap((active) =>
           active.settlement === undefined ? [] : [active.settlement],

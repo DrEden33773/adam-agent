@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, mkdir, open, readFile, realpath } from "node:fs/promises";
+import { chmod, mkdir, open, readdir, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 import {
   type ManagedAgentRecord,
@@ -10,6 +10,269 @@ import {
   ManagedAgentStoreError,
   validateManagedAgentRecord,
 } from "./managed-agent.js";
+import {
+  type ManagedControlRecord,
+  type ManagedControlStore,
+  validateManagedControlRecord,
+} from "./managed-agent-folds.js";
+
+export function createInMemoryManagedAgentControlStore(): ManagedControlStore {
+  const partitions = new Map<string, ManagedControlRecord[]>();
+  const scoped = (parentSessionId?: string): ManagedControlStore => ({
+    forParent(id) {
+      assertParentScope(parentSessionId, id);
+      return scoped(id);
+    },
+    async preflight() {},
+    async readLegacy() {
+      return [];
+    },
+    async read() {
+      return structuredClone(
+        parentSessionId === undefined
+          ? [...partitions.entries()]
+              .sort(([a], [b]) => a.localeCompare(b))
+              .flatMap(([, records]) => records)
+          : (partitions.get(parentSessionId) ?? []),
+      );
+    },
+    async append(record) {
+      if (typeof record !== "object" || record === null)
+        throw new ManagedAgentStoreError("managed_agent_log_invalid");
+      assertParentScope(parentSessionId, record.parentSessionId);
+      const records = partitions.get(record.parentSessionId) ?? [];
+      records.push(validateManagedControlRecord(record, records));
+      partitions.set(record.parentSessionId, records);
+    },
+    async appendNext(input) {
+      if (typeof input !== "object" || input === null)
+        throw new ManagedAgentStoreError("managed_agent_log_invalid");
+      assertParentScope(parentSessionId, input.parentSessionId);
+      const records = partitions.get(input.parentSessionId) ?? [];
+      const record = validateManagedControlRecord(
+        { ...input, sequence: records.length + 1 },
+        records,
+      );
+      records.push(record);
+      partitions.set(input.parentSessionId, records);
+      return structuredClone(record);
+    },
+  });
+  return scoped();
+}
+
+function assertParentScope(bound: string | undefined, requested: string): void {
+  if (
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(requested) ||
+    (bound !== undefined && bound !== requested)
+  )
+    throw new ManagedAgentStoreError("managed_agent_log_invalid");
+}
+
+/** Parent journals share the project writer, while corruption stays in the attributable parent. */
+export async function createJsonlManagedAgentControlStore(options: {
+  readonly workspaceRoot: string;
+  readonly stateRoot?: string;
+}): Promise<ManagedControlStore> {
+  const workspace = await realpath(options.workspaceRoot);
+  const projectKey = createHash("sha256").update(workspace).digest("hex");
+  const stateRoot = resolve(options.stateRoot ?? defaultManagedAgentStateRoot());
+  const projects = join(stateRoot, "projects");
+  const project = join(projects, projectKey);
+  const directory = join(project, "managed-agents");
+  const legacyPath = join(directory, "events-v1.jsonl");
+  const backupPath = join(directory, "events-v1.pre-v3.jsonl");
+  const prepared = new Set<string>();
+  const assertDirectories = async () => {
+    for (const path of [stateRoot, projects, project, directory]) {
+      try {
+        if ((await realpath(path)) !== path)
+          throw new Error("Managed control directory identity changed.");
+      } catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") return;
+        throw error;
+      }
+    }
+  };
+  const readBytes = async (path: string): Promise<string> => {
+    await assertDirectories();
+    let file: Awaited<ReturnType<typeof open>>;
+    try {
+      file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return "";
+      throw error;
+    }
+    try {
+      const stats = await file.stat();
+      if (!stats.isFile()) throw new Error("Managed control journal is not a regular file.");
+      if (stats.size > maximumManagedAgentLogBytes)
+        throw new ManagedAgentStoreError("managed_agent_log_too_large");
+      return await file.readFile("utf8");
+    } finally {
+      await file.close();
+    }
+  };
+  const parseLines = (text: string): readonly unknown[] => {
+    if (text === "") return [];
+    if (!text.endsWith("\n")) throw new ManagedAgentStoreError("managed_agent_log_invalid");
+    try {
+      return text
+        .slice(0, -1)
+        .split("\n")
+        .map((line) => JSON.parse(line) as unknown);
+    } catch {
+      throw new ManagedAgentStoreError("managed_agent_log_invalid");
+    }
+  };
+  const readLegacy = async () => {
+    const records: ManagedAgentRecord[] = [];
+    for (const value of parseLines(await readBytes(legacyPath)))
+      records.push(validateManagedAgentRecord(value, records).record);
+    return records;
+  };
+  const readPartition = async (path: string, parent: string) => {
+    const memory = createInMemoryManagedAgentControlStore().forParent(parent);
+    for (const value of parseLines(await readBytes(path)))
+      await memory.append(value as ManagedControlRecord);
+    return memory.read();
+  };
+  const scoped = (parentSessionId?: string): ManagedControlStore => {
+    const path =
+      parentSessionId === undefined
+        ? undefined
+        : join(directory, `events-v3-${parentSessionId}.jsonl`);
+    const appendStored = (
+      input: Omit<ManagedControlRecord, "sequence">,
+      allocate: boolean,
+    ): Promise<ManagedControlRecord> => {
+      assertParentScope(parentSessionId, input.parentSessionId);
+      if (path === undefined || parentSessionId === undefined || !prepared.has(parentSessionId))
+        return Promise.reject(new ManagedAgentStoreError("managed_agent_log_invalid"));
+      return enqueueManagedAgentAppend(path, async () => {
+        const records = await readPartition(path, parentSessionId);
+        const record = validateManagedControlRecord(
+          allocate ? { ...input, sequence: records.length + 1 } : input,
+          records,
+        );
+        const text = `${JSON.stringify(record)}\n`;
+        const storedBytes = records.reduce(
+          (sum, entry) => sum + Buffer.byteLength(JSON.stringify(entry), "utf8") + 1,
+          0,
+        );
+        if (storedBytes + Buffer.byteLength(text, "utf8") > maximumManagedAgentLogBytes)
+          throw new ManagedAgentStoreError("managed_agent_log_too_large");
+        const file = await open(
+          path,
+          constants.O_APPEND | constants.O_WRONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        );
+        try {
+          if (!(await file.stat()).isFile())
+            throw new Error("Managed control journal is not a regular file.");
+          await file.writeFile(text, "utf8");
+          await file.sync();
+        } finally {
+          await file.close();
+        }
+        return record;
+      });
+    };
+    const store: ManagedControlStore = {
+      forParent(id) {
+        assertParentScope(parentSessionId, id);
+        return scoped(id);
+      },
+      readLegacy,
+      async read() {
+        if (path !== undefined && parentSessionId !== undefined) {
+          await (managedAgentAppendQueues.get(path) ?? Promise.resolve());
+          return readPartition(path, parentSessionId);
+        }
+        await assertDirectories();
+        let names: string[];
+        try {
+          names = await readdir(directory);
+        } catch (error) {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
+          throw error;
+        }
+        const records: ManagedControlRecord[] = [];
+        for (const name of names.filter((name) => name.startsWith("events-v3-")).sort()) {
+          const match = /^events-v3-([0-9a-f-]{36})\.jsonl$/u.exec(name);
+          if (match?.[1] === undefined)
+            throw new Error("Managed control journal identity is unavailable.");
+          records.push(...(await scoped(match[1]).read()));
+        }
+        return records;
+      },
+      preflight() {
+        return enqueueManagedAgentAppend(backupPath, async () => {
+          if (prepared.has(parentSessionId ?? "all")) return;
+          await readLegacy();
+          await store.read();
+          const legacyBytes = await readBytes(legacyPath);
+          for (const entry of [stateRoot, projects, project, directory]) {
+            await mkdir(entry, { recursive: true, mode: 0o700 });
+            if ((await realpath(entry)) !== entry)
+              throw new Error("Managed control directory identity changed.");
+            await chmod(entry, 0o700);
+          }
+          let backup: Awaited<ReturnType<typeof open>> | undefined;
+          try {
+            backup = await open(
+              backupPath,
+              constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW,
+              0o600,
+            );
+          } catch (error) {
+            if (!(error instanceof Error && "code" in error && error.code === "EEXIST"))
+              throw error;
+            if ((await readBytes(backupPath)) !== legacyBytes)
+              throw new ManagedAgentStoreError("managed_agent_log_invalid");
+          }
+          if (backup !== undefined) {
+            try {
+              await backup.writeFile(legacyBytes, "utf8");
+              await backup.sync();
+            } finally {
+              await backup.close();
+            }
+          }
+          if (path !== undefined) await ensureManagedAgentLogFile(path);
+          const directoryFile = await open(
+            directory,
+            constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+          );
+          try {
+            await directoryFile.sync();
+          } finally {
+            await directoryFile.close();
+          }
+          prepared.add(parentSessionId ?? "all");
+        });
+      },
+      async append(record) {
+        if (parentSessionId === undefined) {
+          const target = scoped(record.parentSessionId);
+          await target.preflight();
+          await target.append(record);
+          return;
+        }
+        await appendStored(record, false);
+      },
+      async appendNext(record) {
+        if (parentSessionId === undefined) {
+          const target = scoped(record.parentSessionId);
+          await target.preflight();
+          return target.appendNext(record);
+        }
+        return appendStored(record, true);
+      },
+    };
+    return store;
+  };
+  return scoped();
+}
 
 const maximumManagedAgentLogBytes = 32 * 1024 * 1024;
 const managedAgentAppendQueues = new Map<string, Promise<void>>();
@@ -131,7 +394,7 @@ async function readManagedAgentLog(path: string): Promise<readonly ManagedAgentR
   return records;
 }
 
-function enqueueManagedAgentAppend(path: string, operation: () => Promise<void>): Promise<void> {
+function enqueueManagedAgentAppend<T>(path: string, operation: () => Promise<T>): Promise<T> {
   const previous = managedAgentAppendQueues.get(path) ?? Promise.resolve();
   const queued = previous.then(operation, operation);
   const settled = queued.then(
