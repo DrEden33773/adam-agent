@@ -2,6 +2,7 @@ export class SessionLifecycleError extends Error {
   readonly code:
     | "session_branch_boundary_invalid"
     | "session_invalid"
+    | "session_managed_control_read_only"
     | "session_model_target_incompatible"
     | "session_model_target_unavailable"
     | "session_user_configuration_invalid"
@@ -70,6 +71,8 @@ function sessionLifecycleErrorMessage(code: SessionLifecycleError["code"]): stri
       return "The OS-backed project lifecycle owner is unavailable.";
     case "session_branch_boundary_invalid":
       return "The requested branch position is not a complete session boundary.";
+    case "session_managed_control_read_only":
+      return "Historical agent controls are read-only. Start a new current Session to delegate work.";
     case "session_invalid":
       return "The session history is invalid.";
     case "session_model_target_incompatible":

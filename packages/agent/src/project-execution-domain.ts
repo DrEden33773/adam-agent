@@ -42,7 +42,21 @@ export type ProjectExecutionRootClaim = {
   release(): Promise<void>;
 };
 
+export type ProjectExecutionScope =
+  | {
+      readonly kind: "main_run" | "control" | "reviewer";
+      readonly sessionId: string;
+      readonly identity: string;
+    }
+  | {
+      readonly kind: "child_attempt";
+      readonly sessionId: string;
+      readonly threadId: string;
+      readonly identity: string;
+    };
+
 export type ProjectExecutionDomain = {
+  claimScope(input: ProjectExecutionScope): Promise<ProjectExecutionChildClaim>;
   claimRoot(input: { readonly rootId: string }): Promise<ProjectExecutionRootClaim>;
   runRoot<T>(input: { readonly rootId: string }, operation: () => Promise<T>): Promise<T>;
   close(): Promise<void>;
@@ -61,6 +75,7 @@ export function createProjectExecutionDomain(options: {
   let closePromise: Promise<void> | undefined;
   let resolveClose: (() => void) | undefined;
   let rejectClose: ((error: unknown) => void) | undefined;
+  const scopes = new Map<string, symbol>();
 
   const releaseClaim = async () => {
     claimCount -= 1;
@@ -96,12 +111,43 @@ export function createProjectExecutionDomain(options: {
   };
 
   const domain: ProjectExecutionDomain = {
+    async claimScope(input) {
+      const key = JSON.stringify(
+        input.kind === "child_attempt"
+          ? [input.kind, input.sessionId, input.threadId]
+          : input.kind === "main_run"
+            ? [input.kind, input.sessionId]
+            : [input.kind, input.sessionId, input.identity],
+      );
+      if (scopes.has(key)) throw new ProjectExecutionDomainError("root_conflict");
+      const identity = Symbol(input.identity);
+      scopes.set(key, identity);
+      let root: ProjectExecutionRootClaim;
+      try {
+        root = await domain.claimRoot({ rootId: projectRuntimeRootId });
+      } catch (error) {
+        if (scopes.get(key) === identity) scopes.delete(key);
+        throw error;
+      }
+      let release: Promise<void> | undefined;
+      return {
+        childId: input.identity,
+        release() {
+          release ??= (async () => {
+            await root.release();
+            if (scopes.get(key) === identity) scopes.delete(key);
+          })();
+          return release;
+        },
+      };
+    },
     async claimRoot({ rootId }) {
       if (closed) {
         throw new ProjectExecutionDomainError("domain_closed");
       }
       if (finalReleasePromise !== undefined) {
-        throw new ProjectExecutionDomainError("root_conflict");
+        await finalReleasePromise;
+        if (closed) throw new ProjectExecutionDomainError("domain_closed");
       }
       if (activeRootId !== undefined && activeRootId !== rootId) {
         throw new ProjectExecutionDomainError("root_conflict");

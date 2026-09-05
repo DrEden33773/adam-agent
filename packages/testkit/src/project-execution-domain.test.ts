@@ -9,6 +9,68 @@ import {
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
+test("ProjectExecutionDomain admits Main child and control scopes beneath title while fencing the same child thread", async () => {
+  let acquisitions = 0;
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        acquisitions += 1;
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const title = await domain.claimRoot({ rootId: "project-runtime" });
+  const main = await domain.claimScope({ kind: "main_run", sessionId: "parent", identity: "run" });
+  const child = await domain.claimScope({
+    kind: "child_attempt",
+    sessionId: "parent",
+    threadId: "thread",
+    identity: "attempt-1",
+  });
+  const control = await domain.claimScope({
+    kind: "control",
+    sessionId: "parent",
+    identity: "command",
+  });
+  try {
+    await expect(
+      domain.claimScope({
+        kind: "child_attempt",
+        sessionId: "parent",
+        threadId: "thread",
+        identity: "attempt-2",
+      }),
+    ).rejects.toMatchObject({ code: "root_conflict" });
+    expect(acquisitions).toBe(1);
+    await child.release();
+    const next = await domain.claimScope({
+      kind: "child_attempt",
+      sessionId: "parent",
+      threadId: "thread",
+      identity: "attempt-2",
+    });
+    await child.release();
+    await expect(
+      domain.claimScope({
+        kind: "child_attempt",
+        sessionId: "parent",
+        threadId: "thread",
+        identity: "attempt-3",
+      }),
+    ).rejects.toMatchObject({ code: "root_conflict" });
+    await next.release();
+  } finally {
+    await control.release();
+    await child.release();
+    await main.release();
+    await title.release();
+    await domain.close();
+  }
+});
+
 test("ProjectExecutionDomain retains one owner for a subordinate claim and the same root", async () => {
   let acquisitions = 0;
   let releases = 0;

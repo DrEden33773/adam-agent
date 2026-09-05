@@ -922,6 +922,7 @@ export type TurnComposerDisplay = {
 };
 
 export type AuthoritativePresentationSnapshot = {
+  readonly managedControl?: ManagedWorkspaceSnapshot;
   readonly schemaVersion: 1;
   readonly continuity:
     | {
@@ -942,6 +943,7 @@ export type AuthoritativePresentationSnapshot = {
       readonly attention: number;
     };
     readonly agents: readonly {
+      readonly readOnly?: true;
       readonly agentId: string;
       readonly attemptId: string;
       readonly profile: "scout.v1" | "scout.v2" | "research.v1" | "research.v2";
@@ -1154,6 +1156,7 @@ export type CommandReceipt =
       readonly draftText?: string;
       readonly todo?: TodoPageResource | TodoEntityResource;
       readonly managedAgentTranscript?: ManagedAgentTranscriptPageResource;
+      readonly control?: ManagedControlReceipt;
       readonly managedAgentControl?: {
         readonly action: "message" | "reply" | "cancel" | "follow_up" | "recovery";
         readonly agentId: string;
@@ -1176,6 +1179,11 @@ export type CommandReceipt =
         | "conflict"
         | "invalid_command"
         | "authority_rejected"
+        | "stale_revision"
+        | "authority_busy"
+        | "action_unavailable"
+        | "recovery_required"
+        | "runtime_unavailable"
         | "persistence_failed"
         | "presentation_closed";
       readonly message: string;
@@ -1229,6 +1237,11 @@ export type ManagedAgentTranscriptPageResource = {
 };
 
 export type PresentationCommand =
+  | {
+      readonly type: "managed_control";
+      readonly commandId: string;
+      readonly command: ManagedControlCommand;
+    }
   | { readonly type: "refresh_managed_agents"; readonly sessionId: string }
   | {
       readonly type: "read_managed_agent_transcript";
@@ -1610,3 +1623,143 @@ export function reconcilePresentationUpdate(
     },
   };
 }
+
+export type ManagedControlIdentity = {
+  readonly parentSessionId: string;
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly attemptId: string;
+  readonly childSessionId: string;
+};
+
+export type ManagedControlLink = {
+  readonly sequence: number;
+  readonly digest: `sha256:${string}`;
+};
+
+export type ManagedControlOutcome = {
+  readonly usage: {
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly reasoningTokens: number;
+    readonly providerCalls: number;
+    readonly unknownCalls: number;
+  };
+  readonly type: "outcome";
+  readonly status: "completed" | "failed" | "cancelled" | "interrupted";
+  readonly summary: string;
+  readonly transcript: ManagedControlLink;
+  readonly error?: { readonly code: string; readonly message: string };
+};
+
+export type ManagedControlThread = {
+  readonly parentSessionId: string;
+  readonly lifecycle: "open" | "closed";
+  readonly displayName: string;
+  readonly handle: string;
+  readonly residency: "live" | "unloaded";
+  readonly threadId: string;
+  readonly role: "builtin:explore";
+  readonly description: string;
+  readonly turn: {
+    readonly turnId: string;
+    readonly attemptId: string;
+    readonly childSessionId: string;
+    readonly phase: "starting" | "executing" | "settling" | "idle" | "waiting";
+    readonly waitReason: "none" | "suspended";
+    readonly ownerPhase: "waiting" | "claimed" | "releasing" | "released";
+    readonly lastOutcome: "none" | "completed" | "failed" | "cancelled" | "interrupted";
+    readonly label: string;
+    readonly recovery: "none" | "required";
+    readonly health: "healthy" | "stalled";
+    readonly watchdog?: {
+      readonly deadlineId: string;
+      readonly maximumInactivityMilliseconds: 300_000;
+      readonly lastProgressAtUnixMilliseconds: number;
+      readonly transcript: ManagedControlLink;
+      readonly state: "running" | "stopped" | "stalled";
+    };
+    readonly diagnostic?: string;
+    readonly outcome?: ManagedControlOutcome;
+  };
+};
+
+export type ManagedWorkspaceSnapshot = {
+  readonly completions: readonly {
+    readonly id: `sha256:${string}`;
+    readonly threadId: string;
+    readonly turnId: string;
+    readonly receipt: ManagedControlLink;
+    readonly outcome: ManagedControlOutcome;
+    readonly consumption: "pending" | "consumed";
+  }[];
+  readonly status: "ready" | "recovery_required" | "runtime_unavailable";
+  readonly diagnostic?: string;
+  readonly parentSessionId: string;
+  readonly revision: number;
+  readonly threads: readonly ManagedControlThread[];
+};
+
+export type ManagedControlCommand =
+  | { readonly type: "prepare_main_delivery"; readonly parentSessionId: string }
+  | {
+      readonly type: "acknowledge_main_delivery";
+      readonly parentSessionId: string;
+      readonly deliveries: readonly {
+        readonly id: `sha256:${string}`;
+        readonly digest: `sha256:${string}`;
+      }[];
+    }
+  | {
+      readonly type: "cancel_turn";
+      readonly parentSessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+    }
+  | {
+      readonly type: "start_thread";
+      readonly parentSessionId: string;
+      readonly role: "builtin:explore";
+      readonly task: string;
+      readonly description: string;
+    }
+  | {
+      readonly type: "next_turn";
+      readonly parentSessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+      readonly task: string;
+    }
+  | {
+      readonly type: "recover_turn";
+      readonly parentSessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+    }
+  | { readonly type: "close"; readonly parentSessionId: string };
+
+export type ManagedControlReceipt =
+  | {
+      readonly status: "delivery";
+      readonly messages: readonly { readonly id: `sha256:${string}`; readonly text: string }[];
+      readonly deliveries: readonly {
+        readonly id: `sha256:${string}`;
+        readonly digest: `sha256:${string}`;
+      }[];
+    }
+  | { readonly status: "acknowledged" }
+  | { readonly status: "cancelled"; readonly turnId: string }
+  | ({ readonly status: "accepted" } & ManagedControlIdentity)
+  | { readonly status: "closed" }
+  | { readonly status: "recovered" }
+  | {
+      readonly status: "rejected";
+      readonly code:
+        | "stale_revision"
+        | "authority_busy"
+        | "action_unavailable"
+        | "recovery_required"
+        | "persistence_failed"
+        | "runtime_unavailable";
+      readonly message: string;
+    };

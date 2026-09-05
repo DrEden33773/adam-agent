@@ -764,9 +764,11 @@ export type SessionProviderAttemptStartedRecord = {
     readonly turn: number;
     readonly attempt: number;
     readonly targetIdentity: ModelTargetIdentity;
+    readonly managedAgentDeliveryVersion?: 3;
     readonly managedAgentDeliveries?: readonly {
       readonly id: Sha256Digest;
       readonly digest: Sha256Digest;
+      readonly messageDigest?: Sha256Digest;
     }[];
     readonly promptProjection?: {
       readonly version: 1;
@@ -777,6 +779,13 @@ export type SessionProviderAttemptStartedRecord = {
     };
     readonly projectedContent?: ProjectedContentUsageV1;
   };
+};
+
+export type SessionPartialOutputV1 = {
+  readonly version: 1;
+  readonly text: string;
+  readonly byteCount: number;
+  readonly truncated: boolean;
 };
 
 export type SessionProviderAttemptInterruptedRecord = {
@@ -790,7 +799,11 @@ export type SessionProviderAttemptInterruptedRecord = {
   } & (
     | { readonly reason: "process_restart"; readonly result?: never }
     | { readonly reason: "context_overflow"; readonly result?: never }
-    | { readonly reason: "run_terminal"; readonly result: RunResult }
+    | {
+        readonly reason: "run_terminal";
+        readonly result: RunResult;
+        readonly partialOutput?: SessionPartialOutputV1;
+      }
   );
 };
 
@@ -2925,38 +2938,53 @@ const sessionV3RecordSchema = z.union([
       height: z.number().int().positive().max(4_096),
     }),
   }),
-  z.strictObject({
-    type: z.literal("provider_attempt_started"),
-    runId: z.uuid(),
-    turn: z.number().int().positive(),
-    attempt: z.number().int().positive(),
-    targetIdentity: modelTargetIdentitySchema,
-    managedAgentDeliveries: z
-      .array(
-        z.strictObject({
-          id: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-          digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-        }),
-      )
-      .max(5)
-      .optional(),
-    promptProjection: z
-      .strictObject({
-        version: z.literal(1),
-        assemblyIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-        requestProjectionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-        managedAgentSummary: z
-          .string()
-          .refine((value) => Buffer.byteLength(value, "utf8") <= 1024)
-          .optional(),
-        approvedPlanProjectionDigest: z
-          .string()
-          .regex(/^sha256:[0-9a-f]{64}$/u)
-          .optional(),
-      })
-      .optional(),
-    projectedContent: projectedContentUsageV1Schema.optional(),
-  }),
+  z
+    .strictObject({
+      type: z.literal("provider_attempt_started"),
+      runId: z.uuid(),
+      turn: z.number().int().positive(),
+      attempt: z.number().int().positive(),
+      targetIdentity: modelTargetIdentitySchema,
+      managedAgentDeliveryVersion: z.literal(3).optional(),
+      managedAgentDeliveries: z
+        .array(
+          z.strictObject({
+            id: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+            digest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+            messageDigest: z
+              .string()
+              .regex(/^sha256:[0-9a-f]{64}$/u)
+              .optional(),
+          }),
+        )
+        .max(32)
+        .optional(),
+      promptProjection: z
+        .strictObject({
+          version: z.literal(1),
+          assemblyIdentityDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+          requestProjectionDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
+          managedAgentSummary: z
+            .string()
+            .refine((value) => Buffer.byteLength(value, "utf8") <= 1024)
+            .optional(),
+          approvedPlanProjectionDigest: z
+            .string()
+            .regex(/^sha256:[0-9a-f]{64}$/u)
+            .optional(),
+        })
+        .optional(),
+      projectedContent: projectedContentUsageV1Schema.optional(),
+    })
+    .refine((record) =>
+      record.managedAgentDeliveryVersion === 3
+        ? (record.managedAgentDeliveries?.length ?? 0) > 0 &&
+          record.managedAgentDeliveries?.every((delivery) => delivery.messageDigest !== undefined)
+        : (record.managedAgentDeliveries?.length ?? 0) <= 5 &&
+          record.managedAgentDeliveries?.every(
+            (delivery) => delivery.messageDigest === undefined,
+          ) !== false,
+    ),
   z.strictObject({
     type: z.literal("repository_instructions_committed"),
     recordVersion: z.literal(1),
@@ -2990,14 +3018,29 @@ const sessionV3RecordSchema = z.union([
       })
       .optional(),
   }),
-  z.strictObject({
-    type: z.literal("provider_attempt_interrupted"),
-    runId: z.uuid(),
-    turn: z.number().int().positive(),
-    attempt: z.number().int().positive(),
-    reason: z.enum(["process_restart", "context_overflow", "run_terminal"]),
-    result: runResultSchema.optional(),
-  }),
+  z
+    .strictObject({
+      type: z.literal("provider_attempt_interrupted"),
+      runId: z.uuid(),
+      turn: z.number().int().positive(),
+      attempt: z.number().int().positive(),
+      reason: z.enum(["process_restart", "context_overflow", "run_terminal"]),
+      result: runResultSchema.optional(),
+      partialOutput: z
+        .strictObject({
+          version: z.literal(1),
+          text: z.string().refine((text) => Buffer.byteLength(text, "utf8") <= 16 * 1024),
+          byteCount: z.number().int().nonnegative(),
+          truncated: z.boolean(),
+        })
+        .refine(
+          (partial) =>
+            partial.byteCount >= Buffer.byteLength(partial.text, "utf8") &&
+            partial.truncated === partial.byteCount > Buffer.byteLength(partial.text, "utf8"),
+        )
+        .optional(),
+    })
+    .refine((record) => record.partialOutput === undefined || record.reason === "run_terminal"),
   z.strictObject({
     type: z.literal("model_response_completed"),
     runId: z.uuid(),

@@ -1,6 +1,10 @@
 /** Tests only. This internal fault-injection surface has no compatibility promise. */
-
-export { managedAgentPromptSummary, sessionToolProfileNames } from "./agent-session.js";
+export {
+  managedAgentPromptSummary,
+  managedAgentRequestBoundary,
+  sessionRecordCommittedBarrier,
+  sessionToolProfileNames,
+} from "./agent-session.js";
 export { AiSdkModelDriver as AiSdkModelDriverForTesting } from "./ai-sdk-model-driver.js";
 export {
   createObservedBiomeExecutionAdapter,
@@ -21,13 +25,21 @@ export {
   recoverInterruptedManagedAgents,
 } from "./managed-agent.js";
 export {
+  createManagedAgentControl,
+  managedAgentRecordBarrier,
+  managedAgentSettlementBarrier,
+  managedControlMainRequestBoundary,
+} from "./managed-agent-control.js";
+export {
   researchManagedAgentProfileV1,
   researchManagedAgentProfileV2,
   scoutManagedAgentProfileV1,
   scoutManagedAgentProfileV2,
 } from "./managed-agent-profiles.js";
 export {
+  createInMemoryManagedAgentControlStore,
   createInMemoryManagedAgentStore,
+  createJsonlManagedAgentControlStore,
   createJsonlManagedAgentStore,
 } from "./managed-agent-store.js";
 export type {
@@ -139,6 +151,7 @@ export {
   sessionCloseDrainBarrier,
   sessionLogicalRunStartedBarrier,
   sessionManagedAgentInactivityScheduler,
+  sessionManagedControl,
   sessionProjectLifecycleOwner,
   sessionRuntimeNotificationTransform,
   sessionStoreDirectory,

@@ -2072,6 +2072,7 @@ export function validateManagedAgentRecord(
 }
 
 export type ManagedAgentSummary = {
+  readonly readOnly?: true;
   readonly agentId: string;
   readonly attemptId: string;
   readonly profile: BuiltInManagedAgentProfileId;
@@ -2769,7 +2770,7 @@ export type ManagedAgentInactivityScheduler = {
   schedule(delayMilliseconds: number, onInactivity: () => void): { cancel(): void };
 };
 
-const nodeManagedAgentDeadlineScheduler: ManagedAgentDeadlineScheduler = {
+export const nodeManagedAgentDeadlineScheduler: ManagedAgentDeadlineScheduler = {
   schedule(delayMilliseconds, onDeadline) {
     const timer = setTimeout(onDeadline, delayMilliseconds);
     timer.unref();
@@ -5432,16 +5433,20 @@ export function createAgentManager(options: {
   return manager;
 }
 
-export function createManagedAgentToolRegistry(options: {
-  readonly manager: AgentManager;
-  readonly profile?:
-    | "managed-agent-tools.a1.v1"
-    | "managed-agent-tools.a2-long-lived.v1"
-    | "managed-agent-tools.a3-long-lived.v1"
-    | "managed-agent-tools.a1.v2"
-    | "managed-agent-tools.a2-long-lived.v2"
-    | "managed-agent-tools.a3-long-lived.v2";
-}): ToolRegistry {
+export function createManagedAgentToolRegistry(
+  options: {
+    readonly profile?:
+      | "managed-agent-tools.a1.v1"
+      | "managed-agent-tools.a2-long-lived.v1"
+      | "managed-agent-tools.a3-long-lived.v1"
+      | "managed-agent-tools.a1.v2"
+      | "managed-agent-tools.a2-long-lived.v2"
+      | "managed-agent-tools.a3-long-lived.v2";
+  } & (
+    | { readonly manager: AgentManager; readonly readOnly?: false }
+    | { readonly readOnly: true; readonly manager?: never }
+  ),
+): ToolRegistry {
   const profile = options.profile ?? "managed-agent-tools.a1.v1";
   const current = profile.endsWith(".v2");
   const a3 = profile.includes(".a3-long-lived.");
@@ -5494,6 +5499,11 @@ export function createManagedAgentToolRegistry(options: {
         if (!parsed.success) {
           return toolFailure("invalid_tool_input", "Tool input is invalid.");
         }
+        if (options.readOnly === true)
+          return toolFailure(
+            "managed_agent_unavailable",
+            "Historical agent controls are read-only. Start a new current Session to delegate work.",
+          );
         const a3Input = a3
           ? current
             ? managedAgentA3SpawnSchemaV2.parse(parsed.data)
@@ -5604,6 +5614,11 @@ export function createManagedAgentToolRegistry(options: {
         if (!parsed.success) {
           return toolFailure("invalid_tool_input", "Tool input is invalid.");
         }
+        if (options.readOnly === true)
+          return toolFailure(
+            "managed_agent_unavailable",
+            "Historical agent controls are read-only. Start a new current Session to delegate work.",
+          );
         return {
           status: "ready",
           permissionSubject: {
@@ -5640,6 +5655,11 @@ export function createManagedAgentToolRegistry(options: {
         if (!parsed.success) {
           return toolFailure("invalid_tool_input", "Tool input is invalid.");
         }
+        if (options.readOnly === true)
+          return toolFailure(
+            "managed_agent_unavailable",
+            "Historical agent controls are read-only. Start a new current Session to delegate work.",
+          );
         return {
           status: "ready",
           permissionSubject: {
@@ -5676,6 +5696,11 @@ export function createManagedAgentToolRegistry(options: {
         if (!parsed.success || new Set(parsed.data.agentIds).size !== parsed.data.agentIds.length) {
           return toolFailure("invalid_tool_input", "Tool input is invalid.");
         }
+        if (options.readOnly === true)
+          return toolFailure(
+            "managed_agent_unavailable",
+            "Historical agent controls are read-only. Start a new current Session to delegate work.",
+          );
         return {
           status: "ready",
           permissionSubject: {
@@ -5712,6 +5737,11 @@ export function createManagedAgentToolRegistry(options: {
         if (!parsed.success) {
           return toolFailure("invalid_tool_input", "Tool input is invalid.");
         }
+        if (options.readOnly === true)
+          return toolFailure(
+            "managed_agent_unavailable",
+            "Historical agent controls are read-only. Start a new current Session to delegate work.",
+          );
         return {
           status: "ready",
           permissionSubject: {
@@ -5757,6 +5787,11 @@ export function createManagedAgentToolRegistry(options: {
         ) {
           return toolFailure("invalid_tool_input", "Tool input is invalid.");
         }
+        if (options.readOnly === true)
+          return toolFailure(
+            "managed_agent_unavailable",
+            "Historical agent controls are read-only. Start a new current Session to delegate work.",
+          );
         return {
           status: "ready",
           permissionSubject: {

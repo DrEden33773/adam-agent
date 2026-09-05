@@ -132,6 +132,33 @@ export function validateCurrentSessionHistory(
     throw new SessionLifecycleError("session_invalid");
   }
   const currentRecords = records.filter((record) => record.schemaVersion === 3);
+  const managedDeliveryMessageSequences = new Set<number>();
+  const managedDeliveryIds = new Set<string>();
+  for (const [index, entry] of currentRecords.entries()) {
+    if (
+      entry.record.type !== "provider_attempt_started" ||
+      entry.record.managedAgentDeliveryVersion !== 3
+    )
+      continue;
+    const deliveries = entry.record.managedAgentDeliveries ?? [];
+    if (deliveries.length === 0 || deliveries.length > 32 || index < deliveries.length)
+      throw new SessionLifecycleError("session_invalid");
+    for (const [offset, delivery] of deliveries.entries()) {
+      const message = currentRecords[index - deliveries.length + offset];
+      if (
+        message?.record.type !== "runtime_event" ||
+        message.record.runId !== entry.record.runId ||
+        message.record.event.type !== "user_message" ||
+        !message.record.event.text.startsWith(`Parent message (${delivery.id}): `) ||
+        delivery.messageDigest !==
+          `sha256:${createHash("sha256").update(message.record.event.text, "utf8").digest("hex")}` ||
+        managedDeliveryIds.has(delivery.id)
+      )
+        throw new SessionLifecycleError("session_invalid");
+      managedDeliveryIds.add(delivery.id);
+      managedDeliveryMessageSequences.add(message.sequence);
+    }
+  }
   let run: SessionLogicalRunStartedRecord["record"] | undefined;
   let attemptState: ValidatedAttemptState | undefined;
   let sawUserMessage = false;
@@ -1649,6 +1676,11 @@ export function validateCurrentSessionHistory(
     }
     const event = record.event;
     if (event.type === "user_message") {
+      if (managedDeliveryMessageSequences.has(entry.sequence)) {
+        if (!sawUserMessage || terminalIntent !== undefined || attemptState?.status === "started")
+          throw new SessionLifecycleError("session_invalid");
+        continue;
+      }
       if (
         terminalIntent !== undefined ||
         sawUserMessage ||

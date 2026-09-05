@@ -118,6 +118,7 @@ import {
   isSessionRecordWithinSizeLimit,
   type SessionModelResponse,
   type SessionModelResponseField,
+  type SessionPartialOutputV1,
   type SessionRecord,
   type SessionStore,
   type SessionToolIntent,
@@ -182,8 +183,12 @@ type AgentSessionBaseDependencies = {
 export const sessionToolProfileNames = Symbol("adam-agent.session-tool-profile-names");
 export const managedAgentPromptSummary = Symbol("adam-agent.managed-agent-prompt-summary");
 export const managedAgentRequestBoundary = Symbol("adam-agent.managed-agent-request-boundary");
+export const managedAgentPartialOutput = Symbol("adam-agent.managed-agent-partial-output");
+/** Internal crash conformance barrier, after the canonical append has succeeded. */
+export const sessionRecordCommittedBarrier = Symbol("adam-agent.session-record-committed-barrier");
 
 export type ManagedAgentRequestBoundary = () => Promise<{
+  readonly atomicReceipt?: true;
   readonly messages: readonly { readonly id: `sha256:${string}`; readonly text: string }[];
   readonly deliveries: readonly {
     readonly id: `sha256:${string}`;
@@ -221,6 +226,9 @@ export class AgentSession {
   readonly #permissions: PermissionPolicy | undefined;
   readonly #managedAgentPromptSummary: (() => string) | undefined;
   readonly #managedAgentRequestBoundary: ManagedAgentRequestBoundary | undefined;
+  readonly #recordCommittedBarrier: ((record: SessionRecord) => Promise<void>) | undefined;
+  readonly #retainManagedPartialOutput: boolean;
+  #managedPartialOutput: SessionPartialOutputV1 | undefined;
   #lastManagedAgentPromptSummary: string | undefined;
   #promptContext: PromptContextRecord | undefined;
   #skillContext: SkillContextRecordV1 | undefined;
@@ -355,6 +363,15 @@ export class AgentSession {
         readonly [managedAgentRequestBoundary]?: ManagedAgentRequestBoundary;
       }
     )[managedAgentRequestBoundary];
+    this.#retainManagedPartialOutput =
+      (dependencies as AgentSessionDependencies & { readonly [managedAgentPartialOutput]?: true })[
+        managedAgentPartialOutput
+      ] === true;
+    this.#recordCommittedBarrier = (
+      dependencies as AgentSessionDependencies & {
+        readonly [sessionRecordCommittedBarrier]?: (record: SessionRecord) => Promise<void>;
+      }
+    )[sessionRecordCommittedBarrier];
     this.#promptContext =
       this.#durableContext === undefined
         ? createPromptContextV1(this.#tools)
@@ -763,9 +780,11 @@ export class AgentSession {
       }
       skipProactiveCompaction = false;
       const managedDelivery = await this.#managedAgentRequestBoundary?.();
+      this.#managedPartialOutput = undefined;
       for (const message of managedDelivery?.messages ?? []) {
         const text = `Parent message (${message.id}): ${message.text}`;
-        await this.#emit({ type: "user_message", text });
+        if (managedDelivery?.atomicReceipt !== true)
+          await this.#emit({ type: "user_message", text });
         messages.push({ role: "user", content: text });
       }
       if ((managedDelivery?.deliveries.length ?? 0) > 0) {
@@ -817,9 +836,24 @@ export class AgentSession {
         const targetIdentity = this.#durableContext.targetIdentity;
         const approvedPlan = this.#durableContext.approvedPlan;
         const appendAttempt = async () => {
-          await this.#appendRecord({
+          const deliveryRecords: SessionRecord[] =
+            managedDelivery?.atomicReceipt !== true
+              ? []
+              : managedDelivery.messages.map((message, index) => ({
+                  schemaVersion: 3,
+                  sequence: this.#nextSequence + index,
+                  record: {
+                    type: "runtime_event",
+                    runId: this.#activeRunId as string,
+                    event: {
+                      type: "user_message",
+                      text: `Parent message (${message.id}): ${message.text}`,
+                    },
+                  },
+                }));
+          const providerRecord: SessionRecord = {
             schemaVersion: 3,
-            sequence: this.#nextSequence,
+            sequence: this.#nextSequence + deliveryRecords.length,
             record: {
               type: "provider_attempt_started",
               runId: this.#activeRunId as string,
@@ -828,7 +862,21 @@ export class AgentSession {
               targetIdentity,
               ...(managedDelivery === undefined || managedDelivery.deliveries.length === 0
                 ? {}
-                : { managedAgentDeliveries: managedDelivery.deliveries }),
+                : managedDelivery.atomicReceipt !== true
+                  ? { managedAgentDeliveries: managedDelivery.deliveries }
+                  : {
+                      managedAgentDeliveryVersion: 3 as const,
+                      managedAgentDeliveries: managedDelivery.deliveries.map((delivery, index) => {
+                        const message = managedDelivery.messages[index];
+                        if (message?.id !== delivery.id)
+                          throw new Error("Managed delivery identity mismatch.");
+                        return {
+                          ...delivery,
+                          messageDigest:
+                            `sha256:${createHash("sha256").update(`Parent message (${message.id}): ${message.text}`, "utf8").digest("hex")}` as const,
+                        };
+                      }),
+                    }),
               ...(projectedContent === undefined ? {} : { projectedContent }),
               ...(this.#promptContext === undefined
                 ? {}
@@ -849,7 +897,14 @@ export class AgentSession {
                     },
                   }),
             },
-          });
+          };
+          if (deliveryRecords.length === 0) await this.#appendRecord(providerRecord);
+          else {
+            await this.#appendRecordsAtomically([...deliveryRecords, providerRecord]);
+            for (const record of deliveryRecords)
+              if (record.schemaVersion === 3 && record.record.type === "runtime_event")
+                this.#publish(record.record.event);
+          }
           this.#activeProviderAttempt = {
             runId: this.#activeRunId as string,
             turn: modelTurns,
@@ -1119,6 +1174,17 @@ export class AgentSession {
         streamError = error;
       }
       const answer = answerChunks.join("");
+      if (this.#retainManagedPartialOutput && answer.length > 0) {
+        const bytes = Buffer.from(answer, "utf8");
+        let end = Math.min(bytes.length, 16 * 1024);
+        while (end > 0 && end < bytes.length && ((bytes[end] ?? 0) & 0xc0) === 0x80) end -= 1;
+        this.#managedPartialOutput = {
+          version: 1,
+          text: bytes.subarray(0, end).toString("utf8"),
+          byteCount: bytes.length,
+          truncated: end < bytes.length,
+        };
+      }
       const reasoning = reasoningChunks.join("");
 
       if (finishReason !== undefined && activeReasoningModelId !== undefined) {
@@ -3872,6 +3938,9 @@ export class AgentSession {
         attempt: attempt.attempt,
         reason: "run_terminal",
         result,
+        ...(this.#managedPartialOutput === undefined
+          ? {}
+          : { partialOutput: this.#managedPartialOutput }),
       },
     });
     this.#activeProviderAttempt = undefined;
@@ -4084,6 +4153,7 @@ export class AgentSession {
       throw new SessionPersistenceError();
     }
     this.#nextSequence += 1;
+    await this.#recordCommittedBarrier?.(record);
   }
 
   async #appendRecordsAtomically(records: readonly SessionRecord[]): Promise<void> {
@@ -4093,6 +4163,7 @@ export class AgentSession {
       throw new SessionPersistenceError();
     }
     this.#nextSequence += records.length;
+    for (const record of records) await this.#recordCommittedBarrier?.(record);
   }
 
   async #persistDurableModelResponse(input: {

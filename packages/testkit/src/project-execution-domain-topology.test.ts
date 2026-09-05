@@ -9,12 +9,15 @@ const agentSourceRoot = fileURLToPath(new URL("../../agent/src/", import.meta.ur
 test("ProjectExecutionDomain is the sole production caller of ProjectLifecycleOwner", async () => {
   const sources = await productionAgentSources();
   const ownerMethodCalls = sources.flatMap(({ path, source }) =>
-    [...source.matchAll(/\b([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\.(acquire|run)\(/gu)].map(
-      (match) => ({ call: `${match[1]}.${match[2]}`, path }),
-    ),
+    [
+      ...source.matchAll(
+        /\b([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\.\s*(acquire|run)\s*\(/gu,
+      ),
+    ].map((match) => ({ call: `${match[1]?.replace(/\s+/gu, "")}.${match[2]}`, path })),
   );
 
   expect(ownerMethodCalls).toEqual([
+    { call: "child.run", path: "managed-agent-control.ts" },
     { call: "child.run", path: "managed-agent.ts" },
     { call: "options.lifecycleOwner.acquire", path: "project-execution-domain.ts" },
     { call: "session.run", path: "session-lifecycle.ts" },
