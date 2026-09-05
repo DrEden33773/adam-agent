@@ -266,6 +266,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const transcript = transcriptViewport.document;
   const draftInputsSlot = new Container();
   const editorSlot = new Container();
+  const interruption = new Text();
   const skillAtomIdentities = new Map<
     string,
     { readonly name: string; readonly qualifiedId: string }
@@ -293,6 +294,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           const state = options.presentation.getState();
           return isTuiRunActive({
             cancelSettling,
+            parentRun: state.authoritative.active?.parentRun,
+            sessionStatus: state.authoritative.active?.session.status,
             pendingInteractionCount: state.authoritative.active?.pendingInteractions.length ?? 0,
             transient: state.transient,
           });
@@ -606,8 +609,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     },
     {
       component: new VStack([
+        {
+          component: interruption,
+          visible: () =>
+            options.presentation.getState().authoritative.active?.parentRun?.phase ===
+            "interrupted",
+        },
         draftInputsSlot,
-        editorSlot,
+        {
+          component: editorSlot,
+          visible: () =>
+            options.presentation.getState().authoritative.active?.parentRun?.phase !==
+            "interrupted",
+        },
         {
           component: statusLine,
           visible: () => statusNotice !== null,
@@ -1318,6 +1332,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const renderState = () => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
+    interruption.setText(
+      [
+        "Interrupted session",
+        ...(active?.recovery?.canResume
+          ? ["r  Resume safe work"]
+          : ["This interrupted effect cannot be replayed safely."]),
+        "c  Cancel interrupted work",
+        "i  Inspect durable state",
+      ].join("\n"),
+    );
     synchronizeTodoCompactOverlay(active);
     managedAgentRoster.setManagedAgents(state.authoritative.managedAgents);
     agentNavigator?.navigator.setManagedAgents(
@@ -2154,6 +2178,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     const runActive = isTuiRunActive({
       cancelSettling,
+      parentRun: active?.parentRun,
+      sessionStatus: active?.session.status,
       pendingInteractionCount: active?.pendingInteractions.length ?? 0,
       transient: state.transient,
     });
@@ -2206,6 +2232,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
     }
     if (
+      active?.parentRun?.phase === "interrupted" ||
+      active?.parentRun?.phase === "recovering" ||
+      active?.parentRun?.phase === "cancelling" ||
       webSearchConfigurationPending ||
       startupTrustBlocked ||
       (active === null && state.draft === null)
@@ -2260,6 +2289,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           `draft${draft.mode === "plan" ? " · plan" : ""} · idle\n${safeTerminalText(draft.targetId)}\n/help · Tab complete`,
         ),
       });
+    } else if (active?.parentRun?.phase === "interrupted") {
+      footer.setText(
+        theme.muted(
+          active.recovery?.canResume ? "r Resume · c Cancel · i Inspect" : "c Cancel · i Inspect",
+        ),
+      );
     } else if (active !== null) {
       const runStatus = sessionRunStatus(state.transient?.activity ?? null, active, cancelSettling);
       const activeTarget = state.authoritative.targets.items.find(
@@ -4318,6 +4353,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     const runActive = isTuiRunActive({
       cancelSettling,
+      parentRun: active?.parentRun,
+      sessionStatus: active?.session.status,
       pendingInteractionCount: active.pendingInteractions.length,
       transient: state.transient,
     });
@@ -5558,6 +5595,39 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       return { consume: true };
     }
+    const recoveryActive = options.presentation.getState().authoritative.active;
+    if (
+      recoveryActive?.parentRun?.phase === "interrupted" &&
+      permission === undefined &&
+      focusedCloseableOverlay() === undefined
+    ) {
+      if (isKeyRepeat(data) || isKeyRelease(data)) return { consume: true };
+      if (matchesKey(data, "i")) {
+        submitEditorValue("/session");
+        return { consume: true };
+      }
+      const recovery = recoveryActive.recovery;
+      if (
+        recovery !== undefined &&
+        (matchesKey(data, "c") || (matchesKey(data, "r") && recovery.canResume))
+      ) {
+        void options.presentation
+          .dispatch({
+            type: matchesKey(data, "r")
+              ? "resume_interrupted_session"
+              : "cancel_interrupted_session",
+            sessionId: recoveryActive.session.id,
+            runId: recovery.runId,
+          })
+          .then((receipt) => {
+            if (receipt.status === "rejected")
+              showNotice("error", receipt.message, "until_next_action");
+            renderState();
+          });
+        return { consume: true };
+      }
+      if (!commandRegistry.matchesInput(data, "interrupt")) return { consume: true };
+    }
     if (commandRegistry.matchesInput(data, "toggle_tool_details")) {
       if (isKeyRepeat(data) || isKeyRelease(data)) {
         return { consume: true };
@@ -5751,6 +5821,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
       const runActive = isTuiRunActive({
         cancelSettling,
+        parentRun: active?.parentRun,
+        sessionStatus: active?.session.status,
         pendingInteractionCount: active?.pendingInteractions.length ?? 0,
         transient: runState.transient,
       });
@@ -6311,13 +6383,19 @@ function sessionRunStatus(
   active: ActiveSessionDisplay,
   cancelSettling: boolean,
 ): SessionRunStatus {
-  if (cancelSettling) {
+  if (active.parentRun?.phase === "interrupted") return "Interrupted session";
+  if (active.parentRun?.phase === "recovering") return "Recovering interrupted work";
+  if (active.parentRun?.phase === "cancelling" && active.recovery !== undefined)
+    return "Cancelling interrupted work";
+  if (cancelSettling || active.parentRun?.phase === "cancelling") {
     return "cancelling";
   }
   if (active.pendingInteractions.length > 0) {
     return "permission required";
   }
-  return activity === "using_tool" ? "using tool" : (activity ?? "idle");
+  return activity === "using_tool"
+    ? "using tool"
+    : (activity ?? (active.parentRun?.phase === "running" ? "working" : "idle"));
 }
 
 function authoritativePromptHistory(active: ActiveSessionDisplay | null): readonly string[] {

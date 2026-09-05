@@ -3296,6 +3296,147 @@ test("SessionLifecycle prefix branch keeps an approved parent artifact ready wit
   }
 });
 
+test("SessionLifecycle rejects ordinary input before append while exact Plan approval has not started", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-started-recovery-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const markdown = "# Recover this kickoff\n";
+  let providerCalls = 0;
+  let recoveredApprovedPlan: Parameters<ModelDriver["stream"]>[0]["approvedPlan"];
+  const driver = new FakeModelDriver((request) => {
+    providerCalls += 1;
+    if (providerCalls === 1) {
+      return [
+        { type: "tool_call_start", id: "submit-recovery-plan", name: "submit_plan" },
+        {
+          type: "tool_call_delta",
+          id: "submit-recovery-plan",
+          json: JSON.stringify({ markdown }),
+        },
+        { type: "tool_call_end", id: "submit-recovery-plan" },
+        { type: "finish", reason: "tool_calls" },
+      ];
+    }
+    recoveredApprovedPlan = request.approvedPlan;
+    return [
+      { type: "text_delta", text: "Recovered the reserved implementation run." },
+      { type: "finish", reason: "stop" },
+    ];
+  });
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile: testContextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            readiness: { status: "available", credentialSource: "deterministic test adapter" },
+            contextProfile: testContextProfile,
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  let lifecycle = harness.createLifecycle({
+    modelTargets,
+    stateRoot,
+    workspaceRoot,
+    [planApprovalIntentBarrier]: {
+      afterDurableRecord() {
+        throw new Error("stop before initial kickoff");
+      },
+    },
+  });
+
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.enterPlan({ sessionId: created.sessionId });
+    const submitted = await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Submit the recoverable plan." },
+    });
+    if (submitted.snapshot.plan?.state !== "ready") {
+      throw new Error("Expected a ready Plan artifact.");
+    }
+    const ready = submitted.snapshot.plan;
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        planApproval: {
+          commandId: "123e4567-e89b-42d3-a456-426614176031",
+          cycleId: ready.cycleId,
+          revision: ready.revision,
+          planId: ready.submission.planId,
+          contentDigest: ready.submission.contentDigest,
+        },
+      }),
+    ).rejects.toThrow("stop before initial kickoff");
+    const approved = await lifecycle.inspect({ sessionId: created.sessionId });
+    if (approved.schemaVersion !== 3 || approved.plan?.state !== "approved_not_started") {
+      throw new Error("Expected the durable approval intent.");
+    }
+    const approval = approved.plan.approval;
+    const store = await harness.sessions.open(created.sessionId);
+    if (store === undefined) {
+      throw new Error("Expected the durable Session store.");
+    }
+    const before = await store.read();
+    await expect(
+      lifecycle.continue({ sessionId: created.sessionId, input: { text: "Do unrelated work" } }),
+    ).rejects.toMatchObject({ code: "session_plan_approval_pending" });
+    expect(providerCalls).toBe(1);
+    expect(await store.read()).toEqual(before);
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
+      plan: approved.plan,
+    });
+    await lifecycle.close();
+    lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        input: { text: "Another ordinary turn after restart" },
+      }),
+    ).rejects.toMatchObject({ code: "session_plan_approval_pending" });
+    expect(await store.read()).toEqual(before);
+    expect(providerCalls).toBe(1);
+    await expect(
+      lifecycle.continue({
+        sessionId: created.sessionId,
+        planApproval: {
+          commandId: approval.commandId,
+          cycleId: approval.cycleId,
+          revision: approval.revision,
+          planId: approval.planId,
+          contentDigest: approval.contentDigest,
+        },
+      }),
+    ).resolves.toMatchObject({
+      result: { status: "completed", answer: "Recovered the reserved implementation run." },
+    });
+    expect(recoveredApprovedPlan).toEqual({
+      version: 1,
+      ...approval,
+      markdown,
+    });
+    const records = await store.read();
+    expect(
+      records.filter(
+        (entry) =>
+          entry.schemaVersion === 3 &&
+          entry.record.type === "logical_run_started" &&
+          entry.record.runId === approval.kickoffRunId,
+      ),
+    ).toHaveLength(1);
+  } finally {
+    await lifecycle.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("SessionLifecycle recovers a started Plan kickoff in the same reserved run without duplicate consumption", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-session-plan-started-recovery-"));
   const stateRoot = join(testRoot, "state");
@@ -9313,7 +9454,7 @@ test("SessionLifecycle cold continuation interrupts the old attempt and reuses i
         sessionId: created.sessionId,
         input: { text: "Replace the original request" },
       }),
-    ).rejects.toMatchObject({ code: "session_invalid" });
+    ).rejects.toMatchObject({ code: "session_recovery_required" });
     const events: RuntimeEvent[] = [];
     lifecycle.subscribe((event) => events.push(event));
     const continued = await lifecycle.continue({ sessionId: created.sessionId });

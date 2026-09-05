@@ -115,6 +115,7 @@ export const presentationSessionRecordReader = Symbol(
 );
 
 export type PresentationHydrationBarrier = {
+  afterAdmissionSnapshot?(): Promise<void>;
   afterHydrate(input: {
     readonly sessionId: string;
     readonly throughSequence: number;
@@ -255,7 +256,10 @@ export async function createPresentationSession(
       ) {
         created = inspected;
       } else {
-        const resumed = await options.lifecycle.resume({ sessionId: options.sessionId });
+        const resumed = await options.lifecycle.resume({
+          sessionId: options.sessionId,
+          preserveInterruptedEffects: true,
+        });
         if (resumed.status === "rejected") {
           throw new TypeError(resumed.error.message);
         }
@@ -482,6 +486,10 @@ export async function createPresentationSession(
       created === undefined
         ? { counts: { active: 0, terminal: 0, attention: 0 }, agents: [] }
         : await options.lifecycle.inspectManagedAgents({ sessionId: created.sessionId });
+    const initialRecovery =
+      created?.status !== "interrupted"
+        ? null
+        : await options.lifecycle.inspectInterruptedSession({ sessionId: created.sessionId });
     const authoritative: AuthoritativePresentationSnapshot = {
       schemaVersion: 1,
       continuity: initialOperationProjection.truncated
@@ -588,6 +596,7 @@ export async function createPresentationSession(
           ? null
           : {
               session: summary,
+              ...(initialRecovery === null ? {} : { recovery: initialRecovery }),
               transcript: transcriptPage(transcript, loadedTranscriptStart, created.sessionId),
               linkedOperations: projectedOperations.map(({ display }) => display),
               linkedOperationsTruncated: initialOperationProjection.truncated,
@@ -1226,6 +1235,7 @@ export async function createPresentationSession(
           sessionId: string | null;
           readonly controller: AbortController;
           settlement: Promise<void> | null;
+          recovery?: boolean;
         }
       | undefined;
     let activePlanCommand:
@@ -1235,7 +1245,26 @@ export async function createPresentationSession(
         }
       | undefined;
     let snapshotActivationQueue = Promise.resolve();
+    let lastSnapshotActivation =
+      created === undefined
+        ? undefined
+        : { sessionId: created.sessionId, throughSequence: created.lastSequence };
     const activateSnapshotNow = async (snapshot: CurrentSessionSnapshot): Promise<void> => {
+      // Admission cleanup may finish after the same run's terminal projection.
+      // A late snapshot must not rewind canonical Run/editor truth.
+      if (
+        state.authoritative.active?.session.id === snapshot.sessionId &&
+        lastSnapshotActivation?.sessionId === snapshot.sessionId &&
+        snapshot.lastSequence < lastSnapshotActivation.throughSequence
+      ) {
+        return;
+      }
+      const activatedRecovery =
+        snapshot.status === "interrupted"
+          ? await options.lifecycle.inspectInterruptedSession({
+              sessionId: snapshot.sessionId,
+            })
+          : null;
       const activatedRecords = await readActiveBranchRecords(options, snapshot.sessionId);
       const activatedOperationProjection = await projectLinkedOperations(
         options.operations,
@@ -1343,6 +1372,7 @@ export async function createPresentationSession(
           managedAgents: activatedManagedAgents,
           active: {
             session: activatedSummary,
+            ...(activatedRecovery === null ? {} : { recovery: activatedRecovery }),
             transcript: transcriptPage(transcript, loadedTranscriptStart, snapshot.sessionId),
             linkedOperations: activatedOperations.map((operation) => operation.display),
             linkedOperationsTruncated: activatedOperationProjection.truncated,
@@ -1364,6 +1394,10 @@ export async function createPresentationSession(
             : (state.transient ?? { activity: "working", assistant: null, reasoning: null }),
       };
       draftTargetIdentity = null;
+      lastSnapshotActivation = {
+        sessionId: snapshot.sessionId,
+        throughSequence: snapshot.lastSequence,
+      };
       publishStateChange();
       for (const operation of activatedOperations) {
         watchOperation(operation);
@@ -3014,7 +3048,10 @@ export async function createPresentationSession(
             throw new TypeError("Legacy sessions cannot be selected for continuation.");
           }
           if (snapshot.status === "interrupted") {
-            const resumed = await options.lifecycle.resume({ sessionId: command.sessionId });
+            const resumed = await options.lifecycle.resume({
+              sessionId: command.sessionId,
+              preserveInterruptedEffects: true,
+            });
             if (resumed.status === "rejected") {
               throw new TypeError(resumed.error.message);
             }
@@ -3319,6 +3356,13 @@ export async function createPresentationSession(
             status: "rejected",
             code: "conflict",
             message: "The active session already has a running command.",
+          };
+        }
+        if (state.authoritative.active.session.status === "interrupted") {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "Resolve interrupted work before sending another turn.",
           };
         }
         const activePlan = state.authoritative.active.plan;
@@ -3710,6 +3754,7 @@ export async function createPresentationSession(
             message: "The admitted draft session could not be read from durable history.",
           };
         }
+        await options[presentationHydrationBarrier]?.afterAdmissionSnapshot?.();
         if (recoverableDrafts !== null && submittedScope !== null) {
           await recoverableDrafts.delete(submittedScope);
         }
@@ -3802,6 +3847,81 @@ export async function createPresentationSession(
               message: "The permission request is no longer pending.",
             };
       }
+      if (
+        command.type === "resume_interrupted_session" ||
+        command.type === "cancel_interrupted_session"
+      ) {
+        if (
+          activeRun !== undefined ||
+          state.authoritative.active?.session.id !== command.sessionId ||
+          state.authoritative.continuity.status !== "current"
+        ) {
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "The interrupted session is no longer available.",
+          };
+        }
+        const recovery = await options.lifecycle.inspectInterruptedSession({
+          sessionId: command.sessionId,
+        });
+        if (
+          activeRun !== undefined ||
+          state.authoritative.active?.session.id !== command.sessionId ||
+          recovery?.runId !== command.runId ||
+          (command.type === "resume_interrupted_session" && !recovery.canResume)
+        ) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "This interrupted effect cannot be replayed safely.",
+          };
+        }
+        const controller = new AbortController();
+        const runState = {
+          sessionId: command.sessionId,
+          controller,
+          settlement: null as Promise<void> | null,
+          recovery: true,
+        };
+        activeRun = runState;
+        if (command.type === "cancel_interrupted_session") controller.abort();
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          transient: { activity: "working", assistant: null, reasoning: null },
+        };
+        publishStateChange();
+        const operation = (async (): Promise<CommandReceipt> => {
+          try {
+            const snapshot =
+              command.type === "cancel_interrupted_session"
+                ? await options.lifecycle.cancelInterruptedSession(command)
+                : (
+                    await options.lifecycle.continue({
+                      sessionId: command.sessionId,
+                      interruptedRunId: command.runId,
+                      signal: controller.signal,
+                    })
+                  ).snapshot;
+            await activateSnapshot(snapshot);
+            return { status: "admitted", commandId: randomUUID(), resource: null };
+          } catch {
+            await recoverAdmittedRunSnapshot(command.sessionId);
+            return {
+              status: "rejected",
+              code: "authority_rejected",
+              message: "Interrupted work could not be recovered. Inspect durable state.",
+            };
+          } finally {
+            if (activeRun === runState) activeRun = undefined;
+            state = { ...state, revision: state.revision + 1, transient: null };
+            publishStateChange();
+          }
+        })();
+        runState.settlement = operation.then(() => undefined);
+        return operation;
+      }
       if (command.type === "cancel_run") {
         if (
           activeRun === undefined ||
@@ -3814,6 +3934,8 @@ export async function createPresentationSession(
           };
         }
         activeRun.controller.abort();
+        state = { ...state, revision: state.revision + 1 };
+        publishStateChange();
         return { status: "admitted", commandId: randomUUID(), resource: null };
       }
       if (command.type === "start_project_changes") {
@@ -4621,8 +4743,39 @@ export async function createPresentationSession(
     };
 
     return {
-      getState: () =>
-        managedAgentActivity.length === 0 ? state : { ...state, managedAgentActivity },
+      getState: () => {
+        const active = state.authoritative.active;
+        const phase =
+          activeRun !== undefined
+            ? activeRun.controller.signal.aborted
+              ? ("cancelling" as const)
+              : activeRun.recovery
+                ? ("recovering" as const)
+                : ("running" as const)
+            : active?.session.status === "interrupted"
+              ? ("interrupted" as const)
+              : ("ready" as const);
+        return {
+          ...state,
+          ...(managedAgentActivity.length === 0 ? {} : { managedAgentActivity }),
+          authoritative: {
+            ...state.authoritative,
+            active:
+              active === null
+                ? null
+                : {
+                    ...active,
+                    parentRun: {
+                      phase,
+                      editor:
+                        phase === "ready" && active.plan?.state !== "approved_not_started"
+                          ? ("ready" as const)
+                          : ("blocked" as const),
+                    },
+                  },
+          },
+        };
+      },
       subscribe(onChange) {
         if (closed) {
           return () => {};

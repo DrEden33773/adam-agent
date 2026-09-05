@@ -746,6 +746,7 @@ export interface SessionLifecycle {
   branch(input: SessionBranchInput): Promise<CurrentSessionSnapshot>;
   close(): Promise<McpCloseResult>;
   continue(input: {
+    readonly interruptedRunId?: string;
     readonly sessionId: string;
     readonly input?: UserInput;
     readonly limits?: RunOptions["limits"];
@@ -863,7 +864,18 @@ export interface SessionLifecycle {
     readonly childModel: ModelDriver;
     readonly thinkingPolicy?: ThinkingPolicySnapshotV1;
   }>;
-  resume(input: { readonly sessionId: string }): Promise<SessionResumeResult>;
+  resume(input: {
+    readonly sessionId: string;
+    readonly preserveInterruptedEffects?: boolean;
+  }): Promise<SessionResumeResult>;
+  inspectInterruptedSession(input: { readonly sessionId: string }): Promise<{
+    readonly runId: string;
+    readonly canResume: boolean;
+  } | null>;
+  cancelInterruptedSession(input: {
+    readonly sessionId: string;
+    readonly runId: string;
+  }): Promise<CurrentSessionSnapshot>;
   clearSessionManualName(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
   setSessionManualName(input: {
     readonly sessionId: string;
@@ -2553,7 +2565,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   };
 
   const resumeSession = async (
-    input: { readonly sessionId: string },
+    input: { readonly sessionId: string; readonly preserveInterruptedEffects?: boolean },
     artifactCache = createArtifactMaterializationCache(),
   ): Promise<SessionResumeResult> => {
     let snapshot = await inspectSession(input, artifactCache);
@@ -2630,6 +2642,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       if (
         snapshot.schemaVersion === 3 &&
         snapshot.status === "interrupted" &&
+        input.preserveInterruptedEffects !== true &&
         (await settleIndeterminateToolEffects(options, snapshot, recoveryTools))
       ) {
         snapshot = await inspectSession(input, artifactCache);
@@ -2951,6 +2964,62 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     const plan = planCycleSnapshotFromRecords(records);
     const current = plan === undefined ? snapshot : { ...snapshot, plan };
     return prepared.mcp === undefined ? current : { ...current, mcp: prepared.mcp };
+  };
+
+  const inspectInterruptedSession = async (input: {
+    readonly sessionId: string;
+  }): Promise<{ readonly runId: string; readonly canResume: boolean } | null> => {
+    const snapshot = await inspectSession(input);
+    if (
+      snapshot.schemaVersion !== 3 ||
+      snapshot.status !== "interrupted" ||
+      snapshot.run === undefined
+    )
+      return null;
+    const records = await readSessionRecords(options, input.sessionId);
+    const genesis = records[0];
+    if (genesis === undefined || !isGenesisRecord(genesis))
+      throw new SessionLifecycleError("session_invalid");
+    const tools = await toolsForSessionAuthority(input.sessionId, genesis, records);
+    const runId = snapshot.run.runId;
+    let safePendingTool = false;
+    for (const entry of records) {
+      if (
+        entry.schemaVersion !== 3 ||
+        entry.record.type !== "model_response_completed" ||
+        entry.record.runId !== runId
+      )
+        continue;
+      for (const call of entry.record.response.toolCalls) {
+        const terminal = records.some(
+          (candidate) =>
+            candidate.sequence > entry.sequence &&
+            candidate.schemaVersion === 3 &&
+            candidate.record.type === "runtime_event" &&
+            candidate.record.runId === runId &&
+            (candidate.record.event.type === "tool_completed" ||
+              candidate.record.event.type === "tool_failed") &&
+            candidate.record.event.callId === call.id,
+        );
+        if (terminal) continue;
+        if (!isExactSafeReplay(tools, snapshot, entry.record, call))
+          return { runId, canResume: false };
+        safePendingTool = true;
+      }
+    }
+    if (
+      !safePendingTool &&
+      snapshot.run.lastAttempt?.status === "completed" &&
+      snapshot.run.lastCompletedResponse?.finishReason !== "tool_calls"
+    )
+      return null;
+    return {
+      runId,
+      canResume:
+        safePendingTool ||
+        snapshot.run.lastAttempt === undefined ||
+        snapshot.run.lastAttempt.status === "completed",
+    };
   };
 
   return {
@@ -3588,6 +3657,24 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       disarmMcpIdle(input.sessionId);
       await waitForMcpIdleOperation(input.sessionId);
       const continued = await withOwner(async (parentRoot) => {
+        if (input.interruptedRunId !== undefined) {
+          const recovery = await inspectInterruptedSession({ sessionId: input.sessionId });
+          if (
+            effectiveInput !== undefined ||
+            input.planApproval !== undefined ||
+            recovery?.runId !== input.interruptedRunId ||
+            !recovery.canResume
+          )
+            throw new SessionLifecycleError("session_invalid");
+        }
+        if (effectiveInput !== undefined) {
+          const admission = await inspectSession({ sessionId: input.sessionId });
+          if (admission.schemaVersion === 3 && admission.plan?.state === "approved_not_started") {
+            throw new SessionLifecycleError("session_plan_approval_pending");
+          }
+          if (admission.schemaVersion === 3 && admission.status === "interrupted")
+            throw new SessionLifecycleError("session_recovery_required");
+        }
         if (
           options.managedAgentTools !== undefined &&
           !(
@@ -5828,6 +5915,78 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ? {}
           : { thinkingPolicy: requireRecoveredThinkingPolicy(resolved, thinkingPolicy) }),
       };
+    },
+    inspectInterruptedSession,
+    async cancelInterruptedSession(input) {
+      return withOwner(async () => {
+        let snapshot = await inspectSession(input);
+        if (
+          snapshot.schemaVersion !== 3 ||
+          snapshot.status !== "interrupted" ||
+          snapshot.run?.runId !== input.runId
+        )
+          throw new SessionLifecycleError("session_invalid");
+        await appendDanglingAttemptInterruption(options, snapshot);
+        const records = await readSessionRecords(options, input.sessionId);
+        const store = await openSessionStore(options, input.sessionId);
+        let sequence = records.length + 1;
+        for (const entry of records) {
+          if (
+            entry.schemaVersion !== 3 ||
+            entry.record.type !== "runtime_event" ||
+            entry.record.runId !== input.runId ||
+            entry.record.event.type !== "tool_requested"
+          )
+            continue;
+          const call = entry.record.event;
+          if (
+            records.some(
+              (later) =>
+                later.sequence > entry.sequence &&
+                later.schemaVersion === 3 &&
+                later.record.type === "runtime_event" &&
+                later.record.runId === input.runId &&
+                (later.record.event.type === "tool_completed" ||
+                  later.record.event.type === "tool_failed") &&
+                later.record.event.callId === call.callId,
+            )
+          )
+            continue;
+          await store.append({
+            schemaVersion: 3,
+            sequence: sequence++,
+            record: {
+              type: "runtime_event",
+              runId: input.runId,
+              event: {
+                type: "tool_failed",
+                callId: call.callId,
+                name: call.name,
+                error: {
+                  code: "tool_effect_indeterminate",
+                  reason: "process_restart",
+                  message: "The interrupted tool was cancelled without replay.",
+                },
+              },
+            },
+          });
+        }
+        await store.append({
+          schemaVersion: 3,
+          sequence,
+          record: {
+            type: "runtime_event",
+            runId: input.runId,
+            event: { type: "session_interrupted", reason: "cancelled" },
+          },
+        });
+        snapshot = await inspectSession(input);
+        if (snapshot.schemaVersion !== 3) throw new SessionLifecycleError("session_invalid");
+        await settleInterruptedCancellation(options, snapshot);
+        const settled = await inspectSession(input);
+        if (settled.schemaVersion !== 3) throw new SessionLifecycleError("session_invalid");
+        return settled;
+      });
     },
     async resume(input) {
       if (activeTitleSessions.has(input.sessionId)) {

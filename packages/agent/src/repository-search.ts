@@ -550,6 +550,7 @@ export function createRepositorySearchToolAdapter(options: {
   readonly processObserver?: RepositorySearchProcessObserver;
   readonly rgPathOverrideForTesting?: string;
   readonly backendForTesting?: RepositorySearchBackend;
+  readonly probeFileSystemForTesting?: Pick<typeof import("node:fs/promises"), "lstat" | "open">;
 }): Omit<ToolAdapter, "definitionDigest" | "replay"> {
   const workspaceRoot = resolve(options.workspaceRoot);
   const snapshots = new SearchSnapshotRegistry();
@@ -672,7 +673,9 @@ export function createRepositorySearchToolAdapter(options: {
                 signal: context.signal,
                 budget,
                 backend,
+                probeFileSystem: options.probeFileSystemForTesting ?? { lstat, open },
               });
+              context.signal.throwIfAborted();
               const limit = parsedArguments.data.limit ?? defaultPathResults;
               return {
                 status: "completed",
@@ -713,6 +716,7 @@ export function createRepositorySearchToolAdapter(options: {
               signal: context.signal,
               budget,
               backend,
+              probeFileSystem: options.probeFileSystemForTesting ?? { lstat, open },
             });
             context.signal.throwIfAborted();
             return {
@@ -845,6 +849,7 @@ async function runContentSearch(options: {
   readonly exclude: readonly string[];
   readonly context: number;
   readonly signal: AbortSignal;
+  readonly probeFileSystem: Pick<typeof import("node:fs/promises"), "lstat" | "open">;
   readonly budget: SearchRequestBudget;
   readonly backend: RepositorySearchBackend;
 }): Promise<{
@@ -897,6 +902,8 @@ async function runContentSearch(options: {
       options.workspaceRoot,
       [...new Set(parsed.matches.map((match) => match.path))],
       options.budget,
+      options.probeFileSystem,
+      options.signal,
       parsed.initialFileIdentities,
     );
     const accepted = new Set(probed.paths);
@@ -929,6 +936,7 @@ async function runPathSearch(options: {
   readonly query: string;
   readonly mode: "fuzzy" | "glob";
   readonly signal: AbortSignal;
+  readonly probeFileSystem: Pick<typeof import("node:fs/promises"), "lstat" | "open">;
   readonly budget: SearchRequestBudget;
   readonly backend: RepositorySearchBackend;
 }): Promise<{
@@ -986,11 +994,14 @@ async function runPathSearch(options: {
       }
     },
   });
+  options.signal.throwIfAborted();
   const ranked = candidates.sorted();
   const probed = await probeCandidatePaths(
     options.workspaceRoot,
     ranked.map((candidate) => candidate.path),
     options.budget,
+    options.probeFileSystem,
+    options.signal,
     initialFileIdentities,
   );
   const accepted = new Set(probed.paths);
@@ -1021,6 +1032,7 @@ function readGitChangedPaths(
   signal: AbortSignal,
   budget: RepositorySearchBackendBudget,
 ): Promise<ReadonlySet<string>> {
+  signal.throwIfAborted();
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcessWithoutNullStreams;
     try {
@@ -1147,6 +1159,8 @@ async function probeCandidatePaths(
   workspaceRoot: string,
   paths: readonly string[],
   budget: SearchRequestBudget,
+  fileSystem: Pick<typeof import("node:fs/promises"), "lstat" | "open">,
+  signal: AbortSignal,
   initialFileIdentities?: ReadonlyMap<string, FileIdentity | undefined>,
 ): Promise<{
   readonly paths: string[];
@@ -1155,10 +1169,13 @@ async function probeCandidatePaths(
   const accepted: string[] = [];
   const omissions: z.infer<typeof omissionSchema>[] = [];
   for (const path of paths) {
+    signal.throwIfAborted();
     budget.consumeWorkRecord();
     const omission = await probeCandidatePath(
       workspaceRoot,
       path,
+      fileSystem,
+      signal,
       initialFileIdentities === undefined
         ? undefined
         : {
@@ -1178,6 +1195,8 @@ async function probeCandidatePaths(
 async function probeCandidatePath(
   workspaceRoot: string,
   path: string,
+  fileSystem: Pick<typeof import("node:fs/promises"), "lstat" | "open">,
+  signal: AbortSignal,
   initial?: { readonly observed: boolean; readonly identity: FileIdentity | undefined },
 ): Promise<"binary" | "non_ordinary" | "unreadable" | "changed" | undefined> {
   const absolutePath = resolve(workspaceRoot, path);
@@ -1185,7 +1204,9 @@ async function probeCandidatePath(
     return "non_ordinary";
   }
   try {
-    const before = await lstat(absolutePath);
+    signal.throwIfAborted();
+    const before = await fileSystem.lstat(absolutePath);
+    signal.throwIfAborted();
     if (!before.isFile() || before.isSymbolicLink()) {
       return "non_ordinary";
     }
@@ -1197,9 +1218,14 @@ async function probeCandidatePath(
     ) {
       return "changed";
     }
-    const handle = await open(absolutePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    const handle = await fileSystem.open(
+      absolutePath,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+    );
     try {
+      signal.throwIfAborted();
       const opened = await handle.stat();
+      signal.throwIfAborted();
       if (
         opened.dev !== before.dev ||
         opened.ino !== before.ino ||
@@ -1210,7 +1236,9 @@ async function probeCandidatePath(
       }
       const prefix = Buffer.allocUnsafe(Math.min(binaryProbeBytes, opened.size));
       const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0);
+      signal.throwIfAborted();
       const after = await handle.stat();
+      signal.throwIfAborted();
       if (
         after.dev !== opened.dev ||
         after.ino !== opened.ino ||
@@ -1224,6 +1252,7 @@ async function probeCandidatePath(
       await handle.close();
     }
   } catch {
+    signal.throwIfAborted();
     return "unreadable";
   }
 }
@@ -1836,5 +1865,5 @@ function decodeCursor(
 }
 
 export function repositorySearchBackendForTesting() {
-  return { rgPath } as const;
+  return { rgPath, create: createProcessRepositorySearchBackend } as const;
 }
