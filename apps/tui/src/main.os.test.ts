@@ -80,12 +80,18 @@ test("the real TUI process restores the terminal after staging one input resourc
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
+    await expect(fixture.waitForRecordedOutput("")).rejects.toThrow("non-empty");
+    await expect(fixture.waitForScreen("")).rejects.toThrow("non-empty");
+    await expect(fixture.waitForRecordedOutput(" ", 0)).rejects.toThrow("non-empty");
+    await expect(fixture.waitForCompleteFrameAfter("", 0)).rejects.toThrow("non-empty");
     const beforeAttach = fixture.output().length;
     fixture.write(`/attach ${selectedPath}\r`);
     await fixture.waitForCompleteFrameAfter("Input resource staged.", beforeAttach);
     fixture.write("\u0011");
     const result = await fixture.closed;
+    await expect(fixture.waitForScreen("Input resource staged.")).rejects.toThrow("closed");
+    await fixture.waitForRecordedOutput("Input resource staged.");
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(result.stdout).toContain("\u001b[?2004h");
     expect(result.stdout).toContain("\u001b[?2004l");
@@ -256,7 +262,7 @@ test("real TUI starts on an authoritative empty session and restores the termina
 
   try {
     const fixture = startFixture({ external: true, stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const startupScreen = fixture.screen()?.join("\n") ?? "";
     fixture.write("\u0011");
     const result = await fixture.closed;
@@ -312,11 +318,11 @@ test("the production PTY persists owner-only config and trust, completes a finit
     expect(completionFrame).toContain("> status");
     expect(completionFrame).not.toContain("→ status");
     fixture.write("\t\r");
-    await fixture.waitForAfter("Workspace trust: trusted", beforeAction);
+    await fixture.waitForRecordedOutput("Workspace trust: trusted", beforeAction);
 
     beforeAction = fixture.output().length;
     fixture.write("/config output 1234\r");
-    await fixture.waitForAfter("Saved output limit: 1234 tokens.", beforeAction);
+    await fixture.waitForRecordedOutput("Saved output limit: 1234 tokens.", beforeAction);
     beforeAction = fixture.output().length;
     fixture.write("/config\r");
     await fixture.waitForCompleteFrameAfter("User model configuration", beforeAction);
@@ -332,7 +338,7 @@ test("the production PTY persists owner-only config and trust, completes a finit
     beforeAction = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
     fixture.write("configuration focus restored");
-    await fixture.waitForAfter("configuration focus restored", beforeAction);
+    await fixture.waitForRecordedOutput("configuration focus restored", beforeAction);
     expect(fixture.output().slice(beforeAction)).not.toContain("Configuration closed.");
     fixture.write("\u0015");
 
@@ -377,14 +383,14 @@ test("real PTY streams Ctrl+T reasoning and restores application mouse modes on 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Exercise PTY reasoning\r");
     await waitForPath(join(controlRoot, "model-started"));
-    await fixture.waitFor("Thinking · provider reasoning · adam");
+    await fixture.waitForRecordedOutput("Thinking · provider reasoning · adam");
     fixture.write("\u0014");
-    await fixture.waitFor("Inspect ");
+    await fixture.waitForRecordedOutput("Inspect ");
     await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
-    await fixture.waitFor("Inspect the evidence.");
+    await fixture.waitForRecordedOutput("Inspect the evidence.");
     const beforeAnswer = fixture.output().length;
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
@@ -425,7 +431,7 @@ test("real PTY submits a Plan with assistant preamble and restores every termina
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePlan = fixture.output().length;
     fixture.write("/plan\r");
     await fixture.waitForCompleteFrameAfter("Plan exploring", beforePlan);
@@ -462,7 +468,7 @@ test("real PTY restores every terminal input mode after Plan settlement and refr
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePlan = fixture.output().length;
     fixture.write("/plan\r");
     await fixture.waitForCompleteFrameAfter("Plan exploring", beforePlan);
@@ -502,10 +508,10 @@ test.each([
         terminalProcessMarker,
         workspaceRoot,
       });
-      await fixture.waitFor("Adam · New session");
+      await fixture.waitForScreen("Adam · New session");
       const privateDraftSentinel = `PRIVATE_${signal}_DRAFT_SENTINEL`;
       fixture.write(privateDraftSentinel);
-      await fixture.waitFor(privateDraftSentinel);
+      await fixture.waitForRecordedOutput(privateDraftSentinel);
       await fixture.terminate(signal);
       const result = await fixture.closed;
       expect(result).toMatchObject({ code, signal: null, stderr: "" });
@@ -539,36 +545,38 @@ test("a real tool output artifact opens through the active chronology picker", a
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Produce tool output\r");
     await waitForPath(join(controlRoot, "prompt-submitted"));
     const modelRequest = await Promise.race([
       waitForPath(join(controlRoot, "tool-artifact-requested")).then(() => "requested" as const),
-      fixture.waitFor("The model run failed.").then(() => "failed" as const),
+      fixture.waitForRecordedOutput("The model run failed.").then(() => "failed" as const),
     ]);
     expect(modelRequest).toBe("requested");
     const toolSettlement = await Promise.race([
       waitForPath(join(controlRoot, "tool-artifact-result")).then(() => "completed" as const),
-      fixture.waitFor("artifact_store_failed").then(() => "artifact_failed" as const),
+      fixture.waitForRecordedOutput("artifact_store_failed").then(() => "artifact_failed" as const),
     ]);
     expect(toolSettlement).toBe("completed");
-    await fixture.waitFor("Tool artifact complete");
+    await fixture.waitForRecordedOutput("Tool artifact complete");
     expect(fixture.output()).toContain("output truncated");
     fixture.write("/artifacts \r");
     const artifactList = await Promise.race([
-      fixture.waitFor("shell output").then(() => "listed" as const),
+      fixture.waitForRecordedOutput("shell output").then(() => "listed" as const),
       fixture
-        .waitFor("No artifacts are visible in the active chronology")
+        .waitForRecordedOutput("No artifacts are visible in the active chronology")
         .then(() => "empty" as const),
     ]);
     expect(artifactList).toBe("listed");
     fixture.write("\r");
     await waitForPath(join(controlRoot, "artifact-read-1"));
     const firstPage = await Promise.race([
-      fixture.waitFor("1-16384 of 70000 bytes").then(() => "opened" as const),
-      fixture.waitFor("The artifact could not be read safely").then(() => "unsafe" as const),
+      fixture.waitForRecordedOutput("1-16384 of 70000 bytes").then(() => "opened" as const),
       fixture
-        .waitFor("The artifact is not available through this Presentation session")
+        .waitForRecordedOutput("The artifact could not be read safely")
+        .then(() => "unsafe" as const),
+      fixture
+        .waitForRecordedOutput("The artifact is not available through this Presentation session")
         .then(() => "unavailable" as const),
     ]);
     expect(firstPage).toBe("opened");
@@ -830,12 +838,14 @@ test("the production TUI composes the Linux clipboard adapter for copy commands"
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor(assistantText);
+    await fixture.waitForRecordedOutput(assistantText);
     fixture.write("/copy\r");
     const copyStatus = await Promise.race([
-      fixture.waitFor("Copied last assistant response.").then(() => "copied" as const),
       fixture
-        .waitFor("Clipboard unavailable; assistant response was not copied.")
+        .waitForRecordedOutput("Copied last assistant response.")
+        .then(() => "copied" as const),
+      fixture
+        .waitForRecordedOutput("Clipboard unavailable; assistant response was not copied.")
         .then(() => "unavailable" as const),
     ]);
     expect(copyStatus).toBe("copied");
@@ -869,8 +879,8 @@ test("the production TUI entry reaches a credentialed exact-target session witho
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
-    await fixture.waitFor("deepseek-v4-flash.direct · Certified");
+    await fixture.waitForScreen("Adam · New session");
+    await fixture.waitForRecordedOutput("deepseek-v4-flash.direct · Certified");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -911,7 +921,7 @@ test("the production TUI exposes one enabled extension Skill in the first-prompt
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePalette = fixture.output().length;
     fixture.write("/skills\r");
     await fixture.waitForCompleteFrameAfter("Select next-turn Skills", beforePalette);
@@ -1028,12 +1038,12 @@ test("the production TUI reviews real Git changes through the exact public Eve a
   try {
     await trustWorkspace(configRoot, workspaceRoot);
     const fixture = startFixture({ program, stateRoot, terminalProcessMarker, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     await fixture.resize(120, 40);
     fixture.write("/review\r");
-    await fixture.waitFor("eve-reviewer@0.5.0");
-    await fixture.waitFor("Completed");
-    await fixture.waitFor("Report · eve-reviewer.review-result@1 · application/json");
+    await fixture.waitForRecordedOutput("eve-reviewer@0.5.0");
+    await fixture.waitForRecordedOutput("Completed");
+    await fixture.waitForRecordedOutput("Report · eve-reviewer.review-result@1 · application/json");
 
     let beforeResize = fixture.output().length;
     await fixture.resize(40, 24);
@@ -1047,10 +1057,10 @@ test("the production TUI reviews real Git changes through the exact public Eve a
     await fixture.waitForCompleteFrameAfter("eve-reviewer.local-worktree-review@1", beforeResize);
 
     fixture.write("/artifacts\r");
-    await fixture.waitFor("Review project changes report");
+    await fixture.waitForRecordedOutput("Review project changes report");
     fixture.write("\r");
-    await fixture.waitFor("Artifact detail");
-    await fixture.waitFor("schemaVersion");
+    await fixture.waitForRecordedOutput("Artifact detail");
+    await fixture.waitForRecordedOutput("schemaVersion");
     fixture.write("\u0011");
     const firstResult = await fixture.closed;
     expect(firstResult).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -1166,13 +1176,13 @@ test("a missing configured package disables admission while preserving generic h
       terminalProcessMarker,
       workspaceRoot,
     });
-    await fixture.waitFor("Configured extension packages are unavailable");
+    await fixture.waitForRecordedOutput("Configured extension packages are unavailable");
     await fixture.resize(120, 40);
-    await fixture.waitFor("fixture.recoverable-review@1");
-    await fixture.waitFor("Completed");
-    await fixture.waitFor("generic");
+    await fixture.waitForRecordedOutput("fixture.recoverable-review@1");
+    await fixture.waitForRecordedOutput("Completed");
+    await fixture.waitForRecordedOutput("generic");
     fixture.write("/review\r");
-    await fixture.waitFor("Unknown command /review");
+    await fixture.waitForRecordedOutput("Unknown command /review");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -1243,16 +1253,16 @@ test("the production TUI rehydrates and explicitly recovers one operation after 
       terminalProcessMarker,
       workspaceRoot,
     });
-    await interrupted.waitFor("Adam · New session");
+    await interrupted.waitForScreen("Adam · New session");
     interrupted.write("/review\r");
-    await interrupted.waitFor("Running · analyzing interrupted project changes");
+    await interrupted.waitForRecordedOutput("Running · analyzing interrupted project changes");
     await waitForPath(executionMarker);
     await interrupted.terminate("SIGKILL");
     await interrupted.closed;
 
     const resumed = startFixture({ program, stateRoot, terminalProcessMarker, workspaceRoot });
-    await resumed.waitFor("Recovery required");
-    await resumed.waitFor("Ctrl+R recover");
+    await resumed.waitForRecordedOutput("Recovery required");
+    await resumed.waitForRecordedOutput("Ctrl+R recover");
     await resumed.resize(120, 40);
     const beforeRecovery = resumed.output().length;
     resumed.write("\u0012");
@@ -1300,18 +1310,18 @@ test("the real TUI MCP wizard preserves every separate B8 authority step", async
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/mc");
-    await fixture.waitFor("/mc");
+    await fixture.waitForRecordedOutput("/mc");
     fixture.write("\t");
-    await fixture.waitFor("/mcp");
+    await fixture.waitForRecordedOutput("/mcp");
     const afterTyping = fixture.output().length;
     fixture.write("\r");
     const outcome = await Promise.race([
       fixture
         .waitForCompleteFrameAfter("MCP authority · workspace confirmation required", afterTyping)
         .then(() => "wizard" as const),
-      fixture.waitForAfter("Working", afterTyping).then(() => "prompt" as const),
+      fixture.waitForRecordedOutput("Working", afterTyping).then(() => "prompt" as const),
     ]);
     expect(outcome).toBe("wizard");
     let beforeStep = fixture.output().length;
@@ -1422,9 +1432,9 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
     });
     await seed.waitForCompleteFrameAfter("Adam · MCP reactivation session", 0);
     seed.write("/mc");
-    await seed.waitFor("/mc");
+    await seed.waitForRecordedOutput("/mc");
     seed.write("\t");
-    await seed.waitFor("/mcp");
+    await seed.waitForRecordedOutput("/mcp");
     let beforeStep = seed.output().length;
     seed.write("\r");
     await seed.waitForCompleteFrameAfter(
@@ -1449,7 +1459,7 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
     await expect(seed.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
     const resumed = startFixture({ program, stateRoot, workspaceRoot });
-    await resumed.waitFor("Select a project session");
+    await resumed.waitForRecordedOutput("Select a project session");
     const beforeSessionSelection = resumed.output().length;
     resumed.write("\u001b[B");
     await resumed.waitForCompleteFrameAfter("MCP reactivation session", beforeSessionSelection);
@@ -1457,9 +1467,9 @@ test("the production TUI resumes and explicitly reactivates one committed MCP pr
     resumed.write("\r");
     await resumed.waitForCompleteFrameAfter("Adam · MCP reactivation session", beforeOpen);
     resumed.write("/mc");
-    await resumed.waitFor("/mc");
+    await resumed.waitForRecordedOutput("/mc");
     resumed.write("\t");
-    await resumed.waitFor("/mcp");
+    await resumed.waitForRecordedOutput("/mcp");
     beforeStep = resumed.output().length;
     resumed.write("\r");
     await resumed.waitForCompleteFrameAfter(
@@ -1531,11 +1541,11 @@ test("the TUI process preserves the MCP shutdown diagnosis across a terminal cle
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/mc");
-    await fixture.waitFor("/mc");
+    await fixture.waitForRecordedOutput("/mc");
     fixture.write("\t");
-    await fixture.waitFor("/mcp");
+    await fixture.waitForRecordedOutput("/mcp");
     let beforeStep = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter(
@@ -1580,11 +1590,13 @@ test("idle Ctrl+C preserves a CJK draft and copies it only on the confirming pre
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write(draft);
-    await fixture.waitFor(draft);
+    await fixture.waitForRecordedOutput(draft);
     fixture.write("\u001b[99;5:1u");
-    await fixture.waitFor("Press Ctrl+C again within two seconds to exit · draft will be copied");
+    await fixture.waitForRecordedOutput(
+      "Press Ctrl+C again within two seconds to exit · draft will be copied",
+    );
     expect(fixture.output()).not.toContain("clipboard copied");
     fixture.write("\u0003");
     const result = await fixture.closed;
@@ -1614,13 +1626,13 @@ test("Kitty Ctrl+C repeat and release phases cannot confirm an armed exit", asyn
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("草稿");
-    await fixture.waitFor("草稿");
+    await fixture.waitForRecordedOutput("草稿");
     fixture.write("\u001b[99;5:1u");
-    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
+    await fixture.waitForRecordedOutput("Press Ctrl+C again within two seconds to exit");
     fixture.write("\u001b[99;5:2u\u001b[99;5:3ux");
-    await fixture.waitFor("草稿x");
+    await fixture.waitForRecordedOutput("草稿x");
     await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).rejects.toMatchObject({
       code: "ENOENT",
     });
@@ -1653,16 +1665,16 @@ test("Kitty Ctrl+O repeat and release phases expand one tool card only once", as
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Read the README\r");
-    await fixture.waitFor("Read complete.");
+    await fixture.waitForRecordedOutput("Read complete.");
     const beforeToolView = fixture.output().length;
     fixture.write("\u001b[5~");
-    await fixture.waitForAfter("\u001b[?2026l", beforeToolView);
+    await fixture.waitForRecordedOutput("\u001b[?2026l", beforeToolView);
     expect(fixture.screen()?.join("\n") ?? "").toContain("read README.md · Ctrl+O expand");
     const beforeToggle = fixture.output().length;
     fixture.write("\u001b[111;5:1u\u001b[111;5:2u\u001b[111;5:2u\u001b[111;5:3ux");
-    await fixture.waitForAfter("x", beforeToggle);
+    await fixture.waitForRecordedOutput("x", beforeToggle);
     const screen = fixture.screen()?.join("\n") ?? "";
     expect(screen).toContain("read README.md · Ctrl+O fold");
     fixture.write("\u0015\u0011");
@@ -1680,9 +1692,9 @@ test("unsupported clipboard is reported after terminal restoration without block
 
   try {
     const fixture = startFixture({ external: true, stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("draft without clipboard");
-    await fixture.waitFor("draft without clipboard");
+    await fixture.waitForRecordedOutput("draft without clipboard");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -1708,13 +1720,13 @@ test("the real terminal admits a mutation permission with Enter", async () => {
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Edit the file\r");
-    await fixture.waitFor("Permission required");
-    await fixture.waitFor("-before");
-    await fixture.waitFor("+after");
+    await fixture.waitForRecordedOutput("Permission required");
+    await fixture.waitForRecordedOutput("-before");
+    await fixture.waitForRecordedOutput("+after");
     fixture.write("\r");
-    await fixture.waitFor("Edit complete");
+    await fixture.waitForRecordedOutput("Edit complete");
     await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("after\n");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -1739,12 +1751,12 @@ test("the real terminal delivers Ctrl+C interruption without arming exit", async
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Cancel this run\r");
-    await fixture.waitFor("Working");
+    await fixture.waitForRecordedOutput("Working");
     await waitForPath(join(controlRoot, "model-started"));
     fixture.write("\u0003\u0003");
-    await fixture.waitFor("cancelled");
+    await fixture.waitForRecordedOutput("cancelled");
     expect(fixture.output()).not.toContain("Press Ctrl+C again");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -1772,7 +1784,7 @@ test("the real terminal promotes one large bracketed multiline paste to a Text a
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePaste = fixture.output().length;
     fixture.write(`\u001b[200~${pasted}\u001b[201~`);
     await fixture.waitForCompleteFrameAfter("Pasted text staged.", beforePaste);
@@ -1793,13 +1805,13 @@ test("the real terminal positions the IME cursor on CJK and grapheme cell bounda
 
   try {
     const fixture = startFixture({ external: true, stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("A中e\u0301👩🏽‍💻Z");
-    await fixture.waitFor("A中e");
+    await fixture.waitForRecordedOutput("A中e");
     for (const expectedColumn of [8, 6, 5, 3]) {
       const beforeMove = fixture.output().length;
       fixture.write("\u001b[D");
-      await fixture.waitForAfter(`\u001b[19;${expectedColumn}H`, beforeMove);
+      await fixture.waitForRecordedOutput(`\u001b[19;${expectedColumn}H`, beforeMove);
     }
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -1822,7 +1834,7 @@ test("the real terminal redraws through 40, 80, 120, and minimum-size layouts", 
       terminalProcessMarker,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     let beforeResize = fixture.output().length;
     await fixture.resize(120, 40);
     await fixture.waitForCompleteFrameAfter("context unavailable", beforeResize);
@@ -1861,13 +1873,13 @@ test("candidate ProjectRuntime runs real JSONL child Enter, Main response, layer
   let completed = false;
   let waiting = "New session";
   try {
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start child\r");
     waiting = "Delegation permission";
-    await fixture.waitFor("Permission required");
+    await fixture.waitForRecordedOutput("Permission required");
     fixture.write("\r");
     waiting = "MAIN_READY";
-    await fixture.waitFor("MAIN_READY");
+    await fixture.waitForRecordedOutput("MAIN_READY");
     expect(fixture.screen()?.join("\n")).toContain("PTY child");
     waiting = "child-started";
     await waitForFileContents(join(controlRoot, "child-started"), "started\n");
@@ -1906,7 +1918,7 @@ test("candidate ProjectRuntime runs real JSONL child Enter, Main response, layer
       join(controlRoot, "child-request"),
       JSON.stringify({ delivered: true, childCalls: 2 }),
     );
-    await fixture.waitFor("Completed");
+    await fixture.waitForRecordedOutput("Completed");
     offset = fixture.output().length;
     waiting = "Agents workspace";
     fixture.write("/agents\r");

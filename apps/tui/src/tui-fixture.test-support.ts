@@ -4,7 +4,11 @@ import { fileURLToPath } from "node:url";
 import { AppliedViewportTerminal } from "./applied-viewport-terminal.test-support.js";
 import type { FixtureScenario } from "./fixture-scenario.js";
 import { runTuiFixture } from "./test-fixture.js";
-import { VirtualTerminal } from "./virtual-terminal.test-support.js";
+import {
+  requireTerminalExpectation,
+  terminalObservationTimeoutMilliseconds,
+  VirtualTerminal,
+} from "./virtual-terminal.test-support.js";
 
 const fixturePath = fileURLToPath(new URL("../dist/test-fixture.js", import.meta.url));
 const fixtureFailureMilliseconds = 30_000;
@@ -23,8 +27,8 @@ export type TuiFixture = {
   readonly screen: () => readonly string[] | null;
   readonly resize: (columns: number, rows: number) => Promise<void>;
   readonly terminate: (signal: "SIGHUP" | "SIGKILL" | "SIGTERM") => Promise<void>;
-  readonly waitFor: (text: string) => Promise<void>;
-  readonly waitForAfter: (text: string, offset: number) => Promise<void>;
+  readonly waitForScreen: (text: string) => Promise<void>;
+  readonly waitForRecordedOutput: (text: string, offset?: number) => Promise<void>;
   readonly waitForCompleteFrameAfter: (text: string, offset: number) => Promise<void>;
   readonly write: (text: string) => void;
 };
@@ -118,15 +122,14 @@ function startInProcessTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
     resize(columns, rows) {
       const offset = terminal.output().length;
       terminal.resize(columns, rows);
-      return terminal.nextOutputContaining("\u001b[?2026l", offset);
+      return terminal.waitForRecordedOutput("\u001b[?2026l", offset);
     },
     terminate() {
       return Promise.reject(new Error("Only an external TUI fixture accepts process signals."));
     },
-    waitFor: (text) => terminal.nextOutputContaining(text),
-    waitForAfter: (text, offset) => terminal.nextOutputContaining(text, offset),
-    waitForCompleteFrameAfter: (text, offset) =>
-      terminal.nextSynchronizedFrameContaining(text, offset),
+    waitForScreen: (text) => terminal.waitForScreen(text),
+    waitForRecordedOutput: (text, offset) => terminal.waitForRecordedOutput(text, offset),
+    waitForCompleteFrameAfter: (text, offset) => terminal.waitForFrameAfter(text, offset),
     write: (text) => terminal.input(text),
   };
   trackFixture(fixture);
@@ -343,7 +346,8 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
     frameWaiters.clear();
   };
   void processResult.promise.then(settleOutputWaiters, settleOutputWaiters);
-  const waitForAfter = (text: string, offset: number): Promise<void> => {
+  const waitForRecordedOutput = async (text: string, offset = 0): Promise<void> => {
+    requireTerminalExpectation(text);
     if (
       stdout.indexOf(text, offset) >= 0 ||
       viewportFrames.some((frame) => frame.endOffset > offset && frame.text.includes(text))
@@ -371,13 +375,14 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
             ),
           );
           void cleanup().catch(() => undefined);
-        }, fixtureFailureMilliseconds),
+        }, terminalObservationTimeoutMilliseconds),
       };
       waiter.guard.unref();
       outputWaiters.add(waiter);
     });
   };
-  const waitForCompleteFrameAfter = (text: string, offset: number): Promise<void> => {
+  const waitForCompleteFrameAfter = async (text: string, offset: number): Promise<void> => {
+    requireTerminalExpectation(text);
     if (viewportFrames.some((frame) => frame.endOffset > offset && frame.text.includes(text))) {
       return Promise.resolve();
     }
@@ -402,7 +407,7 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
             ),
           );
           void cleanup().catch(() => undefined);
-        }, fixtureFailureMilliseconds),
+        }, terminalObservationTimeoutMilliseconds),
       };
       waiter.guard.unref();
       frameWaiters.add(waiter);
@@ -438,8 +443,16 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
       }
       process.kill(processId, signal);
     },
-    waitFor: (text) => waitForAfter(text, 0),
-    waitForAfter,
+    async waitForScreen(text) {
+      requireTerminalExpectation(text);
+      if (processClosed)
+        throw new Error(
+          `The TUI process is closed; no current screen can display ${JSON.stringify(text)}.`,
+        );
+      if (viewportFrames.at(-1)?.text.includes(text)) return;
+      await waitForCompleteFrameAfter(text, stdout.length);
+    },
+    waitForRecordedOutput,
     waitForCompleteFrameAfter,
     write: (text) => child.stdin.write(text),
   };
@@ -484,4 +497,32 @@ function trackFixture(fixture: TuiFixture, settlement: Promise<unknown> = fixtur
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+export function latestSynchronizedFrame(output: string): readonly string[] {
+  const start = output.lastIndexOf("\u001b[?2026h");
+  const end = output.indexOf("\u001b[?2026l", start);
+  if (start < 0 || end < 0) {
+    throw new Error("The TUI did not emit one complete synchronized frame.");
+  }
+  const frame = output
+    .slice(start + "\u001b[?2026h".length, end)
+    .replace("\u001b[2J\u001b[H\u001b[3J", "");
+  const absoluteRows = [
+    ...frame.matchAll(new RegExp(`${"\u001b"}\\[(\\d+);1H${"\u001b"}\\[2K`, "gu")),
+  ];
+  if (absoluteRows.length === 0) {
+    return frame.split("\r\n");
+  }
+  const lines: string[] = [];
+  for (const [index, match] of absoluteRows.entries()) {
+    const row = Number(match[1]) - 1;
+    const contentStart = (match.index ?? 0) + match[0].length;
+    const contentEnd = absoluteRows[index + 1]?.index ?? frame.length;
+    const content = frame.slice(contentStart, contentEnd);
+    lines[row] = content
+      .replace(new RegExp(`${"\u001b"}\\[\\d+;\\d+H`, "gu"), "")
+      .replace(new RegExp(`${"\u001b"}\\[\\?25[hl]`, "gu"), "");
+  }
+  return Array.from({ length: lines.length }, (_, index) => lines[index] ?? "");
 }

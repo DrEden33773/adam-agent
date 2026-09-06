@@ -1,6 +1,9 @@
 import {
+  type ContextProfile,
   createSessionLifecycle as createRawSessionLifecycle,
+  type ModelDriver,
   type ModelTargetIdentity,
+  type ModelTargets,
 } from "@adam-agent/agent";
 import {
   createTrustedWorkspaceTrustForTesting,
@@ -43,4 +46,40 @@ export function createSessionLifecycleForTests(
     [planShellEnvironmentFactory]:
       options[planShellEnvironmentFactory] ?? createUnavailablePlanShellEnvironmentV1,
   });
+}
+
+export const sessionLifecycleContextProfile: ContextProfile = {
+  version: 1,
+  contextWindowTokens: 1_000_000,
+  maximumOutputTokens: 32_768,
+  compactAtTokens: 800_000,
+  postCompactTargetTokens: 200_000,
+  retainedTargetTokens: 20_000,
+  estimatorVersion: 1,
+};
+
+export function modelTargetsWithDriver(driver: ModelDriver): ModelTargets {
+  return {
+    async resolve() {
+      return {
+        identity: sessionLifecycleTargetIdentity,
+        driver,
+        contextProfile: sessionLifecycleContextProfile,
+      };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: sessionLifecycleTargetIdentity,
+            readiness: {
+              status: "available" as const,
+              credentialSource: "deterministic test adapter",
+            },
+            contextProfile: sessionLifecycleContextProfile,
+          },
+        ],
+      };
+    },
+  };
 }
