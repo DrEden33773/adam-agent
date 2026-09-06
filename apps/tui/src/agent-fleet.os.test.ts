@@ -46,7 +46,7 @@ test("owner-private child draft survives a cold TUI and Lifecycle rebuild separa
     await h.press("\r", "Cooperative");
     await h.press("Child draft survives restart.", "Child draft survives restart.");
     await h.press("\u001b", "Enter compose · Esc back");
-    await h.press("\u001b", "Esc Main");
+    await h.press("\u001b", "Esc Main", "Conversation ·");
     await h.press("\u001b", "Fleet · ↓ navigate");
     await h.press("Separate Main draft.", "Separate Main draft.");
     await h.stop();

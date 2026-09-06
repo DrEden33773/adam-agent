@@ -83,8 +83,8 @@ test("running Explore has Widget and Fleet, layered Enter and Esc preserve indep
     await h.press("Child draft", "Child draft");
     await h.press("\u001b", "Enter compose · Esc back");
     expect(h.terminal.lines().join("\n")).toContain("Draft to @explore-1");
-    // The Fleet hint is visible behind the viewer; wait for the restored Main widget.
-    await h.press("\u001b", "Agents");
+    // The Fleet hint is visible behind the viewer; observe its closure in the same frame.
+    await h.press("\u001b", "Esc Main", "Conversation ·");
     expect(h.terminal.lines().join("\n")).not.toContain("Conversation ·");
     await h.press("\u001b", "Fleet · ↓ navigate");
     await h.press("Ordinary Main input.\r", "Ordinary Main completed.");
@@ -796,7 +796,7 @@ test("child permission preempts and restores the exact independent composer with
     expect(h.presentation.getState().composer.renderedText).toBe("");
     expect(mainCalls).toBe(0);
     await h.press("\u001b", "Enter compose · Esc back");
-    await h.press("\u001b", "Esc Main");
+    await h.press("\u001b", "Esc Main", "Conversation ·");
     await h.press("\u001b", "Fleet · ↓ navigate");
     await h.press("Main prompt.\r", "Main after permission.");
     expect(mainCalls).toBe(1);

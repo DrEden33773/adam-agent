@@ -25,7 +25,7 @@ test("an explicit action checkpoint retains a complete frame even after the scre
   const checkpoint = terminal.output().length;
   terminal.write("\u001b[?2026h\u001b[2J\u001b[HAccepted\u001b[?2026l");
   terminal.write("\u001b[?2026h\u001b[2J\u001b[HWorking\u001b[?2026l");
-  await terminal.waitForFrameAfter("Accepted", checkpoint);
+  await terminal.waitForFrameAfter("Accepted", checkpoint, "Old ready");
   const stale = terminal.waitForFrameAfter("Old ready", checkpoint);
   terminal.stop();
   await expect(stale).rejects.toThrow("Old ready");
@@ -44,6 +44,25 @@ test("terminal observations reject empty expectations and report the missing scr
   terminal.stop();
   await expect(pending).rejects.toThrow(/Accepted.*Waiting for permission/u);
 });
+
+test.each(["recorded", "live"])(
+  "a %s Fleet hint cannot prove closure while Conversation remains visible",
+  async (timing) => {
+    const terminal = new VirtualTerminal({ columns: 80, rows: 12 });
+    terminal.start(
+      () => {},
+      () => {},
+    );
+    const checkpoint = terminal.output().length;
+    const opened =
+      "\u001b[?2026hConversation · @explore-1\r\nFleet · Enter open · Esc Main\u001b[?2026l";
+    if (timing === "recorded") terminal.write(opened);
+    const pending = terminal.waitForFrameAfter("Esc Main", checkpoint, "Conversation ·");
+    if (timing === "live") terminal.write(opened);
+    terminal.stop();
+    await expect(pending).rejects.toThrow("Esc Main");
+  },
+);
 
 test("a missing-frame deadline reports the expected text and screen before cleanup", async () => {
   vi.useFakeTimers();

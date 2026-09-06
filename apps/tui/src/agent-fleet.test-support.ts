@@ -70,7 +70,7 @@ export type ManagedTuiFixture = {
   readonly children: ManagedTuiStorage["children"];
   readonly storage: ManagedTuiStorage;
   conversationText(): string;
-  press(data: string, frame: string): Promise<void>;
+  press(data: string, frame: string, absentText?: string): Promise<void>;
   openFirstAgent(handle?: string): Promise<void>;
   close(): Promise<void>;
   stop(): Promise<void>;
@@ -252,13 +252,13 @@ export async function startManagedTui(
   });
   // The selected target remains visible when the minimum-height layout compresses the title.
   await terminal.waitForScreen(identity.targetId);
-  const press = async (data: string, frame: string) => {
+  const press = async (data: string, frame: string, absentText?: string) => {
     if (frame.trim().length === 0)
       throw new TypeError("A TUI action requires a visible completion condition.");
     waitingForFrame = frame;
     const offset = terminal.output().length;
     terminal.input(data);
-    await terminal.waitForFrameAfter(frame, offset);
+    await terminal.waitForFrameAfter(frame, offset, absentText);
     waitingForFrame = "next test action";
   };
   return {
