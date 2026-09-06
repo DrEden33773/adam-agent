@@ -2,6 +2,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import type {
+  ManagedSessionTransition,
+  ManagedSessionTransitionResult,
+} from "@adam-agent/presentation";
 import { z } from "zod";
 import {
   AgentSession,
@@ -59,6 +63,7 @@ import {
 } from "./managed-agent.js";
 import {
   createManagedAgentControl,
+  createManagedAgentControlToolRegistry,
   type ManagedAgentControl,
   managedControlMainRequestBoundary,
 } from "./managed-agent-control.js";
@@ -105,6 +110,8 @@ import {
   type ApprovedPlanProjectionV1,
   createPlanToolProfileV1,
   digestApprovedPlanProjectionV1,
+  isHybridPlanPolicy,
+  isPlanDelegationTool,
   type PlanApprovalIntentV1,
   type PlanEligibleToolProfileV1,
   type PlanPolicyVersion,
@@ -441,10 +448,13 @@ export type WorkspaceMcpLeaseTransitionBarrier = {
 };
 
 /** Internal candidate composition; the default entry remains unchanged until cutover. */
+export const sessionManagedTransition = Symbol("adam-agent.session-managed-transition");
 export const sessionManagedControl = Symbol("adam-agent.session-managed-control");
 
 export type SessionLifecycleOptions = {
   readonly [sessionManagedControl]?: {
+    readonly planPolicyVersion?: PlanPolicyVersion;
+    readonly policy?: import("./fleet-ledger.js").FleetPolicy;
     readonly store: import("./managed-agent-folds.js").ManagedControlStore;
     readonly childSessionStores: SessionStoreDirectory<SessionRecord>;
   };
@@ -741,6 +751,11 @@ export type SessionCommand =
   | McpConfigurationCommand;
 
 export interface SessionLifecycle {
+  readonly [sessionManagedTransition]: (input: {
+    readonly destinationSessionId: string | null;
+    readonly transitionId?: string;
+    readonly decision?: "stay" | "wait" | "suspend";
+  }) => Promise<ManagedSessionTransitionResult>;
   readonly [sessionManagedControl]: (
     sessionId: string,
   ) => Promise<import("./managed-agent-control.js").ManagedAgentControl | undefined>;
@@ -1207,6 +1222,158 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     stateRoot: join(effectiveSessionStateRoot(options.stateRoot), "managed-child-sessions"),
   });
   const activeAgentManagers = new Map<string, AgentManager>();
+  let activeManagedFamily: string | null | undefined;
+  let familySerial = Promise.resolve();
+  let pendingManagedFamily:
+    | {
+        descriptor: ManagedSessionTransition;
+        targets: readonly { threadId: string; expectedTurnId: string }[];
+        controller: AbortController;
+      }
+    | undefined;
+  const serializeFamily = <T>(operation: () => Promise<T>): Promise<T> => {
+    const result = familySerial.then(operation);
+    familySerial = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  };
+  const warmManagedTurns = (
+    snapshot: import("./managed-agent-folds.js").ManagedWorkspaceSnapshot,
+  ) =>
+    snapshot.threads.filter(
+      (thread) =>
+        thread.turn.phase !== "idle" &&
+        (thread.residency === "live" || thread.turn.waitReason !== "suspended"),
+    );
+  const prepareManagedSelection = async (
+    destinationSessionId: string | null,
+  ): Promise<ManagedSessionTransitionResult> => {
+    if (options[sessionManagedControl] === undefined) return { status: "ready" };
+    if (destinationSessionId === activeManagedFamily) return { status: "ready" };
+    if (
+      [...trackedOwnerOperations].some(
+        (operation) =>
+          operation.sessionId !== undefined && operation.sessionId !== destinationSessionId,
+      )
+    )
+      return {
+        status: "rejected",
+        message: "Wait for or cancel the active Main run before selecting another Session.",
+      };
+    if (
+      pendingManagedFamily !== undefined &&
+      pendingManagedFamily.descriptor.destinationSessionId === destinationSessionId
+    )
+      return { status: "required", transition: pendingManagedFamily.descriptor };
+    const control =
+      typeof activeManagedFamily === "string"
+        ? await managedControls.get(activeManagedFamily)
+        : undefined;
+    const snapshot =
+      control === undefined || typeof activeManagedFamily !== "string"
+        ? undefined
+        : await control.inspect({ parentSessionId: activeManagedFamily });
+    if (snapshot !== undefined && snapshot.status !== "ready")
+      return {
+        status: "rejected",
+        message: "Restore trustworthy managed history before selecting another Session.",
+      };
+    const warm = snapshot?.status === "ready" ? warmManagedTurns(snapshot) : [];
+    if (warm.length === 0) {
+      pendingManagedFamily?.controller.abort();
+      pendingManagedFamily = undefined;
+      activeManagedFamily = destinationSessionId;
+      return { status: "ready" };
+    }
+    pendingManagedFamily?.controller.abort();
+    const descriptor: ManagedSessionTransition = {
+      id: randomUUID(),
+      sourceSessionId: activeManagedFamily as string,
+      destinationSessionId,
+      runningCount: warm.filter((thread) => thread.turn.phase !== "queued").length,
+      queuedCount: warm.filter((thread) => thread.turn.phase === "queued").length,
+      choices: ["stay", "wait", "suspend"],
+    };
+    pendingManagedFamily = {
+      descriptor,
+      targets: warm.map((thread) => ({
+        threadId: thread.threadId,
+        expectedTurnId: thread.turn.turnId,
+      })),
+      controller: new AbortController(),
+    };
+    return { status: "required", transition: descriptor };
+  };
+  const requireManagedSelection = (destinationSessionId: string | null) =>
+    serializeFamily(async () => {
+      if (options[sessionManagedControl] === undefined) return;
+      if (pendingManagedFamily !== undefined)
+        throw new SessionLifecycleError("session_managed_transition_required");
+      if ((await prepareManagedSelection(destinationSessionId)).status !== "ready")
+        throw new SessionLifecycleError("session_managed_transition_required");
+    });
+  const transitionManagedParent: SessionLifecycle[typeof sessionManagedTransition] = async (
+    input,
+  ) => {
+    if (options[sessionManagedControl] === undefined) return { status: "ready" };
+    if (input.decision === undefined)
+      return serializeFamily(() => prepareManagedSelection(input.destinationSessionId));
+    const pending = await serializeFamily(async () => {
+      const current = pendingManagedFamily;
+      return current !== undefined &&
+        current.descriptor.id === input.transitionId &&
+        current.descriptor.destinationSessionId === input.destinationSessionId
+        ? current
+        : undefined;
+    });
+    if (pending === undefined)
+      return { status: "rejected", message: "The exact managed transition is no longer pending." };
+    if (input.decision === "stay")
+      return serializeFamily(async () => {
+        pending.controller.abort();
+        if (pendingManagedFamily === pending) pendingManagedFamily = undefined;
+        return { status: "stayed" };
+      });
+    const control = await managedControls.get(pending.descriptor.sourceSessionId);
+    if (control === undefined)
+      return { status: "rejected", message: "The source managed owner is unavailable." };
+    const receipt =
+      input.decision === "wait"
+        ? await control.dispatch(
+            {
+              type: "wait_agents",
+              parentSessionId: pending.descriptor.sourceSessionId,
+              targets: pending.targets,
+              mode: "all",
+            },
+            { signal: pending.controller.signal },
+          )
+        : await control.dispatch({
+            type: "suspend_agents",
+            parentSessionId: pending.descriptor.sourceSessionId,
+            targets: pending.targets,
+          });
+    return serializeFamily(async () => {
+      if (pendingManagedFamily !== pending || receipt.status === "rejected")
+        return {
+          status: "rejected",
+          message:
+            receipt.status === "rejected"
+              ? receipt.message
+              : "The transition changed before settlement.",
+        };
+      const snapshot = await control.inspect({
+        parentSessionId: pending.descriptor.sourceSessionId,
+      });
+      if (snapshot.status !== "ready" || warmManagedTurns(snapshot).length > 0)
+        return { status: "rejected", message: "Source work has not settled or suspended." };
+      activeManagedFamily = pending.descriptor.destinationSessionId;
+      pendingManagedFamily = undefined;
+      return { status: "ready" };
+    });
+  };
   const managedControls = new Map<string, Promise<ManagedAgentControl | undefined>>();
   const resolveManagedControl = async (
     sessionId: string,
@@ -1249,6 +1416,49 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           workspaceRoot: options.workspaceRoot,
           targetIdentity: snapshot.targetIdentity,
           contextProfile,
+          ...(composition.policy === undefined ? {} : { policy: composition.policy }),
+          admissionGuard: (operation) =>
+            serializeFamily(async () => {
+              if (activeManagedFamily === undefined) activeManagedFamily = sessionId;
+              if (
+                lifecycleClosing ||
+                pendingManagedFamily !== undefined ||
+                activeManagedFamily !== sessionId
+              )
+                throw new SessionLifecycleError("session_managed_transition_required");
+              return operation();
+            }),
+          artifactStore: sharedArtifactStore,
+          readPlan: async () => {
+            const current = await inspectSession({ sessionId });
+            return current.schemaVersion === 3 ? current.plan : undefined;
+          },
+          resolveFrozenContext: async () => {
+            const current = await readSessionRecords(options, sessionId);
+            const first = current[0];
+            if (first === undefined || !isGenesisRecord(first))
+              throw new SessionLifecycleError("session_invalid");
+            const promptContext = promptContextRecordFromRecords(first, current);
+            const skillContext = skillContextRecordFromRecords(first, current);
+            const run = current.findLast(
+              (record) =>
+                record.schemaVersion === 3 && record.record.type === "logical_run_started",
+            );
+            return {
+              parentBranchId: sessionId,
+              parentRequest:
+                run?.schemaVersion === 3 && run.record.type === "logical_run_started"
+                  ? run.record.userMessage
+                  : "",
+              ...(run?.schemaVersion === 3 &&
+              run.record.type === "logical_run_started" &&
+              run.record.thinkingPolicy !== undefined
+                ? { thinkingPolicy: run.record.thinkingPolicy }
+                : {}),
+              ...(promptContext === undefined ? {} : { repository: promptContext.repository }),
+              ...(skillContext === undefined ? {} : { skillContext }),
+            };
+          },
           model: resolved.driver,
           permissions: options.permissions ?? createPermissionPolicy({ allowedEffects: [] }),
           executionDomain,
@@ -1310,6 +1520,18 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       });
       baseWithWeb = combineToolRegistries(base, webTools);
     }
+    if (
+      options[sessionManagedControl] !== undefined &&
+      managedAgentTools === undefined &&
+      baseWithWeb !== undefined
+    )
+      return combineToolRegistries(
+        baseWithWeb,
+        createManagedAgentControlToolRegistry({
+          control: () => resolveManagedControl(sessionId),
+          parentSessionId: sessionId,
+        }),
+      );
     if (
       options.modelTargets === undefined ||
       (managedAgentTools !== "managed-agent-tools.a1.v1" &&
@@ -1603,6 +1825,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     });
   };
   type TrackedOwnerOperation = {
+    readonly sessionId?: string;
     readonly kind: "ordinary" | "title";
     readonly settlement: Promise<void>;
   };
@@ -1630,6 +1853,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       .then(async (rootClaim) => {
         let mainClaim: Awaited<ReturnType<typeof executionDomain.claimScope>> | undefined;
         try {
+          if (managedMain) await requireManagedSelection(rootId.slice("session:".length));
           if (managedMain)
             mainClaim = await executionDomain.claimScope({
               kind: "main_run",
@@ -1644,6 +1868,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       });
     const tracked = {
       kind,
+      ...(managedMain ? { sessionId: rootId.slice("session:".length) } : {}),
       settlement: operationPromise.then(
         () => undefined,
         () => undefined,
@@ -2882,24 +3107,35 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   const preparePlanCycleEntry = async (
     sequence: number,
     eligibleToolProfile: PlanEligibleToolProfileV1,
-  ): Promise<SessionPlanCycleEnteredRecord> => ({
-    schemaVersion: 3,
-    sequence,
-    record: {
-      type: "plan_cycle_entered",
-      recordVersion: 1,
-      cycleId: randomUUID(),
-      revision: 1,
-      policyVersion: "plan-policy.hybrid-v1",
-      shellPolicyVersion: "plan-shell-policy.v1",
-      shellEnvironment: await (
-        options[planShellEnvironmentFactory] ?? createPlanShellEnvironmentV1
-      )(),
-      gitPolicyVersion: planGitAutomaticPolicyV1.version,
-      gitPolicyDigest: planGitAutomaticPolicyV1.digest,
-      eligibleToolProfile,
-    },
-  });
+  ): Promise<SessionPlanCycleEnteredRecord> => {
+    const policyVersion =
+      options[sessionManagedControl]?.planPolicyVersion ??
+      (options[sessionManagedControl] === undefined
+        ? "plan-policy.hybrid-v1"
+        : "plan-policy.hybrid-delegation-v1");
+    return {
+      schemaVersion: 3,
+      sequence,
+      record: {
+        type: "plan_cycle_entered",
+        recordVersion: 1,
+        cycleId: randomUUID(),
+        revision: 1,
+        policyVersion,
+        ...(isHybridPlanPolicy(policyVersion)
+          ? {
+              shellPolicyVersion: "plan-shell-policy.v1" as const,
+              shellEnvironment: await (
+                options[planShellEnvironmentFactory] ?? createPlanShellEnvironmentV1
+              )(),
+              gitPolicyVersion: planGitAutomaticPolicyV1.version,
+              gitPolicyDigest: planGitAutomaticPolicyV1.digest,
+            }
+          : {}),
+        eligibleToolProfile,
+      },
+    };
+  };
 
   const prepareSessionCreation = async (input: {
     readonly targetIdentity: ModelTargetIdentity;
@@ -3129,7 +3365,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
 
   return {
     [sessionManagedControl]: resolveManagedControl,
+    [sessionManagedTransition]: transitionManagedParent,
     async admit(input) {
+      await requireManagedSelection(null);
       const runId = input.runId ?? randomUUID();
       if (
         !z.uuid().safeParse(runId).success ||
@@ -3190,7 +3428,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               promptContext.toolProfile,
               prepared.tools,
               undefined,
-              "plan-policy.hybrid-v1",
+              options[sessionManagedControl]?.planPolicyVersion ??
+                (options[sessionManagedControl] === undefined
+                  ? "plan-policy.hybrid-v1"
+                  : "plan-policy.hybrid-delegation-v1"),
             ),
           );
         }
@@ -3205,6 +3446,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         } catch {
           throw new SessionLifecycleError("session_persistence_failed");
         }
+        if (options[sessionManagedControl] !== undefined) activeManagedFamily = snapshot.sessionId;
         preparedAdmissionTargets.set(snapshot.sessionId, {
           runId,
           resolved,
@@ -3604,6 +3846,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         return lifecycleClosePromise;
       }
       lifecycleClosing = true;
+      pendingManagedFamily?.controller.abort();
+      pendingManagedFamily = undefined;
       const runningSession = activeSessionSettlement;
       activeSession?.abort();
       lifecycleClosePromise = (async (): Promise<McpCloseResult> => {
@@ -3618,7 +3862,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         const controlSettlements = await Promise.allSettled(
           [...managedControls].map(
             async ([parentSessionId, control]) =>
-              (await control)?.dispatch({ type: "close", parentSessionId }) ?? {
+              (await control)?.dispatch({ type: "close", parentSessionId, reason: "exit" }) ?? {
                 status: "closed" as const,
               },
           ),
@@ -3741,12 +3985,18 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       return lifecycleClosePromise;
     },
     async create(input) {
-      return withOwner(async () => {
+      await requireManagedSelection(null);
+      const snapshot = await withOwner(async () => {
         await requireTrustedWorkspace();
         return persistPreparedSession(
           await prepareSessionCreation({ targetIdentity: input.targetIdentity }),
         );
       });
+      if (options[sessionManagedControl] !== undefined)
+        await serializeFamily(async () => {
+          activeManagedFamily = snapshot.sessionId;
+        });
+      return snapshot;
     },
     async continue(input) {
       if (
@@ -6094,6 +6344,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       });
     },
     async resume(input) {
+      await requireManagedSelection(input.sessionId);
       if (activeTitleSessions.has(input.sessionId)) {
         const snapshot = await inspectSession(input);
         return snapshot.schemaVersion === 3
@@ -6221,7 +6472,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         );
         const entry = await preparePlanCycleEntry(
           (records.at(-1)?.sequence ?? 0) + 1,
-          planToolProfile(inspected, sessionTools, "plan-policy.hybrid-v1"),
+          planToolProfile(
+            inspected,
+            sessionTools,
+            options[sessionManagedControl]?.planPolicyVersion ??
+              (options[sessionManagedControl] === undefined
+                ? "plan-policy.hybrid-v1"
+                : "plan-policy.hybrid-delegation-v1"),
+          ),
         );
         const store = await openSessionStore(options, input.sessionId);
         await store.append(entry);
@@ -7673,10 +7931,27 @@ export function createAgentResumeState(
     lastResponse.record.response.finishReason === "tool_calls"
       ? lastResponse
       : undefined;
+  const completedResponse =
+    lastResponse?.record.type === "model_response_completed" ? lastResponse.record : undefined;
+  const inputBoundary =
+    lastAttemptStatus === "completed" &&
+    lastResponse?.record.type === "model_response_completed" &&
+    lastResponse.record.response.finishReason === "stop" &&
+    currentRecords.some(
+      (record) =>
+        record.record.type === "managed_input_continuation" &&
+        record.record.runId === runId &&
+        record.sequence > lastResponse.sequence &&
+        record.record.turn === completedResponse?.turn &&
+        record.record.attempt === completedResponse?.attempt,
+    )
+      ? lastResponse
+      : undefined;
   if (
     lastAttemptRecord !== undefined &&
     interruptedAttempt?.record.type !== "provider_attempt_interrupted" &&
-    toolBoundary === undefined
+    toolBoundary === undefined &&
+    inputBoundary === undefined
   ) {
     throw new SessionLifecycleError("session_invalid");
   }
@@ -7685,9 +7960,11 @@ export function createAgentResumeState(
       ? interruptedAttempt.record.turn
       : toolBoundary?.record.type === "model_response_completed"
         ? toolBoundary.record.turn + 1
-        : lastAttemptRecord === undefined
-          ? 1
-          : 0;
+        : inputBoundary?.record.type === "model_response_completed"
+          ? inputBoundary.record.turn + 1
+          : lastAttemptRecord === undefined
+            ? 1
+            : 0;
   const contextCheckpoint = currentRecords.findLast(
     (record) => record.record.type === "context_compaction_committed",
   );
@@ -9015,7 +9292,7 @@ function planToolProfileFromAuthority(
     if (mcp !== undefined) {
       if (
         mcp.effect === "read" ||
-        (policyVersion === "plan-policy.hybrid-v1" &&
+        (isHybridPlanPolicy(policyVersion) &&
           (mcp.effect === "execute" || mcp.effect === "network"))
       ) {
         definitions.push({
@@ -9023,7 +9300,7 @@ function planToolProfileFromAuthority(
           definitionDigest: mcp.definitionDigest,
           effect: mcp.effect,
           source: "mcp",
-          ...(policyVersion === "plan-policy.hybrid-v1"
+          ...(isHybridPlanPolicy(policyVersion)
             ? {
                 mcp: {
                   serverId: mcp.serverId,
@@ -9042,7 +9319,10 @@ function planToolProfileFromAuthority(
     }
     if (
       adapter.effect === "read" ||
-      (policyVersion === "plan-policy.hybrid-v1" &&
+      (policyVersion === "plan-policy.hybrid-delegation-v1" &&
+        adapter.effect === "delegate" &&
+        isPlanDelegationTool(definition.name)) ||
+      (isHybridPlanPolicy(policyVersion) &&
         definition.name === "run_shell" &&
         adapter.effect === "execute")
     ) {

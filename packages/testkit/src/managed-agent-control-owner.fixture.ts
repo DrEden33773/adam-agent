@@ -55,6 +55,37 @@ const controlOptions: Parameters<typeof createManagedAgentControl>[0] = {
   },
   model: {
     async *stream(request) {
+      if (
+        phase === "scheduler_outcome_input" ||
+        phase === "scheduler_interrupt" ||
+        (phase === "scheduler_delivery" &&
+          !request.messages.some((message) => message.role === "tool"))
+      ) {
+        const admission = (await controlOptions.store.read())[0];
+        if (admission === undefined) throw new Error("Missing input target");
+        await control.dispatch({
+          type: "post_agent",
+          parentSessionId,
+          threadId: admission.threadId,
+          expectedTurnId: admission.turnId,
+          inputId: "00000000-0000-4000-8000-000000000051",
+          mode: phase === "scheduler_interrupt" ? "interrupt" : "cooperative",
+          text: "Retain this exact input receipt.",
+        });
+        if (phase === "scheduler_delivery") {
+          yield { type: "tool_call_start", id: "read-input", name: "read_file" };
+          yield { type: "tool_call_delta", id: "read-input", json: '{"path":"evidence.txt"}' };
+          yield { type: "tool_call_end", id: "read-input" };
+          yield { type: "usage", inputTokens: 20, outputTokens: 5 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+      }
+      if (phase === "scheduler_unknown") {
+        yield { type: "text_delta", text: "Unknown usage evidence." };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
       if (phase === "stalled_terminal") {
         yield { type: "text_delta", text: "Partial crash evidence." };
         await new Promise<void>((resolve) => {
@@ -99,12 +130,38 @@ const controlOptions: Parameters<typeof createManagedAgentControl>[0] = {
   }),
   ...(parentStore === undefined ? {} : { parentSessionStore: parentStore }),
   [managedAgentRecordBarrier]: async (record) => {
-    if (record.event.type !== (phase.startsWith("cancel_") ? phase.slice(7) : phase)) return;
+    const barrierPhase =
+      phase === "scheduler_settled"
+        ? "settled"
+        : phase === "scheduler_batch"
+          ? "admitted"
+          : phase === "scheduler_started"
+            ? "started"
+            : phase === "scheduler_outcome_input"
+              ? "outcome"
+              : phase === "scheduler_unknown"
+                ? "provider_unknown"
+                : phase.startsWith("cancel_")
+                  ? phase.slice(7)
+                  : phase;
+    if (record.event.type !== barrierPhase) return;
     process.send?.({ phase, threadId: record.threadId, turnId: record.turnId });
     await new Promise<void>(() => {});
   },
   [sessionRecordCommittedBarrier]: async (record) => {
     if (record.schemaVersion !== 3) return;
+    if (phase === "scheduler_interrupt" && record.record.type === "managed_input_continuation") {
+      process.send?.({ phase });
+      await new Promise<void>(() => {});
+    }
+    if (
+      phase === "scheduler_delivery" &&
+      record.record.type === "provider_attempt_started" &&
+      record.record.managedAgentDeliveryVersion === 3
+    ) {
+      process.send?.({ phase });
+      await new Promise<void>(() => {});
+    }
     const kind =
       record.record.type === "runtime_event" ? record.record.event.type : record.record.type;
     if (kind !== (phase === "stalled_terminal" ? "session_settled" : phase)) return;
@@ -125,7 +182,18 @@ const childCompleted =
         for await (const frame of control.observe({ parentSessionId, signal: observation.signal }))
           if (frame.snapshot.completions.length > 0) return;
       })();
-if (phase.startsWith("cancel_")) {
+if (phase.startsWith("scheduler_")) {
+  await domain.claimRoot({ rootId: "project-runtime" });
+  await control.dispatch({
+    type: "spawn_agents",
+    parentSessionId,
+    entries: Array.from({ length: phase === "scheduler_batch" ? 32 : 1 }, () => ({
+      role: "builtin:explore",
+      task: "Retain exact current recovery evidence.",
+      description: "Current recovery",
+    })),
+  });
+} else if (phase.startsWith("cancel_")) {
   const admission = (await controlOptions.store.read())[0];
   if (admission === undefined) throw new Error("Missing cancelled admission.");
   await control.dispatch({

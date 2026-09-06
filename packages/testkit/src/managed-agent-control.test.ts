@@ -234,6 +234,8 @@ test("ManagedAgentControl cold outcome recovery settles and completes once witho
       "admitted",
       "started",
       "execution_progress",
+      "provider_reserved",
+      "provider_unknown",
       "outcome",
       "settled",
       "completion",
@@ -745,6 +747,7 @@ test("ManagedAgentControl persists causal watchdog identity and retains a stalle
       "admitted",
       "started",
       "execution_progress",
+      "provider_reserved",
     ]);
     const expire = callbacks.at(-1);
     if (expire === undefined) throw new Error("Missing executing watchdog.");

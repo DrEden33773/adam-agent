@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
+import { constants } from "node:fs";
 import { chmod, type FileHandle, mkdir, open, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-
 import { valid } from "semver";
 import { z } from "zod";
 import type { RunResult, RuntimeEvent } from "./agent-session-contracts.js";
@@ -14,6 +14,7 @@ import type {
 import type { ContextProfile } from "./context-profile.js";
 import type { ContextCallUsage, ContextEvidenceV1, ContextSummaryV1 } from "./durable-context.js";
 import { maximumInlineModelResponseFieldBytes } from "./durable-model-response-policy.js";
+import { delegationEnvelopeSchema } from "./fleet-ledger.js";
 import {
   type InputResourceOccurrenceV1,
   inputResourceLimitsV1,
@@ -33,6 +34,7 @@ import type {
   PlanRevisionIntentV1,
   PlanSubmissionSnapshotV1,
 } from "./plan-mode.js";
+import { isHybridPlanPolicy } from "./plan-mode.js";
 import type { PlanShellEnvironmentV1 } from "./plan-shell-environment.js";
 import {
   type PromptContextRecord,
@@ -68,6 +70,8 @@ type V1PermissionSubject = Exclude<
       | "extension_capability"
       | "managed_agent_control"
       | "managed_agent_spawn"
+      | "managed_agent_batch"
+      | "managed_agent_action"
       | "managed_agent_web_request"
       | "parent_coordination"
       | "mcp_tool"
@@ -138,6 +142,14 @@ export type SessionGenesisRecord = {
     readonly sessionId: string;
     readonly projectId: string;
     readonly targetIdentity: ModelTargetIdentity;
+    readonly managedParent?: {
+      readonly version: 3;
+      readonly parentSessionId: string;
+      readonly threadId: string;
+      readonly turnId: string;
+      readonly attemptId: string;
+      readonly admission: { readonly sequence: number; readonly digest: `sha256:${string}` };
+    };
     readonly managedAgentTools?:
       | "managed-agent-tools.a1.v1"
       | "managed-agent-tools.a2-long-lived.v1"
@@ -1025,7 +1037,24 @@ export type SessionRepositoryInstructionsFailedRecord = {
   };
 };
 
+export type SessionManagedInputContinuationRecord = {
+  readonly schemaVersion: 3;
+  readonly sequence: number;
+  readonly record: {
+    readonly type: "managed_input_continuation";
+    readonly recordVersion: 1;
+    readonly runId: string;
+    readonly turn: number;
+    readonly attempt: number;
+    readonly inputs: readonly {
+      readonly id: `sha256:${string}`;
+      readonly digest: `sha256:${string}`;
+    }[];
+  };
+};
+
 export type SessionV3Record =
+  | SessionManagedInputContinuationRecord
   | SessionGenesisRecord
   | SessionMcpWorkspaceConfirmedRecord
   | SessionMcpServerDefinitionApprovedRecord
@@ -1075,6 +1104,12 @@ export type SessionV3Record =
 
 export type SessionRecord = SessionEventRecord | SessionV3Record;
 
+export class SessionLogicalQuotaError extends Error {
+  constructor() {
+    super("Logical Session quota is exhausted; terminal space is reserved.");
+  }
+}
+
 export interface SessionStore<RecordType extends SessionRecord = SessionEventRecord> {
   append(record: RecordType): Promise<void>;
   appendBatch(records: readonly RecordType[]): Promise<void>;
@@ -1087,6 +1122,7 @@ export interface SessionStoreDirectoryEntry {
 }
 
 export interface SessionStoreDirectory<RecordType extends SessionRecord = SessionRecord> {
+  byteLength?(sessionId: string): Promise<number | undefined>;
   create(sessionId: string): Promise<SessionStore<RecordType>>;
   listSessionEntries(): Promise<readonly SessionStoreDirectoryEntry[]>;
   listSessionIds(): Promise<readonly string[]>;
@@ -1128,6 +1164,7 @@ const ordinaryRunErrorCodeSchema = z.enum([
   "input_resource_unsupported",
   "run_already_active",
   "session_persistence_failed",
+  "session_quota_exceeded",
   "turn_limit_exceeded",
   "token_limit_exceeded",
   "token_usage_missing",
@@ -1633,7 +1670,34 @@ const webArtifactPermissionSubjectSchema = z.strictObject({
   operation: z.enum(["open", "find"]),
   artifactId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
 });
+const managedActionPermissionSubjectSchema = z.strictObject({
+  type: z.literal("managed_agent_action"),
+  envelope: delegationEnvelopeSchema.optional(),
+  parentSessionId: z.uuid(),
+  action: z.enum([
+    "list_agents",
+    "wait_agents",
+    "post_agent",
+    "reply_agent",
+    "cancel_agents",
+    "report_to_parent",
+    "request_parent_input",
+  ]),
+  threadIds: z.array(z.uuid()).max(32),
+  turnIds: z.array(z.uuid()).max(32),
+  argumentsDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+});
+const managedBatchPermissionSubjectSchema = z.strictObject({
+  type: z.literal("managed_agent_batch"),
+  envelope: delegationEnvelopeSchema,
+  parentSessionId: z.uuid(),
+  mode: z.enum(["background", "foreground"]),
+  count: z.number().int().min(1).max(32),
+  argumentsDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+});
 const v2PermissionSubjectSchema = z.discriminatedUnion("type", [
+  managedActionPermissionSubjectSchema,
+  managedBatchPermissionSubjectSchema,
   z.strictObject({ type: z.literal("file"), path: z.string() }),
   z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
   extensionCapabilityPermissionSubjectSchema,
@@ -1672,7 +1736,7 @@ const planCommandPermissionSubjectSchema = z.strictObject({
     .max(16 * 1024),
   cwd: z.literal("."),
   planCycleId: z.uuid(),
-  planPolicyVersion: z.literal("plan-policy.hybrid-v1"),
+  planPolicyVersion: z.enum(["plan-policy.hybrid-v1", "plan-policy.hybrid-delegation-v1"]),
   shellPolicyVersion: z.literal("plan-shell-policy.v1"),
   shellEnvironmentVersion: z.literal("plan-shell-env.v1"),
   shellEnvironmentDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
@@ -1715,6 +1779,8 @@ const planCommandPermissionSubjectSchema = z.strictObject({
   }),
 });
 const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
+  managedActionPermissionSubjectSchema,
+  managedBatchPermissionSubjectSchema,
   z.strictObject({ type: z.literal("file"), path: z.string() }),
   z.strictObject({ type: z.literal("workspace_path"), path: z.string() }),
   extensionCapabilityPermissionSubjectSchema,
@@ -1865,7 +1931,7 @@ const currentCanonicalRuntimeEventSchema = createCanonicalRuntimeEventSchema({
   runResult: runResultSchema,
   toolError: currentToolErrorSchema,
 });
-const modelTargetIdentitySchema = z.strictObject({
+export const modelTargetIdentitySchema = z.strictObject({
   targetId: z.string().min(1).max(256),
   vendor: z.string().min(1).max(128),
   modelId: z.string().min(1).max(256),
@@ -1939,7 +2005,7 @@ const thinkingPolicyMappingV1Schema = z.union([
     reasoningEffort: z.enum(["low", "high", "max"]),
   }),
 ]);
-const thinkingPolicySnapshotV1Schema = z.strictObject({
+export const thinkingPolicySnapshotV1Schema = z.strictObject({
   schemaVersion: z.literal(1),
   requestedLevelId: z.string().min(1).max(64),
   effectiveLevelId: z.string().min(1).max(64),
@@ -1994,7 +2060,7 @@ const projectedContentUsageV1Schema: z.ZodType<ProjectedContentUsageV1> = z
   .refine(
     (value) => value.explicitUserImages !== undefined || value.imageToolResults !== undefined,
   );
-const contextProfileSchema: z.ZodType<ContextProfile> = z.strictObject({
+export const contextProfileSchema: z.ZodType<ContextProfile> = z.strictObject({
   version: z.number().int().positive(),
   contextWindowTokens: z.number().int().positive(),
   maximumOutputTokens: z.number().int().positive(),
@@ -2110,6 +2176,19 @@ const sessionGenesisV1RecordSchema = z.strictObject({
   sessionId: z.uuid(),
   projectId: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   targetIdentity: modelTargetIdentitySchema,
+  managedParent: z
+    .strictObject({
+      version: z.literal(3),
+      parentSessionId: z.uuid(),
+      threadId: z.uuid(),
+      turnId: z.uuid(),
+      attemptId: z.uuid(),
+      admission: z.strictObject({
+        sequence: z.number().int().positive(),
+        digest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+      }),
+    })
+    .optional(),
   managedAgentTools: z
     .enum([
       "managed-agent-tools.a1.v1",
@@ -2271,7 +2350,11 @@ const logicalRunStartedV2Schema = z
         revision: z.number().int().positive(),
         planId: z.uuid(),
         contentDigest: sha256DigestSchema,
-        policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+        policyVersion: z.enum([
+          "plan-policy.read-v1",
+          "plan-policy.hybrid-v1",
+          "plan-policy.hybrid-delegation-v1",
+        ]),
         toolProfileDigest: sha256DigestSchema,
       })
       .optional(),
@@ -2521,7 +2604,11 @@ const sessionV3RecordSchema = z.union([
         revision: z.number().int().positive(),
         planId: z.uuid(),
         contentDigest: sha256DigestSchema,
-        policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+        policyVersion: z.enum([
+          "plan-policy.read-v1",
+          "plan-policy.hybrid-v1",
+          "plan-policy.hybrid-delegation-v1",
+        ]),
         toolProfileDigest: sha256DigestSchema,
       })
       .optional(),
@@ -2563,7 +2650,11 @@ const sessionV3RecordSchema = z.union([
       recordVersion: z.literal(1),
       cycleId: z.uuid(),
       revision: z.literal(1),
-      policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+      policyVersion: z.enum([
+        "plan-policy.read-v1",
+        "plan-policy.hybrid-v1",
+        "plan-policy.hybrid-delegation-v1",
+      ]),
       shellPolicyVersion: z.literal("plan-shell-policy.v1").optional(),
       shellEnvironment: planShellEnvironmentV1Schema.optional(),
       gitPolicyVersion: z.literal("git-auto-policy.v1").optional(),
@@ -2572,14 +2663,13 @@ const sessionV3RecordSchema = z.union([
     })
     .refine(
       (record) =>
-        (record.policyVersion === "plan-policy.hybrid-v1") ===
+        isHybridPlanPolicy(record.policyVersion) ===
           (record.shellPolicyVersion === "plan-shell-policy.v1") &&
-        (record.policyVersion === "plan-policy.hybrid-v1") ===
+        isHybridPlanPolicy(record.policyVersion) ===
           (record.shellEnvironment?.version === "plan-shell-env.v1") &&
-        (record.policyVersion === "plan-policy.hybrid-v1") ===
+        isHybridPlanPolicy(record.policyVersion) ===
           (record.gitPolicyVersion === "git-auto-policy.v1") &&
-        (record.policyVersion === "plan-policy.hybrid-v1") ===
-          (record.gitPolicyDigest !== undefined),
+        isHybridPlanPolicy(record.policyVersion) === (record.gitPolicyDigest !== undefined),
     ),
   z.strictObject({
     type: z.literal("plan_git_attested"),
@@ -2602,7 +2692,11 @@ const sessionV3RecordSchema = z.union([
         .refine((value) => Buffer.byteLength(value, "utf8") <= 512)
         .optional(),
       artifact: planArtifactReferenceSchema,
-      policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+      policyVersion: z.enum([
+        "plan-policy.read-v1",
+        "plan-policy.hybrid-v1",
+        "plan-policy.hybrid-delegation-v1",
+      ]),
       toolProfileDigest: sha256DigestSchema,
     })
     .refine(
@@ -2622,7 +2716,11 @@ const sessionV3RecordSchema = z.union([
     revision: z.number().int().positive(),
     planId: z.uuid(),
     contentDigest: sha256DigestSchema,
-    policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+    policyVersion: z.enum([
+      "plan-policy.read-v1",
+      "plan-policy.hybrid-v1",
+      "plan-policy.hybrid-delegation-v1",
+    ]),
     toolProfileDigest: sha256DigestSchema,
   }),
   z.strictObject({
@@ -2681,7 +2779,11 @@ const sessionV3RecordSchema = z.union([
       recordVersion: z.literal(1),
       cycleId: z.uuid(),
       revision: z.number().int().positive(),
-      policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+      policyVersion: z.enum([
+        "plan-policy.read-v1",
+        "plan-policy.hybrid-v1",
+        "plan-policy.hybrid-delegation-v1",
+      ]),
       shellPolicyVersion: z.literal("plan-shell-policy.v1").optional(),
       shellEnvironment: planShellEnvironmentV1Schema.optional(),
       gitPolicyVersion: z.literal("git-auto-policy.v1").optional(),
@@ -2699,7 +2801,11 @@ const sessionV3RecordSchema = z.union([
             .refine((value) => Buffer.byteLength(value, "utf8") <= 512)
             .optional(),
           artifact: planArtifactReferenceSchema,
-          policyVersion: z.enum(["plan-policy.read-v1", "plan-policy.hybrid-v1"]),
+          policyVersion: z.enum([
+            "plan-policy.read-v1",
+            "plan-policy.hybrid-v1",
+            "plan-policy.hybrid-delegation-v1",
+          ]),
           toolProfileDigest: sha256DigestSchema,
         })
         .optional(),
@@ -2710,14 +2816,13 @@ const sessionV3RecordSchema = z.union([
     })
     .refine(
       (record) =>
-        (record.policyVersion === "plan-policy.hybrid-v1") ===
+        isHybridPlanPolicy(record.policyVersion) ===
           (record.shellPolicyVersion === "plan-shell-policy.v1") &&
-        (record.policyVersion === "plan-policy.hybrid-v1") ===
+        isHybridPlanPolicy(record.policyVersion) ===
           (record.shellEnvironment?.version === "plan-shell-env.v1") &&
-        (record.policyVersion === "plan-policy.hybrid-v1") ===
+        isHybridPlanPolicy(record.policyVersion) ===
           (record.gitPolicyVersion === "git-auto-policy.v1") &&
-        (record.policyVersion === "plan-policy.hybrid-v1") ===
-          (record.gitPolicyDigest !== undefined) &&
+        isHybridPlanPolicy(record.policyVersion) === (record.gitPolicyDigest !== undefined) &&
         (record.gitAttestation === undefined ||
           (record.gitAttestation.shellEnvironmentDigest === record.shellEnvironment?.digest &&
             record.gitAttestation.gitPolicyVersion === record.gitPolicyVersion &&
@@ -2937,6 +3042,22 @@ const sessionV3RecordSchema = z.union([
       width: z.number().int().positive().max(4_096),
       height: z.number().int().positive().max(4_096),
     }),
+  }),
+  z.strictObject({
+    type: z.literal("managed_input_continuation"),
+    recordVersion: z.literal(1),
+    runId: z.uuid(),
+    turn: z.number().int().positive(),
+    attempt: z.number().int().positive(),
+    inputs: z
+      .array(
+        z.strictObject({
+          id: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+          digest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+        }),
+      )
+      .min(1)
+      .max(32),
   }),
   z
     .strictObject({
@@ -3239,6 +3360,15 @@ export function createInMemorySessionStoreDirectory<
     return lastModifiedAtMilliseconds;
   };
   return {
+    async byteLength(sessionId) {
+      validateSessionId(sessionId);
+      const entry = stores.get(sessionId);
+      if (entry === undefined) return undefined;
+      return (await entry.store.read()).reduce(
+        (bytes, record) => bytes + Buffer.byteLength(JSON.stringify(record), "utf8") + 1,
+        0,
+      );
+    },
     async create(sessionId) {
       validateSessionId(sessionId);
       if (stores.has(sessionId)) {
@@ -3290,6 +3420,26 @@ export function createJsonlSessionStoreDirectory<
   readonly stateRoot?: string;
 }): SessionStoreDirectory<RecordType> {
   return {
+    async byteLength(sessionId) {
+      validateSessionId(sessionId);
+      const { sessionsDirectory } = await resolveProjectSessionDirectories(options);
+      try {
+        const file = await open(
+          join(sessionsDirectory, `${sessionId}.jsonl`),
+          constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        );
+        try {
+          const metadata = await file.stat();
+          if (!metadata.isFile()) throw new SessionStoreError();
+          return metadata.size;
+        } finally {
+          await file.close();
+        }
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") return undefined;
+        throw error;
+      }
+    },
     create(sessionId) {
       return createJsonlSessionStore<RecordType>({ ...options, sessionId });
     },

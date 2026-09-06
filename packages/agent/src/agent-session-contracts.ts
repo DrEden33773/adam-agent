@@ -147,6 +147,7 @@ export type RunResult =
               | "input_resource_unsupported"
               | "run_already_active"
               | "session_persistence_failed"
+              | "session_quota_exceeded"
               | "turn_limit_exceeded"
               | "token_limit_exceeded"
               | "token_usage_missing"

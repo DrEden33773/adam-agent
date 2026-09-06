@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-
 import type { RunResult, RuntimeEvent } from "./agent-session-contracts.js";
 import type { ArtifactReference, ChangePreviewArtifactSource } from "./artifact-store.js";
 import { type ContextProfile, isContextProfileSupported } from "./context-profile.js";
@@ -24,7 +23,11 @@ import { pastedTextLimitsV1 } from "./pasted-text.js";
 import { assessPlanCommandV1 } from "./plan-command-assessment.js";
 import { isPlanGitAttestationV1Valid, planGitAutomaticPolicyV1 } from "./plan-git-policy.js";
 import { isExactPlanMcpPermissionEventV1 } from "./plan-mcp-permission-validation.js";
-import { isPlanToolProfileV1Valid, type PlanEligibleToolProfileV1 } from "./plan-mode.js";
+import {
+  isHybridPlanPolicy,
+  isPlanToolProfileV1Valid,
+  type PlanEligibleToolProfileV1,
+} from "./plan-mode.js";
 import { isPlanShellEnvironmentV1Valid } from "./plan-shell-environment.js";
 import {
   commitMcpToolProfileV3,
@@ -115,6 +118,9 @@ export function validateCurrentSessionHistory(
     genesis.sequence !== 1 ||
     records[0] !== genesis ||
     records.some((record) => record.schemaVersion !== 3) ||
+    (genesis.record.managedParent !== undefined &&
+      (genesis.record.lineage !== undefined ||
+        genesis.record.managedParent.parentSessionId === genesis.record.sessionId)) ||
     (genesis.record.promptContext !== undefined &&
       genesis.record.promptContext.recordVersion !== 1) !==
       (genesis.record.skillContext !== undefined) ||
@@ -123,6 +129,7 @@ export function validateCurrentSessionHistory(
     (genesis.record.promptContext !== undefined &&
       (!isPromptContextRecordValid(genesis.record.promptContext) ||
         (genesis.record.lineage === undefined &&
+          genesis.record.managedParent === undefined &&
           (genesis.record.promptContext.repository.revision !== 1 ||
             JSON.stringify(genesis.record.promptContext.repository.activeScopes) !== '["."]' ||
             genesis.record.promptContext.repository.sources.some(
@@ -159,6 +166,7 @@ export function validateCurrentSessionHistory(
       managedDeliveryMessageSequences.add(message.sequence);
     }
   }
+  let managedContinuation: readonly { readonly id: string; readonly digest: string }[] | undefined;
   let run: SessionLogicalRunStartedRecord["record"] | undefined;
   let attemptState: ValidatedAttemptState | undefined;
   let sawUserMessage = false;
@@ -241,7 +249,11 @@ export function validateCurrentSessionHistory(
   let planSubmissionTerminal = false;
   const isCompletedRunFinishReason = (finishReason: unknown): boolean =>
     finishReason === "stop" || (planSubmissionTerminal && finishReason === "tool_calls");
-  let activePlanPolicyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1" | undefined;
+  let activePlanPolicyVersion:
+    | "plan-policy.read-v1"
+    | "plan-policy.hybrid-v1"
+    | "plan-policy.hybrid-delegation-v1"
+    | undefined;
   let activePlanShellPolicyVersion: "plan-shell-policy.v1" | undefined;
   let activePlanShellEnvironmentDigest: string | undefined;
   let activePlanToolProfileDigest: string | undefined;
@@ -290,13 +302,12 @@ export function validateCurrentSessionHistory(
         run !== undefined ||
         activePlanCycleId !== undefined ||
         !isPlanToolProfileV1Valid(record.eligibleToolProfile, record.policyVersion) ||
-        (record.policyVersion === "plan-policy.hybrid-v1") !==
+        isHybridPlanPolicy(record.policyVersion) !==
           (record.shellPolicyVersion === "plan-shell-policy.v1") ||
-        (record.policyVersion === "plan-policy.hybrid-v1") !==
-          (record.shellEnvironment !== undefined) ||
-        (record.policyVersion === "plan-policy.hybrid-v1") !==
+        isHybridPlanPolicy(record.policyVersion) !== (record.shellEnvironment !== undefined) ||
+        isHybridPlanPolicy(record.policyVersion) !==
           (record.gitPolicyVersion === planGitAutomaticPolicyV1.version) ||
-        (record.policyVersion === "plan-policy.hybrid-v1") !==
+        isHybridPlanPolicy(record.policyVersion) !==
           (record.gitPolicyDigest === planGitAutomaticPolicyV1.digest) ||
         (record.shellEnvironment !== undefined &&
           !isPlanShellEnvironmentV1Valid(record.shellEnvironment)) ||
@@ -335,13 +346,12 @@ export function validateCurrentSessionHistory(
         record.source.sessionId !== sourceSessionId ||
         record.source.throughSequence !== sourceSequence ||
         !isPlanToolProfileV1Valid(record.eligibleToolProfile, record.policyVersion) ||
-        (record.policyVersion === "plan-policy.hybrid-v1") !==
+        isHybridPlanPolicy(record.policyVersion) !==
           (record.shellPolicyVersion === "plan-shell-policy.v1") ||
-        (record.policyVersion === "plan-policy.hybrid-v1") !==
-          (record.shellEnvironment !== undefined) ||
-        (record.policyVersion === "plan-policy.hybrid-v1") !==
+        isHybridPlanPolicy(record.policyVersion) !== (record.shellEnvironment !== undefined) ||
+        isHybridPlanPolicy(record.policyVersion) !==
           (record.gitPolicyVersion === planGitAutomaticPolicyV1.version) ||
-        (record.policyVersion === "plan-policy.hybrid-v1") !==
+        isHybridPlanPolicy(record.policyVersion) !==
           (record.gitPolicyDigest === planGitAutomaticPolicyV1.digest) ||
         (record.shellEnvironment !== undefined &&
           !isPlanShellEnvironmentV1Valid(record.shellEnvironment)) ||
@@ -892,6 +902,7 @@ export function validateCurrentSessionHistory(
     }
     if (record.type === "logical_run_started") {
       if (sawSettlement) {
+        managedContinuation = undefined;
         attemptState = undefined;
         sawUserMessage = false;
         sawSettlement = false;
@@ -1515,6 +1526,21 @@ export function validateCurrentSessionHistory(
     if (run === undefined || record.runId !== run.runId) {
       throw new SessionLifecycleError("session_invalid");
     }
+    if (record.type === "managed_input_continuation") {
+      if (
+        managedContinuation !== undefined ||
+        run?.runId !== record.runId ||
+        attemptState?.status !== "completed" ||
+        attemptState.turn !== record.turn ||
+        attemptState.attempt !== record.attempt ||
+        attemptState.response?.response.finishReason !== "stop" ||
+        [...toolStates.values()].some((state) => !state.terminal) ||
+        new Set(record.inputs.map((input) => input.id)).size !== record.inputs.length
+      )
+        throw new SessionLifecycleError("session_invalid");
+      managedContinuation = record.inputs;
+      continue;
+    }
     if (record.type === "provider_attempt_started") {
       if (
         terminalIntent !== undefined ||
@@ -1541,7 +1567,17 @@ export function validateCurrentSessionHistory(
         }
       } else if (attemptState.status === "completed") {
         if (
-          attemptState.response?.response.finishReason !== "tool_calls" ||
+          (attemptState.response?.response.finishReason !== "tool_calls" &&
+            !(
+              attemptState.response?.response.finishReason === "stop" &&
+              managedContinuation !== undefined &&
+              record.managedAgentDeliveryVersion === 3 &&
+              managedContinuation.every((input) =>
+                record.managedAgentDeliveries?.some(
+                  (delivery) => delivery.id === input.id && delivery.digest === input.digest,
+                ),
+              )
+            )) ||
           [...toolStates.values()].some((state) => !state.terminal) ||
           record.turn !== attemptState.turn + 1 ||
           record.attempt !== 1
@@ -1551,6 +1587,7 @@ export function validateCurrentSessionHistory(
       } else {
         throw new SessionLifecycleError("session_invalid");
       }
+      managedContinuation = undefined;
       attemptState = {
         turn: record.turn,
         attempt: record.attempt,
@@ -1624,7 +1661,8 @@ export function validateCurrentSessionHistory(
           terminalIntent !== undefined ||
           attemptState?.status === "started" ||
           (attemptState?.status === "completed" &&
-            (attemptState.response?.response.finishReason !== "tool_calls" ||
+            ((attemptState.response?.response.finishReason !== "tool_calls" &&
+              managedContinuation === undefined) ||
               [...toolStates.values()].some((state) => !state.terminal))))
       ) {
         throw new SessionLifecycleError("session_invalid");
@@ -2455,7 +2493,11 @@ function isValidPlanPermissionEvent(input: {
   readonly runId: string;
   readonly state: ValidatedToolState;
   readonly activePlanCycleId: string | undefined;
-  readonly activePlanPolicyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1" | undefined;
+  readonly activePlanPolicyVersion:
+    | "plan-policy.read-v1"
+    | "plan-policy.hybrid-v1"
+    | "plan-policy.hybrid-delegation-v1"
+    | undefined;
   readonly activePlanShellPolicyVersion: "plan-shell-policy.v1" | undefined;
   readonly activePlanShellEnvironmentDigest: string | undefined;
   readonly activePlanToolProfileDigest: string | undefined;
@@ -2474,10 +2516,7 @@ function isValidPlanPermissionEvent(input: {
     eligibleDefinition !== undefined &&
     eligibleDefinition.effect === input.state.intent.effect &&
     eligibleDefinition.definitionDigest === input.state.intent.definitionDigest;
-  if (
-    input.activePlanPolicyVersion === "plan-policy.hybrid-v1" &&
-    input.state.call.name === "run_shell"
-  ) {
+  if (isHybridPlanPolicy(input.activePlanPolicyVersion) && input.state.call.name === "run_shell") {
     if (
       !hasExactEligibleDefinition ||
       eligibleDefinition.source !== "builtin" ||
@@ -2530,7 +2569,7 @@ function isValidPlanPermissionEvent(input: {
     );
   }
   if (
-    input.activePlanPolicyVersion === "plan-policy.hybrid-v1" &&
+    isHybridPlanPolicy(input.activePlanPolicyVersion) &&
     eligibleDefinition.source === "mcp" &&
     (input.state.intent.effect === "execute" || input.state.intent.effect === "network")
   ) {

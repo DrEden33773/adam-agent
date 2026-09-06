@@ -102,7 +102,7 @@ export const presentationHydrationBarrier = Symbol("adam-agent.presentation-hydr
 export const presentationHistoryPageSize = Symbol("adam-agent.presentation-history-page-size");
 export const presentationCatalogPageSize = Symbol("adam-agent.presentation-catalog-page-size");
 
-import { sessionManagedControl } from "./session-lifecycle.js";
+import { sessionManagedControl, sessionManagedTransition } from "./session-lifecycle.js";
 
 export const presentationManagedAgentTranscriptPageSize = Symbol(
   "adam-agent.presentation-managed-agent-transcript-page-size",
@@ -692,7 +692,16 @@ export async function createPresentationSession(
       })();
       void controlObservation.catch(() => undefined);
     };
-    if (created !== undefined) await observeManagedControl(created.sessionId);
+    if (created !== undefined) {
+      const selected = await options.lifecycle[sessionManagedTransition]({
+        destinationSessionId: created.sessionId,
+      });
+      if (selected.status !== "ready")
+        throw new TypeError(
+          "Resolve the existing managed-family transition before opening this Session.",
+        );
+      await observeManagedControl(created.sessionId);
+    }
     type TargetConnection = NonNullable<
       AuthoritativePresentationSnapshot["targets"]["items"][number]["connection"]
     >;
@@ -1277,12 +1286,57 @@ export async function createPresentationSession(
           readonly receipt: Promise<CommandReceipt>;
         }
       | undefined;
+    let pendingManagedCommand:
+      | Extract<
+          PresentationCommand,
+          { type: "select_session" | "create_session" | "branch_session" }
+        >
+      | undefined;
+    const clearManagedTransition = () => {
+      const { managedTransition: _transition, ...authoritative } = state.authoritative;
+      state = { ...state, revision: state.revision + 1, authoritative };
+      pendingManagedCommand = undefined;
+      publishStateChange();
+    };
+    const prepareManagedTransition = async (
+      command: Extract<
+        PresentationCommand,
+        { type: "select_session" | "create_session" | "branch_session" }
+      >,
+    ): Promise<CommandReceipt | undefined> => {
+      const result = await options.lifecycle[sessionManagedTransition]({
+        destinationSessionId: command.type === "select_session" ? command.sessionId : null,
+      });
+      if (result.status === "required") {
+        pendingManagedCommand = command;
+        state = {
+          ...state,
+          revision: state.revision + 1,
+          authoritative: { ...state.authoritative, managedTransition: result.transition },
+        };
+        publishStateChange();
+        return {
+          status: "rejected",
+          code: "transition_required",
+          message:
+            "Stay, wait for managed work, or suspend queued work and cancel running work before switching.",
+        };
+      }
+      if (result.status === "rejected")
+        return { status: "rejected", code: "authority_rejected", message: result.message };
+      return undefined;
+    };
     let snapshotActivationQueue = Promise.resolve();
     let lastSnapshotActivation =
       created === undefined
         ? undefined
         : { sessionId: created.sessionId, throughSequence: created.lastSequence };
     const activateSnapshotNow = async (snapshot: CurrentSessionSnapshot): Promise<void> => {
+      const selection = await options.lifecycle[sessionManagedTransition]({
+        destinationSessionId: snapshot.sessionId,
+      });
+      if (selection.status !== "ready")
+        throw new TypeError("The managed-family transition is not complete.");
       // Admission cleanup may finish after the same run's terminal projection.
       // A late snapshot must not rewind canonical Run/editor truth.
       if (
@@ -1381,10 +1435,18 @@ export async function createPresentationSession(
       ) {
         planRevisionIntent = null;
       }
+      const activatedControl = await options.lifecycle[sessionManagedControl](snapshot.sessionId);
+      const activatedControlSnapshot = await activatedControl?.inspect({
+        parentSessionId: snapshot.sessionId,
+      });
+      const { managedControl: _previousControl, ...previousAuthority } = state.authoritative;
       state = {
         revision: state.revision + 1,
         authoritative: {
-          ...state.authoritative,
+          ...previousAuthority,
+          ...(activatedControlSnapshot === undefined
+            ? {}
+            : { managedControl: activatedControlSnapshot }),
           continuity: activatedOperationProjection.truncated
             ? {
                 status: "degraded",
@@ -1427,6 +1489,7 @@ export async function createPresentationSession(
             : (state.transient ?? { activity: "working", assistant: null, reasoning: null }),
       };
       draftTargetIdentity = null;
+      await observeManagedControl(snapshot.sessionId);
       lastSnapshotActivation = {
         sessionId: snapshot.sessionId,
         throughSequence: snapshot.lastSequence,
@@ -2312,6 +2375,63 @@ export async function createPresentationSession(
           message: "The presentation session is closed.",
         };
       }
+      if (command.type === "resolve_managed_transition") {
+        const transition = state.authoritative.managedTransition;
+        const original = pendingManagedCommand;
+        if (transition?.id !== command.transitionId || original === undefined)
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The exact managed transition is no longer pending.",
+          };
+        const result = await options.lifecycle[sessionManagedTransition]({
+          destinationSessionId: transition.destinationSessionId,
+          transitionId: transition.id,
+          decision: command.decision,
+        });
+        if (result.status === "rejected" || result.status === "required")
+          return {
+            status: "rejected",
+            code: "authority_rejected",
+            message:
+              result.status === "rejected" ? result.message : "The transition is still pending.",
+          };
+        clearManagedTransition();
+        return result.status === "stayed"
+          ? { status: "admitted", commandId: randomUUID(), resource: null }
+          : dispatch(original);
+      }
+      if (
+        command.type === "select_session" ||
+        command.type === "create_session" ||
+        command.type === "branch_session"
+      ) {
+        if (activeRun !== undefined)
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "Wait for or cancel the active Main run before changing Sessions.",
+          };
+        if (
+          command.type === "select_session" &&
+          !state.authoritative.sessions.items.some((session) => session.id === command.sessionId)
+        )
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "The requested Session is not in the current catalog.",
+          };
+        if (command.type === "create_session" && !knownTargets.has(command.targetId))
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "The exact target is unavailable.",
+          };
+        if (command.type !== "branch_session") {
+          const transition = await prepareManagedTransition(command);
+          if (transition !== undefined) return transition;
+        }
+      }
       if (command.type === "managed_control") {
         const parentSessionId = command.command.parentSessionId;
         if (state.authoritative.active?.session.id !== parentSessionId)
@@ -3058,6 +3178,10 @@ export async function createPresentationSession(
           composer: projectTurnComposer(),
           transient: null,
         };
+        controlObserver?.abort();
+        controlObserverParent = undefined;
+        const { managedControl: _previousControl, ...draftAuthority } = state.authoritative;
+        state = { ...state, authoritative: draftAuthority };
         draftTargetIdentity = targetIdentity;
         if (recovered !== null) {
           await turnComposer.restoreDraft(recovered);
@@ -3856,6 +3980,27 @@ export async function createPresentationSession(
               : { sourceBoundary: command.sourceBoundary }),
             ...(command.targetId === null ? {} : { targetId: command.targetId }),
           });
+          const summary = sessionSummaryFromSnapshot(
+            snapshot,
+            await readActiveBranchRecords(options, snapshot.sessionId),
+          );
+          state = {
+            ...state,
+            revision: state.revision + 1,
+            authoritative: {
+              ...state.authoritative,
+              sessions: {
+                ...state.authoritative.sessions,
+                items: [...state.authoritative.sessions.items, summary],
+              },
+            },
+          };
+          publishStateChange();
+          const transition = await prepareManagedTransition({
+            type: "select_session",
+            sessionId: snapshot.sessionId,
+          });
+          if (transition !== undefined) return transition;
           await turnComposer.clear({ preserveRetained: true });
           await activateSnapshot(snapshot);
           return { status: "admitted", commandId: randomUUID(), resource: null };

@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import { chmod, type FileHandle, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import type { ManagedDelegationEnvelope } from "@adam-agent/presentation";
 
 import { z } from "zod";
 
@@ -262,6 +263,7 @@ type OrdinaryToolError = Exclude<
 type PreparedToolCall = {
   readonly status: "ready";
   readonly permissionSubject: PermissionSubject;
+  resolvePermissionSubject?(): Promise<PermissionSubject>;
   readonly changePreview?: { readonly text: string };
   validateBeforeDispatch?(): FailedToolResult | undefined;
   execute(context: ToolExecutionContext): Promise<ToolResult>;
@@ -304,6 +306,30 @@ export type ToolRegistry = {
 export type PermissionDecision = "allow" | "ask" | "deny";
 
 export type PermissionSubject =
+  | {
+      readonly type: "managed_agent_action";
+      readonly envelope?: ManagedDelegationEnvelope;
+      readonly parentSessionId: string;
+      readonly action:
+        | "list_agents"
+        | "wait_agents"
+        | "post_agent"
+        | "reply_agent"
+        | "cancel_agents"
+        | "report_to_parent"
+        | "request_parent_input";
+      readonly threadIds: readonly string[];
+      readonly turnIds: readonly string[];
+      readonly argumentsDigest: `sha256:${string}`;
+    }
+  | {
+      readonly type: "managed_agent_batch";
+      readonly envelope: ManagedDelegationEnvelope;
+      readonly parentSessionId: string;
+      readonly mode: "background" | "foreground";
+      readonly count: number;
+      readonly argumentsDigest: `sha256:${string}`;
+    }
   | { readonly type: "file"; readonly path: string }
   | { readonly type: "workspace_path"; readonly path: string }
   | {
@@ -333,7 +359,7 @@ export type PermissionSubject =
       readonly command: string;
       readonly cwd: ".";
       readonly planCycleId: string;
-      readonly planPolicyVersion: "plan-policy.hybrid-v1";
+      readonly planPolicyVersion: "plan-policy.hybrid-v1" | "plan-policy.hybrid-delegation-v1";
       readonly shellPolicyVersion: "plan-shell-policy.v1";
       readonly shellEnvironmentVersion: "plan-shell-env.v1";
       readonly shellEnvironmentDigest: `sha256:${string}`;
@@ -495,6 +521,8 @@ export type PermissionPolicyInput = {
 };
 
 export type PermissionPolicy = {
+  /** Serializable read ceiling for delegated work; arbitrary policy functions grant none. */
+  readonly delegationReadCeiling?: PermissionDecision;
   decide(input: PermissionPolicyInput): PermissionDecision;
 };
 
@@ -505,6 +533,11 @@ export function createPermissionPolicy(options: {
   const allowedEffects = new Set(options.allowedEffects);
   const askedEffects = new Set(options.askedEffects ?? []);
   return {
+    delegationReadCeiling: allowedEffects.has("read")
+      ? "allow"
+      : askedEffects.has("read")
+        ? "ask"
+        : "deny",
     decide(input) {
       if (allowedEffects.has(input.effect)) {
         return "allow";

@@ -6,7 +6,11 @@ import type { PlanGitAttestationV1 } from "./plan-git-policy.js";
 import type { PlanShellEnvironmentV1 } from "./plan-shell-environment.js";
 import type { ModelToolDefinition, ToolEffect } from "./tool-runtime.js";
 
-export const planPolicyVersions = ["plan-policy.read-v1", "plan-policy.hybrid-v1"] as const;
+export const planPolicyVersions = [
+  "plan-policy.read-v1",
+  "plan-policy.hybrid-v1",
+  "plan-policy.hybrid-delegation-v1",
+] as const;
 
 export const submitPlanToolDefinitionV1: ModelToolDefinition = {
   name: "submit_plan",
@@ -22,6 +26,15 @@ export const submitPlanToolDefinitionV1: ModelToolDefinition = {
     },
   },
 };
+
+export function isHybridPlanPolicy(
+  policy: string | undefined,
+): policy is "plan-policy.hybrid-v1" | "plan-policy.hybrid-delegation-v1" {
+  return policy === "plan-policy.hybrid-v1" || policy === "plan-policy.hybrid-delegation-v1";
+}
+export function isPlanDelegationTool(name: string): boolean {
+  return ["spawn_agents", "post_agent", "reply_agent", "cancel_agents"].includes(name);
+}
 
 export type PlanPolicyVersion = (typeof planPolicyVersions)[number];
 
@@ -157,7 +170,11 @@ export function isPlanToolProfileV1Valid(
         definition.name.length <= 256 &&
         /^sha256:[0-9a-f]{64}$/u.test(definition.definitionDigest) &&
         (definition.effect === "read" ||
-          (policyVersion === "plan-policy.hybrid-v1" &&
+          (policyVersion === "plan-policy.hybrid-delegation-v1" &&
+            definition.source === "builtin" &&
+            definition.effect === "delegate" &&
+            isPlanDelegationTool(definition.name)) ||
+          (isHybridPlanPolicy(policyVersion) &&
             ((definition.source === "builtin" &&
               definition.name === "run_shell" &&
               definition.effect === "execute") ||
