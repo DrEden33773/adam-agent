@@ -487,7 +487,7 @@ test("ConversationViewer follows live output, preserves manual scroll, and survi
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.nextSynchronizedFrameContaining("Live viewer evidence");
+    await h.terminal.nextSynchronizedFrameContaining("@explore-1 · Explore · Running");
     await h.press("\u001b[B\u001b[B\r", "Conversation");
     expect(h.conversationText()).toContain("First live line.");
     expect(h.conversationText()).toContain("deepseek-v4-flash.direct · thinking default");
@@ -668,7 +668,7 @@ test.each(["cooperative", "interrupt"] as const)(
         }),
       ).toMatchObject({ status: "admitted" });
       await started.promise;
-      await h.terminal.nextSynchronizedFrameContaining("Finishing boundary");
+      await h.terminal.nextSynchronizedFrameContaining("@explore-1 · Explore · Running");
       await h.press("\u001b[B\u001b[B\r", "Conversation");
       await h.press("\r", "Cooperative");
       if (mode === "interrupt") await h.press("\t", "Interrupt after current effect");
@@ -877,7 +877,7 @@ test.each(["wait", "suspend"] as const)(
         }),
       ).toMatchObject({ status: "admitted" });
       await fourStarted.promise;
-      await h.terminal.nextSynchronizedFrameContaining("Source item 1");
+      await h.terminal.nextSynchronizedFrameContaining("@explore-1 · Explore · Running");
       await h.press("\u001b[B\u001b[B\r", "Conversation");
       await h.press("\r", "Cooperative");
       await h.press("Only the source child draft.", "Only the source child draft.");
@@ -952,7 +952,7 @@ test("two deliberate Enter submissions with identical text admit two distinct ch
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.nextSynchronizedFrameContaining("Repeated input");
+    await h.terminal.nextSynchronizedFrameContaining("@explore-1 · Explore · Running");
     await h.press("\u001b[B\u001b[B\r", "Conversation");
     await h.press("\r", "Cooperative");
     await h.press("Check again.", "Check again.");
@@ -1017,7 +1017,7 @@ test("late durable acceptance cannot clear a draft explicitly retargeted to a ne
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.nextSynchronizedFrameContaining("Retargeted draft");
+    await h.terminal.nextSynchronizedFrameContaining("@explore-1 · Explore · Running");
     await h.press("\u001b[B\u001b[B\r", "Conversation");
     await h.press("\r", "Cooperative");
     await h.press("Still the intended draft.", "Still the intended draft.");
@@ -1448,7 +1448,7 @@ test("live transcript elision is counted separately from the bounded Markdown co
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.nextSynchronizedFrameContaining("Bounded live preview");
+    await h.terminal.nextSynchronizedFrameContaining("@explore-1 · Explore · Running");
     await h.press("\u001b[B\u001b[B\r", "Conversation");
     expect(h.presentation.getState().managedAgentActivity?.[0]?.assistant).toMatchObject({
       totalByteCount: 20000,
@@ -1520,7 +1520,7 @@ test("child permission preempts and restores the exact independent composer with
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.nextSynchronizedFrameContaining("Permission focus");
+    await h.terminal.nextSynchronizedFrameContaining("@explore-1 · Explore · Running");
     await h.press("\u001b[B\u001b[B\r", "Conversation");
     await h.press("\r", "Cooperative");
     await h.press("Kept child draft", "Kept child draft");
@@ -1584,7 +1584,7 @@ test("viewer x x cancels the exact turn only on two presses and retains unknown 
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.nextSynchronizedFrameContaining("Exact cancellation");
+    await h.terminal.nextSynchronizedFrameContaining("@explore-1 · Explore · Running");
     await h.press("\u001b[B\u001b[B\r", "Conversation");
     await h.press("\u001b[120;1:1u", "x again to cancel");
     h.terminal.input("\u001b[120;1:2u\u001b[120;1:3u");

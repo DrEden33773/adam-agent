@@ -41,7 +41,7 @@ test("owner-private child draft survives a cold TUI and Lifecycle rebuild separa
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.nextSynchronizedFrameContaining("Draft persistence");
+    await h.terminal.nextSynchronizedFrameContaining("@explore-1 · Explore · Running");
     await h.press("\u001b[B\u001b[B\r", "Conversation");
     await h.press("\r", "Cooperative");
     await h.press("Child draft survives restart.", "Child draft survives restart.");
