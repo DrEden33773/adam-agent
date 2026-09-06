@@ -243,7 +243,7 @@ const builtInCommands: readonly AdamCommandDefinition[] = [
     id: "agents",
     name: "agents",
     summary: "Inspect, reply to, or cancel managed children for the active session.",
-    usage: "/agents",
+    usage: "/agents [history|settings|attention]",
   },
   {
     aliases: [],

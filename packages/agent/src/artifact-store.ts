@@ -118,7 +118,19 @@ export type PlanArtifactSourceV1 = {
   readonly provenance: "model_submit_plan";
 };
 
+export type ManagedAgentExportArtifactSourceV1 = {
+  readonly type: "managed_agent_export";
+  readonly schemaVersion: 1;
+  readonly parentSessionId: string;
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly completion: { readonly sequence: number; readonly digest: string };
+  readonly fields: readonly string[];
+  readonly provenance: "confirmed_agent_export";
+};
+
 export type ArtifactSource =
+  | ManagedAgentExportArtifactSourceV1
   | ChangePreviewArtifactSource
   | ExtensionArtifactSource
   | InputResourceArtifactSourceV1

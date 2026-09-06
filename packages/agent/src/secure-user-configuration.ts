@@ -5,6 +5,11 @@ import { type FileHandle, mkdir, open, realpath, rename, unlink } from "node:fs/
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import {
+  type AgentUiSettings,
+  defaultAgentUiSettings,
+  isAgentUiSettings,
+} from "@adam-agent/presentation";
+import {
   createUserModelPolicyResolver,
   type UserModelPolicyField,
   type UserModelPolicyResolver,
@@ -33,6 +38,8 @@ export type PresentationPreferencesSnapshot = {
 };
 
 export type PresentationPreferences = {
+  loadAgentUi?(): Promise<AgentUiSettings>;
+  setAgentUi?(settings: AgentUiSettings | null): Promise<void>;
   load(): Promise<PresentationPreferencesSnapshot>;
   setDefaultTarget(targetId: string | null): Promise<void>;
   setModelPolicy(input: {
@@ -113,6 +120,12 @@ export function createPresentationPreferences(options: {
       directoryPath,
       maximumBytes: maximumConfigurationBytes,
       temporaryPrefix: ".config",
+    }),
+    createOwnerConfigurationFileStorage({
+      configurationPath: join(directoryPath, "ui.json"),
+      directoryPath,
+      maximumBytes: maximumConfigurationBytes,
+      temporaryPrefix: ".ui",
     }),
   );
 }
@@ -325,6 +338,7 @@ function createWorkspaceTrustFromStorage(options: {
 
 function createPresentationPreferencesFromStorage(
   storage: UserConfigurationStorage,
+  uiStorage?: UserConfigurationStorage,
 ): PresentationPreferences {
   let lastValidSnapshot = emptySnapshot();
 
@@ -374,6 +388,33 @@ function createPresentationPreferencesFromStorage(
   });
 
   return {
+    ...(uiStorage === undefined
+      ? {}
+      : {
+          async loadAgentUi(): Promise<AgentUiSettings> {
+            const stored = await uiStorage.read();
+            if (stored.status === "missing") return defaultAgentUiSettings;
+            if (stored.status === "unsafe")
+              throw new TypeError("Agent UI settings are not owner-private.");
+            const parsed: unknown = JSON.parse(stored.text);
+            if (
+              !isAgentUiSettings(parsed) ||
+              !("schemaVersion" in parsed) ||
+              parsed.schemaVersion !== 1
+            )
+              throw new TypeError("Agent UI settings are invalid.");
+            const { widgetMode, fleetEnabled, showModel, viewerMode, mentions } = parsed;
+            return { widgetMode, fleetEnabled, showModel, viewerMode, mentions };
+          },
+          async setAgentUi(settings: AgentUiSettings | null): Promise<void> {
+            const value = settings ?? defaultAgentUiSettings;
+            if (!isAgentUiSettings(value)) throw new TypeError("Agent UI settings are invalid.");
+            const { widgetMode, fleetEnabled, showModel, viewerMode, mentions } = value;
+            await uiStorage.write(
+              `${JSON.stringify({ schemaVersion: 1, widgetMode, fleetEnabled, showModel, viewerMode, mentions })}\n`,
+            );
+          },
+        }),
     async load() {
       return loadConfiguration();
     },

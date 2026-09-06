@@ -161,6 +161,9 @@ export function projectToolDisplays(
               tool.changePreviewRef,
               changePreviewCache,
             ),
+            ...(name === "spawn_agents"
+              ? { managedAdmissions: managedAdmissionDisplays(tool.output) }
+              : {}),
           },
         ] as const,
       ];
@@ -518,6 +521,38 @@ function toolResultSummary(name: string, output: JsonValue | undefined): string 
     return output === undefined ? null : `Completed${outputTruncated ? " · output truncated" : ""}`;
   }
   return output === undefined ? null : "Completed";
+}
+
+function managedAdmissionDisplays(
+  output: JsonValue | undefined,
+): NonNullable<ToolCallDisplay["managedAdmissions"]> {
+  const { admissions } = jsonRecord(output) ?? {};
+  if (!Array.isArray(admissions) || admissions.length > 32) return [];
+  return admissions.flatMap((value) => {
+    const { status, lane, threadId, turnId, handle, displayName, description } =
+      jsonRecord(value) ?? {};
+    if (
+      (status !== "started" && status !== "queued") ||
+      (lane !== "background" && lane !== "reserved") ||
+      typeof threadId !== "string" ||
+      typeof turnId !== "string" ||
+      typeof handle !== "string" ||
+      typeof displayName !== "string" ||
+      typeof description !== "string"
+    )
+      return [];
+    return [
+      {
+        threadId,
+        turnId,
+        handle: boundedDisplayText(handle),
+        displayName: boundedDisplayText(displayName),
+        description: boundedDisplayText(description),
+        lane,
+        status,
+      },
+    ];
+  });
 }
 
 const toolTextPreviewMaximumBytes = 16 * 1024;

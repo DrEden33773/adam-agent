@@ -1,10 +1,12 @@
 import type {
+  ManagedAgentExport,
   ManagedControlIdentity,
   ManagedControlLink,
   ManagedControlOutcome,
   ManagedControlThread,
   ManagedWorkspaceSnapshot,
 } from "@adam-agent/presentation";
+import { agentExportFields, presentationAgentExportMaximumBytes } from "@adam-agent/presentation";
 
 export type {
   ManagedControlIdentity,
@@ -49,6 +51,13 @@ export const managedControlFrozenSchema = z.strictObject({
 export type ManagedControlFrozen = z.infer<typeof managedControlFrozenSchema>;
 
 export type ManagedControlEvent =
+  | {
+      readonly type: "exported";
+      readonly completion: ManagedControlLink;
+      readonly fields: ManagedAgentExport["fields"];
+      readonly artifact: ManagedAgentExport["artifact"];
+    }
+  | { readonly type: "seen" | "suppressed"; readonly completion: ManagedControlLink }
   | { readonly type: "admission_paused"; readonly reason: "plan" }
   | { readonly type: "suspend_requested" | "thread_closed" }
   | {
@@ -102,7 +111,7 @@ export type ManagedControlEvent =
       readonly frozen?: ManagedControlFrozen;
       readonly envelope?: DelegationEnvelope;
     }
-  | { readonly type: "started" }
+  | { readonly type: "started"; readonly atUnixMilliseconds?: number }
   | { readonly type: "cancel_requested" }
   | {
       readonly type: "execution_progress";
@@ -209,7 +218,26 @@ const eventSchema = z.discriminatedUnion("type", [
     frozen: managedControlFrozenSchema.optional(),
     envelope: delegationEnvelopeSchema.optional(),
   }),
-  z.strictObject({ type: z.literal("started") }),
+  z.strictObject({
+    type: z.literal("exported"),
+    completion: linkSchema,
+    fields: z
+      .array(z.enum(agentExportFields))
+      .min(1)
+      .max(agentExportFields.length)
+      .refine((fields) => new Set(fields).size === fields.length),
+    artifact: z.strictObject({
+      id: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+      mediaType: z.literal("application/json"),
+      byteCount: z.number().int().positive().max(presentationAgentExportMaximumBytes),
+      source: z.literal("agent_export"),
+    }),
+  }),
+  z.strictObject({ type: z.enum(["seen", "suppressed"]), completion: linkSchema }),
+  z.strictObject({
+    type: z.literal("started"),
+    atUnixMilliseconds: z.number().int().nonnegative().optional(),
+  }),
   z.strictObject({ type: z.literal("cancel_requested") }),
   z.strictObject({
     type: z.literal("execution_progress"),
@@ -230,6 +258,7 @@ const eventSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({
     type: z.literal("outcome"),
+    atUnixMilliseconds: z.number().int().nonnegative().optional(),
     artifact: z
       .strictObject({
         id: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
@@ -311,7 +340,10 @@ export function validateManagedControlRecord(
       (entry) =>
         entry.event.type !== "provider_reserved" &&
         entry.event.type !== "provider_usage" &&
-        entry.event.type !== "provider_unknown",
+        entry.event.type !== "provider_unknown" &&
+        entry.event.type !== "seen" &&
+        entry.event.type !== "suppressed" &&
+        entry.event.type !== "exported",
     );
     if (last !== undefined && last.event.type !== "completion" && last.event.type !== "consumed")
       return invalid();
@@ -333,6 +365,34 @@ export function validateManagedControlRecord(
       admission.childSessionId !== record.childSessionId
     )
       return invalid();
+    if (record.event.type === "exported") {
+      const event = record.event;
+      const completion = turnRecords.find((entry) => entry.event.type === "completion");
+      if (
+        completion === undefined ||
+        event.completion.sequence !== completion.sequence ||
+        event.completion.digest !== managedControlDigest(completion) ||
+        turnRecords.some(
+          (entry) =>
+            entry.event.type === "exported" && entry.event.artifact.id === event.artifact.id,
+        )
+      )
+        return invalid();
+      return record;
+    }
+    if (record.event.type === "seen" || record.event.type === "suppressed") {
+      const completion = turnRecords.find((entry) => entry.event.type === "completion");
+      if (
+        completion === undefined ||
+        record.event.completion.sequence !== completion.sequence ||
+        record.event.completion.digest !== managedControlDigest(completion) ||
+        turnRecords.some((entry) => entry.event.type === record.event.type) ||
+        (record.event.type === "suppressed" &&
+          turnRecords.some((entry) => entry.event.type === "consumed"))
+      )
+        return invalid();
+      return record;
+    }
     if (
       record.event.type === "admission_paused" ||
       record.event.type === "suspend_requested" ||
@@ -455,7 +515,10 @@ export function validateManagedControlRecord(
         entry.event.type !== "provider_reserved" &&
         entry.event.type !== "provider_usage" &&
         entry.event.type !== "provider_unknown" &&
-        entry.event.type !== "budget_blocked",
+        entry.event.type !== "budget_blocked" &&
+        entry.event.type !== "seen" &&
+        entry.event.type !== "suppressed" &&
+        entry.event.type !== "exported",
     );
     const event = record.event;
     if (
@@ -535,6 +598,9 @@ export function foldManagedControl(
       event.type === "input_undelivered" ||
       event.type === "budget_blocked" ||
       event.type === "consumed" ||
+      event.type === "seen" ||
+      event.type === "suppressed" ||
+      event.type === "exported" ||
       event.type === "provider_reserved" ||
       event.type === "provider_usage" ||
       event.type === "provider_unknown"
@@ -544,6 +610,9 @@ export function foldManagedControl(
       const existing = threads.get(record.threadId);
       threads.set(record.threadId, {
         parentSessionId,
+        ...(existing === undefined
+          ? {}
+          : { previousTurns: [...(existing.previousTurns ?? []), existing.turn] }),
         lifecycle: "open",
         displayName: "Explore",
         handle: existing?.handle ?? `@explore-${threads.size + 1}`,
@@ -568,6 +637,7 @@ export function foldManagedControl(
                   parentBranchId: event.frozen.parentBranchId,
                   targetId: event.frozen.targetIdentity.targetId,
                   thinking: event.frozen.thinkingPolicy?.effectiveLevelId ?? "default",
+                  contextWindowTokens: event.frozen.contextProfile.contextWindowTokens,
                 },
               }),
           health: "healthy",
@@ -615,6 +685,15 @@ export function foldManagedControl(
     }
     if (event.type === "capacity_wait" || event.type === "capacity_acquired") {
       const turn = { ...thread.turn };
+      const question =
+        event.type === "capacity_wait" && event.reason === "parent_input"
+          ? records.find(
+              (entry) =>
+                entry.turnId === record.turnId &&
+                entry.event.type === "parent_input_requested" &&
+                entry.event.id === event.requestId,
+            )
+          : undefined;
       delete turn.attention;
       threads.set(record.threadId, {
         ...thread,
@@ -635,7 +714,15 @@ export function foldManagedControl(
           ...(event.type === "capacity_wait" &&
           event.requestId !== undefined &&
           (event.reason === "permission" || event.reason === "parent_input")
-            ? { attention: { id: event.requestId, kind: event.reason } }
+            ? {
+                attention: {
+                  id: event.requestId,
+                  kind: event.reason,
+                  ...(question?.event.type === "parent_input_requested"
+                    ? { question: question.event.text }
+                    : {}),
+                },
+              }
             : {}),
           ...(turn.watchdog === undefined
             ? {}
@@ -703,7 +790,14 @@ export function foldManagedControl(
       residency: phase === "idle" ? "unloaded" : "live",
       turn: {
         ...previousTurn,
-        ...(event.type === "started" ? { hasStarted: true as const } : {}),
+        ...(event.type === "started"
+          ? {
+              hasStarted: true as const,
+              ...(event.atUnixMilliseconds === undefined
+                ? {}
+                : { startedAtUnixMilliseconds: event.atUnixMilliseconds }),
+            }
+          : {}),
         phase,
         ownerPhase:
           phase === "settling" ? "releasing" : phase === "executing" ? "claimed" : "released",
@@ -734,6 +828,20 @@ export function foldManagedControl(
     });
   }
   return {
+    exports: records.flatMap((record) =>
+      record.parentSessionId === parentSessionId && record.event.type === "exported"
+        ? [
+            {
+              parentSessionId,
+              threadId: record.threadId,
+              turnId: record.turnId,
+              completion: record.event.completion,
+              fields: record.event.fields,
+              artifact: record.event.artifact,
+            },
+          ]
+        : [],
+    ),
     completions: records.flatMap((record) => {
       if (record.parentSessionId !== parentSessionId || record.event.type !== "completion")
         return [];
@@ -749,11 +857,18 @@ export function foldManagedControl(
           turnId: record.turnId,
           receipt: managedControlLink(record),
           outcome: outcome.event,
+          ...(records.some((entry) => entry.turnId === record.turnId && entry.event.type === "seen")
+            ? { userSeen: true as const }
+            : {}),
           consumption: records.some(
             (entry) => entry.turnId === record.turnId && entry.event.type === "consumed",
           )
             ? ("consumed" as const)
-            : ("pending" as const),
+            : records.some(
+                  (entry) => entry.turnId === record.turnId && entry.event.type === "suppressed",
+                )
+              ? ("suppressed" as const)
+              : ("pending" as const),
         },
       ];
     }),

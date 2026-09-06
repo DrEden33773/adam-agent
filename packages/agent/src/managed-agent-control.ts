@@ -1,4 +1,10 @@
-import type { ManagedControlCommand, ManagedControlReceipt } from "@adam-agent/presentation";
+import type {
+  ManagedAgentExport,
+  ManagedControlAction,
+  ManagedControlCommand,
+  ManagedControlReceipt,
+} from "@adam-agent/presentation";
+import { agentExportFields, presentationAgentExportMaximumBytes } from "@adam-agent/presentation";
 import type { ArtifactStore } from "./artifact-store.js";
 import type { PlanCycleSnapshot } from "./plan-mode.js";
 
@@ -18,7 +24,7 @@ import {
   managedAgentStorageQuota,
   sessionRecordCommittedBarrier,
 } from "./agent-session.js";
-import type { ModelDriver } from "./agent-session-contracts.js";
+import type { ModelDriver, RuntimeEvent } from "./agent-session-contracts.js";
 import type { ContextProfile } from "./context-profile.js";
 import {
   assertFleetReservation,
@@ -100,6 +106,15 @@ export type ManagedWorkspaceFrame = {
 };
 
 export type ManagedAgentControl = {
+  publishExport(
+    input: Omit<ManagedAgentExport, "artifact"> & { readonly content: string },
+  ): Promise<ManagedAgentExport>;
+  readInput(input: {
+    readonly parentSessionId: string;
+    readonly threadId: string;
+    readonly turnId: string;
+    readonly inputId: string;
+  }): Promise<string | undefined>;
   prepareDelegation(
     command: Extract<ManagedControlCommand, { type: "spawn_agents" }>,
   ): Promise<DelegationEnvelope>;
@@ -142,6 +157,27 @@ const validSpawnMode = (input: {
   entries: readonly unknown[];
 }) => input.mode !== "foreground" || input.entries.length === 1;
 const commandSchema = z.discriminatedUnion("type", [
+  z.strictObject({
+    type: z.literal("suppress_completion"),
+    confirmed: z.literal(true),
+    parentSessionId: z.uuid(),
+    threadId: z.uuid(),
+    expectedTurnId: z.uuid(),
+    completion: z.strictObject({
+      sequence: z.number().int().positive(),
+      digest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+    }),
+  }),
+  z.strictObject({
+    type: z.literal("mark_completion_seen"),
+    parentSessionId: z.uuid(),
+    threadId: z.uuid(),
+    expectedTurnId: z.uuid(),
+    completion: z.strictObject({
+      sequence: z.number().int().positive(),
+      digest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+    }),
+  }),
   z.strictObject({
     type: z.enum(["suspend_agents", "resume_agents"]),
     parentSessionId: z.uuid(),
@@ -286,7 +322,11 @@ export function createManagedAgentControl(options: {
   readonly executionDomain: ProjectExecutionDomain;
   readonly store: ManagedControlStore;
   readonly childSessionStores: SessionStoreDirectory<SessionRecord>;
-  readonly admissionGuard?: <T>(operation: () => Promise<T>) => Promise<T>;
+  readonly onChildRuntimeEvent?: (identity: ManagedControlIdentity, event: RuntimeEvent) => void;
+  readonly admissionGuard?: <T>(
+    operation: () => Promise<T>,
+    constraints?: { readonly requireIdleMain: true },
+  ) => Promise<T>;
   readonly artifactStore?: ArtifactStore;
   readonly policy?: FleetPolicy;
   readonly readPlan?: () => Promise<PlanCycleSnapshot | undefined>;
@@ -401,7 +441,7 @@ export function createManagedAgentControl(options: {
           childSessionId,
           schemaVersion: 3,
           sequence: Number.MAX_SAFE_INTEGER,
-          event: { type: "started" },
+          event: { type: "started", atUnixMilliseconds: Number.MAX_SAFE_INTEGER },
         },
       ])
     );
@@ -462,8 +502,9 @@ export function createManagedAgentControl(options: {
     admittingTurnId?: string,
   ): Promise<ManagedWorkspaceSnapshot> => {
     const snapshot = foldManagedControl(records, parentSessionId);
+    const policyAllowsInput = await currentCeilingAllows();
     const threads = await Promise.all(
-      snapshot.threads.map((thread) => {
+      snapshot.threads.map(async (thread) => {
         const local = active.get(thread.threadId)?.attemptId === thread.turn.attemptId;
         const warm =
           local || ready.has(thread.turn.turnId) || admittingTurnId === thread.turn.turnId;
@@ -473,12 +514,23 @@ export function createManagedAgentControl(options: {
           thread.turn.waitReason !== "plan" &&
           thread.turn.phase !== "idle" &&
           thread.turn.outcome === undefined;
-        return inspectManagedChildReceipt(
+        const inspected = await inspectManagedChildReceipt(
           {
             ...thread,
+            budget: fleetBudget(
+              records,
+              thread.turn.envelope?.threadTokens ?? policy.threadTokens,
+              (record) => record.threadId === thread.threadId,
+              new Set([...active.values()].map((entry) => entry.turnId)),
+            ),
             residency: live ? "live" : "unloaded",
             turn: {
               ...thread.turn,
+              ...(local &&
+              !thread.turn.hasStarted &&
+              (thread.turn.phase === "queued" || thread.turn.waitReason === "suspended")
+                ? { phase: "starting" as const, label: "Starting" }
+                : {}),
               recovery:
                 !warm &&
                 (thread.turn.phase !== "idle" ||
@@ -506,6 +558,118 @@ export function createManagedAgentControl(options: {
             (record) => record.turnId === thread.turn.turnId && record.event.type === "admitted",
           ),
         );
+        const actions: ManagedControlAction[] = [];
+        let recoveryDiagnostic = inspected.turn.diagnostic;
+        if (!closing && inspected.lifecycle === "open") {
+          if (local && inspected.turn.attention?.kind === "permission") actions.push("permission");
+          if (inspected.turn.phase !== "idle" && inspected.turn.outcome === undefined)
+            actions.push("cancel");
+          if (inspected.turn.phase === "idle") actions.push("close");
+          if (policyAllowsInput && inspected.turn.recovery === "none") {
+            if (
+              local &&
+              inspected.turn.hasStarted &&
+              inspected.turn.phase !== "idle" &&
+              inspected.turn.phase !== "settling" &&
+              inspected.turn.outcome === undefined
+            ) {
+              actions.push("cooperative", "interrupt");
+              if (inspected.turn.attention?.kind === "parent_input") actions.push("reply");
+            }
+            const origin = records.find(
+              (entry) => entry.threadId === thread.threadId && entry.event.type === "admitted",
+            );
+            const attempts = records.filter(
+              (entry) => entry.threadId === thread.threadId && entry.event.type === "admitted",
+            ).length;
+            if (
+              inspected.turn.phase === "idle" &&
+              inspected.turn.hasStarted &&
+              inspected.turn.outcome !== undefined &&
+              origin?.event.type === "admitted" &&
+              origin.event.frozen !== undefined &&
+              origin.event.envelope !== undefined &&
+              attempts <
+                Math.min(policy.maximumAttempts, origin.event.envelope.policy.maximumAttempts) &&
+              (inspected.budget?.available ?? 0) > 0
+            )
+              actions.push("new_turn");
+          }
+        }
+        if (
+          !closing &&
+          !local &&
+          !warm &&
+          inspected.lifecycle === "open" &&
+          inspected.turn.diagnostic === undefined &&
+          inspected.turn.recovery === "required"
+        ) {
+          const admission = records.find(
+            (entry) => entry.turnId === thread.turn.turnId && entry.event.type === "admitted",
+          );
+          if (inspected.turn.outcome !== undefined) actions.push("recover");
+          else if (
+            admission?.event.type === "admitted" &&
+            admission.event.envelope !== undefined &&
+            policyAllowsInput &&
+            inspected.turn.health !== "stalled" &&
+            admission.event.frozen !== undefined &&
+            isDeepStrictEqual(admission.event.frozen.targetIdentity, options.targetIdentity) &&
+            isDeepStrictEqual(admission.event.frozen.contextProfile, options.contextProfile)
+          ) {
+            try {
+              const childRecords = await (
+                await options.childSessionStores.open(admission.childSessionId)
+              )?.read();
+              if (childRecords === undefined && !thread.turn.hasStarted) actions.push("resume");
+              else if (childRecords !== undefined && childRecords[0] !== undefined) {
+                validateManagedChildGenesis(admission, childRecords[0]);
+                const terminal = await managedChildTerminalResult(
+                  childRecords,
+                  options.workspaceRoot,
+                  options.artifactStore,
+                );
+                if (terminal !== undefined) actions.push("recover");
+                else if (
+                  !records.some(
+                    (entry) =>
+                      entry.turnId === admission.turnId &&
+                      (entry.event.type === "cancel_requested" || entry.event.type === "stalled"),
+                  ) &&
+                  (childRecords.length === 1 ||
+                    prepareManagedChildResume(
+                      childRecords,
+                      childTools(admission),
+                      options.workspaceRoot,
+                    ) !== undefined)
+                )
+                  actions.push("resume");
+                else recoveryDiagnostic = "This interrupted effect cannot be replayed safely.";
+              }
+            } catch (error) {
+              if (!(error instanceof SessionStoreError || error instanceof SessionLifecycleError))
+                throw error;
+              recoveryDiagnostic = "Child history is unavailable. Inspect durable state.";
+            }
+          }
+        }
+        if (!closing && policyAllowsInput && ceilingWaits.has(thread.turn.turnId))
+          actions.push("resume");
+        return {
+          ...inspected,
+          actions,
+          ...(recoveryDiagnostic === undefined
+            ? {}
+            : {
+                turn: {
+                  ...inspected.turn,
+                  diagnostic: recoveryDiagnostic,
+                  ...(!actions.includes("resume") && inspected.turn.waitReason === "suspended"
+                    ? { label: "Suspended · Inspect or cancel" }
+                    : {}),
+                },
+              }),
+        };
       }),
     );
     return {
@@ -521,6 +685,11 @@ export function createManagedAgentControl(options: {
     };
   };
   const append = async (identity: ManagedControlIdentity, event: ManagedControlEvent) => {
+    if (
+      (event.type === "started" || event.type === "outcome") &&
+      event.atUnixMilliseconds === undefined
+    )
+      event = { ...event, atUnixMilliseconds: (options.now ?? Date.now)() };
     const history = await controlStore.read();
     const terminal =
       event.type === "outcome" ||
@@ -1192,6 +1361,11 @@ export function createManagedAgentControl(options: {
         let lastAssistantDelta: string | undefined;
         const lastReasoning = new Map<string, string>();
         const unsubscribe = child.subscribe((event) => {
+          try {
+            options.onChildRuntimeEvent?.(identity, event);
+          } catch {
+            /* Presentation cannot change execution. */
+          }
           if (
             event.type === "model_message_delta" &&
             event.text.length > 0 &&
@@ -1359,6 +1533,7 @@ export function createManagedAgentControl(options: {
   };
   const startReady = async () => {
     if (closing) return;
+    let launched = false;
     const records = await controlStore.read();
     const selected = selectManagedStarts(
       foldManagedControl(records, options.parentSessionId),
@@ -1413,6 +1588,11 @@ export function createManagedAgentControl(options: {
         recovery?.store,
         recovery?.resume,
       );
+      launched = true;
+    }
+    if (launched) {
+      const snapshot = await project(await controlStore.read(), options.parentSessionId);
+      for (const subscriber of subscribers) subscriber({ type: "reset", snapshot });
     }
   };
   const rejected = (
@@ -1420,6 +1600,90 @@ export function createManagedAgentControl(options: {
     message: string,
   ): ManagedControlReceipt => ({ status: "rejected", code, message });
   const control: ManagedAgentControl = {
+    async publishExport(input) {
+      return authorized(async () => {
+        const bytes = Buffer.from(input.content, "utf8");
+        if (
+          input.parentSessionId !== options.parentSessionId ||
+          options.artifactStore === undefined ||
+          bytes.byteLength > presentationAgentExportMaximumBytes ||
+          input.fields.length === 0 ||
+          input.fields.some((field) => !agentExportFields.includes(field)) ||
+          new Set(input.fields).size !== input.fields.length
+        )
+          throw new TypeError("The bounded export request is invalid.");
+        const records = await controlStore.read();
+        const completion = records.find(
+          (entry) =>
+            entry.threadId === input.threadId &&
+            entry.turnId === input.turnId &&
+            entry.event.type === "completion",
+        );
+        if (
+          completion === undefined ||
+          !isDeepStrictEqual(managedControlLink(completion), input.completion)
+        )
+          throw new TypeError("The exact export completion is unavailable.");
+        const saved = await options.artifactStore.write({
+          bytes,
+          mediaType: "application/json",
+          source: {
+            type: "managed_agent_export",
+            schemaVersion: 1,
+            parentSessionId: input.parentSessionId,
+            threadId: input.threadId,
+            turnId: input.turnId,
+            completion: input.completion,
+            fields: input.fields,
+            provenance: "confirmed_agent_export",
+          },
+        });
+        if (
+          saved.byteCount !== bytes.byteLength ||
+          saved.mediaType !== "application/json" ||
+          !/^sha256:[a-f0-9]{64}$/u.test(saved.id)
+        )
+          throw new TypeError("The export artifact receipt is invalid.");
+        const artifact: ManagedAgentExport["artifact"] = {
+          id: saved.id,
+          byteCount: saved.byteCount,
+          mediaType: "application/json",
+          source: "agent_export",
+        };
+        if (
+          !records.some(
+            (entry) => entry.event.type === "exported" && entry.event.artifact.id === artifact.id,
+          )
+        )
+          await append(completion, {
+            type: "exported",
+            completion: input.completion,
+            fields: input.fields,
+            artifact,
+          });
+        return {
+          parentSessionId: input.parentSessionId,
+          threadId: input.threadId,
+          turnId: input.turnId,
+          completion: input.completion,
+          fields: input.fields,
+          artifact,
+        };
+      });
+    },
+    async readInput(input) {
+      if (input.parentSessionId !== options.parentSessionId)
+        throw new TypeError("The input belongs to another parent Session.");
+      await serial;
+      const record = (await controlStore.read()).find(
+        (entry) =>
+          entry.parentSessionId === input.parentSessionId &&
+          entry.threadId === input.threadId &&
+          entry.turnId === input.turnId &&
+          managedAcceptedInput(entry)?.inputId === input.inputId,
+      );
+      return record === undefined ? undefined : managedAcceptedInput(record)?.text;
+    },
     async prepareDelegation(command) {
       const records = await controlStore.read();
       const sessionTokens = fleetSessionCeiling(records, policy);
@@ -1510,15 +1774,38 @@ export function createManagedAgentControl(options: {
       try {
         const snapshot = await control.inspect({ parentSessionId });
         let revision = snapshot.revision;
+        let highestReadyRevision = snapshot.status === "ready" ? snapshot.revision : 0;
+        let deliveredSnapshot = snapshot;
         yield { type: "snapshot", snapshot };
         while (!signal.aborted) {
-          const frame = pending.shift();
+          let frame = pending.shift();
           if (frame === undefined) {
             await wake.promise;
             wake = Promise.withResolvers<void>();
             continue;
           }
+          // A delayed initial read can already include queued liveness resets. Failure resets
+          // remain visible without allowing older healthy snapshots to restore stale authority.
+          if (frame.snapshot.status === "ready" && frame.snapshot.revision < highestReadyRevision)
+            continue;
           if (frame.type !== "reset" && frame.snapshot.revision <= revision) continue;
+          if (
+            frame.type === "reset" &&
+            frame.snapshot.status === "ready" &&
+            frame.snapshot.revision === highestReadyRevision
+          ) {
+            // Liveness can change without a journal append. Reproject at this head so an
+            // older queued reset cannot undo the initial snapshot's current owner state.
+            const current = await control.inspect({ parentSessionId });
+            if (signal.aborted) break;
+            if (
+              current.status === "ready" &&
+              (current.revision > frame.snapshot.revision ||
+                isDeepStrictEqual(current, deliveredSnapshot))
+            )
+              continue;
+            frame = { type: "reset", snapshot: current };
+          }
           yield {
             ...frame,
             type:
@@ -1527,6 +1814,9 @@ export function createManagedAgentControl(options: {
                 : "change",
           };
           revision = frame.snapshot.revision;
+          deliveredSnapshot = frame.snapshot;
+          if (frame.snapshot.status === "ready")
+            highestReadyRevision = Math.max(highestReadyRevision, revision);
         }
       } finally {
         subscribers.delete(subscriber);
@@ -1539,11 +1829,24 @@ export function createManagedAgentControl(options: {
         const receipt = await (options.admissionGuard !== undefined &&
         (command.type === "spawn_agents" ||
           command.type === "next_turn" ||
-          command.type === "recover_turn")
-          ? options.admissionGuard(execute)
+          command.type === "recover_turn" ||
+          command.type === "suppress_completion")
+          ? options.admissionGuard(
+              execute,
+              command.type === "suppress_completion" ? { requireIdleMain: true } : undefined,
+            )
           : execute());
         return await joinForeground(command, receipt, dispatchOptions);
       } catch (error) {
+        if (
+          error instanceof ProjectExecutionDomainError &&
+          error.code === "root_conflict" &&
+          command.type === "suppress_completion"
+        )
+          return rejected(
+            "authority_busy",
+            "Main is active. Suppress after the current run settles.",
+          );
         if (error instanceof ProjectExecutionDomainError)
           return rejected(
             error.code === "root_conflict" || error.code === "project_in_use"
@@ -1698,6 +2001,58 @@ export function createManagedAgentControl(options: {
             "Suspension is durable but running cleanup requires recovery.",
           )
         : { status: "suspended" };
+    }
+    if (command.type === "suppress_completion") {
+      if (options.admissionGuard === undefined)
+        return rejected("action_unavailable", "The Main admission owner is unavailable.");
+      // The family guard encloses reconciliation and the following serialized mutation.
+      const reconciled = await control.dispatch({
+        type: "prepare_main_delivery",
+        parentSessionId: command.parentSessionId,
+      });
+      if (reconciled.status === "rejected") return reconciled;
+      return authorized(async () => {
+        const records = await controlStore.read();
+        const snapshot = foldManagedControl(records, command.parentSessionId);
+        const completion = snapshot.completions.find(
+          (entry) => entry.threadId === command.threadId && entry.turnId === command.expectedTurnId,
+        );
+        if (completion === undefined || !isDeepStrictEqual(completion.receipt, command.completion))
+          return rejected("stale_revision", "The exact completion receipt changed.");
+        if (completion.consumption === "consumed")
+          return rejected("action_unavailable", "Main has already consumed this completion.");
+        if (completion.consumption === "pending") {
+          const record = records.find((entry) => entry.sequence === completion.receipt.sequence);
+          if (record === undefined)
+            return rejected("recovery_required", "The completion receipt is unavailable.");
+          await append(record, { type: "suppressed", completion: command.completion });
+        }
+        return { status: "acknowledged" as const };
+      });
+    }
+    if (command.type === "mark_completion_seen") {
+      return authorized(async () => {
+        const records = await controlStore.read();
+        const completion = records.find(
+          (entry) =>
+            entry.parentSessionId === command.parentSessionId &&
+            entry.threadId === command.threadId &&
+            entry.turnId === command.expectedTurnId &&
+            entry.event.type === "completion",
+        );
+        if (
+          completion === undefined ||
+          !isDeepStrictEqual(managedControlLink(completion), command.completion)
+        )
+          return rejected("stale_revision", "The exact completion receipt changed.");
+        if (
+          !records.some(
+            (entry) => entry.turnId === command.expectedTurnId && entry.event.type === "seen",
+          )
+        )
+          await append(completion, { type: "seen", completion: command.completion });
+        return { status: "acknowledged" as const };
+      });
     }
     if (command.type === "close_thread") {
       return serialized(async () => {
@@ -2360,8 +2715,32 @@ export function createManagedAgentControl(options: {
           const snapshot = await project(await controlStore.read(), options.parentSessionId);
           for (const subscriber of subscribers) subscriber({ type: "reset", snapshot });
           await startReady();
+          const admittedThreads = foldManagedControl(
+            await controlStore.read(),
+            options.parentSessionId,
+          ).threads;
           return {
             status: "admitted" as const,
+            admissions: records.map((record) => {
+              const thread = admittedThreads.find(
+                (candidate) =>
+                  candidate.threadId === record.threadId && candidate.turn.turnId === record.turnId,
+              );
+              if (thread === undefined)
+                throw new Error("The admitted thread is missing from its canonical batch.");
+              return {
+                threadId: thread.threadId,
+                turnId: thread.turn.turnId,
+                handle: thread.handle,
+                displayName: thread.displayName,
+                description: thread.description,
+                lane,
+                status:
+                  active.has(thread.threadId) || thread.turn.hasStarted
+                    ? ("started" as const)
+                    : ("queued" as const),
+              };
+            }),
             turns: records.map(
               ({ parentSessionId, threadId, turnId, attemptId, childSessionId }) => ({
                 parentSessionId,
@@ -3103,9 +3482,23 @@ function managedToolContainsCompletion(
     !Array.isArray(output.results)
   )
     return false;
-  return output.results.some((result) =>
-    isDeepStrictEqual(result, { ...completion, consumption: "pending" }),
-  );
+  const { userSeen: _seen, consumption: _consumption, ...immutable } = completion;
+  return output.results.some((result) => {
+    if (
+      typeof result !== "object" ||
+      result === null ||
+      !("consumption" in result) ||
+      (result.consumption !== "pending" && result.consumption !== "suppressed")
+    )
+      return false;
+    const { consumption: _resultConsumption, ...remaining } = result;
+    if ("userSeen" in remaining) {
+      if (remaining.userSeen !== true) return false;
+      const { userSeen: _resultSeen, ...payload } = remaining;
+      return isDeepStrictEqual(payload, immutable);
+    }
+    return isDeepStrictEqual(remaining, immutable);
+  });
 }
 
 function managedControlMessageDigest(

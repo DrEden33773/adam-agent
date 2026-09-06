@@ -51,7 +51,11 @@ test("the TUI Registry exposes the active-run managed-child navigator", () => {
   const parsed = adamCommandRegistry.parse("/agents");
   expect(parsed).toMatchObject({
     kind: "known",
-    command: { id: "agents", availability: "always", usage: "/agents" },
+    command: {
+      id: "agents",
+      availability: "always",
+      usage: "/agents [history|settings|attention]",
+    },
   });
 });
 

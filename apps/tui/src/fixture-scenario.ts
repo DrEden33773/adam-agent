@@ -1,4 +1,5 @@
 export const fixtureScenarios = [
+  "managed-control",
   "artifact-backed-assistant",
   "artifact-page-race",
   "artifact-history",

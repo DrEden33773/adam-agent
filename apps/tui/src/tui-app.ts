@@ -7,6 +7,7 @@ import type {
   ArtifactReference,
   BranchSourceBoundary,
   DraftPoint,
+  ManagedControlThread,
   OperationDisplay,
   PresentationCommand,
   PresentationSession,
@@ -18,6 +19,7 @@ import type {
   ThinkingPolicySelectionDisplay,
   TodoPageResource,
 } from "@adam-agent/presentation";
+import { defaultAgentUiSettings } from "@adam-agent/presentation";
 import {
   Box,
   type Component,
@@ -40,12 +42,16 @@ import {
   VStack,
 } from "@earendil-works/pi-tui";
 import PQueue from "p-queue";
+import { AgentConversationViewer } from "./agent-conversation-viewer.js";
+import { AgentFleet, AgentSessionTransition, AgentWorkspace } from "./agent-fleet.js";
 import { AgentNavigator, ManagedAgentRoster } from "./agent-navigator.js";
+import { AgentWidget } from "./agent-widget.js";
 import {
   ArtifactNavigator,
   activeChronologyArtifacts,
   activeChronologyDiffs,
 } from "./artifact-navigator.js";
+import { AttentionCenter, managedAttentionKey } from "./attention-center.js";
 import { ChronologyPicker, completeChronologyBoundaries } from "./chronology-picker.js";
 import { AdamAutocompleteProvider } from "./command-autocomplete.js";
 import {
@@ -344,6 +350,29 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     managedAgents: options.presentation.getState().authoritative.managedAgents,
     theme,
   });
+  const agentWidget = new AgentWidget(
+    theme,
+    () => Math.max(2, Math.min(12, Math.floor((physicalTerminal.rows - 8) / 2))),
+    {
+      scheduler: deadlineScheduler,
+      onChange: () => renderState(),
+      settings: () => options.presentation.getState().agentUiSettings ?? defaultAgentUiSettings,
+    },
+  );
+  const agentFleet = new AgentFleet({
+    theme,
+    onChange: () => tui.requestRender(),
+    onOpen: (thread) => showManagedConversation(thread),
+    hasDraft: (thread) =>
+      options.presentation
+        .getState()
+        .managedDrafts?.some(
+          (draft) =>
+            draft.threadId === thread.threadId && draft.parentSessionId === thread.parentSessionId,
+        ) ?? false,
+    maximumLines: () =>
+      Math.max(1, Math.min(7, physicalTerminal.rows - (physicalTerminal.columns < 80 ? 15 : 12))),
+  });
   const todoCompactViewModel = new TodoCompactViewModel();
   const todoCompactOverlay = new TodoCompactOverlay(todoCompactViewModel, theme);
   let todoCompactReadGeneration = 0;
@@ -464,6 +493,34 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly navigator: AgentNavigator;
       }
     | undefined;
+  let agentConversation:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+        readonly viewer: AgentConversationViewer;
+        readonly pinnedTurnId?: string;
+        readonly threadId: string;
+      }
+    | undefined;
+  let agentConversationLoading:
+    | { readonly close: () => void; readonly hide: () => void }
+    | undefined;
+  let agentSessionTransition:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+        readonly id: string;
+        readonly view: AgentSessionTransition;
+      }
+    | undefined;
+  let agentWorkspace:
+    | {
+        readonly close: () => void;
+        readonly hide: () => void;
+        readonly focus: () => void;
+        readonly workspace: AgentWorkspace;
+      }
+    | undefined;
   let pendingManagedAgentInput:
     | {
         readonly action: "message" | "reply" | "follow_up" | "recovery";
@@ -473,6 +530,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         readonly attentionId?: string;
       }
     | undefined;
+  let attentionView: AttentionCenter | undefined;
+  let attentionOverlay: { readonly close: () => void; readonly hide: () => void } | undefined;
+  const dismissedAttention = new Set<string>();
+  let readyAgentConversation: (() => void) | undefined;
   let managedAgentFocusHandoffKey: "c" | "f" | "m" | "r" | null = null;
   let todoNavigatorGeneration = 0;
   let planActionOverlay:
@@ -490,8 +551,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     readonly hide: () => void;
   };
   const closeableOverlaysInPrecedence = (): readonly (CloseableOverlay | undefined)[] => [
+    attentionOverlay,
     planActionOverlay,
     helpNavigator,
+    agentSessionTransition,
+    agentConversation,
+    agentConversationLoading,
+    agentWorkspace,
     agentNavigator,
     todoNavigator,
     artifactNavigator,
@@ -509,6 +575,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const focusedCloseableOverlay = (): CloseableOverlay | undefined =>
     closeableOverlaysInPrecedence().find((overlay) => overlay !== undefined);
   const hideSessionScopedOverlays = () => {
+    attentionOverlay?.hide();
+    attentionOverlay = undefined;
+    attentionView = undefined;
+    dismissedAttention.clear();
+    readyAgentConversation = undefined;
+    agentSessionTransition?.hide();
+    agentSessionTransition = undefined;
+    agentConversation?.hide();
+    agentConversation = undefined;
+    agentConversationLoading?.hide();
+    agentConversationLoading = undefined;
+    agentWorkspace?.hide();
+    agentWorkspace = undefined;
     planActionOverlay?.hide();
     planActionOverlay = undefined;
     dismissedPlanSubjectKey = undefined;
@@ -596,7 +675,16 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       component: managedAgentRoster,
       basis: "auto",
       minSize: 0,
-      visible: () => options.presentation.getState().authoritative.managedAgents.counts.active > 0,
+      visible: () =>
+        options.presentation.getState().authoritative.managedControl === undefined &&
+        options.presentation.getState().authoritative.managedAgents.counts.active > 0,
+    },
+    {
+      component: agentWidget,
+      basis: "auto",
+      minSize: 0,
+      shrink: 0,
+      visible: () => options.presentation.getState().authoritative.managedControl !== undefined,
     },
     {
       component: todoCompactOverlay,
@@ -625,6 +713,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         {
           component: statusLine,
           visible: () => statusNotice !== null,
+        },
+        {
+          component: agentFleet,
+          shrink: 0,
+          visible: () =>
+            options.presentation.getState().authoritative.managedControl !== undefined &&
+            options.presentation.getState().agentUiSettings?.fleetEnabled !== false,
         },
         footer,
       ]),
@@ -1343,6 +1438,55 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       ].join("\n"),
     );
     synchronizeTodoCompactOverlay(active);
+    agentWidget.setSnapshot(state.authoritative.managedControl);
+    agentWidget.setActivity(state.managedAgentActivity);
+    const visibleFleetThreads = [...agentWidget.visibleThreads()];
+    const viewingThread = state.authoritative.managedControl?.threads.find(
+      (thread) => thread.threadId === agentConversation?.threadId,
+    );
+    if (
+      viewingThread !== undefined &&
+      !visibleFleetThreads.some((thread) => thread.threadId === viewingThread.threadId)
+    )
+      visibleFleetThreads.push(viewingThread);
+    agentFleet.setSnapshot(state.authoritative.managedControl, visibleFleetThreads);
+    if (state.authoritative.managedControl !== undefined)
+      agentWorkspace?.workspace.setSnapshot(
+        state.authoritative.managedControl,
+        state.agentUiSettings ?? defaultAgentUiSettings,
+      );
+    if (agentConversation !== undefined) {
+      const selected = state.authoritative.managedControl?.threads.find(
+        (thread) => thread.threadId === agentConversation?.threadId,
+      );
+      if (selected !== undefined) {
+        const pinned = agentConversation.pinnedTurnId;
+        const turn =
+          pinned === undefined
+            ? undefined
+            : [...(selected.previousTurns ?? []), selected.turn].find(
+                (entry) => entry.turnId === pinned,
+              );
+        if (pinned === undefined) agentConversation.viewer.setThread(selected);
+        else if (turn !== undefined)
+          agentConversation.viewer.setThread({ ...selected, turn, actions: [] });
+      }
+      agentConversation.viewer.setCompletion(
+        state.authoritative.managedControl?.completions.find(
+          (entry) =>
+            entry.threadId === agentConversation?.threadId &&
+            entry.turnId === (agentConversation?.pinnedTurnId ?? selected?.turn.turnId),
+        ),
+      );
+      agentConversation.viewer.setExports(
+        state.authoritative.managedControl?.exports?.filter(
+          (entry) =>
+            entry.threadId === agentConversation?.threadId &&
+            entry.turnId === (agentConversation?.pinnedTurnId ?? selected?.turn.turnId),
+        ) ?? [],
+      );
+      agentConversation.viewer.setActivity(state.managedAgentActivity);
+    }
     managedAgentRoster.setManagedAgents(state.authoritative.managedAgents);
     agentNavigator?.navigator.setManagedAgents(
       state.authoritative.managedAgents,
@@ -1363,6 +1507,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     synchronizeDraftInputs(state.composer);
     const activeSessionChanged = active?.session.id !== previousActiveSessionId;
     if (activeSessionChanged) {
+      if (previousActiveSessionId !== undefined) {
+        sessionPicker?.hide();
+        sessionPicker = undefined;
+        sessionPickerRequested = false;
+      }
       transcriptViewport.followEnd();
       pendingOperationBaseline = null;
       expandedReasoningIds.clear();
@@ -1960,6 +2109,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           wide: `${theme.toolTitle(baseTitle)}${theme.text(` · ${action}`)}`,
         });
         tool.addChild(toolTitle);
+        for (const admission of item.managedAdmissions ?? []) {
+          tool.addChild(
+            new ResponsiveLine(
+              theme.toolOutput(
+                safeTerminalText(
+                  `${admission.status === "started" ? "Started" : "Queued"} ${admission.handle} · ${admission.displayName} · ${admission.description}`,
+                ),
+              ),
+            ),
+          );
+        }
         if (item.preview !== null) {
           tool.addChild(new ToolPreview(item.preview, expanded, theme));
         }
@@ -2230,6 +2390,79 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             tui.requestRender();
           });
       }
+    }
+    const attention = state.managedAttention ?? [];
+    attentionView?.setItems(attention);
+    if (
+      attentionOverlay !== undefined &&
+      attention.length === 0 &&
+      !attentionView?.hasPendingInput()
+    ) {
+      attentionOverlay.hide();
+      attentionOverlay = undefined;
+    }
+    if (
+      permission === undefined &&
+      attentionOverlay === undefined &&
+      attention.some((item) => !dismissedAttention.has(managedAttentionKey(item)))
+    )
+      openAttentionCenter();
+    const managedTransition = state.authoritative.managedTransition;
+    if (
+      agentSessionTransition !== undefined &&
+      agentSessionTransition.id !== managedTransition?.id
+    ) {
+      agentSessionTransition.hide();
+      agentSessionTransition = undefined;
+    }
+    if (
+      managedTransition !== undefined &&
+      agentSessionTransition === undefined &&
+      permission === undefined &&
+      attentionOverlay === undefined
+    ) {
+      const view = new AgentSessionTransition({
+        transition: managedTransition,
+        theme,
+        onDecision(decision) {
+          view.setPending(decision);
+          tui.requestRender();
+          void options.presentation
+            .dispatch({
+              type: "resolve_managed_transition",
+              transitionId: managedTransition.id,
+              decision,
+            })
+            .then((receipt) => {
+              if (agentSessionTransition?.view !== view) return;
+              if (receipt.status === "rejected") view.setError(receipt.message);
+              renderState();
+            })
+            .catch(() => {
+              if (agentSessionTransition?.view === view) {
+                view.setError("The Session transition could not be confirmed.");
+                tui.requestRender();
+              }
+            });
+        },
+      });
+      const handle = showOverlay(view, { width: "80%", minWidth: 36, maxHeight: "85%", margin: 1 });
+      agentSessionTransition = {
+        id: managedTransition.id,
+        view,
+        close: () => view.cancel(),
+        hide: () => handle.hide(),
+      };
+    }
+    if (
+      permission === undefined &&
+      attentionOverlay === undefined &&
+      agentSessionTransition === undefined &&
+      readyAgentConversation !== undefined
+    ) {
+      const open = readyAgentConversation;
+      readyAgentConversation = undefined;
+      open();
     }
     if (
       active?.parentRun?.phase === "interrupted" ||
@@ -2933,7 +3166,362 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     clearNotice();
     tui.requestRender();
   };
-  const showAgentNavigator = (expectedSessionId: string): void => {
+  function openAttentionCenter(force = false): void {
+    const items = options.presentation.getState().managedAttention ?? [];
+    if (attentionOverlay !== undefined || (items.length === 0 && !attentionView?.hasPendingInput()))
+      return;
+    let handle: ReturnType<typeof showOverlay> | undefined;
+    const close = () => {
+      for (const item of options.presentation.getState().managedAttention ?? [])
+        dismissedAttention.add(managedAttentionKey(item));
+      handle?.hide();
+      attentionOverlay = undefined;
+      showNotice("info", "Attention pending · /agents", "until_next_action");
+      tui.requestRender();
+    };
+    if (attentionView === undefined)
+      attentionView = new AttentionCenter({
+        theme,
+        maximumLines: () => Math.max(6, Math.floor(physicalTerminal.rows * 0.85) - 4),
+        onPermission: (item, decision) =>
+          options.presentation.dispatch({
+            type: "managed_control",
+            commandId: randomUUID(),
+            command: {
+              type: "decide_permission",
+              parentSessionId: item.parentSessionId,
+              threadId: item.threadId,
+              expectedTurnId: item.turnId,
+              requestId: item.id,
+              decision,
+            },
+          }),
+        onReply: (item, text, inputId) =>
+          options.presentation.dispatch({
+            type: "managed_control",
+            commandId: randomUUID(),
+            command: {
+              type: "reply_agent",
+              parentSessionId: item.parentSessionId,
+              threadId: item.threadId,
+              expectedTurnId: item.turnId,
+              attentionId: item.id,
+              text,
+              inputId,
+            },
+          }),
+        onChange: () => renderState(),
+        onClose: () => attentionOverlay?.close(),
+      });
+    attentionView.setItems(items);
+    const fresh = items.find((item) => !dismissedAttention.has(managedAttentionKey(item)));
+    if (!force && fresh !== undefined) attentionView.focusItem(managedAttentionKey(fresh));
+    handle = showOverlay(attentionView, {
+      width: "90%",
+      minWidth: 36,
+      maxHeight: "85%",
+      margin: 1,
+    });
+    attentionOverlay = { close, hide: () => handle?.hide() };
+  }
+  function showManagedConversation(thread: ManagedControlThread, returnFocus?: () => void): void {
+    let cancelled = false;
+    const loading = showOverlay(
+      {
+        invalidate() {},
+        render: (width) => new Text("Loading agent conversation… · Esc cancel").render(width),
+        handleInput(data) {
+          if (matchesKey(data, "escape") && !isKeyRepeat(data) && !isKeyRelease(data)) close();
+        },
+      },
+      { width: "90%", minWidth: 36, maxHeight: "85%", margin: 1 },
+    );
+    const close = () => {
+      cancelled = true;
+      readyAgentConversation = undefined;
+      loading.hide();
+      agentConversationLoading = undefined;
+      if (
+        permission === undefined &&
+        attentionOverlay === undefined &&
+        agentSessionTransition === undefined
+      ) {
+        if (returnFocus === undefined && focusedCloseableOverlay() === undefined)
+          tui.setFocus(editor);
+        else returnFocus?.();
+      }
+      tui.requestRender();
+    };
+    agentConversationLoading = {
+      close,
+      hide: () => {
+        cancelled = true;
+        readyAgentConversation = undefined;
+        loading.hide();
+      },
+    };
+    void options.presentation
+      .dispatch({
+        type: "read_agent_draft",
+        sessionId: thread.parentSessionId,
+        threadId: thread.threadId,
+      })
+      .then((receipt) => {
+        if (
+          cancelled ||
+          options.presentation.getState().authoritative.active?.session.id !==
+            thread.parentSessionId
+        )
+          return;
+        const open = () => {
+          if (
+            cancelled ||
+            options.presentation.getState().authoritative.active?.session.id !==
+              thread.parentSessionId
+          )
+            return;
+          if (
+            permission !== undefined ||
+            attentionOverlay !== undefined ||
+            agentSessionTransition !== undefined
+          ) {
+            readyAgentConversation = open;
+            return;
+          }
+          loading.hide();
+          agentConversationLoading = undefined;
+          if (receipt.status === "rejected") {
+            showNotice("error", receipt.message, "until_next_action");
+            if (returnFocus === undefined && focusedCloseableOverlay() === undefined)
+              tui.setFocus(editor);
+            else returnFocus?.();
+            return;
+          }
+          if (receipt.managedDraft !== null && receipt.managedDraft !== undefined)
+            agentFleet.drafts.set(thread.threadId, receipt.managedDraft);
+          const current = options.presentation
+            .getState()
+            .authoritative.managedControl?.threads.find(
+              (entry) => entry.threadId === thread.threadId,
+            );
+          if (current !== undefined) showLoadedManagedConversation(current, returnFocus);
+        };
+        open();
+      })
+      .catch(() => {
+        if (!cancelled) {
+          close();
+          showNotice("error", "The private child draft is unavailable.", "until_next_action");
+        }
+      });
+  }
+  function showLoadedManagedConversation(
+    thread: ManagedControlThread,
+    returnFocus?: () => void,
+    readOnly = false,
+  ): void {
+    let handle: { hide(): void } | undefined;
+    const close = () => {
+      viewer.dispose();
+      handle?.hide();
+      agentConversation = undefined;
+      if (returnFocus === undefined) tui.setFocus(editor);
+      else returnFocus();
+      renderState();
+    };
+    const viewer = new AgentConversationViewer({
+      thread,
+      completion: options.presentation
+        .getState()
+        .authoritative.managedControl?.completions.find(
+          (entry) => entry.threadId === thread.threadId && entry.turnId === thread.turn.turnId,
+        ),
+      exports: options.presentation
+        .getState()
+        .authoritative.managedControl?.exports?.filter(
+          (entry) => entry.threadId === thread.threadId && entry.turnId === thread.turn.turnId,
+        ),
+      onExport: (selected, completion, fields) =>
+        options.presentation.dispatch({
+          type: "export_agent",
+          confirmed: true,
+          sessionId: selected.parentSessionId,
+          threadId: selected.threadId,
+          expectedTurnId: selected.turn.turnId,
+          completion: completion.receipt,
+          fields,
+        }),
+      onSeen: (completion) =>
+        options.presentation.dispatch({
+          type: "managed_control",
+          commandId: randomUUID(),
+          command: {
+            type: "mark_completion_seen",
+            parentSessionId: thread.parentSessionId,
+            threadId: completion.threadId,
+            expectedTurnId: completion.turnId,
+            completion: completion.receipt,
+          },
+        }),
+      onSuppress: (completion) =>
+        options.presentation.dispatch({
+          type: "managed_control",
+          commandId: randomUUID(),
+          command: {
+            type: "suppress_completion",
+            confirmed: true,
+            parentSessionId: thread.parentSessionId,
+            threadId: completion.threadId,
+            expectedTurnId: completion.turnId,
+            completion: completion.receipt,
+          },
+        }),
+      drafts: readOnly ? new Map() : agentFleet.drafts,
+      renderMode: options.presentation.getState().agentUiSettings?.viewerMode ?? "assistant",
+      onRenderMode: (viewerMode) =>
+        options.presentation.dispatch({
+          type: "set_agent_ui_settings",
+          settings: {
+            ...(options.presentation.getState().agentUiSettings ?? defaultAgentUiSettings),
+            viewerMode,
+          },
+        }),
+      theme,
+      activity: options.presentation
+        .getState()
+        .managedAgentActivity?.find(
+          (entry) => entry.agentId === thread.threadId && entry.attemptId === thread.turn.attemptId,
+        ),
+      maximumLines: () => Math.max(6, Math.floor(physicalTerminal.rows * 0.85) - 4),
+      onRead: async (selected, cursor) => {
+        const receipt = await options.presentation.dispatch({
+          type: "read_agent_conversation",
+          sessionId: selected.parentSessionId,
+          threadId: selected.threadId,
+          expectedTurnId: selected.turn.turnId,
+          cursor,
+        });
+        if (receipt.status === "rejected" || receipt.managedAgentTranscript === undefined)
+          throw new Error(
+            receipt.status === "rejected"
+              ? receipt.message
+              : "The bounded agent transcript is unavailable.",
+          );
+        return receipt.managedAgentTranscript;
+      },
+      onSend: (command) =>
+        options.presentation.dispatch({
+          type: "managed_control",
+          commandId: randomUUID(),
+          command,
+        }),
+      onSaveDraft: async (draft) => {
+        const receipt = await options.presentation.dispatch({ type: "save_agent_draft", draft });
+        if (receipt.status === "rejected") {
+          showNotice("error", receipt.message, "until_next_action");
+          throw new Error(receipt.message);
+        }
+      },
+      onClearDraft: async (draft) => {
+        const receipt = await options.presentation.dispatch({ type: "clear_agent_draft", draft });
+        if (receipt.status === "rejected") throw new Error(receipt.message);
+        return receipt.managedDraftCleared === true;
+      },
+      onReadResource: async (selected, resource, range) => {
+        const common = {
+          sessionId: selected.parentSessionId,
+          threadId: selected.threadId,
+          expectedTurnId: selected.turn.turnId,
+          range,
+        };
+        const receipt = await options.presentation.dispatch(
+          resource.kind === "artifact"
+            ? { ...common, type: "read_agent_artifact", artifact: resource.artifact }
+            : resource.kind === "input"
+              ? { ...common, type: "read_agent_input", inputId: resource.inputId }
+              : {
+                  ...common,
+                  type: "read_agent_content",
+                  kind: resource.kind,
+                  itemId: resource.itemId,
+                },
+        );
+        if (receipt.status === "rejected" || receipt.resource === null)
+          throw new Error(
+            receipt.status === "rejected"
+              ? receipt.message
+              : "The bounded agent resource is unavailable.",
+          );
+        return receipt.resource;
+      },
+      onChange: () => tui.requestRender(),
+      onClose: close,
+    });
+    handle = showOverlay(viewer, { width: "90%", minWidth: 36, maxHeight: "85%", margin: 1 });
+    agentConversation = {
+      close: () => viewer.back(),
+      hide: () => {
+        viewer.dispose();
+        handle?.hide();
+      },
+      viewer,
+      threadId: thread.threadId,
+      ...(readOnly ? { pinnedTurnId: thread.turn.turnId } : {}),
+    };
+  }
+
+  const showAgentNavigator = (
+    expectedSessionId: string,
+    initialView: "workspace" | "settings" | "history" = "workspace",
+  ): void => {
+    const snapshot = options.presentation.getState().authoritative.managedControl;
+    if (snapshot !== undefined && snapshot.parentSessionId === expectedSessionId) {
+      let handle: ReturnType<typeof showOverlay> | undefined;
+      const close = () => {
+        handle?.hide();
+        agentWorkspace = undefined;
+        tui.setFocus(editor);
+        tui.requestRender();
+      };
+      const workspace = new AgentWorkspace({
+        snapshot,
+        initialView,
+        settings: options.presentation.getState().agentUiSettings ?? defaultAgentUiSettings,
+        onSettings: (settings) =>
+          options.presentation.dispatch({ type: "set_agent_ui_settings", settings }),
+        onAttention: () => openAttentionCenter(true),
+        hasDraft: (thread) =>
+          options.presentation
+            .getState()
+            .managedDrafts?.some(
+              (draft) =>
+                draft.threadId === thread.threadId &&
+                draft.parentSessionId === thread.parentSessionId,
+            ) ?? false,
+        theme,
+        maximumLines: () => Math.max(4, Math.floor(physicalTerminal.rows * 0.85) - 4),
+        onChange: () => tui.requestRender(),
+        onClose: close,
+        onOpen: (thread, readOnly) =>
+          readOnly
+            ? showLoadedManagedConversation({ ...thread, actions: [] }, () => handle?.focus(), true)
+            : showManagedConversation(thread, () => handle?.focus()),
+        onDispatch: (command) =>
+          options.presentation.dispatch({
+            type: "managed_control",
+            commandId: randomUUID(),
+            command,
+          }),
+      });
+      handle = showOverlay(workspace, { width: "90%", minWidth: 36, maxHeight: "85%", margin: 1 });
+      agentWorkspace = {
+        close: () => workspace.back(),
+        hide: () => handle?.hide(),
+        focus: () => handle?.focus(),
+        workspace,
+      };
+      return;
+    }
     agentNavigator?.hide();
     agentNavigator = undefined;
     const actionId = showNotice(
@@ -2958,6 +3546,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             expectedSessionId,
           );
           renderState();
+          return;
+        }
+        if (current.managedControl !== undefined) {
+          settleNotice(actionId, "info", "", "until_next_action", expectedSessionId);
+          showAgentNavigator(expectedSessionId, initialView);
           return;
         }
         let handle: { hide(): void } | undefined;
@@ -4652,11 +5245,22 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (
       parsedCommand.kind === "known" &&
       parsedCommand.command.id === "agents" &&
-      parsedCommand.argumentsText.length === 0
+      ["", "settings", "history", "attention"].includes(parsedCommand.argumentsText)
     ) {
       editor.setText("");
       editor.disableSubmit = false;
-      showAgentNavigator(active.session.id);
+      if (parsedCommand.argumentsText === "attention") {
+        openAttentionCenter(true);
+        return;
+      }
+      showAgentNavigator(
+        active.session.id,
+        parsedCommand.argumentsText === "settings"
+          ? "settings"
+          : parsedCommand.argumentsText === "history"
+            ? "history"
+            : "workspace",
+      );
       return;
     }
     if (
@@ -5487,6 +6091,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     }
     attempt(() => permission?.hide());
     attempt(() => working.stop());
+    attempt(() => agentWidget.dispose());
     attempt(() => thinking.stop());
     for (const loader of operationLoaders.values()) {
       attempt(() => loader.stop());
@@ -5583,6 +6188,21 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return { consume: true };
     }
     if (
+      options.presentation.getState().authoritative.managedControl !== undefined &&
+      matchesKey(data, "escape") &&
+      (isKeyRepeat(data) || isKeyRelease(data))
+    )
+      return { consume: true };
+    if (
+      permission === undefined &&
+      focusedCloseableOverlay() === undefined &&
+      terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows) &&
+      options.presentation.getState().agentUiSettings?.fleetEnabled !== false &&
+      agentFleet.handleMainInput(data, editor.getText() === "")
+    ) {
+      return { consume: true };
+    }
+    if (
       !terminalSizeIsSupported(physicalTerminal.columns, physicalTerminal.rows) &&
       !commandRegistry.matchesInput(data, "interrupt")
     ) {
@@ -5594,6 +6214,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         }
       }
       return { consume: true };
+    }
+    if (
+      permission === undefined &&
+      (attentionOverlay !== undefined ||
+        agentConversation !== undefined ||
+        agentConversationLoading !== undefined ||
+        agentWorkspace !== undefined ||
+        agentSessionTransition !== undefined)
+    ) {
+      if (commandRegistry.matchesInput(data, "interrupt")) {
+        if (!isKeyRepeat(data) && !isKeyRelease(data)) focusedCloseableOverlay()?.close();
+        return { consume: true };
+      }
+      return undefined;
     }
     const recoveryActive = options.presentation.getState().authoritative.active;
     if (

@@ -1841,3 +1841,101 @@ test("the real terminal redraws through 40, 80, 120, and minimum-size layouts", 
     await rm(testRoot, { recursive: true, force: true });
   }
 });
+
+test("candidate ProjectRuntime runs real JSONL child Enter, Main response, layered Kitty Esc and settled continuation in a PTY", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-managed-project-pty-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  await writeFile(join(workspaceRoot, "evidence.txt"), "Actual filesystem evidence.\n");
+  const fixture = startFixture({
+    external: true,
+    scenario: "managed-control",
+    noColor: true,
+    workspaceRoot,
+    stateRoot,
+    controlRoot,
+  });
+  let completed = false;
+  let waiting = "New session";
+  try {
+    await fixture.waitFor("Adam · New session");
+    fixture.write("Start child\r");
+    waiting = "Delegation permission";
+    await fixture.waitFor("Permission required");
+    fixture.write("\r");
+    waiting = "MAIN_READY";
+    await fixture.waitFor("MAIN_READY");
+    expect(fixture.screen()?.join("\n")).toContain("PTY child");
+    waiting = "child-started";
+    await waitForFileContents(join(controlRoot, "child-started"), "started\n");
+    let offset = fixture.output().length;
+    waiting = "Fleet";
+    fixture.write("\u001b[B");
+    await fixture.waitForCompleteFrameAfter("Fleet", offset);
+    offset = fixture.output().length;
+    waiting = "@explore-1";
+    fixture.write("\u001b[B");
+    await fixture.waitForCompleteFrameAfter("@explore-1", offset);
+    offset = fixture.output().length;
+    waiting = "Conversation";
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Conversation", offset);
+    offset = fixture.output().length;
+    waiting = "Cooperative";
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("Cooperative", offset);
+    offset = fixture.output().length;
+    waiting = "Accepted";
+    fixture.write("PTY child input\r");
+    await fixture.waitForCompleteFrameAfter("Accepted", offset);
+    for (const visible of ["Enter compose", "Esc Main", "↓ navigate"]) {
+      waiting = visible;
+      offset = fixture.output().length;
+      fixture.write("\u001b[27;1:1u\u001b[27;1:2u\u001b[27;1:3u");
+      await fixture.waitForCompleteFrameAfter(visible, offset);
+    }
+    offset = fixture.output().length;
+    waiting = "MAIN_RESPONDED";
+    fixture.write("Main while child runs\r");
+    await fixture.waitForCompleteFrameAfter("MAIN_RESPONDED", offset);
+    await writeFile(join(controlRoot, "release-child"), "release\n");
+    await waitForFileContents(
+      join(controlRoot, "child-request"),
+      JSON.stringify({ delivered: true, childCalls: 2 }),
+    );
+    await fixture.waitFor("Completed");
+    offset = fixture.output().length;
+    waiting = "Agents workspace";
+    fixture.write("/agents\r");
+    await fixture.waitForCompleteFrameAfter("Agents workspace", offset);
+    offset = fixture.output().length;
+    waiting = "CHILD_DELIVERED";
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("CHILD_DELIVERED", offset);
+    offset = fixture.output().length;
+    waiting = "New turn";
+    fixture.write("\r");
+    await fixture.waitForCompleteFrameAfter("New turn", offset);
+    offset = fixture.output().length;
+    waiting = "FOLLOWUP_RESPONDED";
+    fixture.write("Follow up\r");
+    await fixture.waitForCompleteFrameAfter("FOLLOWUP_RESPONDED", offset);
+    fixture.write("\u0011");
+    const result = await fixture.closed;
+    expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
+    expectEveryTerminalInputModeRestored(result);
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: Inspect actual terminal SGR color sequences.
+    expect(result.stdout).not.toMatch(/\u001b\[[0-9;]*(?:3[0-7]|9[0-7]|38;|48;)[0-9;]*m/u);
+    completed = true;
+  } finally {
+    if (!completed)
+      console.error(
+        `Candidate PTY waiting for ${waiting}:\n${fixture.screen()?.join("\n")}\n${fixture.output().slice(-2000)}`,
+      );
+    await fixture.cleanup();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
