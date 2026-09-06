@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import type {
   ArtifactChunk,
@@ -7,6 +8,9 @@ import type {
   ArtifactReference,
   AuthoritativePresentationSnapshot,
   CommandReceipt,
+  ManagedAttentionItem,
+  ManagedControlCommand,
+  ManagedControlReceipt,
   McpDisplay,
   PendingInteraction,
   PresentationCommand,
@@ -21,6 +25,10 @@ import type {
   TranscriptItem,
 } from "@adam-agent/presentation";
 import {
+  agentExportFields,
+  defaultAgentUiSettings,
+  isAgentUiSettings,
+  presentationAgentExportMaximumBytes,
   presentationArtifactPageMaximumBytes,
   reconcilePresentationUpdate,
   resolveSkillMentions,
@@ -59,6 +67,7 @@ import {
 import { listProjectPaths } from "./project-path-catalog.js";
 import {
   createRecoverableTurnDraftRepository,
+  parseManagedComposerDraft,
   type RecoverableTurnDraftRepository,
   type TurnDraftScopeV1,
 } from "./recoverable-turn-draft.js";
@@ -116,6 +125,10 @@ export const presentationArtifactReadBarrier = Symbol(
 export const presentationSessionRecordReader = Symbol(
   "adam-agent.presentation-session-record-reader",
 );
+/** Tests only: delay a returned receipt after the real Control command has completed. */
+export const presentationManagedControlReceiptBarrier = Symbol(
+  "adam-agent.presentation-managed-control-receipt-barrier",
+);
 
 export type PresentationHydrationBarrier = {
   afterAdmissionSnapshot?(): Promise<void>;
@@ -154,6 +167,10 @@ type PresentationSessionBaseOptions = {
   readonly [presentationRuntimeRefreshBarrier]?: PresentationRuntimeRefreshBarrier;
   readonly [presentationArtifactReadBarrier]?: PresentationArtifactReadBarrier;
   readonly [presentationSessionRecordReader]?: PresentationSessionRecordReader;
+  readonly [presentationManagedControlReceiptBarrier]?: (
+    command: ManagedControlCommand,
+    receipt: ManagedControlReceipt,
+  ) => Promise<void>;
   readonly [presentationHistoryPageSize]?: number;
   readonly [presentationCatalogPageSize]?: number;
   readonly [presentationManagedAgentTranscriptPageSize]?: number;
@@ -431,6 +448,9 @@ export async function createPresentationSession(
       );
     };
     let configuredPreferences = await options.preferences?.load();
+    let agentUiSettings =
+      (await options.preferences?.loadAgentUi?.().catch(() => defaultAgentUiSettings)) ??
+      defaultAgentUiSettings;
     let configuredWebSearch = await webSearchConfiguration?.load();
     let configuredTargetContexts = await projectConfiguredTargetContexts(configuredPreferences);
     let preferenceDiagnostic = resolvePreferenceDiagnostic(configuredPreferences);
@@ -621,6 +641,7 @@ export async function createPresentationSession(
       : "New session required for attachments";
     let planRevisionIntent: PresentationDisplayState["composer"]["revisionIntent"] = null;
     let state: PresentationDisplayState = {
+      agentUiSettings,
       revision: 1,
       authoritative,
       draft:
@@ -646,6 +667,9 @@ export async function createPresentationSession(
       transient: null,
     };
     let managedAgentActivity: NonNullable<PresentationDisplayState["managedAgentActivity"]> = [];
+    let hydrateManagedDrafts = async (
+      _snapshot: NonNullable<PresentationDisplayState["authoritative"]["managedControl"]>,
+    ) => {};
     let draftTargetIdentity: ModelTargetIdentity | null = initialDraft?.targetIdentity ?? null;
     const metadataThrough = new Map<string, number>();
     if (created !== undefined) {
@@ -666,6 +690,128 @@ export async function createPresentationSession(
         }
       }
     };
+    const attentionMetadata = new Map<
+      string,
+      {
+        readonly interaction: Extract<PendingInteraction, { readonly type: "permission" }> | null;
+        readonly diagnostic?: string;
+      }
+    >();
+    const attentionReads = new Map<string, Promise<void>>();
+    const attentionKey = (parent: string, thread: string, turn: string, id: string) =>
+      `${parent}:${thread}:${turn}:${id}`;
+    const managedAttention = (): readonly ManagedAttentionItem[] => {
+      const snapshot = state.authoritative.managedControl;
+      if (
+        snapshot === undefined ||
+        snapshot.parentSessionId !== state.authoritative.active?.session.id
+      )
+        return [];
+      return snapshot.threads.flatMap((thread): ManagedAttentionItem[] => {
+        const attention = thread.turn.attention;
+        if (attention === undefined) return [];
+        const common = {
+          id: attention.id,
+          parentSessionId: thread.parentSessionId,
+          threadId: thread.threadId,
+          turnId: thread.turn.turnId,
+          handle: thread.handle,
+          displayName: thread.displayName,
+          description: thread.description,
+        };
+        if (attention.kind === "parent_input")
+          return [
+            {
+              ...common,
+              kind: "parent_input",
+              available:
+                attention.question !== undefined && (thread.actions?.includes("reply") ?? false),
+              question: attention.question ?? "The exact parent question is unavailable.",
+            },
+          ];
+        const metadata = attentionMetadata.get(
+          attentionKey(thread.parentSessionId, thread.threadId, thread.turn.turnId, attention.id),
+        );
+        return [
+          {
+            ...common,
+            kind: "permission",
+            available: metadata !== undefined && (thread.actions?.includes("permission") ?? false),
+            interaction: metadata?.interaction ?? null,
+            ...(metadata?.diagnostic === undefined
+              ? metadata === undefined
+                ? { diagnostic: "Loading exact permission…" }
+                : {}
+              : { diagnostic: metadata.diagnostic }),
+          },
+        ];
+      });
+    };
+    const refreshManagedAttention = (
+      snapshot: NonNullable<AuthoritativePresentationSnapshot["managedControl"]>,
+    ) => {
+      const keys = new Set(
+        snapshot.threads.flatMap((thread) =>
+          thread.turn.attention?.kind === "permission"
+            ? [
+                attentionKey(
+                  thread.parentSessionId,
+                  thread.threadId,
+                  thread.turn.turnId,
+                  thread.turn.attention.id,
+                ),
+              ]
+            : [],
+        ),
+      );
+      for (const key of attentionMetadata.keys()) if (!keys.has(key)) attentionMetadata.delete(key);
+      for (const thread of snapshot.threads) {
+        const attention = thread.turn.attention;
+        if (attention?.kind !== "permission") continue;
+        const key = attentionKey(
+          thread.parentSessionId,
+          thread.threadId,
+          thread.turn.turnId,
+          attention.id,
+        );
+        if (attentionMetadata.has(key) || attentionReads.has(key)) continue;
+        const current = () =>
+          !closed &&
+          state.authoritative.active?.session.id === thread.parentSessionId &&
+          state.authoritative.managedControl?.threads.some(
+            (entry) =>
+              entry.threadId === thread.threadId &&
+              entry.turn.turnId === thread.turn.turnId &&
+              entry.turn.attention?.id === attention.id,
+          );
+        const read = (async () => {
+          try {
+            const child = await options.lifecycle[sessionManagedAgentTranscriptReader]({
+              sessionId: thread.parentSessionId,
+              threadId: thread.threadId,
+              turnId: thread.turn.turnId,
+            });
+            const interaction = projectPendingPermissionCandidates(
+              child.records.map((entry) => ({ sessionId: child.childSessionId, entry })),
+            ).find((entry) => entry.requestId === attention.id);
+            if (interaction === undefined)
+              throw new TypeError("The exact permission is unavailable.");
+            if (current()) attentionMetadata.set(key, { interaction });
+          } catch {
+            if (current())
+              attentionMetadata.set(key, {
+                interaction: null,
+                diagnostic: "Permission details unavailable. Inspect the thread.",
+              });
+          }
+          if (current()) {
+            state = { ...state, revision: state.revision + 1 };
+            publishStateChange();
+          }
+        })().finally(() => attentionReads.delete(key));
+        attentionReads.set(key, read);
+      }
+    };
     const observeManagedControl = async (parentSessionId: string) => {
       if (controlObserverParent === parentSessionId) return;
       controlObserver?.abort();
@@ -674,23 +820,39 @@ export async function createPresentationSession(
       controlObserverParent = parentSessionId;
       const control = await options.lifecycle[sessionManagedControl](parentSessionId);
       if (control === undefined || observer.signal.aborted) return;
+      const firstFrame = Promise.withResolvers<void>();
       controlObservation = (async () => {
         for await (const frame of control.observe({ parentSessionId, signal: observer.signal })) {
           if (
             closed ||
             observer.signal.aborted ||
             state.authoritative.active?.session.id !== parentSessionId
-          )
+          ) {
+            firstFrame.resolve();
             return;
+          }
           state = {
             ...state,
             revision: state.revision + 1,
             authoritative: { ...state.authoritative, managedControl: frame.snapshot },
           };
+          managedAgentActivity = managedAgentActivity.filter((activity) =>
+            frame.snapshot.threads.some(
+              (thread) =>
+                thread.threadId === activity.agentId &&
+                thread.turn.attemptId === activity.attemptId &&
+                thread.turn.phase !== "idle",
+            ),
+          );
+          void hydrateManagedDrafts(frame.snapshot);
+          refreshManagedAttention(frame.snapshot);
           publishStateChange();
+          firstFrame.resolve();
         }
+        firstFrame.resolve();
       })();
-      void controlObservation.catch(() => undefined);
+      void controlObservation.catch((error: unknown) => firstFrame.reject(error));
+      await firstFrame.promise;
     };
     if (created !== undefined) {
       const selected = await options.lifecycle[sessionManagedTransition]({
@@ -809,6 +971,43 @@ export async function createPresentationSession(
             projectId: state.authoritative.project.id,
             stateRoot: effectiveSessionStateRoot(options.stateRoot),
           });
+    const managedDrafts = new Map<
+      string,
+      import("@adam-agent/presentation").ManagedComposerDraft
+    >();
+    const loadedManagedDrafts = new Set<string>();
+    const managedDraftWrites = new Set<Promise<unknown>>();
+    const managedDraftKey = (parentSessionId: string, threadId: string) =>
+      `${parentSessionId}:${threadId}`;
+    hydrateManagedDrafts = async (snapshot) => {
+      const fresh = snapshot.threads.filter(
+        (thread) =>
+          !loadedManagedDrafts.has(managedDraftKey(thread.parentSessionId, thread.threadId)),
+      );
+      for (const thread of fresh)
+        loadedManagedDrafts.add(managedDraftKey(thread.parentSessionId, thread.threadId));
+      await Promise.all(
+        fresh.map(async (thread) => {
+          try {
+            const draft = await recoverableDrafts?.loadManaged(thread);
+            if (draft !== undefined && draft !== null && draft.text.length > 0)
+              managedDrafts.set(managedDraftKey(draft.parentSessionId, draft.threadId), draft);
+          } catch {
+            /* Explicit draft reads retain the diagnostic and refuse overwriting invalid data. */
+          }
+        }),
+      );
+      if (
+        fresh.length > 0 &&
+        !closed &&
+        state.authoritative.active?.session.id === snapshot.parentSessionId
+      ) {
+        state = { ...state, revision: state.revision + 1 };
+        publishStateChange();
+      }
+    };
+    if (state.authoritative.managedControl !== undefined)
+      await hydrateManagedDrafts(state.authoritative.managedControl);
     const currentDraftScope = (): TurnDraftScopeV1 | null => {
       const active = state.authoritative.active;
       if (active !== null) {
@@ -1665,12 +1864,23 @@ export async function createPresentationSession(
       if (closed || active === null || active.session.id !== parentSessionId) {
         return;
       }
-      refreshManagedAgents(parentSessionId);
+      if (state.authoritative.managedControl === undefined) refreshManagedAgents(parentSessionId);
       if (notification.type === "state_changed") {
         return;
       }
       if (notification.type === "child_runtime_event") {
         const { agentId, attemptId, childSessionId, event } = notification;
+        if (
+          state.authoritative.managedControl !== undefined &&
+          !state.authoritative.managedControl.threads.some(
+            (thread) =>
+              thread.threadId === agentId &&
+              thread.turn.attemptId === attemptId &&
+              thread.turn.childSessionId === childSessionId &&
+              thread.turn.phase !== "idle",
+          )
+        )
+          return;
         const current = managedAgentActivity.find(
           (activity) => activity.agentId === agentId && activity.attemptId === attemptId,
         );
@@ -1684,6 +1894,14 @@ export async function createPresentationSession(
             assistant: { itemId: `${attemptId}:assistant`, text: "" },
           };
         } else if (event.type === "model_message_delta") {
+          const text = boundedManagedAgentActivityText(
+            `${current?.assistant?.text ?? ""}${event.text}`,
+            16 * 1024,
+          );
+          const totalByteCount =
+            (current?.assistant?.totalByteCount ??
+              Buffer.byteLength(current?.assistant?.text ?? "", "utf8")) +
+            Buffer.byteLength(event.text, "utf8");
           projected = {
             agentId,
             attemptId,
@@ -1691,10 +1909,13 @@ export async function createPresentationSession(
             activity: "replying",
             assistant: {
               itemId: current?.assistant?.itemId ?? `${attemptId}:assistant`,
-              text: boundedManagedAgentActivityText(
-                `${current?.assistant?.text ?? ""}${event.text}`,
-                16 * 1024,
-              ),
+              text,
+              ...(state.authoritative.managedControl === undefined
+                ? {}
+                : {
+                    totalByteCount,
+                    omittedBytes: totalByteCount - Buffer.byteLength(text, "utf8"),
+                  }),
             },
           };
         } else if (event.type === "model_reasoning_started") {
@@ -2432,6 +2653,28 @@ export async function createPresentationSession(
           if (transition !== undefined) return transition;
         }
       }
+      if (command.type === "set_agent_ui_settings") {
+        if (command.settings !== null && !isAgentUiSettings(command.settings))
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "Agent UI settings are invalid.",
+          };
+        try {
+          await options.preferences?.setAgentUi?.(command.settings);
+          agentUiSettings = command.settings ?? defaultAgentUiSettings;
+          state = { ...state, revision: state.revision + 1, agentUiSettings };
+          publishStateChange();
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch (error) {
+          return {
+            status: "rejected",
+            code: "action_unavailable",
+            message:
+              error instanceof Error ? error.message : "Agent UI settings could not be saved.",
+          };
+        }
+      }
       if (command.type === "managed_control") {
         const parentSessionId = command.command.parentSessionId;
         if (state.authoritative.active?.session.id !== parentSessionId)
@@ -2450,12 +2693,504 @@ export async function createPresentationSession(
         await observeManagedControl(parentSessionId);
         const receipt = await control.dispatch(command.command);
         if (receipt.status === "rejected") return receipt;
+        await options[presentationManagedControlReceiptBarrier]?.(command.command, receipt);
         return {
           status: "admitted",
           commandId: command.commandId,
           resource: null,
           control: receipt,
         };
+      }
+      if (
+        command.type === "read_agent_draft" ||
+        command.type === "save_agent_draft" ||
+        command.type === "clear_agent_draft"
+      ) {
+        const parentSessionId =
+          command.type === "read_agent_draft" ? command.sessionId : command.draft.parentSessionId;
+        const threadId =
+          command.type === "read_agent_draft" ? command.threadId : command.draft.threadId;
+        if (
+          state.authoritative.active?.session.id !== parentSessionId ||
+          !state.authoritative.managedControl?.threads.some(
+            (thread) => thread.threadId === threadId,
+          )
+        )
+          return {
+            status: "rejected",
+            code: "stale_revision",
+            message: "The selected child draft does not belong to the active Session.",
+          };
+        const key = managedDraftKey(parentSessionId, threadId);
+        try {
+          if (command.type === "read_agent_draft") {
+            await Promise.all(managedDraftWrites);
+            const draft =
+              recoverableDrafts === null
+                ? (managedDrafts.get(key) ?? null)
+                : await recoverableDrafts.loadManaged({ parentSessionId, threadId });
+            return {
+              status: "admitted",
+              commandId: randomUUID(),
+              resource: null,
+              managedDraft: draft,
+            };
+          }
+          const draft = parseManagedComposerDraft(command.draft);
+          const mutation = (async () => {
+            let cleared = false;
+            if (command.type === "clear_agent_draft") {
+              cleared =
+                recoverableDrafts === null
+                  ? !managedDrafts.has(key) || isDeepStrictEqual(managedDrafts.get(key), draft)
+                  : await recoverableDrafts.clearManaged(draft);
+              if (cleared) managedDrafts.delete(key);
+            } else {
+              await recoverableDrafts?.saveManaged(draft);
+              if (draft.text.length === 0) managedDrafts.delete(key);
+              else managedDrafts.set(key, draft);
+            }
+            state = { ...state, revision: state.revision + 1 };
+            publishStateChange();
+            return cleared;
+          })();
+          managedDraftWrites.add(mutation);
+          try {
+            return {
+              status: "admitted",
+              commandId: randomUUID(),
+              resource: null,
+              managedDraftCleared: await mutation,
+            };
+          } finally {
+            managedDraftWrites.delete(mutation);
+          }
+        } catch {
+          return {
+            status: "rejected",
+            code: "persistence_failed",
+            message:
+              "The private child draft could not be read or saved. Your current text is retained.",
+          };
+        }
+      }
+      if (command.type === "read_agent_conversation") {
+        const thread = state.authoritative.managedControl?.threads.find(
+          (entry) => entry.threadId === command.threadId,
+        );
+        if (state.authoritative.active?.session.id !== command.sessionId || thread === undefined)
+          return {
+            status: "rejected",
+            code: "stale_revision",
+            message: "The selected agent conversation is no longer current.",
+          };
+        const prefix = `agent-conversation:${command.sessionId}:${command.threadId}:${command.expectedTurnId}:`;
+        const cursor = command.cursor?.startsWith(prefix)
+          ? command.cursor.slice(prefix.length).match(/^(\d+):(\d+)$/u)
+          : null;
+        if (command.cursor !== null && cursor === null)
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "The agent conversation cursor is invalid.",
+          };
+        try {
+          const child = await options.lifecycle[sessionManagedAgentTranscriptReader]({
+            sessionId: command.sessionId,
+            threadId: command.threadId,
+            turnId: command.expectedTurnId,
+            ...(cursor === null ? {} : { throughSequence: Number(cursor[1]) }),
+          });
+          if (child.identity === undefined)
+            throw new TypeError("The exact child identity is unavailable.");
+          const items = projectManagedAgentTranscript(child);
+          const end = cursor === null ? items.length : Number(cursor[2]);
+          if (!Number.isSafeInteger(end) || end < 0 || end > items.length)
+            return {
+              status: "rejected",
+              code: "invalid_command",
+              message: "The agent conversation cursor is invalid.",
+            };
+          const throughSequence = child.records.at(-1)?.sequence ?? 0;
+          const start = Math.max(0, end - managedAgentTranscriptPageSize);
+          return {
+            status: "admitted",
+            commandId: randomUUID(),
+            resource: null,
+            managedAgentTranscript: {
+              type: "managed_agent_transcript_page",
+              agentId: thread.threadId,
+              turnId: command.expectedTurnId,
+              attemptId: child.identity.attemptId,
+              childSessionId: child.childSessionId,
+              throughSequence,
+              cursor: `${prefix}${throughSequence}:${end}`,
+              items: items.slice(start, end),
+              olderCursor: start === 0 ? null : `${prefix}${throughSequence}:${start}`,
+            },
+          };
+        } catch {
+          return {
+            status: "rejected",
+            code: "recovery_required",
+            message: "The agent transcript is unavailable. Inspect durable state.",
+          };
+        }
+      }
+      if (command.type === "export_agent") {
+        if (
+          command.confirmed !== true ||
+          !Array.isArray(command.fields) ||
+          command.fields.length === 0 ||
+          command.fields.length > agentExportFields.length ||
+          command.fields.some((field) => !agentExportFields.includes(field)) ||
+          new Set(command.fields).size !== command.fields.length
+        )
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "Confirm a finite export field selection.",
+          };
+        if (
+          state.authoritative.active?.session.id !== command.sessionId ||
+          options.stateRoot === undefined
+        )
+          return {
+            status: "rejected",
+            code: "stale_revision",
+            message: "The export Session is no longer active.",
+          };
+        try {
+          const control = await options.lifecycle[sessionManagedControl](command.sessionId);
+          const snapshot = await control?.inspect({ parentSessionId: command.sessionId });
+          const completion = snapshot?.completions.find(
+            (entry) =>
+              entry.threadId === command.threadId && entry.turnId === command.expectedTurnId,
+          );
+          const thread = snapshot?.threads.find((entry) => entry.threadId === command.threadId);
+          const turn =
+            thread === undefined
+              ? undefined
+              : [...(thread.previousTurns ?? []), thread.turn].find(
+                  (entry) => entry.turnId === command.expectedTurnId,
+                );
+          if (
+            control === undefined ||
+            completion === undefined ||
+            thread === undefined ||
+            turn === undefined ||
+            !isDeepStrictEqual(completion.receipt, command.completion)
+          )
+            return {
+              status: "rejected",
+              code: "stale_revision",
+              message: "The exact export completion changed.",
+            };
+          const emptyCancellation =
+            !turn.hasStarted &&
+            turn.recovery === "none" &&
+            completion.outcome.status === "cancelled" &&
+            completion.outcome.transcript.sequence === 0;
+          const child = emptyCancellation
+            ? undefined
+            : await options.lifecycle[sessionManagedAgentTranscriptReader]({
+                sessionId: command.sessionId,
+                threadId: command.threadId,
+                turnId: command.expectedTurnId,
+              });
+          const items = child === undefined ? [] : projectManagedAgentTranscript(child);
+          const common = {
+            sessionId: command.sessionId,
+            threadId: command.threadId,
+            expectedTurnId: command.expectedTurnId,
+          };
+          const fields = agentExportFields.filter((field) => command.fields.includes(field));
+          const output: Partial<Record<(typeof agentExportFields)[number], unknown>> = {};
+          const preview = (page: ArtifactChunk) => ({
+            text: page.text,
+            totalByteCount: page.totalByteCount,
+            omittedBytes: page.totalByteCount - page.byteCount,
+          });
+          const read = async (request: PresentationCommand) => {
+            const receipt = await dispatch(request);
+            if (receipt.status === "rejected" || receipt.resource === null)
+              throw new Error(
+                receipt.status === "rejected"
+                  ? receipt.message
+                  : "The selected export resource is unavailable.",
+              );
+            return receipt.resource;
+          };
+          for (const field of fields) {
+            if (field === "summary") {
+              output.summary = {
+                role: thread.role,
+                handle: thread.handle,
+                description: thread.description,
+                status: completion.outcome.status,
+                usage: completion.outcome.usage,
+                configuration: turn.configuration ?? null,
+              };
+            } else if (field === "result") {
+              const artifact = completion.outcome.artifact;
+              const page =
+                artifact === undefined
+                  ? readManagedInlinePage(
+                      completion.outcome.summary,
+                      { offset: 0, maximumBytes: presentationArtifactPageMaximumBytes },
+                      "text/plain; charset=utf-8",
+                    )
+                  : await read({
+                      ...common,
+                      type: "read_agent_artifact",
+                      artifact: { ...artifact, source: "model_response" },
+                      range: { offset: 0, maximumBytes: presentationArtifactPageMaximumBytes },
+                    });
+              output.result = preview(page);
+            } else {
+              const candidates = items.filter((item) =>
+                field === "conversation"
+                  ? item.type === "assistant_message"
+                  : field === "tools"
+                    ? item.type === "tool_call"
+                    : item.type === "reasoning_block",
+              );
+              const exported: {
+                readonly id: string;
+                readonly text: string;
+                readonly totalByteCount: number;
+                readonly omittedBytes: number;
+              }[] = [];
+              let remaining = presentationArtifactPageMaximumBytes;
+              for (const item of candidates.slice(0, 32)) {
+                if (remaining < 4) break;
+                const range = { offset: 0, maximumBytes: remaining };
+                const page =
+                  field === "conversation" && item.type === "assistant_message"
+                    ? item.text !== null
+                      ? readManagedInlinePage(item.text, range, "text/plain; charset=utf-8")
+                      : item.artifact !== null
+                        ? await read({
+                            ...common,
+                            type: "read_agent_artifact",
+                            artifact: item.artifact,
+                            range,
+                          })
+                        : undefined
+                    : await read({
+                        ...common,
+                        type: "read_agent_content",
+                        kind: field === "tools" ? "tool" : "reasoning",
+                        itemId: item.id,
+                        range,
+                      });
+                if (page === undefined)
+                  throw new Error("The selected export resource is unavailable.");
+                exported.push({ id: item.id, ...preview(page) });
+                remaining -= page.byteCount;
+              }
+              output[field] = {
+                items: exported,
+                omittedItems: candidates.length - exported.length,
+              };
+            }
+          }
+          const content = `${JSON.stringify({ format: "adam.agent-export.v1", identity: { parentSessionId: command.sessionId, threadId: command.threadId, turnId: command.expectedTurnId, completion: command.completion }, limits: { fieldBytes: presentationArtifactPageMaximumBytes, fieldItems: 32 }, fields: output }, null, 2)}\n`;
+          if (Buffer.byteLength(content, "utf8") > presentationAgentExportMaximumBytes)
+            return {
+              status: "rejected",
+              code: "not_available",
+              message: "The selected export exceeds its bounded document size.",
+            };
+          const agentExport = await control.publishExport({
+            parentSessionId: command.sessionId,
+            threadId: command.threadId,
+            turnId: command.expectedTurnId,
+            completion: command.completion,
+            fields,
+            content,
+          });
+          return { status: "admitted", commandId: randomUUID(), resource: null, agentExport };
+        } catch (error) {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message:
+              error instanceof Error
+                ? error.message
+                : "The selected export resources are unavailable.",
+          };
+        }
+      }
+      if (
+        command.type === "read_agent_content" ||
+        command.type === "read_agent_artifact" ||
+        command.type === "read_agent_input"
+      ) {
+        if (
+          state.authoritative.active?.session.id !== command.sessionId ||
+          !state.authoritative.managedControl?.threads.some(
+            (thread) => thread.threadId === command.threadId,
+          )
+        )
+          return {
+            status: "rejected",
+            code: "stale_revision",
+            message: "The selected agent resource does not belong to the active Session.",
+          };
+        if (!isBoundedPresentationArtifactRange(command.range))
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "The agent resource range is invalid.",
+          };
+        try {
+          if (
+            command.type === "read_agent_artifact" &&
+            command.artifact.source === "agent_export"
+          ) {
+            const permitted = state.authoritative.managedControl?.exports?.some(
+              (entry) =>
+                entry.threadId === command.threadId &&
+                entry.turnId === command.expectedTurnId &&
+                sameArtifactReference(entry.artifact, command.artifact),
+            );
+            if (!permitted || options.stateRoot === undefined)
+              return {
+                status: "rejected",
+                code: "not_available",
+                message: "The export artifact does not belong to this exact agent turn.",
+              };
+            return {
+              status: "admitted",
+              commandId: randomUUID(),
+              resource: await readPresentationArtifact({
+                artifact: command.artifact,
+                range: command.range,
+                stateRoot: options.stateRoot,
+                barrier: options[presentationArtifactReadBarrier],
+              }),
+            };
+          }
+          if (command.type === "read_agent_input") {
+            const control = await options.lifecycle[sessionManagedControl](command.sessionId);
+            const text = await control?.readInput({
+              parentSessionId: command.sessionId,
+              threadId: command.threadId,
+              turnId: command.expectedTurnId,
+              inputId: command.inputId,
+            });
+            if (text === undefined)
+              return {
+                status: "rejected",
+                code: "not_available",
+                message: "The exact input receipt is unavailable.",
+              };
+            return {
+              status: "admitted",
+              commandId: randomUUID(),
+              resource: readManagedInlinePage(text, command.range, "text/plain; charset=utf-8"),
+            };
+          }
+          const child = await options.lifecycle[sessionManagedAgentTranscriptReader]({
+            sessionId: command.sessionId,
+            threadId: command.threadId,
+            turnId: command.expectedTurnId,
+          });
+          const projected = projectManagedAgentTranscript(child, "detail");
+          let text: string | undefined;
+          let artifact: ArtifactReference | undefined;
+          let mediaType = "text/plain; charset=utf-8";
+          if (command.type === "read_agent_artifact") {
+            const ordinary = projectManagedAgentTranscript(child);
+            const lastAnswer = projected.findLast((item) => item.type === "assistant_message");
+            const derived =
+              lastAnswer?.type === "assistant_message" && lastAnswer.text !== null
+                ? {
+                    id: `sha256:${createHash("sha256").update(lastAnswer.text, "utf8").digest("hex")}`,
+                    byteCount: Buffer.byteLength(lastAnswer.text, "utf8"),
+                    mediaType: "text/plain; charset=utf-8",
+                    source: "model_response" as const,
+                  }
+                : undefined;
+            if (
+              !managedTranscriptContainsArtifact(ordinary, command.artifact) &&
+              (derived === undefined || !sameArtifactReference(derived, command.artifact))
+            )
+              return {
+                status: "rejected",
+                code: "not_available",
+                message: "The artifact does not belong to this exact agent transcript.",
+              };
+            artifact = command.artifact;
+          } else {
+            const item = projected.find((entry) => entry.id === command.itemId);
+            if (command.kind === "reasoning" && item?.type === "reasoning_block") {
+              text = item.text ?? undefined;
+              artifact = item.artifact ?? undefined;
+            } else if (command.kind === "tool" && item?.type === "tool_call") {
+              const response = child.records.findLast(
+                (record) =>
+                  record.schemaVersion === 3 &&
+                  record.record.type === "model_response_completed" &&
+                  record.record.response.toolCalls.some((call) => call.id === item.callId),
+              );
+              const call =
+                response?.schemaVersion === 3 && response.record.type === "model_response_completed"
+                  ? response.record.response.toolCalls.find((entry) => entry.id === item.callId)
+                  : undefined;
+              const result = child.records.findLast(
+                (record) =>
+                  record.schemaVersion === 3 &&
+                  record.record.type === "runtime_event" &&
+                  (record.record.event.type === "tool_completed" ||
+                    record.record.event.type === "tool_failed") &&
+                  record.record.event.callId === item.callId,
+              );
+              text = JSON.stringify(
+                {
+                  name: item.qualifiedName,
+                  status: item.status,
+                  argumentsJson: call?.argumentsJson ?? null,
+                  result:
+                    result?.schemaVersion === 3 &&
+                    result.record.type === "runtime_event" &&
+                    (result.record.event.type === "tool_completed" ||
+                      result.record.event.type === "tool_failed")
+                      ? result.record.event
+                      : null,
+                },
+                null,
+                2,
+              );
+              mediaType = "application/json";
+            }
+          }
+          const resource =
+            artifact !== undefined && options.stateRoot !== undefined
+              ? await readPresentationArtifact({
+                  artifact,
+                  range: command.range,
+                  stateRoot: options.stateRoot,
+                  barrier: options[presentationArtifactReadBarrier],
+                })
+              : text !== undefined
+                ? readManagedInlinePage(text, command.range, mediaType)
+                : undefined;
+          if (resource === undefined)
+            return {
+              status: "rejected",
+              code: "not_available",
+              message: "The bounded agent resource is unavailable.",
+            };
+          return { status: "admitted", commandId: randomUUID(), resource };
+        } catch {
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "The exact agent resource could not be read safely.",
+          };
+        }
       }
       if (
         command.type === "refresh_managed_agents" ||
@@ -4965,7 +5700,18 @@ export async function createPresentationSession(
               : ("ready" as const);
         return {
           ...state,
+          agentUiSettings,
           ...(managedAgentActivity.length === 0 ? {} : { managedAgentActivity }),
+          managedAttention: managedAttention(),
+          managedDrafts: [...managedDrafts.values()]
+            .filter(
+              (draft) => draft.parentSessionId === active?.session.id && draft.text.length > 0,
+            )
+            .map(({ parentSessionId, threadId, expectedTurnId }) => ({
+              parentSessionId,
+              threadId,
+              expectedTurnId,
+            })),
           authoritative: {
             ...state.authoritative,
             active:
@@ -5027,6 +5773,8 @@ export async function createPresentationSession(
         unsubscribeMetadata();
         unsubscribeManagedAgentEvents();
         await activeRun?.settlement;
+        await Promise.all(managedDraftWrites);
+        await Promise.all(attentionReads.values());
         await Promise.all(connectionSettlements);
         await webSearchSettlement;
         await runtimeRefresh;
@@ -5241,7 +5989,10 @@ async function readPresentationArtifact(input: {
   };
 }
 
-function projectManagedAgentTranscript(child: ManagedAgentTranscriptRecords): TranscriptItem[] {
+function projectManagedAgentTranscript(
+  child: ManagedAgentTranscriptRecords,
+  disclosure: "summary" | "detail" = "summary",
+): TranscriptItem[] {
   const history = child.records.map((entry) => ({
     sessionId: child.childSessionId,
     entry,
@@ -5251,7 +6002,7 @@ function projectManagedAgentTranscript(child: ManagedAgentTranscriptRecords): Tr
     if (item.type === "user_message") {
       continue;
     }
-    if (item.type === "reasoning_block") {
+    if (item.type === "reasoning_block" && disclosure === "summary") {
       projected.push({ ...item, text: null, artifact: null });
       continue;
     }
@@ -5271,6 +6022,34 @@ function projectManagedAgentTranscript(child: ManagedAgentTranscriptRecords): Tr
     });
   }
   return projected;
+}
+
+function readManagedInlinePage(
+  text: string,
+  range: ArtifactRange,
+  mediaType: string,
+): ArtifactChunk {
+  const bytes = Buffer.from(text, "utf8");
+  if (range.offset > bytes.byteLength) throw new TypeError("The agent content offset is invalid.");
+  const end = Math.min(bytes.byteLength, range.offset + range.maximumBytes);
+  const decoded = decodeArtifactPage(bytes.subarray(range.offset, end), end === bytes.byteLength);
+  const eof = range.offset + decoded.byteCount === bytes.byteLength;
+  if (!eof && decoded.byteCount === 0)
+    throw new TypeError("The agent content page made no UTF-8 progress.");
+  return {
+    mediaType,
+    offset: range.offset,
+    byteCount: decoded.byteCount,
+    totalByteCount: bytes.byteLength,
+    eof,
+    nextRange: eof
+      ? null
+      : {
+          offset: range.offset + decoded.byteCount,
+          maximumBytes: presentationArtifactPageMaximumBytes,
+        },
+    text: decoded.text,
+  };
 }
 
 function managedTranscriptContainsArtifact(

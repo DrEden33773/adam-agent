@@ -243,7 +243,13 @@ export type ArtifactReference = {
   readonly id: string;
   readonly mediaType: string;
   readonly byteCount: number;
-  readonly source: "model_response" | "tool_output" | "change_preview" | "operation" | "plan";
+  readonly source:
+    | "model_response"
+    | "tool_output"
+    | "change_preview"
+    | "operation"
+    | "plan"
+    | "agent_export";
 };
 
 export type ArtifactChunk = {
@@ -345,6 +351,7 @@ export type ToolPreviewDisplay =
     };
 
 export type ToolCallDisplay = {
+  readonly managedAdmissions?: readonly ManagedAdmissionDisplay[];
   readonly type: "tool_call";
   readonly id: string;
   readonly sequence: number;
@@ -1113,7 +1120,51 @@ export type PresentationTransientState = {
   } | null;
 };
 
+export type AgentUiSettings = {
+  readonly widgetMode: "background" | "all" | "off";
+  readonly fleetEnabled: boolean;
+  readonly showModel: boolean;
+  readonly viewerMode: "raw" | "assistant" | "full";
+  readonly mentions: "direct" | "off";
+};
+export const defaultAgentUiSettings: AgentUiSettings = Object.freeze({
+  widgetMode: "background",
+  fleetEnabled: true,
+  showModel: false,
+  viewerMode: "assistant",
+  mentions: "direct",
+});
+export function nextAgentViewerMode(
+  mode: AgentUiSettings["viewerMode"],
+): AgentUiSettings["viewerMode"] {
+  return mode === "raw" ? "assistant" : mode === "assistant" ? "full" : "raw";
+}
+export function isAgentUiSettings(value: unknown): value is AgentUiSettings {
+  if (typeof value !== "object" || value === null) return false;
+  return (
+    "widgetMode" in value &&
+    typeof value.widgetMode === "string" &&
+    ["background", "all", "off"].includes(value.widgetMode) &&
+    "fleetEnabled" in value &&
+    typeof value.fleetEnabled === "boolean" &&
+    "showModel" in value &&
+    typeof value.showModel === "boolean" &&
+    "viewerMode" in value &&
+    typeof value.viewerMode === "string" &&
+    ["raw", "assistant", "full"].includes(value.viewerMode) &&
+    "mentions" in value &&
+    typeof value.mentions === "string" &&
+    ["direct", "off"].includes(value.mentions)
+  );
+}
+
 export type PresentationDisplayState = {
+  readonly agentUiSettings?: AgentUiSettings;
+  readonly managedAttention?: readonly ManagedAttentionItem[];
+  readonly managedDrafts?: readonly Pick<
+    ManagedComposerDraft,
+    "parentSessionId" | "threadId" | "expectedTurnId"
+  >[];
   readonly revision: number;
   readonly authoritative: AuthoritativePresentationSnapshot;
   readonly draft: NewSessionDraftDisplay | null;
@@ -1127,6 +1178,8 @@ export type PresentationDisplayState = {
     readonly assistant?: {
       readonly itemId: string;
       readonly text: string;
+      readonly totalByteCount?: number;
+      readonly omittedBytes?: number;
     };
     readonly reasoning?: {
       readonly itemId: string;
@@ -1166,6 +1219,9 @@ export type CommandReceipt =
       readonly draftText?: string;
       readonly todo?: TodoPageResource | TodoEntityResource;
       readonly managedAgentTranscript?: ManagedAgentTranscriptPageResource;
+      readonly managedDraft?: ManagedComposerDraft | null;
+      readonly managedDraftCleared?: boolean;
+      readonly agentExport?: ManagedAgentExport;
       readonly control?: ManagedControlReceipt;
       readonly managedAgentControl?: {
         readonly action: "message" | "reply" | "cancel" | "follow_up" | "recovery";
@@ -1243,6 +1299,8 @@ export type TodoEntityResource = {
 };
 
 export type ManagedAgentTranscriptPageResource = {
+  readonly turnId?: string;
+  readonly cursor?: string;
   readonly type: "managed_agent_transcript_page";
   readonly agentId: string;
   readonly attemptId: string;
@@ -1253,6 +1311,53 @@ export type ManagedAgentTranscriptPageResource = {
 };
 
 export type PresentationCommand =
+  | {
+      readonly type: "export_agent";
+      readonly confirmed: true;
+      readonly sessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+      readonly completion: ManagedControlLink;
+      readonly fields: readonly AgentExportField[];
+    }
+  | {
+      readonly type: "read_agent_input";
+      readonly sessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+      readonly inputId: string;
+      readonly range: ArtifactRange;
+    }
+  | {
+      readonly type: "read_agent_content";
+      readonly kind: "reasoning" | "tool";
+      readonly sessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+      readonly itemId: string;
+      readonly range: ArtifactRange;
+    }
+  | {
+      readonly type: "read_agent_artifact";
+      readonly sessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+      readonly artifact: ArtifactReference;
+      readonly range: ArtifactRange;
+    }
+  | { readonly type: "set_agent_ui_settings"; readonly settings: AgentUiSettings | null }
+  | { readonly type: "read_agent_draft"; readonly sessionId: string; readonly threadId: string }
+  | {
+      readonly type: "save_agent_draft" | "clear_agent_draft";
+      readonly draft: ManagedComposerDraft;
+    }
+  | {
+      readonly type: "read_agent_conversation";
+      readonly sessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+      readonly cursor: string | null;
+    }
   | {
       readonly type: "resolve_managed_transition";
       readonly transitionId: string;
@@ -1653,12 +1758,59 @@ export type ManagedControlIdentity = {
   readonly childSessionId: string;
 };
 
+export type ManagedComposerDraft = {
+  readonly parentSessionId: string;
+  readonly threadId: string;
+  readonly expectedTurnId: string;
+  readonly mode: "cooperative" | "interrupt" | "new_turn" | "reply";
+  readonly attentionId?: string;
+  readonly inputId?: string;
+  readonly text: string;
+};
+
+export type ManagedAttentionItem = {
+  readonly id: string;
+  readonly parentSessionId: string;
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly handle: string;
+  readonly displayName: string;
+  readonly description: string;
+  readonly available: boolean;
+  readonly diagnostic?: string;
+} & (
+  | {
+      readonly kind: "permission";
+      readonly interaction: Extract<PendingInteraction, { readonly type: "permission" }> | null;
+    }
+  | { readonly kind: "parent_input"; readonly question: string }
+);
+
+export type ManagedControlAction =
+  | ManagedComposerDraft["mode"]
+  | "cancel"
+  | "resume"
+  | "recover"
+  | "permission"
+  | "close";
+
+export type ManagedAdmissionDisplay = {
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly handle: string;
+  readonly displayName: string;
+  readonly description: string;
+  readonly lane: "background" | "reserved";
+  readonly status: "started" | "queued";
+};
+
 export type ManagedControlLink = {
   readonly sequence: number;
   readonly digest: `sha256:${string}`;
 };
 
 export type ManagedControlOutcome = {
+  readonly atUnixMilliseconds?: number;
   readonly artifact?: {
     readonly id: `sha256:${string}`;
     readonly byteCount: number;
@@ -1679,6 +1831,9 @@ export type ManagedControlOutcome = {
 };
 
 export type ManagedControlThread = {
+  readonly previousTurns?: readonly ManagedControlThread["turn"][];
+  readonly actions?: readonly ManagedControlAction[];
+  readonly budget?: NonNullable<ManagedWorkspaceSnapshot["budget"]>;
   readonly inputs?: readonly {
     readonly id: string;
     readonly turnId: string;
@@ -1694,6 +1849,7 @@ export type ManagedControlThread = {
   readonly role: "builtin:explore";
   readonly description: string;
   readonly turn: {
+    readonly startedAtUnixMilliseconds?: number;
     readonly turnId: string;
     readonly attemptId: string;
     readonly childSessionId: string;
@@ -1707,9 +1863,14 @@ export type ManagedControlThread = {
       readonly parentBranchId: string;
       readonly targetId: string;
       readonly thinking: string;
+      readonly contextWindowTokens?: number;
     };
     readonly waitReason: "none" | "suspended" | "capacity" | "permission" | "parent_input" | "plan";
-    readonly attention?: { readonly id: string; readonly kind: "permission" | "parent_input" };
+    readonly attention?: {
+      readonly id: string;
+      readonly kind: "permission" | "parent_input";
+      readonly question?: string;
+    };
     readonly ownerPhase: "waiting" | "claimed" | "releasing" | "released";
     readonly lastOutcome: "none" | "completed" | "failed" | "cancelled" | "interrupted";
     readonly label: string;
@@ -1727,7 +1888,29 @@ export type ManagedControlThread = {
   };
 };
 
+export const agentExportFields = [
+  "summary",
+  "conversation",
+  "tools",
+  "result",
+  "reasoning",
+] as const;
+export type AgentExportField = (typeof agentExportFields)[number];
+export const presentationAgentExportMaximumBytes = 512 * 1024;
+export type ManagedAgentExport = {
+  readonly parentSessionId: string;
+  readonly threadId: string;
+  readonly turnId: string;
+  readonly completion: ManagedControlLink;
+  readonly fields: readonly AgentExportField[];
+  readonly artifact: ArtifactReference & {
+    readonly source: "agent_export";
+    readonly mediaType: "application/json";
+  };
+};
+
 export type ManagedWorkspaceSnapshot = {
+  readonly exports?: readonly ManagedAgentExport[];
   readonly storage?: {
     readonly status?: "known" | "unavailable";
     readonly ceiling: number;
@@ -1750,7 +1933,8 @@ export type ManagedWorkspaceSnapshot = {
     readonly turnId: string;
     readonly receipt: ManagedControlLink;
     readonly outcome: ManagedControlOutcome;
-    readonly consumption: "pending" | "consumed";
+    readonly consumption: "pending" | "consumed" | "suppressed";
+    readonly userSeen?: true;
   }[];
   readonly status: "ready" | "recovery_required" | "runtime_unavailable";
   readonly diagnostic?: string;
@@ -1793,6 +1977,21 @@ export type ManagedDelegationEnvelope = {
 };
 
 export type ManagedControlCommand =
+  | {
+      readonly type: "suppress_completion";
+      readonly confirmed: true;
+      readonly parentSessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+      readonly completion: ManagedControlLink;
+    }
+  | {
+      readonly type: "mark_completion_seen";
+      readonly parentSessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+      readonly completion: ManagedControlLink;
+    }
   | {
       readonly type: "suspend_agents";
       readonly parentSessionId: string;
@@ -1921,7 +2120,11 @@ export type ManagedControlReceipt =
       readonly revision: number;
     }
   | { readonly status: "completed"; readonly results: ManagedWorkspaceSnapshot["completions"] }
-  | { readonly status: "admitted"; readonly turns: readonly ManagedControlIdentity[] }
+  | {
+      readonly status: "admitted";
+      readonly turns: readonly ManagedControlIdentity[];
+      readonly admissions?: readonly ManagedAdmissionDisplay[];
+    }
   | {
       readonly status: "delivery";
       readonly messages: readonly { readonly id: `sha256:${string}`; readonly text: string }[];

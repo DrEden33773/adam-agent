@@ -25,10 +25,17 @@ import {
   type SessionSnapshot,
   type WorkspaceTrustController,
 } from "@adam-agent/agent";
+import { sessionManagedControl } from "@adam-agent/agent/internal-testing";
 import type { PresentationSession } from "@adam-agent/presentation";
 import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
 
+/** Internal candidate entry for conformance. The ordinary production caller never selects it. */
+export const projectRuntimeManagedControl = Symbol("project-runtime-managed-control-testing");
+
 export type ProductionProjectRuntimeOptions = {
+  readonly [projectRuntimeManagedControl]?: NonNullable<
+    Parameters<typeof createSessionLifecycle>[0][typeof sessionManagedControl]
+  >;
   readonly environment: NodeJS.ProcessEnv;
   readonly extensionPermissions: PermissionPolicy;
   readonly modelTargets: ModelTargets;
@@ -176,7 +183,9 @@ export async function createProductionProjectRuntime(
   });
   lifecycle = createSessionLifecycle({
     extensionHost: host,
-    managedAgentTools: "managed-agent-tools.a3-long-lived.v2",
+    ...(options[projectRuntimeManagedControl] === undefined
+      ? { managedAgentTools: "managed-agent-tools.a3-long-lived.v2" as const }
+      : { [sessionManagedControl]: options[projectRuntimeManagedControl] }),
     modelTargets: options.modelTargets,
     permissions: options.permissions,
     preferences: options.preferences,

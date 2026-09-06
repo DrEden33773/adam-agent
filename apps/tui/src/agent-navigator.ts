@@ -238,6 +238,7 @@ export class AgentNavigator implements Component {
         }
         return;
       }
+      if (this.#detail.readOnly) return;
       if (
         matchesKey(data, "m") &&
         isActiveManagedAgent(this.#detail) &&
@@ -370,34 +371,42 @@ export class AgentNavigator implements Component {
               `${report.kind} r${report.revision} · ${safeTerminalText(report.message)}${report.messageTruncated ? ` · ${report.messageByteCount} bytes total` : ""}`,
           ),
       ];
-      const fullActionLines = [
-        ...(isActiveManagedAgent(detail) && this.#onMessage !== undefined
-          ? [
-              this.#theme.muted(
-                "m message at next safe boundary; delivery does not imply compliance",
-              ),
-            ]
-          : []),
-        ...(this.#cancelConfirmation === `${detail.agentId}:${detail.revision}`
-          ? [this.#theme.statusWarning("Press c again to stop this exact child")]
-          : []),
-        ...(canFollowUp(detail) && this.#onFollowUp !== undefined
-          ? [this.#theme.muted("f follow-up from exact terminal evidence")]
-          : []),
-        ...(detail.status === "recovery_required" && this.#onRecovery !== undefined
-          ? [this.#theme.muted("r recover from exact durable evidence")]
-          : []),
-        ...(hasArtifact && this.#onReadArtifact !== undefined
-          ? [this.#theme.muted("a read artifact")]
-          : []),
-        this.#theme.muted(
-          isActiveManagedAgent(detail) && detail.status !== "waiting_for_parent"
-            ? "↑↓ scroll · PgUp older · c cancel exact revision · Esc back · Ctrl+Q exit"
-            : detail.status === "waiting_for_parent"
-              ? "↑↓ scroll · PgUp older · r reply exact attention · c cancel exact revision · Esc back · Ctrl+Q exit"
-              : "Terminal child · Esc back · Ctrl+Q exit",
-        ),
-      ];
+      const fullActionLines = detail.readOnly
+        ? [
+            this.#theme.muted("Read-only history · Esc back"),
+            ...(hasArtifact && this.#onReadArtifact !== undefined
+              ? [this.#theme.muted("a read artifact")]
+              : []),
+            this.#theme.muted("↑↓ scroll · PgUp older · Ctrl+Q exit"),
+          ]
+        : [
+            ...(isActiveManagedAgent(detail) && this.#onMessage !== undefined
+              ? [
+                  this.#theme.muted(
+                    "m message at next safe boundary; delivery does not imply compliance",
+                  ),
+                ]
+              : []),
+            ...(this.#cancelConfirmation === `${detail.agentId}:${detail.revision}`
+              ? [this.#theme.statusWarning("Press c again to stop this exact child")]
+              : []),
+            ...(canFollowUp(detail) && this.#onFollowUp !== undefined
+              ? [this.#theme.muted("f follow-up from exact terminal evidence")]
+              : []),
+            ...(detail.status === "recovery_required" && this.#onRecovery !== undefined
+              ? [this.#theme.muted("r recover from exact durable evidence")]
+              : []),
+            ...(hasArtifact && this.#onReadArtifact !== undefined
+              ? [this.#theme.muted("a read artifact")]
+              : []),
+            this.#theme.muted(
+              isActiveManagedAgent(detail) && detail.status !== "waiting_for_parent"
+                ? "↑↓ scroll · PgUp older · c cancel exact revision · Esc back · Ctrl+Q exit"
+                : detail.status === "waiting_for_parent"
+                  ? "↑↓ scroll · PgUp older · r reply exact attention · c cancel exact revision · Esc back · Ctrl+Q exit"
+                  : "Terminal child · Esc back · Ctrl+Q exit",
+            ),
+          ];
       const fullHeaderLines = [
         this.#theme.toolTitle("Agent detail"),
         `${detail.profile} · ${detail.mode} · ${detail.status} · revision ${detail.revision} · ${detail.phase}${detail.activeTool === undefined ? "" : ` · ${detail.activeTool.name} ${detail.activeTool.status}`}`,
@@ -784,6 +793,8 @@ function compactAgentActions(
     readonly recovery: boolean;
   },
 ): string {
+  if (agent.readOnly)
+    return `Read-only history${available.artifact ? " · a artifact" : ""} · Esc back`;
   if (confirmation === `${agent.agentId}:${agent.revision}`) {
     return "c again cancel · Esc back";
   }

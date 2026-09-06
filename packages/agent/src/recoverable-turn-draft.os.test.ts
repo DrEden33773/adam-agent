@@ -8,6 +8,42 @@ import { createRecoverableTurnDraftRepository } from "./recoverable-turn-draft.j
 
 const projectId = `sha256:${"b".repeat(64)}` as const;
 
+test("late input acceptance clears only its exact owner-private child draft", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-child-draft-clear-"));
+  const repository = await createRecoverableTurnDraftRepository({ projectId, stateRoot: root });
+  const first = {
+    parentSessionId: "00000000-0000-4000-8000-000000000001",
+    threadId: "00000000-0000-4000-8000-000000000002",
+    expectedTurnId: "00000000-0000-4000-8000-000000000003",
+    inputId: "00000000-0000-4000-8000-000000000004",
+    mode: "cooperative" as const,
+    text: "The submitted input.",
+  };
+  const later = {
+    ...first,
+    inputId: "00000000-0000-4000-8000-000000000005",
+    text: "A newer unsent draft.",
+  };
+  try {
+    await repository.saveManaged(first);
+    await repository.saveManaged(later);
+    await expect(repository.clearManaged(first)).resolves.toBe(false);
+    const reopened = await createRecoverableTurnDraftRepository({ projectId, stateRoot: root });
+    await expect(reopened.loadManaged(first)).resolves.toEqual(later);
+    const path = join(
+      root,
+      "drafts",
+      "b".repeat(64),
+      `managed-${first.parentSessionId}-${first.threadId}.json`,
+    );
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    await expect(repository.clearManaged(later)).resolves.toBe(true);
+    await expect(reopened.loadManaged(first)).resolves.toBeNull();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("recoverable turn draft atomically replaces one owner-private project manifest", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-recoverable-turn-draft-"));
   const repository = await createRecoverableTurnDraftRepository({

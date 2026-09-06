@@ -1482,6 +1482,15 @@ test("PresentationSession opens an empty project catalog without creating a sess
 
     const state = presentation.getState();
     expect(state).toEqual({
+      agentUiSettings: {
+        widgetMode: "background",
+        fleetEnabled: true,
+        showModel: false,
+        viewerMode: "assistant",
+        mentions: "direct",
+      },
+      managedAttention: [],
+      managedDrafts: [],
       revision: 1,
       authoritative: {
         schemaVersion: 1,
@@ -5962,6 +5971,15 @@ test("PresentationSession opens an exact target as a recoverable draft", async (
 
     const state = presentation.getState();
     expect(state).toEqual({
+      agentUiSettings: {
+        widgetMode: "background",
+        fleetEnabled: true,
+        showModel: false,
+        viewerMode: "assistant",
+        mentions: "direct",
+      },
+      managedAttention: [],
+      managedDrafts: [],
       revision: 1,
       authoritative: {
         schemaVersion: 1,

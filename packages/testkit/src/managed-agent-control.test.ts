@@ -596,17 +596,32 @@ test("ManagedAgentControl observers register before their initial read and remai
     firstAbort.abort();
     expect(await first.next()).toMatchObject({ done: true });
     const revisions = [initial.value?.snapshot.revision ?? -1];
+    let startupResets = 0;
     await withManagedFailureGuard(
       (async () => {
         while (true) {
           const frame = await second.next();
           if (frame.done) throw new Error("Second subscription ended unexpectedly.");
-          revisions.push(frame.value.snapshot.revision);
+          if (frame.value.snapshot.revision === revisions.at(-1)) {
+            expect(frame.value.type).toBe("reset");
+            expect(frame.value.snapshot.threads[0]).toMatchObject({
+              residency: "live",
+              turn: { phase: "starting", label: "Starting" },
+            });
+            startupResets += 1;
+          } else {
+            if (frame.value.type === "reset")
+              expect(frame.value.snapshot.threads[0]?.turn.phase).toBe("queued");
+            else expect(frame.value.type).toBe("change");
+            revisions.push(frame.value.snapshot.revision);
+          }
           if (frame.value.snapshot.threads[0]?.turn.phase === "idle") break;
         }
       })(),
       "independent second subscriber settlement",
     );
+    expect(startupResets).toBe(1);
+    expect(revisions.at(-1)).toBeGreaterThan(revisions[0] ?? -1);
     expect(
       revisions.every(
         (revision, index) => index === 0 || revision === (revisions[index - 1] ?? -1) + 1,
@@ -1254,3 +1269,105 @@ test("ManagedAgentControl keeps outcome Settling until cleanup and admits immedi
     await domain.close();
   }
 });
+
+test.each(["starting", "executing"] as const)(
+  "ManagedAgentControl discards a queued reset already covered by its initial %s snapshot",
+  async (phase) => {
+    const providerStarted = Promise.withResolvers<void>();
+    const finish = Promise.withResolvers<void>();
+    const harness = await controlHarness({
+      async *stream() {
+        providerStarted.resolve();
+        await finish.promise;
+        yield { type: "text_delta", text: "Current observer evidence." };
+        yield { type: "finish", reason: "stop" };
+      },
+    });
+    const createReached = Promise.withResolvers<void>();
+    const releaseCreate = Promise.withResolvers<void>();
+    const children = harness.options.childSessionStores;
+    const childSessionStores: typeof children = {
+      ...children,
+      async create(id) {
+        createReached.resolve();
+        if (phase === "starting") await releaseCreate.promise;
+        return children.create(id);
+      },
+    };
+    const firstRead = Promise.withResolvers<void>();
+    const releaseRead = Promise.withResolvers<void>();
+    let gate = true;
+    const backing = harness.options.store;
+    const store: typeof backing = {
+      ...backing,
+      forParent() {
+        return store;
+      },
+      async read() {
+        if (gate) {
+          gate = false;
+          firstRead.resolve();
+          await releaseRead.promise;
+        }
+        return backing.read();
+      },
+    };
+    const control = createManagedAgentControl({ ...harness.options, store, childSessionStores });
+    const abort = new AbortController();
+    const iterator = control
+      .observe({ parentSessionId, signal: abort.signal })
+      [Symbol.asyncIterator]();
+    try {
+      const initialPending = iterator.next();
+      await firstRead.promise;
+      expect(
+        await control.dispatch({
+          type: "start_thread",
+          parentSessionId,
+          role: "builtin:explore",
+          task: "Inspect",
+          description: "Snapshot boundary",
+        }),
+      ).toMatchObject({ status: "accepted" });
+      await createReached.promise;
+      if (phase === "executing") await providerStarted.promise;
+      releaseRead.resolve();
+      const initial = await initialPending;
+      if (initial.done) throw new Error("Missing initial snapshot");
+      expect(initial.value.type).toBe("snapshot");
+      expect(initial.value.snapshot.revision).toBe((await backing.read()).length);
+      expect(initial.value.snapshot.threads[0]?.turn.phase).toBe(phase);
+      const next = iterator.next();
+      releaseCreate.resolve();
+      finish.resolve();
+      await withManagedFailureGuard(
+        (async () => {
+          let current = await next;
+          while (
+            !current.done &&
+            current.value.snapshot.revision === initial.value.snapshot.revision
+          ) {
+            expect(current.value.type).toBe("reset");
+            expect(current.value.snapshot.threads[0]).toMatchObject({
+              residency: "live",
+              turn: { phase, label: phase === "starting" ? "Starting" : "Running" },
+            });
+            current = await iterator.next();
+          }
+          if (current.done) throw new Error("Missing current change");
+          expect(current.value.snapshot.revision).toBe(initial.value.snapshot.revision + 1);
+          expect(current.value.type).toBe("change");
+        })(),
+        "post-snapshot durable change",
+      );
+    } finally {
+      releaseRead.resolve();
+      releaseCreate.resolve();
+      finish.resolve();
+      abort.abort();
+      await iterator.return?.();
+      await control.dispatch({ type: "close", parentSessionId });
+      await harness.close();
+    }
+  },
+);

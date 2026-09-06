@@ -93,6 +93,7 @@ export {
   presentationHistoryPageSize,
   presentationHydrationBarrier,
   presentationManagedAgentTranscriptPageSize,
+  presentationManagedControlReceiptBarrier,
   presentationRuntimeRefreshBarrier,
   presentationSessionRecordReader,
   resolvePresentationTerminalContext,

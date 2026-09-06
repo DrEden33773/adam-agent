@@ -819,3 +819,38 @@ function managedAgentFixture(
     ...overrides,
   };
 }
+
+test.each(["running", "completed", "recovery_required", "waiting_for_parent"] as const)(
+  "historical read-only %s child exposes inspection without legacy control shortcuts",
+  (status) => {
+    const agent = managedAgentFixture({
+      readOnly: true,
+      status,
+      attention: {
+        attentionId: "historical-attention",
+        status: "waiting",
+        question: "Historical question",
+      },
+    });
+    const onAction = vi.fn();
+    const navigator = new AgentNavigator({
+      managedAgents: { counts: { active: 0, terminal: 1, attention: 0 }, agents: [agent] },
+      onCancel: onAction,
+      onReply: onAction,
+      onFollowUp: onAction,
+      onRecovery: onAction,
+      onMessage: onAction,
+      onChange: () => {},
+      onClose: () => {},
+      theme: createAdamTuiTheme(true),
+    });
+    navigator.handleInput("\r");
+    for (const width of [40, 80]) {
+      const text = navigator.render(width).join("\n");
+      expect(text).toContain("Read-only history");
+      expect(text).not.toMatch(/f follow-up|r recover|r reply|c cancel|c twice cancel|m message/u);
+    }
+    for (const key of ["f", "r", "m", "c", "c"]) navigator.handleInput(key);
+    expect(onAction).not.toHaveBeenCalled();
+  },
+);

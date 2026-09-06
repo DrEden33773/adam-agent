@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, mkdir, open, rename, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import type { ManagedComposerDraft } from "@adam-agent/presentation";
 
 import { z } from "zod";
 import type { StagedPastedTextSelectionV1 } from "./pasted-text.js";
@@ -109,7 +111,38 @@ export type RecoverableTurnDraftRepository = {
   load(scope: TurnDraftScopeV1): Promise<RecoverableTurnDraft | null>;
   save(draft: RecoverableTurnDraftV3): Promise<void>;
   delete(scope: TurnDraftScopeV1): Promise<void>;
+  loadManaged(
+    scope: Pick<ManagedComposerDraft, "parentSessionId" | "threadId">,
+  ): Promise<ManagedComposerDraft | null>;
+  saveManaged(draft: ManagedComposerDraft): Promise<void>;
+  clearManaged(draft: ManagedComposerDraft): Promise<boolean>;
 };
+
+const managedComposerDraftSchema = z
+  .strictObject({
+    parentSessionId: z.uuid(),
+    threadId: z.uuid(),
+    expectedTurnId: z.uuid(),
+    mode: z.enum(["cooperative", "interrupt", "new_turn", "reply"]),
+    attentionId: z.string().min(1).max(128).optional(),
+    inputId: z.uuid().optional(),
+    text: z.string().max(512 * 1024),
+  })
+  .refine((draft) => (draft.mode === "reply") === (draft.attentionId !== undefined));
+const managedDraftManifestSchema = z.strictObject({
+  schemaVersion: z.literal(1),
+  type: z.literal("managed_thread_draft"),
+  draft: managedComposerDraftSchema,
+});
+
+export function parseManagedComposerDraft(input: unknown): ManagedComposerDraft {
+  const { attentionId, inputId, ...draft } = managedComposerDraftSchema.parse(input);
+  return {
+    ...draft,
+    ...(attentionId === undefined ? {} : { attentionId }),
+    ...(inputId === undefined ? {} : { inputId }),
+  };
+}
 
 const digestSchema = z.string().regex(/^sha256:[0-9a-f]{64}$/u) as z.ZodType<`sha256:${string}`>;
 const stagedSelectionSchema = z.strictObject({
@@ -428,6 +461,38 @@ export async function createRecoverableTurnDraftRepository(options: {
   };
 
   return {
+    async loadManaged(scope) {
+      await mutationQueue;
+      const value = await readOwnerPrivateManifest(join(root, managedManifestName(scope)));
+      if (value === undefined) return null;
+      const { draft } = managedDraftManifestSchema.parse(value);
+      if (draft.parentSessionId !== scope.parentSessionId || draft.threadId !== scope.threadId)
+        throw new TypeError("The managed draft identity is invalid.");
+      return parseManagedComposerDraft(draft);
+    },
+    saveManaged(draft) {
+      return enqueueMutation(async () => {
+        const validated = parseManagedComposerDraft(draft);
+        const serialized = `${JSON.stringify({ schemaVersion: 1, type: "managed_thread_draft", draft: validated })}\n`;
+        if (Buffer.byteLength(serialized, "utf8") > maximumManifestBytes)
+          throw new TypeError("The recoverable draft manifest is too large.");
+        await replaceOwnerPrivateFile(join(root, managedManifestName(validated)), serialized);
+        await syncDirectory(root);
+      });
+    },
+    clearManaged(draft) {
+      return enqueueMutation(async () => {
+        const validated = parseManagedComposerDraft(draft);
+        const path = join(root, managedManifestName(validated));
+        const value = await readOwnerPrivateManifest(path);
+        if (value === undefined) return true;
+        if (!isDeepStrictEqual(managedDraftManifestSchema.parse(value).draft, validated))
+          return false;
+        await unlink(path);
+        await syncDirectory(root);
+        return true;
+      });
+    },
     delete(scope) {
       return enqueueMutation(async () => {
         try {
@@ -444,33 +509,9 @@ export async function createRecoverableTurnDraftRepository(options: {
     async load(scope) {
       await mutationQueue;
       const path = join(root, manifestName(scope));
-      let bytes: Buffer;
-      try {
-        const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-        try {
-          const stats = await file.stat();
-          if (
-            !stats.isFile() ||
-            stats.size <= 0 ||
-            stats.size > maximumManifestBytes ||
-            (stats.mode & 0o077) !== 0 ||
-            (process.geteuid?.() !== undefined && stats.uid !== process.geteuid())
-          ) {
-            throw new TypeError("The recoverable draft manifest is unsafe.");
-          }
-          bytes = await file.readFile();
-        } finally {
-          await file.close();
-        }
-      } catch (error) {
-        if (isNodeError(error) && error.code === "ENOENT") {
-          return null;
-        }
-        throw error;
-      }
-      const parsed = recoverableDraftSchema.safeParse(
-        JSON.parse(bytes.toString("utf8")) as unknown,
-      );
+      const value = await readOwnerPrivateManifest(path);
+      if (value === undefined) return null;
+      const parsed = recoverableDraftSchema.safeParse(value);
       if (!parsed.success || !matchesScope(parsed.data.scope, scope)) {
         throw new TypeError("The recoverable draft manifest is invalid.");
       }
@@ -488,6 +529,40 @@ export async function createRecoverableTurnDraftRepository(options: {
       });
     },
   };
+}
+
+function managedManifestName(
+  scope: Pick<ManagedComposerDraft, "parentSessionId" | "threadId">,
+): string {
+  const validated = z
+    .strictObject({ parentSessionId: z.uuid(), threadId: z.uuid() })
+    .parse({ parentSessionId: scope.parentSessionId, threadId: scope.threadId });
+  return `managed-${validated.parentSessionId}-${validated.threadId}.json`;
+}
+
+async function readOwnerPrivateManifest(path: string): Promise<unknown> {
+  let bytes: Buffer;
+  try {
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stats = await file.stat();
+      if (
+        !stats.isFile() ||
+        stats.size <= 0 ||
+        stats.size > maximumManifestBytes ||
+        (stats.mode & 0o077) !== 0 ||
+        (process.geteuid?.() !== undefined && stats.uid !== process.geteuid())
+      )
+        throw new TypeError("The recoverable draft manifest is unsafe.");
+      bytes = await file.readFile();
+    } finally {
+      await file.close();
+    }
+  } catch (error) {
+    if (isNodeError(error) && error.code === "ENOENT") return undefined;
+    throw error;
+  }
+  return JSON.parse(bytes.toString("utf8")) as unknown;
 }
 
 async function replaceOwnerPrivateFile(path: string, content: string): Promise<void> {

@@ -10,6 +10,7 @@ import {
   createExtensionHost,
   createFileArtifactStore,
   createInMemoryOperationStore,
+  createJsonlSessionStoreDirectory,
   createPermissionPolicy,
   createPresentationPreferences,
   createPresentationSession,
@@ -24,6 +25,7 @@ import {
 } from "@adam-agent/agent";
 import {
   createInMemorySessionStoreDirectory,
+  createJsonlManagedAgentControlStore,
   createPlanToolProfileV1,
   createTrustedWorkspaceTrustForTesting,
   mcpCloseConfirmation,
@@ -44,6 +46,7 @@ import { ProcessTerminal, type Terminal } from "@earendil-works/pi-tui";
 import { createAdamCommandRegistry } from "./command-registry.js";
 import { type FixtureScenario, isFixtureScenario } from "./fixture-scenario.js";
 import { requireConfirmedLifecycleClose } from "./lifecycle-close.js";
+import { createProductionProjectRuntime, projectRuntimeManagedControl } from "./project-runtime.js";
 import { type ClipboardAdapter, type DeadlineScheduler, runTui } from "./tui-app.js";
 import { tuiProcessFailureMessage } from "./tui-process-failure.js";
 
@@ -255,6 +258,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
   if (options.terminalProcessMarker !== undefined) {
     await writeFile(options.terminalProcessMarker, `${process.pid}\n`, "utf8");
   }
+  if (options.scenario === "managed-control") return runManagedControlProjectFixture(options);
   const modelTargets = createFixtureModelTargets(options);
   const preferences =
     options.launch === undefined
@@ -2641,4 +2645,135 @@ async function fileExists(path: string): Promise<boolean> {
     () => true,
     () => false,
   );
+}
+
+async function runManagedControlProjectFixture(options: TuiFixtureOptions): Promise<void> {
+  const controlRoot = options.controlRoot;
+  if (controlRoot === undefined)
+    throw new TypeError("Managed control fixture requires a causal control directory.");
+  const environment = { XDG_CONFIG_HOME: join(options.stateRoot, "fixture-config") };
+  const workspaceTrust = createWorkspaceTrust({
+    environment,
+    workspaceRoot: options.workspaceRoot,
+  });
+  const trust = await workspaceTrust.load();
+  if (trust.projectId === null) throw new Error("Fixture project identity unavailable.");
+  await workspaceTrust.setTrusted({ projectId: trust.projectId, trusted: true });
+  let mainCalls = 0;
+  let childCalls = 0;
+  const driver: ModelDriver = {
+    async *stream(request) {
+      if (request.purpose === "title") {
+        yield { type: "text_delta", text: "Control fixture" };
+        yield { type: "usage", inputTokens: 10, outputTokens: 10 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      const main = request.tools.some(
+        (tool) => tool.name === "spawn_agents" || tool.name === "spawn_agent",
+      );
+      if (main) {
+        if (++mainCalls === 1) {
+          yield { type: "tool_call_start", id: "pty-spawn", name: "spawn_agents" };
+          yield {
+            type: "tool_call_delta",
+            id: "pty-spawn",
+            json: JSON.stringify({
+              entries: [
+                { role: "builtin:explore", task: "Inspect evidence.txt", description: "PTY child" },
+              ],
+            }),
+          };
+          yield { type: "tool_call_end", id: "pty-spawn" };
+          yield { type: "usage", inputTokens: 20, outputTokens: 10 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        yield { type: "text_delta", text: mainCalls === 2 ? "MAIN_READY" : "MAIN_RESPONDED" };
+      } else {
+        childCalls += 1;
+        if (childCalls === 1) {
+          await writeFile(join(controlRoot, "child-started"), "started\n");
+          const released = await waitForFile(controlRoot, "release-child", request.signal);
+          if (!released) {
+            yield { type: "finish", reason: "stop" };
+            return;
+          }
+          yield { type: "tool_call_start", id: "pty-read", name: "read_file" };
+          yield { type: "tool_call_delta", id: "pty-read", json: '{"path":"evidence.txt"}' };
+          yield { type: "tool_call_end", id: "pty-read" };
+          yield { type: "usage", inputTokens: 20, outputTokens: 10 };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+        const delivered = JSON.stringify(request.messages).includes("PTY child input");
+        await writeFile(
+          join(controlRoot, "child-request"),
+          JSON.stringify({ delivered, childCalls }),
+        );
+        yield {
+          type: "text_delta",
+          text:
+            childCalls === 2
+              ? delivered
+                ? "CHILD_DELIVERED"
+                : "CHILD_INPUT_MISSING"
+              : "FOLLOWUP_RESPONDED",
+        };
+      }
+      yield { type: "usage", inputTokens: 20, outputTokens: 10 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, contextProfile, driver };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            contextProfile,
+            readiness: { status: "available", credentialSource: "external fixture" },
+          },
+        ],
+      };
+    },
+  };
+  const runtime = await createProductionProjectRuntime({
+    [projectRuntimeManagedControl]: {
+      store: await createJsonlManagedAgentControlStore({
+        workspaceRoot: options.workspaceRoot,
+        stateRoot: options.stateRoot,
+      }),
+      childSessionStores: createJsonlSessionStoreDirectory<SessionRecord>({
+        workspaceRoot: options.workspaceRoot,
+        stateRoot: join(options.stateRoot, "managed-agent-sessions"),
+      }),
+    },
+    environment,
+    extensionPermissions: createPermissionPolicy({ allowedEffects: [] }),
+    modelTargets,
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+    preferences: createPresentationPreferences({ environment }),
+    projectLabel: "Control fixture",
+    reservedCommandNames: [],
+    stateRoot: options.stateRoot,
+    workspaceRoot: options.workspaceRoot,
+    workspaceTrust,
+  });
+  try {
+    const presentation = await runtime.createPresentation({ openProject: true });
+    options.onPresentationReady?.(presentation);
+    await runTui({
+      presentation,
+      startupTargetId: targetIdentity.targetId,
+      ...(options.terminal === undefined ? {} : { terminal: options.terminal }),
+      mouse: true,
+      closeRuntime: () => runtime.close(),
+    });
+  } finally {
+    await runtime.close();
+  }
 }

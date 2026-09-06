@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type {
+  ManagedControlIdentity,
   ManagedSessionTransition,
   ManagedSessionTransitionResult,
 } from "@adam-agent/presentation";
@@ -11,6 +12,7 @@ import {
   AgentSession,
   managedAgentPromptSummary,
   managedAgentRequestBoundary,
+  sessionRecordCommittedBarrier,
 } from "./agent-session.js";
 import type {
   ModelDriver,
@@ -65,8 +67,12 @@ import {
   createManagedAgentControl,
   createManagedAgentControlToolRegistry,
   type ManagedAgentControl,
+  managedAgentRecordBarrier,
+  managedAgentSettlementBarrier,
   managedControlMainRequestBoundary,
 } from "./managed-agent-control.js";
+import { managedTranscriptLink } from "./managed-agent-folds.js";
+import { validateManagedChildGenesis } from "./managed-agent-recovery.js";
 import { createJsonlManagedAgentStore } from "./managed-agent-store.js";
 import {
   createMcpRuntimeHost,
@@ -397,6 +403,7 @@ export function validateCurrentSessionHistoryForTesting(
 }
 
 export type ManagedAgentTranscriptRecords = {
+  readonly identity?: ManagedControlIdentity;
   readonly childSessionId: string;
   readonly records: readonly SessionRecord[];
   readonly partialOutput?: {
@@ -453,6 +460,11 @@ export const sessionManagedControl = Symbol("adam-agent.session-managed-control"
 
 export type SessionLifecycleOptions = {
   readonly [sessionManagedControl]?: {
+    readonly [managedAgentSettlementBarrier]?: () => Promise<void>;
+    readonly [managedAgentRecordBarrier]?: NonNullable<
+      Parameters<typeof createManagedAgentControl>[0][typeof managedAgentRecordBarrier]
+    >;
+    readonly [sessionRecordCommittedBarrier]?: (record: SessionRecord) => Promise<void>;
     readonly planPolicyVersion?: PlanPolicyVersion;
     readonly policy?: import("./fleet-ledger.js").FleetPolicy;
     readonly store: import("./managed-agent-folds.js").ManagedControlStore;
@@ -759,13 +771,22 @@ export interface SessionLifecycle {
   readonly [sessionManagedControl]: (
     sessionId: string,
   ) => Promise<import("./managed-agent-control.js").ManagedAgentControl | undefined>;
-  readonly [sessionManagedAgentTranscriptReader]: (input: {
-    readonly sessionId: string;
-    readonly agentId: string;
-    readonly attemptId: string;
-    readonly expectedRevision: number;
-    readonly expectedThroughSequence: number;
-  }) => Promise<ManagedAgentTranscriptRecords>;
+  readonly [sessionManagedAgentTranscriptReader]: (
+    input:
+      | {
+          readonly sessionId: string;
+          readonly agentId: string;
+          readonly attemptId: string;
+          readonly expectedRevision: number;
+          readonly expectedThroughSequence: number;
+        }
+      | {
+          readonly sessionId: string;
+          readonly threadId: string;
+          readonly turnId: string;
+          readonly throughSequence?: number;
+        },
+  ) => Promise<ManagedAgentTranscriptRecords>;
   admit(input: {
     readonly targetIdentity: ModelTargetIdentity;
     readonly input: UserInput;
@@ -1417,8 +1438,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           targetIdentity: snapshot.targetIdentity,
           contextProfile,
           ...(composition.policy === undefined ? {} : { policy: composition.policy }),
-          admissionGuard: (operation) =>
+          admissionGuard: (operation, constraints) =>
             serializeFamily(async () => {
+              if (
+                constraints?.requireIdleMain &&
+                [...trackedOwnerOperations].some(
+                  (entry) => entry.kind === "ordinary" && entry.sessionId === sessionId,
+                )
+              )
+                throw new ProjectExecutionDomainError("root_conflict");
               if (activeManagedFamily === undefined) activeManagedFamily = sessionId;
               if (
                 lifecycleClosing ||
@@ -1460,10 +1488,29 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             };
           },
           model: resolved.driver,
+          onChildRuntimeEvent(identity, event) {
+            publishManagedAgentNotification({
+              type: "child_runtime_event",
+              parentSessionId: sessionId,
+              agentId: identity.threadId,
+              attemptId: identity.attemptId,
+              childSessionId: identity.childSessionId,
+              event,
+            });
+          },
           permissions: options.permissions ?? createPermissionPolicy({ allowedEffects: [] }),
           executionDomain,
           store: composition.store,
           childSessionStores: composition.childSessionStores,
+          ...(composition[managedAgentRecordBarrier] === undefined
+            ? {}
+            : { [managedAgentRecordBarrier]: composition[managedAgentRecordBarrier] }),
+          ...(composition[managedAgentSettlementBarrier] === undefined
+            ? {}
+            : { [managedAgentSettlementBarrier]: composition[managedAgentSettlementBarrier] }),
+          ...(composition[sessionRecordCommittedBarrier] === undefined
+            ? {}
+            : { [sessionRecordCommittedBarrier]: composition[sessionRecordCommittedBarrier] }),
           parentSessionStore: await openSessionStore(options, sessionId),
         });
       })();
@@ -5775,6 +5822,58 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       return continueManagedAgent(input, "recovery");
     },
     async [sessionManagedAgentTranscriptReader](input) {
+      if ("threadId" in input) {
+        const composition = options[sessionManagedControl];
+        if (composition === undefined)
+          throw new SessionLifecycleError("session_managed_control_read_only");
+        const controlRecords = await composition.store.forParent(input.sessionId).read();
+        const admission = controlRecords.find(
+          (record) =>
+            record.event.type === "admitted" &&
+            record.parentSessionId === input.sessionId &&
+            record.threadId === input.threadId &&
+            record.turnId === input.turnId,
+        );
+        if (admission === undefined) throw new SessionLifecycleError("session_invalid");
+        const childRecords = await (
+          await composition.childSessionStores.open(admission.childSessionId)
+        )?.read();
+        const genesis = childRecords?.[0];
+        if (childRecords === undefined || genesis === undefined || !isGenesisRecord(genesis))
+          throw new SessionLifecycleError("session_invalid");
+        validateManagedChildGenesis(admission, genesis);
+        validateCurrentSessionHistory(genesis, childRecords, options.workspaceRoot);
+        const outcome = controlRecords.find(
+          (record) => record.turnId === input.turnId && record.event.type === "outcome",
+        );
+        if (
+          outcome?.event.type === "outcome" &&
+          (outcome.event.transcript.sequence !== childRecords.at(-1)?.sequence ||
+            outcome.event.transcript.digest !== managedTranscriptLink(childRecords).digest)
+        )
+          throw new SessionLifecycleError("session_invalid");
+        if (
+          input.throughSequence !== undefined &&
+          (!Number.isSafeInteger(input.throughSequence) ||
+            input.throughSequence < 1 ||
+            input.throughSequence > (childRecords.at(-1)?.sequence ?? 0))
+        )
+          throw new SessionLifecycleError("session_invalid");
+        return {
+          identity: {
+            parentSessionId: admission.parentSessionId,
+            threadId: admission.threadId,
+            turnId: admission.turnId,
+            attemptId: admission.attemptId,
+            childSessionId: admission.childSessionId,
+          },
+          childSessionId: admission.childSessionId,
+          records:
+            input.throughSequence === undefined
+              ? childRecords
+              : childRecords.filter((record) => record.sequence <= (input.throughSequence ?? 0)),
+        };
+      }
       const records = await managedAgentStore.read();
       const agentRecords = records.filter((record) => record.agentId === input.agentId);
       const admission = records.find(

@@ -159,9 +159,12 @@ export function managedOutcomeFromChild(
     blocked?.event.type === "budget_blocked"
       ? { code: blocked.event.code, message: blocked.event.message }
       : undefined;
+  const suspension = turnRecords.findLast((record) => record.event.type === "suspend_requested");
+  const execution = turnRecords.findLast(
+    (record) => record.event.type === "started" || record.event.type === "capacity_acquired",
+  );
   const suspended =
-    turnRecords.some((record) => record.event.type === "suspend_requested") &&
-    turnRecords.some((record) => record.event.type === "started");
+    suspension !== undefined && execution !== undefined && suspension.sequence > execution.sequence;
   const stalled = turnRecords.some((record) => record.event.type === "stalled");
   const provider = records.findLast(
     (record) => record.schemaVersion === 3 && record.record.type === "provider_attempt_started",
