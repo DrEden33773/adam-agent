@@ -1,8 +1,17 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, symlink } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  realpath,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import { expect, test } from "vitest";
@@ -56,6 +65,8 @@ test("the packed extension API imports with only its public runtime shape", asyn
       "README.md",
       "dist/index.d.ts",
       "dist/index.js",
+      "dist/managed-review.d.ts",
+      "dist/managed-review.js",
       "package.json",
     ]);
     for (const dependency of ["semver", "zod"]) {
@@ -65,13 +76,23 @@ test("the packed extension API imports with only its public runtime shape", asyn
         "dir",
       );
     }
-    const imported: unknown = await import(
-      `${pathToFileURL(join(installedPackage, "dist", "index.js")).href}?packed=${Date.now()}`
+    await writeFile(
+      join(installRoot, "consumer.mjs"),
+      `import * as api from "@adam-agent/extension-api";
+process.stdout.write(JSON.stringify({ keys: Object.keys(api).sort(), version: api.EXTENSION_API_VERSION, decoded: api.extensionManagedReviewTerminalCodec.decode({ status: "failed", error: { code: "review_deadline_exceeded", message: "Incomplete review." } }).ok }));\n`,
     );
-    if (typeof imported !== "object" || imported === null) {
-      throw new TypeError("The packed extension API did not import as a module.");
-    }
-    expect(Object.keys(imported).sort()).toEqual([
+    const consumed = await execFileAsync(process.execPath, [join(installRoot, "consumer.mjs")], {
+      cwd: installRoot,
+      encoding: "utf8",
+      env: environment,
+      timeout: PACK_PROCESS_TIMEOUT_MS,
+    });
+    const imported = JSON.parse(consumed.stdout) as {
+      keys: string[];
+      version: string;
+      decoded: boolean;
+    };
+    expect(imported.keys).toEqual([
       "EXTENSION_API_VERSION",
       "EXTENSION_ARTIFACT_CAPABILITY_ID",
       "EXTENSION_ARTIFACT_MAX_AGGREGATE_BYTES",
@@ -86,6 +107,13 @@ test("the packed extension API imports with only its public runtime shape", asyn
       "EXTENSION_BIOME_MAX_STDOUT_BYTES",
       "EXTENSION_BIOME_PROFILE",
       "EXTENSION_ID_MAX_LENGTH",
+      "EXTENSION_MANAGED_REVIEW_CAPABILITY_ID",
+      "EXTENSION_MANAGED_REVIEW_MAX_EVIDENCE_BYTES",
+      "EXTENSION_MANAGED_REVIEW_MAX_EVIDENCE_COUNT",
+      "EXTENSION_MANAGED_REVIEW_MAX_INSTRUCTION_BYTES",
+      "EXTENSION_MANAGED_REVIEW_MAX_OUTPUT_BYTES",
+      "EXTENSION_MANAGED_REVIEW_TOTAL_DEFAULT_MS",
+      "EXTENSION_MANAGED_REVIEW_TOTAL_MAX_MS",
       "EXTENSION_MANAGED_SESSION_CAPABILITY_ID",
       "EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID",
       "EXTENSION_OPERATION_DEADLINE_DEFAULT_MS",
@@ -112,10 +140,51 @@ test("the packed extension API imports with only its public runtime shape", asyn
       "EXTENSION_RECORD_MAX_BYTES",
       "EXTENSION_RECORD_MAX_CREATES",
       "EXTENSION_RECORD_NAMESPACE_MAX_BYTES",
+      "extensionManagedReviewProgressCodec",
+      "extensionManagedReviewRequestCodec",
+      "extensionManagedReviewTerminalCodec",
       "extensionProjectChangeSnapshotCodec",
       "parseExtensionPackageManifest",
     ]);
-    expect(Reflect.get(imported, "EXTENSION_API_VERSION")).toBe("0.5.0");
+    expect(imported.version).toBe("0.6.0");
+    expect(imported.decoded).toBe(true);
+    await writeFile(
+      join(installRoot, "consumer.mts"),
+      `import type { ExtensionManagedReviewRequest, ExtensionOperationEvidenceReference, ExtensionManagedReviewCapability } from "@adam-agent/extension-api";
+declare const evidence: readonly ExtensionOperationEvidenceReference[];
+declare const capability: ExtensionManagedReviewCapability;
+const request: ExtensionManagedReviewRequest = { evidence, instruction: "Review.", outputContract: { id: "consumer.result", version: 1 } };
+const result = await capability.review(request);
+if (result.status === "completed") result.receipt.reviewRunId satisfies string;\n`,
+    );
+    await writeFile(
+      join(installRoot, "tsconfig.json"),
+      JSON.stringify({
+        compilerOptions: {
+          module: "NodeNext",
+          moduleResolution: "NodeNext",
+          target: "ES2024",
+          strict: true,
+          types: [],
+          noEmit: true,
+        },
+        files: ["consumer.mts"],
+      }),
+    );
+    try {
+      await execFileAsync(
+        fileURLToPath(new URL("../../../node_modules/.bin/tsc", import.meta.url)),
+        ["-p", join(installRoot, "tsconfig.json")],
+        { cwd: installRoot, env: environment, encoding: "utf8", timeout: PACK_PROCESS_TIMEOUT_MS },
+      );
+    } catch (error) {
+      throw new Error(
+        error instanceof Error && "stdout" in error
+          ? String(error.stdout)
+          : "Isolated consumer compilation failed.",
+        { cause: error },
+      );
+    }
     const manifest = JSON.parse(await readFile(join(installedPackage, "package.json"), "utf8"));
     expect(manifest).toMatchObject({
       engines: { node: ">=24.0.0 <25" },
@@ -126,7 +195,7 @@ test("the packed extension API imports with only its public runtime shape", asyn
         type: "git",
         url: "git+https://github.com/DrEden33773/adam-agent.git",
       },
-      version: "0.5.0",
+      version: "0.6.0",
     });
     expect(manifest.publishConfig).toEqual({ access: "public", provenance: true });
   } finally {

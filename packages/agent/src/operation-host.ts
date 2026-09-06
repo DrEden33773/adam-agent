@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { realpath } from "node:fs/promises";
+import { isDeepStrictEqual } from "node:util";
 
 import type {
   ExtensionActivationDiagnostic,
@@ -7,6 +8,11 @@ import type {
   ExtensionBiomeAnalysis,
   ExtensionBiomeFileSnapshot,
   ExtensionJsonValue,
+  ExtensionManagedReviewCapability,
+  ExtensionManagedReviewFailure,
+  ExtensionManagedReviewProgress,
+  ExtensionManagedReviewRequest,
+  ExtensionManagedReviewTerminal,
   ExtensionManagedSessionCapability,
   ExtensionManagedSessionRequest,
   ExtensionManagedSessionTerminal,
@@ -38,6 +44,8 @@ import {
   EXTENSION_BIOME_MAX_STDERR_BYTES,
   EXTENSION_BIOME_MAX_STDOUT_BYTES,
   EXTENSION_BIOME_PROFILE,
+  EXTENSION_MANAGED_REVIEW_CAPABILITY_ID,
+  EXTENSION_MANAGED_REVIEW_MAX_EVIDENCE_BYTES,
   EXTENSION_MANAGED_SESSION_CAPABILITY_ID,
   EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID,
   EXTENSION_OPERATION_DEADLINE_DEFAULT_MS,
@@ -53,6 +61,7 @@ import {
   EXTENSION_RECORD_MAX_BYTES,
   EXTENSION_RECORD_MAX_CREATES,
   EXTENSION_RECORDS_CAPABILITY_ID,
+  extensionManagedReviewRequestCodec,
 } from "@adam-agent/extension-api";
 import type { ModelDriver } from "./agent-session-contracts.js";
 import type { ArtifactStore } from "./artifact-store.js";
@@ -64,6 +73,13 @@ import {
   type ManagedAgentInactivityScheduler,
   type ManagedAgentStore,
 } from "./managed-agent.js";
+import { managedReviewRecovery } from "./managed-agent-control.js";
+import { ManagedReviewError, resolveManagedReviewPolicy } from "./managed-review-policy.js";
+import {
+  ManagedReviewRecoveryRequired,
+  type ManagedReviewRuntime,
+  runManagedReview,
+} from "./managed-review-runner.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import {
   createInMemoryOperationStore,
@@ -168,6 +184,12 @@ export type LinkedOperationPage = {
 };
 
 type OperationSnapshotBase = {
+  readonly managedReview?: {
+    readonly reviewRunId: string;
+    readonly requestDigest: string;
+    readonly progress?: ExtensionManagedReviewProgress;
+    readonly failure?: ExtensionManagedReviewFailure;
+  };
   readonly budget: ExtensionOperationBudgetSnapshot;
   readonly contributionId: string;
   readonly deadlineAt: string;
@@ -263,6 +285,12 @@ export class OperationHostError extends Error {
 }
 
 type ActiveOperation = {
+  readonly managedReviewRuntime: ManagedReviewRuntime | undefined;
+  managedReviewRun?: {
+    readonly digest: string;
+    readonly terminal: Promise<ExtensionManagedReviewTerminal>;
+    expireCapacity(): Promise<void>;
+  };
   readonly activeOperations: Map<string, ActiveOperation>;
   readonly abortController: AbortController;
   managedSessionRun?: {
@@ -290,6 +318,7 @@ type ActiveOperation = {
   cancelPromise?: Promise<void>;
   cancelReason?: OperationCancellationReason;
   forcedFailure?: OperationFailure;
+  forcedInspection?: Extract<OperationEvent, { type: "operation_inspection_required" }>;
   handlerDidSettle: boolean;
   readonly handlerSettled: Promise<void>;
   readonly inputBytes: number;
@@ -310,7 +339,13 @@ type ActiveOperation = {
 
 type OperationTerminalEvent = Extract<
   OperationEvent,
-  { readonly type: "operation_cancelled" | "operation_completed" | "operation_failed" }
+  {
+    readonly type:
+      | "operation_cancelled"
+      | "operation_completed"
+      | "operation_failed"
+      | "operation_inspection_required";
+  }
 >;
 
 type DurableOperationTerminalEvent = Extract<
@@ -333,6 +368,7 @@ export function createOperationHost(options: {
   readonly projectRoot: string;
   readonly permissions?: PermissionPolicy;
   readonly managedSession?: ManagedSessionRuntime;
+  readonly managedReview?: ManagedReviewRuntime;
   readonly deadlineScheduler?: OperationDeadlineScheduler;
   readonly now?: () => number;
   readonly recordStore?: ExtensionRecordStore;
@@ -340,6 +376,13 @@ export function createOperationHost(options: {
   readonly store?: OperationStore;
 }): OperationHostControl {
   const store = options.store ?? createInMemoryOperationStore();
+  const managedReviewRuntime =
+    options.managedReview === undefined
+      ? undefined
+      : {
+          ...options.managedReview,
+          policy: resolveManagedReviewPolicy(options.managedReview.policy),
+        };
   const configuredDeadlineMs = options.defaultDeadlineMs ?? EXTENSION_OPERATION_DEADLINE_DEFAULT_MS;
   let projectIdPromise: Promise<string> | undefined;
   const activeOperations = new Map<string, ActiveOperation>();
@@ -539,6 +582,7 @@ export function createOperationHost(options: {
           signalOwnerSettled = resolve;
         });
         const active: ActiveOperation = {
+          managedReviewRuntime,
           activeOperations,
           abortController: new AbortController(),
           artifactBytes: 0,
@@ -707,6 +751,23 @@ export function createOperationHost(options: {
             return host.query(operationId);
           }
           const registered = options.resolveOperation(started.event.contributionId);
+          const reviewInvocation = records.find(
+            (record) => record.event.type === "operation_managed_review_invoked",
+          )?.event;
+          if (reviewInvocation?.type === "operation_managed_review_invoked") {
+            await appendAndPublish({
+              schemaVersion: 2,
+              operationId,
+              sequence: records.length + 1,
+              recordedAt: new Date((options.now ?? Date.now)()).toISOString(),
+              event: {
+                type: "operation_inspection_required",
+                evidence: reviewInvocation.request.evidence,
+                message: `Managed review ${reviewInvocation.reviewRunId} requires inspection of its existing run. No model request was replayed.`,
+              },
+            });
+            return host.query(operationId);
+          }
           if (
             registered === undefined ||
             registered.extensionId !== started.event.extensionId ||
@@ -806,7 +867,9 @@ export function createOperationHost(options: {
       }
       const active = activeOperations.get(operationId);
       if (active === undefined) {
-        return options.executionDomain
+        const pending = recoveryInFlight.get(operationId);
+        if (pending !== undefined) return pending;
+        const cancellation = options.executionDomain
           .runRoot({ rootId: projectRuntimeRootId }, async () => {
             const records = await store.read(operationId);
             const current = createSnapshot(records, false, options.resolveOperation);
@@ -818,6 +881,14 @@ export function createOperationHost(options: {
             ) {
               return current;
             }
+            projectIdPromise ??= createProjectId(options.projectRoot);
+            const projectId = await projectIdPromise;
+            if (
+              records[0]?.event.type !== "operation_started" ||
+              records[0].event.projectId !== projectId ||
+              (store.projectId !== undefined && store.projectId !== projectId)
+            )
+              throw new OperationHostError("operation_store_project_mismatch");
             if (!records.some((record) => record.event.type === "operation_cancel_requested")) {
               await appendAndPublish({
                 schemaVersion: 2,
@@ -827,6 +898,107 @@ export function createOperationHost(options: {
                 event: { type: "operation_cancel_requested", reason: "caller" },
               });
             }
+            const invocation = records.find(
+              (record) => record.event.type === "operation_managed_review_invoked",
+            )?.event;
+            const started = records[0];
+            if (
+              invocation?.type === "operation_managed_review_invoked" &&
+              started?.schemaVersion === 3 &&
+              started.event.type === "operation_started" &&
+              options.managedReview !== undefined
+            ) {
+              const resolved = await options.managedReview.resolveOrigin({
+                origin: started.origin,
+                projectId: projectId as `sha256:${string}`,
+                signal: new AbortController().signal,
+              });
+              if (resolved.status === "ready") {
+                const settlement = await resolved.control[managedReviewRecovery]({
+                  reviewRunId: invocation.reviewRunId,
+                  requestDigest: invocation.requestDigest,
+                });
+                if (settlement !== "recovery_required") {
+                  const append = async (event: OperationEvent) => {
+                    const latest = await store.read(operationId);
+                    await appendAndPublish({
+                      schemaVersion: 2,
+                      operationId,
+                      sequence: latest.length + 1,
+                      recordedAt: new Date((options.now ?? Date.now)()).toISOString(),
+                      event,
+                    });
+                  };
+                  const progress = records.findLast(
+                    (record) => record.event.type === "operation_managed_review_progress",
+                  )?.event;
+                  if (progress === undefined)
+                    await append({
+                      type: "operation_managed_review_progress",
+                      progress: {
+                        reviewRunId: invocation.reviewRunId,
+                        phase: "waiting_for_capacity",
+                      },
+                    });
+                  if (
+                    progress?.type === "operation_managed_review_progress" &&
+                    progress.progress.phase === "running"
+                  )
+                    await append({
+                      type: "operation_managed_review_progress",
+                      progress: { reviewRunId: invocation.reviewRunId, phase: "settling" },
+                    });
+                  const wait = records.find(
+                    (record) => record.event.type === "operation_managed_wait_started",
+                  )?.event;
+                  if (
+                    wait?.type === "operation_managed_wait_started" &&
+                    !records.some(
+                      (record) => record.event.type === "operation_managed_wait_settled",
+                    )
+                  ) {
+                    const now = (options.now ?? Date.now)();
+                    const latest = await store.read(operationId);
+                    await appendAndPublish({
+                      schemaVersion: 2,
+                      operationId,
+                      sequence: latest.length + 1,
+                      recordedAt: new Date(now).toISOString(),
+                      event: {
+                        type: "operation_managed_wait_settled",
+                        remainingDeadlineMilliseconds: wait.remainingDeadlineMilliseconds,
+                        deadlineAt: new Date(
+                          now + wait.remainingDeadlineMilliseconds,
+                        ).toISOString(),
+                      },
+                    });
+                  }
+                  if (
+                    progress?.type !== "operation_managed_review_progress" ||
+                    progress.progress.phase !== "terminal"
+                  )
+                    await append({
+                      type: "operation_managed_review_progress",
+                      progress: { reviewRunId: invocation.reviewRunId, phase: "terminal" },
+                    });
+                  const cancellation = (await store.read(operationId)).find(
+                    (record) => record.event.type === "operation_cancel_requested",
+                  )?.event;
+                  await append({
+                    type: "operation_cancelled",
+                    reason:
+                      cancellation?.type === "operation_cancel_requested"
+                        ? cancellation.reason
+                        : "caller",
+                    artifacts: records.flatMap((record) =>
+                      record.event.type === "operation_artifact_published"
+                        ? [record.event.artifact]
+                        : [],
+                    ),
+                  });
+                }
+              }
+            }
             return host.query(operationId);
           })
           .catch((error: unknown) => {
@@ -835,6 +1007,12 @@ export function createOperationHost(options: {
             }
             throw error;
           });
+        recoveryInFlight.set(operationId, cancellation);
+        void cancellation.then(
+          () => recoveryInFlight.delete(operationId),
+          () => recoveryInFlight.delete(operationId),
+        );
+        return cancellation;
       }
       await requestCancellation(active, "caller", appendAndPublish);
       return host.query(operationId);
@@ -957,6 +1135,18 @@ function createOperationCapabilities(
       : undefined;
   return Object.freeze({
     ...(biomeCapability === undefined ? {} : { [EXTENSION_BIOME_CAPABILITY_ID]: biomeCapability }),
+    ...(active.managedReviewRuntime === undefined ||
+    !active.registered.capabilityIds.includes(EXTENSION_MANAGED_REVIEW_CAPABILITY_ID)
+      ? {}
+      : {
+          [EXTENSION_MANAGED_REVIEW_CAPABILITY_ID]: createManagedReviewCapability(
+            active,
+            active.managedReviewRuntime,
+            artifactStore,
+            recordStore,
+            appendAndPublish,
+          ),
+        }),
     ...(artifactCapability === undefined
       ? {}
       : { [EXTENSION_ARTIFACT_CAPABILITY_ID]: artifactCapability }),
@@ -969,6 +1159,269 @@ function createOperationCapabilities(
     ...(managedSessionV2Capability === undefined
       ? {}
       : { [EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID]: managedSessionV2Capability }),
+  });
+}
+
+function createManagedReviewCapability(
+  active: ActiveOperation,
+  runtime: ManagedReviewRuntime,
+  artifactStore: ArtifactStore | undefined,
+  recordStore: ExtensionRecordStore | undefined,
+  appendAndPublish: (record: OperationEventRecord) => Promise<void>,
+): ExtensionManagedReviewCapability {
+  return Object.freeze({
+    async review(
+      candidate: ExtensionManagedReviewRequest,
+    ): Promise<ExtensionManagedReviewTerminal> {
+      assertCapabilityActive(active);
+      const parsed = extensionManagedReviewRequestCodec.decode(candidate);
+      const origin = active.origin;
+      const outputCodec = active.registered.registration.managedOutput;
+      if (
+        !parsed.ok ||
+        origin === undefined ||
+        outputCodec === undefined ||
+        artifactStore === undefined ||
+        parsed.value.outputContract.id !== outputCodec.id ||
+        parsed.value.outputContract.version !== outputCodec.version
+      ) {
+        const error = new ManagedReviewError("invalid_request");
+        return { status: "failed", error: { code: error.code, message: error.message } };
+      }
+      const request = parsed.value;
+      const digest = normalizeOperationInput(request).digest;
+      if (active.managedReviewRun !== undefined) {
+        if (active.managedReviewRun.digest !== digest) {
+          active.forcedFailure ??= {
+            code: "operation_capability_conflict",
+            message: "The operation reused a single-use review capability with conflicting input.",
+          };
+          throw new TypeError("The review invocation conflicts.");
+        }
+        return structuredClone(await active.managedReviewRun.terminal);
+      }
+      const reviewRunId = randomUUID();
+      const totalMilliseconds = resolveManagedReviewPolicy(runtime.policy).totalMilliseconds;
+      const reviewAbort = new AbortController();
+      const signal = AbortSignal.any([active.abortController.signal, reviewAbort.signal]);
+      let invocationPersisted = false;
+      let executionStarted = false;
+      let executionEnded = false;
+      let capacityExpiryRequested = false;
+      let expiration: Promise<void> | undefined;
+      let totalTimer: { cancel(): void } | undefined;
+      const progress = (value: ExtensionManagedReviewProgress) =>
+        appendManagedWaitEvent(
+          active,
+          { type: "operation_managed_review_progress", progress: value },
+          value.phase === "running" ? value.startedAt : new Date(active.now()).toISOString(),
+          appendAndPublish,
+        );
+      const expire = (reason: "capacity_expired" | "review_deadline_exceeded"): Promise<void> => {
+        if (expiration !== undefined) return expiration;
+        if (executionEnded) return Promise.resolve();
+        expiration = (async () => {
+          await active.cancelPromise?.catch(() => undefined);
+          if (active.cancelReason !== undefined) return;
+          const error = new ManagedReviewError(reason);
+          if (invocationPersisted)
+            await appendManagedWaitEvent(
+              active,
+              { type: "operation_managed_review_expired", reviewRunId, reason },
+              new Date(active.now()).toISOString(),
+              appendAndPublish,
+            );
+          reviewAbort.abort(error);
+          if (reason === "capacity_expired") active.abortController.abort(error);
+        })();
+        return expiration;
+      };
+      const terminal = (async (): Promise<ExtensionManagedReviewTerminal> => {
+        let evidenceText: string;
+        try {
+          evidenceText = await materializeOperationEvidence(
+            request.evidence,
+            active,
+            artifactStore,
+            recordStore,
+            EXTENSION_MANAGED_REVIEW_MAX_EVIDENCE_BYTES,
+          );
+        } catch (error) {
+          if (!(error instanceof OperationEvidenceError)) throw error;
+          const refusal = new ManagedReviewError("invalid_request");
+          return { status: "failed", error: { code: refusal.code, message: refusal.message } };
+        }
+        if (signal.aborted) throw signal.reason;
+        await appendManagedWaitEvent(
+          active,
+          {
+            type: "operation_managed_review_invoked",
+            reviewRunId,
+            requestDigest: digest as `sha256:${string}`,
+            request,
+            totalMilliseconds,
+          },
+          new Date(active.now()).toISOString(),
+          appendAndPublish,
+        );
+        invocationPersisted = true;
+        await progress({ reviewRunId, phase: "waiting_for_capacity" });
+        const evidence = await artifactStore.write({
+          bytes: new TextEncoder().encode(evidenceText),
+          mediaType: "text/plain; charset=utf-8",
+          source: {
+            type: "extension_operation",
+            contributionId: active.registered.contributionId,
+            extensionId: active.registered.extensionId,
+            extensionVersion: active.registered.extensionVersion,
+            operationId: active.operationId,
+            projectId: active.projectId,
+            contract: { id: "adam.managed-review.evidence", version: 1 },
+          },
+        });
+        let result: ExtensionManagedReviewTerminal;
+        try {
+          const resolved = await runtime.resolveOrigin({
+            origin,
+            projectId: active.projectId as `sha256:${string}`,
+            signal,
+          });
+          if (resolved.status !== "ready") throw new ManagedReviewError(resolved.status);
+          result = await runManagedReview({
+            control: resolved.control,
+            origin: resolved,
+            projectId: active.projectId as `sha256:${string}`,
+            sourceSequence: origin.sourceSequence,
+            parentSessionId: origin.sessionId,
+            reviewRunId,
+            requestDigest: digest as `sha256:${string}`,
+            request,
+            outputCodec,
+            evidence: { id: evidence.id as `sha256:${string}`, byteCount: evidence.byteCount },
+            artifactStore,
+            totalMilliseconds,
+            signal,
+            outputSource: {
+              type: "extension_operation",
+              ...createCapabilityProvenance(active),
+              contract: request.outputContract,
+            },
+            onStarted: async () => {
+              const acquiredAt = active.now();
+              await active.cancelPromise?.catch(() => undefined);
+              if (capacityExpiryRequested || signal.aborted) return false;
+              if (Date.parse(active.deadlineAt) <= active.now()) {
+                capacityExpiryRequested = true;
+                await expire("capacity_expired");
+                return false;
+              }
+              await pauseOperationDeadlineForManagedSessionV2(active, appendAndPublish, acquiredAt);
+              executionStarted = true;
+              await progress({
+                reviewRunId,
+                phase: "running",
+                startedAt: new Date(acquiredAt).toISOString(),
+                totalDeadlineAt: new Date(acquiredAt + totalMilliseconds).toISOString(),
+                totalMilliseconds,
+              });
+              const remaining = acquiredAt + totalMilliseconds - active.now();
+              if (remaining <= 0) {
+                await expire("review_deadline_exceeded");
+                return false;
+              }
+              totalTimer = (runtime.deadlineScheduler ?? nodeOperationDeadlineScheduler).schedule(
+                remaining,
+                () => {
+                  void expire("review_deadline_exceeded").catch(() =>
+                    reviewAbort.abort(new Error("Review deadline persistence failed.")),
+                  );
+                },
+              );
+              const current = await runtime.resolveOrigin({
+                origin,
+                projectId: active.projectId as `sha256:${string}`,
+                signal,
+              });
+              if (current.status !== "ready") {
+                reviewAbort.abort(new ManagedReviewError(current.status));
+                return false;
+              }
+              if (
+                current.control !== resolved.control ||
+                !isDeepStrictEqual(current.targetIdentity, resolved.targetIdentity) ||
+                !isDeepStrictEqual(current.contextProfile, resolved.contextProfile) ||
+                !isDeepStrictEqual(current.thinkingPolicy, resolved.thinkingPolicy)
+              ) {
+                reviewAbort.abort(new ManagedReviewError("target_unavailable"));
+                return false;
+              }
+              return current.model;
+            },
+            onOutcome: async () => {
+              executionEnded = true;
+              totalTimer?.cancel();
+              await expiration;
+              if (executionStarted) await progress({ reviewRunId, phase: "settling" });
+            },
+          });
+        } catch (error) {
+          if (!(error instanceof ManagedReviewError)) {
+            if (active.cancelReason !== undefined) {
+              await resumeOperationDeadlineAfterManagedSessionV2(active, appendAndPublish);
+              await progress({ reviewRunId, phase: "terminal" });
+            }
+            throw error;
+          }
+          result = {
+            status: "failed",
+            reviewRunId,
+            error: { code: error.code, message: error.message },
+            ...(error instanceof ManagedReviewRecoveryRequired && error.partial !== undefined
+              ? { partial: error.partial }
+              : {}),
+          };
+          if (error instanceof ManagedReviewRecoveryRequired)
+            active.forcedInspection = {
+              type: "operation_inspection_required",
+              evidence: request.evidence,
+              message: `Managed review ${reviewRunId} has not settled. Inspect its retained evidence and cleanup state.`,
+            };
+        } finally {
+          totalTimer?.cancel();
+        }
+        executionEnded = true;
+        await expiration;
+        if (result.status === "failed")
+          await appendManagedWaitEvent(
+            active,
+            { type: "operation_managed_review_failed", failure: result },
+            new Date(active.now()).toISOString(),
+            appendAndPublish,
+          );
+        if (active.forcedInspection !== undefined) return result;
+        await resumeOperationDeadlineAfterManagedSessionV2(active, appendAndPublish);
+        await progress({ reviewRunId, phase: "terminal" });
+        return result;
+      })().catch((error: unknown) => {
+        if (!active.abortController.signal.aborted && active.forcedInspection === undefined)
+          active.forcedFailure ??= {
+            code: "operation_capability_execution_failed",
+            message: "The managed review capability failed.",
+          };
+        throw error;
+      });
+      active.managedReviewRun = {
+        digest,
+        terminal,
+        async expireCapacity() {
+          if (!executionStarted && !executionEnded) {
+            capacityExpiryRequested = true;
+            await expire("capacity_expired");
+          }
+        },
+      };
+      return structuredClone(await terminal);
+    },
   });
 }
 
@@ -1036,7 +1489,7 @@ function createManagedSessionCapability(
         return existing.terminal;
       }
       const terminal = (async () => {
-        const evidenceText = await materializeManagedSessionEvidence(
+        const evidenceText = await materializeOperationEvidence(
           input.evidence,
           active,
           artifactStore,
@@ -1226,14 +1679,21 @@ function rejectManagedSessionOutput(
   throw new TypeError("The managed session output contract rejected the result.");
 }
 
-async function materializeManagedSessionEvidence(
+class OperationEvidenceError extends TypeError {
+  constructor() {
+    super("The immutable operation evidence is invalid or unavailable.");
+  }
+}
+
+async function materializeOperationEvidence(
   evidence: ExtensionManagedSessionRequest["evidence"],
   active: ActiveOperation,
   artifactStore: ArtifactStore | undefined,
   recordStore: ExtensionRecordStore | undefined,
+  maximumBytes = EXTENSION_OPERATION_INPUT_MAX_BYTES,
 ): Promise<string> {
   if (!Array.isArray(evidence) || evidence.length === 0 || evidence.length > 8) {
-    throw new TypeError("The managed session evidence is invalid.");
+    throw new OperationEvidenceError();
   }
   const provenance = {
     contributionId: active.registered.contributionId,
@@ -1243,32 +1703,46 @@ async function materializeManagedSessionEvidence(
     projectId: active.projectId,
   };
   const decoder = new TextDecoder("utf-8", { fatal: true });
+  const decodeEvidence = (bytes: Uint8Array): string => {
+    try {
+      return decoder.decode(bytes);
+    } catch {
+      throw new OperationEvidenceError();
+    }
+  };
   const sections: string[] = [];
   let aggregateBytes = 0;
   for (const [index, reference] of evidence.entries()) {
     if (reference.type === "artifact") {
       if (
         artifactStore === undefined ||
-        !sameCapabilityProvenance(reference.artifact.provenance, provenance)
+        !sameCapabilityProvenance(reference.artifact.provenance, provenance) ||
+        !active.artifacts.some((artifact) => artifactSummariesEqual(artifact, reference.artifact))
       ) {
-        throw new TypeError("The managed session artifact evidence is unavailable.");
+        throw new OperationEvidenceError();
       }
-      const bytes = await artifactStore.read(reference.artifact.id);
-      if (bytes === undefined || bytes.byteLength !== reference.artifact.byteCount) {
-        throw new TypeError("The managed session artifact evidence is unavailable.");
+      const bytes = await artifactStore.read(reference.artifact.id, {
+        maximumBytes: reference.artifact.byteCount,
+      });
+      if (
+        bytes === undefined ||
+        bytes.byteLength !== reference.artifact.byteCount ||
+        `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== reference.artifact.id
+      ) {
+        throw new OperationEvidenceError();
       }
       aggregateBytes += bytes.byteLength;
-      if (aggregateBytes > EXTENSION_OPERATION_INPUT_MAX_BYTES) {
-        throw new TypeError("The managed session evidence exceeds its aggregate bound.");
+      if (aggregateBytes > maximumBytes) {
+        throw new OperationEvidenceError();
       }
-      sections.push(`[artifact ${index + 1}]\n${decoder.decode(bytes)}`);
+      sections.push(`[artifact ${index + 1}]\n${decodeEvidence(bytes)}`);
       continue;
     }
     if (
       recordStore === undefined ||
       !sameCapabilityProvenance(reference.record.provenance, provenance)
     ) {
-      throw new TypeError("The managed session record evidence is unavailable.");
+      throw new OperationEvidenceError();
     }
     const record = await recordStore.get(
       {
@@ -1281,14 +1755,22 @@ async function materializeManagedSessionEvidence(
     if (
       record === undefined ||
       record.digest !== reference.record.digest ||
-      record.byteCount !== reference.record.byteCount
+      record.byteCount !== reference.record.byteCount ||
+      !sameCapabilityProvenance(record.provenance, provenance) ||
+      record.contract.id !== reference.record.contract.id ||
+      record.contract.version !== reference.record.contract.version
     ) {
-      throw new TypeError("The managed session record evidence is unavailable.");
+      throw new OperationEvidenceError();
     }
     const value = JSON.stringify(record.value);
+    if (
+      Buffer.byteLength(value, "utf8") !== record.byteCount ||
+      `sha256:${createHash("sha256").update(value).digest("hex")}` !== record.digest
+    )
+      throw new OperationEvidenceError();
     aggregateBytes += Buffer.byteLength(value, "utf8");
-    if (aggregateBytes > EXTENSION_OPERATION_INPUT_MAX_BYTES) {
-      throw new TypeError("The managed session evidence exceeds its aggregate bound.");
+    if (aggregateBytes > maximumBytes) {
+      throw new OperationEvidenceError();
     }
     sections.push(`[record ${index + 1}]\n${value}`);
   }
@@ -2243,6 +2725,22 @@ function scheduleOperationDeadline(
     () => {
       active.deadlineTimer = undefined;
       active.deadlineRemainingMilliseconds = 0;
+      if (active.managedReviewRun !== undefined) {
+        const review = active.managedReviewRun;
+        if (active.cancelReason !== undefined) return;
+        const failure: OperationFailure = {
+          code: "operation_deadline_exceeded",
+          message: "The operation exceeded its deadline.",
+        };
+        active.forcedFailure ??= failure;
+        void (async () => {
+          await review.expireCapacity();
+          active.abortController.abort(new Error("The operation deadline elapsed."));
+          await review.terminal.catch(() => undefined);
+          await settleFailed(active, failure, appendAndPublish, activeOperations);
+        })().catch(() => undefined);
+        return;
+      }
       active.abortController.abort(new Error("The operation deadline elapsed."));
       void settleFailed(
         active,
@@ -2260,6 +2758,16 @@ function scheduleOperationDeadline(
 async function appendManagedWaitEvent(
   active: ActiveOperation,
   event:
+    | Extract<
+        OperationEvent,
+        {
+          type:
+            | "operation_managed_review_invoked"
+            | "operation_managed_review_progress"
+            | "operation_managed_review_expired"
+            | "operation_managed_review_failed";
+        }
+      >
     | {
         readonly type: "operation_managed_wait_started";
         readonly remainingDeadlineMilliseconds: number;
@@ -2297,11 +2805,12 @@ async function appendManagedWaitEvent(
 async function pauseOperationDeadlineForManagedSessionV2(
   active: ActiveOperation,
   appendAndPublish: (record: OperationEventRecord) => Promise<void>,
+  acquiredAt?: number,
 ): Promise<void> {
   if (active.deadlinePausedForManagedSessionV2 || active.deadlineTimer === undefined) {
     throw new TypeError("The operation deadline cannot enter another managed wait.");
   }
-  const now = active.now();
+  const now = acquiredAt ?? active.now();
   const elapsed = Math.max(0, now - active.deadlineStartedAtUnixMilliseconds);
   const remaining = active.deadlineRemainingMilliseconds - elapsed;
   if (!Number.isSafeInteger(remaining) || remaining <= 0) {
@@ -2468,6 +2977,8 @@ async function executeOperation(
     if (active.settling) {
       return;
     }
+    if (active.managedReviewRun !== undefined)
+      active.abortController.abort(new Error("The owning Operation handler failed."));
     if (active.forcedFailure !== undefined) {
       await settleFailed(active, active.forcedFailure, appendAndPublish, activeOperations);
       return;
@@ -2572,9 +3083,16 @@ async function settleTerminal(
   if (active.settling) {
     return;
   }
+  await active.managedReviewRun?.terminal.catch(() => undefined);
+  if (active.settling) return;
   active.settling = true;
   try {
     await active.appendQueue;
+    if (active.forcedInspection !== undefined) event = active.forcedInspection;
+    else if (active.managedReviewRun !== undefined && active.cancelReason !== undefined)
+      event = { type: "operation_cancelled", reason: active.cancelReason };
+    else if (active.forcedFailure !== undefined)
+      event = { type: "operation_failed", error: active.forcedFailure };
     await appendAndPublish({
       schemaVersion: 2,
       operationId: active.operationId,
@@ -2597,7 +3115,7 @@ function attachPublishedArtifacts(
   event: OperationTerminalEvent,
   artifacts: readonly ExtensionArtifactSummary[],
 ): OperationTerminalEvent {
-  if (artifacts.length === 0) {
+  if (artifacts.length === 0 || event.type === "operation_inspection_required") {
     return event;
   }
   return {
@@ -2817,6 +3335,7 @@ function createSnapshot(
     (record) => record.event.type === "operation_managed_wait_settled",
   )?.event;
   const base: OperationSnapshotBase = {
+    ...managedReviewSnapshot(records),
     budget: createBudgetSnapshot(records),
     contributionId: first.event.contributionId,
     deadlineAt:
@@ -2872,7 +3391,9 @@ function createSnapshot(
         code: "operation_recovery_required",
         message: "The interrupted operation requires explicit recovery.",
       },
-      recoverable: isOperationRecoverable(first, resolveOperation(first.event.contributionId)),
+      recoverable:
+        records.some((record) => record.event.type === "operation_managed_review_invoked") ||
+        isOperationRecoverable(first, resolveOperation(first.event.contributionId)),
       status: "recovery_required",
     };
   }
@@ -2881,6 +3402,31 @@ function createSnapshot(
     status: records.some((record) => record.event.type === "operation_cancel_requested")
       ? "cancel_requested"
       : "running",
+  };
+}
+
+function managedReviewSnapshot(
+  records: readonly OperationEventRecord[],
+): Pick<OperationSnapshotBase, "managedReview"> {
+  const invocation = records.find(
+    (record) => record.event.type === "operation_managed_review_invoked",
+  )?.event;
+  if (invocation?.type !== "operation_managed_review_invoked") return {};
+  const progress = records.findLast(
+    (record) => record.event.type === "operation_managed_review_progress",
+  )?.event;
+  const failure = records.findLast(
+    (record) => record.event.type === "operation_managed_review_failed",
+  )?.event;
+  return {
+    managedReview: {
+      reviewRunId: invocation.reviewRunId,
+      requestDigest: invocation.requestDigest,
+      ...(failure?.type === "operation_managed_review_failed" ? { failure: failure.failure } : {}),
+      ...(progress?.type === "operation_managed_review_progress"
+        ? { progress: progress.progress }
+        : {}),
+    },
   };
 }
 

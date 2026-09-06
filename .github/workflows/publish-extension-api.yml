@@ -29,14 +29,16 @@ jobs:
         run: corepack enable
       - name: Install dependencies
         run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Fetch current product main
-        run: git fetch --no-tags --depth=1 origin main
-      - name: Require the tag to target current product main
-        run: test "$(git rev-parse HEAD)" = "$(git rev-parse FETCH_HEAD)"
+      - name: Fetch current product main and release tag
+        run: git fetch --no-tags --depth=1 origin refs/heads/main:refs/remotes/origin/main "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
       - name: Verify release identity
         run: node packages/extension-api/verify-release.mjs
       - name: Run quality checks
         run: pnpm quality:check
+      - name: Recheck current main before staging
+        run: |
+          git fetch --no-tags --depth=1 origin refs/heads/main:refs/remotes/origin/main "+refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          node packages/extension-api/verify-release.mjs
       - name: Stage package through npm Trusted Publishing
         working-directory: packages/extension-api
         run: npm stage publish --access public

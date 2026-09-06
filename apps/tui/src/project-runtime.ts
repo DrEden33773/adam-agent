@@ -17,10 +17,12 @@ import {
   type ExtensionContributionSummary,
   loadExtensionConfiguration,
   type ManagedAgentStore,
+  ModelTargetError,
   type ModelTargets,
   type OperationStore,
   type PermissionPolicy,
   type PresentationPreferences,
+  SessionLifecycleError,
   type SessionRecord,
   type SessionSnapshot,
   type WorkspaceTrustController,
@@ -148,20 +150,57 @@ export async function createProductionProjectRuntime(
       { id: "adam.analyzer-execution.biome@1", version: "1.0.0" },
       { id: "adam.artifact.publish@1", version: "1.0.0" },
       { id: "adam.storage.records@1", version: "1.0.0" },
-      { id: "adam.managed-session@1", version: "1.0.0" },
-      { id: "adam.managed-session@2", version: "2.0.0" },
+      ...(options[projectRuntimeManagedControl] === undefined
+        ? [
+            { id: "adam.managed-session@1", version: "1.0.0" },
+            { id: "adam.managed-session@2", version: "2.0.0" },
+          ]
+        : [{ id: "adam.managed-review@1", version: "1.0.0" }]),
     ],
     extensions,
-    managedSession: {
-      childSessionStores: managedChildSessionStores,
-      managedStore,
-      parentPermissions: options.permissions,
-      async resolveOrigin({ origin, signal }) {
-        if (lifecycle === undefined) throw new Error("The session lifecycle is unavailable.");
-        return lifecycle.resolveManagedSessionOrigin({ origin, signal });
-      },
-      workspaceRoot: options.workspaceRoot,
-    },
+    ...(options[projectRuntimeManagedControl] === undefined
+      ? {
+          managedSession: {
+            childSessionStores: managedChildSessionStores,
+            managedStore,
+            parentPermissions: options.permissions,
+            async resolveOrigin({ origin, signal }) {
+              if (lifecycle === undefined) throw new Error("The session lifecycle is unavailable.");
+              return lifecycle.resolveManagedSessionOrigin({ origin, signal });
+            },
+            workspaceRoot: options.workspaceRoot,
+          },
+        }
+      : {
+          managedReview: {
+            async resolveOrigin({ origin, signal }) {
+              if (lifecycle === undefined) throw new Error("The session lifecycle is unavailable.");
+              try {
+                const resolved = await lifecycle.resolveManagedSessionOrigin({ origin, signal });
+                const control = await lifecycle[sessionManagedControl](origin.sessionId);
+                if (control === undefined) return { status: "policy_denied" as const };
+                return {
+                  status: "ready" as const,
+                  control,
+                  model: resolved.childModel,
+                  targetIdentity: resolved.targetIdentity,
+                  contextProfile: resolved.childContextProfile,
+                  ...(resolved.thinkingPolicy === undefined
+                    ? {}
+                    : { thinkingPolicy: resolved.thinkingPolicy }),
+                };
+              } catch (error) {
+                if (
+                  error instanceof ModelTargetError ||
+                  (error instanceof SessionLifecycleError &&
+                    error.code === "session_model_target_incompatible")
+                )
+                  return { status: "target_unavailable" as const };
+                throw error;
+              }
+            },
+          },
+        }),
     operationOriginAuthority: {
       async validateBoundary({ origin, projectId }) {
         if (lifecycle === undefined) {

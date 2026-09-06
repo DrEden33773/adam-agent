@@ -1323,6 +1323,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         message: "Restore trustworthy managed history before selecting another Session.",
       };
     const warm = snapshot?.status === "ready" ? warmManagedTurns(snapshot) : [];
+    if (
+      snapshot?.reviewers !== undefined &&
+      snapshot.reviewers.running +
+        snapshot.reviewers.queued +
+        snapshot.reviewers.waiting +
+        snapshot.reviewers.settling >
+        0
+    )
+      return {
+        status: "rejected",
+        message:
+          "Wait for or cancel the active review in its Operation before selecting another Session.",
+      };
     if (warm.length === 0) {
       pendingManagedFamily?.controller.abort();
       pendingManagedFamily = undefined;

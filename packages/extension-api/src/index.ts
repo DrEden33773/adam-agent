@@ -1,7 +1,16 @@
 import { valid, validRange } from "semver";
 import { z } from "zod";
+import {
+  EXTENSION_MANAGED_REVIEW_CAPABILITY_ID,
+  type ExtensionManagedReviewCapability,
+  type ExtensionManagedReviewFailure,
+  type ExtensionManagedReviewProgress,
+  type ExtensionManagedReviewRequest,
+} from "./managed-review.js";
 
-export const EXTENSION_API_VERSION = "0.5.0";
+export * from "./managed-review.js";
+
+export const EXTENSION_API_VERSION = "0.6.0";
 export const EXTENSION_MANAGED_SESSION_CAPABILITY_ID = "adam.managed-session@1";
 export const EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID = "adam.managed-session@2";
 export const EXTENSION_BIOME_CAPABILITY_ID = "adam.analyzer-execution.biome@1";
@@ -534,6 +543,7 @@ export type ExtensionManagedSessionV2Terminal =
     };
 
 export type ExtensionOperationCapabilities = {
+  readonly [EXTENSION_MANAGED_REVIEW_CAPABILITY_ID]?: ExtensionManagedReviewCapability;
   readonly [EXTENSION_BIOME_CAPABILITY_ID]?: ExtensionBiomeCapability;
   readonly [EXTENSION_ARTIFACT_CAPABILITY_ID]?: ExtensionArtifactPublishCapability;
   readonly [EXTENSION_RECORDS_CAPABILITY_ID]?: ExtensionRecordCapability;
@@ -691,8 +701,32 @@ export type ExtensionOperationManagedWaitSettledEvent = {
   readonly deadlineAt: string;
   readonly remainingDeadlineMilliseconds: number;
 };
+export type ExtensionOperationManagedReviewInvokedEvent = {
+  readonly type: "operation_managed_review_invoked";
+  readonly reviewRunId: string;
+  readonly requestDigest: `sha256:${string}`;
+  readonly request: ExtensionManagedReviewRequest;
+  readonly totalMilliseconds: number;
+};
+export type ExtensionOperationManagedReviewProgressEvent = {
+  readonly type: "operation_managed_review_progress";
+  readonly progress: ExtensionManagedReviewProgress;
+};
+export type ExtensionOperationManagedReviewExpiredEvent = {
+  readonly type: "operation_managed_review_expired";
+  readonly reviewRunId: string;
+  readonly reason: "capacity_expired" | "review_deadline_exceeded";
+};
+export type ExtensionOperationManagedReviewFailedEvent = {
+  readonly type: "operation_managed_review_failed";
+  readonly failure: ExtensionManagedReviewFailure;
+};
 
 export type ExtensionOperationEvent =
+  | ExtensionOperationManagedReviewInvokedEvent
+  | ExtensionOperationManagedReviewProgressEvent
+  | ExtensionOperationManagedReviewExpiredEvent
+  | ExtensionOperationManagedReviewFailedEvent
   | ExtensionOperationArtifactPublishedEvent
   | ExtensionOperationCancelRequestedEvent
   | ExtensionOperationCancelledEvent

@@ -12722,6 +12722,7 @@ test("PresentationSession degrades an admitted session when settlement and fallb
       targetIdentity,
       stateRoot,
       workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(readFailure.directory),
     });
     const degraded = Promise.withResolvers<{
       readonly status: "degraded";
@@ -12839,6 +12840,7 @@ test("PresentationSession degrades an admitted draft Plan when settlement and fa
       projectLabel: "workspace",
       stateRoot,
       workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(readFailure.directory),
     });
     const degraded = Promise.withResolvers<{
       readonly status: "degraded";

@@ -17,6 +17,7 @@ export type {
 
 import { z } from "zod";
 import { type ManagedAgentRecord, ManagedAgentStoreError } from "./managed-agent.js";
+import { managedReviewPolicyDigest } from "./managed-review-policy.js";
 import { promptContextRecordV1Schema, promptContextRecordV2Schema } from "./prompt-assembly.js";
 import { agentRoleDefinitionSchema, agentRoleIdSchema } from "./role-catalog.js";
 import {
@@ -55,6 +56,26 @@ import { inputResourceOccurrenceV1Schema } from "./input-resources.js";
 
 export const managedControlFrozenSchema = z.strictObject({
   version: z.literal(1),
+  review: z
+    .strictObject({
+      policyVersion: z.literal(1),
+      policyDigest: z
+        .templateLiteral(["sha256:", z.string()])
+        .refine((value) => /^sha256:[a-f0-9]{64}$/u.test(value)),
+      reviewRunId: z.uuid(),
+      requestDigest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+      evidence: z.strictObject({
+        id: z.templateLiteral(["sha256:", z.string()]),
+        byteCount: z
+          .number()
+          .int()
+          .nonnegative()
+          .max(13 * 1024 * 1024),
+      }),
+      maximumTokens: z.number().int().positive(),
+      totalMilliseconds: z.number().int().positive().max(1_800_000),
+    })
+    .optional(),
   roleDefinition: agentRoleDefinitionSchema.optional(),
   parentBranchId: z.uuid(),
   targetIdentity: modelTargetIdentitySchema,
@@ -76,6 +97,7 @@ export const managedControlFrozenSchema = z.strictObject({
     .optional(),
   parentRequest: z.string().max(64 * 1024),
   permissionEffects: z.union([
+    z.tuple([]),
     z.tuple([z.literal("read")]),
     z.tuple([z.literal("read"), z.literal("network")]),
   ]),
@@ -248,7 +270,7 @@ const eventSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("capacity_acquired") }),
   z.strictObject({
     type: z.literal("admitted"),
-    role: agentRoleIdSchema,
+    role: z.union([agentRoleIdSchema, z.literal("builtin:reviewer")]),
     handle: managedHandleSchema.optional(),
     alias: managedAliasSchema.optional(),
     context: delegationContextSchema.optional(),
@@ -385,6 +407,43 @@ export function validateManagedControlRecord(
       )
     )
       return invalid();
+    if (record.event.role === "builtin:reviewer") {
+      const frozen = record.event.frozen;
+      if (
+        frozen?.review === undefined ||
+        record.event.lane !== "reserved" ||
+        record.event.envelope?.origin.id !== frozen.review.reviewRunId ||
+        record.event.envelope.roles.length !== 1 ||
+        record.event.envelope.roles[0] !== "builtin:reviewer" ||
+        frozen.permissionEffects.length !== 0 ||
+        frozen.skillContext !== undefined ||
+        frozen.roleDefinition !== undefined ||
+        frozen.inputResources !== undefined ||
+        record.event.handle !== undefined ||
+        record.event.alias !== undefined ||
+        threadRecords.length !== 0
+      )
+        return invalid();
+      if (
+        previous.some(
+          (entry) =>
+            entry.event.type === "admitted" &&
+            entry.event.frozen?.review?.reviewRunId === frozen.review?.reviewRunId,
+        )
+      )
+        return invalid();
+      if (
+        frozen.review.policyDigest !==
+        managedReviewPolicyDigest({
+          maximumTokens: frozen.review.maximumTokens,
+          totalMilliseconds: frozen.review.totalMilliseconds,
+          targetIdentity: frozen.targetIdentity,
+          contextProfile: frozen.contextProfile,
+          ...(frozen.thinkingPolicy === undefined ? {} : { thinkingPolicy: frozen.thinkingPolicy }),
+        })
+      )
+        return invalid();
+    } else if (record.event.frozen?.review !== undefined) return invalid();
     const last = threadRecords.findLast(
       (entry) =>
         entry.event.type !== "provider_reserved" &&
@@ -403,6 +462,7 @@ export function validateManagedControlRecord(
       if (first === undefined) {
         const names = new Set(["main"]);
         for (const thread of foldManagedControl(previous, record.parentSessionId).threads) {
+          if (thread.role === "builtin:reviewer") continue;
           names.add(managedNameKey(thread.handle));
           if (thread.alias !== undefined) names.add(managedNameKey(thread.alias));
         }
@@ -681,11 +741,14 @@ export function foldManagedControl(
           ? {}
           : { previousTurns: [...(existing.previousTurns ?? []), existing.turn] }),
         lifecycle: "open",
-        displayName: event.frozen?.roleDefinition?.name ?? "Explore",
+        displayName:
+          event.role === "builtin:reviewer"
+            ? "Reviewer"
+            : (event.frozen?.roleDefinition?.name ?? "Explore"),
         handle:
           existing?.handle ??
           event.handle ??
-          `@${event.frozen?.roleDefinition?.name.toLocaleLowerCase() ?? "explore"}-${threads.size + 1}`,
+          `@${event.role === "builtin:reviewer" ? "reviewer" : (event.frozen?.roleDefinition?.name.toLocaleLowerCase() ?? "explore")}-${threads.size + 1}`,
         ...(event.alias === undefined ? {} : { alias: event.alias }),
         residency: "live",
         threadId: record.threadId,

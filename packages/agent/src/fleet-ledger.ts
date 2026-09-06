@@ -59,7 +59,10 @@ export const delegationEnvelopeSchema = z.strictObject({
     .templateLiteral(["sha256:", z.string()])
     .refine((value) => /^sha256:[a-f0-9]{64}$/u.test(value)),
   origin: delegationOriginSchema,
-  roles: z.array(agentRoleIdSchema).min(1).max(32),
+  roles: z
+    .array(z.union([agentRoleIdSchema, z.literal("builtin:reviewer")]))
+    .min(1)
+    .max(32),
   mode: z.enum(["background", "foreground"]),
   threads: positive.max(32),
   running: positive.max(4),

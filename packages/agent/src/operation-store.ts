@@ -7,6 +7,9 @@ import { join } from "node:path";
 import type {
   ExtensionArtifactSummary,
   ExtensionJsonValue,
+  ExtensionManagedReviewFailure,
+  ExtensionManagedReviewProgress,
+  ExtensionManagedReviewRequest,
   ExtensionOperationArtifactPublishedEvent,
   ExtensionOperationCancellationReason,
   ExtensionOperationCancelledEvent,
@@ -26,6 +29,7 @@ import {
   EXTENSION_ARTIFACT_MAX_AGGREGATE_BYTES,
   EXTENSION_ARTIFACT_MAX_BYTES,
   EXTENSION_ARTIFACT_MAX_COUNT,
+  EXTENSION_MANAGED_REVIEW_TOTAL_MAX_MS,
   EXTENSION_OPERATION_DEADLINE_MAX_MS,
   EXTENSION_OPERATION_INPUT_MAX_BYTES,
   EXTENSION_OPERATION_JSON_MAX_CONTAINERS,
@@ -35,6 +39,9 @@ import {
   EXTENSION_OPERATION_PROGRESS_MAX_RECORDS,
   EXTENSION_OPERATION_PROGRESS_RECORD_MAX_BYTES,
   EXTENSION_RECORD_MAX_BYTES,
+  extensionManagedReviewProgressCodec,
+  extensionManagedReviewRequestCodec,
+  extensionManagedReviewTerminalCodec,
 } from "@adam-agent/extension-api";
 import { valid } from "semver";
 import { z } from "zod";
@@ -219,6 +226,35 @@ const operationManagedWaitStartedEventSchema = z.strictObject({
     .positive()
     .max(EXTENSION_OPERATION_DEADLINE_MAX_MS),
 });
+const operationManagedReviewInvokedEventSchema = z.strictObject({
+  type: z.literal("operation_managed_review_invoked"),
+  reviewRunId: z.uuid(),
+  requestDigest: z
+    .templateLiteral(["sha256:", z.string()])
+    .refine((value) => /^sha256:[a-f0-9]{64}$/u.test(value)),
+  request: z.custom<ExtensionManagedReviewRequest>(
+    (value) => extensionManagedReviewRequestCodec.decode(value).ok,
+  ),
+  totalMilliseconds: z.number().int().positive().max(EXTENSION_MANAGED_REVIEW_TOTAL_MAX_MS),
+});
+const operationManagedReviewProgressEventSchema = z.strictObject({
+  type: z.literal("operation_managed_review_progress"),
+  progress: z.custom<ExtensionManagedReviewProgress>(
+    (value) => extensionManagedReviewProgressCodec.decode(value).ok,
+  ),
+});
+const operationManagedReviewExpiredEventSchema = z.strictObject({
+  type: z.literal("operation_managed_review_expired"),
+  reviewRunId: z.uuid(),
+  reason: z.enum(["capacity_expired", "review_deadline_exceeded"]),
+});
+const operationManagedReviewFailedEventSchema = z.strictObject({
+  type: z.literal("operation_managed_review_failed"),
+  failure: z.custom<ExtensionManagedReviewFailure>((value) => {
+    const parsed = extensionManagedReviewTerminalCodec.decode(value);
+    return parsed.ok && parsed.value.status === "failed";
+  }),
+});
 const operationManagedWaitSettledEventSchema = z.strictObject({
   type: z.literal("operation_managed_wait_settled"),
   deadlineAt: canonicalTimestampSchema,
@@ -346,6 +382,10 @@ const operationEventRecordSchema: z.ZodType<OperationEventRecord> = z.union([
       operationArtifactPublishedEventSchema,
       operationReconciliationStartedEventSchema,
       operationManagedWaitStartedEventSchema,
+      operationManagedReviewInvokedEventSchema,
+      operationManagedReviewProgressEventSchema,
+      operationManagedReviewExpiredEventSchema,
+      operationManagedReviewFailedEventSchema,
       operationManagedWaitSettledEventSchema,
       operationProgressEventSchema,
       operationCancelRequestedEventSchema,
@@ -788,6 +828,83 @@ function validateNextRecord(
     ) {
       throw new OperationStoreError();
     }
+  }
+  if (candidate.event.type === "operation_managed_review_invoked") {
+    if (
+      history[0]?.schemaVersion !== 3 ||
+      history.some(
+        (record) =>
+          record.event.type === "operation_managed_review_invoked" ||
+          record.event.type === "operation_cancel_requested",
+      ) ||
+      candidate.event.requestDigest !==
+        `sha256:${createHash("sha256")
+          .update(JSON.stringify(canonicalizeJson(candidate.event.request as ExtensionJsonValue)))
+          .digest("hex")}`
+    )
+      throw new OperationStoreError();
+    const started = history[0]?.event;
+    if (started?.type !== "operation_started") throw new OperationStoreError();
+    for (const reference of candidate.event.request.evidence) {
+      const summary = reference.type === "artifact" ? reference.artifact : reference.record;
+      assertEvidenceProvenance(summary.provenance, candidate.operationId, started);
+      if (reference.type === "artifact") assertArtifactWasPublished(history, reference.artifact);
+    }
+  }
+  if (candidate.event.type === "operation_managed_review_progress") {
+    const invocation = history.find(
+      (record) => record.event.type === "operation_managed_review_invoked",
+    )?.event;
+    const previous = history.findLast(
+      (record) => record.event.type === "operation_managed_review_progress",
+    )?.event;
+    const phase =
+      previous?.type === "operation_managed_review_progress" ? previous.progress.phase : undefined;
+    const progress = candidate.event.progress;
+    if (
+      invocation?.type !== "operation_managed_review_invoked" ||
+      invocation.reviewRunId !== progress.reviewRunId ||
+      (progress.phase === "waiting_for_capacity" && phase !== undefined) ||
+      (progress.phase === "running" &&
+        (phase !== "waiting_for_capacity" ||
+          progress.totalMilliseconds !== invocation.totalMilliseconds ||
+          progress.startedAt !== candidate.recordedAt ||
+          !history.some((record) => record.event.type === "operation_managed_wait_started"))) ||
+      (progress.phase === "settling" && phase !== "running") ||
+      (progress.phase === "terminal" && phase !== "waiting_for_capacity" && phase !== "settling")
+    )
+      throw new OperationStoreError();
+  }
+  if (
+    candidate.event.type === "operation_managed_review_expired" ||
+    candidate.event.type === "operation_managed_review_failed"
+  ) {
+    const invocation = history.find(
+      (record) => record.event.type === "operation_managed_review_invoked",
+    )?.event;
+    const progress = history.findLast(
+      (record) => record.event.type === "operation_managed_review_progress",
+    )?.event;
+    const runId =
+      candidate.event.type === "operation_managed_review_expired"
+        ? candidate.event.reviewRunId
+        : candidate.event.failure.reviewRunId;
+    if (
+      invocation?.type !== "operation_managed_review_invoked" ||
+      invocation.reviewRunId !== runId ||
+      progress?.type !== "operation_managed_review_progress" ||
+      progress.progress.phase === "terminal" ||
+      history.some((record) => record.event.type === candidate.event.type)
+    )
+      throw new OperationStoreError();
+    if (
+      candidate.event.type === "operation_managed_review_expired" &&
+      ((candidate.event.reason === "capacity_expired" &&
+        progress.progress.phase !== "waiting_for_capacity") ||
+        (candidate.event.reason === "review_deadline_exceeded" &&
+          progress.progress.phase !== "running"))
+    )
+      throw new OperationStoreError();
   }
   if (candidate.event.type === "operation_managed_wait_settled") {
     const wait = history.find(

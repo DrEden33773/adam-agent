@@ -6,6 +6,7 @@ import type { ModelDriver, ModelRequest } from "@adam-agent/agent";
 import { sessionManagedControl } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { startManagedTui } from "./agent-fleet.test-support.js";
+import { terminalObservationTimeoutMilliseconds } from "./virtual-terminal.test-support.js";
 
 test("direct delegation reads only its explicitly attached immutable resource", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-role-attachment-"));
@@ -444,6 +445,25 @@ test("delegation shares only the selected initial context and does not absorb la
     expect(admissions[2]?.event).toMatchObject({
       context: { mode: "selected_messages", messages: [link] },
     });
+    if (control === undefined) throw new Error("Missing managed Control.");
+    await (async () => {
+      for await (const frame of control.observe({
+        parentSessionId: h.parent.sessionId,
+        signal: AbortSignal.timeout(terminalObservationTimeoutMilliseconds),
+      })) {
+        if (
+          admissions.every((admission) =>
+            frame.snapshot.completions.some(
+              (completion) =>
+                completion.threadId === admission.threadId &&
+                completion.turnId === admission.turnId,
+            ),
+          )
+        )
+          return;
+      }
+      throw new Error("Missing exact completion receipts for delegated context checks.");
+    })();
     const before = (await h.store.read()).length;
     const forged = {
       ...entries[2],
