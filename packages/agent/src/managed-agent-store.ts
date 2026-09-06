@@ -13,6 +13,7 @@ import {
 import {
   type ManagedControlRecord,
   type ManagedControlStore,
+  validateManagedControlBatches,
   validateManagedControlRecord,
 } from "./managed-agent-folds.js";
 
@@ -28,6 +29,9 @@ export function createInMemoryManagedAgentControlStore(): ManagedControlStore {
       return [];
     },
     async read() {
+      for (const [parent, records] of partitions)
+        if (parentSessionId === undefined || parent === parentSessionId)
+          validateManagedControlBatches(records);
       return structuredClone(
         parentSessionId === undefined
           ? [...partitions.entries()]
@@ -56,6 +60,25 @@ export function createInMemoryManagedAgentControlStore(): ManagedControlStore {
       records.push(record);
       partitions.set(input.parentSessionId, records);
       return structuredClone(record);
+    },
+    async appendBatchNext(inputs) {
+      const first = inputs[0];
+      if (first === undefined || inputs.length > 128)
+        throw new ManagedAgentStoreError("managed_agent_log_invalid");
+      const records = [...(partitions.get(first.parentSessionId) ?? [])];
+      const added: ManagedControlRecord[] = [];
+      for (const input of inputs) {
+        assertParentScope(parentSessionId ?? first.parentSessionId, input.parentSessionId);
+        const record = validateManagedControlRecord(
+          { ...input, sequence: records.length + 1 },
+          records,
+        );
+        records.push(record);
+        added.push(record);
+      }
+      validateManagedControlBatches(records);
+      partitions.set(first.parentSessionId, records);
+      return structuredClone(added);
     },
   });
   return scoped();
@@ -143,19 +166,28 @@ export async function createJsonlManagedAgentControlStore(options: {
         ? undefined
         : join(directory, `events-v3-${parentSessionId}.jsonl`);
     const appendStored = (
-      input: Omit<ManagedControlRecord, "sequence">,
+      inputs: readonly Omit<ManagedControlRecord, "sequence">[],
       allocate: boolean,
-    ): Promise<ManagedControlRecord> => {
-      assertParentScope(parentSessionId, input.parentSessionId);
+    ): Promise<readonly ManagedControlRecord[]> => {
+      if (inputs.length === 0 || inputs.length > 128)
+        return Promise.reject(new ManagedAgentStoreError("managed_agent_log_invalid"));
+      for (const input of inputs) assertParentScope(parentSessionId, input.parentSessionId);
       if (path === undefined || parentSessionId === undefined || !prepared.has(parentSessionId))
         return Promise.reject(new ManagedAgentStoreError("managed_agent_log_invalid"));
       return enqueueManagedAgentAppend(path, async () => {
         const records = await readPartition(path, parentSessionId);
-        const record = validateManagedControlRecord(
-          allocate ? { ...input, sequence: records.length + 1 } : input,
-          records,
-        );
-        const text = `${JSON.stringify(record)}\n`;
+        const working = [...records];
+        const added: ManagedControlRecord[] = [];
+        for (const input of inputs) {
+          const record = validateManagedControlRecord(
+            allocate ? { ...input, sequence: working.length + 1 } : input,
+            working,
+          );
+          working.push(record);
+          added.push(record);
+        }
+        validateManagedControlBatches(records);
+        const text = added.map((record) => `${JSON.stringify(record)}\n`).join("");
         const storedBytes = records.reduce(
           (sum, entry) => sum + Buffer.byteLength(JSON.stringify(entry), "utf8") + 1,
           0,
@@ -174,7 +206,7 @@ export async function createJsonlManagedAgentControlStore(options: {
         } finally {
           await file.close();
         }
-        return record;
+        return added;
       });
     };
     const store: ManagedControlStore = {
@@ -258,7 +290,17 @@ export async function createJsonlManagedAgentControlStore(options: {
           await target.append(record);
           return;
         }
-        await appendStored(record, false);
+        await appendStored([record], false);
+      },
+      async appendBatchNext(records) {
+        if (parentSessionId === undefined) {
+          const first = records[0];
+          if (first === undefined) throw new ManagedAgentStoreError("managed_agent_log_invalid");
+          const target = scoped(first.parentSessionId);
+          await target.preflight();
+          return target.appendBatchNext(records);
+        }
+        return appendStored(records, true);
       },
       async appendNext(record) {
         if (parentSessionId === undefined) {
@@ -266,7 +308,9 @@ export async function createJsonlManagedAgentControlStore(options: {
           await target.preflight();
           return target.appendNext(record);
         }
-        return appendStored(record, true);
+        const added = await appendStored([record], true);
+        if (added[0] === undefined) throw new ManagedAgentStoreError("managed_agent_log_invalid");
+        return added[0];
       },
     };
     return store;

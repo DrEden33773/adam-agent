@@ -13,17 +13,94 @@ export type {
   ManagedWorkspaceSnapshot,
 } from "@adam-agent/presentation";
 
-import { createHash } from "node:crypto";
 import { z } from "zod";
 import { type ManagedAgentRecord, ManagedAgentStoreError } from "./managed-agent.js";
-import type { SessionRecord } from "./session-store.js";
+import { promptContextRecordV1Schema } from "./prompt-assembly.js";
+import {
+  contextProfileSchema,
+  modelTargetIdentitySchema,
+  type SessionRecord,
+  thinkingPolicySnapshotV1Schema,
+} from "./session-store.js";
+import { skillContextRecordV1Schema } from "./skills.js";
+
+export { managedControlDigest } from "./fleet-ledger.js";
+
+import {
+  type DelegationEnvelope,
+  delegationEnvelopeSchema,
+  type FleetProviderEvent,
+  fleetProviderEventSchema,
+  managedControlDigest,
+} from "./fleet-ledger.js";
+
+export const managedControlFrozenSchema = z.strictObject({
+  version: z.literal(1),
+  parentBranchId: z.uuid(),
+  targetIdentity: modelTargetIdentitySchema,
+  contextProfile: contextProfileSchema,
+  thinkingPolicy: thinkingPolicySnapshotV1Schema.optional(),
+  promptContext: promptContextRecordV1Schema,
+  skillContext: skillContextRecordV1Schema.optional(),
+  parentRequest: z.string().max(64 * 1024),
+  permissionEffects: z.tuple([z.literal("read")]),
+  permissionReadCeiling: z.enum(["allow", "ask", "deny"]),
+});
+export type ManagedControlFrozen = z.infer<typeof managedControlFrozenSchema>;
 
 export type ManagedControlEvent =
+  | { readonly type: "admission_paused"; readonly reason: "plan" }
+  | { readonly type: "suspend_requested" | "thread_closed" }
+  | {
+      readonly type: "child_report" | "parent_input_requested";
+      readonly id: `sha256:${string}`;
+      readonly text: string;
+      readonly source: {
+        readonly runId: string;
+        readonly turn: number;
+        readonly attempt: number;
+        readonly callId: string;
+      };
+    }
+  | {
+      readonly type: "input_accepted";
+      readonly inputId: string;
+      readonly text: string;
+      readonly mode: "cooperative" | "interrupt";
+      readonly messageId: `sha256:${string}`;
+    }
+  | {
+      readonly type: "input_delivered";
+      readonly inputId: string;
+      readonly childReceipt: ManagedControlLink;
+    }
+  | {
+      readonly type: "input_undelivered";
+      readonly inputId: string;
+      readonly reason: "settled" | "cancelled" | "restart";
+    }
+  | FleetProviderEvent
+  | {
+      readonly type: "budget_blocked";
+      readonly code: "fleet_budget_exhausted" | "fleet_estimator_overrun";
+      readonly message: string;
+    }
+  | {
+      readonly type: "capacity_wait";
+      readonly reason: "permission" | "parent_input" | "capacity" | "plan";
+      readonly requestId?: string;
+    }
+  | { readonly type: "capacity_acquired" }
   | {
       readonly type: "admitted";
       readonly role: "builtin:explore";
       readonly description: string;
       readonly task: string;
+      readonly lane?: "background" | "reserved";
+      readonly batchId?: string;
+      readonly inputId?: string;
+      readonly frozen?: ManagedControlFrozen;
+      readonly envelope?: DelegationEnvelope;
     }
   | { readonly type: "started" }
   | { readonly type: "cancel_requested" }
@@ -61,6 +138,9 @@ export type ManagedControlStore = {
   read(): Promise<readonly ManagedControlRecord[]>;
   append(record: ManagedControlRecord): Promise<void>;
   appendNext(record: Omit<ManagedControlRecord, "sequence">): Promise<ManagedControlRecord>;
+  appendBatchNext(
+    records: readonly Omit<ManagedControlRecord, "sequence">[],
+  ): Promise<readonly ManagedControlRecord[]>;
 };
 
 const linkSchema = z.strictObject({
@@ -70,11 +150,64 @@ const linkSchema = z.strictObject({
 const boundedText = (maximum: number) =>
   z.string().refine((value) => Buffer.byteLength(value, "utf8") <= maximum);
 const eventSchema = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("admission_paused"), reason: z.literal("plan") }),
+  z.strictObject({ type: z.enum(["suspend_requested", "thread_closed"]) }),
+  z.strictObject({
+    type: z.enum(["child_report", "parent_input_requested"]),
+    id: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+    text: z
+      .string()
+      .min(1)
+      .refine((text) => Buffer.byteLength(text, "utf8") <= 8192),
+    source: z.strictObject({
+      runId: z.uuid(),
+      turn: z.number().int().positive(),
+      attempt: z.number().int().positive(),
+      callId: z.string().min(1).max(256),
+    }),
+  }),
+  ...fleetProviderEventSchema.options,
+  z.strictObject({
+    type: z.literal("input_accepted"),
+    inputId: z.uuid(),
+    text: z
+      .string()
+      .min(1)
+      .refine((text) => Buffer.byteLength(text, "utf8") <= 8192),
+    mode: z.enum(["cooperative", "interrupt"]),
+    messageId: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+  }),
+  z.strictObject({
+    type: z.literal("input_delivered"),
+    inputId: z.uuid(),
+    childReceipt: linkSchema,
+  }),
+  z.strictObject({
+    type: z.literal("input_undelivered"),
+    inputId: z.uuid(),
+    reason: z.enum(["settled", "cancelled", "restart"]),
+  }),
+  z.strictObject({
+    type: z.literal("budget_blocked"),
+    code: z.enum(["fleet_budget_exhausted", "fleet_estimator_overrun"]),
+    message: z.string().min(1).max(1024),
+  }),
+  z.strictObject({
+    type: z.literal("capacity_wait"),
+    reason: z.enum(["permission", "parent_input", "capacity", "plan"]),
+    requestId: z.string().min(1).max(512).optional(),
+  }),
+  z.strictObject({ type: z.literal("capacity_acquired") }),
   z.strictObject({
     type: z.literal("admitted"),
     role: z.literal("builtin:explore"),
     description: boundedText(256).refine((value) => value.length > 0 && !/\p{Cc}/u.test(value)),
     task: boundedText(16 * 1024).refine((value) => value.trim().length > 0),
+    lane: z.enum(["background", "reserved"]).optional(),
+    batchId: z.uuid().optional(),
+    inputId: z.uuid().optional(),
+    frozen: managedControlFrozenSchema.optional(),
+    envelope: delegationEnvelopeSchema.optional(),
   }),
   z.strictObject({ type: z.literal("started") }),
   z.strictObject({ type: z.literal("cancel_requested") }),
@@ -97,6 +230,17 @@ const eventSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({
     type: z.literal("outcome"),
+    artifact: z
+      .strictObject({
+        id: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+        byteCount: z
+          .number()
+          .int()
+          .positive()
+          .max(64 * 1024 * 1024),
+        mediaType: z.literal("text/plain; charset=utf-8"),
+      })
+      .optional(),
     usage: z.strictObject({
       inputTokens: z.number().int().nonnegative(),
       outputTokens: z.number().int().nonnegative(),
@@ -139,6 +283,22 @@ export function validateManagedControlRecord(
     return invalid();
   const turnRecords = previous.filter((entry) => entry.turnId === record.turnId);
   if (record.event.type === "admitted") {
+    const admittedInputId = record.event.inputId;
+    const modern = [
+      record.event.lane,
+      record.event.batchId,
+      record.event.frozen,
+      record.event.envelope,
+    ];
+    if (
+      (modern.some((value) => value !== undefined) &&
+        modern.some((value) => value === undefined)) ||
+      (record.event.inputId !== undefined &&
+        (record.event.envelope === undefined ||
+          previous.some((entry) => managedAcceptedInput(entry)?.inputId === admittedInputId)))
+    )
+      return invalid();
+
     if (
       turnRecords.length > 0 ||
       previous.some(
@@ -147,9 +307,15 @@ export function validateManagedControlRecord(
       )
     )
       return invalid();
-    const last = threadRecords.at(-1);
+    const last = threadRecords.findLast(
+      (entry) =>
+        entry.event.type !== "provider_reserved" &&
+        entry.event.type !== "provider_usage" &&
+        entry.event.type !== "provider_unknown",
+    );
     if (last !== undefined && last.event.type !== "completion" && last.event.type !== "consumed")
       return invalid();
+    if (threadRecords.some((entry) => entry.event.type === "thread_closed")) return invalid();
     const first = threadRecords[0];
     if (
       first?.event.type === "admitted" &&
@@ -168,11 +334,129 @@ export function validateManagedControlRecord(
     )
       return invalid();
     if (
+      record.event.type === "admission_paused" ||
+      record.event.type === "suspend_requested" ||
+      record.event.type === "thread_closed"
+    ) {
+      if (
+        record.event.type === "thread_closed"
+          ? !turnRecords.some((entry) => entry.event.type === "completion") ||
+            threadRecords.some((entry) => entry.event.type === "thread_closed")
+          : turnRecords.some((entry) => entry.event.type === "outcome")
+      )
+        return invalid();
+      return record;
+    }
+    if (record.event.type === "child_report" || record.event.type === "parent_input_requested") {
+      if (
+        turnRecords.some(
+          (entry) =>
+            entry.event.type === "outcome" ||
+            ((entry.event.type === "child_report" ||
+              entry.event.type === "parent_input_requested") &&
+              (record.event.type === "child_report" ||
+                record.event.type === "parent_input_requested") &&
+              entry.event.id === record.event.id),
+        )
+      )
+        return invalid();
+      return record;
+    }
+    if (
+      record.event.type === "input_accepted" ||
+      record.event.type === "input_delivered" ||
+      record.event.type === "input_undelivered"
+    ) {
+      const event = record.event;
+      const input = previous.find(
+        (entry) => managedAcceptedInput(entry)?.inputId === event.inputId,
+      );
+      if (event.type === "input_accepted") {
+        if (
+          input !== undefined ||
+          !turnRecords.some((entry) => entry.event.type === "started") ||
+          turnRecords.some((entry) => entry.event.type === "outcome")
+        )
+          return invalid();
+      } else if (
+        input?.turnId !== record.turnId ||
+        previous.some(
+          (entry) =>
+            (entry.event.type === "input_delivered" || entry.event.type === "input_undelivered") &&
+            entry.event.inputId === event.inputId,
+        )
+      )
+        return invalid();
+      return record;
+    }
+    if (
+      record.event.type === "provider_reserved" ||
+      record.event.type === "provider_usage" ||
+      record.event.type === "provider_unknown"
+    ) {
+      const event = record.event;
+      const reservation = previous.find(
+        (entry) =>
+          entry.event.type === "provider_reserved" && entry.event.requestId === event.requestId,
+      );
+      if (event.type === "provider_reserved") {
+        if (
+          reservation !== undefined ||
+          !turnRecords.some((entry) => entry.event.type === "started") ||
+          turnRecords.some((entry) => entry.event.type === "outcome")
+        )
+          return invalid();
+      } else if (
+        reservation?.turnId !== record.turnId ||
+        previous.some(
+          (entry) =>
+            entry.event.type === event.type &&
+            "requestId" in entry.event &&
+            entry.event.requestId === event.requestId,
+        ) ||
+        (event.type === "provider_unknown" &&
+          previous.some(
+            (entry) =>
+              entry.event.type === "provider_usage" && entry.event.requestId === event.requestId,
+          ))
+      )
+        return invalid();
+      return record;
+    }
+    if (
+      record.event.type === "budget_blocked" ||
+      record.event.type === "capacity_wait" ||
+      record.event.type === "capacity_acquired"
+    ) {
+      if (
+        !turnRecords.some((entry) => entry.event.type === "started") ||
+        turnRecords.some((entry) => entry.event.type === "outcome")
+      )
+        return invalid();
+      return record;
+    }
+    if (
       record.event.type !== "execution_progress" &&
       turnRecords.some((entry) => entry.event.type === record.event.type)
     )
       return invalid();
-    const last = turnRecords.at(-1);
+    const last = turnRecords.findLast(
+      (entry) =>
+        entry.event.type !== "admission_paused" &&
+        entry.event.type !== "suspend_requested" &&
+        entry.event.type !== "thread_closed" &&
+        entry.event.type !== "child_report" &&
+        entry.event.type !== "parent_input_requested" &&
+        entry.event.type !== "input_accepted" &&
+        entry.event.type !== "input_delivered" &&
+        entry.event.type !== "input_undelivered" &&
+        entry.event.type !== "capacity_wait" &&
+        entry.event.type !== "capacity_acquired" &&
+        entry.event.type !== "provider_reserved" &&
+        entry.event.type !== "provider_usage" &&
+        entry.event.type !== "provider_unknown" &&
+        entry.event.type !== "budget_blocked",
+    );
     const event = record.event;
     if (
       event.type === "cleanup_expired" &&
@@ -223,10 +507,6 @@ export function validateManagedControlRecord(
   return record;
 }
 
-export function managedControlDigest(value: unknown): `sha256:${string}` {
-  return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
-}
-
 export function managedControlLink(record: ManagedControlRecord): ManagedControlLink {
   return { sequence: record.sequence, digest: managedControlDigest(record) };
 }
@@ -247,7 +527,19 @@ export function foldManagedControl(
   for (const record of records) {
     if (record.parentSessionId !== parentSessionId) continue;
     const event = record.event;
-    if (event.type === "consumed") continue;
+    if (
+      event.type === "child_report" ||
+      event.type === "parent_input_requested" ||
+      event.type === "input_accepted" ||
+      event.type === "input_delivered" ||
+      event.type === "input_undelivered" ||
+      event.type === "budget_blocked" ||
+      event.type === "consumed" ||
+      event.type === "provider_reserved" ||
+      event.type === "provider_usage" ||
+      event.type === "provider_unknown"
+    )
+      continue;
     if (event.type === "admitted") {
       const existing = threads.get(record.threadId);
       threads.set(record.threadId, {
@@ -261,15 +553,30 @@ export function foldManagedControl(
         description: event.description,
         turn: {
           turnId: record.turnId,
+          admissionSequence: record.sequence,
+          ...(event.envelope === undefined ? {} : { envelope: event.envelope }),
           attemptId: record.attemptId,
           childSessionId: record.childSessionId,
           phase: "starting",
           label: "Starting",
           recovery: "none",
+          ...(event.frozen === undefined
+            ? {}
+            : {
+                configuration: {
+                  digest: managedControlDigest(event.frozen),
+                  parentBranchId: event.frozen.parentBranchId,
+                  targetId: event.frozen.targetIdentity.targetId,
+                  thinking: event.frozen.thinkingPolicy?.effectiveLevelId ?? "default",
+                },
+              }),
           health: "healthy",
           waitReason: "none",
           ownerPhase: "waiting",
           lastOutcome: "none",
+          ...(event.lane === undefined
+            ? {}
+            : { phase: "queued" as const, label: "Queued", lane: event.lane }),
         },
       });
       continue;
@@ -278,6 +585,70 @@ export function foldManagedControl(
     if (thread === undefined || thread.turn.turnId !== record.turnId)
       throw new Error("Invalid managed control history.");
     if (event.type === "completion" || event.type === "cancel_requested") continue;
+    if (event.type === "admission_paused") {
+      threads.set(record.threadId, {
+        ...thread,
+        turn: {
+          ...thread.turn,
+          phase: "waiting",
+          waitReason: "plan",
+          label: "Paused by current Plan policy",
+        },
+      });
+      continue;
+    }
+    if (event.type === "thread_closed") {
+      threads.set(record.threadId, { ...thread, lifecycle: "closed" });
+      continue;
+    }
+    if (event.type === "suspend_requested") {
+      threads.set(record.threadId, {
+        ...thread,
+        turn: {
+          ...thread.turn,
+          phase: "waiting",
+          waitReason: "suspended",
+          label: "Suspended · Resume or cancel",
+        },
+      });
+      continue;
+    }
+    if (event.type === "capacity_wait" || event.type === "capacity_acquired") {
+      const turn = { ...thread.turn };
+      delete turn.attention;
+      threads.set(record.threadId, {
+        ...thread,
+        turn: {
+          ...turn,
+          phase: event.type === "capacity_wait" ? "waiting" : "executing",
+          waitReason: event.type === "capacity_wait" ? event.reason : "none",
+          label:
+            event.type === "capacity_acquired"
+              ? "Running"
+              : event.reason === "permission"
+                ? "Waiting for permission"
+                : event.reason === "parent_input"
+                  ? "Waiting for you"
+                  : event.reason === "plan"
+                    ? "Paused by current Plan policy"
+                    : "Waiting for capacity",
+          ...(event.type === "capacity_wait" &&
+          event.requestId !== undefined &&
+          (event.reason === "permission" || event.reason === "parent_input")
+            ? { attention: { id: event.requestId, kind: event.reason } }
+            : {}),
+          ...(turn.watchdog === undefined
+            ? {}
+            : {
+                watchdog: {
+                  ...turn.watchdog,
+                  state: event.type === "capacity_wait" ? "stopped" : "running",
+                },
+              }),
+        },
+      });
+      continue;
+    }
     if (event.type === "execution_progress") {
       threads.set(record.threadId, {
         ...thread,
@@ -332,6 +703,7 @@ export function foldManagedControl(
       residency: phase === "idle" ? "unloaded" : "live",
       turn: {
         ...previousTurn,
+        ...(event.type === "started" ? { hasStarted: true as const } : {}),
         phase,
         ownerPhase:
           phase === "settling" ? "releasing" : phase === "executing" ? "claimed" : "released",
@@ -388,6 +760,73 @@ export function foldManagedControl(
     status: "ready",
     parentSessionId,
     revision: records.at(-1)?.sequence ?? 0,
-    threads: [...threads.values()],
+    threads: [...threads.values()].map((thread) => ({
+      ...thread,
+      inputs: records.flatMap((record) => {
+        const event = managedAcceptedInput(record);
+        if (record.threadId !== thread.threadId || event === undefined) return [];
+        const terminal = records.find(
+          (entry) =>
+            (entry.event.type === "input_delivered" || entry.event.type === "input_undelivered") &&
+            entry.event.inputId === event.inputId,
+        );
+        return [
+          {
+            id: event.inputId,
+            turnId: record.turnId,
+            status:
+              terminal?.event.type === "input_delivered"
+                ? ("delivered" as const)
+                : terminal?.event.type === "input_undelivered"
+                  ? ("undelivered" as const)
+                  : ("accepted" as const),
+            ...(terminal?.event.type === "input_undelivered"
+              ? { reason: terminal.event.reason }
+              : {}),
+          },
+        ];
+      }),
+    })),
   };
+}
+
+/** A newline-complete prefix is not a complete admission batch. Never expose partial grants. */
+export function validateManagedControlBatches(records: readonly ManagedControlRecord[]): void {
+  const batches = new Map<string, ManagedControlRecord[]>();
+  for (const record of records) {
+    if (record.event.type !== "admitted" || record.event.envelope === undefined) continue;
+    const key = `${record.parentSessionId}:${record.event.envelope.id}`;
+    const batch = batches.get(key) ?? [];
+    batch.push(record);
+    batches.set(key, batch);
+  }
+  for (const batch of batches.values()) {
+    const first = batch[0];
+    if (first?.event.type !== "admitted" || first.event.envelope === undefined)
+      throw new ManagedAgentStoreError("managed_agent_log_invalid");
+    const envelope = first.event.envelope;
+    if (
+      batch.length !== envelope.threads ||
+      envelope.threads > envelope.running + envelope.queued ||
+      batch.some(
+        (record, index) =>
+          record.sequence !== first.sequence + index ||
+          record.event.type !== "admitted" ||
+          record.event.batchId !== envelope.id ||
+          managedControlDigest(record.event.envelope) !== managedControlDigest(envelope),
+      )
+    )
+      throw new ManagedAgentStoreError("managed_agent_log_invalid");
+  }
+}
+
+export function managedAcceptedInput(
+  record: ManagedControlRecord,
+):
+  | { readonly inputId: string; readonly text: string; readonly messageId?: `sha256:${string}` }
+  | undefined {
+  if (record.event.type === "input_accepted") return record.event;
+  if (record.event.type === "admitted" && record.event.inputId !== undefined)
+    return { inputId: record.event.inputId, text: record.event.task };
+  return undefined;
 }

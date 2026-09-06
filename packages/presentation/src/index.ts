@@ -429,7 +429,10 @@ export type PlanSubmissionDisplay = {
       readonly provenance: "model_submit_plan";
     };
   };
-  readonly policyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1";
+  readonly policyVersion:
+    | "plan-policy.read-v1"
+    | "plan-policy.hybrid-v1"
+    | "plan-policy.hybrid-delegation-v1";
   readonly toolProfileDigest: `sha256:${string}`;
 };
 
@@ -441,7 +444,10 @@ export type PlanApprovalDisplay = {
   readonly revision: number;
   readonly planId: string;
   readonly contentDigest: `sha256:${string}`;
-  readonly policyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1";
+  readonly policyVersion:
+    | "plan-policy.read-v1"
+    | "plan-policy.hybrid-v1"
+    | "plan-policy.hybrid-delegation-v1";
   readonly toolProfileDigest: `sha256:${string}`;
 };
 
@@ -532,7 +538,10 @@ export type ActiveSessionDisplay = {
     readonly state: "exploring" | "ready" | "approved_not_started";
     readonly cycleId: string;
     readonly revision: number;
-    readonly policyVersion: "plan-policy.read-v1" | "plan-policy.hybrid-v1";
+    readonly policyVersion:
+      | "plan-policy.read-v1"
+      | "plan-policy.hybrid-v1"
+      | "plan-policy.hybrid-delegation-v1";
     readonly shellPolicyVersion?: "plan-shell-policy.v1";
     readonly eligibleToolProfile: {
       readonly version: 1;
@@ -923,6 +932,7 @@ export type TurnComposerDisplay = {
 
 export type AuthoritativePresentationSnapshot = {
   readonly managedControl?: ManagedWorkspaceSnapshot;
+  readonly managedTransition?: ManagedSessionTransition;
   readonly schemaVersion: 1;
   readonly continuity:
     | {
@@ -1175,11 +1185,17 @@ export type CommandReceipt =
       readonly status: "rejected";
       readonly code:
         | "not_available"
+        | "transition_required"
         | "stale_interaction"
         | "conflict"
         | "invalid_command"
         | "authority_rejected"
         | "stale_revision"
+        | "capacity_exhausted"
+        | "storage_quota_exceeded"
+        | "budget_exhausted"
+        | "plan_policy_paused"
+        | "attempt_limit"
         | "authority_busy"
         | "action_unavailable"
         | "recovery_required"
@@ -1237,6 +1253,11 @@ export type ManagedAgentTranscriptPageResource = {
 };
 
 export type PresentationCommand =
+  | {
+      readonly type: "resolve_managed_transition";
+      readonly transitionId: string;
+      readonly decision: "stay" | "wait" | "suspend";
+    }
   | {
       readonly type: "managed_control";
       readonly commandId: string;
@@ -1638,6 +1659,11 @@ export type ManagedControlLink = {
 };
 
 export type ManagedControlOutcome = {
+  readonly artifact?: {
+    readonly id: `sha256:${string}`;
+    readonly byteCount: number;
+    readonly mediaType: "text/plain; charset=utf-8";
+  };
   readonly usage: {
     readonly inputTokens: number;
     readonly outputTokens: number;
@@ -1653,6 +1679,12 @@ export type ManagedControlOutcome = {
 };
 
 export type ManagedControlThread = {
+  readonly inputs?: readonly {
+    readonly id: string;
+    readonly turnId: string;
+    readonly status: "accepted" | "delivered" | "undelivered";
+    readonly reason?: string;
+  }[];
   readonly parentSessionId: string;
   readonly lifecycle: "open" | "closed";
   readonly displayName: string;
@@ -1665,8 +1697,19 @@ export type ManagedControlThread = {
     readonly turnId: string;
     readonly attemptId: string;
     readonly childSessionId: string;
-    readonly phase: "starting" | "executing" | "settling" | "idle" | "waiting";
-    readonly waitReason: "none" | "suspended";
+    readonly phase: "starting" | "executing" | "settling" | "idle" | "waiting" | "queued";
+    readonly lane?: "background" | "reserved";
+    readonly admissionSequence?: number;
+    readonly hasStarted?: true;
+    readonly envelope?: ManagedDelegationEnvelope;
+    readonly configuration?: {
+      readonly digest: `sha256:${string}`;
+      readonly parentBranchId: string;
+      readonly targetId: string;
+      readonly thinking: string;
+    };
+    readonly waitReason: "none" | "suspended" | "capacity" | "permission" | "parent_input" | "plan";
+    readonly attention?: { readonly id: string; readonly kind: "permission" | "parent_input" };
     readonly ownerPhase: "waiting" | "claimed" | "releasing" | "released";
     readonly lastOutcome: "none" | "completed" | "failed" | "cancelled" | "interrupted";
     readonly label: string;
@@ -1685,6 +1728,22 @@ export type ManagedControlThread = {
 };
 
 export type ManagedWorkspaceSnapshot = {
+  readonly storage?: {
+    readonly status?: "known" | "unavailable";
+    readonly ceiling: number;
+    readonly usedBytes: number;
+    readonly reservedTerminalBytes: number;
+    readonly reservedStartupBytes: number;
+    readonly availableBytes: number;
+  };
+  readonly budget?: {
+    readonly ceiling: number;
+    readonly knownUsed: number;
+    readonly outstandingReserved: number;
+    readonly unknownReserved: number;
+    readonly available: number;
+    readonly overrun: number;
+  };
   readonly completions: readonly {
     readonly id: `sha256:${string}`;
     readonly threadId: string;
@@ -1700,7 +1759,117 @@ export type ManagedWorkspaceSnapshot = {
   readonly threads: readonly ManagedControlThread[];
 };
 
+export type ManagedFleetPolicy = {
+  readonly version: 1;
+  readonly background: { readonly running: number; readonly queued: number };
+  readonly reserved: { readonly running: 1; readonly queued: number };
+  readonly maximumAttempts: number;
+  readonly threadTokens: number;
+  readonly batchTokens: number;
+  readonly sessionTokens: number;
+  readonly storageBytes: number;
+};
+export type ManagedDelegationEnvelope = {
+  readonly version: 1;
+  readonly id: string;
+  readonly digest: `sha256:${string}`;
+  readonly origin: {
+    readonly kind: "main_run" | "direct_request";
+    readonly id: string;
+    readonly callId?: string | undefined;
+  };
+  readonly roles: readonly ["builtin:explore"];
+  readonly mode: "background" | "foreground";
+  readonly threads: number;
+  readonly running: number;
+  readonly queued: number;
+  readonly aggregateTokens: number;
+  readonly threadTokens: number;
+  readonly sessionTokens: number;
+  readonly context: "current_request";
+  readonly skills: readonly string[];
+  readonly policy: ManagedFleetPolicy;
+  readonly policyDigest: `sha256:${string}`;
+};
+
 export type ManagedControlCommand =
+  | {
+      readonly type: "suspend_agents";
+      readonly parentSessionId: string;
+      readonly targets?: readonly { readonly threadId: string; readonly expectedTurnId: string }[];
+    }
+  | {
+      readonly type: "resume_agents";
+      readonly parentSessionId: string;
+      readonly targets?: readonly { readonly threadId: string; readonly expectedTurnId: string }[];
+    }
+  | {
+      readonly type: "close_thread";
+      readonly parentSessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+    }
+  | {
+      readonly type: "cancel_agents";
+      readonly parentSessionId: string;
+      readonly targets: readonly { readonly threadId: string; readonly expectedTurnId: string }[];
+    }
+  | {
+      readonly type: "reply_agent";
+      readonly parentSessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+      readonly attentionId: string;
+      readonly inputId: string;
+      readonly text: string;
+    }
+  | {
+      readonly type: "post_agent";
+      readonly origin?: ManagedDelegationEnvelope["origin"];
+      readonly envelope?: ManagedDelegationEnvelope;
+      readonly parentSessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+      readonly inputId: string;
+      readonly mode: "cooperative" | "interrupt" | "new_turn";
+      readonly text: string;
+    }
+  | {
+      readonly type: "list_agents";
+      readonly parentSessionId: string;
+      readonly limit?: number;
+      readonly cursor?: string;
+    }
+  | {
+      readonly type: "wait_agents";
+      readonly parentSessionId: string;
+      readonly targets: readonly { readonly threadId: string; readonly expectedTurnId: string }[];
+      readonly mode: "any" | "all";
+    }
+  | {
+      readonly type: "decide_permission";
+      readonly parentSessionId: string;
+      readonly threadId: string;
+      readonly expectedTurnId: string;
+      readonly requestId: string;
+      readonly decision: "allow" | "deny";
+    }
+  | {
+      readonly type: "spawn_agents";
+      readonly parentSessionId: string;
+      readonly mode?: "background" | "foreground";
+      readonly envelope?: ManagedDelegationEnvelope;
+      readonly origin?: {
+        readonly kind: "main_run" | "direct_request";
+        readonly id: string;
+        readonly callId?: string;
+      };
+      readonly entries: readonly {
+        readonly role: "builtin:explore";
+        readonly task: string;
+        readonly description: string;
+      }[];
+    }
   | { readonly type: "prepare_main_delivery"; readonly parentSessionId: string }
   | {
       readonly type: "acknowledge_main_delivery";
@@ -1725,6 +1894,9 @@ export type ManagedControlCommand =
     }
   | {
       readonly type: "next_turn";
+      readonly origin?: ManagedDelegationEnvelope["origin"];
+      readonly envelope?: ManagedDelegationEnvelope;
+      readonly inputId?: string;
       readonly parentSessionId: string;
       readonly threadId: string;
       readonly expectedTurnId: string;
@@ -1736,9 +1908,20 @@ export type ManagedControlCommand =
       readonly threadId: string;
       readonly expectedTurnId: string;
     }
-  | { readonly type: "close"; readonly parentSessionId: string };
+  | { readonly type: "close"; readonly parentSessionId: string; readonly reason?: "exit" };
 
 export type ManagedControlReceipt =
+  | { readonly status: "suspended" }
+  | { readonly status: "resumed"; readonly results: readonly ManagedControlReceipt[] }
+  | { readonly status: "input_accepted"; readonly inputId: string; readonly turnId: string }
+  | {
+      readonly status: "listed";
+      readonly threads: readonly ManagedControlThread[];
+      readonly cursor?: string;
+      readonly revision: number;
+    }
+  | { readonly status: "completed"; readonly results: ManagedWorkspaceSnapshot["completions"] }
+  | { readonly status: "admitted"; readonly turns: readonly ManagedControlIdentity[] }
   | {
       readonly status: "delivery";
       readonly messages: readonly { readonly id: `sha256:${string}`; readonly text: string }[];
@@ -1749,13 +1932,18 @@ export type ManagedControlReceipt =
     }
   | { readonly status: "acknowledged" }
   | { readonly status: "cancelled"; readonly turnId: string }
-  | ({ readonly status: "accepted" } & ManagedControlIdentity)
+  | ({ readonly status: "accepted"; readonly inputId?: string } & ManagedControlIdentity)
   | { readonly status: "closed" }
   | { readonly status: "recovered" }
   | {
       readonly status: "rejected";
       readonly code:
         | "stale_revision"
+        | "capacity_exhausted"
+        | "storage_quota_exceeded"
+        | "budget_exhausted"
+        | "plan_policy_paused"
+        | "attempt_limit"
         | "authority_busy"
         | "action_unavailable"
         | "recovery_required"
@@ -1763,3 +1951,16 @@ export type ManagedControlReceipt =
         | "runtime_unavailable";
       readonly message: string;
     };
+
+export type ManagedSessionTransition = {
+  readonly id: string;
+  readonly sourceSessionId: string;
+  readonly destinationSessionId: string | null;
+  readonly runningCount: number;
+  readonly queuedCount: number;
+  readonly choices: readonly ["stay", "wait", "suspend"];
+};
+export type ManagedSessionTransitionResult =
+  | { readonly status: "ready" | "stayed" }
+  | { readonly status: "required"; readonly transition: ManagedSessionTransition }
+  | { readonly status: "rejected"; readonly message: string };

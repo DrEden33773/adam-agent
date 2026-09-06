@@ -26,6 +26,7 @@ export {
 } from "./managed-agent.js";
 export {
   createManagedAgentControl,
+  createManagedAgentControlToolRegistry,
   managedAgentRecordBarrier,
   managedAgentSettlementBarrier,
   managedControlMainRequestBoundary,
@@ -152,6 +153,7 @@ export {
   sessionLogicalRunStartedBarrier,
   sessionManagedAgentInactivityScheduler,
   sessionManagedControl,
+  sessionManagedTransition,
   sessionProjectLifecycleOwner,
   sessionRuntimeNotificationTransform,
   sessionStoreDirectory,

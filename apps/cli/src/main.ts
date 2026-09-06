@@ -313,6 +313,13 @@ function formatPermissionPrompt(
   if (event.subject.type === "input_resource") {
     return `Allow ${event.name} for linked input resource ${quoteForTerminal(event.subject.occurrenceId)} [y/N] `;
   }
+  if (event.subject.type === "managed_agent_action") {
+    const envelope = event.subject.envelope;
+    return `Allow ${event.subject.action} for the exact selected turns${envelope === undefined ? "" : `: ${envelope.threads} thread, ${envelope.running} running/${envelope.queued} queued, ${envelope.aggregateTokens} tokens; envelope ${envelope.id}`} (${event.subject.argumentsDigest}) [y/N] `;
+  }
+  if (event.subject.type === "managed_agent_batch") {
+    return `Allow ${event.subject.count} ${event.subject.mode} agents for this exact batch: ${event.subject.envelope.running} running/${event.subject.envelope.queued} queued, ${event.subject.envelope.aggregateTokens} tokens; envelope ${event.subject.envelope.id} (${event.subject.argumentsDigest}) [y/N] `;
+  }
   if (event.subject.type === "managed_agent_spawn") {
     return `Allow ${event.subject.profile} ${event.subject.mode ?? "foreground"} scout for this exact task (${event.subject.taskDigest}) [y/N] `;
   }

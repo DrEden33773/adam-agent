@@ -83,6 +83,8 @@ import {
 import { createPlanGitAttestationV1, type PlanGitAttestationV1 } from "./plan-git-policy.js";
 import {
   digestApprovedPlanProjectionV1,
+  isHybridPlanPolicy,
+  isPlanDelegationTool,
   type PlanCycleSnapshot,
   submitPlanToolDefinitionV1,
 } from "./plan-mode.js";
@@ -116,6 +118,7 @@ import { sessionTitleFallback } from "./session-naming.js";
 import {
   type CanonicalRuntimeEvent,
   isSessionRecordWithinSizeLimit,
+  SessionLogicalQuotaError,
   type SessionModelResponse,
   type SessionModelResponseField,
   type SessionPartialOutputV1,
@@ -182,6 +185,11 @@ type AgentSessionBaseDependencies = {
 
 export const sessionToolProfileNames = Symbol("adam-agent.session-tool-profile-names");
 export const managedAgentPromptSummary = Symbol("adam-agent.managed-agent-prompt-summary");
+export const managedAgentInterruptAfterEffect = Symbol(
+  "adam-agent.managed-agent-interrupt-after-effect",
+);
+export const managedAgentStorageQuota = Symbol("adam-agent.managed-agent-storage-quota");
+export const managedAgentRuntimeBoundary = Symbol("adam-agent.managed-agent-runtime-boundary");
 export const managedAgentRequestBoundary = Symbol("adam-agent.managed-agent-request-boundary");
 export const managedAgentPartialOutput = Symbol("adam-agent.managed-agent-partial-output");
 /** Internal crash conformance barrier, after the canonical append has succeeded. */
@@ -225,6 +233,19 @@ export class AgentSession {
   #planGitAttestation: PlanGitAttestationV1 | undefined;
   readonly #permissions: PermissionPolicy | undefined;
   readonly #managedAgentPromptSummary: (() => string) | undefined;
+  readonly #managedAgentInterruptAfterEffect:
+    | (() => Promise<
+        readonly { readonly id: `sha256:${string}`; readonly digest: `sha256:${string}` }[]
+      >)
+    | undefined;
+  readonly #managedAgentStorageQuota:
+    | ((
+        records: readonly SessionRecord[],
+        terminal: boolean,
+        commit: () => Promise<void>,
+      ) => Promise<void>)
+    | undefined;
+  readonly #managedAgentRuntimeBoundary: ((record: SessionRecord) => Promise<void>) | undefined;
   readonly #managedAgentRequestBoundary: ManagedAgentRequestBoundary | undefined;
   readonly #recordCommittedBarrier: ((record: SessionRecord) => Promise<void>) | undefined;
   readonly #retainManagedPartialOutput: boolean;
@@ -358,6 +379,27 @@ export class AgentSession {
         readonly [managedAgentPromptSummary]?: () => string;
       }
     )[managedAgentPromptSummary];
+    this.#managedAgentInterruptAfterEffect = (
+      dependencies as AgentSessionDependencies & {
+        readonly [managedAgentInterruptAfterEffect]?: () => Promise<
+          readonly { readonly id: `sha256:${string}`; readonly digest: `sha256:${string}` }[]
+        >;
+      }
+    )[managedAgentInterruptAfterEffect];
+    this.#managedAgentStorageQuota = (
+      dependencies as AgentSessionDependencies & {
+        readonly [managedAgentStorageQuota]?: (
+          records: readonly SessionRecord[],
+          terminal: boolean,
+          commit: () => Promise<void>,
+        ) => Promise<void>;
+      }
+    )[managedAgentStorageQuota];
+    this.#managedAgentRuntimeBoundary = (
+      dependencies as AgentSessionDependencies & {
+        readonly [managedAgentRuntimeBoundary]?: (record: SessionRecord) => Promise<void>;
+      }
+    )[managedAgentRuntimeBoundary];
     this.#managedAgentRequestBoundary = (
       dependencies as AgentSessionDependencies & {
         readonly [managedAgentRequestBoundary]?: ManagedAgentRequestBoundary;
@@ -585,6 +627,11 @@ export class AgentSession {
         if (abortController.signal.aborted && this.#terminalResult === undefined) {
           return await this.#settleCancelled();
         }
+        if (error instanceof SessionLogicalQuotaError)
+          return await this.#settle({
+            status: "failed",
+            error: { code: "session_quota_exceeded", message: error.message },
+          });
         if (error instanceof ModelDriverError) {
           return await this.#settleModelRequestFailed(error);
         }
@@ -1377,6 +1424,32 @@ export class AgentSession {
         return this.#settleTokenLimitExceeded();
       }
       if (finishReason === "stop") {
+        const interruptInputs = await this.#managedAgentInterruptAfterEffect?.();
+        if (
+          interruptInputs !== undefined &&
+          interruptInputs.length > 0 &&
+          this.#durableContext !== undefined
+        ) {
+          await this.#appendRecord({
+            schemaVersion: 3,
+            sequence: this.#nextSequence,
+            record: {
+              type: "managed_input_continuation",
+              recordVersion: 1,
+              runId: this.#activeRunId as string,
+              turn: modelTurns,
+              attempt: attemptNumber,
+              inputs: interruptInputs,
+            },
+          });
+          messages.push({
+            role: "assistant",
+            content: answer,
+            toolCalls: [],
+            ...(reasoning.length === 0 ? {} : { reasoning }),
+          });
+          continue;
+        }
         const result: RunResult = { status: "completed", answer };
         return this.#settle(result);
       }
@@ -2284,9 +2357,24 @@ export class AgentSession {
       await this.#appendToolResult(messages, call, preparedCall);
       return undefined;
     }
-    const preparedPermissionSubject = preparedCall.permissionSubject;
+    let preparedPermissionSubject: PermissionSubject;
+    try {
+      preparedPermissionSubject =
+        (await preparedCall.resolvePermissionSubject?.()) ?? preparedCall.permissionSubject;
+    } catch {
+      const result: ToolResult = {
+        status: "failed",
+        error: {
+          code: "managed_agent_unavailable",
+          message: "The exact managed action could not be prepared. Inspect the current workspace.",
+        },
+      };
+      toolResultsById.set(call.id, { call, result });
+      await this.#appendToolResult(messages, call, result);
+      return undefined;
+    }
     const planCommandAssessment =
-      this.#plan?.policyVersion === "plan-policy.hybrid-v1" &&
+      isHybridPlanPolicy(this.#plan?.policyVersion) &&
       call.name === "run_shell" &&
       preparedPermissionSubject.type === "command"
         ? this.#plan.shellEnvironment !== undefined && this.#repositoryWorkspaceRoot !== undefined
@@ -2439,14 +2527,20 @@ export class AgentSession {
         }
       }
     }
-    const policyDecision =
-      this.#plan !== undefined
+    const ordinaryPolicyDecision =
+      this.#plan !== undefined && planDisposition !== undefined
         ? planDisposition === "ask"
           ? "ask"
           : "allow"
         : preparedPermissionSubject.type === "input_resource"
           ? "allow"
           : (this.#permissions?.decide(permissionInput) ?? "deny");
+    const freshEnvelope =
+      preparedPermissionSubject.type === "managed_agent_batch" ||
+      (preparedPermissionSubject.type === "managed_agent_action" &&
+        preparedPermissionSubject.envelope !== undefined);
+    const policyDecision =
+      freshEnvelope && ordinaryPolicyDecision === "allow" ? "ask" : ordinaryPolicyDecision;
     if (signal.aborted) {
       return this.#settleCancelled();
     }
@@ -2596,7 +2690,7 @@ export class AgentSession {
     if (
       this.#planGitAttestation !== undefined ||
       runId === undefined ||
-      plan?.policyVersion !== "plan-policy.hybrid-v1" ||
+      !isHybridPlanPolicy(plan?.policyVersion) ||
       shellEnvironment === undefined ||
       workspaceRoot === undefined ||
       call.name !== "run_shell" ||
@@ -4109,7 +4203,8 @@ export class AgentSession {
                 record: { type: "runtime_event", runId, event: canonicalEvent },
               },
         );
-      } catch {
+      } catch (error) {
+        if (error instanceof SessionLogicalQuotaError) throw error;
         throw new SessionPersistenceError();
       }
     }
@@ -4148,22 +4243,36 @@ export class AgentSession {
 
   async #appendRecord(record: SessionRecord): Promise<void> {
     try {
-      await this.#store.append(record);
-    } catch {
+      if (this.#managedAgentStorageQuota === undefined) await this.#store.append(record);
+      else
+        await this.#managedAgentStorageQuota([record], this.#terminalResult !== undefined, () =>
+          this.#store.append(record),
+        );
+    } catch (error) {
+      if (error instanceof SessionLogicalQuotaError) throw error;
       throw new SessionPersistenceError();
     }
     this.#nextSequence += 1;
+    await this.#managedAgentRuntimeBoundary?.(record);
     await this.#recordCommittedBarrier?.(record);
   }
 
   async #appendRecordsAtomically(records: readonly SessionRecord[]): Promise<void> {
     try {
-      await this.#store.appendBatch(records);
-    } catch {
+      if (this.#managedAgentStorageQuota === undefined) await this.#store.appendBatch(records);
+      else
+        await this.#managedAgentStorageQuota(records, this.#terminalResult !== undefined, () =>
+          this.#store.appendBatch(records),
+        );
+    } catch (error) {
+      if (error instanceof SessionLogicalQuotaError) throw error;
       throw new SessionPersistenceError();
     }
     this.#nextSequence += records.length;
-    for (const record of records) await this.#recordCommittedBarrier?.(record);
+    for (const record of records) {
+      await this.#managedAgentRuntimeBoundary?.(record);
+      await this.#recordCommittedBarrier?.(record);
+    }
   }
 
   async #persistDurableModelResponse(input: {
@@ -4692,12 +4801,16 @@ function planProfileAllowsDefinition(
     return true;
   }
   if (
-    plan.policyVersion !== "plan-policy.hybrid-v1" ||
+    !isHybridPlanPolicy(plan.policyVersion) ||
     plan.shellPolicyVersion !== "plan-shell-policy.v1"
   ) {
     return false;
   }
   return (
+    (plan.policyVersion === "plan-policy.hybrid-delegation-v1" &&
+      definition.source === "builtin" &&
+      definition.effect === "delegate" &&
+      isPlanDelegationTool(definition.name)) ||
     (definition.source === "builtin" &&
       definition.name === "run_shell" &&
       definition.effect === "execute") ||
@@ -4728,6 +4841,15 @@ function planToolDisposition(
     return "allow";
   }
   if (
+    plan.policyVersion === "plan-policy.hybrid-delegation-v1" &&
+    definition.source === "builtin" &&
+    definition.effect === "delegate" &&
+    isPlanDelegationTool(definition.name) &&
+    ((definition.name === "spawn_agents" && subject.type === "managed_agent_batch") ||
+      (subject.type === "managed_agent_action" && subject.action === definition.name))
+  )
+    return undefined;
+  if (
     definition.source === "builtin" &&
     definition.name === "run_shell" &&
     definition.effect === "execute" &&
@@ -4755,7 +4877,7 @@ function planPermissionSubject(
   assessment: PlanCommandAssessment | undefined,
 ): PermissionSubject {
   if (
-    plan?.policyVersion !== "plan-policy.hybrid-v1" ||
+    !isHybridPlanPolicy(plan?.policyVersion) ||
     plan.shellPolicyVersion !== "plan-shell-policy.v1" ||
     plan.shellEnvironment === undefined ||
     plan.gitPolicyVersion !== "git-auto-policy.v1" ||
