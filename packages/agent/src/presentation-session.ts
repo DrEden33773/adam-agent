@@ -152,6 +152,7 @@ export type PresentationHydrationBarrier = {
 
 export type PresentationRuntimeRefreshBarrier = {
   beforeRead(notification: SessionRuntimeNotification): Promise<void>;
+  beforePublish?(notification: SessionRuntimeNotification): Promise<void>;
 };
 
 export type PresentationArtifactReadBarrier = {
@@ -1718,6 +1719,7 @@ export async function createPresentationSession(
         throughSequence: snapshot.lastSequence,
       };
       publishStateChange();
+      replayBufferedRuntimeEvents();
       for (const operation of activatedOperations) {
         watchOperation(operation);
       }
@@ -2058,6 +2060,14 @@ export async function createPresentationSession(
       handleManagedAgentEvent(event);
     }
     handleRuntime = (notification) => {
+      if (
+        !closed &&
+        activeRun?.sessionId === notification.sessionId &&
+        state.authoritative.active?.session.id !== notification.sessionId
+      ) {
+        bufferedEvents.push(notification);
+        return;
+      }
       if (seenRuntimeNotificationIds.has(notification.notificationId)) {
         return;
       }
@@ -2288,9 +2298,7 @@ export async function createPresentationSession(
               };
               publishStateChange();
             }
-            const pendingInteractions = withManagedPermissionInteractions(
-              await projectPendingInteractions(refreshedRecords, options),
-            );
+            const pendingInteractions = await projectPendingInteractions(refreshedRecords, options);
             const recoveredReasoning =
               missingReasoningSnapshot === undefined
                 ? undefined
@@ -2308,6 +2316,8 @@ export async function createPresentationSession(
             const terminalContextUsage = isAssistantTerminalEvent(event)
               ? await options.lifecycle.inspectContextUsage({ sessionId: active.session.id })
               : null;
+            const beforePublish = options[presentationRuntimeRefreshBarrier]?.beforePublish;
+            if (beforePublish !== undefined) await beforePublish(notification);
             const latest = state.authoritative.active;
             if (closed || latest === null || latest.session.id !== active.session.id) {
               return;
@@ -2370,7 +2380,7 @@ export async function createPresentationSession(
                       modelTargetSnapshot,
                     ),
                   ),
-                  pendingInteractions,
+                  pendingInteractions: withManagedPermissionInteractions(pendingInteractions),
                   ...(refreshedTodo === undefined ? {} : { todo: refreshedTodo }),
                 },
               },
@@ -2422,18 +2432,21 @@ export async function createPresentationSession(
           }
         });
     };
-    for (const event of bufferedEvents.splice(0)) {
-      const hydratedThrough =
-        state.authoritative.continuity.status === "current"
-          ? state.authoritative.continuity.sessionThroughSequence
-          : -1;
-      if (
-        event.sessionId === state.authoritative.active?.session.id &&
-        event.throughSequence > hydratedThrough
-      ) {
-        handleRuntime(event);
+    function replayBufferedRuntimeEvents(): void {
+      for (const event of bufferedEvents.splice(0)) {
+        const hydratedThrough =
+          state.authoritative.continuity.status === "current"
+            ? state.authoritative.continuity.sessionThroughSequence
+            : -1;
+        if (
+          event.sessionId === state.authoritative.active?.session.id &&
+          event.throughSequence > hydratedThrough
+        ) {
+          handleRuntime?.(event);
+        }
       }
     }
+    replayBufferedRuntimeEvents();
     handleMetadata = (event) => {
       metadataRefresh = metadataRefresh.then(async () => {
         const active = state.authoritative.active;
@@ -5194,6 +5207,7 @@ export async function createPresentationSession(
               return;
             }
             admittedSessionId = receipt.sessionId;
+            if (activeRun === runState) runState.sessionId = receipt.sessionId;
             admission.resolve(receipt.sessionId);
           },
         });

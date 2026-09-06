@@ -4632,6 +4632,10 @@ test("SessionLifecycle serializes child Web permission overlays and projects per
     { readonly type: "tool_permission_requested" }
   >[] = [];
   const permissionDecisionEvents: RuntimeEvent[] = [];
+  const releaseFirstPermissionRequest = Promise.withResolvers<void>();
+  const terminalPermissions = Promise.withResolvers<unknown>();
+  let heldRefresh = false;
+  let terminalPublishExpected = false;
   const firstPermission = Promise.withResolvers<string>();
   const secondPermission = Promise.withResolvers<string>();
   const thirdPermission = Promise.withResolvers<string>();
@@ -4658,6 +4662,7 @@ test("SessionLifecycle serializes child Web permission overlays and projects per
         const call = (childCalls.get(childId) ?? 0) + 1;
         childCalls.set(childId, call);
         if (call === 1) {
+          if (childId === "permission-child-1") await releaseFirstPermissionRequest.promise;
           if (childId === "permission-child-2") {
             await releaseSecondPermissionRequest.promise;
           }
@@ -4823,12 +4828,32 @@ test("SessionLifecycle serializes child Web permission overlays and projects per
     const presentation = await createPresentationSession({
       lifecycle,
       projectLabel: "child-web-permissions",
+      [presentationRuntimeRefreshBarrier]: {
+        async beforeRead() {},
+        async beforePublish(notification) {
+          if (
+            heldRefresh ||
+            parentCalls < 2 ||
+            notification.event.type !== "model_message_completed"
+          )
+            return;
+          heldRefresh = true;
+          releaseFirstPermissionRequest.resolve();
+          await firstPermission.promise;
+          terminalPublishExpected = true;
+        },
+      },
       sessionId: created.sessionId,
       stateRoot,
       workspaceRoot,
     });
     const permissionStatusVisible = Promise.withResolvers<void>();
     const unsubscribePermissionStatus = presentation.subscribe(() => {
+      if (terminalPublishExpected && presentation.getState().transient === null) {
+        terminalPermissions.resolve(
+          presentation.getState().authoritative.active?.pendingInteractions,
+        );
+      }
       if (
         presentation
           .getState()
@@ -4848,6 +4873,12 @@ test("SessionLifecycle serializes child Web permission overlays and projects per
       permissionStatusVisible.promise,
       "The managed permission-required state was never projected.",
     );
+    expect(
+      await withManagedFailureGuard(
+        terminalPermissions.promise,
+        "The held terminal refresh did not publish.",
+      ),
+    ).toMatchObject([{ requestId: firstRequestId }]);
     expect(permissionEvents).toHaveLength(1);
     expect(presentation.getState().authoritative.managedAgents).toMatchObject({
       counts: { active: 2, attention: 1 },
@@ -4960,6 +4991,7 @@ test("SessionLifecycle serializes child Web permission overlays and projects per
     unsubscribePermissionStatus();
     await presentation.close();
   } finally {
+    releaseFirstPermissionRequest.resolve();
     releaseSecondPermissionRequest.resolve();
     await lifecycle.close();
     await rm(testRoot, { recursive: true, force: true });
