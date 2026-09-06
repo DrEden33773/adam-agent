@@ -1,3 +1,7 @@
+import type {
+  ManagedDelegationEnvelope,
+  ManagedDelegationSelection,
+} from "@adam-agent/presentation";
 import type { ArtifactReference, ChangePreviewArtifactSource } from "./artifact-store.js";
 import type { ContextCallUsage } from "./durable-context.js";
 import type { InputResourceOccurrenceV1 } from "./input-resources.js";
@@ -203,6 +207,8 @@ export type RunResult =
     };
 
 export type PermissionDecisionCommand = {
+  readonly delegation?: ManagedDelegationEnvelope;
+  readonly delegationSelection?: ManagedDelegationSelection;
   readonly requestId: string;
   readonly decision: "allow" | "deny";
 };

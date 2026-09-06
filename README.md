@@ -90,6 +90,8 @@ Extension JavaScript runs with the Adam process's authority: this is not a packa
 
 ## Development
 
+The [managed-control candidate](docs/managed-control-candidate.md) documents the internal role, direct-input, grant and recovery composition, including its test coverage and current publication boundary.
+
 ```bash
 corepack enable
 pnpm install --frozen-lockfile

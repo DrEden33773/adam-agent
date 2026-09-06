@@ -164,6 +164,7 @@ export class AgentWorkspace implements Component {
       readonly initialView?: "workspace" | "settings" | "history";
       readonly onSettings: (settings: AgentUiSettings | null) => Promise<CommandReceipt>;
       readonly onAttention: () => void;
+      readonly onTypes?: () => void;
       readonly theme: AdamTuiTheme;
       readonly maximumLines: () => number;
       readonly onChange: () => void;
@@ -281,6 +282,10 @@ export class AgentWorkspace implements Component {
           });
       }
       this.options.onChange();
+      return;
+    }
+    if (matchesKey(data, "t") && !isKeyRepeat(data)) {
+      this.options.onTypes?.();
       return;
     }
     if (matchesKey(data, "s") && !isKeyRepeat(data)) {
@@ -587,8 +592,8 @@ export class AgentWorkspace implements Component {
       ].join(" · ");
       const hints = [
         width < 72
-          ? "Enter inspect · h/s/a · Esc"
-          : "Enter inspect · h history · s settings · a attention · Esc back",
+          ? "Enter inspect · t types · h/s/a · Esc"
+          : "Enter inspect · t types · h history · s settings · a attention · Esc back",
         ...(controls ? [controls] : []),
       ];
       const maximum = Math.max(

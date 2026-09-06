@@ -43,6 +43,7 @@ import {
   projectExecutionDomainForExtensionHost,
   withInternalExtensionSkillSourcesCurrent,
 } from "./extension-host.js";
+import { resolveFleetPolicy } from "./fleet-ledger.js";
 import {
   InputResourceError,
   type InputResourceOccurrenceV1,
@@ -118,6 +119,7 @@ import {
   digestApprovedPlanProjectionV1,
   isHybridPlanPolicy,
   isPlanDelegationTool,
+  isPlanWebTool,
   type PlanApprovalIntentV1,
   type PlanEligibleToolProfileV1,
   type PlanPolicyVersion,
@@ -159,6 +161,11 @@ import {
   RepositoryInstructionsError,
 } from "./repository-instructions.js";
 import {
+  type AgentRoleAdministration,
+  createAgentRoleAdministration,
+} from "./role-administration.js";
+import { createAgentRoleCatalog } from "./role-catalog.js";
+import {
   createWorkspaceTrust,
   resolveCanonicalWorkspaceIdentity,
   type WorkspaceTrustController,
@@ -178,6 +185,7 @@ import {
   attemptStatus,
   contextSnapshotFromRecords,
   contextUsageSnapshotFromRecords,
+  inputResourceBytesFromRecords,
   isCompleteBranchBoundary,
   isGenesisRecord,
   type ModelResponseArtifactDegradation,
@@ -186,6 +194,7 @@ import {
   promptContextRecordFromRecords,
   sessionNamingStateFromRecords,
   skillContextRecordFromRecords,
+  skillResourceBytesFromRecords,
   snapshotFromGenesis,
   snapshotFromRecords,
 } from "./session-history-folds.js";
@@ -228,6 +237,7 @@ import {
   buildSkillResourceManifestV1,
   createInitialSkillContextV1,
   type ExtensionSkillSourceV1,
+  readActiveSkillContentsV1,
   reconcileExtensionSkillContextV1,
   reloadSkillContextV1,
   type SkillContextRecordV1,
@@ -457,6 +467,7 @@ export type WorkspaceMcpLeaseTransitionBarrier = {
 /** Internal candidate composition; the default entry remains unchanged until cutover. */
 export const sessionManagedTransition = Symbol("adam-agent.session-managed-transition");
 export const sessionManagedControl = Symbol("adam-agent.session-managed-control");
+export const sessionDraftRoles = Symbol("adam-agent.session-draft-roles");
 
 export type SessionLifecycleOptions = {
   readonly [sessionManagedControl]?: {
@@ -466,6 +477,7 @@ export type SessionLifecycleOptions = {
     >;
     readonly [sessionRecordCommittedBarrier]?: (record: SessionRecord) => Promise<void>;
     readonly planPolicyVersion?: PlanPolicyVersion;
+    readonly userRoleDirectory?: string;
     readonly policy?: import("./fleet-ledger.js").FleetPolicy;
     readonly store: import("./managed-agent-folds.js").ManagedControlStore;
     readonly childSessionStores: SessionStoreDirectory<SessionRecord>;
@@ -539,6 +551,8 @@ export type NewSessionDraftSnapshot = {
   readonly targetIdentity: ModelTargetIdentity;
   readonly contextProfile: ContextProfile;
   readonly skillContext: SkillContextSnapshot;
+  readonly agentRoles?: import("./role-catalog.js").AgentRoleCatalog;
+  readonly delegationPolicy?: import("./fleet-ledger.js").FleetPolicy;
 };
 
 export type SessionAdmissionReceipt = {
@@ -768,6 +782,9 @@ export interface SessionLifecycle {
     readonly transitionId?: string;
     readonly decision?: "stay" | "wait" | "suspend";
   }) => Promise<ManagedSessionTransitionResult>;
+  readonly [sessionDraftRoles]: (
+    targetIdentity: ModelTargetIdentity,
+  ) => AgentRoleAdministration | undefined;
   readonly [sessionManagedControl]: (
     sessionId: string,
   ) => Promise<import("./managed-agent-control.js").ManagedAgentControl | undefined>;
@@ -831,7 +848,10 @@ export interface SessionLifecycle {
   configureWorkspaceTrust(
     command: WorkspaceTrustCommand,
   ): Promise<WorkspaceTrustConfigurationResult>;
-  create(input: { readonly targetIdentity: ModelTargetIdentity }): Promise<CurrentSessionSnapshot>;
+  create(input: {
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly mode?: "default" | "plan";
+  }): Promise<CurrentSessionSnapshot>;
   decidePermission(command: PermissionDecisionCommand): PermissionDecisionCommandResult;
   enableAutomaticTitles(): void;
   ensureAutomaticTitle(input: { readonly sessionId: string }): Promise<SessionNamingResult>;
@@ -902,6 +922,7 @@ export interface SessionLifecycle {
   }): Promise<ProjectSessionCatalogPage>;
   previewNewSession(input: {
     readonly targetIdentity: ModelTargetIdentity;
+    readonly thinkingSelection?: ThinkingPolicySelectionV1;
     readonly signal?: AbortSignal;
   }): Promise<NewSessionDraftSnapshot>;
   reloadRepositoryInstructions(input: {
@@ -945,7 +966,7 @@ export interface SessionLifecycle {
 }
 
 function resolveRunThinkingPolicy(
-  resolved: Awaited<ReturnType<ModelTargets["resolve"]>>,
+  resolved: Pick<Awaited<ReturnType<ModelTargets["resolve"]>>, "identity" | "thinkingCapability">,
   selection: ThinkingPolicySelectionV1 | undefined,
 ): ThinkingPolicySnapshotV1 | undefined {
   if (resolved.thinkingCapability === undefined) {
@@ -1395,6 +1416,107 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       return { status: "ready" };
     });
   };
+  const { XDG_CONFIG_HOME: roleConfigHome } = process.env;
+  const agentRoleCatalog = createAgentRoleCatalog({
+    workspaceRoot: options.workspaceRoot,
+    userDirectory:
+      options[sessionManagedControl]?.userRoleDirectory ??
+      join(roleConfigHome || join(homedir(), ".config"), "adam-agent", "agents"),
+    projectTrusted: async () => (await inspectWorkspaceTrust()).status === "trusted",
+  });
+  const roleTargets = async () =>
+    (await options.modelTargets?.snapshot({ signal: new AbortController().signal }))?.targets
+      .filter(
+        (target) =>
+          target.identity.certification === "certified" && target.readiness.status === "available",
+      )
+      .map((target) => ({
+        targetId: target.identity.targetId,
+        label: target.catalog?.displayName ?? target.identity.targetId,
+        thinkingLevels:
+          target.thinkingCapability?.levels.map((level) => ({
+            id: level.id,
+            label: level.label,
+          })) ?? [],
+      })) ?? [];
+  const resolveRoleTarget = async (
+    inheritedTargetIdentity: ModelTargetIdentity,
+    input: Parameters<
+      NonNullable<Parameters<typeof createManagedAgentControl>[0]["resolveRoleTarget"]>
+    >[0],
+    inheritedContextProfile?: ContextProfile,
+  ) => {
+    const frozen = input.frozen;
+    const targetId =
+      frozen?.targetIdentity.targetId ?? input.role.model ?? inheritedTargetIdentity.targetId;
+    const targets = await options.modelTargets?.snapshot({
+      signal: new AbortController().signal,
+    });
+    const candidate = targets?.targets.find(
+      (target) =>
+        target.identity.targetId === targetId &&
+        target.identity.certification === "certified" &&
+        target.readiness.status === "available",
+    );
+    if (candidate === undefined)
+      throw new Error(
+        `Configured role target ${targetId} is unavailable. Choose Use inherited, Update, or Cancel.`,
+      );
+    const target = await options.modelTargets?.resolve({
+      targetId,
+      targetIdentity:
+        frozen?.targetIdentity ??
+        (input.role.model === undefined ? inheritedTargetIdentity : candidate.identity),
+      allowExperimental: false,
+      signal: new AbortController().signal,
+    });
+    if (
+      target === undefined ||
+      target.identity.certification !== "certified" ||
+      !sameModelTargetIdentity(
+        target.identity,
+        frozen?.targetIdentity ??
+          (input.role.model === undefined ? inheritedTargetIdentity : candidate.identity),
+      )
+    )
+      throw new SessionLifecycleError("session_model_target_incompatible");
+    const inherited = input.inheritedThinking;
+    let thinkingPolicy = frozen?.thinkingPolicy;
+    if (frozen !== undefined) {
+      if (!isHistoricalContextProfileSupported(target.contextProfile, frozen.contextProfile))
+        throw new SessionLifecycleError("session_model_target_incompatible");
+      if (thinkingPolicy !== undefined)
+        thinkingPolicy = requireRecoveredThinkingPolicy(
+          target,
+          thinkingPolicy as ThinkingPolicySnapshotV1,
+        );
+    } else if (
+      input.role.thinking !== undefined ||
+      (input.role.model !== undefined && inherited !== undefined)
+    ) {
+      if (target.thinkingCapability === undefined)
+        throw new SessionLifecycleError("session_thinking_policy_unsupported");
+      thinkingPolicy = resolveThinkingPolicy(
+        target.thinkingCapability,
+        input.role.thinking ?? inherited?.effectiveLevelId,
+        target.identity,
+      );
+    } else thinkingPolicy = inherited ?? resolveRunThinkingPolicy(target, undefined);
+    const configuredContext =
+      frozen === undefined && input.role.model !== undefined && options.preferences !== undefined
+        ? await options.preferences.resolveContextProfile(target.contextProfile)
+        : target.contextProfile;
+    return {
+      targetIdentity: target.identity,
+      contextProfile:
+        frozen?.contextProfile ??
+        (input.role.model === undefined
+          ? (inheritedContextProfile ?? target.contextProfile)
+          : configuredContext),
+      ...(thinkingPolicy === undefined ? {} : { thinkingPolicy }),
+      model: target.driver,
+    };
+  };
   const managedControls = new Map<string, Promise<ManagedAgentControl | undefined>>();
   const resolveManagedControl = async (
     sessionId: string,
@@ -1431,7 +1553,13 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           !isHistoricalContextProfileSupported(resolved.contextProfile, contextProfile)
         )
           throw new SessionLifecycleError("session_model_target_incompatible");
+        const webTools = await toolsForWebProfile(genesis.record.webEvidence);
         return createManagedAgentControl({
+          roleCatalog: agentRoleCatalog,
+          roleTargets,
+          resolveRoleTarget: (input) =>
+            resolveRoleTarget(snapshot.targetIdentity, input, contextProfile),
+          ...(webTools === undefined ? {} : { webTools }),
           parentSessionId: sessionId,
           projectId: snapshot.projectId as `sha256:${string}`,
           workspaceRoot: options.workspaceRoot,
@@ -1457,11 +1585,62 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               return operation();
             }),
           artifactStore: sharedArtifactStore,
+          artifactRoot: join(effectiveStateRoot, "artifacts"),
+          resolveArtifactSelections: async (ids) => {
+            const records = await readSessionRecords(options, sessionId);
+            const genesis = records[0];
+            const boundary = records.at(-1);
+            if (genesis === undefined || !isGenesisRecord(genesis) || boundary === undefined)
+              throw new SessionLifecycleError("session_invalid");
+            validateCurrentSessionHistory(genesis, records, options.workspaceRoot);
+            const visible = await inputResourcesFromLineage(lineage, genesis, records);
+            const selected = ids.map((id) =>
+              visible.find((resource) => resource.occurrenceId === id),
+            );
+            if (selected.some((resource) => resource === undefined))
+              throw new InputResourceError(
+                "input_resource_invalid_selection",
+                "Select an exact available parent attachment.",
+              );
+            return selected
+              .filter((resource) => resource !== undefined)
+              .map((resource) => ({
+                resource,
+                source: {
+                  parentSessionId: sessionId,
+                  sequence: boundary.sequence,
+                  digest: managedTranscriptLink(records).digest,
+                  occurrenceId: resource.occurrenceId,
+                },
+              }));
+          },
+          resolveSkillSources: () => resolveExtensionSkillSources(options),
+          authorizeProjectContextLoad: async () =>
+            (await inspectWorkspaceTrust()).status === "trusted",
+          ...(options.extensionHost === undefined
+            ? {}
+            : {
+                withCurrentExtensionSkillSources: <T>(
+                  sources: readonly ExtensionSkillSourceV1[],
+                  operation: () => Promise<T>,
+                ) =>
+                  withInternalExtensionSkillSourcesCurrent(
+                    options.extensionHost as ExtensionHost,
+                    sources.map((source) => ({
+                      extensionId: source.locator.extensionId,
+                      packageName: source.locator.packageName,
+                      packageVersion: source.locator.packageVersion,
+                      lifecycleRevision: source.lifecycleRevision,
+                      lifecycleDigest: source.lifecycleDigest,
+                    })),
+                    operation,
+                  ),
+              }),
           readPlan: async () => {
             const current = await inspectSession({ sessionId });
             return current.schemaVersion === 3 ? current.plan : undefined;
           },
-          resolveFrozenContext: async () => {
+          resolveFrozenContext: async (directThinkingSelection) => {
             const current = await readSessionRecords(options, sessionId);
             const first = current[0];
             if (first === undefined || !isGenesisRecord(first))
@@ -1472,17 +1651,19 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
               (record) =>
                 record.schemaVersion === 3 && record.record.type === "logical_run_started",
             );
+            const thinkingPolicy =
+              directThinkingSelection !== undefined
+                ? resolveRunThinkingPolicy(resolved, directThinkingSelection ?? undefined)
+                : run?.schemaVersion === 3 && run.record.type === "logical_run_started"
+                  ? run.record.thinkingPolicy
+                  : undefined;
             return {
               parentBranchId: sessionId,
               parentRequest:
                 run?.schemaVersion === 3 && run.record.type === "logical_run_started"
                   ? run.record.userMessage
                   : "",
-              ...(run?.schemaVersion === 3 &&
-              run.record.type === "logical_run_started" &&
-              run.record.thinkingPolicy !== undefined
-                ? { thinkingPolicy: run.record.thinkingPolicy }
-                : {}),
+              ...(thinkingPolicy === undefined ? {} : { thinkingPolicy }),
               ...(promptContext === undefined ? {} : { repository: promptContext.repository }),
               ...(skillContext === undefined ? {} : { skillContext }),
             };
@@ -1521,6 +1702,45 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     }
     return pending;
   };
+  const toolsForWebProfile = async (
+    webEvidence: WebEvidenceProfileV1 | undefined,
+  ): Promise<ToolRegistry | undefined> => {
+    if (webEvidence === undefined) return undefined;
+    if (options.webHttp === undefined || options.webSearchConfiguration === undefined) {
+      throw new SessionLifecycleError("session_invalid");
+    }
+    const currentConfiguration = await options.webSearchConfiguration.load();
+    const desiredProvider = webEvidence.searchProvider;
+    const searchAvailable = async () => {
+      const current = await options.webSearchConfiguration?.load();
+      return (
+        desiredProvider !== null &&
+        current?.status === "configured" &&
+        current.provider !== null &&
+        isDeepStrictEqual(current.provider, desiredProvider)
+      );
+    };
+    return createWebEvidenceProduction({
+      artifactStore: sharedArtifactStore,
+      configuration:
+        desiredProvider === null
+          ? {
+              status: "unconfigured",
+              provider: null,
+              syntheticDnsRange: currentConfiguration.syntheticDnsRange ?? null,
+              diagnostic: null,
+            }
+          : {
+              status: "configured",
+              provider: desiredProvider,
+              syntheticDnsRange: currentConfiguration.syntheticDnsRange ?? null,
+              diagnostic: null,
+            },
+      http: options.webHttp,
+      ...(desiredProvider === null ? {} : { searchAvailable }),
+      store: webEvidenceStore,
+    });
+  };
   const toolsForSession = async (
     sessionId: string,
     targetIdentity: ModelTargetIdentity,
@@ -1530,43 +1750,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   ): Promise<ToolRegistry> => {
     const base = options.tools;
     let baseWithWeb = base;
-    if (webEvidence !== undefined) {
-      if (
-        options.webHttp === undefined ||
-        options.webSearchConfiguration === undefined ||
-        base === undefined
-      ) {
-        throw new SessionLifecycleError("session_invalid");
-      }
-      const currentConfiguration = await options.webSearchConfiguration.load();
-      const desiredProvider = webEvidence.searchProvider;
-      const searchAvailable =
-        desiredProvider !== null &&
-        currentConfiguration.status === "configured" &&
-        currentConfiguration.provider !== null &&
-        isDeepStrictEqual(currentConfiguration.provider, desiredProvider);
-      const webTools = await createWebEvidenceProduction({
-        artifactStore: sharedArtifactStore,
-        configuration:
-          desiredProvider === null
-            ? {
-                status: "unconfigured",
-                provider: null,
-                syntheticDnsRange: currentConfiguration.syntheticDnsRange ?? null,
-                diagnostic: null,
-              }
-            : {
-                status: "configured",
-                provider: desiredProvider,
-                syntheticDnsRange: currentConfiguration.syntheticDnsRange ?? null,
-                diagnostic: null,
-              },
-        http: options.webHttp,
-        ...(desiredProvider === null ? {} : { searchAvailable }),
-        store: webEvidenceStore,
-      });
+    const webTools = await toolsForWebProfile(webEvidence);
+    if (webTools !== undefined && base !== undefined)
       baseWithWeb = combineToolRegistries(base, webTools);
-    }
     if (
       options[sessionManagedControl] !== undefined &&
       managedAgentTools === undefined &&
@@ -3410,7 +3596,77 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     };
   };
 
+  const resolveCreationTarget = async (
+    targetIdentity: ModelTargetIdentity,
+    signal?: AbortSignal,
+  ) => {
+    const officialResolved = await options.modelTargets?.resolve({
+      targetId: targetIdentity.targetId,
+      targetIdentity: targetIdentity,
+      allowExperimental: targetIdentity.certification === "experimental",
+      signal: signal ?? new AbortController().signal,
+    });
+    let resolved = officialResolved;
+    if (officialResolved !== undefined && options.preferences !== undefined) {
+      try {
+        resolved = {
+          ...officialResolved,
+          contextProfile: await options.preferences.resolveContextProfile(
+            officialResolved.contextProfile,
+          ),
+        };
+      } catch {
+        throw new SessionLifecycleError("session_user_configuration_invalid");
+      }
+    }
+    if (
+      resolved === undefined ||
+      !sameModelTargetIdentity(resolved.identity, targetIdentity) ||
+      !modelTargetUsesContextProfile(targetIdentity, resolved.contextProfile) ||
+      !isContextProfileSupported(resolved.contextProfile)
+    ) {
+      throw new SessionLifecycleError("session_model_target_incompatible");
+    }
+    return resolved;
+  };
+
+  const prepareCreationPlan = async (
+    prepared: Awaited<ReturnType<typeof prepareSessionCreation>>,
+    mode?: "default" | "plan",
+  ) => {
+    let plan: SessionPlanCycleEnteredRecord | undefined;
+    if (mode === "plan") {
+      const promptContext = prepared.genesis.record.promptContext;
+      if (promptContext === undefined) {
+        throw new SessionLifecycleError("session_invalid");
+      }
+      plan = await preparePlanCycleEntry(
+        2,
+        planToolProfileFromAuthority(
+          promptContext.toolProfile,
+          prepared.tools,
+          undefined,
+          options[sessionManagedControl]?.planPolicyVersion ??
+            (options[sessionManagedControl] === undefined
+              ? "plan-policy.hybrid-v1"
+              : "plan-policy.hybrid-delegation-v1"),
+        ),
+      );
+    }
+    return plan;
+  };
+
   return {
+    [sessionDraftRoles](targetIdentity) {
+      if (options[sessionManagedControl] === undefined || lifecycleClosing) return undefined;
+      return createAgentRoleAdministration({
+        roleCatalog: agentRoleCatalog,
+        roleTargets,
+        inheritedTargetId: targetIdentity.targetId,
+        inspectTarget: (role) => resolveRoleTarget(targetIdentity, { role }),
+        authorize: (operation) => withOwner(operation),
+      });
+    },
     [sessionManagedControl]: resolveManagedControl,
     [sessionManagedTransition]: transitionManagedParent,
     async admit(input) {
@@ -3428,33 +3684,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       }
       const created = await withOwner(async () => {
         await requireTrustedWorkspace();
-        const officialResolved = await options.modelTargets?.resolve({
-          targetId: input.targetIdentity.targetId,
-          targetIdentity: input.targetIdentity,
-          allowExperimental: input.targetIdentity.certification === "experimental",
-          signal: input.signal ?? new AbortController().signal,
-        });
-        let resolved = officialResolved;
-        if (officialResolved !== undefined && options.preferences !== undefined) {
-          try {
-            resolved = {
-              ...officialResolved,
-              contextProfile: await options.preferences.resolveContextProfile(
-                officialResolved.contextProfile,
-              ),
-            };
-          } catch {
-            throw new SessionLifecycleError("session_user_configuration_invalid");
-          }
-        }
-        if (
-          resolved === undefined ||
-          !sameModelTargetIdentity(resolved.identity, input.targetIdentity) ||
-          !modelTargetUsesContextProfile(input.targetIdentity, resolved.contextProfile) ||
-          !isContextProfileSupported(resolved.contextProfile)
-        ) {
-          throw new SessionLifecycleError("session_model_target_incompatible");
-        }
+        const resolved = await resolveCreationTarget(input.targetIdentity, input.signal);
         const thinkingPolicy = resolveRunThinkingPolicy(resolved, input.thinkingSelection);
         const prepared = await prepareSessionCreation({
           targetIdentity: input.targetIdentity,
@@ -3463,25 +3693,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ...(input.input.skills === undefined ? {} : { skills: input.input.skills }),
           resolved,
         });
-        let plan: SessionPlanCycleEnteredRecord | undefined;
-        if (input.mode === "plan") {
-          const promptContext = prepared.genesis.record.promptContext;
-          if (promptContext === undefined) {
-            throw new SessionLifecycleError("session_invalid");
-          }
-          plan = await preparePlanCycleEntry(
-            2,
-            planToolProfileFromAuthority(
-              promptContext.toolProfile,
-              prepared.tools,
-              undefined,
-              options[sessionManagedControl]?.planPolicyVersion ??
-                (options[sessionManagedControl] === undefined
-                  ? "plan-policy.hybrid-v1"
-                  : "plan-policy.hybrid-delegation-v1"),
-            ),
-          );
-        }
+        const plan = await prepareCreationPlan(prepared, input.mode);
         input.signal?.throwIfAborted();
         let snapshot: CurrentSessionSnapshot;
         try {
@@ -4035,9 +4247,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       await requireManagedSelection(null);
       const snapshot = await withOwner(async () => {
         await requireTrustedWorkspace();
-        return persistPreparedSession(
-          await prepareSessionCreation({ targetIdentity: input.targetIdentity }),
-        );
+        const resolved =
+          input.mode === undefined ? undefined : await resolveCreationTarget(input.targetIdentity);
+        const prepared = await prepareSessionCreation({
+          targetIdentity: input.targetIdentity,
+          ...(resolved === undefined ? {} : { resolved }),
+        });
+        const plan = await prepareCreationPlan(prepared, input.mode);
+        return persistPreparedSession({ ...prepared, ...(plan === undefined ? {} : { plan }) });
       });
       if (options[sessionManagedControl] !== undefined)
         await serializeFamily(async () => {
@@ -4738,11 +4955,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             ...(resumeState === undefined
               ? {}
               : {
-                  inputResourceRunBytes: inputResourceBytesForRun(
+                  inputResourceRunBytes: inputResourceBytesFromRecords(
                     replayRecords,
                     resumeState.agentState.runId,
                   ),
-                  skillResourceRunBytes: skillResourceBytesForRun(
+                  skillResourceRunBytes: skillResourceBytesFromRecords(
                     replayRecords,
                     resumeState.agentState.runId,
                   ),
@@ -5841,7 +6058,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         const genesis = childRecords?.[0];
         if (childRecords === undefined || genesis === undefined || !isGenesisRecord(genesis))
           throw new SessionLifecycleError("session_invalid");
-        validateManagedChildGenesis(admission, genesis);
+        validateManagedChildGenesis(admission, genesis, childRecords);
         validateCurrentSessionHistory(genesis, childRecords, options.workspaceRoot);
         const outcome = controlRecords.find(
           (record) => record.turnId === input.turnId && record.event.type === "outcome",
@@ -6056,6 +6273,8 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         if (target === undefined || target.readiness.status !== "available") {
           throw new SessionLifecycleError("session_model_target_unavailable");
         }
+        if (input.thinkingSelection !== undefined)
+          resolveRunThinkingPolicy(target, input.thinkingSelection);
         if (
           !modelTargetUsesContextProfile(input.targetIdentity, target.contextProfile) ||
           !isContextProfileSupported(target.contextProfile)
@@ -6087,6 +6306,15 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           targetIdentity: input.targetIdentity,
           contextProfile,
           skillContext: skillContextSnapshot(skillContext),
+          ...(options[sessionManagedControl] === undefined
+            ? {}
+            : {
+                agentRoles: await agentRoleCatalog.inspect(),
+                delegationPolicy: resolveFleetPolicy(
+                  contextProfile,
+                  options[sessionManagedControl].policy,
+                ),
+              }),
         };
       });
     },
@@ -8418,34 +8646,12 @@ function reportedTokensForRun(
   return combined;
 }
 
-function skillResourceBytesForRun(records: readonly SessionRecord[], runId: string): number {
-  const total = records.reduce(
-    (sum, record) =>
-      record.schemaVersion === 3 &&
-      record.record.type === "skill_resource_read_committed" &&
-      record.record.runId === runId
-        ? sum + record.record.byteCount
-        : sum,
-    0,
-  );
-  if (!Number.isSafeInteger(total) || total < 0 || total > 1024 * 1024) {
-    throw new SessionLifecycleError("session_invalid");
-  }
-  return total;
-}
-
 async function skillResourceBytesFromLineage(
   lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
 ): Promise<number> {
-  const ownBytes = records.reduce(
-    (sum, record) =>
-      record.schemaVersion === 3 && record.record.type === "skill_resource_read_committed"
-        ? sum + record.record.byteCount
-        : sum,
-    0,
-  );
+  const ownBytes = skillResourceBytesFromRecords(records);
   const inheritedBytes =
     genesis.record.lineage === undefined
       ? 0
@@ -8461,47 +8667,12 @@ async function skillResourceBytesFromLineage(
   return total;
 }
 
-function inputResourceBytesForRun(records: readonly SessionRecord[], runId: string): number {
-  const total = records.reduce(
-    (sum, record) =>
-      record.schemaVersion === 3 &&
-      (record.record.type === "input_resource_read_committed" ||
-        record.record.type === "input_resource_image_read_committed") &&
-      record.record.runId === runId
-        ? sum +
-          (record.record.type === "input_resource_read_committed"
-            ? record.record.byteCount
-            : record.record.image.byteCount)
-        : sum,
-    0,
-  );
-  if (
-    !Number.isSafeInteger(total) ||
-    total < 0 ||
-    total > inputResourceLimitsV1.maximumMaterializedBytesPerRun
-  ) {
-    throw new SessionLifecycleError("session_invalid");
-  }
-  return total;
-}
-
 async function inputResourceBytesFromLineage(
   lineage: SessionLineageTraversal,
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
 ): Promise<number> {
-  const ownBytes = records.reduce(
-    (sum, record) =>
-      record.schemaVersion === 3 &&
-      (record.record.type === "input_resource_read_committed" ||
-        record.record.type === "input_resource_image_read_committed")
-        ? sum +
-          (record.record.type === "input_resource_read_committed"
-            ? record.record.byteCount
-            : record.record.image.byteCount)
-        : sum,
-    0,
-  );
+  const ownBytes = inputResourceBytesFromRecords(records);
   const inheritedBytes =
     genesis.record.lineage === undefined
       ? 0
@@ -8847,38 +9018,19 @@ async function materializeActiveSkillContents(
   options: SessionLifecycleOptions,
   context: SkillContextRecordV1 | undefined,
 ): Promise<ReadonlyMap<string, string>> {
-  const contents = new Map<string, string>();
-  if (context === undefined) {
-    return contents;
-  }
   const root = join(effectiveSessionStateRoot(options.stateRoot), "artifacts");
-  for (const activation of context.active) {
-    let bytes: Uint8Array | undefined;
-    try {
-      bytes = await readFileArtifact({
-        root,
-        id: activation.artifact.id,
-        maximumBytes: activation.byteCount,
-      });
-    } catch {
-      throw new SessionLifecycleError("session_invalid");
-    }
-    if (
-      bytes === undefined ||
-      bytes.byteLength !== activation.byteCount ||
-      `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== activation.skillMdDigest
-    ) {
-      throw new SessionLifecycleError("session_invalid");
-    }
-    let content: string;
-    try {
-      content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    } catch {
-      throw new SessionLifecycleError("session_invalid");
-    }
-    contents.set(activation.qualifiedId, content);
+  try {
+    return await readActiveSkillContentsV1(context, {
+      read: (id, limits) =>
+        readFileArtifact({
+          root,
+          id,
+          ...(limits?.maximumBytes === undefined ? {} : { maximumBytes: limits.maximumBytes }),
+        }),
+    });
+  } catch {
+    throw new SessionLifecycleError("session_invalid");
   }
-  return contents;
 }
 
 async function inspectModelResponseArtifactLineage(
@@ -9418,6 +9570,9 @@ function planToolProfileFromAuthority(
     }
     if (
       adapter.effect === "read" ||
+      (policyVersion === "plan-policy.hybrid-delegation-v1" &&
+        adapter.effect === "network" &&
+        isPlanWebTool(definition.name)) ||
       (policyVersion === "plan-policy.hybrid-delegation-v1" &&
         adapter.effect === "delegate" &&
         isPlanDelegationTool(definition.name)) ||

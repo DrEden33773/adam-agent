@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import type { ManagedControlOutcome, ManagedControlThread } from "@adam-agent/presentation";
 import type { RunResult } from "./agent-session-contracts.js";
 import type { ArtifactStore } from "./artifact-store.js";
@@ -41,7 +42,7 @@ export async function inspectManagedChildReceipt(
       return thread;
     const genesis = records?.[0];
     if (admission !== undefined && genesis !== undefined)
-      validateManagedChildGenesis(admission, genesis);
+      validateManagedChildGenesis(admission, genesis, records);
     if (
       records === undefined ||
       genesis?.schemaVersion !== 3 ||
@@ -326,6 +327,7 @@ export async function materializeManagedOutcome(
 export function validateManagedChildGenesis(
   admission: ManagedControlRecord,
   genesis: SessionRecord,
+  records?: readonly SessionRecord[],
 ): void {
   if (
     genesis.schemaVersion !== 3 ||
@@ -343,6 +345,17 @@ export function validateManagedChildGenesis(
     parent.attemptId !== admission.attemptId ||
     parent.admission.sequence !== admission.sequence ||
     parent.admission.digest !== managedControlDigest(admission)
+  )
+    throw new SessionStoreError();
+  const run = records?.find(
+    (record) => record.schemaVersion === 3 && record.record.type === "logical_run_started",
+  );
+  if (
+    admission.event.frozen.inputResources !== undefined &&
+    run?.schemaVersion === 3 &&
+    run.record.type === "logical_run_started" &&
+    (run.record.runId !== admission.turnId ||
+      !isDeepStrictEqual(run.record.inputResources, admission.event.frozen.inputResources))
   )
     throw new SessionStoreError();
 }

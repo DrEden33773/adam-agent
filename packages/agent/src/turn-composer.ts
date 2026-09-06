@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { isUnsafePresentationControl, stripTerminalSequences } from "@adam-agent/presentation";
+import { isDeepStrictEqual } from "node:util";
+import type { AtMentionAtom, DraftMentionElement } from "@adam-agent/presentation";
+import {
+  isUnsafePresentationControl,
+  leadingMentionRecipients,
+  stripTerminalSequences,
+} from "@adam-agent/presentation";
+import { draftMentionElementSchema } from "./at-mention.js";
 import type { TurnComposerResourceStager } from "./input-resource-staging.js";
 import {
   type InputResourceOccurrenceV1,
@@ -12,7 +19,11 @@ import {
   pastedTextLimitsV1,
   type StagedPastedTextSelectionV1,
 } from "./pasted-text.js";
-import type { RecoverableTurnDraft, RecoverableTurnDraftV3 } from "./recoverable-turn-draft.js";
+import type {
+  RecoverableTurnDraft,
+  RecoverableTurnDraftV3,
+  RecoverableTurnDraftV4,
+} from "./recoverable-turn-draft.js";
 import type { StagedUserContentElementV1 } from "./structured-user-content.js";
 
 export {
@@ -41,6 +52,7 @@ export type TurnComposerDraftPoint =
   | { readonly elementId: string; readonly offset: number };
 
 export type TurnComposerElementSnapshot =
+  | DraftMentionElement
   | { readonly elementId: string; readonly type: "text"; readonly text: string }
   | {
       readonly elementId: string;
@@ -64,6 +76,7 @@ export type TurnComposerElementSnapshot =
   | { readonly type: "path"; readonly elementId: string; readonly path: string };
 
 export type TurnComposerSealedElement =
+  | (DraftMentionElement & { readonly text: string })
   | { readonly type: "text"; readonly text: string }
   | {
       readonly type: "resource";
@@ -154,6 +167,7 @@ export class TurnComposerError extends Error {
 }
 
 export type TurnComposer = {
+  refreshRoleMention(elementId: string, expectedDigest: string, definitionDigest: string): boolean;
   stage(
     path: string,
     mutation?: { readonly at: TurnComposerDraftPoint; readonly baseRevision: number },
@@ -168,6 +182,7 @@ export type TurnComposer = {
     input: {
       readonly baseRevision: number;
       readonly document: readonly (
+        | DraftMentionElement
         | { readonly type: "text"; readonly text: string }
         | { readonly type: "resource"; readonly elementId: string }
         | { readonly type: "pasted_text"; readonly elementId: string }
@@ -182,13 +197,23 @@ export type TurnComposer = {
     },
     commit?: () => Promise<void>,
   ): Promise<boolean>;
-  captureDraft(scope: RecoverableTurnDraftV3["scope"]): Promise<RecoverableTurnDraftV3>;
+  captureDraft(
+    scope: RecoverableTurnDraftV3["scope"],
+  ): Promise<RecoverableTurnDraftV3 | RecoverableTurnDraftV4>;
   restoreDraft(draft: RecoverableTurnDraft): Promise<void>;
   undo(baseRevision: number, commit?: () => Promise<void>): Promise<boolean>;
   cancel(id: string): Promise<boolean>;
   remove(id: string, commit?: () => Promise<void>): Promise<boolean>;
   removePastedText(id: string, commit?: () => Promise<void>): Promise<boolean>;
   removePath(elementId: string, commit?: () => Promise<void>): Promise<boolean>;
+  removeMention(elementId: string, commit?: () => Promise<void>): Promise<boolean>;
+  resolveRecipient(
+    baseRevision: number,
+    elementId: string,
+    action: "keep" | "literal" | "retarget",
+    commit: () => Promise<void>,
+    replacement?: AtMentionAtom,
+  ): Promise<boolean>;
   removeSkill(elementId: string, commit?: () => Promise<void>): Promise<boolean>;
   setText(text: string): void;
   commitText(text: string, commit: () => Promise<void>): Promise<void>;
@@ -294,11 +319,16 @@ export async function createTurnComposer(options: {
       .map((element) =>
         element.type === "text"
           ? element.text
-          : element.type === "skill"
-            ? `$${element.name}`
-            : element.type === "path"
-              ? `@${element.path}`
-              : atomToken(element.type === "pasted_text" ? "text" : element.kind, element.ordinal),
+          : element.type === "mention"
+            ? element.literal
+            : element.type === "skill"
+              ? `$${element.name}`
+              : element.type === "path"
+                ? `@${element.path}`
+                : atomToken(
+                    element.type === "pasted_text" ? "text" : element.kind,
+                    element.ordinal,
+                  ),
       )
       .join("");
 
@@ -313,11 +343,13 @@ export async function createTurnComposer(options: {
     candidateElements.reduce(
       (total, element) =>
         total +
-        (element.type === "skill"
-          ? Buffer.byteLength(`$${element.name}`, "utf8")
-          : element.type === "path"
-            ? Buffer.byteLength(`@${element.path}`, "utf8")
-            : 0),
+        (element.type === "mention"
+          ? Buffer.byteLength(element.literal, "utf8")
+          : element.type === "skill"
+            ? Buffer.byteLength(`$${element.name}`, "utf8")
+            : element.type === "path"
+              ? Buffer.byteLength(`@${element.path}`, "utf8")
+              : 0),
       0,
     ) +
     [...pastedTexts.values()]
@@ -415,6 +447,39 @@ export async function createTurnComposer(options: {
           );
   };
 
+  // A trailing token stays editable until its boundary arrives. Sealing completes it.
+  const promoteLiteralMentions = (
+    source: readonly TurnComposerElementSnapshot[],
+    complete = false,
+  ): TurnComposerElementSnapshot[] =>
+    source.flatMap((element, index) => {
+      if (element.type !== "text") return [element];
+      const result: TurnComposerElementSnapshot[] = [];
+      let end = 0;
+      for (const match of element.text.matchAll(/(^|\s)(@[^\s\p{Cc}]+)(?=\s|$)/gu)) {
+        const literal = match[2];
+        const start = match.index + (match[1]?.length ?? 0);
+        if (
+          literal === undefined ||
+          (start === 0 && index > 0) ||
+          (!complete && start + literal.length === element.text.length)
+        )
+          continue;
+        if (start > end)
+          result.push({
+            ...element,
+            elementId: end === 0 ? element.elementId : randomUUID(),
+            text: element.text.slice(end, start),
+          });
+        result.push({ type: "mention", kind: "literal", elementId: randomUUID(), literal });
+        end = start + literal.length;
+      }
+      if (end === 0) return [element];
+      if (end < element.text.length)
+        result.push({ type: "text", elementId: randomUUID(), text: element.text.slice(end) });
+      return result;
+    });
+
   const insertAtomicElement = (
     element: Exclude<TurnComposerElementSnapshot, { readonly type: "text" }>,
     mutation: { readonly at: TurnComposerDraftPoint; readonly baseRevision: number } | undefined,
@@ -498,7 +563,7 @@ export async function createTurnComposer(options: {
 
   const removeInlineAtomElement = (
     elementId: string,
-    type: "path" | "skill",
+    type: "path" | "skill" | "mention",
   ):
     | {
         readonly previousElements: readonly TurnComposerElementSnapshot[];
@@ -517,6 +582,34 @@ export async function createTurnComposer(options: {
     ]);
     revision += 1;
     return { previousElements };
+  };
+
+  const removeInline = async (
+    elementId: string,
+    kind: "path" | "skill" | "mention",
+    commit?: () => Promise<void>,
+  ): Promise<boolean> => {
+    if (closed || sealed) return false;
+    const previousElements = elements;
+    const previousText = text;
+    const previousRevision = revision;
+    const previousUndoStack = [...undoStack];
+    const removed = removeInlineAtomElement(elementId, kind);
+    if (removed === undefined) return false;
+    text = literalText();
+    pushUndo({ previousElements: removed.previousElements });
+    try {
+      await commit?.();
+    } catch (error) {
+      elements = previousElements;
+      text = previousText;
+      revision = previousRevision;
+      undoStack.length = 0;
+      undoStack.push(...previousUndoStack);
+      throw error;
+    }
+    publish();
+    return true;
   };
 
   return {
@@ -571,7 +664,7 @@ export async function createTurnComposer(options: {
         }
       }
       return {
-        schemaVersion: 3,
+        schemaVersion: 4,
         scope,
         nextOrdinal,
         elements: elements.map((element) => ({ ...element })),
@@ -695,6 +788,24 @@ export async function createTurnComposer(options: {
       revision += 1;
       publish();
     },
+    refreshRoleMention(elementId, expectedDigest, definitionDigest) {
+      if (sealed || closed) return false;
+      const element = elements.find((entry) => entry.elementId === elementId);
+      if (
+        element?.type !== "mention" ||
+        element.kind !== "role" ||
+        element.definitionDigest !== expectedDigest ||
+        !/^sha256:[a-f0-9]{64}$/u.test(definitionDigest)
+      )
+        return false;
+      pushUndo({ previousElements: [...elements] });
+      elements = elements.map((entry) =>
+        entry === element ? { ...element, definitionDigest } : entry,
+      );
+      revision += 1;
+      publish();
+      return true;
+    },
     async replaceText(input, commit) {
       if (
         closed ||
@@ -747,8 +858,15 @@ export async function createTurnComposer(options: {
             if (atom.type === "path" && (part.type !== "path" || atom.path !== part.path)) {
               return false;
             }
+            if (atom.type === "mention" && !isDeepStrictEqual(atom, part)) return false;
             nextElements.push(atom);
             currentAtomIndex += 1;
+          } else if (
+            part.type === "mention" &&
+            draftMentionElementSchema.safeParse(part).success &&
+            !elements.some((element) => element.elementId === part.elementId)
+          ) {
+            nextElements.push({ ...part });
           } else if (
             part.type === "skill" &&
             isValidSkillIdentity(part.name, part.qualifiedId) &&
@@ -803,8 +921,8 @@ export async function createTurnComposer(options: {
       const previousText = text;
       const previousRevision = revision;
       const previousUndoStack = [...undoStack];
-      elements = nextElements;
-      text = nextText;
+      elements = promoteLiteralMentions(nextElements);
+      text = literalText();
       pushUndo({ previousElements });
       revision += 1;
       try {
@@ -929,45 +1047,48 @@ export async function createTurnComposer(options: {
       publish();
       return true;
     },
-    async removeSkill(elementId, commit) {
-      if (closed || sealed) {
-        return false;
-      }
-      const previousElements = elements;
-      const previousText = text;
-      const previousRevision = revision;
-      const previousUndoStack = [...undoStack];
-      const removed = removeInlineAtomElement(elementId, "skill");
-      if (removed === undefined) {
-        return false;
-      }
-      text = literalText();
-      pushUndo({ previousElements: removed.previousElements });
-      try {
-        await commit?.();
-      } catch (error) {
-        elements = previousElements;
-        text = previousText;
-        revision = previousRevision;
-        undoStack.length = 0;
-        undoStack.push(...previousUndoStack);
-        throw error;
-      }
-      publish();
-      return true;
+    removeSkill(elementId, commit) {
+      return removeInline(elementId, "skill", commit);
     },
-    async removePath(elementId, commit) {
-      if (closed || sealed) return false;
+    removePath(elementId, commit) {
+      return removeInline(elementId, "path", commit);
+    },
+    removeMention(elementId, commit) {
+      return removeInline(elementId, "mention", commit);
+    },
+    async resolveRecipient(baseRevision, elementId, action, commit, replacement) {
+      if (closed || sealed || revision !== baseRevision) return false;
+      const recipients = leadingMentionRecipients(elements);
+      if (!recipients.some((element) => element.elementId === elementId)) return false;
+      if (
+        action === "retarget" &&
+        !draftMentionElementSchema.safeParse({ ...replacement, elementId }).success
+      )
+        return false;
       const previousElements = elements;
       const previousText = text;
       const previousRevision = revision;
       const previousUndoStack = [...undoStack];
-      const removed = removeInlineAtomElement(elementId, "path");
-      if (removed === undefined) return false;
+      const otherIds = new Set(
+        recipients
+          .filter((element) => element.elementId !== elementId)
+          .map((element) => element.elementId),
+      );
+      elements = normalizeTextElements(
+        elements.flatMap((element): TurnComposerElementSnapshot[] => {
+          if (action === "keep" && otherIds.has(element.elementId)) return [];
+          if (action === "literal" && element.type === "mention" && element.elementId === elementId)
+            return [{ type: "mention", kind: "literal", elementId, literal: element.literal }];
+          if (action === "retarget" && element.elementId === elementId && replacement !== undefined)
+            return [{ ...replacement, elementId }];
+          return [element];
+        }),
+      );
       text = literalText();
-      pushUndo({ previousElements: removed.previousElements });
+      pushUndo({ previousElements });
+      revision += 1;
       try {
-        await commit?.();
+        await commit();
       } catch (error) {
         elements = previousElements;
         text = previousText;
@@ -1326,6 +1447,8 @@ export async function createTurnComposer(options: {
       if (closed || sealed) {
         throw new TurnComposerError("failed", "The turn composer cannot be sealed.");
       }
+      elements = promoteLiteralMentions(elements, true);
+      text = literalText();
       sealed = true;
       publish();
       const cancelStaging = (): void => {
@@ -1448,6 +1571,7 @@ export async function createTurnComposer(options: {
               selection: pastedText.staged,
             };
           }
+          if (element.type === "mention") return { ...element, text: element.literal };
           if (element.type === "skill") {
             return { ...element, text: `$${element.name}` };
           }
@@ -1491,6 +1615,7 @@ export async function createTurnComposer(options: {
                 draftOrdinal: element.ordinal,
               };
             }
+            if (element.type === "mention") return { type: "text", text: element.literal };
             if (element.type === "skill") {
               return { type: "text", text: `$${element.name}` };
             }
@@ -1515,11 +1640,13 @@ export async function createTurnComposer(options: {
           .flatMap((element) =>
             element.type === "text"
               ? [element.text]
-              : element.type === "skill"
-                ? [`$${element.name}`]
-                : element.type === "path"
-                  ? [`@${element.path}`]
-                  : [],
+              : element.type === "mention"
+                ? [element.literal]
+                : element.type === "skill"
+                  ? [`$${element.name}`]
+                  : element.type === "path"
+                    ? [`@${element.path}`]
+                    : [],
           )
           .join(""),
         selections: retained.map((resource) => resource.staged as StagedInputResourceSelectionV1),
@@ -1586,6 +1713,7 @@ export async function createTurnComposer(options: {
           if (element.type === "resource") {
             return atomToken(element.kind, element.ordinal);
           }
+          if (element.type === "mention") return element.literal;
           if (element.type === "skill") {
             return `$${element.name}`;
           }
@@ -1623,6 +1751,8 @@ export async function createTurnComposer(options: {
         const previousUndoStack = [...undoStack];
         text = nextText;
         replaceAggregateText(nextText);
+        elements = promoteLiteralMentions(elements);
+        text = literalText();
         undoStack.length = 0;
         revision += 1;
         try {

@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { MessageChannel } from "node:worker_threads";
-
 import { isLargePastedTextV1 } from "@adam-agent/agent";
 import type {
   ActiveSessionDisplay,
   ArtifactReference,
+  AtMentionAtom,
   BranchSourceBoundary,
+  DraftMentionElement,
   DraftPoint,
   ManagedControlThread,
   OperationDisplay,
@@ -19,7 +20,7 @@ import type {
   ThinkingPolicySelectionDisplay,
   TodoPageResource,
 } from "@adam-agent/presentation";
-import { defaultAgentUiSettings } from "@adam-agent/presentation";
+import { defaultAgentUiSettings, leadingMentionRecipients } from "@adam-agent/presentation";
 import {
   Box,
   type Component,
@@ -45,6 +46,7 @@ import PQueue from "p-queue";
 import { AgentConversationViewer } from "./agent-conversation-viewer.js";
 import { AgentFleet, AgentSessionTransition, AgentWorkspace } from "./agent-fleet.js";
 import { AgentNavigator, ManagedAgentRoster } from "./agent-navigator.js";
+import { AgentTypes } from "./agent-types.js";
 import { AgentWidget } from "./agent-widget.js";
 import {
   ArtifactNavigator,
@@ -60,6 +62,7 @@ import {
   adamCommandRegistry,
 } from "./command-registry.js";
 import { type ConfigurationField, ConfigurationPage } from "./configuration-page.js";
+import { DelegationSelector } from "./delegation-selector.js";
 import {
   type ClipboardAdapter,
   copyDraftToClipboard,
@@ -79,6 +82,7 @@ import {
 } from "./large-reasoning-view.js";
 import { mcpAdvanceCommand } from "./mcp-advance.js";
 import { McpWizard } from "./mcp-wizard.js";
+import { MentionRecipientSelector } from "./mention-recipient-selector.js";
 import { OverlayFrame } from "./overlay-frame.js";
 import { PermissionOverlay } from "./permission-overlay.js";
 import {
@@ -96,12 +100,16 @@ import {
   terminalSizeIsSupported,
 } from "./responsive-root.js";
 import { RightEdgeGuardTerminal } from "./right-edge-guard-terminal.js";
+import { RoleTargetSelector } from "./role-target-selector.js";
 import { RoundedFrame } from "./rounded-frame.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
 import { SessionInspector, type SessionRunStatus } from "./session-inspector.js";
 import { SessionPicker } from "./session-picker.js";
 import { SkillPalette } from "./skill-palette.js";
-import { createAdamStructuredEditorCompletion } from "./structured-editor-completion.js";
+import {
+  completeLiteralMentionAtCursor,
+  createAdamStructuredEditorCompletion,
+} from "./structured-editor-completion.js";
 import { TargetPicker } from "./target-picker.js";
 import { type AdamTuiTheme, createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
@@ -278,7 +286,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     { readonly name: string; readonly qualifiedId: string }
   >();
   const pathAtomValues = new Map<string, string>();
+  const mentionAtoms = new Map<string, DraftMentionElement>();
   const structuredEditorCompletion = createAdamStructuredEditorCompletion({
+    mentionStyle: theme.reference,
+    onMentionAtom(element) {
+      mentionAtoms.set(element.elementId, element);
+    },
     pathStyle: theme.pathReference,
     onPathAtom({ elementId, path }) {
       pathAtomValues.set(elementId, path);
@@ -291,6 +304,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const created = new Editor(tui, theme.editor, { paddingX: 1 });
     created.setAutocompleteProvider(
       new AdamAutocompleteProvider({
+        getThreads: () =>
+          options.presentation.getState().authoritative.managedControl?.threads ?? [],
+        getMain: () => (options.presentation.getState().agentRoles?.length ?? 0) > 0,
+        mention: theme.reference,
+        structuralBadges: () => physicalTerminal.columns < 60 || theme.reference("a") === "a",
+        getRoles: () => options.presentation.getState().agentRoles ?? [],
         getAttachmentsAvailable: () => options.presentation.getState().composer.attachmentAvailable,
         getProjectPaths: () =>
           options.presentation.getState().authoritative.active?.projectPaths.items ??
@@ -394,7 +413,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   } | null = null;
   let permission:
     | {
-        readonly overlay: PermissionOverlay;
+        readonly overlay: PermissionOverlay | DelegationSelector;
         readonly requestId: string;
         readonly hide: () => void;
       }
@@ -840,8 +859,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (scopeChanged) {
       skillAtomIdentities.clear();
       pathAtomValues.clear();
+      mentionAtoms.clear();
     }
     for (const element of composer.elements) {
+      if (element.type === "mention") mentionAtoms.set(element.elementId, element);
       if (element.type === "skill") {
         skillAtomIdentities.set(element.elementId, {
           name: element.name,
@@ -870,6 +891,18 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return;
     }
     const parts: readonly EditorDocumentPart[] = composer.elements.map((element) => {
+      if (element.type === "mention")
+        return {
+          type: "atom",
+          id: element.elementId,
+          label: element.literal,
+          style:
+            element.kind === "path"
+              ? theme.pathReference
+              : element.kind === "literal"
+                ? theme.text
+                : theme.reference,
+        };
       if (element.type === "text") {
         return { type: "text", id: element.elementId, text: element.text };
       }
@@ -895,6 +928,28 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     localStructuredDocument = parts;
   };
 
+  const mentionAvailable = (atom: AtMentionAtom): boolean => {
+    const state = options.presentation.getState();
+    if (atom.kind === "role")
+      return (
+        state.agentRoles?.some(
+          (role) =>
+            role.qualifiedId === atom.qualifiedRoleId &&
+            role.definitionDigest === atom.definitionDigest,
+        ) === true
+      );
+    if (atom.kind === "agent")
+      return (
+        atom.parentSessionId === state.authoritative.active?.session.id &&
+        state.authoritative.managedControl?.threads.some(
+          (thread) =>
+            thread.threadId === atom.threadId &&
+            thread.handle === atom.handle &&
+            thread.lifecycle === "open",
+        ) === true
+      );
+    return true;
+  };
   const synchronizeDraftInputs = (
     composer: ReturnType<PresentationSession["getState"]>["composer"],
   ): void => {
@@ -902,16 +957,31 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const unavailableSkills = composer.elements.filter(
       (element) => element.type === "skill" && !element.available,
     );
+    const unavailableMentions = composer.elements.filter(
+      (element) => element.type === "mention" && !mentionAvailable(element),
+    );
     if (
       composer.resources.length === 0 &&
       composer.pastedTexts.length === 0 &&
-      unavailableSkills.length === 0
+      unavailableSkills.length === 0 &&
+      unavailableMentions.length === 0
     ) {
       return;
     }
     const resources = new Box(1, 1, theme.toolBackground);
     resources.addChild(new ResponsiveLine(theme.toolTitle("Draft inputs")));
     for (const element of composer.elements) {
+      if (element.type === "mention") {
+        if (!mentionAvailable(element))
+          resources.addChild(
+            new ResponsiveWrappedText(
+              theme.statusError(
+                `${element.literal} unavailable · Remove, convert to literal, or retarget before sending.`,
+              ),
+            ),
+          );
+        continue;
+      }
       if (element.type === "text") {
         continue;
       }
@@ -2355,17 +2425,91 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     } else if (pending !== undefined && permission?.requestId !== pending.requestId) {
       clearExitWindow();
       permission?.hide();
-      const overlay = new PermissionOverlay({
-        interaction: pending,
-        theme,
-        onDecision(decision) {
-          void options.presentation.dispatch({
-            type: "decide_permission",
-            requestId: pending.requestId,
-            decision,
-          });
-        },
-      });
+      let delegationSelection:
+        | import("@adam-agent/presentation").ManagedDelegationSelection
+        | undefined;
+      let delegationLimits: import("@adam-agent/presentation").ManagedDelegationLimits = {};
+      const overlay =
+        pending.delegation !== undefined
+          ? new DelegationSelector({
+              envelope: pending.delegation,
+              canChangeMode: pending.delegationCanChangeMode ?? false,
+              description: `${pending.delegation.threads} child delegation · ${pending.delegation.roles.join(", ")}`,
+              theme,
+              messages: pending.delegationMessages ?? [],
+              onChange: () => tui.requestRender(),
+              ...(pending.delegationCanChangeMode !== true
+                ? {}
+                : {
+                    async onContext(
+                      context: import("@adam-agent/presentation").ManagedDelegationContext,
+                      skills: readonly string[],
+                      source: "context" | "skills",
+                    ) {
+                      const selection = {
+                        ...delegationSelection,
+                        skills,
+                        ...(source === "context" ? { context } : {}),
+                      };
+                      const receipt = await options.presentation.dispatch({
+                        type: "preview_permission_delegation",
+                        requestId: pending.requestId,
+                        limits: delegationLimits,
+                        selection,
+                      });
+                      if (receipt.status === "rejected") throw new Error(receipt.message);
+                      if (receipt.delegation === undefined)
+                        throw new Error("Delegation preview is unavailable.");
+                      delegationSelection = selection;
+                      return receipt.delegation.envelope;
+                    },
+                  }),
+              async onLimits(limits) {
+                const receipt = await options.presentation.dispatch({
+                  type: "preview_permission_delegation",
+                  requestId: pending.requestId,
+                  limits,
+                  ...(delegationSelection === undefined ? {} : { selection: delegationSelection }),
+                });
+                if (receipt.status === "rejected") throw new Error(receipt.message);
+                if (receipt.delegation === undefined)
+                  throw new Error("Delegation preview is unavailable.");
+                delegationLimits = limits;
+                return receipt.delegation.envelope;
+              },
+              onConfirm(delegation) {
+                void options.presentation
+                  .dispatch({
+                    type: "decide_permission",
+                    requestId: pending.requestId,
+                    decision: "allow",
+                    delegation,
+                    ...(delegationSelection === undefined ? {} : { delegationSelection }),
+                  })
+                  .then((receipt) => {
+                    if (receipt.status === "rejected")
+                      showNotice("error", receipt.message, "until_edit");
+                  });
+              },
+              onCancel() {
+                void options.presentation.dispatch({
+                  type: "decide_permission",
+                  requestId: pending.requestId,
+                  decision: "deny",
+                });
+              },
+            })
+          : new PermissionOverlay({
+              interaction: pending,
+              theme,
+              onDecision(decision) {
+                void options.presentation.dispatch({
+                  type: "decide_permission",
+                  requestId: pending.requestId,
+                  decision,
+                });
+              },
+            });
       const handle = showOverlay(overlay, {
         width: "80%",
         minWidth: 36,
@@ -2373,7 +2517,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         margin: 1,
       });
       permission = { overlay, requestId: pending.requestId, hide: () => handle.hide() };
-      if (pending.changePreviewRef === null) {
+      if (overlay instanceof DelegationSelector) {
+        tui.requestRender();
+      } else if (pending.changePreviewRef === null) {
         overlay.setPreview({ readable: pending.canAllow, text: "No preview available." });
       } else {
         void options.presentation
@@ -2893,6 +3039,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         });
       return;
     }
+    structuredEditorActive = true;
     localStructuredDocument = intent.document;
     const localLiteralText = intent.document
       .flatMap((part) => (part.type === "text" ? [part.text] : []))
@@ -2910,27 +3057,29 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
           document: intent.document.map((part) =>
             part.type === "text"
               ? { type: "text", text: part.text }
-              : skillAtomIdentities.has(part.id)
-                ? {
-                    type: "skill" as const,
-                    elementId: part.id,
-                    name: skillAtomIdentities.get(part.id)?.name ?? "",
-                    qualifiedId: skillAtomIdentities.get(part.id)?.qualifiedId ?? "",
-                  }
-                : pathAtomValues.has(part.id)
+              : mentionAtoms.has(part.id)
+                ? (mentionAtoms.get(part.id) as DraftMentionElement)
+                : skillAtomIdentities.has(part.id)
                   ? {
-                      type: "path" as const,
+                      type: "skill" as const,
                       elementId: part.id,
-                      path: pathAtomValues.get(part.id) ?? "",
+                      name: skillAtomIdentities.get(part.id)?.name ?? "",
+                      qualifiedId: skillAtomIdentities.get(part.id)?.qualifiedId ?? "",
                     }
-                  : {
-                      type:
-                        composer.elements.find((element) => element.elementId === part.id)?.type ===
-                        "pasted_text"
-                          ? ("pasted_text" as const)
-                          : ("resource" as const),
-                      elementId: part.id,
-                    },
+                  : pathAtomValues.has(part.id)
+                    ? {
+                        type: "path" as const,
+                        elementId: part.id,
+                        path: pathAtomValues.get(part.id) ?? "",
+                      }
+                    : {
+                        type:
+                          composer.elements.find((element) => element.elementId === part.id)
+                            ?.type === "pasted_text"
+                            ? ("pasted_text" as const)
+                            : ("resource" as const),
+                        elementId: part.id,
+                      },
           ),
         });
       })
@@ -3490,6 +3639,56 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         onSettings: (settings) =>
           options.presentation.dispatch({ type: "set_agent_ui_settings", settings }),
         onAttention: () => openAttentionCenter(true),
+        onTypes: () => {
+          const reload = async () => {
+            const receipt = await options.presentation.dispatch({
+              type: "refresh_agent_types",
+              sessionId: expectedSessionId,
+            });
+            if (receipt.status === "rejected") throw new Error(receipt.message);
+            const catalog = options.presentation.getState().agentTypes;
+            if (catalog === undefined) throw new Error("Agent types unavailable.");
+            return catalog;
+          };
+          void reload().then(
+            (catalog) => {
+              let typesHandle: ReturnType<typeof showOverlay> | undefined;
+              const types = new AgentTypes({
+                catalog,
+                theme,
+                maximumLines: () => Math.max(8, Math.floor(physicalTerminal.rows * 0.85) - 4),
+                onChange: () => tui.requestRender(),
+                onClose: () => {
+                  typesHandle?.hide();
+                  handle?.focus();
+                  tui.requestRender();
+                },
+                onReload: reload,
+                onWrite: (mutation) =>
+                  options.presentation.dispatch({
+                    type: "mutate_agent_types",
+                    sessionId: expectedSessionId,
+                    confirmed: true,
+                    mutation,
+                  }),
+              });
+              typesHandle = showOverlay(types, {
+                width: "90%",
+                minWidth: 36,
+                maxHeight: "85%",
+                margin: 1,
+              });
+            },
+            (error) => {
+              showNotice(
+                "error",
+                error instanceof Error ? error.message : "Agent types unavailable.",
+                "until_next_action",
+              );
+              renderState();
+            },
+          );
+        },
         hasDraft: (thread) =>
           options.presentation
             .getState()
@@ -4609,9 +4808,452 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         },
       );
   };
+  const showUnavailableRecipient = (
+    recipient: DraftMentionElement,
+    draftRevision: number,
+  ): void => {
+    let handle: { hide(): void } | undefined;
+    const close = () => {
+      handle?.hide();
+      editor.disableSubmit = false;
+      renderState();
+    };
+    const mutate = (command: PresentationCommand) => {
+      void draftMutationQueue
+        .add(() => options.presentation.dispatch(command))
+        .then((receipt) => {
+          close();
+          showNotice(
+            receipt?.status === "rejected" ? "error" : "success",
+            receipt?.status === "rejected"
+              ? receipt.message
+              : "Recipient updated. Review and send.",
+            "until_edit",
+          );
+          renderState();
+        });
+    };
+    const selector = new MentionRecipientSelector({
+      title: `Recipient unavailable · ${recipient.literal}`,
+      theme,
+      choices: [
+        {
+          value: "remove",
+          label: "Remove",
+          description: "Remove this exact atom and keep the task.",
+        },
+        {
+          value: "literal",
+          label: "Convert to literal",
+          description: "Keep visible text without routing authority.",
+        },
+        {
+          value: "retarget",
+          label: "Retarget",
+          description: "Explicitly choose an available exact recipient.",
+        },
+      ],
+      onCancel: close,
+      onChoose(value) {
+        if (value === "remove")
+          mutate({
+            type: "remove_draft_element",
+            baseRevision: draftRevision,
+            elementId: recipient.elementId,
+          });
+        else if (value === "literal")
+          mutate({
+            type: "resolve_draft_recipient",
+            baseRevision: draftRevision,
+            elementId: recipient.elementId,
+            action: "literal",
+          });
+        else {
+          handle?.hide();
+          const state = options.presentation.getState();
+          const candidates: AtMentionAtom[] = [
+            ...(state.agentRoles ?? []).map(
+              (role): AtMentionAtom => ({
+                type: "mention",
+                kind: "role",
+                literal: `@${role.qualifiedId}`,
+                qualifiedRoleId: role.qualifiedId,
+                definitionDigest: role.definitionDigest,
+              }),
+            ),
+            ...(state.authoritative.managedControl?.threads ?? [])
+              .filter((thread) => thread.lifecycle === "open")
+              .map(
+                (thread): AtMentionAtom => ({
+                  type: "mention",
+                  kind: "agent",
+                  literal: thread.handle,
+                  parentSessionId: thread.parentSessionId,
+                  threadId: thread.threadId,
+                  handle: thread.handle,
+                }),
+              ),
+            { type: "mention", kind: "main", literal: "@main" },
+          ];
+          handle = showOverlay(
+            new MentionRecipientSelector({
+              title: "Retarget recipient",
+              theme,
+              choices: candidates.map((atom, index) => ({
+                value: String(index),
+                label: atom.literal,
+                description: `A · ${atom.kind}`,
+              })),
+              onCancel: close,
+              onChoose(index) {
+                const replacement = candidates[Number(index)];
+                if (replacement !== undefined)
+                  mutate({
+                    type: "resolve_draft_recipient",
+                    baseRevision: draftRevision,
+                    elementId: recipient.elementId,
+                    action: "retarget",
+                    replacement,
+                  });
+              },
+            }),
+            { width: "90%", maxHeight: "80%", margin: 1 },
+          );
+        }
+      },
+    });
+    handle = showOverlay(selector, { width: "90%", maxHeight: "80%", margin: 1 });
+    tui.requestRender();
+  };
   const submitEditorValue = (text: string) => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
+    const recipients = leadingMentionRecipients(state.composer.elements);
+    if (recipients.length > 1) {
+      let handle: { hide(): void } | undefined;
+      const close = () => {
+        handle?.hide();
+        editor.disableSubmit = false;
+        renderState();
+      };
+      const selector = new MentionRecipientSelector({
+        title: "Choose recipient",
+        theme,
+        choices: [
+          ...recipients.map((recipient) => ({
+            value: recipient.elementId,
+            label: recipient.literal,
+            description: `A · ${recipient.kind} · Keep this recipient and remove the others`,
+          })),
+          {
+            value: "remove-extra",
+            label: "Remove extra recipients",
+            description: `Keep ${recipients[0]?.literal ?? ""}`,
+          },
+        ],
+        onCancel: close,
+        onChoose(value) {
+          const elementId = value === "remove-extra" ? recipients[0]?.elementId : value;
+          if (elementId === undefined) return;
+          void draftMutationQueue
+            .add(() =>
+              options.presentation.dispatch({
+                type: "resolve_draft_recipient",
+                baseRevision: state.composer.draftRevision,
+                elementId,
+                action: "keep",
+              }),
+            )
+            .then((receipt) => {
+              close();
+              if (receipt?.status === "rejected")
+                showNotice("error", receipt.message, "until_edit");
+              else showNotice("success", "Recipient selected. Review and send.", "until_edit");
+              renderState();
+            });
+        },
+      });
+      handle = showOverlay(selector, { width: "90%", maxHeight: "80%", margin: 1 });
+      tui.requestRender();
+      return;
+    }
+    const first = state.composer.elements.find(
+      (element) => element.type !== "text" || element.text.trim().length > 0,
+    );
+    if (recipients[0] !== undefined && !mentionAvailable(recipients[0])) {
+      showUnavailableRecipient(recipients[0], state.composer.draftRevision);
+      return;
+    }
+    if (first?.type === "mention" && first.kind === "agent") {
+      const draftRevision = state.composer.draftRevision;
+      void options.presentation
+        .dispatch({ type: "direct_agent_input", draftRevision })
+        .then((receipt) => {
+          if (receipt.status === "rejected") {
+            showNotice("error", receipt.message, "until_edit");
+            renderState();
+            return;
+          }
+          const prepared = receipt.agentInput;
+          if (prepared === undefined) return;
+          let handle: { hide(): void } | undefined;
+          const cancel = () => {
+            handle?.hide();
+            editor.disableSubmit = false;
+            renderState();
+          };
+          const send = (mode: "cooperative" | "interrupt" | "new_turn" | "reply") => {
+            handle?.hide();
+            void options.presentation
+              .dispatch({
+                type: "direct_agent_input",
+                draftRevision,
+                confirmedInput: { ...prepared.input, mode },
+                ...(prepared.envelope === undefined
+                  ? {}
+                  : { confirmedEnvelope: prepared.envelope }),
+              })
+              .then((result) => {
+                editor.disableSubmit = false;
+                if (result.status === "rejected") showNotice("error", result.message, "until_edit");
+                else {
+                  editor.setText("");
+                  showNotice("success", `Input accepted for ${first.handle}.`, "until_edit");
+                }
+                renderState();
+              })
+              .catch(() => {
+                editor.disableSubmit = false;
+                showNotice(
+                  "error",
+                  "The exact input could not be accepted. The draft is retained.",
+                  "until_edit",
+                );
+                renderState();
+              });
+          };
+          const selector =
+            prepared.actions.length === 1 &&
+            prepared.actions[0] === "new_turn" &&
+            prepared.envelope !== undefined
+              ? new DelegationSelector({
+                  envelope: prepared.envelope,
+                  description: `New turn · ${first.handle} · ${prepared.input.text}`,
+                  theme,
+                  onCancel: cancel,
+                  onConfirm: () => send("new_turn"),
+                })
+              : new MentionRecipientSelector({
+                  title: `Send to ${first.handle}`,
+                  choices: prepared.actions.map((mode) => ({
+                    value: mode,
+                    label:
+                      mode === "cooperative"
+                        ? "Cooperative post"
+                        : mode === "interrupt"
+                          ? "Interrupt after current effect"
+                          : mode === "reply"
+                            ? "Reply to exact parent question"
+                            : "New turn",
+                    description: prepared.input.text,
+                  })),
+                  theme,
+                  onCancel: cancel,
+                  onChoose: (mode) => {
+                    const action = prepared.actions.find((candidate) => candidate === mode);
+                    if (action !== undefined) send(action);
+                  },
+                });
+          handle = showOverlay(selector, { width: "90%", maxHeight: "80%", margin: 1 });
+          tui.requestRender();
+        })
+        .catch(() => {
+          editor.disableSubmit = false;
+          showNotice(
+            "error",
+            "The selected thread is unavailable. The draft is retained.",
+            "until_edit",
+          );
+          renderState();
+        });
+      return;
+    }
+    if (first?.type === "mention" && first.kind === "role") {
+      const draftRevision = state.composer.draftRevision;
+      const directTarget = targetForState(state);
+      const thinkingSelection = thinkingSelectionFor(
+        directTarget,
+        selectedThinkingLevel(directTarget),
+      );
+      void options.presentation
+        .dispatch({ type: "direct_delegation", draftRevision, thinkingSelection })
+        .then((receipt) => {
+          if (receipt.status === "rejected") {
+            if (receipt.code === "stale_interaction") {
+              showUnavailableRecipient(first, draftRevision);
+              return;
+            }
+            showNotice("error", receipt.message, "until_edit");
+            editor.disableSubmit = false;
+            renderState();
+            return;
+          }
+          if (receipt.roleTarget !== undefined) {
+            const recovery = receipt.roleTarget;
+            let targetHandle: { hide(): void } | undefined;
+            const cancelTarget = () => {
+              targetHandle?.hide();
+              editor.disableSubmit = false;
+              renderState();
+            };
+            const selector = new RoleTargetSelector({
+              recovery,
+              theme,
+              onCancel: cancelTarget,
+              onChange: () => tui.requestRender(),
+              onChoose(model) {
+                targetHandle?.hide();
+                void options.presentation
+                  .dispatch({
+                    type: "configure_role_target",
+                    qualifiedId: recovery.qualifiedId,
+                    definitionDigest: recovery.definitionDigest,
+                    model,
+                    draftRevision,
+                    confirmed: true,
+                  })
+                  .then((result) => {
+                    editor.disableSubmit = false;
+                    if (result.status === "rejected") {
+                      showNotice("error", result.message, "until_edit");
+                      renderState();
+                    } else submitEditorValue(text);
+                  })
+                  .catch(() => {
+                    showNotice("error", "Role target could not be saved.", "until_edit");
+                    editor.disableSubmit = false;
+                    renderState();
+                  });
+              },
+            });
+            targetHandle = showOverlay(selector, {
+              width: "90%",
+              minWidth: 36,
+              maxHeight: "80%",
+              margin: 1,
+            });
+            tui.requestRender();
+            return;
+          }
+          if (receipt.delegation === undefined) return;
+          const { envelope, description } = receipt.delegation;
+          let selectedDescription = description;
+          let limits: import("@adam-agent/presentation").ManagedDelegationLimits | undefined;
+          let handle: { hide(): void } | undefined;
+          const cancel = () => {
+            handle?.hide();
+            editor.disableSubmit = false;
+            renderState();
+          };
+          const selector = new DelegationSelector({
+            envelope,
+            description,
+            theme,
+            onCancel: cancel,
+            messages: receipt.delegation.messages,
+            onChange: () => tui.requestRender(),
+            async onDescription(description, context, skills) {
+              const updated = await options.presentation.dispatch({
+                type: "direct_delegation",
+                draftRevision,
+                thinkingSelection,
+                context,
+                skills,
+                description,
+                ...(limits === undefined ? {} : { limits }),
+              });
+              if (updated.status === "rejected") throw new Error(updated.message);
+              if (updated.delegation === undefined)
+                throw new Error("The role or target changed. Retry the draft.");
+              selectedDescription = description;
+              return updated.delegation.envelope;
+            },
+            async onLimits(selectedLimits, context, skills) {
+              const updated = await options.presentation.dispatch({
+                type: "direct_delegation",
+                draftRevision,
+                thinkingSelection,
+                context,
+                skills,
+                description: selectedDescription,
+                limits: selectedLimits,
+              });
+              if (updated.status === "rejected") throw new Error(updated.message);
+              if (updated.delegation === undefined)
+                throw new Error("The role or target changed. Retry the draft.");
+              limits = selectedLimits;
+              return updated.delegation.envelope;
+            },
+            async onContext(context, skills) {
+              const updated = await options.presentation.dispatch({
+                type: "direct_delegation",
+                draftRevision,
+                thinkingSelection,
+                context,
+                skills,
+                description: selectedDescription,
+                ...(limits === undefined ? {} : { limits }),
+              });
+              if (updated.status === "rejected") throw new Error(updated.message);
+              if (updated.delegation === undefined)
+                throw new Error("The role or target changed. Retry the draft.");
+              return updated.delegation.envelope;
+            },
+            onConfirm(selectedEnvelope, context, skills) {
+              handle?.hide();
+              void options.presentation
+                .dispatch({
+                  type: "direct_delegation",
+                  draftRevision,
+                  thinkingSelection,
+                  confirmedEnvelope: selectedEnvelope,
+                  description: selectedDescription,
+                  context,
+                  skills,
+                })
+                .then((result) => {
+                  if (result.status === "rejected")
+                    showNotice("error", result.message, "until_edit");
+                  else editor.setText("");
+                  editor.disableSubmit = false;
+                  renderState();
+                })
+                .catch(() => {
+                  showNotice(
+                    "error",
+                    "Delegation could not be admitted. The draft is retained.",
+                    "until_edit",
+                  );
+                  editor.disableSubmit = false;
+                  renderState();
+                });
+            },
+          });
+          handle = showOverlay(selector, {
+            width: "80%",
+            minWidth: 36,
+            maxHeight: "70%",
+            margin: 1,
+          });
+          tui.requestRender();
+        })
+        .catch(() => {
+          showNotice("error", "Delegation could not be prepared.", "until_edit");
+          editor.disableSubmit = false;
+          renderState();
+        });
+      return;
+    }
     if (
       text.trim().length === 0 &&
       state.composer.pastedTexts.length === 0 &&
@@ -6171,6 +6813,39 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     handleTerminationSignal("SIGTERM");
   }
   tui.addInputListener((data) => {
+    if (
+      permission === undefined &&
+      focusedCloseableOverlay() === undefined &&
+      (matchesKey(data, "backspace") || matchesKey(data, "left") || matchesKey(data, "home")) &&
+      !options.presentation.getState().composer.sealed
+    ) {
+      const visible = editor.getText();
+      const position = editor.getCursor();
+      const lines = editor.getLines();
+      if (position.line === lines.length - 1 && position.col === (lines.at(-1)?.length ?? 0)) {
+        const document: readonly EditorDocumentPart[] =
+          structuredEditorActive && localStructuredDocument !== null
+            ? localStructuredDocument
+            : [{ type: "text", id: "adam-literal-input", text: visible }];
+        const last = document.at(-1);
+        if (last?.type === "text") {
+          const edit = completeLiteralMentionAtCursor(
+            document,
+            { partId: last.id, offset: last.text.length },
+            (atom) => mentionAtoms.set(atom.elementId, atom),
+          );
+          if (edit !== null) {
+            editor.setDocument(edit.document, edit.cursor);
+            editor.onEditIntent?.({
+              type: "replace",
+              range: edit.range,
+              text: edit.text,
+              document: edit.document,
+            });
+          }
+        }
+      }
+    }
     if (managedAgentFocusHandoffKey !== null) {
       if (
         matchesKey(data, managedAgentFocusHandoffKey) &&
@@ -6955,7 +7630,7 @@ function planPolicyFooterSummary(
   }
   return density === "compact"
     ? "inspect:auto · ambig:ask · mutate:deny"
-    : "plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies";
+    : `${policyVersion} · inspect auto · ambiguous exec asks · mutation denies`;
 }
 
 function footerContextText(active: ActiveSessionDisplay): string {

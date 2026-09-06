@@ -17,7 +17,8 @@ export type {
 
 import { z } from "zod";
 import { type ManagedAgentRecord, ManagedAgentStoreError } from "./managed-agent.js";
-import { promptContextRecordV1Schema } from "./prompt-assembly.js";
+import { promptContextRecordV1Schema, promptContextRecordV2Schema } from "./prompt-assembly.js";
+import { agentRoleDefinitionSchema, agentRoleIdSchema } from "./role-catalog.js";
 import {
   contextProfileSchema,
   modelTargetIdentitySchema,
@@ -26,26 +27,59 @@ import {
 } from "./session-store.js";
 import { skillContextRecordV1Schema } from "./skills.js";
 
+export const managedAliasSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[\p{L}\p{N}_-]+$/u);
+const managedHandleSchema = z
+  .string()
+  .max(96)
+  .regex(/^@[\p{L}\p{N}_-]+-[1-9]\d*$/u);
+export const managedNameKey = (value: string): string =>
+  value.replace(/^@/u, "").normalize("NFKC").toLocaleLowerCase();
+
 export { managedControlDigest } from "./fleet-ledger.js";
 
 import {
+  type DelegationContext,
   type DelegationEnvelope,
+  delegationContextSchema,
   delegationEnvelopeSchema,
   type FleetProviderEvent,
   fleetProviderEventSchema,
   managedControlDigest,
 } from "./fleet-ledger.js";
 
+import { inputResourceOccurrenceV1Schema } from "./input-resources.js";
+
 export const managedControlFrozenSchema = z.strictObject({
   version: z.literal(1),
+  roleDefinition: agentRoleDefinitionSchema.optional(),
   parentBranchId: z.uuid(),
   targetIdentity: modelTargetIdentitySchema,
   contextProfile: contextProfileSchema,
   thinkingPolicy: thinkingPolicySnapshotV1Schema.optional(),
-  promptContext: promptContextRecordV1Schema,
+  promptContext: z.union([promptContextRecordV1Schema, promptContextRecordV2Schema]),
   skillContext: skillContextRecordV1Schema.optional(),
+  inputResources: z.array(inputResourceOccurrenceV1Schema).max(8).optional(),
+  artifactSources: z
+    .array(
+      z.strictObject({
+        parentSessionId: z.uuid(),
+        sequence: z.number().int().positive(),
+        digest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+        occurrenceId: z.string().min(1).max(256),
+      }),
+    )
+    .max(8)
+    .optional(),
   parentRequest: z.string().max(64 * 1024),
-  permissionEffects: z.tuple([z.literal("read")]),
+  permissionEffects: z.union([
+    z.tuple([z.literal("read")]),
+    z.tuple([z.literal("read"), z.literal("network")]),
+  ]),
+  permissionNetworkCeiling: z.enum(["allow", "ask", "deny"]).optional(),
   permissionReadCeiling: z.enum(["allow", "ask", "deny"]),
 });
 export type ManagedControlFrozen = z.infer<typeof managedControlFrozenSchema>;
@@ -102,7 +136,12 @@ export type ManagedControlEvent =
   | { readonly type: "capacity_acquired" }
   | {
       readonly type: "admitted";
-      readonly role: "builtin:explore";
+      readonly role: string;
+      readonly handle?: string;
+      readonly alias?: string;
+      readonly context?: DelegationContext;
+      readonly skills?: readonly string[];
+      readonly artifacts?: readonly string[];
       readonly description: string;
       readonly task: string;
       readonly lane?: "background" | "reserved";
@@ -209,7 +248,12 @@ const eventSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("capacity_acquired") }),
   z.strictObject({
     type: z.literal("admitted"),
-    role: z.literal("builtin:explore"),
+    role: agentRoleIdSchema,
+    handle: managedHandleSchema.optional(),
+    alias: managedAliasSchema.optional(),
+    context: delegationContextSchema.optional(),
+    skills: z.array(z.string().min(1).max(512)).max(8).optional(),
+    artifacts: z.array(z.string().min(1).max(256)).max(8).optional(),
     description: boundedText(256).refine((value) => value.length > 0 && !/\p{Cc}/u.test(value)),
     task: boundedText(16 * 1024).refine((value) => value.trim().length > 0),
     lane: z.enum(["background", "reserved"]).optional(),
@@ -312,6 +356,11 @@ export function validateManagedControlRecord(
     return invalid();
   const turnRecords = previous.filter((entry) => entry.turnId === record.turnId);
   if (record.event.type === "admitted") {
+    if (
+      record.schemaVersion !== 3 &&
+      (record.event.context !== undefined || record.event.skills !== undefined)
+    )
+      return invalid();
     const admittedInputId = record.event.inputId;
     const modern = [
       record.event.lane,
@@ -349,10 +398,28 @@ export function validateManagedControlRecord(
       return invalid();
     if (threadRecords.some((entry) => entry.event.type === "thread_closed")) return invalid();
     const first = threadRecords[0];
+    if (record.event.handle !== undefined || record.event.alias !== undefined) {
+      if (record.schemaVersion !== 3 || record.event.handle === undefined) return invalid();
+      if (first === undefined) {
+        const names = new Set(["main"]);
+        for (const thread of foldManagedControl(previous, record.parentSessionId).threads) {
+          names.add(managedNameKey(thread.handle));
+          if (thread.alias !== undefined) names.add(managedNameKey(thread.alias));
+        }
+        for (const value of [record.event.handle, record.event.alias]) {
+          if (value === undefined) continue;
+          const key = managedNameKey(value);
+          if (names.has(key)) return invalid();
+          names.add(key);
+        }
+      }
+    }
     if (
       first?.event.type === "admitted" &&
       (first.event.role !== record.event.role ||
-        first.event.description !== record.event.description)
+        first.event.description !== record.event.description ||
+        first.event.handle !== record.event.handle ||
+        first.event.alias !== record.event.alias)
     )
       return invalid();
   } else {
@@ -614,8 +681,12 @@ export function foldManagedControl(
           ? {}
           : { previousTurns: [...(existing.previousTurns ?? []), existing.turn] }),
         lifecycle: "open",
-        displayName: "Explore",
-        handle: existing?.handle ?? `@explore-${threads.size + 1}`,
+        displayName: event.frozen?.roleDefinition?.name ?? "Explore",
+        handle:
+          existing?.handle ??
+          event.handle ??
+          `@${event.frozen?.roleDefinition?.name.toLocaleLowerCase() ?? "explore"}-${threads.size + 1}`,
+        ...(event.alias === undefined ? {} : { alias: event.alias }),
         residency: "live",
         threadId: record.threadId,
         role: event.role,

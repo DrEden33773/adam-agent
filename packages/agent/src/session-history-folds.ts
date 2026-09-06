@@ -1,6 +1,9 @@
 import type { ContextUsageTotals } from "./agent-session-contracts.js";
 import { createContextProjectionMessage, estimateActiveContextTokens } from "./durable-context.js";
-import { createInputResourceProjectionMessageV1 } from "./input-resources.js";
+import {
+  createInputResourceProjectionMessageV1,
+  inputResourceLimitsV1,
+} from "./input-resources.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
 import type { PlanCycleSnapshot } from "./plan-mode.js";
 import {
@@ -34,6 +37,57 @@ import {
   skillContextSnapshot,
 } from "./skills.js";
 import { hasTodoToolProfileV1, todoStoreSnapshotFromRecordsV1, todoSummaryV1 } from "./todo.js";
+
+export function skillResourceBytesFromRecords(
+  records: readonly SessionRecord[],
+  runId?: string,
+): number {
+  const total = records.reduce(
+    (sum, record) =>
+      record.schemaVersion === 3 &&
+      record.record.type === "skill_resource_read_committed" &&
+      (runId === undefined || record.record.runId === runId)
+        ? sum + record.record.byteCount
+        : sum,
+    0,
+  );
+  if (
+    !Number.isSafeInteger(total) ||
+    total < 0 ||
+    total > (runId === undefined ? 8 : 1) * 1024 * 1024
+  )
+    throw new SessionLifecycleError("session_invalid");
+  return total;
+}
+
+export function inputResourceBytesFromRecords(
+  records: readonly SessionRecord[],
+  runId?: string,
+): number {
+  const total = records.reduce(
+    (sum, record) =>
+      record.schemaVersion === 3 &&
+      (record.record.type === "input_resource_read_committed" ||
+        record.record.type === "input_resource_image_read_committed") &&
+      (runId === undefined || record.record.runId === runId)
+        ? sum +
+          (record.record.type === "input_resource_read_committed"
+            ? record.record.byteCount
+            : record.record.image.byteCount)
+        : sum,
+    0,
+  );
+  if (
+    !Number.isSafeInteger(total) ||
+    total < 0 ||
+    total >
+      (runId === undefined
+        ? inputResourceLimitsV1.maximumMaterializedBytesPerLineage
+        : inputResourceLimitsV1.maximumMaterializedBytesPerRun)
+  )
+    throw new SessionLifecycleError("session_invalid");
+  return total;
+}
 
 export function isSkillContextCatalogSuccessor(
   previous: SkillContextRecordV1,

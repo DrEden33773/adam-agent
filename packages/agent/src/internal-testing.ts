@@ -185,6 +185,7 @@ export {
   type SessionToolIntent,
   type SessionV3Record,
 } from "./session-store.js";
+export { createDirectDeepSeekThinkingCapability } from "./thinking-policy.js";
 export { createCodingToolRegistryForTesting } from "./tool-runtime.js";
 export {
   type TurnComposerStageBarrier,

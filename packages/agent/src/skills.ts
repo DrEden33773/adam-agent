@@ -742,6 +742,47 @@ export function reconcileExtensionSkillContextV1(input: {
   };
 }
 
+export async function readActiveSkillContentsV1(
+  context: SkillContextRecordV1 | undefined,
+  artifacts: Pick<ArtifactStore, "read"> | undefined,
+): Promise<ReadonlyMap<string, string>> {
+  const contents = new Map<string, string>();
+  for (const activation of context?.active ?? []) {
+    const bytes = await artifacts?.read(activation.artifact.id, {
+      maximumBytes: activation.byteCount,
+    });
+    if (
+      bytes === undefined ||
+      bytes.byteLength !== activation.byteCount ||
+      `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== activation.skillMdDigest
+    )
+      throw new SkillsError("skill_catalog_unavailable");
+    contents.set(activation.qualifiedId, new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  }
+  return contents;
+}
+
+export function createIndependentSkillContextV1(
+  context: SkillContextRecordV1,
+  selection: boolean | readonly string[] = true,
+): SkillContextRecordV1 {
+  return createSkillContextV1({
+    userHomeDigest: context.userHomeDigest,
+    revision: context.registry.revision,
+    activeProjectScopes: context.activeProjectScopes,
+    effectiveContextTokens: context.budget.effectiveContextTokens,
+    estimatorVersion: context.budget.estimatorVersion,
+    candidates: context.registry.candidates.filter(
+      (candidate) =>
+        selection === true || (selection !== false && selection.includes(candidate.qualifiedId)),
+    ),
+    diagnostics: context.registry.diagnostics,
+    extensionSources: context.extensionSources,
+    activationCounter: 0,
+    revocations: [],
+  });
+}
+
 export function createEmptySkillContextV1(input: {
   readonly effectiveContextTokens: number;
   readonly estimatorVersion: 1;

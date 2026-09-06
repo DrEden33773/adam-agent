@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -7,6 +7,50 @@ import { expect, test } from "vitest";
 import { createRecoverableTurnDraftRepository } from "./recoverable-turn-draft.js";
 
 const projectId = `sha256:${"b".repeat(64)}` as const;
+
+test("v4 serializes selected role and agent references and restores their exact identities", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-mention-draft-"));
+  const repository = await createRecoverableTurnDraftRepository({ projectId, stateRoot: root });
+  const draft = {
+    schemaVersion: 4 as const,
+    scope: { type: "new_session" as const, targetId: "deepseek-v4-flash.direct" },
+    nextOrdinal: 1,
+    elements: [
+      {
+        type: "mention" as const,
+        kind: "role" as const,
+        elementId: "role",
+        literal: "@Explore",
+        qualifiedRoleId: "builtin:explore",
+        definitionDigest: `sha256:${"a".repeat(64)}`,
+      },
+      {
+        type: "mention" as const,
+        kind: "agent" as const,
+        elementId: "agent",
+        literal: "@explore-1",
+        parentSessionId: "00000000-0000-4000-8000-000000000001",
+        threadId: "00000000-0000-4000-8000-000000000002",
+        handle: "@explore-1",
+      },
+    ],
+    resources: [],
+  };
+  try {
+    await repository.save(draft);
+    const directory = join(root, "drafts", "b".repeat(64));
+    const name = (await readdir(directory))[0];
+    const serialized = JSON.parse(await readFile(join(directory, name ?? ""), "utf8"));
+    expect(serialized.elements.map((element: { type: string }) => element.type)).toEqual([
+      "role_ref",
+      "agent_ref",
+    ]);
+    const reopened = await createRecoverableTurnDraftRepository({ projectId, stateRoot: root });
+    await expect(reopened.load(draft.scope)).resolves.toEqual(draft);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("late input acceptance clears only its exact owner-private child draft", async () => {
   const root = await mkdtemp(join(tmpdir(), "adam-child-draft-clear-"));

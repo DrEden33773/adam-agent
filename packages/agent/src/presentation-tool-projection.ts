@@ -226,6 +226,14 @@ export function projectPendingPermissionCandidates(
                     : "This public operator can receive this exact Web request and network address. Adam will not verify, replace, or fall back from this endpoint.",
                 }
               : {}),
+        ...(entry.record.event.subject?.type === "managed_agent_batch" ||
+        (entry.record.event.subject?.type === "managed_agent_action" &&
+          entry.record.event.subject.envelope !== undefined)
+          ? {
+              delegation: entry.record.event.subject.envelope,
+              delegationCanChangeMode: entry.record.event.subject.type === "managed_agent_batch",
+            }
+          : {}),
         canAllow:
           entry.record.event.name !== "write_file" && entry.record.event.name !== "edit_file",
         changePreviewRef,

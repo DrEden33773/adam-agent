@@ -148,7 +148,7 @@ test("background spawn cards settle to Started and Queued with frozen identities
     },
   );
   try {
-    await h.press("Inspect these five items.\r", "Allow");
+    await h.press("Inspect these five items.\r", "Confirm delegation");
     await h.press("\r", "Batch admitted; Main ready.");
     await prepared.promise;
     await h.terminal.waitForScreen("Starting · 0 used");
@@ -1811,8 +1811,8 @@ test("viewer Help disarms an earlier x-x cancellation before returning to the sa
     await h.press("\r", "Conversation");
     await h.press("x", "x again to cancel");
     await h.press("?", "Conversation details");
-    await h.press("\u001b", "Conversation");
-    await h.press("x", "Conversation");
+    await h.press("\u001b", "Following tail");
+    await h.press("x", "x again to cancel");
     expect(h.conversationText()).toContain("x again to cancel");
     expect(aborts).toBe(0);
     await h.press("x", "Cancelled");

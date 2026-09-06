@@ -197,6 +197,55 @@ export async function ingestLocalInputResourcesV1(input: {
   return occurrences;
 }
 
+/** Rebind explicitly selected immutable resources to the receiving logical run. */
+export async function linkInputResourcesV1(input: {
+  readonly artifactStore: ArtifactStore;
+  readonly runId: string;
+  readonly occurrences: readonly InputResourceOccurrenceV1[];
+}): Promise<readonly InputResourceOccurrenceV1[]> {
+  const sources = inputResourceOccurrenceV1Schema
+    .array()
+    .max(inputResourceLimitsV1.maximumOccurrencesPerRun)
+    .parse(input.occurrences);
+  if (
+    sources.reduce((sum, source) => sum + source.artifact.byteCount, 0) >
+    inputResourceLimitsV1.maximumAggregateBytesPerRun
+  )
+    throw new InputResourceError(
+      "input_resource_aggregate_too_large",
+      "The selected input resources exceed the v1 aggregate run limit.",
+    );
+  return Promise.all(
+    sources.map(async (source, index) => {
+      const bytes = await input.artifactStore.read(source.artifact.id, {
+        maximumBytes: source.artifact.byteCount,
+      });
+      if (
+        bytes === undefined ||
+        bytes.byteLength !== source.artifact.byteCount ||
+        `sha256:${createHash("sha256").update(bytes).digest("hex")}` !== source.digest
+      )
+        throw new InputResourceError(
+          "input_resource_io_failed",
+          "The selected immutable resource is unavailable.",
+        );
+      const occurrenceId = `${input.runId}:input:${index + 1}`;
+      await input.artifactStore.write({
+        bytes,
+        mediaType: source.artifact.mediaType,
+        source: {
+          type: "input_resource",
+          schemaVersion: 1,
+          occurrenceId,
+          runId: input.runId,
+          provenance: source.provenance,
+        },
+      });
+      return { ...source, occurrenceId };
+    }),
+  );
+}
+
 async function ingestSelectedLocalFile(input: {
   readonly artifactStore: ArtifactStore;
   readonly afterResolved?: () => Promise<void> | void;
