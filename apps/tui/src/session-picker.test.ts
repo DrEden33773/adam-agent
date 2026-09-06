@@ -130,13 +130,13 @@ test("the framed picker composites into a synchronized 40-column terminal frame"
 
   try {
     tui.start();
-    await terminal.nextOutputContaining("\u001b[?2026l");
+    await terminal.waitForRecordedOutput("\u001b[?2026l");
     let offset = terminal.output().length;
     terminal.resize(120, 40);
-    await terminal.nextSynchronizedFrameContaining("New Session", offset);
+    await terminal.waitForFrameAfter("New Session", offset);
     offset = terminal.output().length;
     terminal.resize(40, 12);
-    await terminal.nextSynchronizedFrameContaining("New Session", offset);
+    await terminal.waitForFrameAfter("New Session", offset);
   } finally {
     tui.stop();
   }

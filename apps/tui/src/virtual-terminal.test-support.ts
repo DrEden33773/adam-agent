@@ -1,7 +1,7 @@
 import { StdinBuffer, type Terminal } from "@earendil-works/pi-tui";
 import { AppliedViewportTerminal } from "./applied-viewport-terminal.test-support.js";
 
-const missingOutputFailureMilliseconds = 30_000;
+export const terminalObservationTimeoutMilliseconds = 10_000;
 
 type OutputWaiter = {
   readonly guard: ReturnType<typeof setTimeout>;
@@ -105,7 +105,7 @@ export class VirtualTerminal implements Terminal {
       clearTimeout(waiter.guard);
       waiter.reject(
         new Error(
-          `VirtualTerminal stopped before displaying ${JSON.stringify(waiter.text)} after offset ${waiter.offset}. Screen: ${JSON.stringify(this.#viewport.lines())}`,
+          `VirtualTerminal stopped before displaying ${JSON.stringify(waiter.text)} after offset ${waiter.offset}. Screen ${this.#columns}x${this.#rows}: ${JSON.stringify(this.#viewport.lines())}`,
         ),
       );
     }
@@ -188,7 +188,8 @@ export class VirtualTerminal implements Terminal {
     return this.#state === "started";
   }
 
-  nextOutputContaining(text: string, offset = 0): Promise<void> {
+  async waitForRecordedOutput(text: string, offset = 0): Promise<void> {
+    requireTerminalExpectation(text);
     if (
       this.#output.indexOf(text, offset) >= 0 ||
       this.#frames.some((frame) => frame.endOffset > offset && frame.text.includes(text))
@@ -208,10 +209,10 @@ export class VirtualTerminal implements Terminal {
           this.#waiters.delete(waiter);
           reject(
             new Error(
-              `VirtualTerminal did not render ${JSON.stringify(text)} after offset ${offset}. Screen: ${JSON.stringify(this.#viewport.lines())}. Output tail: ${JSON.stringify(this.#output.slice(Math.max(offset, this.#output.length - 2_000)))}`,
+              `VirtualTerminal did not render ${JSON.stringify(text)} after offset ${offset}. Screen ${this.#columns}x${this.#rows}: ${JSON.stringify(this.#viewport.lines())}. Output tail: ${JSON.stringify(this.#output.slice(Math.max(offset, this.#output.length - 2_000)))}`,
             ),
           );
-        }, missingOutputFailureMilliseconds),
+        }, terminalObservationTimeoutMilliseconds),
         offset,
         reject,
         resolve,
@@ -222,13 +223,26 @@ export class VirtualTerminal implements Terminal {
     });
   }
 
-  async nextSynchronizedFrameContaining(text: string, offset = 0): Promise<void> {
+  /** Wait for text on the current complete screen or a later one; old screens cannot satisfy it. */
+  async waitForScreen(text: string): Promise<void> {
+    requireTerminalExpectation(text);
+    if (this.#state === "stopped")
+      throw new Error(
+        `VirtualTerminal is stopped; no current screen can display ${JSON.stringify(text)}.`,
+      );
+    if (this.#frames.at(-1)?.text.includes(text)) return;
+    await this.waitForFrameAfter(text, this.#output.length);
+  }
+
+  /** Observe a complete frame after an output checkpoint, including one produced before this call. */
+  async waitForFrameAfter(text: string, offset: number): Promise<void> {
+    requireTerminalExpectation(text);
     if (this.#frames.some((frame) => frame.endOffset > offset && frame.text.includes(text))) {
       return;
     }
     if (this.#state === "stopped") {
       throw new Error(
-        `VirtualTerminal already stopped without displaying ${JSON.stringify(text)} after offset ${offset}. Screen: ${JSON.stringify(this.#viewport.lines())}`,
+        `VirtualTerminal already stopped without displaying ${JSON.stringify(text)} after offset ${offset}. Screen ${this.#columns}x${this.#rows}: ${JSON.stringify(this.#viewport.lines())}`,
       );
     }
     await new Promise<void>((resolve, reject) => {
@@ -237,10 +251,10 @@ export class VirtualTerminal implements Terminal {
           this.#frameWaiters.delete(waiter);
           reject(
             new Error(
-              `VirtualTerminal did not display ${JSON.stringify(text)} after offset ${offset}. Screen: ${JSON.stringify(this.#viewport.lines())}`,
+              `VirtualTerminal did not display ${JSON.stringify(text)} after offset ${offset}. Screen ${this.#columns}x${this.#rows}: ${JSON.stringify(this.#viewport.lines())}`,
             ),
           );
-        }, missingOutputFailureMilliseconds),
+        }, terminalObservationTimeoutMilliseconds),
         offset,
         reject,
         resolve,
@@ -290,4 +304,9 @@ export class VirtualTerminal implements Terminal {
   setProgress(active: boolean): void {
     this.write(active ? "\u001b]9;4;3\u0007" : "\u001b]9;4;0\u0007");
   }
+}
+
+export function requireTerminalExpectation(text: string): void {
+  if (text.trim().length === 0)
+    throw new TypeError("A terminal wait requires non-empty visible text.");
 }

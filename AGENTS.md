@@ -81,6 +81,6 @@ Run commands from the product root:
 | Install pinned dependencies | `pnpm install --frozen-lockfile` |
 | Launch TUI / CLI help | `pnpm tui` / `pnpm --silent adam --help` (see [setup and target selection](README.md)) |
 | Refresh generated package output | `pnpm build` |
-| Focused behavior tests | After building, `pnpm exec vitest run <test-file> -t '<test name>'` |
+| Focused behavior tests | `pnpm test <test-file> [more test files]` (builds once first); add `-t '<test name>'` when narrowing a failure |
 | Markdown / code checks | `pnpm markdown:check` / `pnpm code:check` |
 | Complete Linux gate | `pnpm quality:check` |

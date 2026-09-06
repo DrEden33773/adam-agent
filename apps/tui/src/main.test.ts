@@ -42,6 +42,7 @@ import {
 } from "./tui-filesystem.test-support.js";
 import {
   cleanupActiveTuiFixtures,
+  latestSynchronizedFrame,
   outputAfterFinalAltScreenExit,
   startTuiFixture as startFixture,
 } from "./tui-fixture.test-support.js";
@@ -211,7 +212,7 @@ async function exerciseColdParentRecovery(
         await lifecycle?.close();
       },
     });
-    await terminal.nextOutputContaining("\u001b[?2026l", 0);
+    await terminal.waitForRecordedOutput("\u001b[?2026l", 0);
     const screen = terminal.lines().join("\n");
     expect(screen).toContain("Interrupted session");
     if (toolName === "search_repository") expect(screen).toContain("Resume safe work");
@@ -252,7 +253,7 @@ async function exerciseColdParentRecovery(
     expect(screen).toContain("Inspect durable state");
     expect(calls).toBe(2);
     terminal.input(viewport.noColor ? "\u001b[105u" : "i");
-    await terminal.nextSynchronizedFrameContaining("Session facts", 0);
+    await terminal.waitForFrameAfter("Session facts", 0);
     terminal.input("\u001b[27;1;27~");
     const phases: string[] = [];
     const unsubscribe = presentation.subscribe(() => {
@@ -273,13 +274,10 @@ async function exerciseColdParentRecovery(
         editor: "blocked",
       });
       releaseRecovery.resolve();
-      await terminal.nextSynchronizedFrameContaining("Safe search recovered.", 0);
+      await terminal.waitForFrameAfter("Safe search recovered.", 0);
     }
 
-    await terminal.nextSynchronizedFrameContaining(
-      viewport.columns === 40 ? "idle · ctx" : " · idle",
-      0,
-    );
+    await terminal.waitForFrameAfter(viewport.columns === 40 ? "idle · ctx" : " · idle", 0);
     expect(phases).toContain(action === "resume" ? "recovering" : "cancelling");
     expect(presentation.getState().authoritative.active?.parentRun).toEqual({
       phase: "ready",
@@ -287,7 +285,7 @@ async function exerciseColdParentRecovery(
     });
     unsubscribe();
     terminal.input("Ordinary Main prompt\r");
-    await terminal.nextSynchronizedFrameContaining("Ordinary Main prompt completed.", 0);
+    await terminal.waitForFrameAfter("Ordinary Main prompt completed.", 0);
     expect(calls).toBe(action === "resume" ? 4 : 3);
     expect((await lifecycle.inspect({ sessionId: created.sessionId })).status).toBe("settled");
   } finally {
@@ -335,9 +333,9 @@ test("minimum-size rendering preserves the draft and returns to the supported la
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("保留 draft 👩🏽‍💻");
-    await fixture.waitFor("保留 draft");
+    await fixture.waitForRecordedOutput("保留 draft");
     const beforeMinimum = fixture.output().length;
     await fixture.resize(39, 11);
     const minimumFrame = latestSynchronizedFrame(fixture.output().slice(beforeMinimum));
@@ -347,7 +345,7 @@ test("minimum-size rendering preserves the draft and returns to the supported la
 
     const beforeRestore = fixture.output().length;
     await fixture.resize(80, 24);
-    await fixture.waitForAfter("保留 draft", beforeRestore);
+    await fixture.waitForRecordedOutput("保留 draft", beforeRestore);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -370,11 +368,11 @@ test("/agents replies through one exact attention barrier without starting a par
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start one managed attention fixture.\r");
     await waitForPath(join(controlRoot, "managed-attention-parent-settled"));
     const beforeIdle = fixture.output().length;
-    await fixture.waitFor("Managed child needs exact input.");
+    await fixture.waitForRecordedOutput("Managed child needs exact input.");
     await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
     await fixture.waitForCompleteFrameAfter(" · idle", beforeIdle);
     fixture.write("\u0015");
@@ -382,11 +380,13 @@ test("/agents replies through one exact attention barrier without starting a par
     fixture.write("/agents");
     await fixture.waitForCompleteFrameAfter("/agents", beforeAgents);
     fixture.write("\r\r");
-    await fixture.waitFor("Agents · 1 active · 0 terminal");
+    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
     fixture.write("\r");
-    await fixture.waitFor("Which exact fixture source should I use?");
+    await fixture.waitForRecordedOutput("Which exact fixture source should I use?");
     fixture.write("r");
-    await fixture.waitFor("Enter one bounded reply for the exact managed-child attention request.");
+    await fixture.waitForRecordedOutput(
+      "Enter one bounded reply for the exact managed-child attention request.",
+    );
     fixture.write("Use the immutable fixture source.\r");
     const replyPath = join(controlRoot, "managed-attention-reply");
     await waitForPath(replyPath);
@@ -416,11 +416,11 @@ test("active-run /agents opens the live managed overlay without ending the paren
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start one held managed child.\r");
     await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
     await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
-    await fixture.waitFor("Agents 1 active/0 terminal");
+    await fixture.waitForRecordedOutput("Agents 1 active/0 terminal");
 
     const beforeAgents = fixture.output().length;
     fixture.write("/agents\r");
@@ -431,7 +431,7 @@ test("active-run /agents opens the live managed overlay without ending the paren
     await fixture.resize(81, 24);
     expect(fixture.screen()?.join("\n") ?? "").toContain("research.v2 · running");
     await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
-    await fixture.waitFor("Managed active parent completed.");
+    await fixture.waitForRecordedOutput("Managed active parent completed.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -454,18 +454,18 @@ test("terminal managed follow-up restores responsive editor input before admissi
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start one terminal managed child.\r");
     await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
     await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
     await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
-    await fixture.waitFor("Managed active parent completed.");
-    await fixture.waitFor("Agents 0 active/1 terminal");
+    await fixture.waitForRecordedOutput("Managed active parent completed.");
+    await fixture.waitForRecordedOutput("Agents 0 active/1 terminal");
 
     fixture.write("/agents\r");
-    await fixture.waitFor("Agents · 0 active · 1 terminal");
+    await fixture.waitForScreen("Agents · 0 active · 1 terminal");
     fixture.write("\r");
-    await fixture.waitFor("f follow-up from exact terminal evidence");
+    await fixture.waitForRecordedOutput("f follow-up from exact terminal evidence");
     fixture.write("\u001b[102;1:1u");
     fixture.write("\u001b[102;1:2u");
     fixture.write("\u001b[102;1:3u");
@@ -502,13 +502,13 @@ test("active managed viewer sends one exact ordinary message without a Main turn
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start one messageable managed child.\r");
     await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
     await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
-    await fixture.waitFor("Agents 1 active/0 terminal");
+    await fixture.waitForRecordedOutput("Agents 1 active/0 terminal");
     fixture.write("/agents\r");
-    await fixture.waitFor("Agents · 1 active · 0 terminal");
+    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
     fixture.write("\r");
     await fixture.resize(81, 24);
     expect(fixture.screen()?.join("\n") ?? "").toContain("Agent detail");
@@ -520,7 +520,7 @@ test("active managed viewer sends one exact ordinary message without a Main turn
     await expect(waitForFileContents(settlement, "admitted\n")).resolves.toBe("admitted\n");
 
     await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
-    await fixture.waitFor("Managed active parent completed.");
+    await fixture.waitForRecordedOutput("Managed active parent completed.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -543,13 +543,13 @@ test("active managed viewer requires two exact cancel inputs before causal settl
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start one cancellable managed child.\r");
     await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
     await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
-    await fixture.waitFor("Agents 1 active/0 terminal");
+    await fixture.waitForRecordedOutput("Agents 1 active/0 terminal");
     fixture.write("/agents\r");
-    await fixture.waitFor("Agents · 1 active · 0 terminal");
+    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
     fixture.write("\r");
     await fixture.resize(81, 24);
     fixture.write("\u001b[99;1:1u");
@@ -562,8 +562,8 @@ test("active managed viewer requires two exact cancel inputs before causal settl
     expect(fixture.screen()?.join("\n") ?? "").toContain("Press c again to stop this exact child");
 
     fixture.write("\u001b[99;1:1u");
-    await fixture.waitFor("Managed child cancelled after causal settlement.");
-    await fixture.waitFor("Managed active parent completed.");
+    await fixture.waitForRecordedOutput("Managed child cancelled after causal settlement.");
+    await fixture.waitForRecordedOutput("Managed active parent completed.");
 
     fixture.write("\u001b[99;1:2u");
     fixture.write("\u001b[99;1:3u");
@@ -587,17 +587,17 @@ test("managed viewer reads a bounded artifact through exact child transcript aut
 
   try {
     const fixture = startFixture({ scenario: "managed-artifact", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Create one managed artifact fixture.\r");
-    await fixture.waitFor("Managed active parent completed.");
-    await fixture.waitFor("Agents 0 active/1 terminal");
+    await fixture.waitForRecordedOutput("Managed active parent completed.");
+    await fixture.waitForRecordedOutput("Agents 0 active/1 terminal");
 
     fixture.write("/agents\r");
-    await fixture.waitFor("Agents · 0 active · 1 terminal");
+    await fixture.waitForScreen("Agents · 0 active · 1 terminal");
     fixture.write("\r");
-    await fixture.waitFor("a read artifact");
+    await fixture.waitForRecordedOutput("a read artifact");
     fixture.write("a");
-    await fixture.waitFor("Managed artifact production evidence.");
+    await fixture.waitForRecordedOutput("Managed artifact production evidence.");
     expect(fixture.screen()?.join("\n") ?? "").toContain("Artifact · read-only");
 
     fixture.write("\u0011");
@@ -623,14 +623,14 @@ test("stalled managed viewer preserves controls at 40 and full truth at 120 with
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start one causally stalled managed child.\r");
     await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
     await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
     await writeFile(join(controlRoot, "trigger-managed-stall"), "trigger\n", "utf8");
-    await fixture.waitFor("research.v2 · stalled");
+    await fixture.waitForRecordedOutput("research.v2 · stalled");
     fixture.write("/agents\r");
-    await fixture.waitFor("Agents · 1 active · 0 terminal");
+    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
     fixture.write("\r");
 
     const beforeNarrow = fixture.output().length;
@@ -653,7 +653,7 @@ test("stalled managed viewer preserves controls at 40 and full truth at 120 with
     fixture.write("\u001b[27;1;27~");
     fixture.write("\u001b[27;1;27~");
     await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
-    await fixture.waitFor("Managed active parent completed.");
+    await fixture.waitForRecordedOutput("Managed active parent completed.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -676,17 +676,17 @@ test("managed viewer pauses live-tail following until the reader returns to the 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start one managed live-scroll fixture.\r");
     await waitForFileContents(join(controlRoot, "managed-live-ready"), "ready\n");
     await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
     fixture.write("/agents\r");
-    await fixture.waitFor("Agents · 1 active · 0 terminal");
+    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
     fixture.write("\r");
-    await fixture.waitFor("live-7");
+    await fixture.waitForRecordedOutput("live-7");
 
     fixture.write("\u001b[A");
-    await fixture.waitFor("reading paused");
+    await fixture.waitForRecordedOutput("reading paused");
     const beforeGrowth = fixture.output().length;
     await writeFile(join(controlRoot, "release-managed-live-growth"), "release\n", "utf8");
     await waitForFileContents(join(controlRoot, "managed-live-grown"), "grown\n");
@@ -721,26 +721,26 @@ test("managed viewer regains exact focus after a parent permission preempts it",
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start one managed permission focus fixture.\r");
     await waitForFileContents(join(controlRoot, "managed-parent-permission-child-held"), "held\n");
     await waitForFileContents(join(controlRoot, "managed-parent-permission-ready"), "ready\n");
     fixture.write("/agents\r");
-    await fixture.waitFor("Agents · 1 active · 0 terminal");
+    await fixture.waitForScreen("Agents · 1 active · 0 terminal");
     fixture.write("\r");
-    await fixture.waitFor("Agent detail");
+    await fixture.waitForRecordedOutput("Agent detail");
     await writeFile(
       join(controlRoot, "release-managed-parent-permission-call"),
       "release\n",
       "utf8",
     );
-    await fixture.waitFor("Permission required");
+    await fixture.waitForRecordedOutput("Permission required");
     const beforeRestore = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
     await fixture.waitForCompleteFrameAfter("m message at next safe boundary", beforeRestore);
     expect(fixture.screen()?.join("\n") ?? "").toContain("research.v2 · background · running");
     fixture.write("m");
-    await fixture.waitFor("Enter one bounded message");
+    await fixture.waitForRecordedOutput("Enter one bounded message");
 
     await writeFile(
       join(controlRoot, "release-managed-parent-permission-child"),
@@ -769,9 +769,9 @@ test("minimum-size mode consumes ordinary editor input while preserving safe exi
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("exact draft");
-    await fixture.waitFor("exact draft");
+    await fixture.waitForRecordedOutput("exact draft");
     await fixture.resize(39, 11);
     fixture.write(" must not enter the editor");
     fixture.write("\u0011");
@@ -806,7 +806,7 @@ test("Ctrl+Q explicitly preserves the pre-Adam screen without printing the trans
   try {
     await terminal.whenStarted();
     terminal.input(privateDraftSentinel);
-    await terminal.nextSynchronizedFrameContaining(privateDraftSentinel);
+    await terminal.waitForScreen(privateDraftSentinel);
     terminal.input("\u0011");
     await expect(execution).resolves.toBeUndefined();
 
@@ -853,14 +853,14 @@ test("/exit clears its literal input and reaches the existing TUI cleanup withou
     await terminal.whenStarted();
     const privateTranscriptSentinel = "PRIVATE_TRANSCRIPT_SENTINEL";
     terminal.input(`${privateTranscriptSentinel}\r`);
-    await terminal.nextSynchronizedFrameContaining("Provider usage unavailable.");
+    await terminal.waitForScreen("Provider usage unavailable.");
     terminal.input("/exit extra\r");
-    await terminal.nextOutputContaining("Usage: /exit");
+    await terminal.waitForRecordedOutput("Usage: /exit");
     expect(terminal.running()).toBe(true);
     terminal.input("/exit\r");
     const outcome = await Promise.race([
       execution.then(() => "closed" as const),
-      terminal.nextOutputContaining("Unknown command /exit").then(
+      terminal.waitForRecordedOutput("Unknown command /exit").then(
         () => "unknown" as const,
         () => "stopped" as const,
       ),
@@ -893,7 +893,7 @@ test("Usage feedback remains actionable until editor correction begins", async (
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/exit extra\r");
     await fixture.waitForCompleteFrameAfter("! Usage: /exit", 0);
     expect(latestSynchronizedFrame(fixture.output()).join("\n")).toContain(
@@ -926,7 +926,7 @@ test("Usage feedback keeps its semantic marker without color", async () => {
 
   try {
     const fixture = startFixture({ noColor: true, stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeUsage = fixture.output().length;
     fixture.write("/exit extra\r");
     await fixture.waitForCompleteFrameAfter("! Usage: /exit", beforeUsage);
@@ -992,10 +992,10 @@ test("/exit remains available during a held run and closes without releasing the
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Hold this run\r");
     await waitForPath(join(controlRoot, "model-started"));
-    await fixture.waitFor("Working");
+    await fixture.waitForRecordedOutput("Working");
     fixture.write("/exit\r");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     await expect(access(join(controlRoot, "release-model"))).rejects.toMatchObject({
@@ -1031,7 +1031,7 @@ test("slash exit durably cancels a held run and its exact cold restart stays res
     await firstTerminal.whenStarted();
     firstTerminal.input("Hold this run across exit and restart\r");
     await waitForPath(join(controlRoot, "model-started"));
-    await firstTerminal.nextSynchronizedFrameContaining("Working");
+    await firstTerminal.waitForScreen("Working");
     firstTerminal.input("/exit\r");
     await expect(firstExecution).resolves.toBeUndefined();
     expect(firstTerminal.lifecycle()).toEqual(["started", "stopped"]);
@@ -1093,9 +1093,9 @@ test("slash exit terminalizes an attention child before the exact cold session r
     firstTerminal.input("Start one managed child before exit\r");
     await waitForFileContents(join(controlRoot, "managed-attention-parent-settled"), "settled\n");
     const beforeIdle = firstTerminal.output().length;
-    await firstTerminal.nextSynchronizedFrameContaining("Managed child needs exact input.");
+    await firstTerminal.waitForScreen("Managed child needs exact input.");
     await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
-    await firstTerminal.nextSynchronizedFrameContaining(" · idle", beforeIdle);
+    await firstTerminal.waitForFrameAfter(" · idle", beforeIdle);
     firstTerminal.input("/exit\r");
     await expect(firstExecution).resolves.toBeUndefined();
     expect(firstTerminal.lifecycle()).toEqual(["started", "stopped"]);
@@ -1154,7 +1154,7 @@ test("the 40, 80, and 120 column layouts expose progressively bounded footer fac
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
 
     let beforeResize = fixture.output().length;
     await fixture.resize(120, 40);
@@ -1196,9 +1196,9 @@ test("Help keeps its exact page and focus across minimum-size resize", async () 
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/help\r\r");
-    await fixture.waitFor("Command Reference");
+    await fixture.waitForRecordedOutput("Command Reference");
 
     let beforeResize = fixture.output().length;
     await fixture.resize(39, 11);
@@ -1211,7 +1211,7 @@ test("Help keeps its exact page and focus across minimum-size resize", async () 
     frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
     expect(frame).toContain("Command Reference");
     fixture.write("\u0003focus restored");
-    await fixture.waitFor("focus restored");
+    await fixture.waitForRecordedOutput("focus restored");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -1228,9 +1228,9 @@ test("a permission remains authoritative across narrow and minimum-size focus re
 
   try {
     const fixture = startFixture({ scenario: "mutation", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Edit after resize\r");
-    await fixture.waitFor("+after");
+    await fixture.waitForRecordedOutput("+after");
 
     let beforeResize = fixture.output().length;
     await fixture.resize(40, 12);
@@ -1246,7 +1246,7 @@ test("a permission remains authoritative across narrow and minimum-size focus re
     expect(frame).not.toContain("Permission required");
     fixture.write("\u001b[27;1;27~");
     await fixture.resize(80, 24);
-    await fixture.waitFor("denied");
+    await fixture.waitForRecordedOutput("denied");
     await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("before\n");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -1270,9 +1270,9 @@ test("Shift+Enter and Ctrl+J preserve one exact multiline draft", async () => {
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("first\u001b[13;2usecond\n第三行");
-    await fixture.waitFor("第三行");
+    await fixture.waitForRecordedOutput("第三行");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(
@@ -1303,11 +1303,11 @@ test("a chunked large bracketed paste becomes one exact expandable Text atom", a
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write(`\u001b[200~${pasted.slice(0, split)}`);
     fixture.write(`${pasted.slice(split)}\u001b[201~`);
-    await fixture.waitFor("Pasted text staged.");
-    await fixture.waitFor("[Text #1]");
+    await fixture.waitForRecordedOutput("Pasted text staged.");
+    await fixture.waitForRecordedOutput("[Text #1]");
     expect(fixture.screen()?.join("\n") ?? "").toContain("Draft inputs");
     fixture.write("/copy draft\r");
     await expect(waitForFileContents(join(controlRoot, "clipboard.txt"), pasted)).resolves.toBe(
@@ -1366,7 +1366,7 @@ test("NO_COLOR preserves ready pasted Text structure and preview without SGR", a
 
   try {
     const fixture = startFixture({ noColor: true, stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePaste = fixture.output().length;
     fixture.write(`\u001b[200~${pasted}\u001b[201~`);
     await fixture.waitForCompleteFrameAfter("colorless...", beforePaste);
@@ -1502,7 +1502,7 @@ test("Tab accepts one exact Skill atom without changing an adjacent Text atom", 
   });
   try {
     fixture.write(" Use $fir");
-    await fixture.waitFor("$first");
+    await fixture.waitForRecordedOutput("$first");
     const beforeAccept = fixture.output().length;
     fixture.write("\t");
     await fixture.waitForCompleteFrameAfter("Use $first", beforeAccept);
@@ -1522,13 +1522,13 @@ test("Enter accepts one exact Skill atom without submitting an adjacent Text ato
   });
   try {
     fixture.write(" Use $fir");
-    await fixture.waitFor("$first");
+    await fixture.waitForRecordedOutput("$first");
     const beforeAccept = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter("Use $first", beforeAccept);
     expect(fixture.screen()?.join("\n") ?? "").toContain("[Text #1]");
     fixture.write("\r");
-    await fixture.waitFor("Skill selection complete.");
+    await fixture.waitForRecordedOutput("Skill selection complete.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     const durableState = await readFilesRecursively(stateRoot);
@@ -1563,7 +1563,7 @@ test("an accepted path atom stays adjacent to Text and Backspace removes it whol
   });
   try {
     fixture.write(" Inspect @srca");
-    await fixture.waitFor("@alpha.ts");
+    await fixture.waitForRecordedOutput("@alpha.ts");
     const beforeAccept = fixture.output().length;
     fixture.write("\t");
     await fixture.waitForCompleteFrameAfter("Inspect @src/alpha.ts", beforeAccept);
@@ -1598,13 +1598,13 @@ async function startPastedTextAtomFixture(input: {
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const pasted = Array.from({ length: 11 }, (_, index) => `structured line ${index + 1}`).join(
       "\n",
     );
     fixture.write(`\u001b[200~${pasted}\u001b[201~`);
-    await fixture.waitFor("Pasted text staged.");
-    await fixture.waitFor("[Text #1]");
+    await fixture.waitForRecordedOutput("Pasted text staged.");
+    await fixture.waitForRecordedOutput("[Text #1]");
     return { fixture, stateRoot, testRoot };
   } catch (error) {
     await rm(testRoot, { recursive: true, force: true });
@@ -1652,9 +1652,9 @@ test("a 1000-scalar paste stays ordinary text even when UTF-16 length is larger"
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write(`\u001b[200~${pasted}\u001b[201~`);
-    await fixture.waitFor("é👩💻");
+    await fixture.waitForRecordedOutput("é👩💻");
     expect(fixture.screen()?.join("\n") ?? "").not.toContain("[Text #1]");
     expect(fixture.screen()?.join("\n") ?? "").not.toContain("[paste #1");
     fixture.write("\u0011");
@@ -1673,9 +1673,9 @@ test("the focused editor positions the IME hardware cursor on grapheme cell boun
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("A中e\u0301👩🏽‍💻Z");
-    await fixture.waitFor("A中e");
+    await fixture.waitForRecordedOutput("A中e");
 
     for (const expectedColumn of [8, 6, 5, 3]) {
       const beforeMove = fixture.output().length;
@@ -1705,15 +1705,15 @@ test("minimum-size Ctrl+C still aborts one active run without arming exit", asyn
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Cancel from minimum mode\r");
-    await fixture.waitFor("Working");
+    await fixture.waitForRecordedOutput("Working");
     await waitForPath(join(controlRoot, "model-started"));
     await fixture.resize(39, 11);
     fixture.write("\u0003");
     const beforeRestore = fixture.output().length;
     await fixture.resize(80, 24);
-    await fixture.waitForAfter("cancelled", beforeRestore);
+    await fixture.waitForRecordedOutput("cancelled", beforeRestore);
     expect(fixture.output().slice(beforeRestore)).not.toContain("Press Ctrl+C again");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -1792,7 +1792,7 @@ test("terminal and clipboard failures remain independent and cannot skip Present
     });
     await terminal.whenStarted();
     terminal.input("preserve this exact draft");
-    await terminal.nextOutputContaining("preserve this exact draft");
+    await terminal.waitForRecordedOutput("preserve this exact draft");
     terminal.input("\u0011");
     const failure = await execution.catch((error: unknown) => error);
     expect(failure).toBeInstanceOf(AggregateError);
@@ -1830,7 +1830,7 @@ test("an overlay cleanup failure cannot skip terminal restoration or Presentatio
     });
     await terminal.whenStarted();
     terminal.input("/help\r");
-    await terminal.nextOutputContaining("Adam Help");
+    await terminal.waitForScreen("Adam Help");
     terminal.input("\u0011");
     await expect(execution).rejects.toThrow(
       "Injected overlay cleanup failure before terminal restoration.",
@@ -1870,34 +1870,6 @@ test("startup and cleanup failures preserve both causal errors", async () => {
   }
 });
 
-function latestSynchronizedFrame(output: string): readonly string[] {
-  const start = output.lastIndexOf("\u001b[?2026h");
-  const end = output.indexOf("\u001b[?2026l", start);
-  if (start < 0 || end < 0) {
-    throw new Error("The TUI did not emit one complete synchronized frame.");
-  }
-  const frame = output
-    .slice(start + "\u001b[?2026h".length, end)
-    .replace("\u001b[2J\u001b[H\u001b[3J", "");
-  const absoluteRows = [
-    ...frame.matchAll(new RegExp(`${"\u001b"}\\[(\\d+);1H${"\u001b"}\\[2K`, "gu")),
-  ];
-  if (absoluteRows.length === 0) {
-    return frame.split("\r\n");
-  }
-  const lines: string[] = [];
-  for (const [index, match] of absoluteRows.entries()) {
-    const row = Number(match[1]) - 1;
-    const contentStart = (match.index ?? 0) + match[0].length;
-    const contentEnd = absoluteRows[index + 1]?.index ?? frame.length;
-    const content = frame.slice(contentStart, contentEnd);
-    lines[row] = content
-      .replace(new RegExp(`${"\u001b"}\\[\\d+;\\d+H`, "gu"), "")
-      .replace(new RegExp(`${"\u001b"}\\[\\?25[hl]`, "gu"), "");
-  }
-  return Array.from({ length: lines.length }, (_, index) => lines[index] ?? "");
-}
-
 async function expectColdRestartResponsive(input: {
   readonly controlRoot?: string;
   readonly expectCancelledNotice: boolean;
@@ -1925,7 +1897,7 @@ async function expectColdRestartResponsive(input: {
       workspaceRoot: input.workspaceRoot,
     });
     await terminal.whenStarted();
-    await terminal.nextSynchronizedFrameContaining("fake.local · Certified");
+    await terminal.waitForScreen("fake.local · Certified");
 
     const coldPresentation = presentation;
     if (coldPresentation === undefined) {
@@ -1950,16 +1922,16 @@ async function expectColdRestartResponsive(input: {
 
     const beforeSession = terminal.output().length;
     terminal.input("/session\r");
-    await terminal.nextSynchronizedFrameContaining("Session facts", beforeSession);
+    await terminal.waitForFrameAfter("Session facts", beforeSession);
     expect(terminal.lines().join("\n")).toContain(input.sessionId);
     const beforeSessionClose = terminal.output().length;
     terminal.input("\u001b[27;1;27~");
-    await terminal.nextSynchronizedFrameContaining("fake.local · Certified", beforeSessionClose);
+    await terminal.waitForFrameAfter("fake.local · Certified", beforeSessionClose);
     expect(terminal.lines().join("\n")).not.toContain("Session facts");
 
     const beforeAgents = terminal.output().length;
     terminal.input("/agents\r");
-    await terminal.nextSynchronizedFrameContaining("Agents ·", beforeAgents);
+    await terminal.waitForFrameAfter("Agents ·", beforeAgents);
     const managedAgents = coldPresentation.getState().authoritative.managedAgents;
     expect(managedAgents.counts.active).toBe(0);
     expect(managedAgents.agents).toHaveLength(input.expectedTerminalAgentCount);
@@ -1968,12 +1940,12 @@ async function expectColdRestartResponsive(input: {
     }
     const beforeAgentsClose = terminal.output().length;
     terminal.input("\u001b[27;1;27~");
-    await terminal.nextSynchronizedFrameContaining("fake.local · Certified", beforeAgentsClose);
+    await terminal.waitForFrameAfter("fake.local · Certified", beforeAgentsClose);
     expect(terminal.lines().join("\n")).not.toContain("Agents ·");
 
     const beforeDraft = terminal.output().length;
     terminal.input(input.responsiveDraft);
-    await terminal.nextSynchronizedFrameContaining(input.responsiveDraft, beforeDraft);
+    await terminal.waitForFrameAfter(input.responsiveDraft, beforeDraft);
     expect(terminal.lines().join("\n").split(input.responsiveDraft)).toHaveLength(2);
     terminal.input("\u0011");
     await expect(execution).resolves.toBeUndefined();
@@ -2082,8 +2054,8 @@ test("the production target picker renders catalog-owned product names and keeps
     expect(targetFrame).not.toContain("deepseek-v4-pro.direct");
     expect(targetFrame).not.toContain("deepseek-v4-flash-vision-exp.direct");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
-    await fixture.waitFor("deepseek-v4-flash.direct · Certified");
+    await fixture.waitForScreen("Adam · New session");
+    await fixture.waitForRecordedOutput("deepseek-v4-flash.direct · Certified");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -2101,7 +2073,7 @@ test("the production target picker preserves query and selection across responsi
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
     await fixture.waitForCompleteFrameAfter("Select an exact model target", 0);
     fixture.write("pro");
-    await fixture.waitFor("Search: pro");
+    await fixture.waitForRecordedOutput("Search: pro");
 
     for (const columns of [40, 80, 120, 200, 80, 40]) {
       await fixture.resize(columns, 40);
@@ -2151,7 +2123,7 @@ test("the production target picker keeps its focused section and footer reachabl
 
       const beforeDetails = fixture.output().length;
       fixture.write("\t");
-      await fixture.waitForAfter("Details [focused]", beforeDetails);
+      await fixture.waitForRecordedOutput("Details [focused]", beforeDetails);
       frameLines = fixture.screen() ?? [];
       frame = frameLines.join("\n");
       expect(frame.replace(/[\s│]+/gu, " ")).toContain("Exact target deepseek-v4-flash.direct");
@@ -2166,18 +2138,18 @@ test("the production target picker keeps its focused section and footer reachabl
         expect(frame).toContain("PgDn Page");
         const beforePageDown = fixture.output().length;
         fixture.write("\u001b[6~");
-        await fixture.waitForAfter("Details [focused]", beforePageDown);
+        await fixture.waitForRecordedOutput("Details [focused]", beforePageDown);
         const pagedDown = (fixture.screen() ?? []).join("\n");
         expect(pagedDown).not.toBe(frame);
         expect(pagedDown).toContain("PgUp/PgDn Page");
         const beforePageUp = fixture.output().length;
         fixture.write("\u001b[5~");
-        await fixture.waitForAfter("Details [focused]", beforePageUp);
+        await fixture.waitForRecordedOutput("Details [focused]", beforePageUp);
         expect((fixture.screen() ?? []).join("\n")).toContain("PgDn Page");
 
         const beforeScroll = fixture.output().length;
         for (let offset = 0; offset < 20; offset += 1) fixture.write("\u001b[B");
-        await fixture.waitForAfter("Thinking", beforeScroll);
+        await fixture.waitForRecordedOutput("Thinking", beforeScroll);
         const bottom = (fixture.screen() ?? []).join("\n");
         expect(bottom.replace(/[\s│]+/gu, " ")).toContain("Esc Close");
         expect(bottom).toContain("↑ Up");
@@ -2186,23 +2158,23 @@ test("the production target picker keeps its focused section and footer reachabl
         expect(bottom).not.toContain("PgDn");
         const beforeBottomPageUp = fixture.output().length;
         fixture.write("\u001b[5~");
-        await fixture.waitForAfter("Details [focused]", beforeBottomPageUp);
+        await fixture.waitForRecordedOutput("Details [focused]", beforeBottomPageUp);
         expect((fixture.screen() ?? []).join("\n")).not.toBe(bottom);
         const beforeBottomPageDown = fixture.output().length;
         fixture.write("\u001b[6~");
-        await fixture.waitForAfter("Thinking", beforeBottomPageDown);
+        await fixture.waitForRecordedOutput("Thinking", beforeBottomPageDown);
         expect((fixture.screen() ?? []).join("\n")).toContain("PgUp Page");
         const beforeSingleUp = fixture.output().length;
         fixture.write("\u001b[A");
-        await fixture.waitForAfter("Details [focused]", beforeSingleUp);
+        await fixture.waitForRecordedOutput("Details [focused]", beforeSingleUp);
         expect((fixture.screen() ?? []).join("\n")).not.toBe(bottom);
         for (let offset = 0; offset < 19; offset += 1) fixture.write("\u001b[A");
-        await fixture.waitFor("Exact target  deepseek-v4-flash.direct");
+        await fixture.waitForRecordedOutput("Exact target  deepseek-v4-flash.direct");
       }
 
       const beforeModels = fixture.output().length;
       fixture.write("\t");
-      await fixture.waitForAfter("Models [focused]", beforeModels);
+      await fixture.waitForRecordedOutput("Models [focused]", beforeModels);
     }
 
     fixture.write("\u0011");
@@ -2230,11 +2202,11 @@ test("the production target picker preserves long catalog truth and details focu
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("超长");
-    await fixture.waitFor("Search: 超长");
+    await fixture.waitForRecordedOutput("Search: 超长");
     fixture.write("\t");
-    await fixture.waitFor("Details [focused]");
+    await fixture.waitForRecordedOutput("Details [focused]");
 
     for (const columns of [40, 79, 80, 119, 120, 200]) {
       await fixture.resize(columns, 40);
@@ -2269,7 +2241,7 @@ test("the production target picker preserves long catalog truth and details focu
         for (let offset = 0; offset < 6; offset += 1) {
           fixture.write("\u001b[B");
         }
-        await fixture.waitForAfter("Thinking  Not available", beforeDetailScroll);
+        await fixture.waitForRecordedOutput("Thinking  Not available", beforeDetailScroll);
         const scrolledDetails = (fixture.screen() ?? []).join("\n");
         expect(scrolledDetails).toContain("Context  1,000,000 tokens");
         expect(scrolledDetails).toContain("Thinking  Not available");
@@ -2301,16 +2273,14 @@ test("the production TUI tests a configured exact target without conflating reac
 
   try {
     await terminal.whenStarted();
-    await terminal.nextSynchronizedFrameContaining("Adam · New session");
-    await terminal.nextSynchronizedFrameContaining(
-      "deepseek-v4-flash-vision-exp.direct · Certified",
-    );
-    await terminal.nextSynchronizedFrameContaining("Configured · Not tested");
+    await terminal.waitForScreen("Adam · New session");
+    await terminal.waitForScreen("deepseek-v4-flash-vision-exp.direct · Certified");
+    await terminal.waitForScreen("Configured · Not tested");
     const beforeTest = terminal.output().length;
 
     terminal.input("/connection\r");
 
-    await terminal.nextSynchronizedFrameContaining(
+    await terminal.waitForFrameAfter(
       "Connection test: Configured · Reachable · Certified.",
       beforeTest,
     );
@@ -2334,7 +2304,7 @@ test("the production target picker checks the focused API without turning connec
 
   try {
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     const initial = (fixture.screen() ?? []).join("\n");
     expect(initial).toContain("Connection not checked");
     expect(initial).not.toContain("Configured · Not tested");
@@ -2345,7 +2315,7 @@ test("the production target picker checks the focused API without turning connec
     expect(proIndex).toBeGreaterThan(flashIndex);
 
     fixture.write("direct");
-    await fixture.waitFor("Search: direct");
+    await fixture.waitForRecordedOutput("Search: direct");
     expect((fixture.screen() ?? []).join("\n")).toContain("Connection not checked");
     const modelOrder = (lines: readonly string[]) =>
       lines
@@ -2355,13 +2325,13 @@ test("the production target picker checks the focused API without turning connec
         );
     const beforeConnectionOrder = modelOrder(fixture.screen() ?? []);
     fixture.write("\t");
-    await fixture.waitFor("Details [focused]");
+    await fixture.waitForRecordedOutput("Details [focused]");
     fixture.write("x");
     expect((fixture.screen() ?? []).join("\n")).toContain("Search: direct");
     fixture.write("\u001b[99;1:1u");
     await fixture.resize(81, 24);
     expect((fixture.screen() ?? []).join("\n")).toMatch(/Checking API|Reachable/u);
-    await fixture.waitFor("Reachable");
+    await fixture.waitForRecordedOutput("Reachable");
     const settled = (fixture.screen() ?? []).join("\n");
     expect(settled).toContain("Connection  Reachable");
     const settledLines = fixture.screen() ?? [];
@@ -2395,18 +2365,18 @@ test("the production target picker preserves one in-flight API check identity ac
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\u001b[B");
-    await fixture.waitFor("Exact target  deepseek-v4-pro.direct");
+    await fixture.waitForRecordedOutput("Exact target  deepseek-v4-pro.direct");
     const beforeCheck = await readDurableState();
     fixture.write("\t");
-    await fixture.waitFor("Details [focused]");
+    await fixture.waitForRecordedOutput("Details [focused]");
     fixture.write("c");
     await waitForFileContents(
       join(controlRoot, "target-connection-pending"),
       "deepseek-v4-pro.direct\n",
     );
-    await fixture.waitFor("Connection  Checking API…");
+    await fixture.waitForRecordedOutput("Connection  Checking API…");
 
     for (const columns of [40, 120, 200, 80]) {
       await fixture.resize(columns, 40);
@@ -2423,20 +2393,22 @@ test("the production target picker preserves one in-flight API check identity ac
 
     const beforeModels = fixture.output().length;
     fixture.write("\t");
-    await fixture.waitForAfter("Models [focused]", beforeModels);
+    await fixture.waitForRecordedOutput("Models [focused]", beforeModels);
     fixture.write("\u001b[B");
-    await fixture.waitFor("Exact target  deepseek-v4-flash-vision-exp.direct");
+    await fixture.waitForRecordedOutput("Exact target  deepseek-v4-flash-vision-exp.direct");
     expect((fixture.screen() ?? []).join("\n").replace(/[\s│]+/gu, " ")).toContain(
       "Checking API for DeepSeek V4 Pro (deepseek-v4-pro.direct)…",
     );
     const beforeDetails = fixture.output().length;
     fixture.write("\t");
-    await fixture.waitForAfter("Details [focused]", beforeDetails);
+    await fixture.waitForRecordedOutput("Details [focused]", beforeDetails);
     expect((fixture.screen() ?? []).join("\n").replace(/[\s│]+/gu, " ")).toContain(
       "c Cancel DeepSeek V4 Pro API check",
     );
     fixture.write("c");
-    await fixture.waitFor("API check cancelled for DeepSeek V4 Pro (deepseek-v4-pro.direct).");
+    await fixture.waitForRecordedOutput(
+      "API check cancelled for DeepSeek V4 Pro (deepseek-v4-pro.direct).",
+    );
     expect(await readDurableState()).toBe(beforeCheck);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -2461,12 +2433,12 @@ test("multiple authoritative API checks require one exact Testing selection befo
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("vision");
-    await fixture.waitFor("Search: vision");
+    await fixture.waitForRecordedOutput("Search: vision");
     const beforeVisionDetails = fixture.output().length;
     fixture.write("\t");
-    await fixture.waitForAfter("Details [focused]", beforeVisionDetails);
+    await fixture.waitForRecordedOutput("Details [focused]", beforeVisionDetails);
     const nonTestingDetails = (fixture.screen() ?? []).join("\n");
     expect(nonTestingDetails).not.toContain("c Check API");
     expect(nonTestingDetails).not.toContain("c Cancel");
@@ -2474,20 +2446,22 @@ test("multiple authoritative API checks require one exact Testing selection befo
     fixture.write("c");
     const beforeModels = fixture.output().length;
     fixture.write("\t");
-    await fixture.waitForAfter("Models [focused]", beforeModels);
+    await fixture.waitForRecordedOutput("Models [focused]", beforeModels);
     for (let index = 0; index < "vision".length; index += 1) fixture.write("\u007f");
     const beforeProQuery = fixture.output().length;
     fixture.write("pro");
-    await fixture.waitForAfter("Search: pro", beforeProQuery);
+    await fixture.waitForRecordedOutput("Search: pro", beforeProQuery);
     const beforeProDetails = fixture.output().length;
     fixture.write("\t");
-    await fixture.waitForAfter("Details [focused]", beforeProDetails);
+    await fixture.waitForRecordedOutput("Details [focused]", beforeProDetails);
     expect((fixture.screen() ?? []).join("\n").replace(/[\s│]+/gu, " ")).toContain(
       "c Cancel DeepSeek V4 Pro API check",
     );
 
     fixture.write("c");
-    await fixture.waitFor("API check cancelled for DeepSeek V4 Pro (deepseek-v4-pro.direct).");
+    await fixture.waitForRecordedOutput(
+      "API check cancelled for DeepSeek V4 Pro (deepseek-v4-pro.direct).",
+    );
     expect((fixture.screen() ?? []).join("\n").replace(/[\s│]+/gu, " ")).toContain(
       "c Cancel DeepSeek V4 Flash API check",
     );
@@ -2497,7 +2471,7 @@ test("multiple authoritative API checks require one exact Testing selection befo
       "release\n",
       "utf8",
     );
-    await fixture.waitFor("c Check API");
+    await fixture.waitForRecordedOutput("c Check API");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -2517,7 +2491,7 @@ test("the session header distinguishes the Adam brand from the session title", a
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const frame = latestSynchronizedFrame(fixture.output()).join("\n");
     expect(frame).toContain("\u001b[1m\u001b[38;2;203;166;247mAdam\u001b[39m\u001b[22m");
     expect(frame).toContain("\u001b[38;2;166;227;161mNew session\u001b[39m");
@@ -2541,7 +2515,7 @@ test("NO_COLOR keeps the semantically split session header plain", async () => {
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const frame = latestSynchronizedFrame(fixture.output()).join("\n");
     expect(frame).toContain("Adam · New session");
     expect(frame).not.toContain("\u001b[38;2;203;166;247m");
@@ -2561,10 +2535,10 @@ test("Escape closes the target picker before idle Ctrl+C can arm exit", async ()
 
   try {
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\u001b[27;1;27~");
     fixture.write("\u0003");
-    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
+    await fixture.waitForRecordedOutput("Press Ctrl+C again within two seconds to exit");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -2588,7 +2562,7 @@ test("the production TUI creates from one valid saved exact default without open
 
   try {
     const fixture = startFixture({ launch: { configRoot }, stateRoot, workspaceRoot });
-    await fixture.waitFor("deepseek-v4-flash.direct · Certified");
+    await fixture.waitForRecordedOutput("deepseek-v4-flash.direct · Certified");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -2608,9 +2582,9 @@ test("the production target picker saves and clears its focused exact default se
 
   try {
     const fixture = startFixture({ launch: { configRoot }, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\u0013");
-    await fixture.waitFor("Saved deepseek-v4-flash.direct as the default");
+    await fixture.waitForRecordedOutput("Saved deepseek-v4-flash.direct as the default");
     const configurationPath = join(configRoot, "adam-agent", "config.json");
     const savedConfiguration = `${JSON.stringify({
       schemaVersion: 2,
@@ -2625,7 +2599,7 @@ test("the production target picker saves and clears its focused exact default se
       savedConfiguration,
     );
     fixture.write("\u0013");
-    await fixture.waitFor("Cleared the saved default target");
+    await fixture.waitForRecordedOutput("Cleared the saved default target");
     const clearedConfiguration = `${JSON.stringify({
       schemaVersion: 2,
       defaultTargetId: null,
@@ -2665,7 +2639,7 @@ test("the production target picker sorts and clears the saved default in place",
 
   try {
     const fixture = startFixture({ launch: { configRoot }, stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePicker = fixture.output().length;
     fixture.write("/target\r");
     await fixture.waitForCompleteFrameAfter("Select an exact model target", beforePicker);
@@ -2676,7 +2650,7 @@ test("the production target picker sorts and clears the saved default in place",
     expect(frame).not.toContain("Clear saved default");
 
     fixture.write("\u0013");
-    await fixture.waitFor("Cleared the saved default target");
+    await fixture.waitForRecordedOutput("Cleared the saved default target");
     await waitForFileContents(
       configurationPath,
       `${JSON.stringify({
@@ -2711,15 +2685,15 @@ test("the production target picker keeps an unavailable target searchable withou
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("alternate");
-    await fixture.waitFor("Search: alternate");
+    await fixture.waitForRecordedOutput("Search: alternate");
     const focused = (fixture.screen() ?? []).join("\n");
     expect(focused).toMatch(/Deterministic alternate model.*Setup/u);
 
     const beforeRemediation = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitForAfter("is not ready. Set", beforeRemediation);
+    await fixture.waitForRecordedOutput("is not ready. Set", beforeRemediation);
     const remediation = (fixture.screen() ?? []).join("\n");
     expect(remediation).toContain("is not ready. Set");
     expect(remediation).toContain("UNAVAILABLE_TEST_KEY and");
@@ -2745,7 +2719,7 @@ test("the production target picker keeps an unavailable target searchable withou
     }
     const beforeDefault = fixture.output().length;
     fixture.write("\u0013");
-    await fixture.waitForAfter("is not ready. Set", beforeDefault);
+    await fixture.waitForRecordedOutput("is not ready. Set", beforeDefault);
     await expect(readFile(configurationPath, "utf8")).rejects.toMatchObject({ code: "ENOENT" });
     const durable = await readFilesRecursively(stateRoot).catch((error: NodeJS.ErrnoException) => {
       if (error.code === "ENOENT") return "";
@@ -2781,9 +2755,9 @@ test("an unavailable saved default stays recoverable through its explicit Clear 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("alternate");
-    await fixture.waitFor("Search: alternate");
+    await fixture.waitForRecordedOutput("Search: alternate");
     const unavailableDefault = (fixture.screen() ?? []).join("\n");
     expect(unavailableDefault).toMatch(/Deterministic alternate model.*DEFAULT.*Setup/u);
     expect(unavailableDefault).toContain("Ctrl+S Clear default");
@@ -2791,7 +2765,7 @@ test("an unavailable saved default stays recoverable through its explicit Clear 
     expect(unavailableDefault).not.toContain("Save default");
 
     fixture.write("\u0013");
-    await fixture.waitFor("Cleared the saved default target.");
+    await fixture.waitForRecordedOutput("Cleared the saved default target.");
     await waitForFileContents(
       configurationPath,
       `${JSON.stringify({
@@ -2836,7 +2810,7 @@ test("the production target picker repairs an absent saved default through the f
 
   try {
     const fixture = startFixture({ launch: { configRoot }, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     expect((fixture.screen() ?? []).join("\n")).not.toContain("Clear saved default");
     const beforeSave = fixture.output().length;
     fixture.write("\u0013");
@@ -2850,7 +2824,10 @@ test("the production target picker repairs an absent saved default through the f
       },
     })}\n`;
     await waitForFileContents(configurationPath, savedConfiguration);
-    await fixture.waitForAfter("Saved deepseek-v4-flash.direct as the default.", beforeSave);
+    await fixture.waitForRecordedOutput(
+      "Saved deepseek-v4-flash.direct as the default.",
+      beforeSave,
+    );
     fixture.write("\u0013");
     const expectedConfiguration = `${JSON.stringify({
       schemaVersion: 2,
@@ -2878,12 +2855,12 @@ test("the production TUI recovers an edited new-session draft without creating s
 
   try {
     const first = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await first.waitFor("Select an exact model target");
+    await first.waitForRecordedOutput("Select an exact model target");
     const beforeTarget = first.output().length;
     first.write("\r");
-    await first.waitForAfter("Adam · New session", beforeTarget);
+    await first.waitForRecordedOutput("Adam · New session", beforeTarget);
     first.write("temporary unsent draft");
-    await first.waitForAfter("temporary unsent draft", beforeTarget);
+    await first.waitForRecordedOutput("temporary unsent draft", beforeTarget);
     first.write("\u0011");
     const result = await first.closed;
 
@@ -2892,9 +2869,9 @@ test("the production TUI recovers an edited new-session draft without creating s
     expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
 
     const restarted = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await restarted.waitFor("Select an exact model target");
+    await restarted.waitForRecordedOutput("Select an exact model target");
     restarted.write("\r");
-    await restarted.waitFor("temporary unsent draft");
+    await restarted.waitForRecordedOutput("temporary unsent draft");
     expect(restarted.screen()?.join("\n") ?? "").toContain("temporary unsent draft");
     restarted.write("\u0011");
     await expect(restarted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -2918,9 +2895,9 @@ test("the production TUI stages and sends one linked input resource", async () =
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeAttach = fixture.output().length;
     fixture.write(`/attach ${selectedPath}\r`);
     await expect(
@@ -2929,14 +2906,14 @@ test("the production TUI stages and sends one linked input resource", async () =
           .waitForCompleteFrameAfter("Input resource staged.", beforeAttach)
           .then(() => "ready" as const),
         fixture
-          .waitForAfter("Unknown command /attach", beforeAttach)
+          .waitForRecordedOutput("Unknown command /attach", beforeAttach)
           .then(() => "unknown" as const),
       ]),
     ).resolves.toBe("ready");
 
     const beforePrompt = fixture.output().length;
     fixture.write("Use the linked notes if needed.\r");
-    await fixture.waitForAfter("Provider usage unavailable.", beforePrompt);
+    await fixture.waitForRecordedOutput("Provider usage unavailable.", beforePrompt);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     const durable = await readFilesRecursively(stateRoot);
@@ -2963,11 +2940,11 @@ test("the production TUI keeps one staged file token and its Draft inputs rail b
 
   try {
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write(`/attach ${selectedPath}\r`);
-    await fixture.waitFor("Input resource staged.");
+    await fixture.waitForRecordedOutput("Input resource staged.");
 
     const screen = fixture.screen()?.join("\n") ?? "";
     expect(screen).toContain("[File #1]");
@@ -2991,14 +2968,14 @@ test("the production TUI inserts ordinary text after one staged file atom", asyn
 
   try {
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write(`/attach ${selectedPath}\r`);
-    await fixture.waitFor("Input resource staged.");
+    await fixture.waitForRecordedOutput("Input resource staged.");
 
     fixture.write("after");
-    await fixture.waitFor("[File #1]after");
+    await fixture.waitForRecordedOutput("[File #1]after");
     expect(fixture.screen()?.join("\n") ?? "").toContain("[File #1]after");
 
     fixture.write("\u0011");
@@ -3018,21 +2995,21 @@ test("the production TUI deletes and undoes one whole staged file atom", async (
 
   try {
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write(`/attach ${selectedPath}\r`);
-    await fixture.waitFor("Input resource staged.");
+    await fixture.waitForRecordedOutput("Input resource staged.");
     fixture.write("after");
-    await fixture.waitFor("[File #1]after");
+    await fixture.waitForRecordedOutput("[File #1]after");
 
     fixture.write(`${"\u001b[D".repeat(6)}\u001b[3~`);
-    await fixture.waitFor("Draft element removed.");
+    await fixture.waitForRecordedOutput("Draft element removed.");
     expect(fixture.screen()?.join("\n") ?? "").not.toContain("[File #1]");
     expect(fixture.screen()?.join("\n") ?? "").not.toContain("Draft inputs");
 
     fixture.write(String.fromCharCode(31));
-    await fixture.waitFor("Draft edit undone.");
+    await fixture.waitForRecordedOutput("Draft edit undone.");
     expect(fixture.screen()?.join("\n") ?? "").toContain("[File #1]after");
     expect(fixture.screen()?.join("\n") ?? "").toContain("Draft inputs");
 
@@ -3065,17 +3042,17 @@ test("the production TUI stages and sends one validated image to the exact Visio
 
   try {
     await terminal.whenStarted();
-    await terminal.nextSynchronizedFrameContaining("Adam · New session");
+    await terminal.waitForScreen("Adam · New session");
     const beforeAttach = terminal.output().length;
     terminal.input(`/attach ${selectedPath}\r`);
-    await terminal.nextSynchronizedFrameContaining(
+    await terminal.waitForFrameAfter(
       `ready · one-pixel.png · ${imageBytes.byteLength} bytes`,
       beforeAttach,
     );
 
     const beforePrompt = terminal.output().length;
     terminal.input("Describe the attached image.\r");
-    await terminal.nextSynchronizedFrameContaining("Provider usage unavailable.", beforePrompt);
+    await terminal.waitForFrameAfter("Provider usage unavailable.", beforePrompt);
     terminal.input("\u0011");
     await expect(execution).resolves.toBeUndefined();
   } finally {
@@ -3102,21 +3079,21 @@ test("the production TUI removes a ready linked input resource by its visible in
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write(`/attach ${selectedPath}\r`);
-    await fixture.waitFor("Input resource staged.");
+    await fixture.waitForRecordedOutput("Input resource staged.");
 
     const beforeRemove = fixture.output().length;
     fixture.write("/detach 1\r");
     await expect(
       Promise.race([
         fixture
-          .waitForAfter("Input resource removed.", beforeRemove)
+          .waitForRecordedOutput("Input resource removed.", beforeRemove)
           .then(() => "removed" as const),
         fixture
-          .waitForAfter("Unknown command /detach", beforeRemove)
+          .waitForRecordedOutput("Unknown command /detach", beforeRemove)
           .then(() => "unknown" as const),
       ]),
     ).resolves.toBe("removed");
@@ -3145,11 +3122,11 @@ test("linked input resources stay sanitized, colorless, and bounded at supported
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write(`/attach ${selectedPath}\r`);
-    await fixture.waitFor("Input resource staged.");
+    await fixture.waitForRecordedOutput("Input resource staged.");
 
     for (const columns of [40, 80, 120]) {
       const beforeResize = fixture.output().length;
@@ -3188,13 +3165,13 @@ test("the production TUI selects a draft Skill without creating durable session 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/skills\r");
-    await fixture.waitFor("Select next-turn Skills");
+    await fixture.waitForRecordedOutput("Select next-turn Skills");
     fixture.write("\r");
-    await fixture.waitFor("1 Skill selected");
+    await fixture.waitForRecordedOutput("1 Skill selected");
     fixture.write("\u0011");
     const result = await fixture.closed;
 
@@ -3226,15 +3203,15 @@ test("the production TUI admits one selected draft Skill with the first prompt",
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/skills\r");
-    await fixture.waitFor("Select next-turn Skills");
+    await fixture.waitForRecordedOutput("Select next-turn Skills");
     fixture.write("\r");
-    await fixture.waitFor("1 Skill selected");
+    await fixture.waitForRecordedOutput("1 Skill selected");
     fixture.write("Apply the draft procedure\r");
-    await fixture.waitFor("Skill selection complete.");
+    await fixture.waitForRecordedOutput("Skill selection complete.");
     fixture.write("\u0011");
     const result = await fixture.closed;
     const durable = await readFilesRecursively(stateRoot);
@@ -3255,11 +3232,11 @@ test("the production TUI opens command Help from a draft without creating durabl
 
   try {
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/help commands\r");
-    await fixture.waitFor("Command Reference");
+    await fixture.waitForRecordedOutput("Command Reference");
     fixture.write("\u0011");
     const result = await fixture.closed;
 
@@ -3282,14 +3259,14 @@ test("the production TUI reopens the project session picker from a draft without
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select a project session");
+    await fixture.waitForRecordedOutput("Select a project session");
     fixture.write("\r");
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeResume = fixture.output().length;
     fixture.write("/resume\r");
-    await fixture.waitForAfter("Select a project session", beforeResume);
+    await fixture.waitForRecordedOutput("Select a project session", beforeResume);
     fixture.write("\u0011");
     const result = await fixture.closed;
     const durable = await readFilesRecursively(stateRoot);
@@ -3309,14 +3286,14 @@ test("the production TUI switches an exact draft target without creating durable
 
   try {
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("deepseek-v4-flash.direct · Certified");
+    await fixture.waitForRecordedOutput("deepseek-v4-flash.direct · Certified");
     const beforeTarget = fixture.output().length;
     fixture.write("/target\r");
-    await fixture.waitForAfter("Select an exact model target", beforeTarget);
+    await fixture.waitForRecordedOutput("Select an exact model target", beforeTarget);
     fixture.write("\u001b[B\r");
-    await fixture.waitForAfter("deepseek-v4-pro.direct · Certified", beforeTarget);
+    await fixture.waitForRecordedOutput("deepseek-v4-pro.direct · Certified", beforeTarget);
     fixture.write("\u0011");
     const result = await fixture.closed;
 
@@ -3339,7 +3316,7 @@ test("canceling target selection restores the editor without status noise", asyn
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeTarget = fixture.output().length;
     fixture.write("/target\r");
     await fixture.waitForCompleteFrameAfter("Select an exact model target", beforeTarget);
@@ -3374,7 +3351,7 @@ test("the production TUI opens owner-local configuration from an exact draft", a
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePage = fixture.output().length;
     fixture.write("/config\r");
     await fixture.waitForCompleteFrameAfter("User model configuration", beforePage);
@@ -3412,14 +3389,14 @@ test("the production TUI applies one exact draft policy command", async () => {
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     let beforeMutation = fixture.output().length;
     fixture.write("/config con");
     await fixture.waitForCompleteFrameAfter("context", beforeMutation);
     fixture.write("\t d");
     await fixture.waitForCompleteFrameAfter("default", beforeMutation);
     fixture.write("\t\r");
-    await fixture.waitForAfter("Saved context limit: default.", beforeMutation);
+    await fixture.waitForRecordedOutput("Saved context limit: default.", beforeMutation);
 
     beforeMutation = fixture.output().length;
     fixture.write("/config out");
@@ -3431,11 +3408,11 @@ test("the production TUI applies one exact draft policy command", async () => {
     await fixture.resize(81, 24);
     await fixture.waitForCompleteFrameAfter("/config output 1234", beforeForcedCompletion);
     fixture.write("\r");
-    await fixture.waitForAfter("Saved output limit: 1234 tokens.", beforeMutation);
+    await fixture.waitForRecordedOutput("Saved output limit: 1234 tokens.", beforeMutation);
     const beforePrompt = fixture.output().length;
     fixture.write("Configured TUI admission\r");
-    await fixture.waitForAfter("Provider usage unavailable.", beforePrompt);
-    await fixture.waitForAfter(" · idle", beforePrompt);
+    await fixture.waitForRecordedOutput("Provider usage unavailable.", beforePrompt);
+    await fixture.waitForRecordedOutput(" · idle", beforePrompt);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
@@ -3473,7 +3450,7 @@ test("the production TUI tests and persists one explicit public SearXNG endpoint
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write(`/config web ${endpoint}\r`);
     await waitForFileContents(
       join(controlRoot, "web-search-dispatch-started"),
@@ -3523,13 +3500,13 @@ test("the production TUI explicitly admits one narrow fake-IP DNS subnet", async
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/config web-fake-ip 198.18.5.220/16\r");
     await waitForFileContents(
       join(controlRoot, "set_web_synthetic_dns_range-settled"),
       "admitted\n",
     );
-    await fixture.waitFor("Web DNS now trusts the Owner-managed TUN/proxy");
+    await fixture.waitForRecordedOutput("Web DNS now trusts the Owner-managed TUN/proxy");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
@@ -3558,7 +3535,7 @@ test("the production TUI shows the exact Owner-managed loopback SearXNG warning"
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write(`/config web ${endpoint}\r`);
     await waitForFileContents(join(controlRoot, "web-search-dispatch-settled"), "admitted\n");
     await fixture.resize(81, 24);
@@ -3609,17 +3586,17 @@ test("the production TUI renders exact Web permission and a responsive settled s
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const before = fixture.output().length;
     fixture.write("Render one Web card\r");
-    await fixture.waitForAfter("Permission required", before);
+    await fixture.waitForRecordedOutput("Permission required", before);
     const permissionFrame = (fixture.screen()?.join("\n") ?? "").replace(/\s+/gu, " ");
     expect(permissionFrame).toContain("https://search.example.test");
     expect(permissionFrame).toContain("query");
     expect(permissionFrame).toContain('"tui web evidence" · limit 1');
     fixture.write("\r");
-    await fixture.waitForAfter("Web search card complete.", before);
-    await fixture.waitForAfter("1 Web source", before);
+    await fixture.waitForRecordedOutput("Web search card complete.", before);
+    await fixture.waitForRecordedOutput("1 Web source", before);
     await fixture.resize(60, 24);
     const settledFrame = fixture.screen()?.join("\n") ?? "";
     expect(settledFrame).toContain("web search");
@@ -3648,7 +3625,7 @@ test("Ctrl+C cancels a held Web Search configuration test without changing prior
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/config web https://held-search.example.test/search\r");
     await waitForFileContents(join(controlRoot, "web-search-http-requested"), "requested\n");
     fixture.write("\u0003");
@@ -3746,7 +3723,7 @@ test("canceling workspace trust management restores the editor without status no
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeTrust = fixture.output().length;
     fixture.write("/trust\r");
     await fixture.waitForCompleteFrameAfter("Workspace trust", beforeTrust);
@@ -3913,16 +3890,16 @@ test("the production TUI clears draft Skill selections when the exact target cha
 
   try {
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/skills\r");
-    await fixture.waitFor("Select next-turn Skills");
+    await fixture.waitForRecordedOutput("Select next-turn Skills");
     fixture.write("\r");
-    await fixture.waitFor("1 Skill selected");
+    await fixture.waitForRecordedOutput("1 Skill selected");
     const beforeTarget = fixture.output().length;
     fixture.write("/target\r");
-    await fixture.waitForAfter("Select an exact model target", beforeTarget);
+    await fixture.waitForRecordedOutput("Select an exact model target", beforeTarget);
     fixture.write("\u001b[B\r");
     await fixture.waitForCompleteFrameAfter("deepseek-v4-pro.direct · Certified", beforeTarget);
     const frame = latestSynchronizedFrame(fixture.output().slice(beforeTarget)).join("\n");
@@ -3945,17 +3922,20 @@ test("the production TUI explains durable-identity commands without admitting a 
 
   try {
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeName = fixture.output().length;
     fixture.write("/name Draft name\r");
     const outcome = await Promise.race([
       fixture
-        .waitForAfter("/name needs a session. Submit the first prompt or use /resume.", beforeName)
+        .waitForRecordedOutput(
+          "/name needs a session. Submit the first prompt or use /resume.",
+          beforeName,
+        )
         .then(() => "actionable" as const),
       fixture
-        .waitForAfter(
+        .waitForRecordedOutput(
           "This command is not available before the first prompt is admitted.",
           beforeName,
         )
@@ -3985,12 +3965,12 @@ test("the production TUI admits the first draft prompt before showing its durabl
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePrompt = fixture.output().length;
     fixture.write("Admit this first draft prompt\r");
-    await fixture.waitForAfter("Skill selection complete.", beforePrompt);
+    await fixture.waitForRecordedOutput("Skill selection complete.", beforePrompt);
     fixture.write("\u0011");
     const result = await fixture.closed;
     const durable = await readFilesRecursively(stateRoot);
@@ -4020,9 +4000,9 @@ test("Ctrl+C cancels draft admission preflight without persisting or arming exit
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Cancel this draft admission\r");
     await waitForPath(join(controlRoot, "model-resolve-pending"));
     const beforeCancel = fixture.output().length;
@@ -4058,7 +4038,7 @@ test("the production target picker shows malformed configuration diagnostics wit
 
   try {
     const fixture = startFixture({ launch: { configRoot }, stateRoot, workspaceRoot });
-    await fixture.waitFor("deepseek-v4-flash.direct");
+    await fixture.waitForRecordedOutput("deepseek-v4-flash.direct");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -4080,7 +4060,7 @@ test("the production TUI shows the project session picker before any target reso
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("deepseek-v4-flash.direct");
+    await fixture.waitForRecordedOutput("deepseek-v4-flash.direct");
     await fixture.waitForCompleteFrameAfter("Select a project session", 0);
     expectFramedOverlay(fixture.output(), "Select a project session");
     const frame = latestSynchronizedFrame(fixture.output()).join("\n");
@@ -4160,7 +4140,7 @@ test("an explicit target still waits for explicit New Session when project sessi
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("deepseek-v4-");
+    await fixture.waitForRecordedOutput("deepseek-v4-");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result.stdout).toContain("Select a project session");
@@ -4182,11 +4162,11 @@ test("the production session picker opens the exact focused existing session", a
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select a project session");
+    await fixture.waitForRecordedOutput("Select a project session");
     const beforeSelection = fixture.output().length;
     fixture.write("\u001b[B\r");
-    await fixture.waitForAfter("Adam · Streaming session", beforeSelection);
-    await fixture.waitForAfter("deepseek-v4-flash.direct · Certified", beforeSelection);
+    await fixture.waitForRecordedOutput("Adam · Streaming session", beforeSelection);
+    await fixture.waitForRecordedOutput("deepseek-v4-flash.direct · Certified", beforeSelection);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -4269,9 +4249,9 @@ test("the production TUI starts and resumes a valid session beside invalid histo
     const fixture = startFixture({ launch: {}, noColor: true, stateRoot, workspaceRoot });
     await fixture.waitForCompleteFrameAfter("Invalid sessions", 0);
     fixture.write("\r");
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeResume = fixture.output().length;
     fixture.write("/resume\r");
     await fixture.waitForCompleteFrameAfter("Invalid sessions", beforeResume);
@@ -4304,7 +4284,7 @@ test("the production TUI starts and resumes a valid session beside invalid histo
     await fixture.waitForCompleteFrameAfter("Invalid sessions", beforeReviewWidth);
     const beforeReview = fixture.output().length;
     fixture.write("\u001b[B\u001b[B\r");
-    await fixture.waitForAfter(invalid.sessionId, beforeReview);
+    await fixture.waitForRecordedOutput(invalid.sessionId, beforeReview);
     const diagnosticFrame = (fixture.screen()?.join(" ") ?? "")
       .replace(/│/gu, " ")
       .replace(/\s+/gu, " ");
@@ -4314,7 +4294,7 @@ test("the production TUI starts and resumes a valid session beside invalid histo
     );
 
     fixture.write("\u001b[27;1;27~\u001b[A\r");
-    await fixture.waitFor("TUI catalog fixture valid.");
+    await fixture.waitForRecordedOutput("TUI catalog fixture valid.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(frames).toHaveLength(3);
@@ -4335,10 +4315,10 @@ test("the production session picker requires explicit New Session before target 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select a project session");
+    await fixture.waitForRecordedOutput("Select a project session");
     const beforeNewSession = fixture.output().length;
     fixture.write("\u001b[B\u001b[A\r");
-    await fixture.waitForAfter("Select an exact model target", beforeNewSession);
+    await fixture.waitForRecordedOutput("Select an exact model target", beforeNewSession);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -4356,7 +4336,7 @@ test("the production editor renames the active session through canonical Present
 
   try {
     const fixture = startFixture({ controlRoot, stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeRename = fixture.output().length;
     fixture.write("/name Release triage\r");
     const settledMarker = join(controlRoot, "session-name-dispatch-settled");
@@ -4379,12 +4359,14 @@ test("the real TUI opens slash Help locally without submitting it to the model",
 
   try {
     const fixture = startFixture({ scenario: "review-unavailable", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeHelp = fixture.output().length;
     fixture.write("/help\r");
     const outcome = await Promise.race([
       fixture.waitForCompleteFrameAfter("Adam Help", beforeHelp).then(() => "help" as const),
-      fixture.waitForAfter("Skill selection complete.", beforeHelp).then(() => "model" as const),
+      fixture
+        .waitForRecordedOutput("Skill selection complete.", beforeHelp)
+        .then(() => "model" as const),
     ]);
     expectFramedOverlay(fixture.output().slice(beforeHelp), "Adam Help");
     expect(fixture.output().slice(beforeHelp)).toContain(keywordLabel("Commands"));
@@ -4405,14 +4387,16 @@ test("the real TUI explains its safety and trust boundary locally", async () => 
 
   try {
     const fixture = startFixture({ scenario: "review-unavailable", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeHelp = fixture.output().length;
     fixture.write("/help safety\r");
     const outcome = await Promise.race([
       fixture
         .waitForCompleteFrameAfter("Safety and Trust", beforeHelp)
         .then(() => "safety" as const),
-      fixture.waitForAfter("Unknown Help topic safety", beforeHelp).then(() => "unknown" as const),
+      fixture
+        .waitForRecordedOutput("Unknown Help topic safety", beforeHelp)
+        .then(() => "unknown" as const),
     ]);
     expect(outcome).toBe("safety");
     const frame = fixture.output().slice(beforeHelp);
@@ -4448,9 +4432,9 @@ test("Escape closes the Help root and restores editor focus", async () => {
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/help\r");
-    await fixture.waitFor("Adam Help");
+    await fixture.waitForScreen("Adam Help");
     fixture.write("\u001b[27;1;27~draft after Help");
     fixture.write("\u0011");
     await waitForPath(join(controlRoot, "clipboard.txt"));
@@ -4470,19 +4454,19 @@ test("Escape returns from a Help topic to the Help root", async () => {
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeTopic = fixture.output().length;
     fixture.write("/help commands");
-    await fixture.waitForAfter("Command names, arguments, and aliases", beforeTopic);
+    await fixture.waitForRecordedOutput("Command names, arguments, and aliases", beforeTopic);
     fixture.write("\t\r");
     const opened = await Promise.race([
-      fixture.waitForAfter("Command Reference", beforeTopic).then(() => "topic" as const),
-      fixture.waitForAfter("Adam Help", beforeTopic).then(() => "root" as const),
+      fixture.waitForRecordedOutput("Command Reference", beforeTopic).then(() => "topic" as const),
+      fixture.waitForRecordedOutput("Adam Help", beforeTopic).then(() => "root" as const),
     ]);
     expect(opened).toBe("topic");
     const beforeParent = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
-    await fixture.waitForAfter("Adam Help", beforeParent);
+    await fixture.waitForRecordedOutput("Adam Help", beforeParent);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -4498,9 +4482,9 @@ test("Enter opens the focused topic in the Help navigator", async () => {
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/help\r");
-    await fixture.waitFor("Adam Help");
+    await fixture.waitForScreen("Adam Help");
     const beforeTopic = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter("Command Reference", beforeTopic);
@@ -4525,14 +4509,16 @@ test("slash Hotkeys opens the shared local Help navigator", async () => {
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeHotkeys = fixture.output().length;
     fixture.write("/hotkeys\r");
     const outcome = await Promise.race([
       fixture
         .waitForCompleteFrameAfter("Effective Hotkeys", beforeHotkeys)
         .then(() => "hotkeys" as const),
-      fixture.waitForAfter("Skill selection complete.", beforeHotkeys).then(() => "model" as const),
+      fixture
+        .waitForRecordedOutput("Skill selection complete.", beforeHotkeys)
+        .then(() => "model" as const),
     ]);
     expectFramedOverlay(fixture.output().slice(beforeHotkeys), "Effective Hotkeys");
     fixture.write("\u0011");
@@ -4557,9 +4543,9 @@ test("Ctrl+C closes the complete Help stack without arming idle exit", async () 
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/hotkeys\r");
-    await fixture.waitFor("Effective Hotkeys");
+    await fixture.waitForRecordedOutput("Effective Hotkeys");
     const beforeClose = fixture.output().length;
     fixture.write("\u0003");
     fixture.write("draft after Help");
@@ -4591,7 +4577,7 @@ test("question mark remains ordinary editor input instead of a Help binding", as
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeDraft = fixture.output().length;
     fixture.write("?");
     fixture.write("\u0011");
@@ -4612,15 +4598,17 @@ test("Tab completes a slash command from the local Registry", async () => {
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeCompletion = fixture.output().length;
     fixture.write("/hot");
-    await fixture.waitForAfter("Show the fixed effective keyboard map.", beforeCompletion);
+    await fixture.waitForRecordedOutput("Show the fixed effective keyboard map.", beforeCompletion);
     fixture.write("\t\r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Effective Hotkeys", beforeCompletion).then(() => "completed" as const),
       fixture
-        .waitForAfter("Skill selection complete.", beforeCompletion)
+        .waitForRecordedOutput("Effective Hotkeys", beforeCompletion)
+        .then(() => "completed" as const),
+      fixture
+        .waitForRecordedOutput("Skill selection complete.", beforeCompletion)
         .then(() => "model" as const),
     ]);
     fixture.write("\u0011");
@@ -4639,17 +4627,20 @@ test("Registry discovers the no-argument review command without sending it to th
 
   try {
     const fixture = startFixture({ scenario: "review-unavailable", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeCompletion = fixture.output().length;
     fixture.write("/rev");
-    await fixture.waitForAfter("Review project changes", beforeCompletion);
+    await fixture.waitForRecordedOutput("Review project changes", beforeCompletion);
     fixture.write("\t\r");
     const outcome = await Promise.race([
       fixture
-        .waitForAfter("No active extension command can admit project changes.", beforeCompletion)
+        .waitForRecordedOutput(
+          "No active extension command can admit project changes.",
+          beforeCompletion,
+        )
         .then(() => "rejected" as const),
       fixture
-        .waitForAfter("Skill selection complete.", beforeCompletion)
+        .waitForRecordedOutput("Skill selection complete.", beforeCompletion)
         .then(() => "model" as const),
     ]);
     fixture.write("\u0011");
@@ -4668,7 +4659,7 @@ test("an admitted project review renders one inline generic operation card", asy
 
   try {
     const fixture = startFixture({ scenario: "review-operation", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     await fixture.resize(120, 40);
     const beforeReview = fixture.output().length;
     fixture.write("/review\r");
@@ -4693,9 +4684,9 @@ test("an active operation card keeps its status, action, identity, and draft thr
 
   try {
     const fixture = startFixture({ scenario: "review-operation", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/review\r");
-    await fixture.waitFor("Ctrl+C cancel");
+    await fixture.waitForRecordedOutput("Ctrl+C cancel");
     fixture.write("preserved review draft");
 
     let operationId: string | undefined;
@@ -4742,9 +4733,9 @@ test("a 40-column operation card keeps exact long provenance identities reachabl
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/review\r");
-    await fixture.waitFor("Ctrl+C cancel");
+    await fixture.waitForRecordedOutput("Ctrl+C cancel");
     const beforeResize = fixture.output().length;
     await fixture.resize(40, 60);
     await fixture.waitForCompleteFrameAfter("Ctrl+C cancel", beforeResize);
@@ -4776,9 +4767,9 @@ test("Ctrl+C cancels only an actionable linked review and waits for durable sett
 
   try {
     const fixture = startFixture({ scenario: "review-operation", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/review\r");
-    await fixture.waitFor("Ctrl+C cancel");
+    await fixture.waitForRecordedOutput("Ctrl+C cancel");
     const beforeCancel = fixture.output().length;
     fixture.write("\u0003");
     await fixture.waitForCompleteFrameAfter("Cancelled · caller", beforeCancel);
@@ -4807,11 +4798,11 @@ test("a completed linked review opens its bounded generic report through slash A
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     await fixture.resize(120, 40);
     fixture.write("/review\r");
-    await fixture.waitFor("Completed");
-    await fixture.waitFor("Review project changes admitted.");
+    await fixture.waitForRecordedOutput("Completed");
+    await fixture.waitForRecordedOutput("Review project changes admitted.");
     expect(fixture.output()).toContain("Report · fixture.review-result@1 · application/json");
     const beforeArtifacts = fixture.output().length;
     fixture.write("/artifacts\r");
@@ -4822,7 +4813,7 @@ test("a completed linked review opens its bounded generic report through slash A
     const beforeOpen = fixture.output().length;
     fixture.write("\r");
     await waitForPath(join(controlRoot, "artifact-read-1-settled"));
-    await fixture.waitForAfter('"reviewed":true', beforeOpen);
+    await fixture.waitForRecordedOutput('"reviewed":true', beforeOpen);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -4845,9 +4836,9 @@ test("Ctrl+R recovers only an eligible linked review from durable operation evid
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/review\r");
-    await fixture.waitFor("Ctrl+R recover");
+    await fixture.waitForRecordedOutput("Ctrl+R recover");
     const beforeRecovery = fixture.output().length;
     fixture.write("\u0012");
     await waitForPath(join(controlRoot, "operation-recover-submitted"));
@@ -4870,9 +4861,9 @@ test("review arguments are rejected locally with descriptor-owned usage", async 
 
   try {
     const fixture = startFixture({ scenario: "review-unavailable", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/review extra\r");
-    await fixture.waitFor("Usage: /review");
+    await fixture.waitForRecordedOutput("Usage: /review");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -4890,13 +4881,13 @@ test("slash completion exposes Registry usage as its argument hint", async () =>
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeCompletion = fixture.output().length;
     fixture.write("/he");
-    await fixture.waitForAfter("/help [topic]", beforeCompletion);
+    await fixture.waitForRecordedOutput("/help [topic]", beforeCompletion);
     expect(fixture.output().slice(beforeCompletion)).toContain("\u001b[38;2;203;166;247m> /help");
     fixture.write("\t\r");
-    await fixture.waitForAfter("Adam Help", beforeCompletion);
+    await fixture.waitForRecordedOutput("Adam Help", beforeCompletion);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -4912,522 +4903,9 @@ test("the idle footer exposes Registry-driven interaction hints", async () => {
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     await fixture.resize(120, 40);
-    await fixture.waitFor("/help [topic] · /hotkeys · Tab complete");
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("current hybrid Plan copy is policy-aware in notices and footer", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-hybrid-copy-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({
-      launch: {},
-      scenario: "skill-selection",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Select an exact model target");
-    fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
-    fixture.write("Admit the current hybrid Plan session\r");
-    await fixture.waitFor("Skill selection complete.");
-    const afterAnswer = fixture.output().lastIndexOf("Skill selection complete.");
-    await fixture.waitForCompleteFrameAfter(" · idle", afterAnswer);
-    const beforePlan = fixture.output().length;
-    fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring", beforePlan);
-    const output = fixture.output().slice(beforePlan);
-    const frame = fixture.screen()?.join("\n") ?? "";
-
-    expect(output).toContain("Entered Plan.");
-    expect(frame).toContain("Plan exploring");
-    expect(frame).toContain(
-      "plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies",
-    );
-    expect(`${output}\n${frame}`).not.toContain("read-only Plan");
-    expect(frame).not.toContain("Plan exploring · read-only");
-
-    for (const [columns, rows, policyCopy] of [
-      [120, 40, ["plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies"]],
-      [80, 24, ["plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies"]],
-      [40, 12, ["inspect:auto · ambig:ask ·", "mutate:deny"]],
-    ] as const) {
-      await fixture.resize(columns, rows);
-      const resizedFrame = fixture.screen() ?? [];
-      for (const expected of policyCopy) {
-        expect(resizedFrame.join("\n")).toContain(expected);
-      }
-      expect(resizedFrame.join("\n")).not.toContain("read-only");
-      expect(resizedFrame.every((line) => visibleWidth(line) <= columns)).toBe(true);
-    }
-
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("production Help renders policy-neutral Plan Registry copy", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-help-copy-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
-    await fixture.resize(120, 40);
-    const beforeHelp = fixture.output().length;
-    fixture.write("/help commands\r");
-    await fixture.waitForCompleteFrameAfter("Command Reference", beforeHelp);
-    const frame = fixture.screen()?.join("\n") ?? "";
-    expect(frame).toContain("/plan · idle only · Enter or exit the authoritative Plan cycle.");
-    expect(frame).not.toContain("read-only Plan");
-
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("NO_COLOR preserves current hybrid Plan policy copy without claiming read-only", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-hybrid-no-color-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({
-      launch: {},
-      noColor: true,
-      scenario: "skill-selection",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Select an exact model target");
-    fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
-    fixture.write("Admit the colorless hybrid Plan session\r");
-    await fixture.waitFor("Skill selection complete.");
-    const afterAnswer = fixture.output().lastIndexOf("Skill selection complete.");
-    await fixture.waitForCompleteFrameAfter(" · idle", afterAnswer);
-    const beforePlan = fixture.output().length;
-    fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter(
-      "plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies",
-      beforePlan,
-    );
-    const frame = fixture.screen()?.join("\n") ?? "";
-
-    expect(frame).toContain("Entered Plan.");
-    expect(frame).not.toContain("read-only");
-    expect(frame).not.toContain("\u001b[38;2;");
-    expect(frame).not.toContain("\u001b[48;2;");
-
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("historical read-v1 Plan keeps exact read-only footer wording", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-read-v1-copy-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({ scenario: "plan-read-v1", stateRoot, workspaceRoot });
-    await fixture.waitForCompleteFrameAfter("plan-policy.read-v1 · read-only", 0);
-    let frame = fixture.screen() ?? [];
-    expect(frame.join("\n")).toContain("Plan exploring");
-    expect(frame.join("\n")).not.toContain("hybrid-v1");
-
-    await fixture.resize(40, 12);
-    frame = fixture.screen() ?? [];
-    expect(frame.join("\n")).toContain("plan read-only");
-    expect(frame.every((line) => visibleWidth(line) <= 40)).toBe(true);
-
-    const beforeExit = fixture.output().length;
-    fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Exited Plan.", beforeExit);
-    expect(fixture.screen()?.join("\n") ?? "").not.toContain("plan read-only");
-
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("a new-session draft toggles policy-aware Plan without creating durable identity", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-status-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
-    const beforeTarget = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
-    const beforeTargetClose = fixture.output().length;
-    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
-    await fixture.resize(120, 40);
-
-    const beforeEntry = fixture.output().length;
-    fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeEntry);
-    let frame = latestSynchronizedFrame(fixture.output()).join("\n");
-    expect(frame).toContain("Plan exploring");
-    expect(frame).not.toContain("read-only");
-    expect(frame).not.toContain("plan-policy.");
-    expect(await readFilesRecursively(stateRoot)).not.toContain('"type":"session_genesis"');
-
-    const beforeTargetSwitch = fixture.output().length;
-    fixture.write("/target\r");
-    await fixture.waitForCompleteFrameAfter("Select an exact model target", beforeTargetSwitch);
-    const beforeTargetSelection = fixture.output().length;
-    fixture.write("\u001b[B\r");
-    await fixture.waitForCompleteFrameAfter(
-      "deepseek-v4-pro.direct · Certified",
-      beforeTargetSelection,
-    );
-    const beforeSwitchedTargetClose = fixture.output().length;
-    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeSwitchedTargetClose);
-    expect(fixture.screen()?.join("\n") ?? "").not.toContain("read-only");
-    expect(fixture.screen()?.join("\n") ?? "").not.toContain("plan-policy.");
-
-    const beforeExit = fixture.output().length;
-    fixture.write("/plan\r");
-    await fixture.waitForAfter("Exited Plan.", beforeExit);
-    frame = latestSynchronizedFrame(fixture.output().slice(beforeExit)).join("\n");
-    expect(frame).not.toContain("Plan exploring");
-
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("a prompt-admitted production session enters policy-aware Plan after its first turn", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-after-admission-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({
-      launch: {},
-      scenario: "skill-selection",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Select an exact model target");
-    const beforeTarget = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
-    const beforeTargetClose = fixture.output().length;
-    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
-
-    const beforePrompt = fixture.output().length;
-    fixture.write("Confirm the current Plan capability\r");
-    await fixture.waitForAfter("Skill selection complete.", beforePrompt);
-    const afterAnswer = fixture.output().lastIndexOf("Skill selection complete.");
-    await fixture.waitForCompleteFrameAfter(" · idle", afterAnswer);
-
-    const beforePlan = fixture.output().length;
-    fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter(
-      "plan-policy.hybrid-v1 · inspect auto · ambiguous exec asks · mutation denies",
-      beforePlan,
-    );
-    const frame = latestSynchronizedFrame(fixture.output().slice(beforePlan)).join("\n");
-    expect(frame).toContain("Plan exploring");
-    expect(frame).not.toContain("read-only");
-    expect(frame).not.toContain("Plan could not be entered from the current session state.");
-
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI reviews, revises, and implements the exact ready Plan", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-review-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({ launch: {}, scenario: "plan-review", stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
-    const beforeTarget = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
-    const beforeTargetClose = fixture.output().length;
-    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
-    await fixture.resize(120, 40);
-    const beforeEntry = fixture.output().length;
-    fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeEntry);
-
-    const beforeInitialSubmission = fixture.output().length;
-    fixture.write("Create the exact implementation plan\r");
-    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeInitialSubmission);
-    let frame = latestSynchronizedFrame(fixture.output().slice(beforeInitialSubmission)).join("\n");
-    expect(frame).toContain("Fixture plan 1");
-    expect(frame).toContain("# Fixture plan 1");
-    expect(frame).toContain("Implement the exact reviewed change.");
-    expect(frame).toContain("sha256:");
-    expect(frame).toContain("Approve and implement");
-    expect(frame).toContain("Request changes…");
-    expect(frame).toContain("Cancel plan");
-
-    fixture.write("\u001b[B");
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter(
-      "Revision intent active; submit the main composer when ready.",
-      beforeInitialSubmission,
-    );
-
-    const beforeRevisionSubmit = fixture.output().length;
-    fixture.write("Preserve this revision request\r");
-    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeRevisionSubmit);
-    frame = latestSynchronizedFrame(fixture.output()).join("\n");
-    expect(frame).toContain("Review exact submitted plan");
-    expect(frame).toContain("# Fixture plan 2");
-    const beforeApproval = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter(
-      "Approved Plan implementation complete.",
-      beforeApproval,
-    );
-    await fixture.waitForCompleteFrameAfter(
-      "Approved Plan implementation completed.",
-      beforeApproval,
-    );
-    const beforeArtifacts = fixture.output().length;
-    fixture.write("/artifacts \r");
-    await fixture.waitForCompleteFrameAfter("Session artifacts", beforeArtifacts);
-    frame = latestSynchronizedFrame(fixture.output().slice(beforeArtifacts)).join("\n");
-    expect(frame).toContain("Fixture plan 2");
-    expect(frame).toContain("approved");
-    const beforeArtifactSelection = fixture.output().length;
-    fixture.write("\u001b[B");
-    await fixture.waitForCompleteFrameAfter("Fixture plan 2", beforeArtifactSelection);
-    const beforeArtifactDetail = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter("Artifact detail", beforeArtifactDetail);
-    frame = latestSynchronizedFrame(fixture.output().slice(beforeArtifactDetail)).join("\n");
-    expect(frame).toContain("# Fixture plan 2");
-    expect(frame).toContain("Implement the exact reviewed change.");
-
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the minimum supported Plan review never hides executable approval actions", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-review-minimum-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({ launch: {}, scenario: "plan-review", stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
-    fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
-    await fixture.waitFor("New session draft · idle");
-    fixture.write("/plan\r");
-    await fixture.waitFor("Plan exploring");
-    await fixture.resize(40, 12);
-
-    const beforeSubmission = fixture.output().length;
-    fixture.write("Create a safely visible implementation plan\r");
-    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeSubmission);
-    const frame = latestSynchronizedFrame(fixture.output().slice(beforeSubmission)).join("\n");
-    expect(frame).toContain("Approve and implement");
-    expect(frame).toContain("Request changes…");
-    expect(frame).toContain("Cancel plan");
-    expect(frame).toContain("Enter choose");
-
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI keeps the exact composer draft while a ready Plan review is dismissed", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-draft-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({ launch: {}, scenario: "plan-review", stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
-    const beforeTarget = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
-    const beforeTargetClose = fixture.output().length;
-    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
-    await fixture.resize(120, 40);
-    const beforeEntry = fixture.output().length;
-    fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeEntry);
-    const beforePlan = fixture.output().length;
-    fixture.write("Create a plan whose ready state must remain exact\r");
-    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);
-
-    const beforeFirstDismiss = fixture.output().length;
-    fixture.write("\u001b");
-    await fixture.waitForCompleteFrameAfter("Plan ready r2 · review required", beforeFirstDismiss);
-    const beforeReopen = fixture.output().length;
-    fixture.write("Preserve this exact revision draft\r");
-    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeReopen);
-    const beforeDismiss = fixture.output().length;
-    fixture.write("\u001b");
-    await fixture.waitForCompleteFrameAfter("Plan ready r2 · review required", beforeDismiss);
-    const screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toContain("Preserve this exact revision draft");
-    expect(screen).toContain("Plan ready r2 · review required");
-
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI cancels a ready Plan only after concise confirmation", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-cancel-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({ launch: {}, scenario: "plan-review", stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
-    const beforeTarget = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
-    const beforeTargetClose = fixture.output().length;
-    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
-    await fixture.resize(120, 40);
-    const beforeEntry = fixture.output().length;
-    fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeEntry);
-    const beforePlan = fixture.output().length;
-    fixture.write("Create a plan that will be cancelled exactly\r");
-    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);
-
-    const openCancellation = async (): Promise<void> => {
-      let beforeSelection = fixture.output().length;
-      fixture.write("\u001b[B");
-      await fixture.waitForCompleteFrameAfter("Request changes…", beforeSelection);
-      beforeSelection = fixture.output().length;
-      fixture.write("\u001b[B");
-      await fixture.waitForCompleteFrameAfter("Cancel plan", beforeSelection);
-      const beforeConfirmation = fixture.output().length;
-      fixture.write("\r");
-      await fixture.waitForCompleteFrameAfter("Cancel this exact plan?", beforeConfirmation);
-    };
-
-    await openCancellation();
-    const beforeSafeDefault = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforeSafeDefault);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("Plan ready r2 · review required");
-
-    await openCancellation();
-    const beforeConfirmSelection = fixture.output().length;
-    fixture.write("\u001b[B");
-    await fixture.waitForCompleteFrameAfter("Confirm cancellation", beforeConfirmSelection);
-    const beforeCancellation = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter("Plan cancelled.", beforeCancellation);
-    const screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toContain("Plan cancelled.");
-    expect(screen).not.toContain("Plan ready");
-
-    fixture.write("\u0011");
-    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
-  } finally {
-    await rm(testRoot, { recursive: true, force: true });
-  }
-});
-
-test("the production TUI explicitly continues a recovered unstarted Plan approval", async () => {
-  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-plan-recovery-"));
-  const workspaceRoot = join(testRoot, "workspace");
-  const stateRoot = join(testRoot, "state");
-  await mkdir(workspaceRoot);
-
-  try {
-    const fixture = startFixture({
-      launch: {},
-      scenario: "plan-review-recovery",
-      stateRoot,
-      workspaceRoot,
-    });
-    await fixture.waitFor("Select an exact model target");
-    const beforeTarget = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter("Adam · New session", beforeTarget);
-    const beforeTargetClose = fixture.output().length;
-    await fixture.waitForCompleteFrameAfter("New session draft · idle", beforeTargetClose);
-    await fixture.resize(120, 40);
-    const beforeEntry = fixture.output().length;
-    fixture.write("/plan\r");
-    await fixture.waitForCompleteFrameAfter("Plan exploring", beforeEntry);
-    const beforePlan = fixture.output().length;
-    fixture.write("Create a plan whose durable approval must be recovered\r");
-    await fixture.waitForCompleteFrameAfter("Review exact submitted plan", beforePlan);
-
-    const beforeApproval = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter("Continue implementation", beforeApproval);
-    let screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toContain("Approved plan has not started");
-    expect(screen).not.toContain("Approved Plan implementation complete.");
-
-    const beforeDismiss = fixture.output().length;
-    fixture.write("\u001b");
-    await fixture.waitForCompleteFrameAfter("Plan approved · not started", beforeDismiss);
-    const beforeReopen = fixture.output().length;
-    fixture.write("Do not create a second approval command\r");
-    await fixture.waitForCompleteFrameAfter("Continue implementation", beforeReopen);
-
-    const beforeContinue = fixture.output().length;
-    fixture.write("\r");
-    await fixture.waitForCompleteFrameAfter(
-      "Approved Plan implementation completed.",
-      beforeContinue,
-    );
-    screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toContain("Approved Plan implementation complete.");
-    expect(screen).toContain("Approved Plan implementation completed.");
-
+    await fixture.waitForRecordedOutput("/help [topic] · /hotkeys · Tab complete");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -5447,27 +4925,27 @@ test("the footer exposes authoritative project context and run facts", async () 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     await fixture.resize(120, 40);
     fixture.write("Produce an artifact-backed answer\r");
-    await fixture.waitFor("Adam · Streaming session");
-    await fixture.waitFor("Assistant response stored as artifact");
+    await fixture.waitForRecordedOutput("Adam · Streaming session");
+    await fixture.waitForRecordedOutput("Assistant response stored as artifact");
     const afterFirstAnswer = fixture.output().lastIndexOf("Assistant response stored as artifact");
     await fixture.waitForCompleteFrameAfter(" · idle", afterFirstAnswer);
     const beforeCompaction = fixture.output().length;
     fixture.write("Continue after the large answer\r");
     await fixture.waitForCompleteFrameAfter("Working", beforeCompaction);
     const afterWorking = fixture.output().length;
-    await fixture.waitForAfter("Context compacted · window 1", beforeCompaction);
+    await fixture.waitForRecordedOutput("Context compacted · window 1", beforeCompaction);
     const secondAssistantSummary = "· 270058 bytes · /artifacts to inspect";
-    await fixture.waitForAfter(secondAssistantSummary, afterWorking);
+    await fixture.waitForRecordedOutput(secondAssistantSummary, afterWorking);
     const afterAssistant = fixture.output().lastIndexOf(secondAssistantSummary);
     await fixture.waitForCompleteFrameAfter("context · estimated · idle", afterAssistant);
     expect(fixture.output()).toMatch(/workspace · \d+\/32768 context · estimated · idle/u);
 
     let beforeResize = fixture.output().length;
     await fixture.resize(80, 24);
-    await fixture.waitForAfter("context · estimated · idle", beforeResize);
+    await fixture.waitForRecordedOutput("context · estimated · idle", beforeResize);
     let frame = latestSynchronizedFrame(fixture.output().slice(beforeResize)).join("\n");
     expect(frame).toMatch(/workspace · \d+\/32768 context · estimated · idle/u);
 
@@ -5491,9 +4969,9 @@ test("the footer distinguishes provider-reported context occupancy at every widt
 
   try {
     const fixture = startFixture({ scenario: "provider-usage", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Report exact usage\r");
-    await fixture.waitFor("Provider usage answer.");
+    await fixture.waitForRecordedOutput("Provider usage answer.");
     const afterAnswer = fixture.output().lastIndexOf("Provider usage answer.");
     await fixture.waitForCompleteFrameAfter(
       "workspace · 12345/32768 context · provider reported · idle",
@@ -5539,11 +5017,11 @@ test("the footer distinguishes unknown context occupancy at every width", async 
 
   try {
     const fixture = startFixture({ scenario: "provider-no-usage", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePrompt = fixture.output().length;
     fixture.write("Report usage availability\r");
-    await fixture.waitForAfter("Provider usage unavailable.", beforePrompt);
-    await fixture.waitForAfter("context · unknown · idle", beforePrompt);
+    await fixture.waitForRecordedOutput("Provider usage unavailable.", beforePrompt);
+    await fixture.waitForRecordedOutput("context · unknown · idle", beforePrompt);
 
     let beforeResize = fixture.output().length;
     await fixture.resize(120, 40);
@@ -5584,9 +5062,9 @@ test("Tab accepts a fuzzy slash-command suggestion from the Registry", async () 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/nme");
-    await fixture.waitFor("/name <text|--clear|--generate>");
+    await fixture.waitForRecordedOutput("/name <text|--clear|--generate>");
     fixture.write("\t");
     fixture.write("\u0011");
     const result = await fixture.closed;
@@ -5613,12 +5091,12 @@ test("Tab completes an authoritative project path without reading the file", asy
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("src/al");
-    await fixture.waitFor("src/al");
+    await fixture.waitForRecordedOutput("src/al");
     const beforeTab = fixture.output().length;
     fixture.write("\t");
-    await fixture.waitForAfter("src/alpha.ts", beforeTab);
+    await fixture.waitForRecordedOutput("src/alpha.ts", beforeTab);
     fixture.write("\u0011");
     await waitForPath(join(controlRoot, "clipboard.txt"));
     const result = await fixture.closed;
@@ -5647,11 +5125,11 @@ test("Tab completes an authoritative project path on a later multiline draft lin
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("first line\u000asrc/al");
-    await fixture.waitFor("src/al");
+    await fixture.waitForRecordedOutput("src/al");
     fixture.write("\t");
-    await fixture.waitFor("src/alpha.ts");
+    await fixture.waitForRecordedOutput("src/alpha.ts");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -5680,11 +5158,11 @@ test("Tab path completion renders terminal controls from filenames as inert text
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("src/ev");
-    await fixture.waitFor("src/ev");
+    await fixture.waitForRecordedOutput("src/ev");
     fixture.write("\t");
-    await fixture.waitFor("src/evil.ts");
+    await fixture.waitForRecordedOutput("src/evil.ts");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -5711,7 +5189,7 @@ test("at path completion opens only at a token boundary", async () => {
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("email@example@");
     fixture.write("\u0011");
     await waitForPath(join(controlRoot, "clipboard.txt"));
@@ -5736,13 +5214,13 @@ test("Tab completes an exact qualified Skill argument from authoritative catalog
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/skills skill:v1:project:.:fir");
-    await fixture.waitFor("First completion procedure.");
+    await fixture.waitForRecordedOutput("First completion procedure.");
     fixture.write("\t\r");
     const outcome = await Promise.race([
-      fixture.waitFor("1 Skill selected").then(() => "selected" as const),
-      fixture.waitFor("Skill selection complete.").then(() => "model" as const),
+      fixture.waitForRecordedOutput("1 Skill selected").then(() => "selected" as const),
+      fixture.waitForRecordedOutput("Skill selection complete.").then(() => "model" as const),
     ]);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -5769,13 +5247,13 @@ test("Tab completes and admits a Skill mention from the current first-draft cata
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Use $fir");
-    await fixture.waitFor("$first");
+    await fixture.waitForRecordedOutput("$first");
     fixture.write("\t");
-    await fixture.waitFor("Use $first");
+    await fixture.waitForRecordedOutput("Use $first");
     fixture.write("\r");
-    await fixture.waitFor("Skill selection complete.");
+    await fixture.waitForRecordedOutput("Skill selection complete.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
@@ -5815,9 +5293,9 @@ test("accepted Skill completion preserves its exact identity across a recoverabl
       stateRoot,
       workspaceRoot,
     });
-    await first.waitFor("Select an exact model target");
+    await first.waitForRecordedOutput("Select an exact model target");
     first.write("\r");
-    await first.waitFor("Adam · New session");
+    await first.waitForScreen("Adam · New session");
     const beforeCompletion = first.output().length;
     first.write("Use $sha");
     await first.waitForCompleteFrameAfter("$shared-name", beforeCompletion);
@@ -5827,7 +5305,7 @@ test("accepted Skill completion preserves its exact identity across a recoverabl
       await first.resize(79, 24);
     }
     first.write("\t");
-    await first.waitFor("Use $shared-name");
+    await first.waitForRecordedOutput("Use $shared-name");
     first.write("\u0011");
     await expect(first.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
@@ -5845,11 +5323,11 @@ test("accepted Skill completion preserves its exact identity across a recoverabl
       stateRoot,
       workspaceRoot,
     });
-    await restarted.waitFor("Select an exact model target");
+    await restarted.waitForRecordedOutput("Select an exact model target");
     restarted.write("\r");
-    await restarted.waitFor("Use $shared-name");
+    await restarted.waitForRecordedOutput("Use $shared-name");
     restarted.write("\r");
-    await restarted.waitFor("Skill selection complete.");
+    await restarted.waitForRecordedOutput("Skill selection complete.");
     restarted.write("\u0011");
     await expect(restarted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     const durable = await readFilesRecursively(stateRoot);
@@ -5881,15 +5359,15 @@ test("a Skill atom navigates as one token and Backspace removes its exact occurr
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("$fir");
-    await fixture.waitFor("$first");
+    await fixture.waitForRecordedOutput("$first");
     fixture.write("\t");
-    await fixture.waitFor("$first");
+    await fixture.waitForRecordedOutput("$first");
     fixture.write("\u001b[Dx");
-    await fixture.waitFor("x$first");
+    await fixture.waitForRecordedOutput("x$first");
     fixture.write("\u001b[Cy");
-    await fixture.waitFor("x$firsty");
+    await fixture.waitForRecordedOutput("x$firsty");
     fixture.write("\u001b[D\u007f");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -5918,11 +5396,11 @@ test("Delete immediately before a Skill atom removes the whole occurrence", asyn
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("$fir");
-    await fixture.waitFor("$first");
+    await fixture.waitForRecordedOutput("$first");
     fixture.write("\ty");
-    await fixture.waitFor("$firsty");
+    await fixture.waitForRecordedOutput("$firsty");
     fixture.write("\u001b[D\u001b[D\u001b[3~");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -5957,9 +5435,9 @@ test("copying an accepted Skill atom and pasting those bytes loses identity auth
       stateRoot,
       workspaceRoot,
     });
-    await source.waitFor("Adam · New session");
+    await source.waitForScreen("Adam · New session");
     source.write("$fir");
-    await source.waitFor("$first");
+    await source.waitForRecordedOutput("$first");
     const beforeAccept = source.output().length;
     source.write("\t");
     await source.waitForCompleteFrameAfter("$first", beforeAccept);
@@ -5969,9 +5447,9 @@ test("copying an accepted Skill atom and pasting those bytes loses identity auth
     expect(copiedText).toBe("$first");
 
     const pasted = startFixture({ stateRoot: pastedStateRoot, workspaceRoot });
-    await pasted.waitFor("Adam · New session");
+    await pasted.waitForScreen("Adam · New session");
     pasted.write(`\u001b[200~${copiedText}\u001b[201~`);
-    await pasted.waitFor("$first");
+    await pasted.waitForRecordedOutput("$first");
     pasted.write("\u0011");
     await expect(pasted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     const pastedManifest = await readFilesRecursively(join(pastedStateRoot, "drafts"));
@@ -6002,11 +5480,11 @@ test("an unavailable recovered Skill atom stays visible and blocks submission wi
       stateRoot,
       workspaceRoot,
     });
-    await first.waitFor("Select an exact model target");
+    await first.waitForRecordedOutput("Select an exact model target");
     first.write("\r");
-    await first.waitFor("Adam · New session");
+    await first.waitForScreen("Adam · New session");
     first.write("Use $fir");
-    await first.waitFor("$first");
+    await first.waitForRecordedOutput("$first");
     const beforeAccept = first.output().length;
     first.write("\t");
     await first.waitForCompleteFrameAfter("Use $first", beforeAccept);
@@ -6020,14 +5498,14 @@ test("an unavailable recovered Skill atom stays visible and blocks submission wi
       stateRoot,
       workspaceRoot,
     });
-    await restarted.waitFor("Select an exact model target");
+    await restarted.waitForRecordedOutput("Select an exact model target");
     restarted.write("\r");
-    await restarted.waitFor("Use $first");
+    await restarted.waitForRecordedOutput("Use $first");
     const diagnostic = "Skill $first is unavailable; delete it or choose a current Skill.";
     expect((restarted.screen()?.join("\n") ?? "").replace(/\s+/gu, " ")).toContain(diagnostic);
     const beforeSubmit = restarted.output().length;
     restarted.write("\r");
-    await restarted.waitForAfter(diagnostic, beforeSubmit);
+    await restarted.waitForRecordedOutput(diagnostic, beforeSubmit);
     restarted.write("\u0011");
     await expect(restarted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     const durable = await readFilesRecursively(stateRoot);
@@ -6046,15 +5524,17 @@ test("Tab completes a Help topic argument from the Registry", async () => {
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeCompletion = fixture.output().length;
     fixture.write("/help hot");
-    await fixture.waitForAfter("Fixed effective keyboard bindings", beforeCompletion);
+    await fixture.waitForRecordedOutput("Fixed effective keyboard bindings", beforeCompletion);
     expect(fixture.output().slice(beforeCompletion)).toContain("\u001b[38;2;203;166;247m> hotkeys");
     fixture.write("\t\r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Effective Hotkeys", beforeCompletion).then(() => "hotkeys" as const),
-      fixture.waitForAfter("Adam Help", beforeCompletion).then(() => "root" as const),
+      fixture
+        .waitForRecordedOutput("Effective Hotkeys", beforeCompletion)
+        .then(() => "hotkeys" as const),
+      fixture.waitForRecordedOutput("Adam Help", beforeCompletion).then(() => "root" as const),
     ]);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -6072,7 +5552,7 @@ test("NO_COLOR keeps slash, Help-topic, and first-level Help labels plain", asyn
 
   try {
     const fixture = startFixture({ noColor: true, stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     let beforeAction = fixture.output().length;
     fixture.write("/help hot");
     await fixture.waitForCompleteFrameAfter("Fixed effective keyboard bindings", beforeAction);
@@ -6081,7 +5561,7 @@ test("NO_COLOR keeps slash, Help-topic, and first-level Help labels plain", asyn
     expect(frame).not.toContain("\u001b[38;2;");
     expect(frame).not.toContain("\u001b[48;2;");
     fixture.write("\t\r");
-    await fixture.waitForAfter("Effective Hotkeys", beforeAction);
+    await fixture.waitForRecordedOutput("Effective Hotkeys", beforeAction);
 
     beforeAction = fixture.output().length;
     fixture.write("\u001b");
@@ -6106,14 +5586,14 @@ test("an unknown Help topic is rejected locally with a Registry suggestion", asy
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeTopic = fixture.output().length;
     fixture.write("/help htokeys\r");
     const outcome = await Promise.race([
       fixture
-        .waitForAfter("Unknown Help topic htokeys · Did you mean hotkeys?", beforeTopic)
+        .waitForRecordedOutput("Unknown Help topic htokeys · Did you mean hotkeys?", beforeTopic)
         .then(() => "rejected" as const),
-      fixture.waitForAfter("Adam Help", beforeTopic).then(() => "root" as const),
+      fixture.waitForRecordedOutput("Adam Help", beforeTopic).then(() => "root" as const),
     ]);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -6131,14 +5611,16 @@ test("Help exposes the effective Pi Editor hotkeys on a dedicated topic", async 
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeTopic = fixture.output().length;
     fixture.write("/help editor");
-    await fixture.waitFor("Pi Editor navigation and editing bindings");
+    await fixture.waitForRecordedOutput("Pi Editor navigation and editing bindings");
     fixture.write("\t\r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Editor Hotkeys", beforeTopic).then(() => "editor" as const),
-      fixture.waitForAfter("Unknown Help topic editor", beforeTopic).then(() => "unknown" as const),
+      fixture.waitForRecordedOutput("Editor Hotkeys", beforeTopic).then(() => "editor" as const),
+      fixture
+        .waitForRecordedOutput("Unknown Help topic editor", beforeTopic)
+        .then(() => "unknown" as const),
     ]);
     fixture.write("\u0011");
     const result = await fixture.closed;
@@ -6165,7 +5647,7 @@ test("resume rebuilds prompt history from active authoritative chronology", asyn
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("History prompt 3");
+    await fixture.waitForRecordedOutput("History prompt 3");
     fixture.write("\u001b[A");
     fixture.write("\u0011");
     const result = await fixture.closed;
@@ -6192,7 +5674,7 @@ test("restored prompt history renders terminal controls as inert text", async ()
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Visible history");
+    await fixture.waitForRecordedOutput("Visible history");
     fixture.write("\u001b[A");
     fixture.write("\u0011");
     const result = await fixture.closed;
@@ -6220,9 +5702,9 @@ test("session selection rebuilds prompt history from the selected authoritative 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select a project session");
+    await fixture.waitForRecordedOutput("Select a project session");
     fixture.write("Selected");
-    await fixture.waitFor("Search: Selected");
+    await fixture.waitForRecordedOutput("Search: Selected");
     const beforeSelection = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter("Selected session prompt", beforeSelection);
@@ -6246,12 +5728,16 @@ test("slash Resume opens the project session catalog from an active session", as
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeResume = fixture.output().length;
     fixture.write("/resume\r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Select a project session", beforeResume).then(() => "catalog" as const),
-      fixture.waitForAfter("Skill selection complete.", beforeResume).then(() => "model" as const),
+      fixture
+        .waitForRecordedOutput("Select a project session", beforeResume)
+        .then(() => "catalog" as const),
+      fixture
+        .waitForRecordedOutput("Skill selection complete.", beforeResume)
+        .then(() => "model" as const),
     ]);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -6274,9 +5760,9 @@ test("successful session selection feedback expires when editing begins", async 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Select a project session");
+    await fixture.waitForRecordedOutput("Select a project session");
     fixture.write("Selected");
-    await fixture.waitFor("Search: Selected");
+    await fixture.waitForRecordedOutput("Search: Selected");
     const beforeSelection = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter("✓ Session selected.", beforeSelection);
@@ -6301,12 +5787,16 @@ test("slash New requires an exact target before creating another session", async
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeNew = fixture.output().length;
     fixture.write("/new \r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Select an exact model target", beforeNew).then(() => "target" as const),
-      fixture.waitForAfter("Skill selection complete.", beforeNew).then(() => "model" as const),
+      fixture
+        .waitForRecordedOutput("Select an exact model target", beforeNew)
+        .then(() => "target" as const),
+      fixture
+        .waitForRecordedOutput("Skill selection complete.", beforeNew)
+        .then(() => "model" as const),
     ]);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -6325,14 +5815,14 @@ test("slash Session opens bounded authoritative session and context facts", asyn
 
   try {
     const fixture = startFixture({ scenario: "history", stateRoot, workspaceRoot });
-    await fixture.waitFor("History prompt 3");
+    await fixture.waitForRecordedOutput("History prompt 3");
     const beforeSession = fixture.output().length;
     fixture.write("/session \r");
     const outcome = await Promise.race([
       fixture
         .waitForCompleteFrameAfter("Session facts", beforeSession)
         .then(() => "facts" as const),
-      fixture.waitForAfter("History answer.", beforeSession).then(() => "model" as const),
+      fixture.waitForRecordedOutput("History answer.", beforeSession).then(() => "model" as const),
     ]);
     expectFramedOverlay(fixture.output().slice(beforeSession), "Session facts");
     fixture.write("\u0011");
@@ -6359,13 +5849,13 @@ test("slash Tree opens a read-only browser over visible complete chronology boun
 
   try {
     const fixture = startFixture({ scenario: "history", stateRoot, workspaceRoot });
-    await fixture.waitFor("History prompt 3");
+    await fixture.waitForRecordedOutput("History prompt 3");
     const beforeTree = fixture.output().length;
     fixture.write("/tree \r");
     await fixture.waitForCompleteFrameAfter("Active chronology · read only", beforeTree);
     expectFramedOverlay(fixture.output().slice(beforeTree), "Active chronology · read only");
     fixture.write("prompt3");
-    await fixture.waitForAfter("Search: prompt3", beforeTree);
+    await fixture.waitForRecordedOutput("Search: prompt3", beforeTree);
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -6418,7 +5908,7 @@ test("prompt history navigation restores the exact draft after returning past ne
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "history", stateRoot, workspaceRoot });
-    await fixture.waitFor("History prompt 3");
+    await fixture.waitForRecordedOutput("History prompt 3");
     fixture.write("unsent draft");
     fixture.write("\u001b[A");
     fixture.write("\u001b[B");
@@ -6439,14 +5929,16 @@ test("an unknown slash command is rejected locally with a fuzzy suggestion", asy
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeUnknown = fixture.output().length;
     fixture.write("/hepl\r");
     const outcome = await Promise.race([
       fixture
-        .waitForAfter("Unknown command /hepl · Did you mean /help?", beforeUnknown)
+        .waitForRecordedOutput("Unknown command /hepl · Did you mean /help?", beforeUnknown)
         .then(() => "rejected" as const),
-      fixture.waitForAfter("Skill selection complete.", beforeUnknown).then(() => "model" as const),
+      fixture
+        .waitForRecordedOutput("Skill selection complete.", beforeUnknown)
+        .then(() => "model" as const),
     ]);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -6465,15 +5957,15 @@ test("malformed slash input is rejected locally instead of reaching the model", 
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeMalformed = fixture.output().length;
     fixture.write("/help!\r");
     const outcome = await Promise.race([
       fixture
-        .waitForAfter("Unknown command /help!", beforeMalformed)
+        .waitForRecordedOutput("Unknown command /help!", beforeMalformed)
         .then(() => "rejected" as const),
       fixture
-        .waitForAfter("Skill selection complete.", beforeMalformed)
+        .waitForRecordedOutput("Skill selection complete.", beforeMalformed)
         .then(() => "model" as const),
     ]);
     fixture.write("\u0011");
@@ -6493,12 +5985,14 @@ test("invalid arguments for a known command are rejected locally with Registry u
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeInvalid = fixture.output().length;
     fixture.write("/mcp unexpected\r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Usage: /mcp", beforeInvalid).then(() => "usage" as const),
-      fixture.waitForAfter("Skill selection complete.", beforeInvalid).then(() => "model" as const),
+      fixture.waitForRecordedOutput("Usage: /mcp", beforeInvalid).then(() => "usage" as const),
+      fixture
+        .waitForRecordedOutput("Skill selection complete.", beforeInvalid)
+        .then(() => "model" as const),
     ]);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -6519,18 +6013,18 @@ test("Help remains locally available while a model run is active", async () => {
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start a held run\r");
     await waitForPath(join(controlRoot, "model-started"));
-    await fixture.waitFor("Working");
+    await fixture.waitForRecordedOutput("Working");
     const beforeHelp = fixture.output().length;
     fixture.write("/help");
-    await fixture.waitForAfter("Browse Adam commands and interaction help.", beforeHelp);
+    await fixture.waitForRecordedOutput("Browse Adam commands and interaction help.", beforeHelp);
     fixture.write("\t\r");
-    await fixture.waitForAfter("Adam Help", beforeHelp);
+    await fixture.waitForRecordedOutput("Adam Help", beforeHelp);
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
     fixture.write("\u001b[27;1;27~");
-    await fixture.waitFor("Streaming answer");
+    await fixture.waitForRecordedOutput("Streaming answer");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -6556,23 +6050,26 @@ test("thinking selection changed during a run applies only to the next prompt", 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/thinking max\r");
-    await fixture.waitFor("Thinking Max selected for the next prompt.");
+    await fixture.waitForRecordedOutput("Thinking Max selected for the next prompt.");
     fixture.write("First held prompt\r");
     await waitForPath(join(controlRoot, "model-started"));
-    await fixture.waitFor("Working");
+    await fixture.waitForRecordedOutput("Working");
 
     const beforeNextSelection = fixture.output().length;
     fixture.write("/thinking off\r");
-    await fixture.waitForAfter("Thinking Off selected for the next prompt.", beforeNextSelection);
-    await fixture.waitForAfter("Next thinking Off", beforeNextSelection);
+    await fixture.waitForRecordedOutput(
+      "Thinking Off selected for the next prompt.",
+      beforeNextSelection,
+    );
+    await fixture.waitForRecordedOutput("Next thinking Off", beforeNextSelection);
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await fixture.waitFor("Thinking policy: max.");
-    await fixture.waitFor("Adam · Streaming session");
+    await fixture.waitForRecordedOutput("Thinking policy: max.");
+    await fixture.waitForRecordedOutput("Adam · Streaming session");
     const beforeSecondPrompt = fixture.output().length;
     fixture.write("Second prompt\r");
-    await fixture.waitForAfter("Thinking policy: off.", beforeSecondPrompt);
+    await fixture.waitForRecordedOutput("Thinking policy: off.", beforeSecondPrompt);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -6590,12 +6087,15 @@ test("Tab completes a thinking level from the exact current target without model
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeCompletion = fixture.output().length;
     fixture.write("/thinking ma");
-    await fixture.waitForAfter("max", beforeCompletion);
+    await fixture.waitForRecordedOutput("max", beforeCompletion);
     fixture.write("\t\r");
-    await fixture.waitForAfter("Thinking Max selected for the next prompt.", beforeCompletion);
+    await fixture.waitForRecordedOutput(
+      "Thinking Max selected for the next prompt.",
+      beforeCompletion,
+    );
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     await expect(access(join(controlRoot, "model-started"))).rejects.toThrow();
@@ -6614,17 +6114,17 @@ test("slash Thinking opens the framed exact-level selector without admitting a p
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePicker = fixture.output().length;
     fixture.write("/thinking\r");
     await fixture.waitForCompleteFrameAfter("Thinking level for the next prompt", beforePicker);
     expectFramedOverlay(fixture.output(), "Thinking level for the next prompt");
-    await fixture.waitFor("Off");
-    await fixture.waitFor("Low");
-    await fixture.waitFor("High");
-    await fixture.waitFor("Max");
+    await fixture.waitForRecordedOutput("Off");
+    await fixture.waitForRecordedOutput("Low");
+    await fixture.waitForRecordedOutput("High");
+    await fixture.waitForRecordedOutput("Max");
     fixture.write("\u001b[B\r");
-    await fixture.waitFor("Thinking Max selected for the next prompt.");
+    await fixture.waitForRecordedOutput("Thinking Max selected for the next prompt.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     await expect(access(join(controlRoot, "model-started"))).rejects.toThrow();
@@ -6649,7 +6149,7 @@ test("Thinking selector keeps keyboard focus visible without color", async () =>
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePicker = fixture.output().length;
     fixture.write("/thinking\r");
     await fixture.waitForCompleteFrameAfter("Thinking level for the next prompt", beforePicker);
@@ -6660,7 +6160,7 @@ test("Thinking selector keeps keyboard focus visible without color", async () =>
 
     const beforeClose = fixture.output().length;
     fixture.write("\u001b");
-    await fixture.waitForAfter("\u001b[?2026l", beforeClose);
+    await fixture.waitForRecordedOutput("\u001b[?2026l", beforeClose);
     expect(fixture.screen()?.join("\n")).toContain("Next thinking High");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -6679,12 +6179,12 @@ test("editor submission renders Working then a streamed Markdown answer from rea
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Explain streaming\r");
     await waitForPath(join(controlRoot, "model-started"));
-    await fixture.waitFor("Working");
+    await fixture.waitForRecordedOutput("Working");
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await fixture.waitFor("Streaming answer");
+    await fixture.waitForRecordedOutput("Streaming answer");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -6710,10 +6210,10 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Reason before answering\r");
     await waitForPath(join(controlRoot, "model-started"));
-    await fixture.waitFor("Thinking · provider reasoning · adam");
+    await fixture.waitForRecordedOutput("Thinking · provider reasoning · adam");
     let beforeFrame = fixture.output().length;
     await fixture.resize(80, 24);
     let frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
@@ -6722,7 +6222,7 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     expect(frame).not.toContain("╭");
 
     fixture.write("\u0014");
-    await fixture.waitFor("Inspect ");
+    await fixture.waitForRecordedOutput("Inspect ");
     beforeFrame = fixture.output().length;
     fixture.write("\u001b[116;5:2u");
     await fixture.resize(79, 24);
@@ -6743,29 +6243,29 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     beforeFrame = fixture.output().length;
     await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
     await fixture.resize(120, 40);
-    await fixture.waitForAfter("Inspect the evidence.", beforeFrame);
+    await fixture.waitForRecordedOutput("Inspect the evidence.", beforeFrame);
     lines = fixture.screen() ?? [];
     expect(lines.join("\n")).toContain("Inspect the evidence.");
     expect(lines.every((line) => visibleWidth(line) <= 120)).toBe(true);
 
     const beforeCompletion = fixture.output().length;
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await fixture.waitFor("Thinking done · adam");
-    await fixture.waitFor("Reasoning answer.");
-    await fixture.waitForAfter(" · idle", beforeCompletion);
-    await fixture.waitForAfter("Adam · Streaming session", beforeCompletion);
+    await fixture.waitForRecordedOutput("Thinking done · adam");
+    await fixture.waitForRecordedOutput("Reasoning answer.");
+    await fixture.waitForRecordedOutput(" · idle", beforeCompletion);
+    await fixture.waitForRecordedOutput("Adam · Streaming session", beforeCompletion);
     beforeFrame = fixture.output().length;
     await fixture.resize(80, 24);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
     expect(frame).toContain("Inspect the evidence.");
     expect(frame).not.toContain("Working");
     fixture.write("/copy\r");
-    await fixture.waitFor("Copied last assistant response.");
+    await fixture.waitForRecordedOutput("Copied last assistant response.");
     await expect(readFile(join(controlRoot, "clipboard.txt"), "utf8")).resolves.toBe(
       "Reasoning answer.",
     );
     fixture.write("/session\r");
-    await fixture.waitFor("Session facts");
+    await fixture.waitForRecordedOutput("Session facts");
     beforeFrame = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
     fixture.write("session inspector focus restored");
@@ -6773,7 +6273,7 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     fixture.write("\u0015");
 
     fixture.write("/resume\r");
-    await fixture.waitFor("Select a project session");
+    await fixture.waitForRecordedOutput("Select a project session");
     beforeFrame = fixture.output().length;
     fixture.write("fake.local\r");
     await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforeFrame);
@@ -6781,9 +6281,9 @@ test("Ctrl+T expands cumulative live provider reasoning and preserves disclosure
     expect(frame).not.toContain("Inspect the evidence.");
     const beforeReopenToggle = fixture.output().length;
     fixture.write("\u0014");
-    await fixture.waitForAfter("\u001b[?2026l", beforeReopenToggle);
+    await fixture.waitForRecordedOutput("\u001b[?2026l", beforeReopenToggle);
     fixture.write("\u001b[6~");
-    await fixture.waitForAfter("Inspect the evidence.", beforeFrame);
+    await fixture.waitForRecordedOutput("Inspect the evidence.", beforeFrame);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -7107,7 +6607,7 @@ test.each([
 
     try {
       const fixture = startFixture({ noColor: true, scenario, stateRoot, workspaceRoot });
-      await fixture.waitFor("Adam · New session");
+      await fixture.waitForScreen("Adam · New session");
       const beforePrompt = fixture.output().length;
       fixture.write("Exercise a reasoning terminal state\r");
       if (action === "cancel") {
@@ -7144,12 +6644,12 @@ test("Ctrl+T reads artifact-backed provider reasoning without placing it in the 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePrompt = fixture.output().length;
     fixture.write("Store provider reasoning out of line\r");
     await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforePrompt);
     await waitForPath(join(controlRoot, "reasoning-session-settled"));
-    await fixture.waitFor("Adam · Streaming session");
+    await fixture.waitForRecordedOutput("Adam · Streaming session");
     let frame = latestSynchronizedFrame(fixture.output().slice(beforePrompt)).join("\n");
     expect(frame).not.toContain("Artifact reasoning evidence");
     const durableStateBeforeExpand = await readFilesRecursively(stateRoot);
@@ -7180,7 +6680,7 @@ test("Ctrl+T reads artifact-backed provider reasoning without placing it in the 
       waitForFileContents(join(controlRoot, "artifact-read-2-range"), "16384:16384\n"),
     ).resolves.toBe("16384:16384\n");
     await waitForPath(join(controlRoot, "artifact-read-2-settled"));
-    await fixture.waitFor("Reasoning bytes 16385-32768");
+    await fixture.waitForRecordedOutput("Reasoning bytes 16385-32768");
     const beforeNarrowResize = fixture.output().length;
     await fixture.resize(40, 18);
     frame = latestSynchronizedFrame(fixture.output().slice(beforeNarrowResize)).join("\n");
@@ -7513,12 +7013,12 @@ test.each(["missing", "truncated", "same-size corrupt"] as const)(
         stateRoot,
         workspaceRoot,
       });
-      await fixture.waitFor("Adam · New session");
+      await fixture.waitForScreen("Adam · New session");
       const beforePrompt = fixture.output().length;
       fixture.write("Recover one unavailable reasoning range\r");
       await fixture.waitForCompleteFrameAfter("Thinking done · adam", beforePrompt);
       await waitForPath(join(controlRoot, "reasoning-session-settled"));
-      await fixture.waitFor("Adam · Streaming session");
+      await fixture.waitForRecordedOutput("Adam · Streaming session");
       const artifactRoot = join(stateRoot, "artifacts");
       const artifactRelativePaths = (await readdir(artifactRoot, { recursive: true })).filter(
         (path): path is string => typeof path === "string" && !path.endsWith(".tmp"),
@@ -7547,7 +7047,7 @@ test.each(["missing", "truncated", "same-size corrupt"] as const)(
       await waitForPath(join(controlRoot, "artifact-read-1-settled"));
       const beforeFailureScroll = fixture.output().length;
       fixture.write("\u001b[6~");
-      await fixture.waitForAfter("\u001b[?2026l", beforeFailureScroll);
+      await fixture.waitForRecordedOutput("\u001b[?2026l", beforeFailureScroll);
       fixture.write("\u001b[6~");
       await fixture.waitForCompleteFrameAfter("Reasoning range unavailable", beforeFailure);
       if (failure === "missing") {
@@ -7659,12 +7159,12 @@ test("provider reasoning disclosure keeps explicit markers without color", async
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Reason without color\r");
     await waitForPath(join(controlRoot, "model-started"));
-    await fixture.waitFor("▸ Thinking · provider reasoning · adam");
+    await fixture.waitForRecordedOutput("▸ Thinking · provider reasoning · adam");
     fixture.write("\u0014");
-    await fixture.waitFor("Inspect ");
+    await fixture.waitForRecordedOutput("Inspect ");
     const beforeFrame = fixture.output().length;
     await fixture.resize(40, 12);
     const frame = latestSynchronizedFrame(fixture.output().slice(beforeFrame)).join("\n");
@@ -7675,9 +7175,9 @@ test("provider reasoning disclosure keeps explicit markers without color", async
     await writeFile(join(controlRoot, "release-reasoning"), "release\n", "utf8");
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
     await fixture.resize(80, 24);
-    await fixture.waitForAfter(" · idle", beforeCompletion);
+    await fixture.waitForRecordedOutput(" · idle", beforeCompletion);
     fixture.write("\u001b[F");
-    await fixture.waitForAfter("Reasoning answer.", beforeCompletion);
+    await fixture.waitForRecordedOutput("Reasoning answer.", beforeCompletion);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -7695,20 +7195,20 @@ test("slash Session remains read-only and available while a model run is active"
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start a held run\r");
     await waitForPath(join(controlRoot, "model-started"));
-    await fixture.waitFor("Working");
+    await fixture.waitForRecordedOutput("Working");
     const beforeSession = fixture.output().length;
     fixture.write("/session\r");
-    await fixture.waitForAfter("Session facts", beforeSession);
-    await fixture.waitForAfter("Run     working", beforeSession);
+    await fixture.waitForRecordedOutput("Session facts", beforeSession);
+    await fixture.waitForRecordedOutput("Run     working", beforeSession);
     expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/session"');
     const beforeClose = fixture.output().length;
     fixture.write("\u0003");
-    await fixture.waitForAfter("Working", beforeClose);
+    await fixture.waitForRecordedOutput("Working", beforeClose);
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await fixture.waitFor("Streaming answer");
+    await fixture.waitForRecordedOutput("Streaming answer");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -7726,16 +7226,16 @@ test("slash completion retains annotated idle-only Registry commands during an a
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start completion hold\r");
     await waitForPath(join(controlRoot, "model-started"));
-    await fixture.waitFor("Working");
+    await fixture.waitForRecordedOutput("Working");
     const beforeCompletion = fixture.output().length;
     fixture.write("/n");
-    await fixture.waitForAfter("unavailable · idle only", beforeCompletion);
+    await fixture.waitForRecordedOutput("unavailable · idle only", beforeCompletion);
     fixture.write("\u001b[27;1;27~");
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await fixture.waitFor("Streaming answer");
+    await fixture.waitForRecordedOutput("Streaming answer");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -7759,10 +7259,10 @@ test("active-run finite argument families stay unavailable without forced path f
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Start argument completion hold\r");
     await waitForPath(join(controlRoot, "model-started"));
-    await fixture.waitFor("Working");
+    await fixture.waitForRecordedOutput("Working");
 
     let columns = 80;
     for (const input of ["/config c", "/trust g", "/name --c", "/instructions r", "/skills r"]) {
@@ -7780,7 +7280,7 @@ test("active-run finite argument families stay unavailable without forced path f
     }
 
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await fixture.waitFor("Streaming answer");
+    await fixture.waitForRecordedOutput("Streaming answer");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -7804,22 +7304,22 @@ test("permission preempts Help and restores its exact page after settlement", as
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Prepare a held edit\r");
     await waitForPath(join(controlRoot, "model-started"));
     fixture.write("/hotkeys");
-    await fixture.waitFor("Show the fixed effective keyboard map.");
+    await fixture.waitForRecordedOutput("Show the fixed effective keyboard map.");
     fixture.write("\t\r");
-    await fixture.waitFor("Effective Hotkeys");
+    await fixture.waitForRecordedOutput("Effective Hotkeys");
     await writeFile(join(controlRoot, "release-model"), "release\n", "utf8");
-    await fixture.waitFor("Permission required");
+    await fixture.waitForRecordedOutput("Permission required");
     const beforeRestore = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
-    await fixture.waitForAfter("Effective Hotkeys", beforeRestore);
-    await fixture.waitForAfter(" · idle", beforeRestore);
+    await fixture.waitForRecordedOutput("Effective Hotkeys", beforeRestore);
+    await fixture.waitForRecordedOutput(" · idle", beforeRestore);
     const beforeParent = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
-    await fixture.waitForAfter("Adam Help", beforeParent);
+    await fixture.waitForRecordedOutput("Adam Help", beforeParent);
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -7845,11 +7345,11 @@ test("permission settlement restores an existing ordinary overlay as the exact f
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Prepare an inspector-held edit\r");
     await waitForPath(join(controlRoot, "model-started"));
     fixture.write("/session\r");
-    await fixture.waitFor("Session facts");
+    await fixture.waitForRecordedOutput("Session facts");
     expect(fixture.output()).toContain("Run     working");
 
     const beforePermission = fixture.output().length;
@@ -7889,7 +7389,7 @@ test("the production editor clears a manual session name through canonical Prese
 
   try {
     const fixture = startFixture({ controlRoot, stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeRename = fixture.output().length;
     fixture.write("/name Temporary name\r");
     await expect(
@@ -7928,16 +7428,19 @@ test("the real TUI inspects and reloads repository instruction status through Pr
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/instructions");
-    await fixture.waitFor("/instructions");
+    await fixture.waitForRecordedOutput("/instructions");
     const afterTyping = fixture.output().length;
     fixture.write("\r");
     const outcome = await Promise.race([
       fixture
-        .waitForAfter("Instructions r1 · scopes . · AGENTS.md · reload available", afterTyping)
+        .waitForRecordedOutput(
+          "Instructions r1 · scopes . · AGENTS.md · reload available",
+          afterTyping,
+        )
         .then(() => "status" as const),
-      fixture.waitForAfter("Working", afterTyping).then(() => "prompt" as const),
+      fixture.waitForRecordedOutput("Working", afterTyping).then(() => "prompt" as const),
     ]);
     expect(outcome).toBe("status");
     await writeFile(instructionsPath, "# Rules\n\nSecond revision.\n", "utf8");
@@ -7945,7 +7448,9 @@ test("the real TUI inspects and reloads repository instruction status through Pr
     fixture.write("/instructions r");
     await fixture.waitForCompleteFrameAfter("reload", beforeReload);
     fixture.write("\t\r");
-    await fixture.waitFor("Instructions r2 · scopes . · AGENTS.md · reload available");
+    await fixture.waitForRecordedOutput(
+      "Instructions r2 · scopes . · AGENTS.md · reload available",
+    );
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(fixture.output()).not.toContain("Second revision.");
@@ -7964,14 +7469,14 @@ test("slash Reload selects one existing resource authority explicitly", async ()
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     await writeFile(instructionsPath, "# Rules\n\nSecond revision.\n", "utf8");
     const beforeReload = fixture.output().length;
     fixture.write("/reload \r");
     await fixture.waitForCompleteFrameAfter("Reload project resources", beforeReload);
     expectFramedOverlay(fixture.output().slice(beforeReload), "Reload project resources");
     fixture.write("\r");
-    await fixture.waitForAfter("Reloaded repository instructions.", beforeReload);
+    await fixture.waitForRecordedOutput("Reloaded repository instructions.", beforeReload);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/reload"');
@@ -7990,9 +7495,9 @@ test("repository instruction status exposes bounded diagnostic identities", asyn
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/instructions\r");
-    await fixture.waitFor("repository_instruction_masked");
+    await fixture.waitForRecordedOutput("repository_instruction_masked");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -8018,16 +7523,16 @@ test("the real TUI opens exact next-turn Skill metadata instead of submitting a 
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/skills");
-    await fixture.waitFor("/skills");
+    await fixture.waitForRecordedOutput("/skills");
     const afterTyping = fixture.output().length;
     fixture.write("\r");
     const outcome = await Promise.race([
       fixture
         .waitForCompleteFrameAfter("Select next-turn Skills", afterTyping)
         .then(() => "palette" as const),
-      fixture.waitForAfter("Working", afterTyping).then(() => "prompt" as const),
+      fixture.waitForRecordedOutput("Working", afterTyping).then(() => "prompt" as const),
     ]);
     expectFramedOverlay(fixture.output().slice(afterTyping), "Select next-turn Skills");
     fixture.write("\u0011");
@@ -8149,9 +7654,9 @@ test("the Skill palette renders untrusted metadata and diagnostic identities as 
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/skills\r");
-    await fixture.waitFor("skill_filename_invalid");
+    await fixture.waitForRecordedOutput("skill_filename_invalid");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -8181,12 +7686,12 @@ test("idle Ctrl+C closes the Skill palette and returns focus to the editor", asy
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/skills\r");
-    await fixture.waitFor("Select next-turn Skills");
+    await fixture.waitForRecordedOutput("Select next-turn Skills");
     fixture.write("\u0003");
     fixture.write("/instructions\r");
-    await fixture.waitFor("Instructions r1");
+    await fixture.waitForRecordedOutput("Instructions r1");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -8209,17 +7714,17 @@ test("the real TUI submits exact selected Skills once and clears them only after
 
   try {
     const fixture = startFixture({ scenario: "skill-selection", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("/skills");
-    await fixture.waitFor("/skills");
+    await fixture.waitForRecordedOutput("/skills");
     fixture.write("\r");
-    await fixture.waitFor("Select next-turn Skills");
+    await fixture.waitForRecordedOutput("Select next-turn Skills");
     fixture.write("\r");
-    await fixture.waitFor("1 Skill selected");
+    await fixture.waitForRecordedOutput("1 Skill selected");
     fixture.write("Apply the selected procedure");
-    await fixture.waitFor("Apply the selected procedure");
+    await fixture.waitForRecordedOutput("Apply the selected procedure");
     fixture.write("\r");
-    await fixture.waitFor("Skill selection complete.");
+    await fixture.waitForRecordedOutput("Skill selection complete.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
@@ -8251,7 +7756,7 @@ test("the real TUI reloads its Skill palette through lifecycle authority", async
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "streaming", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     await mkdir(join(skillRoot, "second"));
     await writeFile(
       join(skillRoot, "second", "SKILL.md"),
@@ -8262,16 +7767,18 @@ test("the real TUI reloads its Skill palette through lifecycle authority", async
     fixture.write("/skills r");
     await fixture.waitForCompleteFrameAfter("reload", beforeCompletion);
     fixture.write("\t");
-    await fixture.waitFor("/skills reload");
+    await fixture.waitForRecordedOutput("/skills reload");
     const afterTyping = fixture.output().length;
     fixture.write("\r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Skills r2 · 2 visible", afterTyping).then(() => "reloaded" as const),
-      fixture.waitForAfter("Working", afterTyping).then(() => "prompt" as const),
+      fixture
+        .waitForRecordedOutput("Skills r2 · 2 visible", afterTyping)
+        .then(() => "reloaded" as const),
+      fixture.waitForRecordedOutput("Working", afterTyping).then(() => "prompt" as const),
     ]);
     expect(outcome).toBe("reloaded");
     fixture.write("/skills\r");
-    await fixture.waitFor("skill:v1:project:.:second");
+    await fixture.waitForRecordedOutput("skill:v1:project:.:second");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -8289,7 +7796,7 @@ test("the real TUI opens inline project path completion from the at trigger", as
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforeCompletion = fixture.output().length;
     fixture.write("Open @");
     await fixture.waitForCompleteFrameAfter("@README.md", beforeCompletion);
@@ -8326,11 +7833,11 @@ test("the real TUI fuzzy-selects one durable project path atom without reading i
 
   try {
     const fixture = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("\r");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Inspect @srca");
-    await fixture.waitFor("@alpha.ts");
+    await fixture.waitForRecordedOutput("@alpha.ts");
     const beforeAccept = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter("Inspect @src/alpha.ts", beforeAccept);
@@ -8345,9 +7852,9 @@ test("the real TUI fuzzy-selects one durable project path atom without reading i
     expect(fixture.output()).not.toContain("PRIVATE_ALPHA_BYTES");
 
     const restarted = startFixture({ launch: {}, stateRoot, workspaceRoot });
-    await restarted.waitFor("Select an exact model target");
+    await restarted.waitForRecordedOutput("Select an exact model target");
     restarted.write("\r");
-    await restarted.waitFor("Inspect @src/alpha.ts");
+    await restarted.waitForRecordedOutput("Inspect @src/alpha.ts");
     restarted.write("\u0011");
     await expect(restarted.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -8365,11 +7872,11 @@ test("project path insertion renders terminal controls from filenames as inert t
 
   try {
     const fixture = startFixture({ stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Inspect @");
-    await fixture.waitFor("@.ts");
+    await fixture.waitForRecordedOutput("@.ts");
     fixture.write("\r");
-    await fixture.waitFor("Inspect @src/.ts");
+    await fixture.waitForRecordedOutput("Inspect @src/.ts");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -8389,11 +7896,11 @@ test("the real TUI loads older authoritative chronology through the current opaq
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "history", stateRoot, workspaceRoot });
-    await fixture.waitFor("History prompt 3");
+    await fixture.waitForRecordedOutput("History prompt 3");
     fixture.write("/history\r");
-    await fixture.waitFor("History prompt 2");
+    await fixture.waitForRecordedOutput("History prompt 2");
     fixture.write("/history\r");
-    await fixture.waitFor("History prompt 1");
+    await fixture.waitForRecordedOutput("History prompt 1");
     fixture.write("\u001b[A\u001b[A\u001b[A");
     fixture.write("\u0011");
     const result = await fixture.closed;
@@ -8412,15 +7919,17 @@ test("the branch compatibility alias selects an authoritative complete boundary"
 
   try {
     const fixture = startFixture({ scenario: "history", stateRoot, workspaceRoot });
-    await fixture.waitFor("History prompt 3");
+    await fixture.waitForRecordedOutput("History prompt 3");
     const afterTyping = fixture.output().length;
     fixture.write("/branch \r");
-    await fixture.waitForAfter("Fork from a boundary", afterTyping);
+    await fixture.waitForRecordedOutput("Fork from a boundary", afterTyping);
     const beforeSelection = fixture.output().length;
     fixture.write("\r");
     const outcome = await Promise.race([
-      fixture.waitForAfter("Adam · Branch of ", beforeSelection).then(() => "branch" as const),
-      fixture.waitForAfter("Working", beforeSelection).then(() => "prompt" as const),
+      fixture
+        .waitForRecordedOutput("Adam · Branch of ", beforeSelection)
+        .then(() => "branch" as const),
+      fixture.waitForRecordedOutput("Working", beforeSelection).then(() => "prompt" as const),
     ]);
     fixture.write("\u0011");
     await fixture.closed;
@@ -8449,29 +7958,29 @@ test("slash Model and Target expose an explicit current-boundary fork onto the f
     await fixture.waitForCompleteFrameAfter(" · idle", 0);
     const beforeModel = fixture.output().length;
     fixture.write("/model \r");
-    await fixture.waitForAfter("Select an exact model target", beforeModel);
-    await fixture.waitForAfter("Deterministic local model", beforeModel);
+    await fixture.waitForRecordedOutput("Select an exact model target", beforeModel);
+    await fixture.waitForRecordedOutput("Deterministic local model", beforeModel);
     const initial = (fixture.screen() ?? []).join("\n");
     expect(initial).toContain("CURRENT · Ready");
     expect(initial).toContain("Ctrl+N New session");
     expect(initial).toContain("Ctrl+F Fork current boundary");
     const beforeUnsupportedDetails = fixture.output().length;
     fixture.write("\t");
-    await fixture.waitForAfter("Details [focused]", beforeUnsupportedDetails);
+    await fixture.waitForRecordedOutput("Details [focused]", beforeUnsupportedDetails);
     expect((fixture.screen() ?? []).join("\n")).not.toContain("c Check API");
     const beforeUnsupportedModels = fixture.output().length;
     fixture.write("\t");
-    await fixture.waitForAfter("Models [focused]", beforeUnsupportedModels);
+    await fixture.waitForRecordedOutput("Models [focused]", beforeUnsupportedModels);
     fixture.write("other");
-    await fixture.waitFor("Search: other");
-    await fixture.waitFor("Deterministic alternate model");
+    await fixture.waitForRecordedOutput("Search: other");
+    await fixture.waitForRecordedOutput("Deterministic alternate model");
     const beforeForkState = await readFilesRecursively(stateRoot);
     expect(beforeForkState).not.toContain('"targetId":"fake.other"');
     fixture.write("\u0006");
-    await fixture.waitFor("Adam · Branch of");
+    await fixture.waitForRecordedOutput("Adam · Branch of");
     const beforeTarget = fixture.output().length;
     fixture.write("/target \r");
-    await fixture.waitForAfter("Select an exact model target", beforeTarget);
+    await fixture.waitForRecordedOutput("Select an exact model target", beforeTarget);
     const transitioned = (fixture.screen() ?? []).join("\n");
     expect(transitioned).toContain("Deterministic alternate model");
     expect(transitioned).toContain("CURRENT · UNCERTIFIED · Ready");
@@ -8512,14 +8021,14 @@ test("an active target transition creates a new session only through its explici
     expect(backgroundStatusLine).toBeDefined();
     expect(backgroundHelpLine).toBeDefined();
     fixture.write("/model \r");
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     fixture.write("other");
-    await fixture.waitFor("Search: other");
-    await fixture.waitFor("Deterministic alternate model");
+    await fixture.waitForRecordedOutput("Search: other");
+    await fixture.waitForRecordedOutput("Deterministic alternate model");
     const beforeAction = await readFilesRecursively(stateRoot);
     expect(beforeAction).not.toContain('"targetId":"fake.other"');
     fixture.write("\u000e");
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const afterAction = await readFilesRecursively(stateRoot);
     expect(afterAction).toContain('"targetId":"fake.local"');
     expect(afterAction).not.toContain('"targetId":"fake.other"');
@@ -8556,13 +8065,13 @@ test("an unavailable active-session target rejects Select, Default, New session,
     expect(backgroundStatusLine).toBeDefined();
     expect(backgroundHelpLine).toBeDefined();
     fixture.write("/model \r");
-    await fixture.waitFor("Select an exact model target");
+    await fixture.waitForRecordedOutput("Select an exact model target");
     const isolated = (fixture.screen() ?? []).join("\n");
     expect(isolated).not.toContain(backgroundStatusLine?.trim());
     expect(isolated).not.toContain(backgroundHelpLine?.trim());
     fixture.write("other");
-    await fixture.waitFor("Search: other");
-    await fixture.waitFor("Deterministic alternate model");
+    await fixture.waitForRecordedOutput("Search: other");
+    await fixture.waitForRecordedOutput("Deterministic alternate model");
     const unavailableFooter = (fixture.screen() ?? []).join("\n");
     expect(unavailableFooter).toContain("Enter Setup help");
     expect(unavailableFooter).not.toContain("Ctrl+N New session");
@@ -8571,7 +8080,7 @@ test("an unavailable active-session target rejects Select, Default, New session,
     expect(unavailableFooter).not.toContain("c Check API");
     const beforeSelection = await readFilesRecursively(stateRoot);
     fixture.write("\r");
-    await fixture.waitFor("UNAVAILABLE_TRANSITION_KEY");
+    await fixture.waitForRecordedOutput("UNAVAILABLE_TRANSITION_KEY");
     expect((fixture.screen() ?? []).join("\n")).not.toContain(
       "Selected Deterministic alternate model.",
     );
@@ -8580,7 +8089,7 @@ test("an unavailable active-session target rejects Select, Default, New session,
     for (const action of ["\u0013", "\u000e", "\u0006"]) {
       const beforeRejection = fixture.output().length;
       fixture.write(action);
-      await fixture.waitForAfter("UNAVAILABLE_TRANSITION_KEY", beforeRejection);
+      await fixture.waitForRecordedOutput("UNAVAILABLE_TRANSITION_KEY", beforeRejection);
       expect(await readFilesRecursively(stateRoot)).toBe(beforeSelection);
     }
     expect(beforeSelection).not.toContain('"targetId":"fake.other"');
@@ -8603,11 +8112,11 @@ test("a real read tool is rendered as a bounded Pi-style tool card", async () =>
     await fixture.waitForCompleteFrameAfter("Adam · New session", 0);
     await fixture.waitForCompleteFrameAfter(" · idle", 0);
     fixture.write("Read README\r");
-    await fixture.waitFor("read README.md");
-    await fixture.waitFor("29 bytes");
-    await fixture.waitFor("Read complete");
-    await fixture.waitFor("1 │ # Fixture");
-    await fixture.waitFor("3 │ Readable content.");
+    await fixture.waitForRecordedOutput("read README.md");
+    await fixture.waitForRecordedOutput("29 bytes");
+    await fixture.waitForRecordedOutput("Read complete");
+    await fixture.waitForRecordedOutput("1 │ # Fixture");
+    await fixture.waitForRecordedOutput("3 │ Readable content.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -8628,7 +8137,7 @@ test("a real repository search is rendered as one bounded read-like tool card", 
     await fixture.waitForCompleteFrameAfter("Adam · New session", 0);
     await fixture.waitForCompleteFrameAfter(" · idle", 0);
     fixture.write("Search orchard\r");
-    await fixture.waitFor("Search complete.");
+    await fixture.waitForRecordedOutput("Search complete.");
     expect(fixture.output()).toContain("search .");
     expect(fixture.output()).toContain("2 results");
     fixture.write("\u0011");
@@ -8653,9 +8162,9 @@ test("Kitty Ctrl+O repeat and release phases toggle bounded tool details only on
 
   try {
     const fixture = startFixture({ noColor: true, scenario: "read", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Read the README\r");
-    await fixture.waitFor("Read complete");
+    await fixture.waitForRecordedOutput("Read complete");
     expect(fixture.output()).toContain("10 │ line10");
     expect(fixture.output()).not.toContain("11 │ line11");
     expect(fixture.output()).not.toContain("provider model response");
@@ -8665,28 +8174,28 @@ test("Kitty Ctrl+O repeat and release phases toggle bounded tool details only on
     expect(resizedFrame.match(/Ctrl\+O expand/gu)).toHaveLength(1);
     beforeResize = fixture.output().length;
     await fixture.resize(80, 24);
-    await fixture.waitForAfter("\u001b[?2026l", beforeResize);
+    await fixture.waitForRecordedOutput("\u001b[?2026l", beforeResize);
     const beforeToolView = fixture.output().length;
     fixture.write("\u001b[5~");
-    await fixture.waitForAfter("\u001b[?2026l", beforeToolView);
+    await fixture.waitForRecordedOutput("\u001b[?2026l", beforeToolView);
     const collapsedToolRow = fixture.screen()?.findIndex((line) => line.includes("read README.md"));
     expect(collapsedToolRow).toBeGreaterThanOrEqual(0);
     expect((fixture.screen()?.join("\n") ?? "").match(/Ctrl\+O expand/gu)).toHaveLength(1);
     const beforeExpand = fixture.output().length;
     fixture.write("\u001b[111;5:1u\u001b[111;5:2u\u001b[111;5:2u\u001b[111;5:3u");
-    await fixture.waitForAfter("\u001b[?2026l", beforeExpand);
+    await fixture.waitForRecordedOutput("\u001b[?2026l", beforeExpand);
     let screen = fixture.screen()?.join("\n") ?? "";
     expect(fixture.screen()?.findIndex((line) => line.includes("read README.md"))).toBe(
       collapsedToolRow,
     );
     const beforeDetails = fixture.output().length;
     fixture.write("\u001b[6~");
-    await fixture.waitForAfter("\u001b[?2026l", beforeDetails);
+    await fixture.waitForRecordedOutput("\u001b[?2026l", beforeDetails);
     screen = fixture.screen()?.join("\n") ?? "";
     expect(screen).toContain("12 │ line12");
     const beforeMetadata = fixture.output().length;
     fixture.write("\u001b[6~");
-    await fixture.waitForAfter("\u001b[?2026l", beforeMetadata);
+    await fixture.waitForRecordedOutput("\u001b[?2026l", beforeMetadata);
     screen = fixture.screen()?.join("\n") ?? "";
     expect(screen).toContain("read_file · read · completed · replay safe");
     expect(screen).toContain("provider model response");
@@ -8697,7 +8206,7 @@ test("Kitty Ctrl+O repeat and release phases toggle bounded tool details only on
     expect(screen).toContain("provider model response");
     const beforeCollapse = fixture.output().length;
     fixture.write("\u000f");
-    await fixture.waitForAfter("\u001b[?2026l", beforeCollapse);
+    await fixture.waitForRecordedOutput("\u001b[?2026l", beforeCollapse);
     screen = fixture.screen()?.join("\n") ?? "";
     expect(screen).toContain("read README.md · Ctrl+O expand");
     expect(screen).not.toContain("provider model response");
@@ -8833,18 +8342,18 @@ test("a settled write card previews numbered content from its canonical change a
 
   try {
     const fixture = startFixture({ noColor: true, scenario: "write", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Create a TypeScript file\r");
-    await fixture.waitFor("Permission required");
-    await fixture.waitFor("Preview 1-8 of");
+    await fixture.waitForRecordedOutput("Permission required");
+    await fixture.waitForRecordedOutput("Preview 1-8 of");
     fixture.write("\u001b[6~");
     await fixture.resize(81, 24);
     expect(fixture.screen()?.join("\n") ?? "").toContain("+export const value12 = 12;");
     const beforeAllow = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitForAfter("Write complete.", beforeAllow);
-    await fixture.waitForAfter(" 1 │ export const value01 = 1;", beforeAllow);
-    await fixture.waitForAfter("10 │ export const value10 = 10;", beforeAllow);
+    await fixture.waitForRecordedOutput("Write complete.", beforeAllow);
+    await fixture.waitForRecordedOutput(" 1 │ export const value01 = 1;", beforeAllow);
+    await fixture.waitForRecordedOutput("10 │ export const value10 = 10;", beforeAllow);
     expect(fixture.output().slice(beforeAllow)).not.toContain("11 │ export const value11");
     await expect(readFile(join(workspaceRoot, "created.ts"), "utf8")).resolves.toContain(
       "export const value12 = 12;",
@@ -8865,15 +8374,15 @@ test("a settled edit card previews its canonical diff without inventing line coo
 
   try {
     const fixture = startFixture({ noColor: true, scenario: "mutation", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Edit the file\r");
-    await fixture.waitFor("Permission required");
-    await fixture.waitFor("+after");
+    await fixture.waitForRecordedOutput("Permission required");
+    await fixture.waitForRecordedOutput("+after");
     const beforeAllow = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitForAfter("Edit complete.", beforeAllow);
-    await fixture.waitForAfter("  - │ before", beforeAllow);
-    await fixture.waitForAfter("  + │ after", beforeAllow);
+    await fixture.waitForRecordedOutput("Edit complete.", beforeAllow);
+    await fixture.waitForRecordedOutput("  - │ before", beforeAllow);
+    await fixture.waitForRecordedOutput("  + │ after", beforeAllow);
     await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("after\n");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -8893,7 +8402,7 @@ test("slash Copy copies the last inline assistant response without persisting a 
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "read", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePrompt = fixture.output().length;
     fixture.write("Read the README\r");
     await fixture.waitForCompleteFrameAfter("Read complete", beforePrompt);
@@ -8906,11 +8415,13 @@ test("slash Copy copies the last inline assistant response without persisting a 
       waitForFileContents(join(controlRoot, "clipboard.txt"), "Read complete.").then(
         () => "copied" as const,
       ),
-      fixture.waitForAfter("Unknown command /copy", beforeCopy).then(() => "unknown" as const),
+      fixture
+        .waitForRecordedOutput("Unknown command /copy", beforeCopy)
+        .then(() => "unknown" as const),
     ]);
     expect(outcome).toBe("copied");
     expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("Read complete.");
-    await fixture.waitForAfter("Copied last assistant response.", beforeCopy);
+    await fixture.waitForRecordedOutput("Copied last assistant response.", beforeCopy);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/copy"');
@@ -8949,17 +8460,17 @@ test("an older asynchronous copy receipt cannot replace newer Usage feedback", a
   try {
     await terminal.whenStarted();
     terminal.input("Read the README\r");
-    await terminal.nextSynchronizedFrameContaining("Read complete");
+    await terminal.waitForScreen("Read complete");
     const resultOccurrence = terminal.output().lastIndexOf("Read complete");
     expect(resultOccurrence).toBeGreaterThanOrEqual(0);
-    await terminal.nextSynchronizedFrameContaining(" · idle", resultOccurrence);
+    await terminal.waitForFrameAfter(" · idle", resultOccurrence);
     terminal.input("/copy\r");
     await copyStarted.promise;
     terminal.input("/exit extra\r");
-    await terminal.nextSynchronizedFrameContaining("! Usage: /exit");
+    await terminal.waitForScreen("! Usage: /exit");
     const beforeCopyReceipt = terminal.output().length;
     copyResult.resolve("copied");
-    await terminal.nextSynchronizedFrameContaining("! Usage: /exit", beforeCopyReceipt);
+    await terminal.waitForFrameAfter("! Usage: /exit", beforeCopyReceipt);
 
     terminal.input("\u0011");
     await expect(execution).resolves.toBeUndefined();
@@ -9003,20 +8514,20 @@ test("an older asynchronous copy receipt cannot survive a newer overlay action",
   try {
     await terminal.whenStarted();
     terminal.input("Read the README\r");
-    await terminal.nextSynchronizedFrameContaining("Read complete");
+    await terminal.waitForScreen("Read complete");
     const resultOccurrence = terminal.output().lastIndexOf("Read complete");
     expect(resultOccurrence).toBeGreaterThanOrEqual(0);
-    await terminal.nextSynchronizedFrameContaining(" · idle", resultOccurrence);
+    await terminal.waitForFrameAfter(" · idle", resultOccurrence);
     terminal.input("/copy\r");
     await copyStarted.promise;
     terminal.input("/session\r");
-    await terminal.nextSynchronizedFrameContaining("Session facts");
+    await terminal.waitForScreen("Session facts");
     const beforeCopyReceipt = terminal.output().length;
     copyResult.resolve("copied");
-    await terminal.nextSynchronizedFrameContaining("Session facts", beforeCopyReceipt);
+    await terminal.waitForFrameAfter("Session facts", beforeCopyReceipt);
     const beforeClose = terminal.output().length;
     terminal.input("\u001b[27;1;27~");
-    await terminal.nextSynchronizedFrameContaining("Adam · Streaming session", beforeClose);
+    await terminal.waitForFrameAfter("Adam · Streaming session", beforeClose);
 
     expect(terminal.lines().join("\n")).not.toContain("Copied last assistant response.");
     terminal.input("\u0011");
@@ -9046,7 +8557,7 @@ test("slash Copy never truncates a large inline assistant response", async () =>
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePrompt = fixture.output().length;
     fixture.write("Produce a large inline response\r");
     await fixture.waitForCompleteFrameAfter("Exact copy tail.", beforePrompt);
@@ -9080,7 +8591,7 @@ test("slash Copy reads and copies the complete last artifact-backed assistant re
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePrompt = fixture.output().length;
     fixture.write("Produce an artifact-backed answer\r");
     await fixture.waitForCompleteFrameAfter("Assistant response stored as artifact", beforePrompt);
@@ -9132,12 +8643,12 @@ test("slash Copy loads older active chronology to find the last assistant respon
         () => "copied" as const,
       ),
       fixture
-        .waitForAfter("No assistant response is available to copy.", beforeCopy)
+        .waitForRecordedOutput("No assistant response is available to copy.", beforeCopy)
         .then(() => "missing" as const),
     ]);
     expect(outcome).toBe("copied");
     expect(await readFile(join(controlRoot, "clipboard.txt"), "utf8")).toBe("Older copy answer.");
-    await fixture.waitForAfter("Copied last assistant response.", beforeCopy);
+    await fixture.waitForRecordedOutput("Copied last assistant response.", beforeCopy);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -9153,11 +8664,11 @@ test("a shell tool card uses the accepted dollar-command grammar", async () => {
 
   try {
     const fixture = startFixture({ noColor: true, scenario: "shell", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Show shell card\r");
-    await fixture.waitFor("$ printf shell-card-fixture");
-    await fixture.waitFor("Shell card complete.");
-    await fixture.waitFor("stdout");
+    await fixture.waitForRecordedOutput("$ printf shell-card-fixture");
+    await fixture.waitForRecordedOutput("Shell card complete.");
+    await fixture.waitForRecordedOutput("stdout");
     expect(fixture.output()).not.toContain("stderr");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -9174,9 +8685,9 @@ test("tool subjects keep their full bounded value only in the 120-column layout"
 
   try {
     const fixture = startFixture({ scenario: "shell", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Show responsive shell card\r");
-    await fixture.waitFor("Shell card complete.");
+    await fixture.waitForRecordedOutput("Shell card complete.");
 
     let beforeResize = fixture.output().length;
     await fixture.resize(120, 40);
@@ -9198,7 +8709,7 @@ test("tool subjects keep their full bounded value only in the 120-column layout"
 
     beforeResize = fixture.output().length;
     await fixture.resize(40, 40);
-    await fixture.waitForAfter("\u001b[?2026l", beforeResize);
+    await fixture.waitForRecordedOutput("\u001b[?2026l", beforeResize);
     const narrowFrameLines = latestSynchronizedFrame(fixture.output().slice(beforeResize));
     expect(narrowFrameLines.find((line) => line.includes("$ printf"))).toContain("Ctrl+O expand");
     fixture.write("\u0011");
@@ -9220,9 +8731,9 @@ test("an artifact-backed assistant response remains visible in the transcript", 
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Produce an artifact-backed answer\r");
-    await fixture.waitFor("Adam · Streaming session");
+    await fixture.waitForRecordedOutput("Adam · Streaming session");
     expect(fixture.output()).toContain("Assistant response stored as artifact");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -9243,9 +8754,9 @@ test("slash Artifacts opens one bounded assistant artifact page", async () => {
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Produce an artifact-backed answer\r");
-    await fixture.waitFor("Adam · Streaming session");
+    await fixture.waitForRecordedOutput("Adam · Streaming session");
     const beforeArtifacts = fixture.output().length;
     fixture.write("/artifacts \r");
     const opened = await Promise.race([
@@ -9253,14 +8764,14 @@ test("slash Artifacts opens one bounded assistant artifact page", async () => {
         .waitForCompleteFrameAfter("Session artifacts", beforeArtifacts)
         .then(() => "opened" as const),
       fixture
-        .waitForAfter("Unknown command /artifacts", beforeArtifacts)
+        .waitForRecordedOutput("Unknown command /artifacts", beforeArtifacts)
         .then(() => "unknown" as const),
     ]);
     expectFramedOverlay(fixture.output().slice(beforeArtifacts), "Session artifacts");
     expect(opened).toBe("opened");
-    await fixture.waitForAfter("assistant response", beforeArtifacts);
+    await fixture.waitForRecordedOutput("assistant response", beforeArtifacts);
     fixture.write("\r");
-    await fixture.waitForAfter("Artifact detail", beforeArtifacts);
+    await fixture.waitForRecordedOutput("Artifact detail", beforeArtifacts);
     const detailOutput = fixture.output().slice(beforeArtifacts);
     expect(detailOutput).toContain("Assistant artifact page one");
     expect(detailOutput).not.toContain("Assistant artifact page two");
@@ -9279,17 +8790,17 @@ test("slash Todos opens the authoritative read-only list and exact detail", asyn
 
   try {
     const fixture = startFixture({ scenario: "todo", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Create the exact Todo fixture\r");
-    await fixture.waitFor("Permission required");
+    await fixture.waitForRecordedOutput("Permission required");
     const permissionFrame = (fixture.screen()?.join("\n") ?? "").replace(/\s+/gu, " ");
     expect(permissionFrame).toContain("Action write · Subject .");
     expect(permissionFrame).toContain("No preview available.");
     expect(permissionFrame).toContain("Allow");
     expect(permissionFrame).not.toContain("Allow unavailable");
     fixture.write("\r");
-    await fixture.waitFor("Todo fixture created.");
-    await fixture.waitFor("Todo 1/0/0 · 0 blocked");
+    await fixture.waitForRecordedOutput("Todo fixture created.");
+    await fixture.waitForRecordedOutput("Todo 1/0/0 · 0 blocked");
     await fixture.resize(40, 12);
     const beforeTodos = fixture.output().length;
     fixture.write("/todos\r");
@@ -9326,11 +8837,11 @@ test("active-run /todos reads the causally refreshed exact Todo revision", async
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Create one active Todo fixture\r");
     await waitForFileContents(join(controlRoot, "todo-active-parent-held"), "held\n");
-    await fixture.waitFor("Todo 1/0/0 · 0 blocked");
-    await fixture.waitFor("Todos · 1 unfinished · 0 blocked");
+    await fixture.waitForRecordedOutput("Todo 1/0/0 · 0 blocked");
+    await fixture.waitForRecordedOutput("Todos · 1 unfinished · 0 blocked");
     expect(fixture.screen()?.join("\n") ?? "").toContain("Todos · 1 unfinished · 0 blocked");
     expect(fixture.screen()?.join("\n") ?? "").toContain("○ Active Todo fixture");
 
@@ -9346,7 +8857,7 @@ test("active-run /todos reads the causally refreshed exact Todo revision", async
     fixture.write("\u001b[27;1;27~");
     await fixture.waitForCompleteFrameAfter("Todos · 1 unfinished · collapsed", beforeClose);
     await writeFile(join(controlRoot, "release-todo-active-parent"), "release\n", "utf8");
-    await fixture.waitFor("Todo fixture created.");
+    await fixture.waitForRecordedOutput("Todo fixture created.");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -9362,15 +8873,15 @@ test("slash Artifacts loads artifact references from older active chronology", a
 
   try {
     const fixture = startFixture({ scenario: "artifact-history", stateRoot, workspaceRoot });
-    await fixture.waitFor("Later history answer.");
+    await fixture.waitForRecordedOutput("Later history answer.");
     fixture.write("/artifacts \r");
-    await fixture.waitFor("Session artifacts");
-    await fixture.waitFor("Load older chronology");
+    await fixture.waitForRecordedOutput("Session artifacts");
+    await fixture.waitForRecordedOutput("Load older chronology");
     const beforeFirstPage = fixture.output().length;
     fixture.write("\r");
-    await fixture.waitForAfter("Load older chronology", beforeFirstPage);
+    await fixture.waitForRecordedOutput("Load older chronology", beforeFirstPage);
     fixture.write("\r");
-    await fixture.waitFor("assistant response");
+    await fixture.waitForRecordedOutput("assistant response");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -9393,7 +8904,7 @@ test("PageDown reads the next bounded assistant artifact page", async () => {
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePrompt = fixture.output().length;
     fixture.write("Produce an artifact-backed answer\r");
     await fixture.waitForCompleteFrameAfter("Assistant response stored as artifact", beforePrompt);
@@ -9401,23 +8912,23 @@ test("PageDown reads the next bounded assistant artifact page", async () => {
     expect(resultOccurrence).toBeGreaterThanOrEqual(beforePrompt);
     await fixture.waitForCompleteFrameAfter(" · idle", resultOccurrence);
     fixture.write("/artifacts \r");
-    await fixture.waitFor("Session artifacts");
+    await fixture.waitForRecordedOutput("Session artifacts");
     fixture.write("\r");
     await waitForPath(join(controlRoot, "artifact-read-1"));
-    await fixture.waitFor("1-16384 of 270057 bytes");
+    await fixture.waitForRecordedOutput("1-16384 of 270057 bytes");
     const beforeNextPage = fixture.output().length;
     fixture.write("\u001b[6~");
     await expect(
       waitForFileContents(join(controlRoot, "artifact-read-2"), "16384\n"),
     ).resolves.toBe("16384\n");
-    await fixture.waitForAfter("16385-32768 of 270057 bytes", beforeNextPage);
-    await fixture.waitForAfter("Assistant artifact page two", beforeNextPage);
+    await fixture.waitForRecordedOutput("16385-32768 of 270057 bytes", beforeNextPage);
+    await fixture.waitForRecordedOutput("Assistant artifact page two", beforeNextPage);
     const beforePreviousPage = fixture.output().length;
     fixture.write("\u001b[5~");
     await expect(waitForFileContents(join(controlRoot, "artifact-read-3"), "0\n")).resolves.toBe(
       "0\n",
     );
-    await fixture.waitForAfter("1-16384 of 270057 bytes", beforePreviousPage);
+    await fixture.waitForRecordedOutput("1-16384 of 270057 bytes", beforePreviousPage);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -9440,22 +8951,22 @@ test("Escape keeps a late artifact page response from restoring stale detail", a
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Produce an artifact-backed answer\r");
-    await fixture.waitFor("Assistant response stored as artifact");
+    await fixture.waitForRecordedOutput("Assistant response stored as artifact");
     fixture.write("/artifacts \r");
-    await fixture.waitFor("Session artifacts");
+    await fixture.waitForRecordedOutput("Session artifacts");
     fixture.write("\r");
-    await fixture.waitFor("Artifact detail");
+    await fixture.waitForRecordedOutput("Artifact detail");
     fixture.write("\u001b[6~");
     await waitForPath(join(controlRoot, "page-read-pending"));
     const beforeEscape = fixture.output().length;
     fixture.write("\u001b");
-    await fixture.waitForAfter("type search · Enter inspect", beforeEscape);
+    await fixture.waitForRecordedOutput("type search · Enter inspect", beforeEscape);
     await writeFile(join(controlRoot, "release-page-read"), "release\n", "utf8");
     await waitForPath(join(controlRoot, "artifact-read-2-settled"));
     fixture.write("no-such-artifact");
-    await fixture.waitFor("Search: no-such-artifact");
+    await fixture.waitForRecordedOutput("Search: no-such-artifact");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -9475,16 +8986,16 @@ test("completed durable-context compaction renders an explicit chronology marker
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Produce an artifact-backed answer\r");
-    await fixture.waitFor("Assistant response stored as artifact");
-    await fixture.waitFor("Adam · Streaming session");
+    await fixture.waitForRecordedOutput("Assistant response stored as artifact");
+    await fixture.waitForRecordedOutput("Adam · Streaming session");
     const afterFirstAnswer = fixture.output().lastIndexOf("Assistant response stored as artifact");
     await fixture.waitForCompleteFrameAfter(" · idle", afterFirstAnswer);
     const beforeCompaction = fixture.output().length;
     fixture.write("Continue after the large answer\r");
-    await fixture.waitForAfter("Context compacted · window 1", beforeCompaction);
-    await fixture.waitForAfter("Assistant response stored as artifact", beforeCompaction);
+    await fixture.waitForRecordedOutput("Context compacted · window 1", beforeCompaction);
+    await fixture.waitForRecordedOutput("Assistant response stored as artifact", beforeCompaction);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -9501,11 +9012,11 @@ test("a mutation permission shows its canonical diff and Enter allows the exact 
 
   try {
     const fixture = startFixture({ scenario: "mutation", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePermission = fixture.output().length;
     fixture.write("Edit the file\r");
-    await fixture.waitFor("Permission required");
-    await fixture.waitFor("-before");
+    await fixture.waitForRecordedOutput("Permission required");
+    await fixture.waitForRecordedOutput("-before");
     await fixture.waitForCompleteFrameAfter("+after", beforePermission);
     expectFramedOverlay(fixture.output().slice(beforePermission), "Permission required");
     const permissionOutput = fixture.output().slice(beforePermission);
@@ -9517,7 +9028,7 @@ test("a mutation permission shows its canonical diff and Enter allows the exact 
     expect(permissionOutput).toContain("\u001b[38;2;166;227;161mAllow\u001b[39m");
     expect(permissionOutput).toContain("\u001b[38;2;243;139;168mDeny\u001b[39m");
     fixture.write("\r");
-    await fixture.waitFor("Edit complete");
+    await fixture.waitForRecordedOutput("Edit complete");
     await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("after\n");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -9631,7 +9142,7 @@ test("permission semantics remain explicit without color", async () => {
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePermission = fixture.output().length;
     fixture.write("Edit without color\r");
     await fixture.waitForCompleteFrameAfter("+after", beforePermission);
@@ -9642,7 +9153,7 @@ test("permission semantics remain explicit without color", async () => {
     expect(frame).not.toContain("\u001b[38;2;");
     expect(frame).not.toContain("\u001b[48;2;");
     fixture.write("\u001b[27;1;27~");
-    await fixture.waitFor("denied");
+    await fixture.waitForRecordedOutput("denied");
     await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("before\n");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -9660,24 +9171,26 @@ test("slash Diffs reopens a settled mutation preview from authoritative chronolo
 
   try {
     const fixture = startFixture({ scenario: "mutation", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Edit the file\r");
-    await fixture.waitFor("Permission required");
+    await fixture.waitForRecordedOutput("Permission required");
     fixture.write("\r");
-    await fixture.waitFor("Edit complete");
+    await fixture.waitForRecordedOutput("Edit complete");
     const beforeDiffs = fixture.output().length;
     fixture.write("/diffs \r");
     const opened = await Promise.race([
       fixture.waitForCompleteFrameAfter("Settled diffs", beforeDiffs).then(() => "opened" as const),
-      fixture.waitForAfter("Unknown command /diffs", beforeDiffs).then(() => "unknown" as const),
+      fixture
+        .waitForRecordedOutput("Unknown command /diffs", beforeDiffs)
+        .then(() => "unknown" as const),
     ]);
     expectFramedOverlay(fixture.output().slice(beforeDiffs), "Settled diffs");
     expect(opened).toBe("opened");
-    await fixture.waitForAfter("edit change preview", beforeDiffs);
+    await fixture.waitForRecordedOutput("edit change preview", beforeDiffs);
     fixture.write("\r");
-    await fixture.waitForAfter("Diff detail", beforeDiffs);
-    await fixture.waitForAfter("-before", beforeDiffs);
-    await fixture.waitForAfter("+after", beforeDiffs);
+    await fixture.waitForRecordedOutput("Diff detail", beforeDiffs);
+    await fixture.waitForRecordedOutput("-before", beforeDiffs);
+    await fixture.waitForRecordedOutput("+after", beforeDiffs);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -9701,7 +9214,7 @@ test("Enter cannot allow a mutation while its canonical preview is still loading
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     const beforePrompt = fixture.output().length;
     fixture.write("Edit before preview\r");
     await fixture.waitForCompleteFrameAfter("Loading canonical preview", beforePrompt);
@@ -9711,7 +9224,7 @@ test("Enter cannot allow a mutation while its canonical preview is still loading
     await waitForPath(join(controlRoot, "permission-decision-submitted"));
     await writeFile(join(controlRoot, "release-preview"), "release\n", "utf8");
     await waitForPath(join(controlRoot, "preview-read-complete"));
-    await fixture.waitFor("denied");
+    await fixture.waitForRecordedOutput("denied");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     await expect(readFile(join(workspaceRoot, "edit.txt"), "utf8")).resolves.toBe("before\n");
@@ -9735,12 +9248,12 @@ test("Ctrl+C cancels one active run and repeated input cannot arm exit while set
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Cancel this run\r");
-    await fixture.waitFor("Working");
+    await fixture.waitForRecordedOutput("Working");
     await waitForPath(join(controlRoot, "model-started"));
     fixture.write("\u0003\u0003");
-    await fixture.waitFor("cancelled");
+    await fixture.waitForRecordedOutput("cancelled");
     expect(fixture.output()).not.toContain("Press Ctrl+C again");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -9759,16 +9272,19 @@ test("the injected deadline causally expires an idle Ctrl+C exit arm", async () 
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "deadline", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("\u001b[99;5:1u");
-    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
+    await fixture.waitForRecordedOutput("Press Ctrl+C again within two seconds to exit");
     await waitForPath(join(controlRoot, "scheduled-deadline-2000-1"));
     const armedOutputEnd = fixture.output().length;
     await writeFile(join(controlRoot, "deadline-2000-1"), "expire\n", "utf8");
-    await fixture.waitForAfter("fake.local · Certified", armedOutputEnd);
+    await fixture.waitForRecordedOutput("fake.local · Certified", armedOutputEnd);
     const expiredOutputEnd = fixture.output().length;
     fixture.write("\u001b[99;5:1u");
-    await fixture.waitForAfter("Press Ctrl+C again within two seconds to exit", expiredOutputEnd);
+    await fixture.waitForRecordedOutput(
+      "Press Ctrl+C again within two seconds to exit",
+      expiredOutputEnd,
+    );
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -9786,15 +9302,15 @@ test("the legacy duplicate guard consumes one immediate Ctrl+C duplicate", async
 
   try {
     const fixture = startFixture({ controlRoot, scenario: "deadline", stateRoot, workspaceRoot });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("保留");
-    await fixture.waitFor("保留");
+    await fixture.waitForRecordedOutput("保留");
     fixture.write("\u0003\u0003");
-    await fixture.waitFor("Press Ctrl+C again within two seconds to exit");
+    await fixture.waitForRecordedOutput("Press Ctrl+C again within two seconds to exit");
     await waitForPath(join(controlRoot, "scheduled-deadline-50-1"));
     await writeFile(join(controlRoot, "deadline-50-1"), "expire\n", "utf8");
     fixture.write("x");
-    await fixture.waitFor("保留x");
+    await fixture.waitForRecordedOutput("保留x");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -9817,9 +9333,9 @@ test("a pending clipboard adapter fails closed from the injected deadline", asyn
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("保留超时草稿");
-    await fixture.waitFor("保留超时草稿");
+    await fixture.waitForRecordedOutput("保留超时草稿");
     fixture.write("\u0011");
     await waitForPath(join(controlRoot, "clipboard-started"));
     await waitForPath(join(controlRoot, "scheduled-deadline-250-1"));
@@ -9841,8 +9357,8 @@ test("a restarted TUI resumes an existing authoritative transcript", async () =>
 
   try {
     const fixture = startFixture({ scenario: "resume", stateRoot, workspaceRoot });
-    await fixture.waitFor("Resume transcript");
-    await fixture.waitFor("Previous answer");
+    await fixture.waitForRecordedOutput("Resume transcript");
+    await fixture.waitForRecordedOutput("Previous answer");
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
   } finally {
@@ -9863,9 +9379,9 @@ test("untrusted model terminal controls are rendered as inert text", async () =>
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("Adam · New session");
+    await fixture.waitForScreen("Adam · New session");
     fixture.write("Render unsafe output\r");
-    await fixture.waitFor("Visible");
+    await fixture.waitForRecordedOutput("Visible");
     fixture.write("\u0011");
     const result = await fixture.closed;
     expect(result).toMatchObject({ code: 0, signal: null, stderr: "" });
@@ -9894,10 +9410,10 @@ test("slash Fork restores the selected boundary prompt in the child editor", asy
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("History prompt 3");
+    await fixture.waitForRecordedOutput("History prompt 3");
     const beforeFork = fixture.output().length;
     fixture.write("/fork \r");
-    await fixture.waitForAfter("Fork from a boundary", beforeFork);
+    await fixture.waitForRecordedOutput("Fork from a boundary", beforeFork);
     const beforeSelection = fixture.output().length;
     fixture.write("\r");
     await fixture.waitForCompleteFrameAfter("Adam · Branch of ", beforeSelection);
@@ -9924,10 +9440,10 @@ test("slash Clone branches at the latest complete boundary with an empty editor"
       stateRoot,
       workspaceRoot,
     });
-    await fixture.waitFor("History prompt 3");
+    await fixture.waitForRecordedOutput("History prompt 3");
     const beforeClone = fixture.output().length;
     fixture.write("/clone \r");
-    await fixture.waitForAfter("Adam · Branch of ", beforeClone);
+    await fixture.waitForRecordedOutput("Adam · Branch of ", beforeClone);
     fixture.write("\u0011");
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
     await expect(access(join(controlRoot, "clipboard.txt"))).rejects.toMatchObject({

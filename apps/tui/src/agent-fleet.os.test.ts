@@ -41,8 +41,8 @@ test("owner-private child draft survives a cold TUI and Lifecycle rebuild separa
       }),
     ).toMatchObject({ status: "admitted" });
     await started.promise;
-    await h.terminal.nextSynchronizedFrameContaining("@explore-1 · Explore · Running");
-    await h.press("\u001b[B\u001b[B\r", "Conversation");
+    await h.terminal.waitForScreen("@explore-1 · Explore · Running");
+    await h.openFirstAgent();
     await h.press("\r", "Cooperative");
     await h.press("Child draft survives restart.", "Child draft survives restart.");
     await h.press("\u001b", "Enter compose · Esc back");
@@ -54,7 +54,7 @@ test("owner-private child draft survives a cold TUI and Lifecycle rebuild separa
       restore: h.storage,
       draftPersistencePolicy: "recoverable",
     });
-    await cold.terminal.nextSynchronizedFrameContaining("Separate Main draft.");
+    await cold.terminal.waitForScreen("Separate Main draft.");
     expect(cold.presentation.getState().composer.renderedText).toBe("Separate Main draft.");
     cold.terminal.input("\u0001\u000b");
     await cold.press("/agents\r", "Agents workspace");
@@ -112,7 +112,7 @@ test("explicit child resources page private reasoning, exact tool records and im
         },
       }),
     ).toMatchObject({ status: "admitted" });
-    await h.terminal.nextSynchronizedFrameContaining("Completed");
+    await h.terminal.waitForScreen("Completed");
     const thread = h.presentation.getState().authoritative.managedControl?.threads[0];
     if (thread === undefined) throw new Error("Missing child");
     expect(JSON.stringify(h.presentation.getState())).not.toContain("PRIVATE_REASONING");
@@ -189,7 +189,7 @@ test("full Markdown renders an actual read-file prose result while assistant mod
         },
       }),
     ).toMatchObject({ status: "admitted" });
-    await h.terminal.nextSynchronizedFrameContaining("Completed");
+    await h.terminal.waitForScreen("Completed");
     await h.press("/agents\r", "Agents workspace");
     await h.press("\r", "Conversation");
     await h.press("\u001b[H", "Manual scroll");
@@ -379,7 +379,7 @@ test("cold undelivered input remains private and can be explicitly inspected and
     await h.press("PRIVATE_UNDELIVERED_MESSAGE\r", "Accepted");
     const offset = h.terminal.output().length;
     finish.resolve();
-    await h.terminal.nextSynchronizedFrameContaining("Undelivered · settled", offset);
+    await h.terminal.waitForFrameAfter("Undelivered · settled", offset);
     await h.stop();
     cold = await startManagedTui(driver, {
       restore: h.storage,
@@ -451,7 +451,7 @@ test("confirmed bounded exports persist selected fields privately with a separat
         },
       }),
     ).toMatchObject({ status: "admitted" });
-    await h.terminal.nextSynchronizedFrameContaining("Completed");
+    await h.terminal.waitForScreen("Completed");
     await h.press("/agents\r", "Agents workspace");
     await h.press("\r", "Seen · Main pending");
     const artifactsBefore = await readdir(join(h.storage.stateRoot, "artifacts"));
@@ -617,7 +617,7 @@ test.each([
           },
         }),
       ).toMatchObject({ status: "admitted" });
-      await h.terminal.nextSynchronizedFrameContaining("Completed");
+      await h.terminal.waitForScreen("Completed");
       await h.press("/agents\r", "Agents workspace");
       await h.press("\r", "Seen · Main pending");
       await h.press("e", "Export agent");

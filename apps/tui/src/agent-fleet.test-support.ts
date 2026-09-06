@@ -70,6 +70,7 @@ export type ManagedTuiFixture = {
   readonly storage: ManagedTuiStorage;
   conversationText(): string;
   press(data: string, frame: string): Promise<void>;
+  openFirstAgent(handle?: string): Promise<void>;
   close(): Promise<void>;
   stop(): Promise<void>;
   waitForAttention(
@@ -226,7 +227,16 @@ export async function startManagedTui(
     },
   });
   // The selected target remains visible when the minimum-height layout compresses the title.
-  await terminal.nextSynchronizedFrameContaining(identity.targetId);
+  await terminal.waitForScreen(identity.targetId);
+  const press = async (data: string, frame: string) => {
+    if (frame.trim().length === 0)
+      throw new TypeError("A TUI action requires a visible completion condition.");
+    waitingForFrame = frame;
+    const offset = terminal.output().length;
+    terminal.input(data);
+    await terminal.waitForFrameAfter(frame, offset);
+    waitingForFrame = "next test action";
+  };
   return {
     parent,
     ...(destination === undefined ? {} : { destination }),
@@ -254,13 +264,14 @@ export async function startManagedTui(
         .map((line) => line.slice(left + 1, right))
         .join("\n");
     },
-    async press(data: string, frame: string) {
-      waitingForFrame = frame;
-      const offset = terminal.output().length;
-      terminal.input(data);
-      await terminal.nextSynchronizedFrameContaining(frame, offset);
-      waitingForFrame = "next test action";
+    async openFirstAgent(handle = "@explore-1") {
+      await terminal.waitForScreen("Fleet");
+      await press("\u001b[B", "● Main");
+      await press("\u001b[B", `● ${handle}`);
+      await press("\r", `Conversation · ${handle}`);
     },
+    press,
+
     async close() {
       if (terminal.running()) terminal.input("\u0011");
       try {
