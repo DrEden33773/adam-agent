@@ -5310,7 +5310,7 @@ test("accepted Skill completion preserves its exact identity across a recoverabl
     await expect(first.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
     const recoveredManifest = await readFilesRecursively(join(stateRoot, "drafts"));
-    expect(recoveredManifest).toContain('"schemaVersion":3');
+    expect(recoveredManifest).toContain('"schemaVersion":4');
     expect(recoveredManifest).toContain('"type":"skill"');
     expect(recoveredManifest).toMatch(/"elementId":"adam-skill-[^"]+"/u);
     expect(recoveredManifest).toContain(
@@ -5373,7 +5373,7 @@ test("a Skill atom navigates as one token and Backspace removes its exact occurr
     await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
 
     const recoveredManifest = await readFilesRecursively(join(stateRoot, "drafts"));
-    expect(recoveredManifest).toContain('"schemaVersion":3');
+    expect(recoveredManifest).toContain('"schemaVersion":4');
     expect(recoveredManifest).toContain('"text":"xy"');
     expect(recoveredManifest).not.toContain('"type":"skill"');
     expect(recoveredManifest).not.toContain("skill:v1:project:.:first");
@@ -7802,13 +7802,13 @@ test("the real TUI opens inline project path completion from the at trigger", as
     await fixture.waitForCompleteFrameAfter("@README.md", beforeCompletion);
     const frame = fixture.output().slice(beforeCompletion);
     let screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toMatch(/@README\.md\s+\.\//u);
-    expect(screen).toMatch(/@alpha\.ts\s+src\//u);
+    expect(screen).toMatch(/@README\.md\s+F · \.\//u);
+    expect(screen).toMatch(/@alpha\.ts\s+F · src\//u);
 
     await fixture.resize(120, 40);
     screen = fixture.screen()?.join("\n") ?? "";
-    expect(screen).toMatch(/@README\.md\s+\.\//u);
-    expect(screen).toMatch(/@alpha\.ts\s+src\//u);
+    expect(screen).toMatch(/@README\.md\s+F · \.\//u);
+    expect(screen).toMatch(/@alpha\.ts\s+F · src\//u);
 
     await fixture.resize(40, 12);
     screen = fixture.screen()?.join("\n") ?? "";
@@ -7846,7 +7846,8 @@ test("the real TUI fuzzy-selects one durable project path atom without reading i
     await fixture.closed;
 
     const durableState = await readFilesRecursively(stateRoot);
-    expect(durableState).toContain('"type":"path"');
+    expect(durableState).toContain('"type":"mention"');
+    expect(durableState).toContain('"kind":"path"');
     expect(durableState).toContain('"path":"src/alpha.ts"');
     expect(durableState).not.toContain("PRIVATE_ALPHA_BYTES");
     expect(fixture.output()).not.toContain("PRIVATE_ALPHA_BYTES");

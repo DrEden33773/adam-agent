@@ -1632,7 +1632,7 @@ const managedAgentWebRequestPermissionSubjectSchema = z.strictObject({
   agentId: z.uuid(),
   attemptId: z.uuid(),
   childSessionId: z.uuid(),
-  profile: z.enum(["research.v1", "research.v2"]),
+  profile: z.enum(["research.v1", "research.v2", "research.v3"]),
   providerOrigin: z.url(),
   queryOrUrl: z.string().min(1).max(4_096),
   argumentsDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),

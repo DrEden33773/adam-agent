@@ -740,7 +740,7 @@ test("TurnComposer captures and restores one recoverable ordered draft through r
       type: "new_session",
       targetId: "deepseek-v4-flash.direct",
     });
-    expect(draft.schemaVersion).toBe(3);
+    expect(draft.schemaVersion).toBe(4);
     expect(retained).toHaveLength(2);
     const legacyDraft: RecoverableTurnDraftV1 = {
       ...draft,

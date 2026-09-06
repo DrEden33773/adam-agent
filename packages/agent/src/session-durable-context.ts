@@ -57,6 +57,7 @@ export type AgentSessionDurableContext = {
     | undefined;
   readonly referencedModelResponseArtifactBytes?: number;
   readonly repositoryWorkspaceRoot?: string;
+  readonly frozenProjectContext?: true;
   readonly authorizeProjectContextLoad?: (() => Promise<boolean>) | undefined;
   readonly skillResourceLineageBytes?: number;
   readonly skillResourceRunBytes?: number;

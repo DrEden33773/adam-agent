@@ -3,9 +3,10 @@ import { constants } from "node:fs";
 import { chmod, mkdir, open, rename, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import type { ManagedComposerDraft } from "@adam-agent/presentation";
+import type { DraftMentionElement, ManagedComposerDraft } from "@adam-agent/presentation";
 
 import { z } from "zod";
+import { deserializeMention, draftMentionElementSchema, serializeMention } from "./at-mention.js";
 import type { StagedPastedTextSelectionV1 } from "./pasted-text.js";
 
 const maximumManifestBytes = 1024 * 1024;
@@ -102,14 +103,20 @@ export type RecoverableTurnDraftV3 = Omit<RecoverableTurnDraftV2, "elements" | "
   )[];
 };
 
+export type RecoverableTurnDraftV4 = Omit<RecoverableTurnDraftV3, "elements" | "schemaVersion"> & {
+  readonly schemaVersion: 4;
+  readonly elements: readonly (RecoverableTurnDraftV3["elements"][number] | DraftMentionElement)[];
+};
+
 export type RecoverableTurnDraft =
   | RecoverableTurnDraftV1
   | RecoverableTurnDraftV2
-  | RecoverableTurnDraftV3;
+  | RecoverableTurnDraftV3
+  | RecoverableTurnDraftV4;
 
 export type RecoverableTurnDraftRepository = {
   load(scope: TurnDraftScopeV1): Promise<RecoverableTurnDraft | null>;
-  save(draft: RecoverableTurnDraftV3): Promise<void>;
+  save(draft: RecoverableTurnDraftV3 | RecoverableTurnDraftV4): Promise<void>;
   delete(scope: TurnDraftScopeV1): Promise<void>;
   loadManaged(
     scope: Pick<ManagedComposerDraft, "parentSessionId" | "threadId">,
@@ -343,14 +350,34 @@ const draftV3Schema = z
   })
   .superRefine((draft, context) => validateDraftGraph(draft, context));
 
+const draftV4Schema = z
+  .strictObject({
+    ...draftV3Schema.shape,
+    schemaVersion: z.literal(4),
+    elements: z
+      .array(
+        z.union([
+          textElementSchema,
+          resourceElementSchema,
+          pastedTextElementSchema,
+          skillElementSchema,
+          pathElementSchema,
+          draftMentionElementSchema,
+        ]),
+      )
+      .max(17),
+  })
+  .superRefine((draft, context) => validateDraftGraph(draft, context));
+
 const recoverableDraftSchema = z.discriminatedUnion("schemaVersion", [
   draftV1Schema,
   draftV2Schema,
   draftV3Schema,
+  draftV4Schema,
 ]);
 
 function validateDraftGraph(draft: RecoverableTurnDraft, context: z.RefinementCtx): void {
-  const allElements: readonly RecoverableTurnDraftV3["elements"][number][] = draft.elements;
+  const allElements: readonly RecoverableTurnDraftV4["elements"][number][] = draft.elements;
   const resourceElements = allElements.filter(
     (
       element,
@@ -375,11 +402,13 @@ function validateDraftGraph(draft: RecoverableTurnDraft, context: z.RefinementCt
         length +
         (element.type === "text"
           ? Buffer.byteLength(element.text, "utf8")
-          : element.type === "skill"
-            ? Buffer.byteLength(`$${element.name}`, "utf8")
-            : element.type === "path"
-              ? Buffer.byteLength(`@${element.path}`, "utf8")
-              : 0),
+          : element.type === "mention"
+            ? Buffer.byteLength(element.literal, "utf8")
+            : element.type === "skill"
+              ? Buffer.byteLength(`$${element.name}`, "utf8")
+              : element.type === "path"
+                ? Buffer.byteLength(`@${element.path}`, "utf8")
+                : 0),
       0,
     ) +
       pastedTexts.reduce((total, pastedText) => total + pastedText.byteCount, 0) >
@@ -511,7 +540,16 @@ export async function createRecoverableTurnDraftRepository(options: {
       const path = join(root, manifestName(scope));
       const value = await readOwnerPrivateManifest(path);
       if (value === undefined) return null;
-      const parsed = recoverableDraftSchema.safeParse(value);
+      const decoded =
+        typeof value === "object" &&
+        value !== null &&
+        "schemaVersion" in value &&
+        value.schemaVersion === 4 &&
+        "elements" in value &&
+        Array.isArray(value.elements)
+          ? { ...value, elements: value.elements.map(deserializeMention) }
+          : value;
+      const parsed = recoverableDraftSchema.safeParse(decoded);
       if (!parsed.success || !matchesScope(parsed.data.scope, scope)) {
         throw new TypeError("The recoverable draft manifest is invalid.");
       }
@@ -519,8 +557,8 @@ export async function createRecoverableTurnDraftRepository(options: {
     },
     save(draft) {
       return enqueueMutation(async () => {
-        const validated = draftV3Schema.parse(draft);
-        const serialized = `${JSON.stringify(validated)}\n`;
+        const validated = (draft.schemaVersion === 4 ? draftV4Schema : draftV3Schema).parse(draft);
+        const serialized = `${JSON.stringify({ ...validated, elements: validated.elements.map((element) => (element.type === "mention" ? serializeMention(element) : element)) })}\n`;
         if (Buffer.byteLength(serialized, "utf8") > maximumManifestBytes) {
           throw new TypeError("The recoverable draft manifest is too large.");
         }

@@ -9,6 +9,7 @@ import {
   type ModelTargets,
 } from "@adam-agent/agent";
 import {
+  createDirectDeepSeekThinkingCapability,
   createInMemoryManagedAgentControlStore,
   createInMemorySessionStoreDirectory,
   createTrustedWorkspaceTrustForTesting,
@@ -81,6 +82,7 @@ export type ManagedTuiFixture = {
 export async function startManagedTui(
   driver: ModelDriver,
   viewport: {
+    readonly clipboard?: Parameters<typeof runTui>[0]["clipboard"];
     readonly preferences?: Parameters<typeof createPresentationSession>[0]["preferences"];
     readonly rows?: number;
     readonly columns?: number;
@@ -88,6 +90,8 @@ export async function startManagedTui(
     readonly draftPersistencePolicy?: "process_only" | "recoverable";
     readonly restore?: ManagedTuiStorage;
     readonly withDestination?: boolean;
+    readonly blankDraft?: boolean;
+    readonly thinking?: boolean;
     readonly controlReceiptBarrier?: (
       command: ManagedControlCommand,
       receipt: ManagedControlReceipt,
@@ -98,7 +102,13 @@ export async function startManagedTui(
     ) => Promise<void>;
     readonly childRecordBarrier?: (record: SessionRecord) => Promise<void>;
     readonly workspaceRoot?: string;
+    readonly modelTargets?: ModelTargets;
     readonly permissions?: NonNullable<Parameters<typeof createSessionLifecycle>[0]["permissions"]>;
+    readonly webHttp?: Parameters<typeof createSessionLifecycle>[0]["webHttp"];
+    readonly webSearchConfiguration?: Parameters<
+      typeof createSessionLifecycle
+    >[0]["webSearchConfiguration"];
+    readonly planPolicyVersion?: "plan-policy.hybrid-delegation-v1";
   } = {},
 ): Promise<ManagedTuiFixture> {
   const stateRoot =
@@ -109,9 +119,12 @@ export async function startManagedTui(
   const children =
     viewport.restore?.children ?? createInMemorySessionStoreDirectory<SessionRecord>();
   const store = viewport.restore?.store ?? createInMemoryManagedAgentControlStore();
-  const modelTargets: ModelTargets = {
+  const thinking = viewport.thinking
+    ? { thinkingCapability: createDirectDeepSeekThinkingCapability(identity) }
+    : {};
+  const modelTargets: ModelTargets = viewport.modelTargets ?? {
     async resolve() {
-      return { identity, contextProfile, driver };
+      return { identity, contextProfile, driver, ...thinking };
     },
     async snapshot() {
       return {
@@ -119,6 +132,7 @@ export async function startManagedTui(
           {
             identity,
             contextProfile,
+            ...thinking,
             readiness: { status: "available", credentialSource: "test" },
           },
         ],
@@ -138,6 +152,11 @@ export async function startManagedTui(
   const lifecycle = createSessionLifecycle({
     workspaceRoot,
     stateRoot,
+    ...(viewport.preferences === undefined ? {} : { preferences: viewport.preferences }),
+    ...(viewport.webHttp === undefined ? {} : { webHttp: viewport.webHttp }),
+    ...(viewport.webSearchConfiguration === undefined
+      ? {}
+      : { webSearchConfiguration: viewport.webSearchConfiguration }),
     modelTargets,
     permissions:
       viewport.permissions ?? createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
@@ -156,6 +175,10 @@ export async function startManagedTui(
       },
     },
     [sessionManagedControl]: {
+      userRoleDirectory: join(stateRoot, "roles"),
+      ...(viewport.planPolicyVersion === undefined
+        ? {}
+        : { planPolicyVersion: viewport.planPolicyVersion }),
       store,
       childSessionStores: children,
       ...(viewport.controlRecordBarrier === undefined
@@ -171,7 +194,7 @@ export async function startManagedTui(
   });
   const parent =
     viewport.restore === undefined
-      ? await lifecycle.create({ targetIdentity: identity })
+      ? await lifecycle.create({ targetIdentity: identity, mode: "default" })
       : { sessionId: viewport.restore.sessionId };
   if (viewport.restore === undefined)
     await lifecycle.setSessionManualName({ sessionId: parent.sessionId, name: "Fleet fixture" });
@@ -199,7 +222,7 @@ export async function startManagedTui(
     workspaceRoot,
     stateRoot,
     ...(viewport.preferences === undefined ? {} : { preferences: viewport.preferences }),
-    sessionId: parent.sessionId,
+    ...(viewport.blankDraft ? { targetIdentity: identity } : { sessionId: parent.sessionId }),
     projectLabel: "Fleet fixture",
     draftPersistencePolicy: viewport.draftPersistencePolicy ?? "process_only",
     ...(viewport.controlReceiptBarrier === undefined
@@ -212,12 +235,13 @@ export async function startManagedTui(
   let waitingForFrame = "initial frame";
   onTestFailed(() =>
     console.error(
-      `Fleet screen at failure (${waitingForFrame}):\n${terminal.lines().join("\n")}\nPending transition: ${JSON.stringify(presentation.getState().authoritative.managedTransition)}\nAttention: ${JSON.stringify(presentation.getState().managedAttention)}\nControl: ${JSON.stringify(presentation.getState().authoritative.managedControl?.threads.map((thread) => ({ handle: thread.handle, phase: thread.turn.phase, label: thread.turn.label, diagnostic: thread.turn.diagnostic, attention: thread.turn.attention, actions: thread.actions })))}`,
+      `Fleet screen at failure (${waitingForFrame}):\n${terminal.lines().join("\n")}\nPending transition: ${JSON.stringify(presentation.getState().authoritative.managedTransition)}\nAttention: ${JSON.stringify(presentation.getState().managedAttention)}\nControl: ${JSON.stringify(presentation.getState().authoritative.managedControl?.threads.map((thread) => ({ handle: thread.handle, phase: thread.turn.phase, label: thread.turn.label, diagnostic: thread.turn.diagnostic, outcome: thread.turn.outcome, attention: thread.turn.attention, actions: thread.actions })))}`,
     ),
   );
   const running = runTui({
     terminal,
     presentation,
+    ...(viewport.clipboard === undefined ? {} : { clipboard: viewport.clipboard }),
     ...(viewport.deadlineScheduler === undefined
       ? {}
       : { deadlineScheduler: viewport.deadlineScheduler }),

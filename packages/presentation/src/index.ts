@@ -832,6 +832,9 @@ export type RepositoryInstructionsDisplay = {
 };
 
 export type PendingInteraction = {
+  readonly delegation?: ManagedDelegationEnvelope;
+  readonly delegationCanChangeMode?: boolean;
+  readonly delegationMessages?: readonly ManagedDelegationMessage[];
   readonly type: "permission";
   readonly requestId: string;
   readonly callId: string;
@@ -859,7 +862,40 @@ export type DraftPoint =
   | { readonly elementId: string; readonly edge: "before" | "after" }
   | { readonly elementId: string; readonly offset: number };
 
+export type AtMentionAtom = { readonly type: "mention"; readonly literal: string } & (
+  | { readonly kind: "literal" }
+  | { readonly kind: "path"; readonly path: string }
+  | { readonly kind: "role"; readonly qualifiedRoleId: string; readonly definitionDigest: string }
+  | {
+      readonly kind: "agent";
+      readonly parentSessionId: string;
+      readonly threadId: string;
+      readonly handle: string;
+    }
+  | { readonly kind: "main" }
+);
+
+export type DraftMentionElement = AtMentionAtom & { readonly elementId: string };
+
+export function leadingMentionRecipients(
+  elements: readonly ({ readonly type: string; readonly text?: string } | DraftMentionElement)[],
+): readonly DraftMentionElement[] {
+  const recipients: DraftMentionElement[] = [];
+  for (const element of elements) {
+    if (element.type === "text" && "text" in element && element.text?.trim().length === 0) continue;
+    if (
+      element.type !== "mention" ||
+      !("kind" in element) ||
+      !["role", "agent", "main"].includes(element.kind)
+    )
+      break;
+    recipients.push(element);
+  }
+  return recipients;
+}
+
 export type DraftTextDocumentPart =
+  | DraftMentionElement
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "resource"; readonly elementId: string }
   | { readonly type: "pasted_text"; readonly elementId: string }
@@ -875,6 +911,7 @@ export type TurnComposerDisplay = {
   readonly attachmentAvailable: boolean;
   readonly draftRevision: number;
   readonly elements: readonly (
+    | DraftMentionElement
     | { readonly elementId: string; readonly type: "text"; readonly text: string }
     | {
         readonly elementId: string;
@@ -1158,7 +1195,79 @@ export function isAgentUiSettings(value: unknown): value is AgentUiSettings {
   );
 }
 
+export type AgentRoleTypeDisplay = {
+  readonly qualifiedId: string;
+  readonly name: string;
+  readonly description: string;
+  readonly definitionDigest: string;
+  readonly base: "explore" | "research";
+  readonly tools: readonly string[];
+  readonly web: boolean;
+  readonly source?:
+    | { readonly kind: "builtin" | "project" | "user"; readonly path?: string | undefined }
+    | undefined;
+  readonly instructions?: string | undefined;
+  readonly model?: string | undefined;
+  readonly thinking?: string | undefined;
+  readonly skills?: boolean | string[] | undefined;
+  readonly contextMode?: "task" | "current_request" | undefined;
+  readonly limits?:
+    | { readonly maxTokens?: number | undefined; readonly maxTurns?: number | undefined }
+    | undefined;
+};
+export type AgentRoleDefinitionInput = {
+  name: string;
+  description: string;
+  base: "explore" | "research";
+  tools?: string[];
+  skills?: boolean | string[];
+  web?: boolean;
+  context_mode?: "task" | "current_request";
+  model?: string;
+  thinking?: string;
+  limits?: { maxTokens?: number | undefined; maxTurns?: number | undefined };
+  overrides?: string;
+};
+export type AgentRoleMutation =
+  | {
+      readonly action: "create";
+      readonly source: "project" | "user";
+      readonly fields: AgentRoleDefinitionInput;
+      readonly instructions: string;
+      readonly original?: { readonly qualifiedId: string; readonly definitionDigest: string };
+    }
+  | {
+      readonly action: "toggle";
+      readonly qualifiedId: string;
+      readonly definitionDigest: string;
+      readonly enabled: boolean;
+    };
+export type AgentTypesDisplay = {
+  readonly sources: readonly {
+    readonly kind: "project" | "user";
+    readonly path: string;
+    readonly writable: boolean;
+  }[];
+  readonly definitions: readonly (AgentRoleTypeDisplay & {
+    readonly enabled: boolean;
+    readonly available: boolean;
+  })[];
+  readonly diagnostics: readonly { readonly source: string; readonly message: string }[];
+  readonly targets: readonly {
+    readonly targetId: string;
+    readonly label: string;
+    readonly thinkingLevels?: readonly { readonly id: string; readonly label: string }[];
+  }[];
+};
+
 export type PresentationDisplayState = {
+  readonly agentTypes?: AgentTypesDisplay;
+  readonly agentRoles?: readonly {
+    readonly qualifiedId: string;
+    readonly name: string;
+    readonly description: string;
+    readonly definitionDigest: string;
+  }[];
   readonly agentUiSettings?: AgentUiSettings;
   readonly managedAttention?: readonly ManagedAttentionItem[];
   readonly managedDrafts?: readonly Pick<
@@ -1217,6 +1326,23 @@ export type CommandReceipt =
       readonly commandId: string;
       readonly resource: ArtifactChunk | null;
       readonly draftText?: string;
+      readonly roleTarget?: {
+        readonly qualifiedId: string;
+        readonly definitionDigest: string;
+        readonly source: string;
+        readonly message: string;
+        readonly targets: readonly { readonly targetId: string; readonly label: string }[];
+      };
+      readonly delegation?: {
+        readonly messages: readonly ManagedDelegationMessage[];
+        readonly envelope: ManagedDelegationEnvelope;
+        readonly description: string;
+      };
+      readonly agentInput?: {
+        readonly input: Omit<ManagedComposerDraft, "mode">;
+        readonly actions: readonly ManagedComposerDraft["mode"][];
+        readonly envelope?: ManagedDelegationEnvelope;
+      };
       readonly todo?: TodoPageResource | TodoEntityResource;
       readonly managedAgentTranscript?: ManagedAgentTranscriptPageResource;
       readonly managedDraft?: ManagedComposerDraft | null;
@@ -1311,6 +1437,37 @@ export type ManagedAgentTranscriptPageResource = {
 };
 
 export type PresentationCommand =
+  | {
+      readonly type: "direct_agent_input";
+      readonly draftRevision: number;
+      readonly confirmedInput?: ManagedComposerDraft;
+      readonly confirmedEnvelope?: ManagedDelegationEnvelope;
+    }
+  | { readonly type: "refresh_agent_types"; readonly sessionId: string }
+  | {
+      readonly type: "mutate_agent_types";
+      readonly sessionId: string;
+      readonly confirmed: true;
+      readonly mutation: AgentRoleMutation;
+    }
+  | {
+      readonly type: "configure_role_target";
+      readonly qualifiedId: string;
+      readonly definitionDigest: string;
+      readonly model: string | null;
+      readonly draftRevision: number;
+      readonly confirmed: true;
+    }
+  | {
+      readonly type: "direct_delegation";
+      readonly description?: string;
+      readonly limits?: ManagedDelegationLimits;
+      readonly skills?: readonly string[];
+      readonly context?: ManagedDelegationContext;
+      readonly draftRevision: number;
+      readonly thinkingSelection?: ThinkingPolicySelectionDisplay | null;
+      readonly confirmedEnvelope?: ManagedDelegationEnvelope;
+    }
   | {
       readonly type: "export_agent";
       readonly confirmed: true;
@@ -1627,6 +1784,13 @@ export type PresentationCommand =
       readonly elementId: string;
     }
   | {
+      readonly type: "resolve_draft_recipient";
+      readonly baseRevision: number;
+      readonly elementId: string;
+      readonly action: "keep" | "literal" | "retarget";
+      readonly replacement?: AtMentionAtom;
+    }
+  | {
       readonly type: "undo_draft";
       readonly baseRevision: number;
     }
@@ -1672,6 +1836,14 @@ export type PresentationCommand =
       readonly type: "decide_permission";
       readonly requestId: string;
       readonly decision: "allow" | "deny";
+      readonly delegation?: ManagedDelegationEnvelope;
+      readonly delegationSelection?: ManagedDelegationSelection;
+    }
+  | {
+      readonly type: "preview_permission_delegation";
+      readonly requestId: string;
+      readonly limits: ManagedDelegationLimits;
+      readonly selection?: ManagedDelegationSelection;
     }
   | ({
       readonly type: "branch_session";
@@ -1844,9 +2016,10 @@ export type ManagedControlThread = {
   readonly lifecycle: "open" | "closed";
   readonly displayName: string;
   readonly handle: string;
+  readonly alias?: string;
   readonly residency: "live" | "unloaded";
   readonly threadId: string;
-  readonly role: "builtin:explore";
+  readonly role: string;
   readonly description: string;
   readonly turn: {
     readonly startedAtUnixMilliseconds?: number;
@@ -1953,6 +2126,27 @@ export type ManagedFleetPolicy = {
   readonly sessionTokens: number;
   readonly storageBytes: number;
 };
+export type ManagedDelegationMessage = ManagedControlLink & {
+  readonly role: "user" | "assistant";
+  readonly text: string;
+};
+export type ManagedDelegationContext =
+  | { readonly mode: "task" }
+  | { readonly mode: "current_request" }
+  | { readonly mode: "selected_messages"; readonly messages: readonly ManagedControlLink[] };
+
+export type ManagedDelegationSelection = {
+  readonly context?: ManagedDelegationContext;
+  readonly skills?: readonly string[];
+};
+
+export type ManagedDelegationLimits = Partial<
+  Pick<
+    ManagedDelegationEnvelope,
+    "mode" | "running" | "queued" | "aggregateTokens" | "threadTokens" | "sessionTokens"
+  >
+>;
+
 export type ManagedDelegationEnvelope = {
   readonly version: 1;
   readonly id: string;
@@ -1962,7 +2156,7 @@ export type ManagedDelegationEnvelope = {
     readonly id: string;
     readonly callId?: string | undefined;
   };
-  readonly roles: readonly ["builtin:explore"];
+  readonly roles: readonly string[];
   readonly mode: "background" | "foreground";
   readonly threads: number;
   readonly running: number;
@@ -1970,7 +2164,7 @@ export type ManagedDelegationEnvelope = {
   readonly aggregateTokens: number;
   readonly threadTokens: number;
   readonly sessionTokens: number;
-  readonly context: "current_request";
+  readonly context: "task" | "current_request" | "selected_messages";
   readonly skills: readonly string[];
   readonly policy: ManagedFleetPolicy;
   readonly policyDigest: `sha256:${string}`;
@@ -2035,6 +2229,7 @@ export type ManagedControlCommand =
     }
   | {
       readonly type: "list_agents";
+      readonly view?: "threads" | "roles" | "context";
       readonly parentSessionId: string;
       readonly limit?: number;
       readonly cursor?: string;
@@ -2064,7 +2259,11 @@ export type ManagedControlCommand =
         readonly callId?: string;
       };
       readonly entries: readonly {
-        readonly role: "builtin:explore";
+        readonly role: string;
+        readonly alias?: string;
+        readonly context?: ManagedDelegationContext;
+        readonly skills?: readonly string[];
+        readonly artifacts?: readonly string[];
         readonly task: string;
         readonly description: string;
       }[];
@@ -2087,7 +2286,7 @@ export type ManagedControlCommand =
   | {
       readonly type: "start_thread";
       readonly parentSessionId: string;
-      readonly role: "builtin:explore";
+      readonly role: string;
       readonly task: string;
       readonly description: string;
     }
@@ -2110,6 +2309,18 @@ export type ManagedControlCommand =
   | { readonly type: "close"; readonly parentSessionId: string; readonly reason?: "exit" };
 
 export type ManagedControlReceipt =
+  | {
+      readonly status: "context_listed";
+      readonly messages: readonly ManagedDelegationMessage[];
+      readonly cursor?: string;
+      readonly revision: string;
+    }
+  | {
+      readonly status: "roles_listed";
+      readonly roles: readonly Omit<AgentRoleTypeDisplay, "instructions">[];
+      readonly cursor?: string;
+      readonly revision: string;
+    }
   | { readonly status: "suspended" }
   | { readonly status: "resumed"; readonly results: readonly ManagedControlReceipt[] }
   | { readonly status: "input_accepted"; readonly inputId: string; readonly turnId: string }

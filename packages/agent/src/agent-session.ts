@@ -85,6 +85,7 @@ import {
   digestApprovedPlanProjectionV1,
   isHybridPlanPolicy,
   isPlanDelegationTool,
+  isPlanWebTool,
   type PlanCycleSnapshot,
   submitPlanToolDefinitionV1,
 } from "./plan-mode.js";
@@ -284,6 +285,10 @@ export class AgentSession {
     | {
         readonly requestId: string;
         readonly resolve: (decision: "allow" | "deny") => void;
+        readonly refineDelegation?: (
+          envelope: NonNullable<PermissionDecisionCommand["delegation"]>,
+          selection?: PermissionDecisionCommand["delegationSelection"],
+        ) => void;
       }
     | undefined;
 
@@ -474,6 +479,21 @@ export class AgentSession {
           message: "The permission request is not pending.",
         },
       };
+    }
+    if (command.delegation !== undefined) {
+      try {
+        if (command.decision !== "allow" || pendingPermission.refineDelegation === undefined)
+          throw new TypeError("This pending request cannot refine delegation.");
+        pendingPermission.refineDelegation(command.delegation, command.delegationSelection);
+      } catch {
+        return {
+          status: "rejected",
+          error: {
+            code: "invalid_permission_decision",
+            message: "The exact delegation grant is invalid for this pending request.",
+          },
+        };
+      }
     }
     pendingPermission.resolve(command.decision);
     return { status: "accepted" };
@@ -2408,7 +2428,7 @@ export class AgentSession {
       preparedPermissionSubject,
       planCommandAssessment,
     );
-    const permissionInput: PermissionPolicyInput = {
+    let permissionInput: PermissionPolicyInput = {
       callId: call.id,
       name: call.name,
       effect: adapter.effect,
@@ -2557,7 +2577,19 @@ export class AgentSession {
         throw new Error("Cannot request permission without an active run ID.");
       }
       const requestId = `${runId}:${call.id}`;
-      const pendingDecision = this.#createPendingPermissionDecision(requestId, signal);
+      let delegationRefined = false;
+      const refineDelegation = preparedCall.refineDelegation?.bind(preparedCall);
+      const pendingDecision = this.#createPendingPermissionDecision(
+        requestId,
+        signal,
+        refineDelegation === undefined
+          ? undefined
+          : (envelope, selection) => {
+              const subject = refineDelegation(envelope, selection);
+              permissionInput = { ...permissionInput, subject };
+              delegationRefined = true;
+            },
+      );
       try {
         await this.#emit({
           type: "tool_permission_requested",
@@ -2570,6 +2602,8 @@ export class AgentSession {
           return this.#settleCancelled();
         }
         decision = userDecision;
+        if (delegationRefined)
+          await this.#emit({ type: "tool_permission_requested", requestId, ...permissionInput });
         await this.#emit({
           type: "tool_permission_decided",
           requestId,
@@ -3567,6 +3601,7 @@ export class AgentSession {
     call: ToolCall,
     subject: PermissionSubject,
   ): Promise<Extract<ToolResult, { readonly status: "failed" }> | undefined> {
+    if (this.#durableContext?.frozenProjectContext === true) return undefined;
     const context = this.#promptContext;
     const workspaceRoot = this.#repositoryWorkspaceRoot;
     if (
@@ -4104,6 +4139,10 @@ export class AgentSession {
   #createPendingPermissionDecision(
     requestId: string,
     signal: AbortSignal,
+    refineDelegation?: (
+      envelope: NonNullable<PermissionDecisionCommand["delegation"]>,
+      selection?: PermissionDecisionCommand["delegationSelection"],
+    ) => void,
   ): {
     readonly promise: Promise<"allow" | "deny" | undefined>;
     readonly cancel: () => void;
@@ -4126,6 +4165,7 @@ export class AgentSession {
       settle = finish;
       this.#pendingPermission = {
         requestId,
+        ...(refineDelegation === undefined ? {} : { refineDelegation }),
         resolve: (decision) => finish(decision),
       };
       if (signal.aborted) {
@@ -4809,6 +4849,10 @@ function planProfileAllowsDefinition(
   return (
     (plan.policyVersion === "plan-policy.hybrid-delegation-v1" &&
       definition.source === "builtin" &&
+      definition.effect === "network" &&
+      isPlanWebTool(definition.name)) ||
+    (plan.policyVersion === "plan-policy.hybrid-delegation-v1" &&
+      definition.source === "builtin" &&
       definition.effect === "delegate" &&
       isPlanDelegationTool(definition.name)) ||
     (definition.source === "builtin" &&
@@ -4840,6 +4884,14 @@ function planToolDisposition(
   if (definition.effect === "read") {
     return "allow";
   }
+  if (
+    plan.policyVersion === "plan-policy.hybrid-delegation-v1" &&
+    definition.source === "builtin" &&
+    definition.effect === "network" &&
+    isPlanWebTool(definition.name) &&
+    subject.type === "web_request"
+  )
+    return undefined;
   if (
     plan.policyVersion === "plan-policy.hybrid-delegation-v1" &&
     definition.source === "builtin" &&

@@ -1,12 +1,41 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+import type { ManagedDelegationContext, ManagedDelegationLimits } from "@adam-agent/presentation";
 import { z } from "zod";
 import type { ContextProfile } from "./context-profile.js";
 import type { ManagedControlRecord } from "./managed-agent-folds.js";
+import { agentRoleIdSchema } from "./role-catalog.js";
 export function managedControlDigest(value: unknown): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
 }
 
 const positive = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+export const delegationContextSchema = z.discriminatedUnion("mode", [
+  z.strictObject({ mode: z.literal("task") }),
+  z.strictObject({ mode: z.literal("current_request") }),
+  z.strictObject({
+    mode: z.literal("selected_messages"),
+    messages: z
+      .array(
+        z.strictObject({
+          sequence: positive,
+          digest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+        }),
+      )
+      .min(1)
+      .max(32),
+  }),
+]);
+export type DelegationContext = ManagedDelegationContext;
+export function requestedDelegationContext(
+  entries: readonly { readonly context?: DelegationContext | undefined }[],
+): DelegationEnvelope["context"] {
+  return entries.some((entry) => entry.context?.mode === "selected_messages")
+    ? "selected_messages"
+    : entries.every((entry) => entry.context?.mode === "task")
+      ? "task"
+      : "current_request";
+}
 export const fleetPolicySchema = z.strictObject({
   version: z.literal(1),
   background: z.strictObject({ running: positive.max(4), queued: z.number().int().min(0).max(32) }),
@@ -30,7 +59,7 @@ export const delegationEnvelopeSchema = z.strictObject({
     .templateLiteral(["sha256:", z.string()])
     .refine((value) => /^sha256:[a-f0-9]{64}$/u.test(value)),
   origin: delegationOriginSchema,
-  roles: z.tuple([z.literal("builtin:explore")]),
+  roles: z.array(agentRoleIdSchema).min(1).max(32),
   mode: z.enum(["background", "foreground"]),
   threads: positive.max(32),
   running: positive.max(4),
@@ -38,7 +67,7 @@ export const delegationEnvelopeSchema = z.strictObject({
   aggregateTokens: positive,
   threadTokens: positive,
   sessionTokens: positive,
-  context: z.literal("current_request"),
+  context: z.enum(["task", "current_request", "selected_messages"]),
   skills: z.array(z.string().max(512)).max(64),
   policy: fleetPolicySchema,
   policyDigest: z
@@ -46,6 +75,16 @@ export const delegationEnvelopeSchema = z.strictObject({
     .refine((value) => /^sha256:[a-f0-9]{64}$/u.test(value)),
 });
 export type DelegationEnvelope = z.infer<typeof delegationEnvelopeSchema>;
+const delegationLimitsSchema = delegationEnvelopeSchema
+  .pick({
+    mode: true,
+    running: true,
+    queued: true,
+    aggregateTokens: true,
+    threadTokens: true,
+    sessionTokens: true,
+  })
+  .partial();
 export const fleetProviderEventSchema = z.discriminatedUnion("type", [
   z.strictObject({
     type: z.literal("provider_reserved"),
@@ -100,6 +139,10 @@ export function createDelegationEnvelope(
     sessionTokens: number;
     availableTokens?: number;
     threadTokens?: number;
+    roles?: DelegationEnvelope["roles"];
+    context?: DelegationEnvelope["context"];
+    skills?: readonly string[];
+    limits?: ManagedDelegationLimits;
   },
 ): DelegationEnvelope {
   const lane = input.mode === "background" ? policy.background : policy.reserved;
@@ -107,7 +150,7 @@ export function createDelegationEnvelope(
     version: 1 as const,
     id: randomUUID(),
     origin: input.origin,
-    roles: ["builtin:explore"] as const,
+    roles: input.roles ?? ["builtin:explore"],
     mode: input.mode,
     threads: input.count,
     running: Math.min(lane.running, input.count),
@@ -119,12 +162,71 @@ export function createDelegationEnvelope(
     ),
     threadTokens: Math.min(policy.threadTokens, input.threadTokens ?? policy.threadTokens),
     sessionTokens: input.sessionTokens,
-    context: "current_request" as const,
-    skills: [],
+    context: input.context ?? "current_request",
+    skills: [...(input.skills ?? [])],
+    ...delegationLimitsSchema.parse(input.limits ?? {}),
     policy,
     policyDigest: managedControlDigest(policy),
   };
-  return delegationEnvelopeSchema.parse({ ...value, digest: managedControlDigest(value) });
+  const envelope = delegationEnvelopeSchema.parse({
+    ...value,
+    digest: managedControlDigest(value),
+  });
+  if (
+    !delegationEnvelopeMatches(envelope, {
+      policy,
+      roles: value.roles,
+      count: input.count,
+      mode: input.mode,
+      origin: input.origin,
+      sessionTokens: input.sessionTokens,
+      context: value.context,
+      skills: value.skills,
+    }) ||
+    envelope.aggregateTokens > (input.availableTokens ?? input.sessionTokens)
+  )
+    throw new TypeError("Delegation limits exceed the available policy or Session budget.");
+  return envelope;
+}
+
+export function delegationEnvelopeMatches(
+  candidate: unknown,
+  expected: {
+    readonly policy: FleetPolicy;
+    readonly roles: readonly string[];
+    readonly count: number;
+    readonly mode: "background" | "foreground";
+    readonly origin?: DelegationEnvelope["origin"];
+    readonly sessionTokens: number;
+    readonly context?: DelegationEnvelope["context"];
+    readonly skills?: readonly string[];
+  },
+): candidate is DelegationEnvelope {
+  const parsed = delegationEnvelopeSchema.safeParse(candidate);
+  if (!parsed.success) return false;
+  const envelope = parsed.data;
+  const { digest, ...fields } = envelope;
+  return (
+    managedControlDigest(fields) === digest &&
+    managedControlDigest(envelope.policy) === envelope.policyDigest &&
+    isDeepStrictEqual(envelope.policy, expected.policy) &&
+    isDeepStrictEqual(envelope.roles, [...new Set(expected.roles)]) &&
+    envelope.threads === expected.count &&
+    envelope.threads <= envelope.running + envelope.queued &&
+    isDeepStrictEqual(envelope.skills, [...new Set(expected.skills ?? [])]) &&
+    envelope.context === (expected.context ?? "current_request") &&
+    envelope.mode === expected.mode &&
+    (expected.origin === undefined || isDeepStrictEqual(envelope.origin, expected.origin)) &&
+    envelope.running <=
+      expected.policy[envelope.mode === "background" ? "background" : "reserved"].running &&
+    envelope.queued <=
+      expected.policy[envelope.mode === "background" ? "background" : "reserved"].queued &&
+    (envelope.mode !== "foreground" || envelope.threads === 1) &&
+    envelope.aggregateTokens <= expected.policy.batchTokens &&
+    envelope.aggregateTokens <= envelope.sessionTokens &&
+    envelope.threadTokens <= expected.policy.threadTokens &&
+    envelope.sessionTokens <= expected.sessionTokens
+  );
 }
 export function fleetBudget(
   records: readonly ManagedControlRecord[],

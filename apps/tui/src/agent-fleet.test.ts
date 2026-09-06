@@ -148,7 +148,7 @@ test("background spawn cards settle to Started and Queued with frozen identities
     },
   );
   try {
-    await h.press("Inspect these five items.\r", "Allow");
+    await h.press("Inspect these five items.\r", "Confirm delegation");
     await h.press("\r", "Batch admitted; Main ready.");
     await prepared.promise;
     await h.terminal.waitForScreen("Starting · 0 used");

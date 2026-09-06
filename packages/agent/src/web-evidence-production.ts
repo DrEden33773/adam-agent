@@ -13,7 +13,7 @@ export async function createWebEvidenceProduction(options: {
   readonly artifactStore: ArtifactStore;
   readonly configuration: WebSearchConfigurationSnapshot;
   readonly http: WebHttpAdapter;
-  readonly searchAvailable?: boolean;
+  readonly searchAvailable?: boolean | (() => Promise<boolean>);
   readonly store: WebEvidenceStore;
 }): Promise<ToolRegistry> {
   const providerConfiguration = options.configuration.provider;
@@ -32,6 +32,19 @@ export async function createWebEvidenceProduction(options: {
       default:
         assertNever(providerConfiguration.kind);
     }
+  }
+  if (searchProvider !== undefined && typeof options.searchAvailable === "function") {
+    const provider = searchProvider;
+    const available = options.searchAvailable;
+    searchProvider = {
+      kind: provider.kind,
+      origin: provider.origin,
+      async search(input) {
+        if (!(await available()))
+          return unavailableSearxngSearchProvider(provider.origin).search(input);
+        return provider.search(input);
+      },
+    };
   }
   return createWebEvidenceToolRegistry({
     artifactStore: options.artifactStore,

@@ -32,6 +32,10 @@ export function isHybridPlanPolicy(
 ): policy is "plan-policy.hybrid-v1" | "plan-policy.hybrid-delegation-v1" {
   return policy === "plan-policy.hybrid-v1" || policy === "plan-policy.hybrid-delegation-v1";
 }
+export function isPlanWebTool(name: string): boolean {
+  return name === "web_fetch" || name === "web_search";
+}
+
 export function isPlanDelegationTool(name: string): boolean {
   return ["spawn_agents", "post_agent", "reply_agent", "cancel_agents"].includes(name);
 }
@@ -170,6 +174,10 @@ export function isPlanToolProfileV1Valid(
         definition.name.length <= 256 &&
         /^sha256:[0-9a-f]{64}$/u.test(definition.definitionDigest) &&
         (definition.effect === "read" ||
+          (policyVersion === "plan-policy.hybrid-delegation-v1" &&
+            definition.source === "builtin" &&
+            definition.effect === "network" &&
+            isPlanWebTool(definition.name)) ||
           (policyVersion === "plan-policy.hybrid-delegation-v1" &&
             definition.source === "builtin" &&
             definition.effect === "delegate" &&

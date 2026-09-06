@@ -1,11 +1,19 @@
 import type {
+  AtMentionAtom,
+  ManagedControlThread,
+  PresentationDisplayState,
+} from "@adam-agent/presentation";
+import type {
   AutocompleteItem,
   AutocompleteProvider,
   AutocompleteSuggestions,
 } from "@earendil-works/pi-tui";
-
 import { type AdamCommandRegistry, adamCommandRegistry } from "./command-registry.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
+
+export function mentionAutocompleteIdentity(item: AutocompleteItem): AtMentionAtom | null {
+  return (item as AutocompleteItem & { readonly adamMention?: AtMentionAtom }).adamMention ?? null;
+}
 
 type SkillCompletion = {
   readonly description: string;
@@ -49,6 +57,11 @@ export function skillAutocompleteIdentity(
 }
 
 export class AdamAutocompleteProvider implements AutocompleteProvider {
+  readonly #getThreads: () => readonly ManagedControlThread[];
+  readonly #getMain: () => boolean;
+  readonly #mention: (text: string) => string;
+  readonly #structuralBadges: () => boolean;
+  readonly #getRoles: () => NonNullable<PresentationDisplayState["agentRoles"]>;
   readonly triggerCharacters = ["$", "@"];
   readonly #getAttachmentsAvailable: () => boolean;
   readonly #getProjectPaths: () => readonly string[];
@@ -61,6 +74,11 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
   readonly #registry: AdamCommandRegistry;
 
   constructor(options: {
+    readonly getThreads?: () => readonly ManagedControlThread[];
+    readonly getMain?: () => boolean;
+    readonly mention?: (text: string) => string;
+    readonly structuralBadges?: () => boolean;
+    readonly getRoles?: () => NonNullable<PresentationDisplayState["agentRoles"]>;
     readonly getAttachmentsAvailable?: () => boolean;
     readonly getProjectPaths: () => readonly string[];
     readonly getRunActive: () => boolean;
@@ -72,6 +90,11 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
     readonly registry?: AdamCommandRegistry;
   }) {
     this.#getAttachmentsAvailable = options.getAttachmentsAvailable ?? (() => true);
+    this.#getRoles = options.getRoles ?? (() => []);
+    this.#getThreads = options.getThreads ?? (() => []);
+    this.#getMain = options.getMain ?? (() => false);
+    this.#mention = options.mention ?? ((text) => text);
+    this.#structuralBadges = options.structuralBadges ?? (() => false);
     this.#getProjectPaths = options.getProjectPaths;
     this.#getRunActive = options.getRunActive;
     this.#getSkills = options.getSkills;
@@ -221,13 +244,80 @@ export class AdamAutocompleteProvider implements AutocompleteProvider {
         return {
           adamPath: { path: safePath },
           value: `@${safePath}`,
-          label: this.#path(`@${columns.fileName}`),
-          description: columns.parentPath,
+          label: this.#path(`${this.#structuralBadges() ? "F " : ""}@${columns.fileName}`),
+          description: `F · ${columns.parentPath}`,
         };
       });
-      return Promise.resolve(
-        pathItems.length === 0 ? null : { items: pathItems, prefix: pathPrefix },
-      );
+      const catalog = this.#getRoles();
+      const roles = catalog
+        .map((role) => ({
+          role,
+          alias:
+            catalog.filter(
+              (other) => other.name.toLocaleLowerCase() === role.name.toLocaleLowerCase(),
+            ).length === 1 && !/\s/u.test(role.name)
+              ? role.name
+              : role.qualifiedId,
+        }))
+        .filter(({ role, alias }) =>
+          [role.name, alias].some((name) =>
+            name.toLocaleLowerCase().startsWith(pathPrefix.slice(1).toLocaleLowerCase()),
+          ),
+        )
+        .map(({ role, alias }) => ({
+          adamMention: {
+            type: "mention",
+            kind: "role",
+            literal: `@${alias}`,
+            qualifiedRoleId: role.qualifiedId,
+            definitionDigest: role.definitionDigest,
+          } satisfies AtMentionAtom,
+          value: `@${alias}`,
+          label: this.#mention(
+            `${this.#structuralBadges() ? "A " : ""}${safeTerminalText(`@${alias}`)}`,
+          ),
+          description: `A · ${safeTerminalText(role.description)}`,
+        }));
+      const threads = this.#getThreads()
+        .filter((thread) => thread.lifecycle === "open")
+        .flatMap((thread) =>
+          [thread.handle, ...(thread.alias === undefined ? [] : [`@${thread.alias}`])]
+            .filter((literal) =>
+              literal.replace(/^@/u, "").toLocaleLowerCase().startsWith(normalizedPrefix),
+            )
+            .map((literal) => ({
+              adamMention: {
+                type: "mention",
+                kind: "agent",
+                literal,
+                parentSessionId: thread.parentSessionId,
+                threadId: thread.threadId,
+                handle: thread.handle,
+              } satisfies AtMentionAtom,
+              value: literal,
+              label: this.#mention(
+                `${this.#structuralBadges() ? "A " : ""}${safeTerminalText(literal)}`,
+              ),
+              description: `A · ${safeTerminalText(thread.description)} · ${safeTerminalText(thread.turn.label)}`,
+            })),
+        );
+      const main =
+        this.#getMain() && "main".startsWith(normalizedPrefix)
+          ? [
+              {
+                adamMention: {
+                  type: "mention",
+                  kind: "main",
+                  literal: "@main",
+                } satisfies AtMentionAtom,
+                value: "@main",
+                label: this.#mention(`${this.#structuralBadges() ? "A " : ""}@main`),
+                description: "A · Main conversation",
+              },
+            ]
+          : [];
+      const items = [...roles, ...threads, ...main, ...pathItems];
+      return Promise.resolve(items.length === 0 ? null : { items, prefix: pathPrefix });
     }
     if (options.force !== true) {
       return Promise.resolve(null);

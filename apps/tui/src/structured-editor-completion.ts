@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { DraftMentionElement } from "@adam-agent/presentation";
 import type {
   EditorDocumentPart,
   EditorDocumentPoint,
@@ -6,6 +7,7 @@ import type {
   EditorStructuredCompletionProjection,
 } from "@earendil-works/pi-tui";
 import {
+  mentionAutocompleteIdentity,
   type PathAutocompleteIdentity,
   pathAutocompleteIdentity,
   type SkillAutocompleteIdentity,
@@ -14,6 +16,8 @@ import {
 
 export function createAdamStructuredEditorCompletion(
   options: {
+    readonly onMentionAtom?: (element: DraftMentionElement) => void;
+    readonly mentionStyle?: (text: string) => string;
     readonly pathStyle?: (text: string) => string;
     readonly onPathAtom?: (
       identity: PathAutocompleteIdentity & { readonly elementId: string },
@@ -23,8 +27,31 @@ export function createAdamStructuredEditorCompletion(
     ) => void;
   } = {},
 ): EditorStructuredCompletion {
+  const selectedItem = (item: Parameters<EditorStructuredCompletion["accept"]>[2]) => {
+    const path = pathAutocompleteIdentity(item);
+    return options.onMentionAtom === undefined || path === null
+      ? item
+      : {
+          ...item,
+          adamMention: {
+            type: "mention" as const,
+            kind: "path" as const,
+            literal: `@${encodeURI(path.path)}`,
+            path: path.path,
+          },
+        };
+  };
   return {
     promote(text, cursorOffset, item, prefix) {
+      item = selectedItem(item);
+      if (mentionAutocompleteIdentity(item) !== null)
+        return acceptMentionAtom(
+          [{ type: "text", id: "adam-editor-text-1", text }],
+          { partId: "adam-editor-text-1", offset: cursorOffset },
+          item,
+          prefix,
+          options,
+        );
       if (skillAutocompleteIdentity(item) === null && pathAutocompleteIdentity(item) === null) {
         return null;
       }
@@ -65,6 +92,9 @@ export function createAdamStructuredEditorCompletion(
       );
     },
     accept(document, cursor, item, prefix) {
+      item = selectedItem(item);
+      if (mentionAutocompleteIdentity(item) !== null)
+        return acceptMentionAtom(document, cursor, item, prefix, options);
       const textCursor = textPartAtCursor(document, cursor);
       if (textCursor === null) {
         if (prefix.length === 0 && "edge" in cursor && item.value.length > 0) {
@@ -128,6 +158,78 @@ export function createAdamStructuredEditorCompletion(
 }
 
 export const adamStructuredEditorCompletion = createAdamStructuredEditorCompletion();
+
+export function completeLiteralMentionAtCursor(
+  document: readonly EditorDocumentPart[],
+  cursor: EditorDocumentPoint,
+  onMentionAtom: (element: DraftMentionElement) => void,
+): ReturnType<EditorStructuredCompletion["accept"]> {
+  const current = textPartAtCursor(document, cursor);
+  if (current === null || current.offset !== current.part.text.length) return null;
+  const match = /(^|\s)(@[^\s\p{Cc}]+)$/u.exec(current.part.text);
+  const literal = match?.[2];
+  if (literal === undefined || (match?.index === 0 && match[1] === "" && current.index > 0))
+    return null;
+  return acceptMentionAtom(
+    document,
+    cursor,
+    {
+      value: literal,
+      label: literal,
+      adamMention: { type: "mention", kind: "literal", literal },
+    } as Parameters<EditorStructuredCompletion["accept"]>[2],
+    literal,
+    { onMentionAtom },
+  );
+}
+
+function acceptMentionAtom(
+  document: readonly EditorDocumentPart[],
+  cursor: EditorDocumentPoint,
+  item: Parameters<EditorStructuredCompletion["accept"]>[2],
+  prefix: string,
+  options: {
+    readonly onMentionAtom?: (element: DraftMentionElement) => void;
+    readonly mentionStyle?: (text: string) => string;
+    readonly pathStyle?: (text: string) => string;
+  },
+): ReturnType<EditorStructuredCompletion["accept"]> {
+  const atom = mentionAutocompleteIdentity(item);
+  const textCursor = textPartAtCursor(document, cursor);
+  if (atom === null || textCursor === null) return null;
+  const start = textCursor.offset - prefix.length;
+  if (start < 0 || textCursor.part.text.slice(start, textCursor.offset) !== prefix) return null;
+  const elementId = `adam-mention-${randomUUID()}`;
+  const before = textCursor.part.text.slice(0, start);
+  const after = textCursor.part.text.slice(textCursor.offset);
+  options.onMentionAtom?.({ ...atom, elementId });
+  return {
+    cursor: { partId: elementId, edge: "after" },
+    document: [
+      ...document.slice(0, textCursor.index),
+      ...(before.length === 0 ? [] : [{ ...textCursor.part, text: before }]),
+      {
+        type: "atom",
+        id: elementId,
+        label: atom.literal,
+        ...(atom.kind === "path" && options.pathStyle !== undefined
+          ? { style: options.pathStyle }
+          : options.mentionStyle === undefined
+            ? {}
+            : { style: options.mentionStyle }),
+      },
+      ...(after.length === 0
+        ? []
+        : [{ type: "text" as const, id: nextTextPartId(document), text: after }]),
+      ...document.slice(textCursor.index + 1),
+    ],
+    range: {
+      anchor: { partId: textCursor.part.id, offset: start },
+      focus: { partId: textCursor.part.id, offset: textCursor.offset },
+    },
+    text: item.value,
+  };
+}
 
 function acceptPathAtom(
   document: readonly EditorDocumentPart[],

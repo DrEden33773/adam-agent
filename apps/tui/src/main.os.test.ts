@@ -1876,7 +1876,7 @@ test("candidate ProjectRuntime runs real JSONL child Enter, Main response, layer
     await fixture.waitForScreen("Adam · New session");
     fixture.write("Start child\r");
     waiting = "Delegation permission";
-    await fixture.waitForRecordedOutput("Permission required");
+    await fixture.waitForRecordedOutput("Confirm delegation");
     fixture.write("\r");
     waiting = "MAIN_READY";
     await fixture.waitForRecordedOutput("MAIN_READY");

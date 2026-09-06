@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-
 import type {
   ArtifactChunk,
   ArtifactRange,
@@ -28,6 +27,7 @@ import {
   agentExportFields,
   defaultAgentUiSettings,
   isAgentUiSettings,
+  leadingMentionRecipients,
   presentationAgentExportMaximumBytes,
   presentationArtifactPageMaximumBytes,
   reconcilePresentationUpdate,
@@ -35,9 +35,17 @@ import {
 } from "@adam-agent/presentation";
 import type { RuntimeEvent } from "./agent-session-contracts.js";
 import { readFileArtifact, readFileArtifactRange } from "./artifact-store.js";
+import { delegationMessages, resolveDelegationContext } from "./delegation-context.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
 import type { ExtensionHost } from "./extension-host.js";
+import {
+  createDelegationEnvelope,
+  type DelegationContext,
+  delegationContextSchema,
+  delegationEnvelopeMatches,
+} from "./fleet-ledger.js";
 import { createFileTurnComposerResourceStager } from "./input-resource-staging.js";
+import { managedSpawnInputSchema } from "./managed-agent-control.js";
 import {
   type ModelTargetIdentity,
   type ModelTargetSnapshot,
@@ -111,7 +119,11 @@ export const presentationHydrationBarrier = Symbol("adam-agent.presentation-hydr
 export const presentationHistoryPageSize = Symbol("adam-agent.presentation-history-page-size");
 export const presentationCatalogPageSize = Symbol("adam-agent.presentation-catalog-page-size");
 
-import { sessionManagedControl, sessionManagedTransition } from "./session-lifecycle.js";
+import {
+  sessionDraftRoles,
+  sessionManagedControl,
+  sessionManagedTransition,
+} from "./session-lifecycle.js";
 
 export const presentationManagedAgentTranscriptPageSize = Symbol(
   "adam-agent.presentation-managed-agent-transcript-page-size",
@@ -642,6 +654,9 @@ export async function createPresentationSession(
     let planRevisionIntent: PresentationDisplayState["composer"]["revisionIntent"] = null;
     let state: PresentationDisplayState = {
       agentUiSettings,
+      ...(initialDraft?.agentRoles === undefined
+        ? {}
+        : { agentRoles: initialDraft.agentRoles.roles }),
       revision: 1,
       authoritative,
       draft:
@@ -822,6 +837,12 @@ export async function createPresentationSession(
       if (control === undefined || observer.signal.aborted) return;
       const firstFrame = Promise.withResolvers<void>();
       controlObservation = (async () => {
+        const agentRoles = (await control.inspectRoles()).roles;
+        if (closed || observer.signal.aborted) {
+          firstFrame.resolve();
+          return;
+        }
+        state = { ...state, agentRoles };
         for await (const frame of control.observe({ parentSessionId, signal: observer.signal })) {
           if (
             closed ||
@@ -1641,6 +1662,9 @@ export async function createPresentationSession(
       const { managedControl: _previousControl, ...previousAuthority } = state.authoritative;
       state = {
         revision: state.revision + 1,
+        ...(activatedControlSnapshot === undefined
+          ? {}
+          : { agentRoles: (await activatedControl?.inspectRoles())?.roles ?? [] }),
         authoritative: {
           ...previousAuthority,
           ...(activatedControlSnapshot === undefined
@@ -2674,6 +2698,500 @@ export async function createPresentationSession(
               error instanceof Error ? error.message : "Agent UI settings could not be saved.",
           };
         }
+      }
+      if (command.type === "refresh_agent_types" || command.type === "mutate_agent_types") {
+        if (state.authoritative.active?.session.id !== command.sessionId)
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The active Session changed.",
+          };
+        try {
+          const control = await options.lifecycle[sessionManagedControl](command.sessionId);
+          if (control === undefined) throw new Error("Agent types are unavailable.");
+          if (command.type === "mutate_agent_types") {
+            if (command.confirmed !== true)
+              throw new Error("Preview and confirm this role change first.");
+            await control.mutateAgentTypes(command.mutation);
+          } else await control.inspectRoles({ reload: true });
+          state = {
+            ...state,
+            agentRoles: (await control.inspectRoles()).roles,
+            agentTypes: await control.inspectAgentTypes(),
+            revision: state.revision + 1,
+          };
+          publishStateChange();
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch (error) {
+          return {
+            status: "rejected",
+            code: "action_unavailable",
+            message: error instanceof Error ? error.message : "Role change failed.",
+          };
+        }
+      }
+      if (command.type === "configure_role_target") {
+        const parentId = state.authoritative.active?.session.id;
+        const composer = turnComposer.snapshot();
+        const element = composer.elements.find(
+          (entry) =>
+            entry.type === "mention" &&
+            entry.kind === "role" &&
+            entry.qualifiedRoleId === command.qualifiedId &&
+            entry.definitionDigest === command.definitionDigest,
+        );
+        const control =
+          parentId === undefined
+            ? draftTargetIdentity === null
+              ? undefined
+              : options.lifecycle[sessionDraftRoles](draftTargetIdentity)
+            : await options.lifecycle[sessionManagedControl](parentId);
+        if (
+          control === undefined ||
+          composer.revision !== command.draftRevision ||
+          element === undefined ||
+          command.confirmed !== true
+        )
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected role draft changed.",
+          };
+        try {
+          const role = await control.configureRoleTarget(command);
+          turnComposer.refreshRoleMention(
+            element.elementId,
+            command.definitionDigest,
+            role.definitionDigest,
+          );
+          state = {
+            ...state,
+            agentRoles: (await control.inspectRoles()).roles,
+            revision: state.revision + 1,
+          };
+          await persistCurrentTurnDraft();
+          publishStateChange();
+          return { status: "admitted", commandId: randomUUID(), resource: null };
+        } catch (error) {
+          return {
+            status: "rejected",
+            code: "action_unavailable",
+            message: error instanceof Error ? error.message : "Role target could not be updated.",
+          };
+        }
+      }
+      if (command.type === "direct_delegation") {
+        const composer = turnComposer.snapshot();
+        const submittedScope = currentDraftScope();
+        if (leadingMentionRecipients(composer.elements).length > 1)
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "Choose one recipient or remove the extra recipients before sending.",
+          };
+        const first = composer.elements.find(
+          (element) => element.type !== "text" || element.text.trim().length > 0,
+        );
+        let parentSessionId = state.authoritative.active?.session.id;
+        let control =
+          parentSessionId === undefined
+            ? undefined
+            : await options.lifecycle[sessionManagedControl](parentSessionId);
+        let draftPreview: Awaited<ReturnType<SessionLifecycle["previewNewSession"]>> | undefined;
+        if (parentSessionId === undefined && draftTargetIdentity !== null) {
+          try {
+            draftPreview = await options.lifecycle.previewNewSession({
+              targetIdentity: draftTargetIdentity,
+              ...(command.thinkingSelection == null
+                ? {}
+                : { thinkingSelection: command.thinkingSelection }),
+            });
+          } catch (error) {
+            if (!(error instanceof SessionLifecycleError)) throw error;
+            return { status: "rejected", code: "not_available", message: error.message };
+          }
+        }
+        const roleAdministration =
+          control ??
+          (draftTargetIdentity === null
+            ? undefined
+            : options.lifecycle[sessionDraftRoles](draftTargetIdentity));
+        const catalog = (await control?.inspectRoles()) ?? draftPreview?.agentRoles;
+        const role =
+          first?.type === "mention" && first.kind === "role"
+            ? catalog?.roles.find(
+                (role) =>
+                  role.qualifiedId === first.qualifiedRoleId &&
+                  role.definitionDigest === first.definitionDigest,
+              )
+            : undefined;
+        if (
+          first === undefined ||
+          first.type !== "mention" ||
+          first.kind !== "role" ||
+          role === undefined ||
+          (parentSessionId === undefined && draftPreview?.delegationPolicy === undefined) ||
+          composer.revision !== command.draftRevision ||
+          (command.confirmedEnvelope !== undefined &&
+            command.confirmedEnvelope.origin.kind !== "direct_request")
+        )
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "Select a current role and retry this exact draft.",
+          };
+        if (control === undefined && draftPreview?.delegationPolicy === undefined)
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "Managed control is unavailable for this Session.",
+          };
+        let task: string;
+        try {
+          task = directMentionText(turnComposer, first.literal);
+        } catch (error) {
+          if (!(error instanceof TurnComposerError)) throw error;
+          return { status: "rejected", code: "invalid_command", message: error.message };
+        }
+        const description =
+          command.description ??
+          [
+            ...(task
+              .split("\n")
+              .find((line) => line.trim().length > 0)
+              ?.trim() ?? ""),
+          ]
+            .slice(0, 64)
+            .join("")
+            .replace(/\p{Cc}/gu, " ");
+        const requestedSkills = [
+          ...new Set(
+            composer.elements.flatMap((element) =>
+              element.type === "skill" ? [element.qualifiedId] : [],
+            ),
+          ),
+        ];
+        const skills = command.skills ?? requestedSkills;
+        if (skills.some((skill) => !requestedSkills.includes(skill)))
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "Choose pre-activation only from this draft's selected Skills.",
+          };
+        if (
+          draftPreview !== undefined &&
+          skills.some(
+            (id) =>
+              !draftPreview.skillContext.catalog.entries.some(
+                (entry) => entry.qualifiedId === id,
+              ) ||
+              role.skills === false ||
+              (Array.isArray(role.skills) && !role.skills.includes(id)),
+          )
+        )
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "A selected Skill is unavailable for this role.",
+          };
+        if (
+          composer.resources.some((resource) => resource.state !== "removed") &&
+          !role.tools.includes("read_input_resource")
+        )
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message:
+              "This role cannot read attachments. Choose a role with input-resource read access.",
+          };
+        const context = command.context ?? { mode: role.contextMode ?? "current_request" };
+        if (
+          !managedSpawnInputSchema.safeParse({
+            entries: [{ role: role.qualifiedId, task, description, context, skills }],
+          }).success
+        )
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "Add a nonempty task of at most 16 KiB after the selected role.",
+          };
+        if (parentSessionId === undefined && context.mode === "selected_messages")
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "A blank draft has no earlier parent messages to select.",
+          };
+        const spawn = {
+          type: "spawn_agents" as const,
+          mode: command.confirmedEnvelope?.mode ?? command.limits?.mode ?? "background",
+          parentSessionId: parentSessionId ?? randomUUID(),
+          entries: [{ role: role.qualifiedId, task, description, context, skills }],
+          origin: {
+            kind: "direct_request" as const,
+            id: command.confirmedEnvelope?.origin.id ?? randomUUID(),
+          },
+        };
+        const target = await roleAdministration?.inspectRoleTarget(role.qualifiedId);
+        if (target?.status === "unavailable") {
+          if (command.confirmedEnvelope !== undefined)
+            return { status: "rejected", code: "action_unavailable", message: target.message };
+          return {
+            status: "admitted",
+            commandId: randomUUID(),
+            resource: null,
+            roleTarget: {
+              qualifiedId: role.qualifiedId,
+              definitionDigest: role.definitionDigest,
+              source: role.source?.path ?? role.qualifiedId,
+              message: target.message,
+              targets: target.targets,
+            },
+          };
+        }
+        if (command.confirmedEnvelope === undefined) {
+          const policy = draftPreview?.delegationPolicy;
+          const envelope =
+            control !== undefined
+              ? await control.prepareDelegation(spawn, command.limits)
+              : policy === undefined
+                ? undefined
+                : createDelegationEnvelope(policy, {
+                    context: context.mode,
+                    skills,
+                    mode: spawn.mode,
+                    ...(command.limits === undefined ? {} : { limits: command.limits }),
+                    count: 1,
+                    roles: [role.qualifiedId],
+                    origin: spawn.origin,
+                    sessionTokens: policy.sessionTokens,
+                  });
+          if (envelope === undefined)
+            return {
+              status: "rejected",
+              code: "not_available",
+              message: "Delegation is unavailable.",
+            };
+          const contextPage = await control?.dispatch({
+            type: "list_agents",
+            parentSessionId: spawn.parentSessionId,
+            view: "context",
+            limit: 32,
+          });
+          return {
+            status: "admitted",
+            commandId: envelope.id,
+            resource: null,
+            delegation: {
+              envelope,
+              description,
+              messages: contextPage?.status === "context_listed" ? contextPage.messages : [],
+            },
+          };
+        }
+        if (
+          parentSessionId === undefined &&
+          draftPreview?.delegationPolicy !== undefined &&
+          !delegationEnvelopeMatches(command.confirmedEnvelope, {
+            policy: draftPreview.delegationPolicy,
+            roles: [role.qualifiedId],
+            count: 1,
+            mode: spawn.mode,
+            context: context.mode,
+            skills,
+            origin: spawn.origin,
+            sessionTokens: draftPreview.delegationPolicy.sessionTokens,
+          })
+        )
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "The exact delegation envelope is invalid or exceeds current authority.",
+          };
+        const directResources = composer.elements.some((element) => element.type === "resource")
+          ? await turnComposer
+              .seal(new AbortController().signal)
+              .then((sealed) => sealed.selections)
+              .finally(() => turnComposer.unseal())
+          : [];
+        if (parentSessionId === undefined && draftTargetIdentity !== null) {
+          const snapshot = await options.lifecycle.create({
+            targetIdentity: draftTargetIdentity,
+            mode: state.draft?.mode ?? "default",
+          });
+          parentSessionId = snapshot.sessionId;
+          await activateSnapshot(snapshot);
+          control = await options.lifecycle[sessionManagedControl](parentSessionId);
+        }
+        if (control === undefined || parentSessionId === undefined)
+          return {
+            status: "rejected",
+            code: "not_available",
+            message: "Managed control is unavailable.",
+          };
+        const receipt = await control.dispatch(
+          { ...spawn, parentSessionId, envelope: command.confirmedEnvelope },
+          { directThinkingSelection: command.thinkingSelection ?? null, directResources },
+        );
+        if (receipt.status === "rejected") return receipt;
+        if (turnComposer.snapshot().revision === command.draftRevision) {
+          await turnComposer.clear();
+          await persistCurrentTurnDraft();
+          if (recoverableDrafts !== null && submittedScope !== null)
+            await recoverableDrafts.delete(submittedScope);
+        }
+        return {
+          status: "admitted",
+          commandId: command.confirmedEnvelope.id,
+          resource: null,
+          control: receipt,
+        };
+      }
+      if (command.type === "direct_agent_input") {
+        const composer = turnComposer.snapshot();
+        const recipients = leadingMentionRecipients(composer.elements);
+        const recipient = recipients[0];
+        const parentSessionId = state.authoritative.active?.session.id;
+        if (
+          composer.revision !== command.draftRevision ||
+          recipients.length !== 1 ||
+          recipient?.kind !== "agent" ||
+          parentSessionId !== recipient.parentSessionId
+        )
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "Select one available exact thread and retry this draft.",
+          };
+        const control = await options.lifecycle[sessionManagedControl](parentSessionId);
+        const current = await control?.inspect({ parentSessionId });
+        const thread = current?.threads.find(
+          (entry) =>
+            entry.threadId === recipient.threadId &&
+            entry.handle === recipient.handle &&
+            entry.lifecycle === "open",
+        );
+        if (thread === undefined || control === undefined)
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The selected exact thread is unavailable.",
+          };
+        let text: string;
+        try {
+          text = directMentionText(turnComposer, recipient.literal);
+        } catch (error) {
+          if (!(error instanceof TurnComposerError)) throw error;
+          return { status: "rejected", code: "invalid_command", message: error.message };
+        }
+        if (text.length === 0 || Buffer.byteLength(text, "utf8") > 16 * 1024)
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "Add a nonempty message of at most 16 KiB after the selected thread.",
+          };
+        const actions = (thread.actions ?? []).filter(
+          (action): action is "cooperative" | "interrupt" | "new_turn" | "reply" =>
+            action === "cooperative" ||
+            action === "interrupt" ||
+            action === "new_turn" ||
+            action === "reply",
+        );
+        const hasAttachments = composer.elements.some((element) => element.type === "resource");
+        if (hasAttachments && !actions.includes("new_turn"))
+          return {
+            status: "rejected",
+            code: "action_unavailable",
+            message:
+              "Attachments require a new child turn. Keep this draft until the current turn settles.",
+          };
+        if (actions.length === 0)
+          return {
+            status: "rejected",
+            code: "action_unavailable",
+            message: "This turn cannot accept input. Inspect its available actions.",
+          };
+        if (command.confirmedInput === undefined) {
+          const input = {
+            parentSessionId,
+            threadId: thread.threadId,
+            expectedTurnId: thread.turn.turnId,
+            inputId: randomUUID(),
+            text,
+            ...(actions.includes("reply") && thread.turn.attention?.kind === "parent_input"
+              ? { attentionId: thread.turn.attention.id }
+              : {}),
+          };
+          const envelope = actions.includes("new_turn")
+            ? await control.prepareContinuation({
+                type: "next_turn",
+                parentSessionId,
+                threadId: thread.threadId,
+                expectedTurnId: thread.turn.turnId,
+                inputId: input.inputId,
+                task: text,
+                origin: { kind: "direct_request", id: input.inputId },
+              })
+            : undefined;
+          return {
+            status: "admitted",
+            commandId: input.inputId,
+            resource: null,
+            agentInput: { input, actions, ...(envelope === undefined ? {} : { envelope }) },
+          };
+        }
+        const input = command.confirmedInput;
+        if (
+          input.parentSessionId !== parentSessionId ||
+          input.threadId !== thread.threadId ||
+          input.expectedTurnId !== thread.turn.turnId ||
+          input.text !== text ||
+          input.inputId === undefined ||
+          !actions.includes(input.mode) ||
+          (input.mode === "reply" &&
+            (thread.turn.attention?.kind !== "parent_input" ||
+              thread.turn.attention.id !== input.attentionId)) ||
+          (input.mode === "new_turn" && command.confirmedEnvelope === undefined)
+        )
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The exact turn or input action changed. Inspect and retry.",
+          };
+        const common = {
+          parentSessionId,
+          threadId: thread.threadId,
+          expectedTurnId: input.expectedTurnId,
+          inputId: input.inputId,
+          text,
+        };
+        const directResources = hasAttachments
+          ? await turnComposer
+              .seal(new AbortController().signal)
+              .then((sealed) => sealed.selections)
+              .finally(() => turnComposer.unseal())
+          : [];
+        const receipt = await control.dispatch(
+          input.mode === "reply"
+            ? { ...common, type: "reply_agent", attentionId: input.attentionId ?? "" }
+            : {
+                ...common,
+                type: "post_agent",
+                mode: input.mode,
+                ...(input.mode === "new_turn" && command.confirmedEnvelope !== undefined
+                  ? {
+                      envelope: command.confirmedEnvelope,
+                      origin: { kind: "direct_request" as const, id: input.inputId },
+                    }
+                  : {}),
+              },
+          { directResources },
+        );
+        if (receipt.status === "rejected") return receipt;
+        if (turnComposer.snapshot().revision === command.draftRevision) {
+          await turnComposer.clear();
+          await persistCurrentTurnDraft();
+        }
+        return { status: "admitted", commandId: input.inputId, resource: null, control: receipt };
       }
       if (command.type === "managed_control") {
         const parentSessionId = command.command.parentSessionId;
@@ -3895,6 +4413,7 @@ export async function createPresentationSession(
           state.authoritative.active === null ? (state.draft?.mode ?? "default") : "default";
         state = {
           revision: state.revision + 1,
+          ...(preview.agentRoles === undefined ? {} : { agentRoles: preview.agentRoles.roles }),
           authoritative: {
             ...state.authoritative,
             continuity: {
@@ -4077,6 +4596,59 @@ export async function createPresentationSession(
           };
         }
       }
+      if (command.type === "resolve_draft_recipient") {
+        if (activeRun !== undefined)
+          return {
+            status: "rejected",
+            code: "conflict",
+            message: "The current turn cannot change while it is active.",
+          };
+        if (command.action === "retarget") {
+          const replacement = command.replacement;
+          const sessionId = state.authoritative.active?.session.id;
+          const control =
+            sessionId === undefined
+              ? undefined
+              : await options.lifecycle[sessionManagedControl](sessionId);
+          const available =
+            replacement?.kind === "main" ||
+            (replacement?.kind === "role" &&
+              (await control?.inspectRoles())?.roles.some(
+                (role) =>
+                  role.qualifiedId === replacement.qualifiedRoleId &&
+                  role.definitionDigest === replacement.definitionDigest,
+              )) ||
+            (replacement?.kind === "agent" &&
+              sessionId !== undefined &&
+              replacement.parentSessionId === sessionId &&
+              (await control?.inspect({ parentSessionId: sessionId }))?.threads.some(
+                (thread) =>
+                  thread.threadId === replacement.threadId &&
+                  thread.handle === replacement.handle &&
+                  thread.lifecycle === "open",
+              ));
+          if (!available)
+            return {
+              status: "rejected",
+              code: "stale_interaction",
+              message: "Choose an available exact recipient.",
+            };
+        }
+        const resolved = await turnComposer.resolveRecipient(
+          command.baseRevision,
+          command.elementId,
+          command.action,
+          persistCurrentTurnDraft,
+          command.replacement,
+        );
+        return resolved
+          ? { status: "admitted", commandId: randomUUID(), resource: null }
+          : {
+              status: "rejected",
+              code: "stale_interaction",
+              message: "The selected recipient is no longer current.",
+            };
+      }
       if (command.type === "remove_draft_element") {
         if (activeRun !== undefined || state.composer.sealed) {
           return {
@@ -4106,9 +4678,11 @@ export async function createPresentationSession(
               ? await turnComposer.remove(element.resourceId, persistCurrentTurnDraft)
               : element.type === "pasted_text"
                 ? await turnComposer.removePastedText(element.pastedTextId, persistCurrentTurnDraft)
-                : element.type === "path"
-                  ? await turnComposer.removePath(element.elementId, persistCurrentTurnDraft)
-                  : await turnComposer.removeSkill(element.elementId, persistCurrentTurnDraft);
+                : element.type === "mention"
+                  ? await turnComposer.removeMention(element.elementId, persistCurrentTurnDraft)
+                  : element.type === "path"
+                    ? await turnComposer.removePath(element.elementId, persistCurrentTurnDraft)
+                    : await turnComposer.removeSkill(element.elementId, persistCurrentTurnDraft);
           return removed
             ? { status: "admitted", commandId: randomUUID(), resource: null }
             : {
@@ -4254,6 +4828,13 @@ export async function createPresentationSession(
             };
       }
       if (command.type === "submit_prompt") {
+        const recipients = leadingMentionRecipients(turnComposer.snapshot().elements);
+        if (recipients.length > 1 || recipients.some((atom) => atom.kind !== "main"))
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "Resolve the selected recipient through direct routing before sending.",
+          };
         if (
           command.sessionId !== state.authoritative.active?.session.id ||
           (command.text.trim().length === 0 &&
@@ -4477,6 +5058,13 @@ export async function createPresentationSession(
         return { status: "admitted", commandId, resource: null };
       }
       if (command.type === "submit_draft_prompt") {
+        const recipients = leadingMentionRecipients(turnComposer.snapshot().elements);
+        if (recipients.length > 1 || recipients.some((atom) => atom.kind !== "main"))
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "Resolve the selected recipient through direct routing before sending.",
+          };
         const draft = state.draft;
         if (
           draft === null ||
@@ -4744,6 +5332,67 @@ export async function createPresentationSession(
             status: "rejected",
             code: "authority_rejected",
             message: "The exact branch boundary was not accepted.",
+          };
+        }
+      }
+      if (command.type === "preview_permission_delegation") {
+        const pending = state.authoritative.active?.pendingInteractions.find(
+          (interaction) => interaction.requestId === command.requestId,
+        );
+        if (pending?.delegation === undefined || !pending.canAllow)
+          return {
+            status: "rejected",
+            code: "stale_interaction",
+            message: "The delegation request is no longer pending.",
+          };
+        const original = pending.delegation;
+        if (
+          pending.delegationCanChangeMode !== true &&
+          command.limits.mode !== undefined &&
+          command.limits.mode !== original.mode
+        )
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "A continuation keeps its frozen execution mode.",
+          };
+        try {
+          const selectedContext =
+            command.selection?.context === undefined
+              ? undefined
+              : (delegationContextSchema.parse(command.selection.context) as DelegationContext);
+          if (pending.delegationCanChangeMode !== true && command.selection !== undefined)
+            throw new TypeError("A continuation keeps its frozen context and Skills.");
+          if (command.selection?.skills?.some((id) => !original.skills.includes(id)))
+            throw new TypeError("Choose only requested Skill pre-activations.");
+          if (selectedContext !== undefined)
+            resolveDelegationContext(selectedContext, "", pending.delegationMessages ?? []);
+          const envelope = createDelegationEnvelope(original.policy, {
+            mode: command.limits.mode ?? original.mode,
+            count: original.threads,
+            origin: original.origin,
+            roles: [...original.roles],
+            sessionTokens: original.sessionTokens,
+            availableTokens: original.aggregateTokens,
+            context: selectedContext?.mode ?? original.context,
+            skills: command.selection?.skills ?? original.skills,
+            limits: command.limits,
+          });
+          return {
+            status: "admitted",
+            commandId: envelope.id,
+            resource: null,
+            delegation: {
+              envelope,
+              description: `${envelope.threads} child delegation`,
+              messages: pending.delegationMessages ?? [],
+            },
+          };
+        } catch {
+          return {
+            status: "rejected",
+            code: "invalid_command",
+            message: "The selected limits exceed this pending delegation's authority.",
           };
         }
       }
@@ -6338,6 +6987,17 @@ async function projectPendingInteractions(
   return Promise.all(
     projectPendingPermissionCandidates(records).map(async (interaction) => ({
       ...interaction,
+      ...(interaction.delegation === undefined
+        ? {}
+        : {
+            delegationMessages: delegationMessages(
+              records
+                .filter((record) => record.sessionId === activeSessionId)
+                .map(({ entry }) => entry),
+            )
+              .slice(-32)
+              .reverse(),
+          }),
       canAllow:
         interaction.canAllow ||
         (await isActionableChangePreview(records, activeSessionId, interaction.requestId, options)),
@@ -6782,6 +7442,10 @@ function projectSessionTitleGeneration(
       return unreachable;
     }
   }
+}
+
+function directMentionText(composer: TurnComposer, recipient: string): string {
+  return composer.readExpandedText().trimStart().slice(recipient.length).trim();
 }
 
 function emptyUserModelPolicyDisplay() {

@@ -4,7 +4,10 @@ import { constants } from "node:fs";
 import { chmod, type FileHandle, mkdir, mkdtemp, open, realpath, rm } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { ManagedDelegationEnvelope } from "@adam-agent/presentation";
+import type {
+  ManagedDelegationEnvelope,
+  ManagedDelegationSelection,
+} from "@adam-agent/presentation";
 
 import { z } from "zod";
 
@@ -264,6 +267,10 @@ type PreparedToolCall = {
   readonly status: "ready";
   readonly permissionSubject: PermissionSubject;
   resolvePermissionSubject?(): Promise<PermissionSubject>;
+  refineDelegation?(
+    envelope: ManagedDelegationEnvelope,
+    selection?: ManagedDelegationSelection,
+  ): PermissionSubject;
   readonly changePreview?: { readonly text: string };
   validateBeforeDispatch?(): FailedToolResult | undefined;
   execute(context: ToolExecutionContext): Promise<ToolResult>;
@@ -486,7 +493,7 @@ export type PermissionSubject =
       readonly agentId: string;
       readonly attemptId: string;
       readonly childSessionId: string;
-      readonly profile: "research.v1" | "research.v2";
+      readonly profile: "research.v1" | "research.v2" | "research.v3";
       readonly providerOrigin: string;
       readonly queryOrUrl: string;
       readonly argumentsDigest: `sha256:${string}`;
@@ -523,6 +530,7 @@ export type PermissionPolicyInput = {
 export type PermissionPolicy = {
   /** Serializable read ceiling for delegated work; arbitrary policy functions grant none. */
   readonly delegationReadCeiling?: PermissionDecision;
+  readonly delegationNetworkCeiling?: PermissionDecision;
   decide(input: PermissionPolicyInput): PermissionDecision;
 };
 
@@ -533,6 +541,11 @@ export function createPermissionPolicy(options: {
   const allowedEffects = new Set(options.allowedEffects);
   const askedEffects = new Set(options.askedEffects ?? []);
   return {
+    delegationNetworkCeiling: allowedEffects.has("network")
+      ? "allow"
+      : askedEffects.has("network")
+        ? "ask"
+        : "deny",
     delegationReadCeiling: allowedEffects.has("read")
       ? "allow"
       : askedEffects.has("read")

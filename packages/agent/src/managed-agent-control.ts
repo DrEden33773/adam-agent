@@ -3,10 +3,23 @@ import type {
   ManagedControlAction,
   ManagedControlCommand,
   ManagedControlReceipt,
+  ManagedDelegationLimits,
 } from "@adam-agent/presentation";
 import { agentExportFields, presentationAgentExportMaximumBytes } from "@adam-agent/presentation";
 import type { ArtifactStore } from "./artifact-store.js";
+import {
+  InputResourceError,
+  type InputResourceOccurrenceV1,
+  ingestLocalInputResourcesV1,
+  linkInputResourcesV1,
+  type StagedInputResourceSelectionV1,
+} from "./input-resources.js";
 import type { PlanCycleSnapshot } from "./plan-mode.js";
+import {
+  type AgentRoleAdministration,
+  createAgentRoleAdministration,
+} from "./role-administration.js";
+import { type AgentRoleDefinition, agentRoleIdSchema } from "./role-catalog.js";
 
 export type { ManagedControlCommand, ManagedControlReceipt } from "@adam-agent/presentation";
 
@@ -26,10 +39,14 @@ import {
 } from "./agent-session.js";
 import type { ModelDriver, RuntimeEvent } from "./agent-session-contracts.js";
 import type { ContextProfile } from "./context-profile.js";
+import { delegationMessages, resolveDelegationContext } from "./delegation-context.js";
 import {
   assertFleetReservation,
   createDelegationEnvelope,
+  type DelegationContext,
   type DelegationEnvelope,
+  delegationContextSchema,
+  delegationEnvelopeMatches,
   delegationEnvelopeSchema,
   delegationOriginSchema,
   FleetBudgetError,
@@ -40,6 +57,7 @@ import {
   fleetStorage,
   managedChildTerminalBytes,
   managedControlTerminalBytes,
+  requestedDelegationContext,
   resolveFleetPolicy,
   storedRecordBytes,
 } from "./fleet-ledger.js";
@@ -57,9 +75,11 @@ import {
   type ManagedControlStore,
   type ManagedWorkspaceSnapshot,
   managedAcceptedInput,
+  managedAliasSchema,
   managedControlDigest,
   managedControlFrozenSchema,
   managedControlLink,
+  managedNameKey,
   managedTranscriptLink,
 } from "./managed-agent-folds.js";
 import {
@@ -76,9 +96,25 @@ import type { ModelTargetIdentity } from "./model-targets.js";
 import {
   type ProjectExecutionDomain,
   ProjectExecutionDomainError,
+  projectRuntimeRootId,
 } from "./project-execution-domain.js";
-import { createPromptContextV1 } from "./prompt-assembly.js";
-import { sessionDurableContext } from "./session-durable-context.js";
+import {
+  createPromptContextV1,
+  createPromptContextV2,
+  hasSkillPromptContext,
+  replacePromptSkillsV2,
+} from "./prompt-assembly.js";
+import {
+  type AgentSessionDurableContext,
+  sessionDurableContext,
+} from "./session-durable-context.js";
+import {
+  inputResourceBytesFromRecords,
+  isGenesisRecord,
+  promptContextRecordFromRecords,
+  skillContextRecordFromRecords,
+  skillResourceBytesFromRecords,
+} from "./session-history-folds.js";
 import { modelMessagesFromCompleteRecords } from "./session-history-replay.js";
 import {
   cancelManagedChildSessionRecords,
@@ -87,12 +123,17 @@ import {
 import { SessionLifecycleError } from "./session-lifecycle-error.js";
 import type { SessionRecord, SessionStore, SessionStoreDirectory } from "./session-store.js";
 import { SessionLogicalQuotaError, SessionStoreError } from "./session-store.js";
+import { createIndependentSkillContextV1, readActiveSkillContentsV1 } from "./skills.js";
+import type { ThinkingPolicySelectionV1 } from "./thinking-policy.js";
 import {
+  bindInputResourceToolRegistry,
+  createCodingToolRegistry,
   createInternalToolAdapter,
   createInternalToolRegistry,
   createReadToolRegistry,
   type JsonValue,
   type PermissionPolicy,
+  type ToolAdapter,
   type ToolRegistry,
 } from "./tool-runtime.js";
 
@@ -105,7 +146,7 @@ export type ManagedWorkspaceFrame = {
   readonly snapshot: ManagedWorkspaceSnapshot;
 };
 
-export type ManagedAgentControl = {
+export type ManagedAgentControl = AgentRoleAdministration & {
   publishExport(
     input: Omit<ManagedAgentExport, "artifact"> & { readonly content: string },
   ): Promise<ManagedAgentExport>;
@@ -117,6 +158,7 @@ export type ManagedAgentControl = {
   }): Promise<string | undefined>;
   prepareDelegation(
     command: Extract<ManagedControlCommand, { type: "spawn_agents" }>,
+    limits?: ManagedDelegationLimits,
   ): Promise<DelegationEnvelope>;
   prepareContinuation(
     command: Extract<ManagedControlCommand, { type: "next_turn" }>,
@@ -129,19 +171,35 @@ export type ManagedAgentControl = {
   }): AsyncIterable<ManagedWorkspaceFrame>;
   dispatch(
     command: ManagedControlCommand,
-    options?: { readonly signal?: AbortSignal },
+    options?: {
+      readonly signal?: AbortSignal;
+      readonly directThinkingSelection?: ThinkingPolicySelectionV1 | null;
+      readonly directResources?: readonly StagedInputResourceSelectionV1[];
+    },
   ): Promise<ManagedControlReceipt>;
 };
 
 const taskSchema = z
   .string()
   .refine((text) => text.trim().length > 0 && Buffer.byteLength(text, "utf8") <= 16 * 1024);
-const spawnInputSchema = z.strictObject({
+export const managedSpawnInputSchema = z.strictObject({
   mode: z.enum(["background", "foreground"]).optional(),
   entries: z
     .array(
       z.strictObject({
-        role: z.literal("builtin:explore"),
+        role: agentRoleIdSchema,
+        alias: managedAliasSchema.optional(),
+        context: delegationContextSchema.optional(),
+        artifacts: z
+          .array(z.string().min(1).max(256))
+          .max(8)
+          .refine((ids) => new Set(ids).size === ids.length)
+          .optional(),
+        skills: z
+          .array(z.string().min(1).max(512))
+          .max(8)
+          .refine((skills) => new Set(skills).size === skills.length)
+          .optional(),
         task: taskSchema,
         description: z
           .string()
@@ -232,6 +290,7 @@ const commandSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({
     type: z.literal("list_agents"),
+    view: z.enum(["threads", "roles", "context"]).optional(),
     parentSessionId: z.uuid(),
     limit: z.number().int().min(1).max(41).optional(),
     cursor: z.string().max(128).optional(),
@@ -253,7 +312,7 @@ const commandSchema = z.discriminatedUnion("type", [
     requestId: z.string().min(1).max(512),
     decision: z.enum(["allow", "deny"]),
   }),
-  spawnInputSchema.extend({
+  managedSpawnInputSchema.extend({
     type: z.literal("spawn_agents"),
     parentSessionId: z.uuid(),
     envelope: delegationEnvelopeSchema.optional(),
@@ -281,7 +340,7 @@ const commandSchema = z.discriminatedUnion("type", [
   z.strictObject({
     type: z.literal("start_thread"),
     parentSessionId: z.uuid(),
-    role: z.literal("builtin:explore"),
+    role: agentRoleIdSchema,
     task: taskSchema,
     description: z
       .string()
@@ -328,9 +387,38 @@ export function createManagedAgentControl(options: {
     constraints?: { readonly requireIdleMain: true },
   ) => Promise<T>;
   readonly artifactStore?: ArtifactStore;
+  readonly artifactRoot?: string;
+  readonly resolveArtifactSelections?: (ids: readonly string[]) => Promise<
+    readonly {
+      readonly resource: InputResourceOccurrenceV1;
+      readonly source: NonNullable<ManagedControlFrozen["artifactSources"]>[number];
+    }[]
+  >;
   readonly policy?: FleetPolicy;
   readonly readPlan?: () => Promise<PlanCycleSnapshot | undefined>;
-  readonly resolveFrozenContext?: () => Promise<
+  readonly webTools?: ToolRegistry;
+  readonly resolveRoleTarget?: (input: {
+    readonly role: AgentRoleDefinition;
+    readonly inheritedThinking?: ManagedControlFrozen["thinkingPolicy"];
+    readonly frozen?: ManagedControlFrozen;
+  }) => Promise<{
+    readonly targetIdentity: ModelTargetIdentity;
+    readonly contextProfile: ContextProfile;
+    readonly thinkingPolicy?: ManagedControlFrozen["thinkingPolicy"];
+    readonly model: ModelDriver;
+  }>;
+  readonly roleTargets?: () => Promise<
+    import("@adam-agent/presentation").AgentTypesDisplay["targets"]
+  >;
+  readonly roleCatalog?: ReturnType<typeof import("./role-catalog.js").createAgentRoleCatalog>;
+  readonly resolveSkillSources?: () => Promise<
+    NonNullable<AgentSessionDurableContext["extensionSkillSources"]>
+  >;
+  readonly withCurrentExtensionSkillSources?: AgentSessionDurableContext["withCurrentExtensionSkillSources"];
+  readonly authorizeProjectContextLoad?: AgentSessionDurableContext["authorizeProjectContextLoad"];
+  readonly resolveFrozenContext?: (
+    directThinkingSelection?: ThinkingPolicySelectionV1 | null,
+  ) => Promise<
     Pick<
       ManagedControlFrozen,
       "parentBranchId" | "thinkingPolicy" | "skillContext" | "parentRequest"
@@ -348,6 +436,29 @@ export function createManagedAgentControl(options: {
   readonly [managedAgentRecordBarrier]?: (record: ManagedControlRecord) => Promise<void>;
   readonly [sessionRecordCommittedBarrier]?: (record: SessionRecord) => Promise<void>;
 }): ManagedAgentControl {
+  const resolveFrozenTarget = async (frozen: ManagedControlFrozen | undefined) => {
+    if (frozen?.roleDefinition !== undefined && options.resolveRoleTarget !== undefined)
+      return options.resolveRoleTarget({ role: frozen.roleDefinition, frozen });
+    if (
+      frozen !== undefined &&
+      (!isDeepStrictEqual(frozen.targetIdentity, options.targetIdentity) ||
+        !isDeepStrictEqual(frozen.contextProfile, options.contextProfile))
+    )
+      throw new Error("The thread's frozen target and context are unavailable.");
+    return {
+      model: options.model,
+      targetIdentity: options.targetIdentity,
+      contextProfile: options.contextProfile,
+    };
+  };
+  const frozenTargetAvailable = async (frozen: ManagedControlFrozen | undefined) => {
+    try {
+      await resolveFrozenTarget(frozen);
+      return true;
+    } catch {
+      return false;
+    }
+  };
   const policy = resolveFleetPolicy(options.contextProfile, options.policy);
   const controlStore = options.store.forParent(options.parentSessionId);
   let serial = Promise.resolve();
@@ -425,6 +536,9 @@ export function createManagedAgentControl(options: {
         targetIdentity: frozen?.targetIdentity ?? options.targetIdentity,
         contextProfile: frozen?.contextProfile ?? options.contextProfile,
         promptContext,
+        ...(hasSkillPromptContext(promptContext) && frozen?.skillContext !== undefined
+          ? { skillContext: frozen.skillContext }
+          : {}),
       },
     };
   };
@@ -614,8 +728,7 @@ export function createManagedAgentControl(options: {
             policyAllowsInput &&
             inspected.turn.health !== "stalled" &&
             admission.event.frozen !== undefined &&
-            isDeepStrictEqual(admission.event.frozen.targetIdentity, options.targetIdentity) &&
-            isDeepStrictEqual(admission.event.frozen.contextProfile, options.contextProfile)
+            (await frozenTargetAvailable(admission.event.frozen))
           ) {
             try {
               const childRecords = await (
@@ -623,7 +736,7 @@ export function createManagedAgentControl(options: {
               )?.read();
               if (childRecords === undefined && !thread.turn.hasStarted) actions.push("resume");
               else if (childRecords !== undefined && childRecords[0] !== undefined) {
-                validateManagedChildGenesis(admission, childRecords[0]);
+                validateManagedChildGenesis(admission, childRecords[0], childRecords);
                 const terminal = await managedChildTerminalResult(
                   childRecords,
                   options.workspaceRoot,
@@ -639,7 +752,21 @@ export function createManagedAgentControl(options: {
                   (childRecords.length === 1 ||
                     prepareManagedChildResume(
                       childRecords,
-                      childTools(admission),
+                      childTools(
+                        admission,
+                        hasSkillPromptContext(
+                          admission.event.type === "admitted"
+                            ? admission.event.frozen?.promptContext
+                            : undefined,
+                        ),
+                        admission.event.type === "admitted" &&
+                          admission.event.frozen?.permissionEffects.some(
+                            (effect) => effect === "network",
+                          ),
+                        admission.event.type === "admitted"
+                          ? admission.event.frozen?.roleDefinition
+                          : undefined,
+                      ),
                       options.workspaceRoot,
                     ) !== undefined)
                 )
@@ -816,8 +943,25 @@ export function createManagedAgentControl(options: {
       }
     }
   };
-  const childTools = (identity?: ManagedControlIdentity): ToolRegistry => {
-    const reads = createReadToolRegistry({ workspaceRoot: options.workspaceRoot });
+  const childTools = (
+    identity?: ManagedControlIdentity,
+    skills = false,
+    web = false,
+    role?: AgentRoleDefinition,
+    inputResources: readonly InputResourceOccurrenceV1[] = [],
+  ): ToolRegistry => {
+    const builtins =
+      skills || role !== undefined
+        ? createCodingToolRegistry({ workspaceRoot: options.workspaceRoot })
+        : createReadToolRegistry({ workspaceRoot: options.workspaceRoot });
+    const names = skills
+      ? ["read_file", "search_repository", "activate_skill", "read_skill_resource"]
+      : ["read_file", "search_repository"];
+    if (role !== undefined) names.push("read_input_resource");
+    const reads: ToolRegistry = {
+      definitions: () => builtins.definitions().filter((tool) => names.includes(tool.name)),
+      resolve: (name) => (names.includes(name) ? builtins.resolve(name) : undefined),
+    };
     const adapters = (["report_to_parent", "request_parent_input"] as const).map((name) => {
       const schema =
         name === "report_to_parent"
@@ -961,13 +1105,73 @@ export function createManagedAgentControl(options: {
         "never",
       );
     });
-    return createInternalToolRegistry([
+    const registry = createInternalToolRegistry([
       ...reads.definitions().flatMap((definition) => {
         const adapter = reads.resolve(definition.name);
         return adapter === undefined ? [] : [adapter];
       }),
       ...adapters,
+      ...(web
+        ? (options.webTools?.definitions().flatMap((definition): ToolAdapter[] => {
+            const adapter = options.webTools?.resolve(definition.name);
+            if (
+              adapter === undefined ||
+              !["web_fetch", "web_search", "web_open", "web_find"].includes(definition.name)
+            )
+              return [];
+            if (adapter.effect === "read") return [adapter];
+            return [
+              {
+                ...adapter,
+                prepare(json, source) {
+                  const prepared = adapter.prepare(json, source);
+                  if (prepared.status !== "ready") return prepared;
+                  const subject = prepared.permissionSubject;
+                  if (identity === undefined || subject?.type !== "web_request")
+                    return {
+                      status: "failed",
+                      error: {
+                        code: "invalid_tool_input",
+                        message: "The exact child Web request is unavailable.",
+                      },
+                    };
+                  return {
+                    ...prepared,
+                    permissionSubject: {
+                      type: "managed_agent_web_request",
+                      parentRootId: projectRuntimeRootId,
+                      parentSessionId: identity.parentSessionId,
+                      agentId: identity.threadId,
+                      attemptId: identity.attemptId,
+                      childSessionId: identity.childSessionId,
+                      profile: "research.v3",
+                      operation: subject.operation,
+                      providerOrigin: subject.providerOrigin,
+                      queryOrUrl: subject.operation === "search" ? subject.query : subject.url,
+                      argumentsDigest: managedControlDigest(JSON.parse(json)),
+                    },
+                  };
+                },
+              },
+            ];
+          }) ?? [])
+        : []),
     ]);
+    const filtered =
+      role === undefined
+        ? registry
+        : createInternalToolRegistry(
+            registry.definitions().flatMap((definition) => {
+              const adapter = registry.resolve(definition.name);
+              return adapter !== undefined && role.tools.includes(definition.name) ? [adapter] : [];
+            }),
+          );
+    return options.artifactStore === undefined
+      ? filtered
+      : bindInputResourceToolRegistry(filtered, {
+          artifactStore: options.artifactStore,
+          occurrences: inputResources,
+        });
   };
   const run = async (
     identity: ManagedControlIdentity,
@@ -992,11 +1196,42 @@ export function createManagedAgentControl(options: {
       let cleanupExpired = false;
       let cleanupTimer: { cancel(): void } | undefined;
       try {
+        const target = await resolveFrozenTarget(frozen);
         const tools =
           frozen === undefined
             ? createReadToolRegistry({ workspaceRoot: options.workspaceRoot })
-            : childTools(identity);
-        const promptContext = frozen?.promptContext ?? createPromptContextV1(tools);
+            : childTools(
+                identity,
+                hasSkillPromptContext(frozen.promptContext),
+                frozen.permissionEffects.some((effect) => effect === "network"),
+                frozen.roleDefinition,
+                frozen.inputResources,
+              );
+        let promptContext = frozen?.promptContext ?? createPromptContextV1(tools);
+        let skillContext = hasSkillPromptContext(promptContext) ? frozen?.skillContext : undefined;
+        const restoredRecords = (await preparedStore?.read()) ?? [];
+        if (preparedStore !== undefined) {
+          const records = restoredRecords;
+          const genesis = records[0];
+          if (genesis === undefined || !isGenesisRecord(genesis)) throw new SessionStoreError();
+          const restoredPrompt = promptContextRecordFromRecords(genesis, records);
+          if (restoredPrompt === undefined || restoredPrompt.recordVersion === 3)
+            throw new SessionStoreError();
+          promptContext = restoredPrompt;
+          skillContext = skillContextRecordFromRecords(genesis, records);
+        }
+        const activeSkillContents = await readActiveSkillContentsV1(
+          skillContext,
+          options.artifactStore,
+        );
+        const extensionSkillSources = (await options.resolveSkillSources?.())?.filter((source) =>
+          skillContext?.extensionSources.some(
+            (frozenSource) =>
+              frozenSource.lifecycleDigest === source.lifecycleDigest &&
+              frozenSource.lifecycleRevision === source.lifecycleRevision &&
+              isDeepStrictEqual(frozenSource.locator, source.locator),
+          ),
+        );
         const store =
           preparedStore ?? (await options.childSessionStores.create(identity.childSessionId));
         if (preparedStore === undefined) {
@@ -1022,6 +1257,18 @@ export function createManagedAgentControl(options: {
           previousSessionId === undefined
             ? undefined
             : await options.childSessionStores.open(previousSessionId);
+        const threadRecords: SessionRecord[] = [...restoredRecords];
+        for (const record of await controlStore.read()) {
+          if (
+            record.threadId === identity.threadId &&
+            record.event.type === "admitted" &&
+            record.childSessionId !== identity.childSessionId
+          ) {
+            const prior = await options.childSessionStores.open(record.childSessionId);
+            if (prior === undefined) throw new SessionStoreError();
+            threadRecords.push(...(await prior.read()));
+          }
+        }
         let generation = 0;
         let executing = false;
         let timer: { cancel(): void } | undefined;
@@ -1144,7 +1391,7 @@ export function createManagedAgentControl(options: {
           model: {
             async *stream(request) {
               if (admission?.event.type !== "admitted" || admission.event.envelope === undefined) {
-                yield* options.model.stream(request);
+                yield* target.model.stream(request);
                 return;
               }
               await waitForCeiling(identity, request.signal);
@@ -1195,7 +1442,7 @@ export function createManagedAgentControl(options: {
                     resetInactivity();
                   }
                 });
-                for await (const event of options.model.stream(request)) {
+                for await (const event of target.model.stream(request)) {
                   if (event.type === "usage") {
                     await control.settleUsage({
                       requestId,
@@ -1247,14 +1494,23 @@ export function createManagedAgentControl(options: {
                     frozen?.permissionReadCeiling ?? "allow",
                     options.permissions.decide(input),
                   )
-                : input.effect === "delegate" &&
-                    input.subject.type === "managed_agent_action" &&
-                    input.subject.parentSessionId === identity.parentSessionId &&
-                    input.subject.turnIds.length === 1 &&
-                    input.subject.turnIds[0] === identity.turnId &&
-                    (input.name === "report_to_parent" || input.name === "request_parent_input")
-                  ? ("allow" as const)
-                  : ("deny" as const),
+                : input.effect === "network" &&
+                    frozen?.permissionEffects.some((effect) => effect === "network") &&
+                    input.subject.type === "managed_agent_web_request" &&
+                    input.subject.agentId === identity.threadId &&
+                    input.subject.attemptId === identity.attemptId
+                  ? intersectReadPermission(
+                      frozen.permissionNetworkCeiling ?? "deny",
+                      options.permissions.decide(input),
+                    )
+                  : input.effect === "delegate" &&
+                      input.subject.type === "managed_agent_action" &&
+                      input.subject.parentSessionId === identity.parentSessionId &&
+                      input.subject.turnIds.length === 1 &&
+                      input.subject.turnIds[0] === identity.turnId &&
+                      (input.name === "report_to_parent" || input.name === "request_parent_input")
+                    ? ("allow" as const)
+                    : ("deny" as const),
           },
           store: store as SessionStore,
           [managedAgentRequestBoundary]: async () => {
@@ -1331,7 +1587,24 @@ export function createManagedAgentControl(options: {
             };
           },
           [sessionDurableContext]: {
-            nextSequence: preparedStore === undefined ? 2 : (await preparedStore.read()).length + 1,
+            nextSequence: preparedStore === undefined ? 2 : restoredRecords.length + 1,
+            ...(frozen?.inputResources === undefined
+              ? {}
+              : { inputResources: frozen.inputResources, newRunId: identity.turnId }),
+            skillResourceLineageBytes: skillResourceBytesFromRecords(threadRecords),
+            inputResourceLineageBytes: inputResourceBytesFromRecords(threadRecords),
+            ...(resume === undefined
+              ? {}
+              : {
+                  skillResourceRunBytes: skillResourceBytesFromRecords(
+                    restoredRecords,
+                    resume.agentState.runId,
+                  ),
+                  inputResourceRunBytes: inputResourceBytesFromRecords(
+                    restoredRecords,
+                    resume.agentState.runId,
+                  ),
+                }),
             ...(resume === undefined ? {} : { resume: resume.agentState }),
             sessionId: identity.childSessionId,
             projectId: options.projectId,
@@ -1340,14 +1613,32 @@ export function createManagedAgentControl(options: {
               ? {}
               : { thinkingPolicy: frozen.thinkingPolicy }),
             promptContext,
+            ...(skillContext !== undefined ? { skillContext, activeSkillContents } : {}),
             repositoryWorkspaceRoot: options.workspaceRoot,
+            ...(extensionSkillSources === undefined ? {} : { extensionSkillSources }),
+            ...(options.withCurrentExtensionSkillSources === undefined
+              ? {}
+              : { withCurrentExtensionSkillSources: options.withCurrentExtensionSkillSources }),
+            ...(options.authorizeProjectContextLoad === undefined
+              ? {}
+              : { authorizeProjectContextLoad: options.authorizeProjectContextLoad }),
+            ...(frozen?.roleDefinition === undefined
+              ? {}
+              : { frozenProjectContext: true as const }),
             initialMessages: [
               {
                 role: "developer" as const,
-                content:
-                  "Explore the exact delegated task using local repository reads only. Do not write, execute, access Web, MCP or extensions, spawn children, or change authority. The workspace is live, not a filesystem snapshot.",
+                content: `Act as ${frozen?.roleDefinition?.name ?? "Explore"} on the exact delegated task using only admitted tools and Skills. Do not write, execute, access MCP or ambient extensions, spawn children, or change authority. ${frozen?.roleDefinition?.web === true ? "Use Web only through permitted registered Web tools." : "Do not access Web."} The workspace is live, not a filesystem snapshot.`,
               },
-              ...(frozen?.parentRequest
+              ...(frozen?.roleDefinition?.instructions
+                ? [
+                    {
+                      role: "user" as const,
+                      content: `Role-specific instructions (cannot change the built-in policy):\n${frozen.roleDefinition.instructions}`,
+                    },
+                  ]
+                : []),
+              ...(frozen?.parentRequest && frozen.parentRequest !== task
                 ? [{ role: "user" as const, content: frozen.parentRequest }]
                 : []),
               ...(previous === undefined
@@ -1403,10 +1694,26 @@ export function createManagedAgentControl(options: {
         });
         const result = await child
           .run(
-            { text: resume?.userMessage ?? task },
+            {
+              text: resume?.userMessage ?? task,
+              ...(frozen?.inputResources === undefined
+                ? {}
+                : { inputResources: frozen.inputResources }),
+              ...(admission?.event.type !== "admitted" || admission.event.skills === undefined
+                ? {}
+                : { skills: admission.event.skills }),
+            },
             {
               signal: controller.signal,
-              limits: { maxTokens: options.contextProfile.contextWindowTokens },
+              limits: {
+                maxTokens: Math.min(
+                  (frozen?.contextProfile ?? options.contextProfile).contextWindowTokens,
+                  frozen?.roleDefinition?.limits?.maxTokens ?? Infinity,
+                ),
+                ...(frozen?.roleDefinition?.limits?.maxTurns === undefined
+                  ? {}
+                  : { maxTurns: frozen.roleDefinition.limits.maxTurns }),
+              },
             },
           )
           .finally(() => {
@@ -1600,6 +1907,15 @@ export function createManagedAgentControl(options: {
     message: string,
   ): ManagedControlReceipt => ({ status: "rejected", code, message });
   const control: ManagedAgentControl = {
+    ...createAgentRoleAdministration({
+      ...(options.roleCatalog === undefined ? {} : { roleCatalog: options.roleCatalog }),
+      ...(options.roleTargets === undefined ? {} : { roleTargets: options.roleTargets }),
+      ...(options.resolveRoleTarget === undefined
+        ? {}
+        : { inspectTarget: (role) => options.resolveRoleTarget?.({ role }) ?? Promise.resolve() }),
+      inheritedTargetId: options.targetIdentity.targetId,
+      authorize: authorized,
+    }),
     async publishExport(input) {
       return authorized(async () => {
         const bytes = Buffer.from(input.content, "utf8");
@@ -1684,14 +2000,18 @@ export function createManagedAgentControl(options: {
       );
       return record === undefined ? undefined : managedAcceptedInput(record)?.text;
     },
-    async prepareDelegation(command) {
+    async prepareDelegation(command, limits) {
       const records = await controlStore.read();
       const sessionTokens = fleetSessionCeiling(records, policy);
       const available = fleetBudget(records, sessionTokens).available;
       if (available <= 0) throw new FleetBudgetError("fleet_budget_exhausted");
       return createDelegationEnvelope(policy, {
+        ...(limits === undefined ? {} : { limits }),
         mode: command.mode ?? "background",
         count: command.entries.length,
+        roles: [...new Set(command.entries.map((entry) => entry.role))],
+        context: requestedDelegationContext(command.entries),
+        skills: [...new Set(command.entries.flatMap((entry) => entry.skills ?? []))],
         origin: command.origin ?? { kind: "direct_request", id: randomUUID() },
         sessionTokens,
         availableTokens: available,
@@ -1714,6 +2034,7 @@ export function createManagedAgentControl(options: {
       return createDelegationEnvelope(policy, {
         mode: first.event.lane === "reserved" ? "foreground" : "background",
         count: 1,
+        roles: [first.event.role],
         origin: command.origin ?? { kind: "direct_request", id: command.inputId ?? randomUUID() },
         sessionTokens,
         availableTokens: available,
@@ -1862,6 +2183,8 @@ export function createManagedAgentControl(options: {
         if (error instanceof SessionLogicalQuotaError)
           return rejected("storage_quota_exceeded", error.message);
         if (error instanceof FleetBudgetError) return rejected("budget_exhausted", error.message);
+        if (error instanceof InputResourceError)
+          return rejected("action_unavailable", error.message);
         if (
           error instanceof ManagedAgentStoreError ||
           error instanceof SessionStoreError ||
@@ -1880,7 +2203,11 @@ export function createManagedAgentControl(options: {
   };
   async function dispatchCommand(
     command: ManagedControlCommand,
-    dispatchOptions?: { readonly signal?: AbortSignal },
+    dispatchOptions?: {
+      readonly signal?: AbortSignal;
+      readonly directThinkingSelection?: ThinkingPolicySelectionV1 | null;
+      readonly directResources?: readonly StagedInputResourceSelectionV1[];
+    },
   ): Promise<ManagedControlReceipt> {
     if (
       dispatchOptions?.signal?.aborted &&
@@ -2167,6 +2494,52 @@ export function createManagedAgentControl(options: {
         dispatchOptions,
       );
     }
+    if (command.type === "list_agents" && command.view === "context") {
+      const messages = delegationMessages(
+        (await options.parentSessionStore?.read()) ?? [],
+      ).reverse();
+      const revision = managedControlDigest(
+        messages.map(({ sequence, digest }) => ({ sequence, digest })),
+      );
+      const cursor = command.cursor?.match(/^(sha256:[a-f0-9]{64}):(\d+)$/u);
+      if (
+        command.cursor !== undefined &&
+        (cursor === undefined || cursor === null || cursor[1] !== revision)
+      )
+        return rejected("stale_revision", "Parent messages changed. Read the first page again.");
+      const offset = Number(cursor?.[2] ?? 0);
+      const limit = command.limit ?? 16;
+      return {
+        status: "context_listed",
+        revision,
+        messages: messages.slice(offset, offset + limit),
+        ...(offset + limit < messages.length ? { cursor: `${revision}:${offset + limit}` } : {}),
+      };
+    }
+    if (command.type === "list_agents" && command.view === "roles") {
+      const catalog = await control.inspectRoles();
+      const revision = managedControlDigest(
+        catalog.roles.map((role) => [role.qualifiedId, role.definitionDigest]),
+      );
+      const cursor = command.cursor?.match(/^(sha256:[a-f0-9]{64}):(\d+)$/u);
+      if (
+        command.cursor !== undefined &&
+        (cursor === undefined || cursor === null || cursor[1] !== revision)
+      )
+        return rejected("stale_revision", "The role catalog changed. Read its first page again.");
+      const offset = Number(cursor?.[2] ?? 0);
+      const limit = command.limit ?? 16;
+      return {
+        status: "roles_listed",
+        revision,
+        roles: catalog.roles
+          .slice(offset, offset + limit)
+          .map(({ instructions: _instructions, ...role }) => role),
+        ...(offset + limit < catalog.roles.length
+          ? { cursor: `${revision}:${offset + limit}` }
+          : {}),
+      };
+    }
     if (command.type === "list_agents") {
       const snapshot = await control.inspect({ parentSessionId: command.parentSessionId });
       const cursor = command.cursor?.match(/^(\d+):(\d+)$/u);
@@ -2288,16 +2661,19 @@ export function createManagedAgentControl(options: {
     }
     if (command.type === "post_agent") {
       if (command.mode === "new_turn")
-        return control.dispatch({
-          type: "next_turn",
-          parentSessionId: command.parentSessionId,
-          threadId: command.threadId,
-          expectedTurnId: command.expectedTurnId,
-          task: command.text,
-          inputId: command.inputId,
-          ...(command.origin === undefined ? {} : { origin: command.origin }),
-          ...(command.envelope === undefined ? {} : { envelope: command.envelope }),
-        });
+        return control.dispatch(
+          {
+            type: "next_turn",
+            parentSessionId: command.parentSessionId,
+            threadId: command.threadId,
+            expectedTurnId: command.expectedTurnId,
+            task: command.text,
+            inputId: command.inputId,
+            ...(command.origin === undefined ? {} : { origin: command.origin }),
+            ...(command.envelope === undefined ? {} : { envelope: command.envelope }),
+          },
+          dispatchOptions,
+        );
       return authorized(async () => {
         if (!(await currentCeilingAllows()))
           return rejected("plan_policy_paused", "Paused by current Plan policy");
@@ -2441,7 +2817,7 @@ export function createManagedAgentControl(options: {
             const unstartedStore = await options.childSessionStores.open(admission.childSessionId);
             const existingRecords = await unstartedStore?.read();
             if (existingRecords?.[0] !== undefined)
-              validateManagedChildGenesis(admission, existingRecords[0]);
+              validateManagedChildGenesis(admission, existingRecords[0], existingRecords);
             const childRecords =
               unstartedStore === undefined &&
               !turn.some((record) => record.event.type === "started")
@@ -2564,7 +2940,23 @@ export function createManagedAgentControl(options: {
         )
           return rejected("plan_policy_paused", "Paused by current Plan policy");
         if (command.type === "spawn_agents") {
-          const frozenContext = (await options.resolveFrozenContext?.()) ?? options.frozenContext;
+          const catalog = await control.inspectRoles();
+          if (
+            command.entries.some(
+              (entry) => !catalog.roles.some((role) => role.qualifiedId === entry.role),
+            )
+          )
+            return rejected("action_unavailable", "Select an available exact role definition.");
+          const frozenContext =
+            (await options.resolveFrozenContext?.(
+              command.origin?.kind === "direct_request"
+                ? dispatchOptions?.directThinkingSelection
+                : undefined,
+            )) ?? options.frozenContext;
+          const skillContext =
+            frozenContext?.skillContext === undefined
+              ? undefined
+              : createIndependentSkillContextV1(frozenContext.skillContext);
           const frozen = managedControlFrozenSchema.parse({
             version: 1,
             parentBranchId: frozenContext?.parentBranchId ?? options.parentSessionId,
@@ -2573,11 +2965,19 @@ export function createManagedAgentControl(options: {
             ...(frozenContext?.thinkingPolicy === undefined
               ? {}
               : { thinkingPolicy: frozenContext.thinkingPolicy }),
-            ...(frozenContext?.skillContext === undefined
-              ? {}
-              : { skillContext: frozenContext.skillContext }),
-            promptContext: createPromptContextV1(childTools(), frozenContext?.repository),
-            parentRequest: frozenContext?.parentRequest ?? "",
+            ...(skillContext === undefined ? {} : { skillContext }),
+            promptContext:
+              skillContext === undefined
+                ? createPromptContextV1(childTools(), frozenContext?.repository)
+                : createPromptContextV2(
+                    childTools(undefined, true),
+                    frozenContext?.repository ?? createPromptContextV1(undefined).repository,
+                    skillContext,
+                  ),
+            parentRequest:
+              command.origin?.kind === "direct_request"
+                ? command.entries.map((entry) => entry.task).join("\n")
+                : (frozenContext?.parentRequest ?? ""),
             permissionEffects: ["read"],
             permissionReadCeiling: options.permissions.delegationReadCeiling ?? "deny",
           });
@@ -2590,20 +2990,17 @@ export function createManagedAgentControl(options: {
             command.envelope === undefined
               ? await control.prepareDelegation(command)
               : delegationEnvelopeSchema.parse(command.envelope);
-          const { digest: envelopeDigest, ...envelopeFields } = envelope;
           if (
-            managedControlDigest(envelopeFields) !== envelopeDigest ||
-            managedControlDigest(envelope.policy) !== envelope.policyDigest ||
-            envelope.threads !== command.entries.length ||
-            envelope.threads > envelope.running + envelope.queued ||
-            envelope.skills.length > 0 ||
-            envelope.mode !== (command.mode ?? "background") ||
-            (command.origin !== undefined && !isDeepStrictEqual(envelope.origin, command.origin)) ||
-            envelope.running >
-              policy[envelope.mode === "background" ? "background" : "reserved"].running ||
-            envelope.aggregateTokens > policy.batchTokens ||
-            envelope.threadTokens > policy.threadTokens ||
-            envelope.sessionTokens > fleetSessionCeiling(await controlStore.read(), policy)
+            !delegationEnvelopeMatches(envelope, {
+              policy,
+              roles: command.entries.map((entry) => entry.role),
+              count: command.entries.length,
+              mode: command.mode ?? "background",
+              ...(command.origin === undefined ? {} : { origin: command.origin }),
+              sessionTokens: fleetSessionCeiling(await controlStore.read(), policy),
+              context: requestedDelegationContext(command.entries),
+              skills: command.entries.flatMap((entry) => entry.skills ?? []),
+            })
           )
             return rejected(
               "action_unavailable",
@@ -2622,6 +3019,9 @@ export function createManagedAgentControl(options: {
                   !isDeepStrictEqual(record.event.envelope, envelope) ||
                   record.event.task !== command.entries[index]?.task ||
                   record.event.role !== command.entries[index]?.role ||
+                  record.event.alias !== command.entries[index]?.alias ||
+                  !isDeepStrictEqual(record.event.context, command.entries[index]?.context) ||
+                  !isDeepStrictEqual(record.event.skills, command.entries[index]?.skills) ||
                   record.event.description !== command.entries[index]?.description,
               )
             )
@@ -2671,6 +3071,36 @@ export function createManagedAgentControl(options: {
           const lane =
             command.mode === "foreground" ? ("reserved" as const) : ("background" as const);
           const current = foldManagedControl(await controlStore.read(), options.parentSessionId);
+          const names = new Set(["main"]);
+          for (const thread of current.threads) {
+            names.add(managedNameKey(thread.handle));
+            if (thread.alias !== undefined) names.add(managedNameKey(thread.alias));
+          }
+          for (const entry of command.entries) {
+            if (entry.alias === undefined) continue;
+            const key = managedNameKey(entry.alias);
+            if (names.has(key))
+              return rejected(
+                "action_unavailable",
+                "The alias is already reserved for this Session. Choose a unique lifetime name.",
+              );
+            names.add(key);
+          }
+          let number = current.threads.length + 1;
+          const handles = command.entries.map((entry) => {
+            const role = catalog.roles.find((role) => role.qualifiedId === entry.role);
+            const name =
+              (role?.name ?? "explore")
+                .normalize("NFKC")
+                .toLocaleLowerCase()
+                .replace(/[^\p{L}\p{N}_-]+/gu, "-")
+                .slice(0, 64)
+                .replace(/^-+|-+$/gu, "") || "agent";
+            let handle = `@${name}-${number++}`;
+            while (names.has(managedNameKey(handle))) handle = `@${name}-${number++}`;
+            names.add(managedNameKey(handle));
+            return handle;
+          });
           if (
             current.threads.filter(
               (thread) =>
@@ -2683,15 +3113,199 @@ export function createManagedAgentControl(options: {
               "capacity_exhausted",
               "This lane has no remaining nonterminal admission capacity.",
             );
-          const inputs = command.entries.map((entry) => ({
-            parentSessionId: options.parentSessionId,
-            threadId: randomUUID(),
-            turnId: randomUUID(),
-            attemptId: randomUUID(),
-            childSessionId: randomUUID(),
-            schemaVersion: 3 as const,
-            event: { type: "admitted" as const, ...entry, batchId, lane, frozen, envelope },
-          }));
+          let contexts: string[];
+          try {
+            const messages = delegationMessages((await options.parentSessionStore?.read()) ?? []);
+            contexts = command.entries.map((entry) =>
+              resolveDelegationContext(
+                entry.context ?? {
+                  mode:
+                    catalog.roles.find((role) => role.qualifiedId === entry.role)?.contextMode ??
+                    "current_request",
+                },
+                command.origin?.kind === "direct_request" ? entry.task : frozen.parentRequest,
+                messages,
+              ),
+            );
+          } catch (error) {
+            return rejected(
+              "action_unavailable",
+              error instanceof Error ? error.message : "Selected parent context is unavailable.",
+            );
+          }
+          for (const entry of command.entries) {
+            const role = catalog.roles.find((role) => role.qualifiedId === entry.role);
+            const candidates =
+              skillContext === undefined
+                ? []
+                : createIndependentSkillContextV1(skillContext, role?.skills).registry.candidates;
+            if (
+              (entry.skills ?? []).some(
+                (id) => !candidates.some((candidate) => candidate.qualifiedId === id),
+              ) ||
+              (entry.skills ?? []).reduce(
+                (tokens, id) =>
+                  tokens +
+                  (candidates.find((candidate) => candidate.qualifiedId === id)?.estimatedTokens ??
+                    0),
+                0,
+              ) > 32_768
+            )
+              return rejected(
+                "action_unavailable",
+                "Select exact available Skills within the role's activation limits.",
+              );
+          }
+          const directResources = dispatchOptions?.directResources ?? [];
+          if (
+            directResources.length > 0 &&
+            (command.origin?.kind !== "direct_request" || command.entries.length !== 1)
+          )
+            return rejected(
+              "action_unavailable",
+              "Direct attachments require one exact user-selected role.",
+            );
+          const requestedArtifacts = [
+            ...new Set(command.entries.flatMap((entry) => entry.artifacts ?? [])),
+          ];
+          const parentResourceRecords =
+            requestedArtifacts.length > 0 && options.resolveArtifactSelections === undefined
+              ? ((await options.parentSessionStore?.read()) ?? [])
+              : [];
+          if (requestedArtifacts.length > 0 && options.resolveArtifactSelections === undefined)
+            validateManagedParentHistory(
+              parentResourceRecords,
+              options.parentSessionId,
+              options.projectId,
+              options.workspaceRoot,
+            );
+          const availableResources =
+            requestedArtifacts.length > 0 && options.resolveArtifactSelections !== undefined
+              ? await options.resolveArtifactSelections(requestedArtifacts)
+              : parentResourceRecords.flatMap((record) =>
+                  record.schemaVersion === 3 && record.record.type === "logical_run_started"
+                    ? (record.record.inputResources ?? []).map((resource) => ({
+                        resource,
+                        source: {
+                          parentSessionId: options.parentSessionId,
+                          sequence: record.sequence,
+                          digest: managedTranscriptLink(
+                            parentResourceRecords.filter(
+                              (entry) => entry.sequence <= record.sequence,
+                            ),
+                          ).digest,
+                          occurrenceId: resource.occurrenceId,
+                        },
+                      }))
+                    : [],
+                );
+          const selectedResources = command.entries.map((entry) =>
+            (entry.artifacts ?? []).map((id) =>
+              availableResources.find((source) => source.resource.occurrenceId === id),
+            ),
+          );
+          if (
+            command.entries.some(
+              (entry, index) =>
+                selectedResources[index]?.some((source) => source === undefined) ||
+                (((entry.artifacts?.length ?? 0) > 0 || directResources.length > 0) &&
+                  !catalog.roles
+                    .find((role) => role.qualifiedId === entry.role)
+                    ?.tools.includes("read_input_resource")),
+            )
+          )
+            return rejected(
+              "action_unavailable",
+              "Select exact available attachments for a role that can read input resources.",
+            );
+          const inputs = await Promise.all(
+            command.entries.map(async (entry, index) => {
+              const turnId = randomUUID();
+              const handle = handles[index];
+              if (handle === undefined) throw new Error("Missing allocated thread handle.");
+              const roleDefinition = catalog.roles.find((role) => role.qualifiedId === entry.role);
+              if (roleDefinition === undefined) throw new Error("Role unavailable.");
+              const roleTarget = await options.resolveRoleTarget?.({
+                role: roleDefinition,
+                ...(frozen.thinkingPolicy === undefined
+                  ? {}
+                  : { inheritedThinking: frozen.thinkingPolicy }),
+              });
+              const web = roleDefinition?.web === true && options.webTools !== undefined;
+              const roleSkills =
+                skillContext === undefined
+                  ? undefined
+                  : createIndependentSkillContextV1(skillContext, roleDefinition?.skills);
+              const tools = childTools(undefined, roleSkills !== undefined, web, roleDefinition);
+              const selected =
+                selectedResources[index]?.filter((source) => source !== undefined) ?? [];
+              let inputResources: readonly InputResourceOccurrenceV1[] = [];
+              if (directResources.length > 0 || selected.length > 0) {
+                if (options.artifactStore === undefined) throw new SessionStoreError();
+                inputResources =
+                  directResources.length > 0
+                    ? await ingestLocalInputResourcesV1({
+                        ...(options.artifactRoot === undefined
+                          ? {}
+                          : { artifactRoot: options.artifactRoot }),
+                        artifactStore: options.artifactStore,
+                        runId: turnId,
+                        selections: directResources,
+                        signal: dispatchOptions?.signal ?? new AbortController().signal,
+                      })
+                    : await linkInputResourcesV1({
+                        artifactStore: options.artifactStore,
+                        runId: turnId,
+                        occurrences: selected.map((source) => source.resource),
+                      });
+              }
+              const roleFrozen = managedControlFrozenSchema.parse({
+                ...frozen,
+                ...(roleTarget === undefined
+                  ? {}
+                  : {
+                      targetIdentity: roleTarget.targetIdentity,
+                      contextProfile: roleTarget.contextProfile,
+                      thinkingPolicy: roleTarget.thinkingPolicy,
+                    }),
+                roleDefinition,
+                ...(inputResources.length === 0 ? {} : { inputResources }),
+                ...(selected.length === 0
+                  ? {}
+                  : { artifactSources: selected.map((source) => source.source) }),
+                ...(roleSkills === undefined ? {} : { skillContext: roleSkills }),
+                parentRequest: contexts[index] ?? "",
+                permissionEffects: web ? ["read", "network"] : ["read"],
+                ...(web
+                  ? {
+                      permissionNetworkCeiling:
+                        options.permissions.delegationNetworkCeiling ?? "deny",
+                    }
+                  : {}),
+                promptContext:
+                  roleSkills === undefined
+                    ? createPromptContextV1(tools, frozen.promptContext.repository)
+                    : createPromptContextV2(tools, frozen.promptContext.repository, roleSkills),
+              });
+              return {
+                parentSessionId: options.parentSessionId,
+                threadId: randomUUID(),
+                turnId,
+                attemptId: randomUUID(),
+                childSessionId: randomUUID(),
+                schemaVersion: 3 as const,
+                event: {
+                  type: "admitted" as const,
+                  ...entry,
+                  handle,
+                  batchId,
+                  lane,
+                  frozen: roleFrozen,
+                  envelope,
+                },
+              };
+            }),
+          );
           const capacity = await storageUsage(await controlStore.read());
           if (
             storedRecordBytes(inputs) +
@@ -2884,8 +3498,7 @@ export function createManagedAgentControl(options: {
           if (
             admission.event.type === "admitted" &&
             admission.event.frozen !== undefined &&
-            (!isDeepStrictEqual(admission.event.frozen.targetIdentity, options.targetIdentity) ||
-              !isDeepStrictEqual(admission.event.frozen.contextProfile, options.contextProfile))
+            !(await frozenTargetAvailable(admission.event.frozen))
           )
             return rejected(
               "action_unavailable",
@@ -2919,7 +3532,7 @@ export function createManagedAgentControl(options: {
           const childStore = await options.childSessionStores.open(admission.childSessionId);
           let childRecords = await childStore?.read();
           if (childRecords?.[0] !== undefined)
-            validateManagedChildGenesis(admission, childRecords[0]);
+            validateManagedChildGenesis(admission, childRecords[0], childRecords);
           if (childRecords !== undefined)
             await reconcileInputs(
               admission,
@@ -2928,7 +3541,13 @@ export function createManagedAgentControl(options: {
             );
           const recoveryTools =
             admission.event.type === "admitted" && admission.event.frozen !== undefined
-              ? childTools(admission)
+              ? childTools(
+                  admission,
+                  hasSkillPromptContext(admission.event.frozen.promptContext),
+                  admission.event.frozen.permissionEffects.some((effect) => effect === "network"),
+                  admission.event.frozen.roleDefinition,
+                  admission.event.frozen.inputResources,
+                )
               : createReadToolRegistry({ workspaceRoot: options.workspaceRoot });
           const childGenesis = childRecords?.[0];
           if (
@@ -2938,7 +3557,12 @@ export function createManagedAgentControl(options: {
             childGenesis.record.type === "session_genesis" &&
             childGenesis.record.sessionId === admission.childSessionId &&
             childGenesis.record.projectId === options.projectId &&
-            isDeepStrictEqual(childGenesis.record.targetIdentity, options.targetIdentity)
+            isDeepStrictEqual(
+              childGenesis.record.targetIdentity,
+              admission.event.type === "admitted"
+                ? (admission.event.frozen?.targetIdentity ?? options.targetIdentity)
+                : options.targetIdentity,
+            )
           ) {
             if (
               childRecords.some(
@@ -2984,16 +3608,26 @@ export function createManagedAgentControl(options: {
               genesis.record.type === "session_genesis" &&
               genesis.record.sessionId === admission.childSessionId &&
               genesis.record.projectId === options.projectId &&
-              isDeepStrictEqual(genesis.record.targetIdentity, options.targetIdentity) &&
-              isDeepStrictEqual(genesis.record.contextProfile, options.contextProfile) &&
+              isDeepStrictEqual(
+                genesis.record.targetIdentity,
+                admission.event.frozen?.targetIdentity ?? options.targetIdentity,
+              ) &&
+              isDeepStrictEqual(
+                genesis.record.contextProfile,
+                admission.event.frozen?.contextProfile ?? options.contextProfile,
+              ) &&
               isDeepStrictEqual(
                 genesis.record.promptContext,
-                createPromptContextV1(
-                  recoveryTools,
-                  admission.event.type === "admitted"
-                    ? admission.event.frozen?.promptContext.repository
-                    : undefined,
-                ),
+                admission.event.frozen?.skillContext === undefined
+                  ? createPromptContextV1(
+                      recoveryTools,
+                      admission.event.frozen?.promptContext.repository,
+                    )
+                  : createPromptContextV2(
+                      recoveryTools,
+                      admission.event.frozen.promptContext.repository,
+                      admission.event.frozen.skillContext,
+                    ),
               ) &&
               !turnRecords.some(
                 (record) =>
@@ -3102,8 +3736,9 @@ export function createManagedAgentControl(options: {
               "The child transcript does not match its outcome receipt.",
             );
           if (
-            !isDeepStrictEqual(genesis.record.targetIdentity, options.targetIdentity) ||
-            !isDeepStrictEqual(genesis.record.contextProfile, options.contextProfile)
+            !(await frozenTargetAvailable(
+              firstAdmission?.event.type === "admitted" ? firstAdmission.event.frozen : undefined,
+            ))
           )
             return rejected(
               "action_unavailable",
@@ -3145,6 +3780,7 @@ export function createManagedAgentControl(options: {
         if (
           digest !== managedControlDigest(fields) ||
           envelope.policyDigest !== managedControlDigest(envelope.policy) ||
+          !isDeepStrictEqual(envelope.roles, [inherited.role]) ||
           envelope.threads !== 1 ||
           envelope.running !== 1 ||
           envelope.mode !== (lane === "reserved" ? "foreground" : "background") ||
@@ -3169,13 +3805,77 @@ export function createManagedAgentControl(options: {
           policy[lane].running + policy[lane].queued
         )
           return rejected("capacity_exhausted", "This lane has no remaining admission capacity.");
+        let continuationFrozen = inherited.frozen;
+        const previousAdmission = (await controlStore.read()).find(
+          (record) => record.turnId === previous?.turn.turnId && record.event.type === "admitted",
+        );
+        if (
+          previousAdmission?.event.type === "admitted" &&
+          previousAdmission.event.frozen?.inputResources !== undefined
+        )
+          continuationFrozen = {
+            ...continuationFrozen,
+            inputResources: previousAdmission.event.frozen.inputResources,
+          };
+        const addedResources = dispatchOptions?.directResources ?? [];
+        if (
+          addedResources.length > 0 &&
+          (command.origin?.kind !== "direct_request" ||
+            !continuationFrozen.roleDefinition?.tools.includes("read_input_resource"))
+        )
+          return rejected(
+            "action_unavailable",
+            "This exact child turn cannot accept attached resources.",
+          );
+        if (continuationFrozen.inputResources !== undefined || addedResources.length > 0) {
+          if (options.artifactStore === undefined) throw new SessionStoreError();
+          const added =
+            addedResources.length === 0
+              ? []
+              : await ingestLocalInputResourcesV1({
+                  ...(options.artifactRoot === undefined
+                    ? {}
+                    : { artifactRoot: options.artifactRoot }),
+                  artifactStore: options.artifactStore,
+                  runId: identity.turnId,
+                  selections: addedResources,
+                  signal: dispatchOptions?.signal ?? new AbortController().signal,
+                });
+          continuationFrozen = {
+            ...continuationFrozen,
+            inputResources: [
+              ...(await linkInputResourcesV1({
+                artifactStore: options.artifactStore,
+                runId: identity.turnId,
+                occurrences: [...(continuationFrozen.inputResources ?? []), ...added],
+              })),
+            ],
+          };
+        }
+        if (previous !== undefined && hasSkillPromptContext(continuationFrozen.promptContext)) {
+          const records = await (
+            await options.childSessionStores.open(previous.turn.childSessionId)
+          )?.read();
+          const genesis = records?.[0];
+          if (records === undefined || genesis === undefined || !isGenesisRecord(genesis))
+            throw new SessionStoreError();
+          const skillContext = skillContextRecordFromRecords(genesis, records);
+          if (skillContext === undefined) throw new SessionStoreError();
+          continuationFrozen = {
+            ...continuationFrozen,
+            skillContext,
+            promptContext: replacePromptSkillsV2(continuationFrozen.promptContext, skillContext),
+          };
+        }
         const event: ManagedControlEvent = {
           type: "admitted",
           envelope,
           batchId: envelope.id,
           lane,
-          frozen: inherited.frozen,
+          frozen: continuationFrozen,
           role: previous?.role ?? "builtin:explore",
+          ...(inherited.handle === undefined ? {} : { handle: inherited.handle }),
+          ...(inherited.alias === undefined ? {} : { alias: inherited.alias }),
           description: previous?.description ?? "",
           task: command.task,
           ...(command.inputId === undefined ? {} : { inputId: command.inputId }),
@@ -3249,10 +3949,11 @@ export function createManagedAgentControlToolRegistry(options: {
     expectedTurnId: z.uuid().optional(),
   });
   const schemas = [
-    { name: "spawn_agents" as const, schema: spawnInputSchema },
+    { name: "spawn_agents" as const, schema: managedSpawnInputSchema },
     {
       name: "list_agents" as const,
       schema: z.strictObject({
+        view: z.enum(["threads", "roles", "context"]).optional(),
         limit: z.number().int().min(1).max(32).optional(),
         cursor: z.string().max(128).optional(),
       }),
@@ -3295,7 +3996,7 @@ export function createManagedAgentControlToolRegistry(options: {
               name === "spawn_agents"
                 ? "Atomically admit 1-32 background agents, or join exactly one foreground agent. Target, thinking and authority are Host-owned."
                 : name === "list_agents"
-                  ? "List bounded thread summaries and actions without raw task or transcript."
+                  ? "List bounded threads, current qualified roles, or exact user/assistant parent messages for explicit context selection. Context never includes reasoning or tool arguments."
                   : name === "wait_agents"
                     ? "Wait for any/all exact turns. Handles resolve once at dispatch."
                     : name === "post_agent"
@@ -3320,7 +4021,7 @@ export function createManagedAgentControlToolRegistry(options: {
             if (
               !parsed.success ||
               (name === "spawn_agents" &&
-                (!spawnInputSchema.safeParse(parsed.data).success ||
+                (!managedSpawnInputSchema.safeParse(parsed.data).success ||
                   !("entries" in parsed.data) ||
                   !validSpawnMode(parsed.data)))
             )
@@ -3331,6 +4032,9 @@ export function createManagedAgentControlToolRegistry(options: {
             let prepared:
               | Promise<{ control: ManagedAgentControl; command: ManagedControlCommand }>
               | undefined;
+            let resolved:
+              | { control: ManagedAgentControl; command: ManagedControlCommand }
+              | undefined;
             const prepare = () =>
               (prepared ??= (async () => {
                 const control = await resolveControl();
@@ -3338,10 +4042,14 @@ export function createManagedAgentControlToolRegistry(options: {
                   parentSessionId: options.parentSessionId,
                 });
                 const resolveTarget = (input: z.infer<typeof target>) => {
-                  const thread = snapshot.threads.find(
-                    (thread) =>
-                      thread.threadId === input.threadId || thread.handle === input.threadId,
-                  );
+                  const thread =
+                    snapshot.threads.find((thread) => thread.threadId === input.threadId) ??
+                    snapshot.threads.find(
+                      (thread) =>
+                        managedNameKey(thread.handle) === managedNameKey(input.threadId) ||
+                        (thread.alias !== undefined &&
+                          managedNameKey(thread.alias) === managedNameKey(input.threadId)),
+                    );
                   return {
                     threadId: thread?.threadId ?? input.threadId,
                     expectedTurnId: input.expectedTurnId ?? thread?.turn.turnId,
@@ -3387,7 +4095,8 @@ export function createManagedAgentControlToolRegistry(options: {
                       ...(command.origin === undefined ? {} : { origin: command.origin }),
                     }),
                   };
-                return { control, command };
+                resolved = { control, command };
+                return resolved;
               })());
             return {
               status: "ready",
@@ -3426,6 +4135,106 @@ export function createManagedAgentControlToolRegistry(options: {
                   threadIds: targets.map((target) => target.threadId),
                   turnIds: targets.map((target) => target.expectedTurnId),
                   argumentsDigest: managedControlDigest(command),
+                };
+              },
+              refineDelegation(envelope, selection) {
+                const command = resolved?.command;
+                if (
+                  command?.type === "post_agent" &&
+                  command.mode === "new_turn" &&
+                  command.envelope !== undefined
+                ) {
+                  if (selection !== undefined)
+                    throw new TypeError("A continuation keeps its frozen context and Skills.");
+                  if (
+                    !delegationEnvelopeMatches(envelope, {
+                      policy: command.envelope.policy,
+                      roles: command.envelope.roles,
+                      count: 1,
+                      mode: command.envelope.mode,
+                      origin: command.envelope.origin,
+                      sessionTokens: command.envelope.sessionTokens,
+                      context: command.envelope.context,
+                      skills: command.envelope.skills,
+                    }) ||
+                    envelope.aggregateTokens > command.envelope.aggregateTokens ||
+                    envelope.threadTokens > command.envelope.threadTokens
+                  )
+                    throw new TypeError("A continuation must keep its frozen thread authority.");
+                  const refined = {
+                    ...command,
+                    envelope: delegationEnvelopeSchema.parse(envelope),
+                  };
+                  if (resolved === undefined) throw new TypeError("Delegation is unavailable.");
+                  resolved.command = refined;
+                  return {
+                    type: "managed_agent_action",
+                    parentSessionId: command.parentSessionId,
+                    action: "post_agent",
+                    envelope,
+                    threadIds: [command.threadId],
+                    turnIds: [command.expectedTurnId],
+                    argumentsDigest: managedControlDigest(refined),
+                  };
+                }
+                const context =
+                  selection?.context === undefined
+                    ? undefined
+                    : delegationContextSchema.parse(selection.context);
+                const entries =
+                  command?.type === "spawn_agents"
+                    ? command.entries.map((entry) => ({
+                        ...entry,
+                        ...(context === undefined ? {} : { context: context as DelegationContext }),
+                        ...(selection?.skills === undefined
+                          ? {}
+                          : {
+                              skills: (entry.skills ?? []).filter((id) =>
+                                selection.skills?.includes(id),
+                              ),
+                            }),
+                      }))
+                    : [];
+                if (
+                  selection?.skills?.some(
+                    (id) =>
+                      !command ||
+                      !("envelope" in command) ||
+                      !command.envelope?.skills.includes(id),
+                  )
+                )
+                  throw new TypeError("Only requested Skill pre-activations can be selected.");
+                if (
+                  command?.type !== "spawn_agents" ||
+                  command.envelope === undefined ||
+                  !delegationEnvelopeMatches(envelope, {
+                    policy: command.envelope.policy,
+                    roles: command.envelope.roles,
+                    count: command.entries.length,
+                    mode: envelope.mode,
+                    origin: command.envelope.origin,
+                    sessionTokens: command.envelope.sessionTokens,
+                    context: requestedDelegationContext(entries),
+                    skills: [...new Set(entries.flatMap((entry) => entry.skills ?? []))],
+                  }) ||
+                  envelope.aggregateTokens > command.envelope.aggregateTokens
+                )
+                  throw new TypeError("The selected grant does not match this pending delegation.");
+                const refined = {
+                  ...command,
+                  entries,
+                  mode: envelope.mode,
+                  envelope: delegationEnvelopeSchema.parse(envelope),
+                };
+                if (resolved === undefined) throw new TypeError("Delegation is unavailable.");
+                resolved.command = refined;
+                return {
+                  type: "managed_agent_batch",
+                  parentSessionId: command.parentSessionId,
+                  envelope,
+                  mode: envelope.mode,
+                  count: command.entries.length,
+                  argumentsDigest: managedControlDigest(refined),
                 };
               },
               async execute(context) {

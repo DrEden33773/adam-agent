@@ -1,6 +1,47 @@
+import { SelectList } from "@earendil-works/pi-tui";
 import { expect, test } from "vitest";
 import { AdamAutocompleteProvider } from "./command-autocomplete.js";
 import { adamCommandRegistry } from "./command-registry.js";
+
+test("role completion renders untrusted descriptions as inert terminal text", async () => {
+  const provider = new AdamAutocompleteProvider({
+    getProjectPaths: () => [],
+    getRunActive: () => false,
+    getSkills: () => [],
+    getRoles: () => [
+      {
+        qualifiedId: "user:Audit",
+        name: "Audit",
+        description: "\x1b[2JFORGED",
+        base: "explore",
+        tools: [],
+        web: false,
+        definitionDigest: `sha256:${"0".repeat(64)}`,
+      },
+    ],
+  });
+  const suggestions = await provider.getSuggestions(["@"], 0, 1, {
+    signal: new AbortController().signal,
+  });
+  const list = new SelectList(
+    [
+      { value: "@Explore", label: "@Explore", description: "Safe built-in" },
+      ...(suggestions?.items ?? []),
+    ],
+    8,
+    {
+      selectedPrefix: (s) => s,
+      selectedText: (s) => s,
+      description: (s) => s,
+      scrollInfo: (s) => s,
+      noMatch: (s) => s,
+    },
+    { overrideSelectedStyles: true },
+  );
+  const rendered = list.render(120).join("\n");
+  expect(rendered).toContain("FORGED");
+  expect(rendered).not.toContain("\x1b[2J");
+});
 
 test("active-run slash completion keeps the complete Registry with availability annotations", async () => {
   const provider = new AdamAutocompleteProvider({
@@ -122,13 +163,13 @@ test("path mention rows separate file names from parent paths without changing i
         adamPath: { path: "README.md" },
         value: "@README.md",
         label: "<text>@README.md</text>",
-        description: "./",
+        description: "F · ./",
       },
       {
         adamPath: { path: "packages/extension-api/README.md" },
         value: "@packages/extension-api/README.md",
         label: "<text>@README.md</text>",
-        description: "packages/extension-api/",
+        description: "F · packages/extension-api/",
       },
     ],
     prefix: "@",
@@ -157,13 +198,13 @@ test("path mentions recall root and nested files with the same matching name", a
         adamPath: { path: "AGENTS.md" },
         value: "@AGENTS.md",
         label: "@AGENTS.md",
-        description: "./",
+        description: "F · ./",
       },
       {
         adamPath: { path: "examples/portfolio-walkthrough/AGENTS.md" },
         value: "@examples/portfolio-walkthrough/AGENTS.md",
         label: "@AGENTS.md",
-        description: "examples/portfolio-walkthrough/",
+        description: "F · examples/portfolio-walkthrough/",
       },
     ],
     prefix: "@agents",
