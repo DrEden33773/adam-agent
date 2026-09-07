@@ -15,7 +15,6 @@ import {
   openJsonlSessionStore,
   preparedDirectDeepSeekV2ContextProfile,
   type SessionRecord,
-  sessionAutomaticTitlesEnabled,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 
@@ -56,6 +55,12 @@ test.each(["bounded results", "invalid cursor"] as const)(
           contextProfile: preparedDirectDeepSeekV2ContextProfile,
           driver: {
             async *stream(request) {
+              if (request.purpose === "title") {
+                yield { type: "text_delta", text: "Search feedback fixture" };
+                yield { type: "usage", inputTokens: 10, outputTokens: 10 };
+                yield { type: "finish", reason: "stop" };
+                return;
+              }
               const last = request.messages.at(-1);
               if (last?.role === "user" && last.content === "Find all extensions.") {
                 yield { type: "tool_call_start", id: "wide-search", name: "search_repository" };
@@ -108,7 +113,6 @@ test.each(["bounded results", "invalid cursor"] as const)(
       modelTargets,
       permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
       workspaceTrust: createTrustedWorkspaceTrustForTesting(workspaceRoot),
-      [sessionAutomaticTitlesEnabled]: false,
     });
     const terminal = new VirtualTerminal();
     let running: Promise<void> | undefined;

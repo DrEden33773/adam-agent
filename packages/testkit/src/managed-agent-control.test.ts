@@ -16,6 +16,7 @@ import {
   presentationSessionRecordReader,
   type SessionRecord,
   sessionManagedControl,
+  sessionRecordCommittedBarrier,
 } from "@adam-agent/agent/internal-testing";
 import { expect, test } from "vitest";
 import { createInMemorySessionLifecycleHarness } from "./index.js";
@@ -1371,3 +1372,88 @@ test.each(["starting", "executing"] as const)(
     }
   },
 );
+
+test("ManagedAgentControl requires recovery after a committed child terminal barrier fails", async () => {
+  let providerCalls = 0;
+  const harness = await controlHarness({
+    async *stream() {
+      providerCalls += 1;
+      yield { type: "text_delta", text: "Durably completed child evidence." };
+      yield { type: "usage", inputTokens: 5, outputTokens: 3 };
+      yield { type: "finish", reason: "stop" };
+    },
+  });
+  const original = createManagedAgentControl({
+    ...harness.options,
+    [sessionRecordCommittedBarrier]: async (record) => {
+      if (
+        record.schemaVersion === 3 &&
+        record.record.type === "runtime_event" &&
+        record.record.event.type === "session_settled"
+      )
+        throw new Error("Private committed barrier fault.");
+    },
+  });
+  const subscription = new AbortController();
+  const stopped = (async () => {
+    for await (const frame of original.observe({ parentSessionId, signal: subscription.signal })) {
+      const thread = frame.snapshot.threads[0];
+      if (thread?.turn.recovery === "required" || thread?.turn.phase === "idle") return thread;
+    }
+    throw new Error("Missing the stopped child projection.");
+  })();
+  let cold: ReturnType<typeof createManagedAgentControl> | undefined;
+  try {
+    await original.dispatch({
+      type: "start_thread",
+      parentSessionId,
+      role: "builtin:explore",
+      task: "Complete once before the required barrier.",
+      description: "Committed barrier evidence",
+    });
+    const thread = await withManagedFailureGuard(
+      stopped,
+      "committed child terminal barrier projection",
+    );
+    expect(thread.turn.recovery).toBe("required");
+    expect(thread.turn.outcome).toBeUndefined();
+    const records = await harness.options.store.read();
+    expect(
+      records.some((record) => ["outcome", "settled", "completion"].includes(record.event.type)),
+    ).toBe(false);
+    const admission = records.find((record) => record.event.type === "admitted");
+    if (admission === undefined) throw new Error("Missing exact child admission.");
+    const child = await harness.options.childSessionStores.open(admission.childSessionId);
+    const durable = await child?.read();
+    expect(durable?.at(-1)).toMatchObject({
+      record: {
+        type: "runtime_event",
+        event: {
+          type: "session_settled",
+          result: { status: "completed", answer: "Durably completed child evidence." },
+        },
+      },
+    });
+    await original.dispatch({ type: "close", parentSessionId });
+    cold = createManagedAgentControl(harness.options);
+    expect(
+      await cold.dispatch({
+        type: "recover_turn",
+        parentSessionId,
+        threadId: admission.threadId,
+        expectedTurnId: admission.turnId,
+      }),
+    ).toMatchObject({ status: "recovered" });
+    expect((await cold.inspect({ parentSessionId })).threads[0]?.turn).toMatchObject({
+      phase: "idle",
+      outcome: { status: "completed", summary: "Durably completed child evidence." },
+    });
+    expect(await child?.read()).toEqual(durable);
+    expect(providerCalls).toBe(1);
+  } finally {
+    subscription.abort();
+    await original.dispatch({ type: "close", parentSessionId });
+    await cold?.dispatch({ type: "close", parentSessionId });
+    await harness.close();
+  }
+});

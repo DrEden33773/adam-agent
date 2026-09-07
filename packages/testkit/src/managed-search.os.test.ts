@@ -30,7 +30,7 @@ type ContentPage = {
   }[];
 };
 
-test("a real managed child pages the shared search and continues after a typed cursor failure", async () => {
+test("a real managed child pages search and handles typed failure despite a rejected runtime observer", async () => {
   const root = await mkdtemp(join(tmpdir(), "adam-managed-search-"));
   const workspaceRoot = join(root, "workspace");
   const stateRoot = join(root, "state");
@@ -59,6 +59,7 @@ test("a real managed child pages the shared search and continues after a typed c
   const outputs: JsonValue[] = [];
   const failures: string[] = [];
   let invalidCursorTurn = false;
+  let failedToolObserved = false;
   let providerRequests = 0;
   const model: ModelDriver = {
     async *stream(request) {
@@ -137,6 +138,11 @@ test("a real managed child pages the shared search and continues after a typed c
     executionDomain: domain,
     store: createInMemoryManagedAgentControlStore(),
     childSessionStores,
+    async onChildRuntimeEvent(_identity, event) {
+      if (event.type === "tool_failed" && event.name === "search_repository")
+        failedToolObserved = true;
+      throw new Error("Ordinary managed runtime observer rejected.");
+    },
   });
   const subscription = new AbortController();
   const settledAfter = async (previousTurnId?: string) => {
@@ -189,6 +195,7 @@ test("a real managed child pages the shared search and continues after a typed c
       summary: "Child cursor failure handled.",
     });
     expect(failures).toEqual(["search_cursor_invalid"]);
+    expect(failedToolObserved).toBe(true);
     const records = await (await childSessionStores.open(next.turn.childSessionId))?.read();
     const events = records
       ?.filter((record) => record.schemaVersion === 3 && record.record.type === "runtime_event")

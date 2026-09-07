@@ -1,3 +1,5 @@
+import type { SessionExecutionFailure } from "@adam-agent/presentation";
+
 export class SessionLifecycleError extends Error {
   readonly code:
     | "session_branch_boundary_invalid"
@@ -32,7 +34,11 @@ export class SessionLifecycleError extends Error {
     | "project_owner_unavailable";
   readonly supportedLevelIds?: readonly string[];
 
-  constructor(code: SessionLifecycleError["code"], supportedLevelIds: readonly string[] = []) {
+  constructor(
+    code: SessionLifecycleError["code"],
+    supportedLevelIds: readonly string[] = [],
+    readonly executionFailure?: SessionExecutionFailure,
+  ) {
     super(
       code === "session_thinking_policy_unsupported" && supportedLevelIds.length > 0
         ? `${sessionLifecycleErrorMessage(code)} Choose ${supportedLevelIds.join(", ")}.`

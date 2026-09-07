@@ -1260,7 +1260,52 @@ export type AgentTypesDisplay = {
   }[];
 };
 
+/** Current execution diagnostics; never a replacement for durable session state. */
+export type SessionExecutionFailure = {
+  readonly category:
+    | "encoding_rejected"
+    | "storage_io_failed"
+    | "append_outcome_uncertain"
+    | "execution_failed";
+  readonly stage:
+    | "admission"
+    | "open"
+    | "permissions"
+    | "write"
+    | "sync"
+    | "close"
+    | "adapter"
+    | "artifact"
+    | "execution"
+    | "barrier";
+  readonly phase:
+    | "user_input"
+    | "model_response"
+    | "tool_execution"
+    | "tool_result"
+    | "run_settlement"
+    | "session_metadata"
+    | "execution";
+  readonly writeOutcome: "not_written" | "committed" | "uncertain" | null;
+  readonly reason:
+    | "invalid_record"
+    | "size_limit"
+    | "sequence_mismatch"
+    | "permission_denied"
+    | "storage_full"
+    | "read_only"
+    | "unavailable"
+    | "io_error"
+    | "unknown";
+  readonly sessionId: string | null;
+  readonly runId: string | null;
+  readonly callId: string | null;
+  readonly attemptedSequence: number | null;
+  readonly message: string;
+};
+
 export type PresentationDisplayState = {
+  readonly executionFailure?: SessionExecutionFailure;
   readonly agentTypes?: AgentTypesDisplay;
   readonly agentRoles?: readonly {
     readonly qualifiedId: string;

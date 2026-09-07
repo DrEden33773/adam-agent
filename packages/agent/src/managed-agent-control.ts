@@ -7,6 +7,7 @@ import type {
 } from "@adam-agent/presentation";
 import { agentExportFields, presentationAgentExportMaximumBytes } from "@adam-agent/presentation";
 import type { ArtifactStore } from "./artifact-store.js";
+import { SessionExecutionError } from "./execution-failure.js";
 import {
   InputResourceError,
   type InputResourceOccurrenceV1,
@@ -14,6 +15,7 @@ import {
   linkInputResourcesV1,
   type StagedInputResourceSelectionV1,
 } from "./input-resources.js";
+import { notifyObserver } from "./observer-notification.js";
 import type { PlanCycleSnapshot } from "./plan-mode.js";
 import {
   type AgentRoleAdministration,
@@ -1774,11 +1776,8 @@ export function createManagedAgentControl(options: {
         let lastAssistantDelta: string | undefined;
         const lastReasoning = new Map<string, string>();
         const unsubscribe = child.subscribe((event) => {
-          try {
-            if (frozen?.review === undefined) options.onChildRuntimeEvent?.(identity, event);
-          } catch {
-            /* Presentation cannot change execution. */
-          }
+          if (frozen?.review === undefined)
+            notifyObserver(() => options.onChildRuntimeEvent?.(identity, event));
           if (
             event.type === "model_message_delta" &&
             event.text.length > 0 &&
@@ -1846,6 +1845,7 @@ export function createManagedAgentControl(options: {
             generation += 1;
             timer?.cancel();
           });
+        if ("executionFailure" in result) throw new SessionExecutionError(result.executionFailure);
         const records = await store.read();
         if (
           (await managedChildTerminalResult(

@@ -281,6 +281,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const draftInputsSlot = new Container();
   const editorSlot = new Container();
   const interruption = new Text();
+  const executionFailureNotice = new ResponsiveText();
   const skillAtomIdentities = new Map<
     string,
     { readonly name: string; readonly qualifiedId: string }
@@ -716,6 +717,10 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     },
     {
       component: new VStack([
+        {
+          component: executionFailureNotice,
+          visible: () => options.presentation.getState().executionFailure !== undefined,
+        },
         {
           component: interruption,
           visible: () =>
@@ -1497,13 +1502,30 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const renderState = () => {
     const state = options.presentation.getState();
     const active = state.authoritative.active;
+    const failure = state.executionFailure;
+    const failureMessage = failure === undefined ? "" : safeTerminalText(failure.message);
+    const failureReason =
+      failure === undefined ? "" : safeTerminalText(failure.reason.replaceAll("_", " "));
+    const failurePhase =
+      failure === undefined
+        ? ""
+        : safeTerminalText(
+            `${failure.phase.replaceAll("_", " ")} · ${failure.stage} · ${failureReason}`,
+          );
+    executionFailureNotice.setText({
+      narrow: `${failureMessage}\n${failureReason}`,
+      standard: `${failureMessage}\n${failurePhase}`,
+      wide: `${failureMessage}\n${failurePhase}`,
+    });
     interruption.setText(
       [
         "Interrupted session",
-        ...(active?.recovery?.canResume
-          ? ["r  Resume safe work"]
-          : ["This interrupted effect cannot be replayed safely."]),
-        "c  Cancel interrupted work",
+        ...(active?.recovery === undefined
+          ? ["Durable recovery state is unavailable."]
+          : active.recovery.canResume
+            ? ["r  Resume safe work"]
+            : ["This interrupted effect cannot be replayed safely."]),
+        ...(active?.recovery === undefined ? [] : ["c  Cancel interrupted work"]),
         "i  Inspect durable state",
       ].join("\n"),
     );
@@ -2671,7 +2693,11 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     } else if (active?.parentRun?.phase === "interrupted") {
       footer.setText(
         theme.muted(
-          active.recovery?.canResume ? "r Resume · c Cancel · i Inspect" : "c Cancel · i Inspect",
+          active.recovery === undefined
+            ? "i Inspect"
+            : active.recovery.canResume
+              ? "r Resume · c Cancel · i Inspect"
+              : "c Cancel · i Inspect",
         ),
       );
     } else if (active !== null) {

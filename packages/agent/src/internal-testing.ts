@@ -177,6 +177,8 @@ export {
   type SessionContextCompactionStartedRecord,
   type SessionEventRecord,
   type SessionGenesisRecord,
+  type SessionLogFile,
+  type SessionLogFileSystem,
   type SessionModelResponseCompletedRecord,
   type SessionProviderAttemptInterruptedRecord,
   type SessionProviderAttemptStartedRecord,
@@ -186,6 +188,7 @@ export {
   type SessionStoreDirectory,
   type SessionToolIntent,
   type SessionV3Record,
+  sessionLogFileSystem,
 } from "./session-store.js";
 export { createDirectDeepSeekThinkingCapability } from "./thinking-policy.js";
 export { createCodingToolRegistryForTesting } from "./tool-runtime.js";
