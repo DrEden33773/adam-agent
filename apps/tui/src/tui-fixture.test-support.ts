@@ -29,7 +29,11 @@ export type TuiFixture = {
   readonly terminate: (signal: "SIGHUP" | "SIGKILL" | "SIGTERM") => Promise<void>;
   readonly waitForScreen: (text: string) => Promise<void>;
   readonly waitForRecordedOutput: (text: string, offset?: number) => Promise<void>;
-  readonly waitForCompleteFrameAfter: (text: string, offset: number) => Promise<void>;
+  readonly waitForCompleteFrameAfter: (
+    text: string,
+    offset: number,
+    absentText?: string,
+  ) => Promise<void>;
   readonly write: (text: string) => void;
 };
 
@@ -129,7 +133,8 @@ function startInProcessTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
     },
     waitForScreen: (text) => terminal.waitForScreen(text),
     waitForRecordedOutput: (text, offset) => terminal.waitForRecordedOutput(text, offset),
-    waitForCompleteFrameAfter: (text, offset) => terminal.waitForFrameAfter(text, offset),
+    waitForCompleteFrameAfter: (text, offset, absentText) =>
+      terminal.waitForFrameAfter(text, offset, absentText),
     write: (text) => terminal.input(text),
   };
   trackFixture(fixture);
@@ -199,6 +204,7 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
   const frameWaiters = new Set<{
     readonly offset: number;
     readonly text: string;
+    readonly absentText: string | undefined;
     readonly resolve: () => void;
     readonly reject: (error: Error) => void;
     readonly guard: ReturnType<typeof setTimeout>;
@@ -243,7 +249,11 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
         }
       }
       for (const waiter of frameWaiters) {
-        if (frame.endOffset > waiter.offset && frame.text.includes(waiter.text)) {
+        if (
+          frame.endOffset > waiter.offset &&
+          frame.text.includes(waiter.text) &&
+          (waiter.absentText === undefined || !frame.text.includes(waiter.absentText))
+        ) {
           clearTimeout(waiter.guard);
           frameWaiters.delete(waiter);
           waiter.resolve();
@@ -381,9 +391,20 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
       outputWaiters.add(waiter);
     });
   };
-  const waitForCompleteFrameAfter = async (text: string, offset: number): Promise<void> => {
+  const waitForCompleteFrameAfter = async (
+    text: string,
+    offset: number,
+    absentText?: string,
+  ): Promise<void> => {
     requireTerminalExpectation(text);
-    if (viewportFrames.some((frame) => frame.endOffset > offset && frame.text.includes(text))) {
+    if (
+      viewportFrames.some(
+        (frame) =>
+          frame.endOffset > offset &&
+          frame.text.includes(text) &&
+          (absentText === undefined || !frame.text.includes(absentText)),
+      )
+    ) {
       return Promise.resolve();
     }
     if (processClosed) {
@@ -397,6 +418,7 @@ function startExternalTuiFixture(input: StartTuiFixtureOptions): TuiFixture {
       const waiter = {
         offset,
         text,
+        absentText,
         resolve,
         reject,
         guard: setTimeout(() => {

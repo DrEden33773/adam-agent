@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, open, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -7,6 +7,7 @@ import {
   createJsonlSessionStore,
   createPermissionPolicy,
   type SessionRecord,
+  SessionStoreError,
 } from "@adam-agent/agent";
 import {
   openJsonlSessionStore,
@@ -227,5 +228,43 @@ test("known committed close failure advances the bare runtime cursor without rep
     expect(modelCalls).toBe(2);
   } finally {
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("JSONL warm reads detect rewritten prefixes, gaps and partial tails", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-warm-log-"));
+  const stateRoot = join(testRoot, "state");
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  const store = await createJsonlSessionStore({ stateRoot, workspaceRoot, sessionId: "warm-log" });
+  const record: SessionRecord = {
+    schemaVersion: 1,
+    runId,
+    sequence: 1,
+    event: { type: "user_message", text: "before" },
+  };
+  try {
+    await store.append(record);
+    expect(await store.read()).toEqual([record]);
+    const relative = (await readdir(stateRoot, { recursive: true })).find((path) =>
+      path.endsWith(".jsonl"),
+    );
+    if (relative === undefined) throw new Error("Missing session log.");
+    const path = join(stateRoot, relative);
+    const replacement = { ...record, event: { type: "user_message", text: "after!" } };
+    const prefix = `${JSON.stringify(replacement)}\n`;
+    await writeFile(path, prefix);
+    expect(await store.read()).toEqual([replacement]);
+    const second = { ...record, sequence: 2 };
+    await writeFile(path, `${prefix}${JSON.stringify(second)}\n`);
+    expect(await store.read()).toEqual([replacement, second]);
+    await writeFile(path, `${prefix}${JSON.stringify({ ...second, sequence: 3 })}\n`);
+    await expect(store.read()).rejects.toBeInstanceOf(SessionStoreError);
+    await writeFile(path, `${prefix}{`);
+    await expect(store.read()).rejects.toBeInstanceOf(SessionStoreError);
+    await writeFile(path, prefix);
+    expect(await store.read()).toEqual([replacement]);
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
   }
 });

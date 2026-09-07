@@ -7108,9 +7108,20 @@ describe("AgentSession", () => {
     const store = createInMemorySessionStore<SessionRecord>();
     const session = createTestSession({
       model,
-      permissions: createPermissionPolicy({ allowedEffects: ["read", "write"] }),
+      permissions: createPermissionPolicy({ allowedEffects: ["read"], askedEffects: ["write"] }),
       store: store as unknown as SessionStore,
       tools: createCodingToolRegistry({ workspaceRoot: "/workspace" }),
+    });
+
+    const permissionCalls: string[] = [];
+    session.subscribe((event) => {
+      if (event.type === "tool_permission_requested") {
+        permissionCalls.push(event.callId);
+        session.decidePermission({
+          requestId: event.requestId,
+          decision: event.callId === "create-cas" ? "allow" : "deny",
+        });
+      }
     });
 
     await expect(session.run({ text: "Reject stale Todo writes." })).resolves.toEqual({
@@ -7128,6 +7139,7 @@ describe("AgentSession", () => {
       });
       expect(todoSummaryMessage(request)).toContain('"storeRevision":1');
     }
+    expect(permissionCalls).toEqual(["create-cas"]);
     expect(todoId).toMatch(/^[0-9a-f-]{36}$/u);
     expect(
       (await store.read()).filter(

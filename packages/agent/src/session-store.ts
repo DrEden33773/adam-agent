@@ -60,7 +60,11 @@ import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from ".
 export type CanonicalRuntimeEvent = Exclude<
   RuntimeEvent,
   {
-    readonly type: "model_message_delta" | "model_reasoning_updated" | "mcp_catalog_state_changed";
+    readonly type:
+      | "model_message_delta"
+      | "model_reasoning_updated"
+      | "mcp_catalog_state_changed"
+      | "model_tool_arguments_started";
   }
 >;
 
@@ -3441,6 +3445,24 @@ export function createJsonlSessionStoreDirectory<
   readonly stateRoot?: string;
   readonly [sessionLogFileSystem]?: SessionLogFileSystem;
 }): SessionStoreDirectory<RecordType> {
+  // Retain a bounded working set, including active parent/child readers. Every read
+  // still checks the complete file bytes; neither timestamps nor growth prove validity.
+  const verifiedLogs = new Map<string, VerifiedSessionLog>();
+  const readLog = async (path: string, previous?: VerifiedSessionLog) => {
+    const log = await readBoundedSessionLog(path, previous ?? verifiedLogs.get(path));
+    verifiedLogs.delete(path);
+    if (log !== undefined) verifiedLogs.set(path, log);
+    let retainedBytes = [...verifiedLogs.values()].reduce(
+      (sum, entry) => sum + entry.storedBytes,
+      0,
+    );
+    for (const [key, entry] of verifiedLogs) {
+      if (verifiedLogs.size <= 4 && retainedBytes <= maxSessionLogBytes) break;
+      verifiedLogs.delete(key);
+      retainedBytes -= entry.storedBytes;
+    }
+    return log;
+  };
   return {
     async byteLength(sessionId) {
       validateSessionId(sessionId);
@@ -3517,7 +3539,7 @@ export function createJsonlSessionStoreDirectory<
     async open(sessionId) {
       validateSessionId(sessionId);
       const sessionPath = await resolveSessionPath({ ...options, sessionId });
-      const log = await readBoundedSessionLog(sessionPath);
+      const log = await readLog(sessionPath);
       if (log === undefined || log.records.length === 0) {
         return undefined;
       }
@@ -3526,6 +3548,8 @@ export function createJsonlSessionStoreDirectory<
         log.records.length + 1,
         log.storedBytes,
         options[sessionLogFileSystem],
+        log,
+        readLog,
       );
     },
   };
@@ -3584,6 +3608,7 @@ export async function openJsonlSessionStore<
     log.records.length + 1,
     log.storedBytes,
     options[sessionLogFileSystem],
+    log,
   );
 }
 
@@ -3592,7 +3617,10 @@ function createJsonlStore<RecordType extends SessionRecord>(
   initialNextSequence: number,
   initialStoredBytes: number,
   fileSystem: SessionLogFileSystem = nativeSessionLogFileSystem,
+  initialLog?: VerifiedSessionLog,
+  readLog: typeof readBoundedSessionLog = readBoundedSessionLog,
 ): SessionStore<RecordType> {
+  let verifiedLog = initialLog;
   let nextSequence = initialNextSequence;
   let storedBytes = initialStoredBytes;
   let appendQueue = Promise.resolve();
@@ -3654,7 +3682,8 @@ function createJsonlStore<RecordType extends SessionRecord>(
     appendBatch,
     async read() {
       await appendQueue;
-      const log = await readBoundedSessionLog(sessionPath);
+      const log = await readLog(sessionPath, verifiedLog);
+      verifiedLog = log;
       return (log?.records ?? []) as readonly RecordType[];
     },
   };
@@ -3706,11 +3735,16 @@ function defaultStateRoot(): string {
     : join(xdgStateHome, "adam-agent");
 }
 
+type VerifiedSessionLog = {
+  readonly records: readonly SessionRecord[];
+  readonly lines: readonly Buffer[];
+  readonly storedBytes: number;
+};
+
 async function readBoundedSessionLog(
   sessionPath: string,
-): Promise<
-  { readonly records: readonly SessionRecord[]; readonly storedBytes: number } | undefined
-> {
+  previous?: VerifiedSessionLog,
+): Promise<VerifiedSessionLog | undefined> {
   let file: FileHandle;
   try {
     file = await open(sessionPath, "r");
@@ -3727,6 +3761,8 @@ async function readBoundedSessionLog(
       throw new SessionStoreError("session_log_too_large");
     }
     const records: SessionRecord[] = [];
+    const lines: Buffer[] = [];
+    let samePrefix = previous !== undefined;
     const lineChunks: Buffer[] = [];
     const readBuffer = Buffer.allocUnsafe(64 * 1024);
     let lineBytes = 0;
@@ -3752,7 +3788,19 @@ async function readBoundedSessionLog(
         if (lineBytes > maxSessionRecordBytes) {
           throw new SessionStoreError("session_log_too_large");
         }
-        records.push(parseSessionRecordBytes(Buffer.concat(lineChunks, lineBytes)));
+        const bytes = Buffer.concat(lineChunks, lineBytes);
+        const previousBytes = previous?.lines[records.length];
+        const previousRecord = previous?.records[records.length];
+        samePrefix = samePrefix && previousBytes?.equals(bytes) === true;
+        if (samePrefix && previousRecord !== undefined && previousBytes !== undefined) {
+          records.push(previousRecord);
+          lines.push(previousBytes);
+        } else {
+          const record = parseSessionRecordBytes(bytes);
+          freezeSessionRecord(record);
+          records.push(record);
+          lines.push(bytes);
+        }
         lineChunks.length = 0;
         lineBytes = 0;
         segmentStart = index + 1;
@@ -3770,10 +3818,17 @@ async function readBoundedSessionLog(
     if (lineBytes !== 0) {
       throw new SessionStoreError();
     }
-    return { records: validateRecordSequence(records), storedBytes: offset };
+    if (samePrefix && records.length === previous?.records.length) return previous;
+    return { records: Object.freeze(validateRecordSequence(records)), lines, storedBytes: offset };
   } finally {
     await file.close();
   }
+}
+
+function freezeSessionRecord(value: unknown): void {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) return;
+  for (const nested of Object.values(value)) freezeSessionRecord(nested);
+  Object.freeze(value);
 }
 
 function parseSessionRecordBytes(bytes: Uint8Array): SessionRecord {

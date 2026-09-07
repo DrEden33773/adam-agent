@@ -728,6 +728,9 @@ function mergeTranscriptItems(
 }
 
 function managedActivityLines(activity: ManagedAgentActivity[number]): string[] {
+  if (activity.tool?.status === "generating_arguments") {
+    return [`Live tool · ${safeTerminalText(activity.tool.name)} · generating arguments`];
+  }
   if (activity.assistant !== undefined) {
     return safeTerminalText(activity.assistant.text)
       .split("\n")

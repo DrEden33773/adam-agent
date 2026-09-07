@@ -140,7 +140,9 @@ export class AgentWidget implements Component {
       const isQueued = isQueuedThread(thread);
       const elapsed = agentElapsedLabel(thread);
       const content =
-        activity?.tool?.name ??
+        (activity?.tool?.status === "generating_arguments"
+          ? `Generating arguments · ${activity.tool.name}`
+          : activity?.tool?.name) ??
         activity?.assistant?.text.split("\n").find((line) => line.trim().length > 0) ??
         (activity?.reasoning ? "Thinking…" : thread.turn.label);
       return [

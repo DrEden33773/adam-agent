@@ -244,6 +244,7 @@ export type ActiveContextUsage =
     };
 
 export type RuntimeEvent =
+  | { readonly type: "model_tool_arguments_started"; readonly id: string; readonly name: string }
   | { readonly type: "user_message"; readonly text: string }
   | { readonly type: "model_message_started" }
   | {

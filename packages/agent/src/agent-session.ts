@@ -1127,6 +1127,11 @@ export class AgentSession {
                   name: event.name,
                   argumentsJson: "",
                 });
+                await this.#emit({
+                  type: "model_tool_arguments_started",
+                  id: event.id,
+                  name: event.name,
+                });
               }
               break;
             case "tool_call_delta": {
@@ -2540,6 +2545,24 @@ export class AgentSession {
           };
           toolResultsById.set(call.id, { call, result });
           await this.#appendToolResult(messages, call, result);
+          return undefined;
+        }
+      }
+    }
+    // Reject known-invalid Todo CAS before asking; execution rechecks after the decision.
+    if (call.name === "update_todo" && this.#plan === undefined) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(call.argumentsJson);
+      } catch {
+        parsed = undefined;
+      }
+      const input = updateTodoInputV1Schema.safeParse(parsed);
+      if (input.success) {
+        const preflight = updateTodoMutationV1(this.#todo, input.data);
+        if (preflight.status === "failed") {
+          toolResultsById.set(call.id, { call, result: preflight });
+          await this.#appendToolResult(messages, call, preflight);
           return undefined;
         }
       }
@@ -4232,7 +4255,11 @@ export class AgentSession {
       this.#publish(event);
       return;
     }
-    if (event.type !== "model_message_delta" && event.type !== "model_reasoning_updated") {
+    if (
+      event.type !== "model_message_delta" &&
+      event.type !== "model_reasoning_updated" &&
+      event.type !== "model_tool_arguments_started"
+    ) {
       const canonicalEvent: CanonicalRuntimeEvent = event;
       const runId = this.#activeRunId;
       if (runId === undefined) {

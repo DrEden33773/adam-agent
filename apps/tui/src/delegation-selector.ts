@@ -41,8 +41,8 @@ export class DelegationSelector implements Component {
         envelope: ManagedDelegationEnvelope,
         context: ManagedDelegationContext,
         skills: readonly string[],
-      ) => void;
-      readonly onCancel: () => void;
+      ) => void | Promise<void>;
+      readonly onCancel: () => void | Promise<void>;
       readonly onContext?: (
         context: ManagedDelegationContext,
         skills: readonly string[],
@@ -240,7 +240,7 @@ export class DelegationSelector implements Component {
       this.options.theme.editor.selectList,
     );
     list.onCancel = () => {
-      if (this.#page === "review") this.options.onCancel();
+      if (this.#page === "review") this.#decide(false);
       else {
         this.#page = "review";
         this.#list = this.#createList();
@@ -248,9 +248,8 @@ export class DelegationSelector implements Component {
     };
     list.onSelect = (item) => {
       if (this.#page === "review") {
-        if (item.value === "confirm")
-          this.options.onConfirm(this.#envelope, this.#context, this.#skills);
-        else if (item.value === "cancel") this.options.onCancel();
+        if (item.value === "confirm") this.#decide(true);
+        else if (item.value === "cancel") this.#decide(false);
         else if (item.value === "description") {
           this.#descriptionInput = new Input();
           this.#descriptionInput.setValue(this.#description);
@@ -384,6 +383,24 @@ export class DelegationSelector implements Component {
       }
     };
     return list;
+  }
+  #decide(allow: boolean): void {
+    this.#pending = true;
+    this.#notice = allow ? "Submitting allow decision…" : "Submitting deny decision…";
+    this.options.onChange?.();
+    void Promise.resolve()
+      .then(() =>
+        allow
+          ? this.options.onConfirm(this.#envelope, this.#context, this.#skills)
+          : this.options.onCancel(),
+      )
+      .catch((error: unknown) => {
+        this.#notice = error instanceof Error ? error.message : "The decision could not be saved.";
+      })
+      .finally(() => {
+        this.#pending = false;
+        this.options.onChange?.();
+      });
   }
   #updateContext(
     context: ManagedDelegationContext,

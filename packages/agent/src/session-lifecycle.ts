@@ -51,6 +51,7 @@ import {
   withInternalExtensionSkillSourcesCurrent,
 } from "./extension-host.js";
 import { resolveFleetPolicy } from "./fleet-ledger.js";
+import { isDeeplyImmutable } from "./immutable-value.js";
 import {
   InputResourceError,
   type InputResourceOccurrenceV1,
@@ -3006,11 +3007,24 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     mcpIdleTimers.set(sessionId, { generationId, cancel: scheduled.cancel });
   };
 
+  const validatedHistories = new WeakSet<readonly SessionRecord[]>();
+  const validatedPromptPrefixes = new WeakMap<
+    SessionRecord,
+    {
+      readonly records: readonly SessionRecord[];
+      readonly inheritedMessages: string;
+    }
+  >();
+
   const inspectSession = async (
     input: { readonly sessionId: string },
     artifactCache = createArtifactMaterializationCache(),
+    suppliedRecords?: readonly SessionRecord[],
   ): Promise<SessionSnapshot> => {
-    const records = await storeDirectory.open(input.sessionId).then((store) => store?.read() ?? []);
+    const records: readonly SessionRecord[] =
+      suppliedRecords === undefined
+        ? await storeDirectory.open(input.sessionId).then((store) => store?.read() ?? [])
+        : suppliedRecords;
     const first = records[0];
     if (first === undefined) {
       throw new SessionLifecycleError("session_not_found");
@@ -3034,7 +3048,10 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     if (first.record.projectId !== projectId) {
       throw new SessionLifecycleError("session_project_mismatch");
     }
-    validateCurrentSessionHistory(first, records, options.workspaceRoot);
+    if (!validatedHistories.has(records)) {
+      validateCurrentSessionHistory(first, records, options.workspaceRoot);
+      if (isDeeplyImmutable(records)) validatedHistories.add(records);
+    }
     await lineage.validateSessionLineage(first, records);
     await validateMcpAuthorityFromLineage(lineage, first, records);
     const planTools = records.some(
@@ -3067,6 +3084,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         first,
         artifactInspection.records,
         artifactCache,
+        { rawRecords: records, cache: validatedPromptPrefixes },
       );
     }
     const replayRecords =
@@ -3336,6 +3354,36 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         message: "Legacy session history can be inspected but cannot be resumed safely.",
       },
     };
+  };
+
+  const pendingTodoReads = new Map<
+    string,
+    Promise<ReturnType<typeof todoStoreSnapshotFromRecordsV1>>
+  >();
+  const inspectTodos = (sessionId: string) => {
+    const pending = pendingTodoReads.get(sessionId);
+    if (pending !== undefined) return pending;
+    const operation = (async () => {
+      await prepareSessionInspection(sessionId);
+      const records = await readSessionRecords(options, sessionId);
+      const snapshot = await inspectSession(
+        { sessionId },
+        createArtifactMaterializationCache(),
+        records,
+      );
+      if (snapshot.schemaVersion !== 3 || snapshot.todo === undefined) {
+        throw new SessionLifecycleError("session_todo_unavailable");
+      }
+      const currentRecords = await readSessionRecords(options, sessionId);
+      if (currentRecords !== records) {
+        await inspectSession({ sessionId }, createArtifactMaterializationCache(), currentRecords);
+      }
+      return todoStoreSnapshotFromRecordsV1(currentRecords);
+    })().finally(() => {
+      if (pendingTodoReads.get(sessionId) === operation) pendingTodoReads.delete(sessionId);
+    });
+    pendingTodoReads.set(sessionId, operation);
+    return operation;
   };
 
   const prepareSessionInspection = async (sessionId: string): Promise<void> => {
@@ -6199,26 +6247,14 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       return inspectSessionContextUsage(input);
     },
     async getTodo(input) {
-      await prepareSessionInspection(input.sessionId);
-      const snapshot = await inspectSession({ sessionId: input.sessionId });
-      if (snapshot.schemaVersion !== 3 || snapshot.todo === undefined) {
-        throw new SessionLifecycleError("session_todo_unavailable");
-      }
-      const records = await readSessionRecords(options, input.sessionId);
-      const todo = todoStoreSnapshotFromRecordsV1(records);
+      const todo = await inspectTodos(input.sessionId);
       if (todo.storeRevision !== input.expectedStoreRevision) {
         return { status: "stale" };
       }
       return getTodoV1(todo, { id: input.id });
     },
     async listTodos(input) {
-      await prepareSessionInspection(input.sessionId);
-      const snapshot = await inspectSession({ sessionId: input.sessionId });
-      if (snapshot.schemaVersion !== 3 || snapshot.todo === undefined) {
-        throw new SessionLifecycleError("session_todo_unavailable");
-      }
-      const records = await readSessionRecords(options, input.sessionId);
-      const todo = todoStoreSnapshotFromRecordsV1(records);
+      const todo = await inspectTodos(input.sessionId);
       if (todo.storeRevision !== input.expectedStoreRevision) {
         return { status: "stale" };
       }
@@ -7531,11 +7567,34 @@ async function validatePromptProjectionDigests(
   genesis: SessionGenesisRecord,
   records: readonly SessionRecord[],
   artifactCache: ModelResponseArtifactCache,
+  reuse?: {
+    readonly rawRecords: readonly SessionRecord[];
+    readonly cache: WeakMap<
+      SessionRecord,
+      {
+        readonly records: readonly SessionRecord[];
+        readonly inheritedMessages: string;
+      }
+    >;
+  },
 ): Promise<void> {
   if (genesis.record.promptContext === undefined) {
     return;
   }
   const inheritedMessages = await createBranchMessages(options, lineage, records, artifactCache);
+  const inheritedIdentity = JSON.stringify(inheritedMessages);
+  const rawRecords = reuse?.rawRecords;
+  const rawGenesis = rawRecords?.[0];
+  const previous = rawGenesis === undefined ? undefined : reuse?.cache.get(rawGenesis);
+  let verifiedPrefix = 0;
+  if (previous?.inheritedMessages === inheritedIdentity && rawRecords !== undefined) {
+    while (
+      verifiedPrefix < previous.records.length &&
+      previous.records[verifiedPrefix] === rawRecords[verifiedPrefix]
+    ) {
+      verifiedPrefix += 1;
+    }
+  }
   for (const entry of records) {
     if (
       entry.schemaVersion !== 3 ||
@@ -7551,6 +7610,8 @@ async function validatePromptProjectionDigests(
     }
     const skillContext = skillContextRecordFromRecords(genesis, prefix);
     const activeSkillContents = await materializeActiveSkillContents(options, skillContext);
+    // Artifact availability is checked even for a previously verified request.
+    if (entry.sequence <= verifiedPrefix) continue;
     const ownMessages = modelMessagesFromCompleteRecords(
       entry.record.managedAgentDeliveryVersion === 3 ? [...prefix, entry] : prefix,
     );
@@ -7625,6 +7686,14 @@ async function validatePromptProjectionDigests(
     ) {
       throw new SessionLifecycleError("session_invalid");
     }
+  }
+  if (
+    reuse !== undefined &&
+    rawGenesis !== undefined &&
+    rawRecords !== undefined &&
+    isDeeplyImmutable(rawRecords)
+  ) {
+    reuse.cache.set(rawGenesis, { records: rawRecords, inheritedMessages: inheritedIdentity });
   }
 }
 
