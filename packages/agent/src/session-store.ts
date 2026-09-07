@@ -1131,24 +1131,61 @@ export interface SessionStoreDirectory<RecordType extends SessionRecord = Sessio
   open(sessionId: string): Promise<SessionStore<RecordType> | undefined>;
 }
 
+export const sessionLogFileSystem = Symbol("adam-agent.session-log-file-system");
+export type SessionLogFile = {
+  chmod(mode: number): Promise<void>;
+  writeFile(data: string, encoding: "utf8"): Promise<void>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
+};
+export type SessionLogFileSystem = { openAppend(path: string): Promise<SessionLogFile> };
+const nativeSessionLogFileSystem: SessionLogFileSystem = {
+  openAppend: (path) => open(path, "a", 0o600),
+};
+
+export type SessionStoreAppendFailure = {
+  readonly category: "encoding_rejected" | "storage_io_failed" | "append_outcome_uncertain";
+  readonly stage: "admission" | "open" | "permissions" | "write" | "sync" | "close";
+  readonly writeOutcome: "not_written" | "committed" | "uncertain";
+  readonly reason:
+    | "invalid_record"
+    | "size_limit"
+    | "sequence_mismatch"
+    | "permission_denied"
+    | "storage_full"
+    | "read_only"
+    | "unavailable"
+    | "io_error";
+};
+
 export class SessionStoreError extends Error {
-  readonly code: "session_log_exists" | "session_log_invalid" | "session_log_too_large";
+  readonly appendFailure?: SessionStoreAppendFailure;
+  readonly code:
+    | "session_log_exists"
+    | "session_log_invalid"
+    | "session_log_too_large"
+    | "session_log_io_failed";
 
   constructor(
     code:
       | "session_log_exists"
       | "session_log_invalid"
-      | "session_log_too_large" = "session_log_invalid",
+      | "session_log_too_large"
+      | "session_log_io_failed" = "session_log_invalid",
+    appendFailure?: SessionStoreAppendFailure,
   ) {
     super(
       code === "session_log_exists"
         ? "The session log already exists."
         : code === "session_log_too_large"
           ? "The session log exceeds its read limit."
-          : "The session log contains an invalid record.",
+          : code === "session_log_io_failed"
+            ? "The session log could not be written."
+            : "The session log contains an invalid record.",
     );
     this.name = "SessionStoreError";
     this.code = code;
+    if (appendFailure !== undefined) this.appendFailure = appendFailure;
   }
 }
 
@@ -3253,6 +3290,59 @@ export function isSessionRecordWithinSizeLimit(record: SessionRecord): boolean {
   return Buffer.byteLength(JSON.stringify(record), "utf8") <= maxSessionRecordBytes;
 }
 
+function admitSessionRecordBatch(
+  batch: readonly SessionRecord[],
+  nextSequence: number,
+  storedBytes: number,
+) {
+  try {
+    const validated = batch.map((record) => validateBoundedSessionEventRecord(record));
+    let expectedSequence = nextSequence;
+    let aggregateBytes = 0;
+    for (const entry of validated) {
+      if (entry.record.sequence !== expectedSequence)
+        throw new SessionStoreError("session_log_invalid", {
+          category: "encoding_rejected",
+          stage: "admission",
+          writeOutcome: "not_written",
+          reason: "sequence_mismatch",
+        });
+      expectedSequence += 1;
+      aggregateBytes += entry.storedByteLength;
+    }
+    if (storedBytes + aggregateBytes > maxSessionLogBytes)
+      throw new SessionStoreError("session_log_too_large");
+    return { validated, expectedSequence, aggregateBytes };
+  } catch (error) {
+    if (error instanceof SessionStoreError && error.appendFailure !== undefined) throw error;
+    const code = error instanceof SessionStoreError ? error.code : "session_log_invalid";
+    throw new SessionStoreError(code, {
+      category: "encoding_rejected",
+      stage: "admission",
+      writeOutcome: "not_written",
+      reason: code === "session_log_too_large" ? "size_limit" : "invalid_record",
+    });
+  }
+}
+
+function storageFailureReason(error: unknown): SessionStoreAppendFailure["reason"] {
+  try {
+    const code =
+      error !== null && typeof error === "object" && "code" in error ? error.code : undefined;
+    return code === "EACCES" || code === "EPERM"
+      ? "permission_denied"
+      : code === "ENOSPC" || code === "EDQUOT"
+        ? "storage_full"
+        : code === "EROFS"
+          ? "read_only"
+          : code === "ENOENT" || code === "EMFILE" || code === "ENFILE"
+            ? "unavailable"
+            : "io_error";
+  } catch {
+    return "io_error";
+  }
+}
+
 export function createInMemorySessionStore<
   RecordType extends SessionRecord = SessionRecord,
 >(): SessionStore<RecordType> {
@@ -3260,19 +3350,11 @@ export function createInMemorySessionStore<
   let nextSequence = 1;
   let storedBytes = 0;
   const appendBatch = async (batch: readonly RecordType[]): Promise<void> => {
-    const validated = batch.map((record) => validateBoundedSessionEventRecord(record));
-    let expectedSequence = nextSequence;
-    let aggregateBytes = 0;
-    for (const entry of validated) {
-      if (entry.record.sequence !== expectedSequence) {
-        throw new SessionStoreError();
-      }
-      expectedSequence += 1;
-      aggregateBytes += entry.storedByteLength;
-    }
-    if (storedBytes + aggregateBytes > maxSessionLogBytes) {
-      throw new SessionStoreError("session_log_too_large");
-    }
+    const { validated, expectedSequence, aggregateBytes } = admitSessionRecordBatch(
+      batch,
+      nextSequence,
+      storedBytes,
+    );
     records.push(...validated.map((entry) => entry.record as RecordType));
     nextSequence = expectedSequence;
     storedBytes += aggregateBytes;
@@ -3357,6 +3439,7 @@ export function createJsonlSessionStoreDirectory<
 >(options: {
   readonly workspaceRoot: string;
   readonly stateRoot?: string;
+  readonly [sessionLogFileSystem]?: SessionLogFileSystem;
 }): SessionStoreDirectory<RecordType> {
   return {
     async byteLength(sessionId) {
@@ -3438,7 +3521,12 @@ export function createJsonlSessionStoreDirectory<
       if (log === undefined || log.records.length === 0) {
         return undefined;
       }
-      return createJsonlStore<RecordType>(sessionPath, log.records.length + 1, log.storedBytes);
+      return createJsonlStore<RecordType>(
+        sessionPath,
+        log.records.length + 1,
+        log.storedBytes,
+        options[sessionLogFileSystem],
+      );
     },
   };
 }
@@ -3449,6 +3537,7 @@ export async function createJsonlSessionStore<
   readonly workspaceRoot: string;
   readonly sessionId: string;
   readonly stateRoot?: string;
+  readonly [sessionLogFileSystem]?: SessionLogFileSystem;
 }): Promise<SessionStore<RecordType>> {
   validateSessionId(options.sessionId);
 
@@ -3473,7 +3562,7 @@ export async function createJsonlSessionStore<
     }
     throw error;
   }
-  return createJsonlStore(sessionPath, 1, 0);
+  return createJsonlStore(sessionPath, 1, 0, options[sessionLogFileSystem]);
 }
 
 export async function openJsonlSessionStore<
@@ -3482,6 +3571,7 @@ export async function openJsonlSessionStore<
   readonly workspaceRoot: string;
   readonly sessionId: string;
   readonly stateRoot?: string;
+  readonly [sessionLogFileSystem]?: SessionLogFileSystem;
 }): Promise<SessionStore<RecordType>> {
   validateSessionId(options.sessionId);
   const sessionPath = await resolveSessionPath(options);
@@ -3489,46 +3579,71 @@ export async function openJsonlSessionStore<
   if (log === undefined || log.records.length === 0) {
     throw new SessionStoreError();
   }
-  return createJsonlStore<RecordType>(sessionPath, log.records.length + 1, log.storedBytes);
+  return createJsonlStore<RecordType>(
+    sessionPath,
+    log.records.length + 1,
+    log.storedBytes,
+    options[sessionLogFileSystem],
+  );
 }
 
 function createJsonlStore<RecordType extends SessionRecord>(
   sessionPath: string,
   initialNextSequence: number,
   initialStoredBytes: number,
+  fileSystem: SessionLogFileSystem = nativeSessionLogFileSystem,
 ): SessionStore<RecordType> {
   let nextSequence = initialNextSequence;
   let storedBytes = initialStoredBytes;
   let appendQueue = Promise.resolve();
+  let uncertainWrite = false;
 
   const appendBatch = (batch: readonly RecordType[]): Promise<void> => {
     const operation = appendQueue.then(async () => {
-      const validated = batch.map((record) => validateBoundedSessionEventRecord(record));
-      let expectedSequence = nextSequence;
-      let aggregateBytes = 0;
-      for (const entry of validated) {
-        if (entry.record.sequence !== expectedSequence) {
-          throw new SessionStoreError();
-        }
-        expectedSequence += 1;
-        aggregateBytes += entry.storedByteLength;
-      }
-      if (storedBytes + aggregateBytes > maxSessionLogBytes) {
-        throw new SessionStoreError("session_log_too_large");
-      }
-      if (validated.length === 0) {
-        return;
-      }
-      const file = await open(sessionPath, "a", 0o600);
+      if (uncertainWrite)
+        throw new SessionStoreError("session_log_io_failed", {
+          category: "storage_io_failed",
+          stage: "admission",
+          writeOutcome: "not_written",
+          reason: "unavailable",
+        });
+      const { validated, expectedSequence, aggregateBytes } = admitSessionRecordBatch(
+        batch,
+        nextSequence,
+        storedBytes,
+      );
+      if (validated.length === 0) return;
+      const serialized = `${validated.map((entry) => entry.serialized).join("\n")}\n`;
+      let file: SessionLogFile | undefined;
+      let stage: SessionStoreAppendFailure["stage"] = "open";
+      let writeOutcome: SessionStoreAppendFailure["writeOutcome"] = "not_written";
       try {
+        file = await fileSystem.openAppend(sessionPath);
+        stage = "permissions";
         await file.chmod(0o600);
-        await file.writeFile(`${validated.map((entry) => entry.serialized).join("\n")}\n`, "utf8");
+        stage = "write";
+        writeOutcome = "uncertain";
+        await file.writeFile(serialized, "utf8");
+        stage = "sync";
         await file.sync();
-      } finally {
-        await file.close();
+        writeOutcome = "committed";
+        nextSequence = expectedSequence;
+        storedBytes += aggregateBytes;
+        stage = "close";
+        const closing = file;
+        file = undefined;
+        await closing.close();
+      } catch (error) {
+        if (writeOutcome === "uncertain") uncertainWrite = true;
+        // Close an opened handle once; cleanup must not replace the write failure.
+        if (file !== undefined) await file.close().catch(() => {});
+        throw new SessionStoreError("session_log_io_failed", {
+          category: writeOutcome === "uncertain" ? "append_outcome_uncertain" : "storage_io_failed",
+          stage,
+          writeOutcome,
+          reason: storageFailureReason(error),
+        });
       }
-      nextSequence = expectedSequence;
-      storedBytes += aggregateBytes;
     });
     appendQueue = operation.catch(() => {});
     return operation;

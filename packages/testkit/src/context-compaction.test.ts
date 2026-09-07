@@ -2497,6 +2497,18 @@ test("AgentSession never uses a compacted projection when checkpoint persistence
         code: "session_persistence_failed",
         message: "The session event could not be persisted.",
       },
+      executionFailure: {
+        category: "append_outcome_uncertain",
+        stage: "adapter",
+        phase: "session_metadata",
+        writeOutcome: "uncertain",
+        reason: "unknown",
+        sessionId: null,
+        runId: expect.any(String),
+        callId: null,
+        attemptedSequence: 14,
+        message: "Session write outcome uncertain. Inspect durable state before retrying.",
+      },
     });
     expect(requests).toHaveLength(2);
     expect(events.filter((event) => event.type.startsWith("context_compaction_"))).toEqual([
@@ -4820,7 +4832,19 @@ test("SessionLifecycle reports then normalizes a dangling compaction attempt aft
         sessionId: created.sessionId,
         input: { text: "Read context.txt before the process disappears." },
       }),
-    ).rejects.toThrow("simulated process loss during compaction");
+    ).resolves.toMatchObject({
+      result: {
+        status: "failed",
+        error: { code: "session_execution_failed" },
+        executionFailure: {
+          category: "execution_failed",
+          stage: "execution",
+          sessionId: created.sessionId,
+          message: "Execution stopped unexpectedly.",
+        },
+      },
+      snapshot: { status: "interrupted" },
+    });
 
     await expect(lifecycle.inspect({ sessionId: created.sessionId })).resolves.toMatchObject({
       status: "interrupted",

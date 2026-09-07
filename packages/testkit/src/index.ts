@@ -326,12 +326,13 @@ export function createSessionLifecycleForTesting(
   });
 }
 
-export function createInMemorySessionLifecycleHarness(): {
+export function createInMemorySessionLifecycleHarness(
+  directory: SessionStoreDirectory<SessionRecord> = createInMemorySessionStoreDirectory<SessionRecord>(),
+): {
   readonly acquireOwner: () => Promise<ProjectLifecycleOwnerLease>;
   readonly createLifecycle: (options: SessionLifecycleOptions) => SessionLifecycle;
   readonly sessions: SessionStoreDirectory<SessionRecord>;
 } {
-  const directory = createInMemorySessionStoreDirectory<SessionRecord>();
   const owner = createInMemoryProjectLifecycleOwner();
   let canonicalWorkspaceRoot: string | undefined;
   return {

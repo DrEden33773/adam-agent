@@ -1,6 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-
 import { z } from "zod";
 import { AgentSession, managedAgentRequestBoundary } from "./agent-session.js";
 import type {
@@ -12,6 +11,7 @@ import type {
 } from "./agent-session-contracts.js";
 import type { ArtifactReference, ArtifactStore } from "./artifact-store.js";
 import type { ContextProfile } from "./context-profile.js";
+import { SessionExecutionError } from "./execution-failure.js";
 import {
   researchManagedAgentProfileV1,
   researchManagedAgentProfileV2,
@@ -21,6 +21,7 @@ import {
   scoutManagedAgentProfileV2,
 } from "./managed-agent-profiles.js";
 import type { ModelTargetIdentity } from "./model-targets.js";
+import { notifyObserver } from "./observer-notification.js";
 import type { ProjectExecutionRootClaim } from "./project-execution-domain.js";
 import {
   assemblePromptMessagesV1,
@@ -2860,7 +2861,7 @@ export function createAgentManager(options: {
         sequence: records.length + 1,
       });
       appended = true;
-      options.onManagedAgentStateChanged?.();
+      notifyObserver(() => options.onManagedAgentStateChanged?.());
     });
     appendQueue = operation.catch(() => undefined);
     await operation;
@@ -2977,7 +2978,7 @@ export function createAgentManager(options: {
         continue;
       }
       activeChildPermissionRequestId = next.requestId;
-      options.onChildPermissionEvent?.(next);
+      notifyObserver(() => options.onChildPermissionEvent?.(next));
       return;
     }
   };
@@ -2997,7 +2998,7 @@ export function createAgentManager(options: {
       childPermissionSessions.delete(event.requestId);
       childPermissionRequests.delete(event.requestId);
       activeChildPermissionRequestId = undefined;
-      options.onChildPermissionEvent?.(event);
+      notifyObserver(() => options.onChildPermissionEvent?.(event));
       publishNextChildPermission();
     }
   };
@@ -4094,7 +4095,9 @@ export function createAgentManager(options: {
       const child = new AgentSession(childDependencies);
       ownedChild = child;
       unsubscribeChildPermissions = child.subscribe((event) => {
-        options.onChildRuntimeEvent?.({ agentId, attemptId, childSessionId, event });
+        notifyObserver(() =>
+          options.onChildRuntimeEvent?.({ agentId, attemptId, childSessionId, event }),
+        );
         observeChildPermissionEvent(child, event);
         if (event.type === "model_message_started" || event.type === "model_message_completed") {
           resetPartialOutput();
@@ -4163,6 +4166,7 @@ export function createAgentManager(options: {
           },
         },
       );
+      if ("executionFailure" in result) throw new SessionExecutionError(result.executionFailure);
       if (terminalCommitted) {
         return toolFailure(
           "managed_agent_unavailable",
@@ -4438,19 +4442,21 @@ export function createAgentManager(options: {
           childPermissionSessions.delete(requestId);
           childPermissionRequests.delete(requestId);
           if (surfaced && request !== undefined) {
-            options.onChildPermissionEvent?.({
-              type: "tool_permission_decided",
-              callId: request.callId,
-              name: request.name,
-              decision: "deny",
-              requestId,
-              effect: request.effect,
-              scope: request.scope,
-              subject: request.subject,
-              ...(request.changePreviewRef === undefined
-                ? {}
-                : { changePreviewRef: request.changePreviewRef }),
-            });
+            notifyObserver(() =>
+              options.onChildPermissionEvent?.({
+                type: "tool_permission_decided",
+                callId: request.callId,
+                name: request.name,
+                decision: "deny",
+                requestId,
+                effect: request.effect,
+                scope: request.scope,
+                subject: request.subject,
+                ...(request.changePreviewRef === undefined
+                  ? {}
+                  : { changePreviewRef: request.changePreviewRef }),
+              }),
+            );
           }
         }
       }

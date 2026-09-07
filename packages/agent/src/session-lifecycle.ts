@@ -38,6 +38,13 @@ import {
   maximumReferencedModelResponseArtifactBytes,
 } from "./durable-model-response-policy.js";
 import {
+  type AgentExecutionResult,
+  ExecutionFailureSignal,
+  executionFailureResult,
+  persistenceFailure,
+  SessionExecutionError,
+} from "./execution-failure.js";
+import {
   type ExtensionHost,
   loadInternalExtensionSkillSources,
   projectExecutionDomainForExtensionHost,
@@ -106,6 +113,7 @@ import {
   modelTargetUsesContextProfile,
   sameModelTargetIdentity,
 } from "./model-targets.js";
+import { notifyObserver } from "./observer-notification.js";
 import {
   isLargePastedTextV1,
   pastedTextMetricsV1,
@@ -543,7 +551,7 @@ function managedAgentToolsVersion(profile: ManagedAgentToolsProfile | undefined)
 type WebEvidenceProfileV1 = NonNullable<SessionGenesisRecord["record"]["webEvidence"]>;
 
 export type SessionContinueResult = {
-  readonly result: RunResult;
+  readonly result: AgentExecutionResult;
   readonly snapshot: CurrentSessionSnapshot;
 };
 
@@ -1123,16 +1131,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
   const managedAgentEventListeners = new Set<ManagedAgentRuntimeEventListener>();
   const publishManagedAgentNotification = (notification: ManagedAgentNotification): void => {
     for (const listener of managedAgentEventListeners) {
-      try {
-        listener(notification);
-      } catch {
-        // Presentation observers cannot change durable managed-child outcomes.
-      }
+      notifyObserver(() => listener(notification));
     }
   };
   const metadataListeners = new Set<SessionMetadataListener>();
   let activeSession: AgentSession | undefined;
-  let activeSessionSettlement: Promise<void> | undefined;
+  let activeSessionSettlement: Promise<boolean> | undefined;
   let lifecycleClosing = false;
   let automaticTitlesEnabled = options[sessionAutomaticTitlesEnabled] ?? true;
   let lifecycleClosePromise: Promise<McpCloseResult> | undefined;
@@ -2368,7 +2372,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             parentCoordination: { interactive: () => managedAgentEventListeners.size > 0 },
             onChildPermissionEvent(event: RuntimeEvent) {
               for (const listener of listeners) {
-                listener(event);
+                notifyObserver(() => listener(event));
               }
               publishManagedAgentNotification({
                 type: "runtime_event",
@@ -2842,19 +2846,23 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           if (existingClosedServers.has(server.serverId)) {
             continue;
           }
-          await store.append({
-            schemaVersion: 3,
-            sequence: nextSequence,
-            record: {
-              type: "mcp_server_closed",
-              recordVersion: 1,
-              generationId: change.generationId,
-              attempt: change.attempt,
-              serverId: server.serverId,
-              definitionDigest: server.definitionDigest,
-              reason: "stale",
+          await appendRecoveryRecord(
+            store,
+            {
+              schemaVersion: 3,
+              sequence: nextSequence,
+              record: {
+                type: "mcp_server_closed",
+                recordVersion: 1,
+                generationId: change.generationId,
+                attempt: change.attempt,
+                serverId: server.serverId,
+                definitionDigest: server.definitionDigest,
+                reason: "stale",
+              },
             },
-          });
+            sessionId,
+          );
           existingClosedServers.add(server.serverId);
           nextSequence += 1;
         }
@@ -2865,19 +2873,23 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         change.catalogDigest,
       );
       if (!staleServers.has(change.serverId)) {
-        await store.append({
-          schemaVersion: 3,
-          sequence: nextSequence,
-          record: {
-            type: "mcp_catalog_state_changed",
-            recordVersion: 1,
-            generationId: change.generationId,
-            serverId: change.serverId,
-            catalogDigest: change.catalogDigest,
-            status: "stale",
-            reason: change.reason,
+        await appendRecoveryRecord(
+          store,
+          {
+            schemaVersion: 3,
+            sequence: nextSequence,
+            record: {
+              type: "mcp_catalog_state_changed",
+              recordVersion: 1,
+              generationId: change.generationId,
+              serverId: change.serverId,
+              catalogDigest: change.catalogDigest,
+              status: "stale",
+              reason: change.reason,
+            },
           },
-        });
+          sessionId,
+        );
         nextSequence += 1;
       }
       try {
@@ -2912,7 +2924,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     const runningSession = activeSessionSettlement;
     const configurationOperations = [...activeMcpConfigurationOperations.values()];
     const operation = (async () => {
-      await runningSession;
+      if ((await runningSession) === false) return;
       await Promise.allSettled(configurationOperations);
       await runWithOwner(() => flushPendingMcpCatalogChanges(sessionId));
     })();
@@ -4419,15 +4431,34 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             );
             const sequence = resumed.snapshot.lastSequence + 1;
             const approvalStore = await openSessionStore(options, input.sessionId);
-            await approvalStore.append({
+            const approvalRecord: SessionRecord = {
               schemaVersion: 3,
               sequence,
               record: { type: "plan_approval_intent", recordVersion: 1, ...planApproval },
-            });
-            await options[planApprovalIntentBarrier]?.afterDurableRecord({
-              ...planApproval,
-              sequence,
-            });
+            };
+            await appendRecoveryRecord(approvalStore, approvalRecord, input.sessionId);
+            try {
+              await options[planApprovalIntentBarrier]?.afterDurableRecord({
+                ...planApproval,
+                sequence,
+              });
+            } catch {
+              throw new SessionExecutionError(
+                executionFailureResult(
+                  new ExecutionFailureSignal(
+                    {
+                      category: "execution_failed",
+                      stage: "barrier",
+                      writeOutcome: "committed",
+                      reason: "unknown",
+                    },
+                    approvalRecord,
+                  ),
+                  input.sessionId,
+                  planApproval.kickoffRunId,
+                ).executionFailure,
+              );
+            }
           } else {
             if (input.planApproval.commandId !== currentPlan.approval.commandId) {
               throw new SessionLifecycleError("session_invalid");
@@ -5107,7 +5138,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
                         },
                         onChildPermissionEvent(event) {
                           for (const listener of listeners) {
-                            listener(event);
+                            notifyObserver(() => listener(event));
                           }
                           publishManagedAgentNotification({
                             type: "runtime_event",
@@ -5146,19 +5177,22 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         agentManager?.rebindResearchContext(researchContext);
         await agentManager?.snapshot();
         const session = new AgentSession(sessionDependencies);
-        let resolveSessionSettlement = () => {};
-        const sessionSettlement = new Promise<void>((resolve) => {
+        let allowMetadataFlush = false;
+        let observedRunId = effectiveRunId;
+        let resolveSessionSettlement = (_allowMetadata: boolean) => {};
+        const sessionSettlement = new Promise<boolean>((resolve) => {
           resolveSessionSettlement = resolve;
         });
         const unsubscribe = session.subscribe((event) => {
           for (const listener of listeners) {
-            listener(event);
+            notifyObserver(() => listener(event));
           }
         });
         const unsubscribeNotifications = session.subscribeNotifications((notification) => {
           if (notification.sessionId === null || notification.runId === null) {
             return;
           }
+          observedRunId = notification.runId;
           const sessionNotification: SessionRuntimeNotification = {
             ...notification,
             sessionId: notification.sessionId,
@@ -5169,7 +5203,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
           ) ?? [sessionNotification];
           for (const notification of projected) {
             for (const listener of sessionEventListeners) {
-              listener(notification);
+              notifyObserver(() => listener(notification));
             }
           }
         });
@@ -5184,17 +5218,32 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
             ...(input.signal === undefined ? {} : { signal: input.signal }),
             ...(runLimits === undefined ? {} : { limits: runLimits }),
           });
-          await flushPendingMcpCatalogChanges(input.sessionId);
-          const snapshot = await inspectSession({ sessionId: input.sessionId }, artifactCache);
-          if (snapshot.schemaVersion !== 3) {
-            throw new SessionLifecycleError("session_invalid");
+          try {
+            if (!("executionFailure" in result))
+              await flushPendingMcpCatalogChanges(input.sessionId);
+            const snapshot = await inspectSession({ sessionId: input.sessionId }, artifactCache);
+            if (snapshot.schemaVersion !== 3) throw new SessionLifecycleError("session_invalid");
+            allowMetadataFlush = !("executionFailure" in result);
+            return { result, snapshot };
+          } catch (error) {
+            if ("executionFailure" in result)
+              throw new SessionExecutionError(result.executionFailure);
+            if (error instanceof SessionExecutionError) throw error;
+            if (error instanceof SessionLifecycleError)
+              throw new SessionLifecycleError(
+                error.code,
+                error.supportedLevelIds,
+                executionFailureResult(error, input.sessionId, observedRunId).executionFailure,
+              );
+            throw new SessionExecutionError(
+              executionFailureResult(error, input.sessionId, observedRunId).executionFailure,
+            );
           }
-          return { result, snapshot };
         } finally {
           if (!isLongLivedManagedAgentTools(first.record.managedAgentTools)) {
             activeAgentManagers.delete(input.sessionId);
           }
-          resolveSessionSettlement();
+          resolveSessionSettlement(allowMetadataFlush);
           if (activeSession === session) {
             activeSession = undefined;
           }
@@ -6674,7 +6723,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         await appendDanglingAttemptInterruption(options, snapshot);
         const records = await readSessionRecords(options, input.sessionId);
         const store = await openSessionStore(options, input.sessionId);
-        await appendInterruptedToolCancellation(records, store, input.runId);
+        await appendInterruptedToolCancellation(records, store, input.runId, input.sessionId);
         snapshot = await inspectSession(input);
         if (snapshot.schemaVersion !== 3) throw new SessionLifecycleError("session_invalid");
         await settleInterruptedCancellation(options, snapshot);
@@ -7612,6 +7661,28 @@ async function modelResponseTargetsFromBranchContext(
   return [...(await modelResponseTargetsFromBranchContext(lineage, parentRecords)), ...ownTargets];
 }
 
+async function appendRecoveryRecord(
+  store: SessionStore<SessionRecord>,
+  record: SessionRecord,
+  sessionId: string,
+): Promise<void> {
+  try {
+    await store.append(record);
+  } catch (error) {
+    const runId =
+      record.schemaVersion === 3
+        ? record.record.type === "plan_approval_intent"
+          ? record.record.kickoffRunId
+          : "runId" in record.record
+            ? record.record.runId
+            : undefined
+        : record.runId;
+    throw new SessionExecutionError(
+      executionFailureResult(persistenceFailure(error, record), sessionId, runId).executionFailure,
+    );
+  }
+}
+
 async function appendDanglingAttemptInterruption(
   options: SessionLifecycleOptions,
   snapshot: CurrentSessionSnapshot,
@@ -7636,6 +7707,7 @@ async function appendDanglingAttemptInterruption(
   }
   const attemptRecord = attempt.record;
   const store = await openSessionStore(options, snapshot.sessionId);
+  const append = (record: SessionRecord) => appendRecoveryRecord(store, record, snapshot.sessionId);
   let nextSequence = records.length + 1;
   const reasoningId = `${attemptRecord.turn}:${attemptRecord.attempt}:provider-reasoning-0`;
   const reasoningStarted = currentRecords.findLast(
@@ -7655,7 +7727,7 @@ async function appendDanglingAttemptInterruption(
       record.record.event.id === reasoningId,
   );
   if (reasoningStarted !== undefined && !reasoningSettled) {
-    await store.append({
+    await append({
       schemaVersion: 3,
       sequence: nextSequence,
       record: {
@@ -7666,7 +7738,7 @@ async function appendDanglingAttemptInterruption(
     });
     nextSequence += 1;
   }
-  await store.append({
+  await append({
     schemaVersion: 3,
     sequence: nextSequence,
     record: {
@@ -7705,7 +7777,8 @@ async function appendDanglingContextCompactionInterruption(
     return false;
   }
   const store = await openSessionStore(options, snapshot.sessionId);
-  await store.append({
+  const append = (record: SessionRecord) => appendRecoveryRecord(store, record, snapshot.sessionId);
+  await append({
     schemaVersion: 3,
     sequence: records.length + 1,
     record: {
@@ -7745,15 +7818,19 @@ async function appendMissingUserMessage(
     return false;
   }
   const store = await openSessionStore(options, snapshot.sessionId);
-  await store.append({
-    schemaVersion: 3,
-    sequence: records.length + 1,
-    record: {
-      type: "runtime_event",
-      runId,
-      event: { type: "user_message", text: userMessage },
+  await appendRecoveryRecord(
+    store,
+    {
+      schemaVersion: 3,
+      sequence: records.length + 1,
+      record: {
+        type: "runtime_event",
+        runId,
+        event: { type: "user_message", text: userMessage },
+      },
     },
-  });
+    snapshot.sessionId,
+  );
   return true;
 }
 
@@ -7787,6 +7864,7 @@ async function settleRunTerminalIntent(
     return false;
   }
   const store = await openSessionStore(options, snapshot.sessionId);
+  const append = (record: SessionRecord) => appendRecoveryRecord(store, record, snapshot.sessionId);
   let nextSequence = records.length + 1;
   const hasCancellationEvent = currentRecords.some(
     (record) =>
@@ -7795,7 +7873,7 @@ async function settleRunTerminalIntent(
       record.record.event.type === "session_interrupted",
   );
   if (intent.record.result.status === "cancelled" && !hasCancellationEvent) {
-    await store.append({
+    await append({
       schemaVersion: 3,
       sequence: nextSequence,
       record: {
@@ -7806,7 +7884,7 @@ async function settleRunTerminalIntent(
     });
     nextSequence += 1;
   }
-  await store.append({
+  await append({
     schemaVersion: 3,
     sequence: nextSequence,
     record: {
@@ -7884,10 +7962,11 @@ async function settleIndeterminateToolEffects(
     return false;
   }
   const store = await openSessionStore(options, snapshot.sessionId);
+  const append = (record: SessionRecord) => appendRecoveryRecord(store, record, snapshot.sessionId);
   let nextSequence = records.length + 1;
   for (const call of indeterminateCalls) {
     if (!call.requested) {
-      await store.append({
+      await append({
         schemaVersion: 3,
         sequence: nextSequence,
         record: {
@@ -7899,7 +7978,7 @@ async function settleIndeterminateToolEffects(
       nextSequence += 1;
     }
     const message = indeterminateToolMessage(call);
-    await store.append({
+    await append({
       schemaVersion: 3,
       sequence: nextSequence,
       record: {
@@ -7919,7 +7998,7 @@ async function settleIndeterminateToolEffects(
     });
     nextSequence += 1;
   }
-  await store.append({
+  await append({
     schemaVersion: 3,
     sequence: nextSequence,
     record: {
@@ -7969,7 +8048,8 @@ async function settleInterruptedCancellation(
     return false;
   }
   const store = await openSessionStore(options, snapshot.sessionId);
-  await store.append({
+  const append = (record: SessionRecord) => appendRecoveryRecord(store, record, snapshot.sessionId);
+  await append({
     schemaVersion: 3,
     sequence: records.length + 1,
     record: {
@@ -8108,6 +8188,7 @@ async function settleCompletedResponseTerminal(
           }
         : { status: "completed", answer: responseText };
   const store = await openSessionStore(options, snapshot.sessionId);
+  const append = (record: SessionRecord) => appendRecoveryRecord(store, record, snapshot.sessionId);
   let nextSequence = records.length + 1;
   const responseWasPublished = currentRecords.some(
     (record) =>
@@ -8140,7 +8221,7 @@ async function settleCompletedResponseTerminal(
             event: { type: "model_message_completed", text: responseText },
           },
         };
-    await store.append(publicationRecord);
+    await append(publicationRecord);
     nextSequence += 1;
   }
   const settlementRecord: SessionRecord =
@@ -8167,7 +8248,7 @@ async function settleCompletedResponseTerminal(
             event: { type: "session_settled", result },
           },
         };
-  await store.append(settlementRecord);
+  await append(settlementRecord);
   return true;
 }
 
@@ -9699,7 +9780,9 @@ async function appendInterruptedToolCancellation(
   records: readonly SessionRecord[],
   store: SessionStore<SessionRecord>,
   runId: string,
+  sessionId: string,
 ): Promise<void> {
+  const append = (record: SessionRecord) => appendRecoveryRecord(store, record, sessionId);
   let sequence = records.length + 1;
   for (const entry of records) {
     if (
@@ -9723,7 +9806,7 @@ async function appendInterruptedToolCancellation(
       )
     )
       continue;
-    await store.append({
+    await append({
       schemaVersion: 3,
       sequence: sequence++,
       record: {
@@ -9742,7 +9825,7 @@ async function appendInterruptedToolCancellation(
       },
     });
   }
-  await store.append({
+  await append({
     schemaVersion: 3,
     sequence,
     record: {
@@ -9776,7 +9859,7 @@ export async function cancelManagedChildSessionRecords(input: {
   await appendDanglingAttemptInterruption(options, snapshot);
   const latest = await readSessionRecords(options, input.sessionId);
   const store = await openSessionStore(options, input.sessionId);
-  await appendInterruptedToolCancellation(latest, store, snapshot.run.runId);
+  await appendInterruptedToolCancellation(latest, store, snapshot.run.runId, input.sessionId);
   await settleInterruptedCancellation(options, snapshot);
   return readSessionRecords(options, input.sessionId);
 }

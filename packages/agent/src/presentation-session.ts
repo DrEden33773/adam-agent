@@ -37,6 +37,11 @@ import type { RuntimeEvent } from "./agent-session-contracts.js";
 import { readFileArtifact, readFileArtifactRange } from "./artifact-store.js";
 import { delegationMessages, resolveDelegationContext } from "./delegation-context.js";
 import { maximumModelResponseContentBytes } from "./durable-model-response-policy.js";
+import {
+  type AgentExecutionResult,
+  SessionExecutionError,
+  type SessionExecutionFailure,
+} from "./execution-failure.js";
 import type { ExtensionHost } from "./extension-host.js";
 import {
   createDelegationEnvelope,
@@ -52,6 +57,7 @@ import {
   type ModelTargets,
   sameModelTargetIdentity,
 } from "./model-targets.js";
+import { notifyObserver } from "./observer-notification.js";
 import type { OperationHost, OperationSnapshot } from "./operation-host.js";
 import {
   type ProjectedOperation,
@@ -693,17 +699,25 @@ export async function createPresentationSession(
       metadataThrough.set(`mcp_configuration_changed:${created.sessionId}`, created.lastSequence);
     }
     const listeners = new Set<() => void>();
+    let executionFailure: SessionExecutionFailure | undefined;
+    const captureExecutionResult = (result: AgentExecutionResult): void => {
+      if ("executionFailure" in result && result.executionFailure.sessionId !== null)
+        executionFailure = result.executionFailure;
+    };
+    const captureExecutionError = (error: unknown): void => {
+      if (
+        error instanceof SessionExecutionError ||
+        (error instanceof SessionLifecycleError && error.executionFailure !== undefined)
+      )
+        executionFailure = error.executionFailure;
+    };
     let closed = false;
     let controlObserver: AbortController | undefined;
     let controlObserverParent: string | undefined;
     let controlObservation = Promise.resolve();
     const publishStateChange = (): void => {
       for (const listener of listeners) {
-        try {
-          listener();
-        } catch {
-          // Presentation observers cannot change authoritative command or refresh outcomes.
-        }
+        notifyObserver(listener);
       }
     };
     const attentionMetadata = new Map<
@@ -1553,6 +1567,7 @@ export async function createPresentationSession(
         ? undefined
         : { sessionId: created.sessionId, throughSequence: created.lastSequence };
     const activateSnapshotNow = async (snapshot: CurrentSessionSnapshot): Promise<void> => {
+      if (executionFailure?.sessionId !== snapshot.sessionId) executionFailure = undefined;
       const selection = await options.lifecycle[sessionManagedTransition]({
         destinationSessionId: snapshot.sessionId,
       });
@@ -2088,6 +2103,12 @@ export async function createPresentationSession(
               return;
             }
             const event = notification.event;
+            if (
+              event.type === "user_message" &&
+              executionFailure?.sessionId === notification.sessionId &&
+              executionFailure.runId !== notification.runId
+            )
+              executionFailure = undefined;
             let missingReasoningSnapshot:
               | {
                   readonly expectedId: string;
@@ -2568,6 +2589,7 @@ export async function createPresentationSession(
         settlement: null as Promise<void> | null,
       };
       activeRun = runState;
+      executionFailure = undefined;
       state = {
         ...state,
         revision: state.revision + 1,
@@ -2588,20 +2610,13 @@ export async function createPresentationSession(
             },
           });
           if (!closed) {
+            captureExecutionResult(continued.result);
             await activateSnapshot(continued.snapshot);
           }
           return { status: "admitted", commandId: command.commandId, resource: null };
-        } catch {
-          if (!closed) {
-            try {
-              const inspected = await options.lifecycle.inspect({ sessionId: command.sessionId });
-              if (inspected.schemaVersion === 3) {
-                await activateSnapshot(inspected);
-              }
-            } catch {
-              // The command receipt remains fail-closed when refresh is also unavailable.
-            }
-          }
+        } catch (error) {
+          captureExecutionError(error);
+          if (!closed) await recoverAdmittedRunSnapshot(command.sessionId);
           return {
             status: "rejected",
             code: "authority_rejected",
@@ -4940,6 +4955,7 @@ export async function createPresentationSession(
           settlement: null as Promise<void> | null,
         };
         activeRun = runState;
+        executionFailure = undefined;
         state = {
           ...state,
           revision: state.revision + 1,
@@ -5023,10 +5039,14 @@ export async function createPresentationSession(
         const settlement = continuation
           .then(async (continued) => {
             if (!closed) {
+              captureExecutionResult(continued.result);
               await activateSnapshot(continued.snapshot);
             }
           })
-          .catch(() => recoverAdmittedRunSnapshot(command.sessionId))
+          .catch((error) => {
+            captureExecutionError(error);
+            return recoverAdmittedRunSnapshot(command.sessionId);
+          })
           .finally(() => {
             if (activeRun === runState) {
               activeRun = undefined;
@@ -5147,6 +5167,7 @@ export async function createPresentationSession(
           settlement: null as Promise<void> | null,
         };
         activeRun = runState;
+        executionFailure = undefined;
         state = {
           ...state,
           revision: state.revision + 1,
@@ -5214,10 +5235,12 @@ export async function createPresentationSession(
         const settlement = continuation
           .then(async (continued) => {
             if (!closed && admittedSessionId !== null) {
+              captureExecutionResult(continued.result);
               await activateSnapshot(continued.snapshot);
             }
           })
-          .catch(() => {
+          .catch((error) => {
+            captureExecutionError(error);
             const sessionId = admittedSessionId;
             if (closed || sessionId === null) {
               return;
@@ -5491,6 +5514,7 @@ export async function createPresentationSession(
           recovery: true,
         };
         activeRun = runState;
+        executionFailure = undefined;
         if (command.type === "cancel_interrupted_session") controller.abort();
         state = {
           ...state,
@@ -5500,19 +5524,22 @@ export async function createPresentationSession(
         publishStateChange();
         const operation = (async (): Promise<CommandReceipt> => {
           try {
-            const snapshot =
-              command.type === "cancel_interrupted_session"
-                ? await options.lifecycle.cancelInterruptedSession(command)
-                : (
-                    await options.lifecycle.continue({
-                      sessionId: command.sessionId,
-                      interruptedRunId: command.runId,
-                      signal: controller.signal,
-                    })
-                  ).snapshot;
+            let snapshot: CurrentSessionSnapshot;
+            if (command.type === "cancel_interrupted_session")
+              snapshot = await options.lifecycle.cancelInterruptedSession(command);
+            else {
+              const continued = await options.lifecycle.continue({
+                sessionId: command.sessionId,
+                interruptedRunId: command.runId,
+                signal: controller.signal,
+              });
+              captureExecutionResult(continued.result);
+              snapshot = continued.snapshot;
+            }
             await activateSnapshot(snapshot);
             return { status: "admitted", commandId: randomUUID(), resource: null };
-          } catch {
+          } catch (error) {
+            captureExecutionError(error);
             await recoverAdmittedRunSnapshot(command.sessionId);
             return {
               status: "rejected",
@@ -6351,6 +6378,15 @@ export async function createPresentationSession(
     return {
       getState: () => {
         const active = state.authoritative.active;
+        const currentFailure =
+          executionFailure !== undefined && executionFailure.sessionId === active?.session.id
+            ? executionFailure
+            : undefined;
+        let visibleActive = active;
+        if (active !== null && state.authoritative.continuity.status !== "current") {
+          const { recovery: _unavailableRecovery, ...lastKnown } = active;
+          visibleActive = lastKnown;
+        }
         const phase =
           activeRun !== undefined
             ? activeRun.controller.signal.aborted
@@ -6358,11 +6394,16 @@ export async function createPresentationSession(
               : activeRun.recovery
                 ? ("recovering" as const)
                 : ("running" as const)
-            : active?.session.status === "interrupted"
+            : active?.session.status === "interrupted" ||
+                (currentFailure !== undefined &&
+                  state.authoritative.continuity.status !== "current")
               ? ("interrupted" as const)
               : ("ready" as const);
         return {
           ...state,
+          ...(executionFailure !== undefined && executionFailure.sessionId === active?.session.id
+            ? { executionFailure }
+            : {}),
           agentUiSettings,
           ...(managedAgentActivity.length === 0 ? {} : { managedAgentActivity }),
           managedAttention: managedAttention(),
@@ -6378,14 +6419,16 @@ export async function createPresentationSession(
           authoritative: {
             ...state.authoritative,
             active:
-              active === null
+              visibleActive === null
                 ? null
                 : {
-                    ...active,
+                    ...visibleActive,
                     parentRun: {
                       phase,
                       editor:
-                        phase === "ready" && active.plan?.state !== "approved_not_started"
+                        phase === "ready" &&
+                        state.authoritative.continuity.status === "current" &&
+                        active?.plan?.state !== "approved_not_started"
                           ? ("ready" as const)
                           : ("blocked" as const),
                     },

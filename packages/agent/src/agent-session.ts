@@ -47,6 +47,12 @@ import {
   maximumReferencedModelResponseArtifactBytes,
 } from "./durable-model-response-policy.js";
 import {
+  type AgentExecutionResult,
+  ExecutionFailureSignal,
+  executionFailureResult,
+  persistenceFailure,
+} from "./execution-failure.js";
+import {
   createInputResourceProjectionMessageV1,
   createInputResourceUserMessageV1,
   inputResourceImageV1Schema,
@@ -67,6 +73,7 @@ import {
   prepareExplicitUserImageMessagesV1,
   projectedContentUsageV1,
 } from "./model-user-content.js";
+import { notifyObserver } from "./observer-notification.js";
 import {
   isLargePastedTextV1,
   pastedTextMetricsV1,
@@ -166,8 +173,6 @@ import type {
   ToolRegistry,
   ToolResult,
 } from "./tool-runtime.js";
-
-class SessionPersistenceError extends Error {}
 
 class InputResourceProjectionError extends Error {
   constructor(readonly details: Extract<RunResult, { readonly status: "failed" }>["error"]) {
@@ -499,7 +504,7 @@ export class AgentSession {
     return { status: "accepted" };
   }
 
-  async run(input: UserInput, options: RunOptions = {}): Promise<RunResult> {
+  async run(input: UserInput, options: RunOptions = {}): Promise<AgentExecutionResult> {
     if (!areRunLimitsValid(options.limits)) {
       return {
         status: "failed",
@@ -644,6 +649,7 @@ export class AgentSession {
           projectedUserMessage,
         );
       } catch (error) {
+        if (error instanceof ExecutionFailureSignal) throw error;
         if (abortController.signal.aborted && this.#terminalResult === undefined) {
           return await this.#settleCancelled();
         }
@@ -664,16 +670,7 @@ export class AgentSession {
         throw error;
       }
     } catch (error) {
-      if (error instanceof SessionPersistenceError) {
-        return {
-          status: "failed",
-          error: {
-            code: "session_persistence_failed",
-            message: "The session event could not be persisted.",
-          },
-        };
-      }
-      throw error;
+      return executionFailureResult(error, this.#durableContext?.sessionId, this.#activeRunId);
     } finally {
       options.signal?.removeEventListener("abort", abortFromCaller);
       if (this.#activeAbortController === abortController) {
@@ -2696,7 +2693,20 @@ export class AgentSession {
               ? await this.#readInputResource(call, () => preparedCall.execute(executionContext))
               : await preparedCall.execute(executionContext);
     } catch (error) {
-      if (call.name !== "search_repository" || !signal.aborted) throw error;
+      if (call.name !== "search_repository" || !signal.aborted) {
+        if (error instanceof ExecutionFailureSignal || signal.aborted) throw error;
+        throw new ExecutionFailureSignal(
+          {
+            category: "execution_failed",
+            stage: "execution",
+            writeOutcome: null,
+            reason: "unknown",
+          },
+          undefined,
+          "tool_execution",
+          call.id,
+        );
+      }
       // The search adapter reclaims its process/file handles before rejecting cancellation.
       // Commit that tool terminal before the run's existing cancellation settlement.
       result = {
@@ -4236,7 +4246,7 @@ export class AgentSession {
         });
       } catch (error) {
         if (error instanceof SessionLogicalQuotaError) throw error;
-        throw new SessionPersistenceError();
+        throw error;
       }
     }
     this.#publish(event);
@@ -4244,7 +4254,7 @@ export class AgentSession {
 
   #publish(event: RuntimeEvent): void {
     for (const listener of this.#listeners) {
-      listener(event);
+      notifyObserver(() => listener(event));
     }
     const notification: RuntimeEventNotification = {
       notificationId: `${this.#activeRunId ?? "idle"}:${this.#nextNotification}`,
@@ -4255,7 +4265,7 @@ export class AgentSession {
     };
     this.#nextNotification += 1;
     for (const listener of this.#notificationListeners) {
-      listener(notification);
+      notifyObserver(() => listener(notification));
     }
   }
 
@@ -4281,11 +4291,26 @@ export class AgentSession {
         );
     } catch (error) {
       if (error instanceof SessionLogicalQuotaError) throw error;
-      throw new SessionPersistenceError();
+      const failure = persistenceFailure(error, record);
+      if (failure.details.writeOutcome === "committed")
+        this.#nextSequence = Math.max(this.#nextSequence, record.sequence + 1);
+      throw failure;
     }
     this.#nextSequence += 1;
-    await this.#managedAgentRuntimeBoundary?.(record);
-    await this.#recordCommittedBarrier?.(record);
+    try {
+      await this.#managedAgentRuntimeBoundary?.(record);
+      await this.#recordCommittedBarrier?.(record);
+    } catch {
+      throw new ExecutionFailureSignal(
+        {
+          category: "execution_failed",
+          stage: "barrier",
+          writeOutcome: "committed",
+          reason: "unknown",
+        },
+        record,
+      );
+    }
   }
 
   async #appendRecordsAtomically(records: readonly SessionRecord[]): Promise<void> {
@@ -4297,12 +4322,30 @@ export class AgentSession {
         );
     } catch (error) {
       if (error instanceof SessionLogicalQuotaError) throw error;
-      throw new SessionPersistenceError();
+      const failure = persistenceFailure(error, records[0]);
+      if (failure.details.writeOutcome === "committed")
+        this.#nextSequence = Math.max(
+          this.#nextSequence,
+          (records.at(-1)?.sequence ?? this.#nextSequence - 1) + 1,
+        );
+      throw failure;
     }
     this.#nextSequence += records.length;
     for (const record of records) {
-      await this.#managedAgentRuntimeBoundary?.(record);
-      await this.#recordCommittedBarrier?.(record);
+      try {
+        await this.#managedAgentRuntimeBoundary?.(record);
+        await this.#recordCommittedBarrier?.(record);
+      } catch {
+        throw new ExecutionFailureSignal(
+          {
+            category: "execution_failed",
+            stage: "barrier",
+            writeOutcome: "committed",
+            reason: "unknown",
+          },
+          record,
+        );
+      }
     }
   }
 
@@ -4463,7 +4506,16 @@ export class AgentSession {
       durableContext.sessionId === undefined ||
       runId === undefined
     ) {
-      throw new SessionPersistenceError();
+      throw new ExecutionFailureSignal(
+        {
+          category: "append_outcome_uncertain",
+          stage: "artifact",
+          writeOutcome: "uncertain",
+          reason: "unknown",
+        },
+        undefined,
+        "model_response",
+      );
     }
     try {
       return {
@@ -4486,7 +4538,16 @@ export class AgentSession {
         }),
       };
     } catch {
-      throw new SessionPersistenceError();
+      throw new ExecutionFailureSignal(
+        {
+          category: "append_outcome_uncertain",
+          stage: "artifact",
+          writeOutcome: "uncertain",
+          reason: "unknown",
+        },
+        undefined,
+        "model_response",
+      );
     }
   }
 

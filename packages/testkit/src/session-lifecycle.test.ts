@@ -2619,7 +2619,17 @@ test("SessionLifecycle prefix branch keeps an approved parent artifact ready wit
           contentDigest: ready.submission.contentDigest,
         },
       }),
-    ).rejects.toThrow("stop before parent kickoff");
+    ).rejects.toMatchObject({
+      name: "SessionExecutionError",
+      executionFailure: {
+        category: "execution_failed",
+        stage: "barrier",
+        writeOutcome: "committed",
+        phase: "session_metadata",
+        runId: expect.any(String),
+        message: "Execution stopped at a required runtime barrier.",
+      },
+    });
     const approved = await lifecycle.inspect({ sessionId: parent.sessionId });
     if (approved.schemaVersion !== 3 || approved.plan?.state !== "approved_not_started") {
       throw new Error("Expected the unstarted parent approval.");
@@ -2661,7 +2671,14 @@ test("SessionLifecycle prefix branch keeps an approved parent artifact ready wit
           contentDigest: child.plan.submission.contentDigest,
         },
       }),
-    ).rejects.toThrow("stop after inherited child kickoff became durable");
+    ).resolves.toMatchObject({
+      result: {
+        status: "failed",
+        error: { code: "session_execution_failed" },
+        executionFailure: { sessionId: child.sessionId, category: "execution_failed" },
+      },
+      snapshot: { status: "interrupted" },
+    });
     await lifecycle.close();
     lifecycle = harness.createLifecycle({ modelTargets, stateRoot, workspaceRoot });
     await expect(lifecycle.continue({ sessionId: child.sessionId })).resolves.toMatchObject({
@@ -2752,7 +2769,17 @@ test("SessionLifecycle rejects ordinary input before append while exact Plan app
           contentDigest: ready.submission.contentDigest,
         },
       }),
-    ).rejects.toThrow("stop before initial kickoff");
+    ).rejects.toMatchObject({
+      name: "SessionExecutionError",
+      executionFailure: {
+        category: "execution_failed",
+        stage: "barrier",
+        writeOutcome: "committed",
+        phase: "session_metadata",
+        runId: expect.any(String),
+        message: "Execution stopped at a required runtime barrier.",
+      },
+    });
     const approved = await lifecycle.inspect({ sessionId: created.sessionId });
     if (approved.schemaVersion !== 3 || approved.plan?.state !== "approved_not_started") {
       throw new Error("Expected the durable approval intent.");
@@ -2893,7 +2920,17 @@ test("SessionLifecycle recovers a started Plan kickoff in the same reserved run 
           contentDigest: ready.submission.contentDigest,
         },
       }),
-    ).rejects.toThrow("stop before initial kickoff");
+    ).rejects.toMatchObject({
+      name: "SessionExecutionError",
+      executionFailure: {
+        category: "execution_failed",
+        stage: "barrier",
+        writeOutcome: "committed",
+        phase: "session_metadata",
+        runId: expect.any(String),
+        message: "Execution stopped at a required runtime barrier.",
+      },
+    });
     const approved = await lifecycle.inspect({ sessionId: created.sessionId });
     if (approved.schemaVersion !== 3 || approved.plan?.state !== "approved_not_started") {
       throw new Error("Expected the durable approval intent.");

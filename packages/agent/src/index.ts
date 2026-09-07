@@ -33,6 +33,11 @@ export {
 } from "./biome-execution.js";
 export type { ContextProfile } from "./context-profile.js";
 export {
+  type AgentExecutionResult,
+  SessionExecutionError,
+  type SessionExecutionFailure,
+} from "./execution-failure.js";
+export {
   ExtensionConfigurationError,
   loadExtensionConfiguration,
 } from "./extension-configuration.js";
