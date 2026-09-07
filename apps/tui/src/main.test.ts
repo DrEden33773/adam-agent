@@ -8706,6 +8706,7 @@ test.each(["complete", "cancel"])(
         const beforeCancel = fixture.output().length;
         fixture.write("\u0003");
         await fixture.waitForCompleteFrameAfter("cancelled", beforeCancel);
+        await fixture.waitForCompleteFrameAfter(" · idle", beforeCancel);
         const cancelled = await readFilesRecursively(stateRoot);
         expect(cancelled).toContain('"status":"cancelled"');
         expect(cancelled).not.toContain('"type":"tool_started"');
