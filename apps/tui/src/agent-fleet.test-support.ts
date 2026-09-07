@@ -12,6 +12,7 @@ import {
   createDirectDeepSeekThinkingCapability,
   createInMemoryManagedAgentControlStore,
   createInMemorySessionStoreDirectory,
+  createJsonlSessionStoreDirectory,
   createTrustedWorkspaceTrustForTesting,
   managedAgentRecordBarrier,
   managedAgentSettlementBarrier,
@@ -91,6 +92,7 @@ export async function startManagedTui(
     readonly restore?: ManagedTuiStorage;
     readonly withDestination?: boolean;
     readonly initialPrompt?: string;
+    readonly durableSessions?: boolean;
     readonly blankDraft?: boolean;
     readonly thinking?: boolean;
     readonly controlReceiptBarrier?: (
@@ -117,9 +119,18 @@ export async function startManagedTui(
     viewport.restore?.stateRoot ?? (await mkdtemp(join(tmpdir(), "adam-fleet-ui-")));
   const workspaceRoot = viewport.workspaceRoot ?? process.cwd();
   const sessions =
-    viewport.restore?.sessions ?? createInMemorySessionStoreDirectory<SessionRecord>();
+    viewport.restore?.sessions ??
+    (viewport.durableSessions
+      ? createJsonlSessionStoreDirectory<SessionRecord>({ workspaceRoot, stateRoot })
+      : createInMemorySessionStoreDirectory<SessionRecord>());
   const children =
-    viewport.restore?.children ?? createInMemorySessionStoreDirectory<SessionRecord>();
+    viewport.restore?.children ??
+    (viewport.durableSessions
+      ? createJsonlSessionStoreDirectory<SessionRecord>({
+          workspaceRoot,
+          stateRoot: join(stateRoot, "managed-children"),
+        })
+      : createInMemorySessionStoreDirectory<SessionRecord>());
   const store = viewport.restore?.store ?? createInMemoryManagedAgentControlStore();
   const thinking = viewport.thinking
     ? { thinkingCapability: createDirectDeepSeekThinkingCapability(identity) }

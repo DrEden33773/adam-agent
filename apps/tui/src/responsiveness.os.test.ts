@@ -204,6 +204,7 @@ test("candidate Control remains reachable with representative history and two li
         estimatorVersion: 1,
       },
       initialPrompt: "Seed responsiveness history",
+      durableSessions: true,
       permissions: createPermissionPolicy({ allowedEffects: ["read", "write", "delegate"] }),
     },
   );
