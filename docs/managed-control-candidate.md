@@ -1,6 +1,8 @@
 # Managed-control candidate
 
-The internal managed-control composition exercises ordinary child threads through `ManagedAgentControl`, the existing `AgentSession` loop, and shared Lifecycle/Presentation owners. It is selected by the internal test composition. The default product entry and the public managed-review extension capability retain their existing execution paths.
+The internal managed-control composition exercises ordinary child threads through `ManagedAgentControl`, the existing `AgentSession` loop, and shared Lifecycle/Presentation owners. It is selected by the internal test composition. The default product entry retains its existing managed-session consumer integration.
+
+The same candidate composition provides the public `adam.managed-review@1` contract through OperationHost and the shared reserved Control lane. The Host owns immutable invocation identity, origin resolution, no-tool execution, total deadline, cancellation and settlement. Reviewers expose aggregate lane counts to ordinary Fleet inspection and remain outside Agent handles, controls and Main completion delivery. The [Extension API contract](../packages/extension-api/README.md) documents the wire bounds and failure outcomes; consumer migration and the default production cutover remain separate.
 
 ## Roles and authority
 

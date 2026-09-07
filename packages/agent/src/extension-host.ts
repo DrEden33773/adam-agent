@@ -9,6 +9,7 @@ import {
   EXTENSION_ARTIFACT_CAPABILITY_ID,
   EXTENSION_BIOME_CAPABILITY_ID,
   EXTENSION_ID_MAX_LENGTH,
+  EXTENSION_MANAGED_REVIEW_CAPABILITY_ID,
   EXTENSION_MANAGED_SESSION_CAPABILITY_ID,
   EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID,
   EXTENSION_OPERATION_DEADLINE_MAX_MS,
@@ -98,6 +99,7 @@ export type ExtensionHostOptions = {
   readonly operationOriginAuthority?: OperationOriginAuthority;
   readonly operationStore?: OperationStore;
   readonly managedSession?: Parameters<typeof createOperationHost>[0]["managedSession"];
+  readonly managedReview?: Parameters<typeof createOperationHost>[0]["managedReview"];
   readonly permissions?: PermissionPolicy;
   readonly projectChangeMaterializer?: ProjectChangeMaterializer;
   readonly projectLifecycleOwner?: ProjectLifecycleOwner;
@@ -425,6 +427,10 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
         capability.id === EXTENSION_MANAGED_SESSION_V2_CAPABILITY_ID,
     ) &&
       options.managedSession === undefined) ||
+    (options.capabilities.some(
+      (capability) => capability.id === EXTENSION_MANAGED_REVIEW_CAPABILITY_ID,
+    ) &&
+      options.managedReview === undefined) ||
     (options.operationDeadlineMs !== undefined &&
       (!Number.isSafeInteger(options.operationDeadlineMs) ||
         options.operationDeadlineMs <= 0 ||
@@ -485,6 +491,7 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
       : { originAuthority: options.operationOriginAuthority }),
     ...(options.permissions === undefined ? {} : { permissions: options.permissions }),
     ...(options.managedSession === undefined ? {} : { managedSession: options.managedSession }),
+    ...(options.managedReview === undefined ? {} : { managedReview: options.managedReview }),
     recordStore,
     resolveOperation: (contributionId) => registeredOperations.get(contributionId),
     ...(options.operationStore === undefined ? {} : { store: options.operationStore }),
@@ -762,9 +769,14 @@ export function createExtensionHost(options: ExtensionHostOptions): ExtensionHos
               continue;
             }
             if (
-              !["0.3.0", "0.4.0", EXTENSION_API_VERSION].some((version) =>
+              !["0.3.0", "0.4.0", "0.5.0", "0.6.0"].some((version) =>
                 satisfies(version, manifest.adamAgent.apiVersion),
-              )
+              ) ||
+              ([
+                ...manifest.adamAgent.capabilities.required,
+                ...manifest.adamAgent.capabilities.optional,
+              ].some((capability) => capability.id === EXTENSION_MANAGED_REVIEW_CAPABILITY_ID) &&
+                !satisfies("0.6.0", manifest.adamAgent.apiVersion))
             ) {
               extensions.push({
                 diagnostics: [

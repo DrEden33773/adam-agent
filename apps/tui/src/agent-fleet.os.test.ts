@@ -46,7 +46,7 @@ test("owner-private child draft survives a cold TUI and Lifecycle rebuild separa
     await h.press("\r", "Cooperative");
     await h.press("Child draft survives restart.", "Child draft survives restart.");
     await h.press("\u001b", "Enter compose · Esc back");
-    await h.press("\u001b", "Esc Main");
+    await h.press("\u001b", "Esc Main", "Conversation ·");
     await h.press("\u001b", "Fleet · ↓ navigate");
     await h.press("Separate Main draft.", "Separate Main draft.");
     await h.stop();
@@ -398,7 +398,7 @@ test("cold undelivered input remains private and can be explicitly inspected and
     expect(cold.conversationText()).not.toContain("To @explore-1");
     await cold.press("\r", "New turn");
     expect(cold.conversationText()).toContain("PRIVATE_UNDELIVERED_MESSAGE");
-    await cold.press("\u001b", "Draft to @explore-1");
+    await cold.press("\u001b", "Enter compose · Esc back", "To @explore-1");
     await cold.press("d", "Enter compose · Esc back");
     expect(cold.conversationText()).not.toContain("Draft to @explore-1");
     expect(calls).toBe(1);

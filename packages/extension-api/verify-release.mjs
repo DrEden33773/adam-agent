@@ -25,6 +25,35 @@ if (process.env.GITHUB_SHA !== commit) {
   throw new TypeError("The GitHub release ref does not match the checked-out commit.");
 }
 
+async function resolveCommit(ref) {
+  const { stdout } = await execFileAsync("git", ["rev-parse", "--verify", `${ref}^{commit}`], {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  });
+  return stdout.trim();
+}
+
+if ((await resolveCommit(`refs/tags/${expectedTag}`)) !== commit) {
+  throw new TypeError("The actual release tag does not target the checked-out commit.");
+}
+if (
+  (await resolveCommit("refs/remotes/origin/main")) !== commit ||
+  (await resolveCommit("FETCH_HEAD")) !== commit
+) {
+  throw new TypeError("The release checkout is not the freshly fetched product main.");
+}
+const { stdout: status } = await execFileAsync(
+  "git",
+  ["status", "--porcelain", "--untracked-files=normal"],
+  {
+    cwd: repositoryRoot,
+    encoding: "utf8",
+  },
+);
+if (status.trim() !== "") {
+  throw new TypeError("Staging requires a clean release checkout.");
+}
+
 process.stdout.write(
   `${JSON.stringify({
     commit,

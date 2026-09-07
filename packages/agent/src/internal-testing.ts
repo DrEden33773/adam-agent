@@ -13,6 +13,7 @@ export {
 export type { ContextProfile } from "./context-profile.js";
 export { DirectDeepSeekResponsesModelDriver as DirectDeepSeekResponsesModelDriverForTesting } from "./deepseek-responses-model-driver.js";
 export { digestContextRecordPrefix } from "./durable-context.js";
+export { projectExecutionDomainForExtensionHost } from "./extension-host.js";
 export { createInputResourceUserMessageV1 } from "./input-resources.js";
 export {
   createAgentManager,
@@ -66,6 +67,7 @@ export {
   mcpTransportFactory,
 } from "./mcp-host.js";
 export { preparedDirectDeepSeekV2ContextProfile } from "./model-targets.js";
+export { createOperationHost, type RegisteredOperation } from "./operation-host.js";
 export type { PatchFileSystem } from "./patch-transaction.js";
 export { assessPlanCommandV1 } from "./plan-command-assessment.js";
 export {

@@ -2083,6 +2083,13 @@ export type ManagedAgentExport = {
 };
 
 export type ManagedWorkspaceSnapshot = {
+  readonly reviewers?: {
+    readonly running: number;
+    readonly queued: number;
+    readonly waiting: number;
+    readonly settling: number;
+    readonly recoveryRequired: number;
+  };
   readonly exports?: readonly ManagedAgentExport[];
   readonly storage?: {
     readonly status?: "known" | "unavailable";

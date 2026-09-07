@@ -83,7 +83,8 @@ test("running Explore has Widget and Fleet, layered Enter and Esc preserve indep
     await h.press("Child draft", "Child draft");
     await h.press("\u001b", "Enter compose · Esc back");
     expect(h.terminal.lines().join("\n")).toContain("Draft to @explore-1");
-    await h.press("\u001b", "Esc Main");
+    // The Fleet hint is visible behind the viewer; observe its closure in the same frame.
+    await h.press("\u001b", "Esc Main", "Conversation ·");
     expect(h.terminal.lines().join("\n")).not.toContain("Conversation ·");
     await h.press("\u001b", "Fleet · ↓ navigate");
     await h.press("Ordinary Main input.\r", "Ordinary Main completed.");
@@ -795,7 +796,7 @@ test("child permission preempts and restores the exact independent composer with
     expect(h.presentation.getState().composer.renderedText).toBe("");
     expect(mainCalls).toBe(0);
     await h.press("\u001b", "Enter compose · Esc back");
-    await h.press("\u001b", "Esc Main");
+    await h.press("\u001b", "Esc Main", "Conversation ·");
     await h.press("\u001b", "Fleet · ↓ navigate");
     await h.press("Main prompt.\r", "Main after permission.");
     expect(mainCalls).toBe(1);
@@ -1178,6 +1179,7 @@ test.each([
 test("Widget and viewer expose owner-timed elapsed duration and actual compact model and usage preferences", async () => {
   const started = Promise.withResolvers<void>();
   const finish = Promise.withResolvers<void>();
+  const usageRendered = Promise.withResolvers<void>();
   const h = await startManagedTui(
     {
       async *stream() {
@@ -1185,6 +1187,7 @@ test("Widget and viewer expose owner-timed elapsed duration and actual compact m
         await finish.promise;
         yield { type: "text_delta", text: "Timed evidence" };
         yield { type: "usage", inputTokens: 23, outputTokens: 17 };
+        await usageRendered.promise;
         yield { type: "finish", reason: "stop" };
       },
     },
@@ -1210,6 +1213,8 @@ test("Widget and viewer expose owner-timed elapsed duration and actual compact m
     const offset = h.terminal.output().length;
     finish.resolve();
     await h.terminal.waitForFrameAfter("40 used", offset);
+    usageRendered.resolve();
+    await h.terminal.waitForFrameAfter("Completed", offset);
     const thread = h.presentation.getState().authoritative.managedControl?.threads[0];
     expect(thread?.turn.startedAtUnixMilliseconds).toBeGreaterThanOrEqual(beforeStart);
     expect(thread?.turn.outcome?.atUnixMilliseconds).toBeGreaterThanOrEqual(
@@ -1220,6 +1225,7 @@ test("Widget and viewer expose owner-timed elapsed duration and actual compact m
     expect(h.conversationText()).toContain("40 used");
   } finally {
     finish.resolve();
+    usageRendered.resolve();
     await h.close();
   }
 });

@@ -1,15 +1,67 @@
 # @adam-agent/extension-api
 
-Public, schema-library-neutral contracts for trusted first-party Adam Agent extensions.
+Public contracts and runtime codecs for trusted first-party Adam Agent extensions.
 
-Version `0.5.0` adds operation-scoped `adam.managed-session@2` while retaining exact `adam.managed-session@1` compatibility from `0.4.0`. The v2 Host derives the non-interactive `reviewer.v1` target, historical context and thinking from the linked origin, defaults cumulative input-plus-output usage to that context capacity, permits only an optional tighter token ceiling, owns the fixed five-minute causal inactivity supervisor, returns typed `managed_session_stalled`, and pauses the enclosing operation deadline only during the durable managed-wait phase. Neither managed-session version exposes provider selection, a turn-loop implementation, tools, a deadline or watchdog control, cancellation handles, Stores, workspace roots or arbitrary schemas. Version `0.3.0` added pure-data command, project-change input-source and report descriptors plus the strict bounded `adam.project-change-snapshot@1` contract. Version `0.2.0` added bounded read-only operation reconciliation to the first supported `0.1.0` contract. Earlier version `0.0.0-bootstrap.0` established the npm package identity and is deprecated; do not depend on it. Releases are staged from an exact product tag through npm Trusted Publishing before human approval.
+The `0.6.0` source API adds the purpose-specific, operation-scoped `adam.managed-review@1` capability. An extension negotiates `>=0.6.0 <0.7.0`, requires and receives a grant for the exact capability, and calls `review(request)`. Same-digest calls join the same run; a different second request conflicts. Host-generated `reviewRunId` and request digest are durable before managed admission.
 
-The package defines static manifest parsing, capability identifiers and bounds, operation contexts and events, durable v2 managed-wait start/settlement facts, artifact summaries, immutable namespaced records, bounded operation-scoped reconciliation evidence, the fixed-profile Biome analyzer contract and the managed-review request/terminal envelopes. A contribution may declare at most one exact managed output contract and register its matching codec; there is no general codec registry or per-call schema. Reconciliation can only read exact immutable record or artifact evidence and cannot resume `execute`, publish, report progress, access ordinary operation capabilities, or perform workspace, process, network, model, or managed-session effects. The package does not export Adam runtime implementations, stores, provider access, raw filesystem or process handles, model-facing tools, or a global host.
+A request contains immutable evidence references, a short instruction, the exact contribution-registered `outputContract`, and an optional tighter cumulative token ceiling. It contains no target, model, role, tool list, deadline control, Fleet handle, workspace root, store, or cancellation handle. The Host resolves the exact origin configuration, revalidates it at execution-slot acquisition, and runs a fresh non-interactive reviewer with no tools or Skills.
 
-The optional `project_changes@1` descriptor is admissible only with exact operation input contract `adam.project-change-snapshot@1`. That eager browser-neutral value contains one Git capture-policy identity, an exact committed or unborn base, a captured candidate tree, deterministic unified diff, bounded strict-UTF-8 source sides, explicit binary/symlink/gitlink unavailability facts and digests. It grants no later filesystem access, URI, listing, callback, renderer or cross-operation handle.
+| Bound | Contract |
+| --- | --- |
+| Evidence | 1–8 exact operation-owned artifact or record references; at most 12 MiB of validated evidence |
+| Instruction | Nonblank, well-formed UTF-8; at most 16 KiB |
+| Result | Registered-codec-valid JSON; at most 1 MiB after encoding, independent of internal inline limits |
+| Ordinary Operation | Default 60 seconds; public maximum 5 minutes |
+| Review execution | Default and maximum 30 minutes from actual slot acquisition; versioned Host policy may only shorten it |
+| Inactivity and cleanup | Separate existing inactivity guards; managed inactivity is 5 minutes, and cleanup has its own 10-second bound |
 
-Extension packages declare required and optional capabilities in `package.json.adamAgent`. Adam validates the locked package identity and manifest before importing the runtime, then injects only declared, available, compatible, and granted handles into each operation context.
+`extensionManagedReviewRequestCodec`, `extensionManagedReviewTerminalCodec`, and `extensionManagedReviewProgressCodec` export the wire validation used by the Host. Matching `EXTENSION_MANAGED_REVIEW_*` constants export the capability bounds. Evidence uses the existing public reference types, including readonly reference arrays. The codecs reject non-JSON values, malformed Unicode, unknown fields and unsupported failure classes.
 
-Capability grants do not authorize external effects. The Biome execution broker also requires a per-operation `PermissionPolicy` allow decision, and its process, snapshot, report, stdout, stderr, deadline, cancellation, and provenance remain Host-owned. Artifact summaries already published by an operation may appear on completed, failed, or cancelled terminal events.
+Inside an operation that declares and registers `example.findings@1` as its `managedOutput`:
 
-This interface is designed for trusted in-process code and is not a security sandbox.
+```ts
+import {
+  EXTENSION_MANAGED_REVIEW_CAPABILITY_ID,
+  extensionManagedReviewRequestCodec,
+  extensionManagedReviewTerminalCodec,
+  type ExtensionOperationContext,
+  type ExtensionOperationEvidenceReference,
+} from "@adam-agent/extension-api";
+
+export async function reviewEvidence(
+  operation: ExtensionOperationContext,
+  evidence: readonly ExtensionOperationEvidenceReference[],
+) {
+  const capability = operation.capabilities[EXTENSION_MANAGED_REVIEW_CAPABILITY_ID];
+  if (capability === undefined) throw new Error("Managed review is unavailable.");
+
+  const request = extensionManagedReviewRequestCodec.decode({
+    evidence,
+    instruction: "Review the supplied evidence and return findings.",
+    outputContract: { id: "example.findings", version: 1 },
+  });
+  if (!request.ok) throw new Error("Invalid review request.");
+
+  const result = extensionManagedReviewTerminalCodec.decode(
+    await capability.review(request.value),
+  );
+  if (!result.ok) throw new Error("Invalid review terminal.");
+  return result.value;
+}
+```
+
+Success returns the decoded result and a receipt containing `reviewRunId`, resolved policy digest and target identity, evidence-set digest, output contract/digest/serialized size, trace digest, and input/output/reasoning/turn usage. The Host materializes artifact-backed output and persists the encoded result under its receipt digest. Returned values are detached from the Host's authoritative cached result. The receipt contains no internal thread or attempt IDs and no permanently unavailable cost field.
+
+Admission failures are `invalid_request`, `policy_denied`, `target_unavailable`, or `capacity_expired`. Execution failures are `model_failed`, `stalled`, `budget_exhausted`, `output_invalid`, `review_deadline_exceeded`, or `recovery_required`. Available partial output, trace and usage remain attached to incomplete results. Unknown internal failures remain sanitized Operation failures.
+
+The Host durably projects `waiting_for_capacity`, `running`, `settling`, and `terminal`. Queued review shares the reserved foreground/reviewer lane and consumes ordinary Operation time; queue admission does not pause that clock. Capacity expiry cancels and settles the review before the outer Operation reports its exhausted deadline. Actual slot acquisition pauses ordinary time and starts the separate total review deadline. Progress does not reset that total. Outcome persistence ends execution accounting; ordinary remaining time resumes after claim release and managed settlement. Cleanup that cannot settle remains explicitly inspection-required with retained evidence and reservations.
+
+Cancellation belongs to the enclosing Operation and is independent of review failure classes. An extension cannot bypass settlement by returning without awaiting its review. Cold recovery retains the exact invocation and never automatically replays the extension or provider. Explicit cold cancellation can cancel or finish cleanup of the existing run; unknown provider usage remains reserved rather than being refunded as zero. Reviewers are isolated from ordinary Agent handles, controls and Main completion delivery.
+
+The package also retains supported historical `0.3.0`, `0.4.0`, and `0.5.0` contracts. The ordinary CLI currently uses the existing managed-session consumer integration; the new managed-review Host path is exercised through the internal candidate composition until the coordinated consumer cutover. Neither the API version bump nor package publication performs that switch.
+
+The optional `project_changes@1` descriptor requires exact input contract `adam.project-change-snapshot@1`. It carries a bounded immutable Git capture, source sides, explicit unavailable entries and digests, with no later filesystem authority. One contribution registers its exact input, output, progress and optional managed-output codecs; there is no general per-call schema registry. Ordinary reconciliation is bounded and read-only.
+
+Releases use the exact `extension-api-v<version>` tag at freshly fetched product `main`, a clean checkout, full Quality, and npm Trusted Publishing staging. The verifier checks the actual tag target, GitHub SHA and fetched main, and the workflow rechecks main after Quality. Final npm publication remains a separate human approval step. Source version and a local tarball are not registry publication evidence.
+
+Adam validates locked package identity, manifest compatibility and capability grants before runtime import. This interface is for trusted in-process JavaScript and is not a security sandbox.

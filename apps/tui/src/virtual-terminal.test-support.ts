@@ -12,6 +12,7 @@ type OutputWaiter = {
 };
 
 type FrameWaiter = {
+  readonly absentText?: string;
   readonly guard: ReturnType<typeof setTimeout>;
   readonly offset: number;
   readonly reject: (error: Error) => void;
@@ -139,7 +140,11 @@ export class VirtualTerminal implements Terminal {
         }
       }
       for (const waiter of this.#frameWaiters) {
-        if (frame.endOffset > waiter.offset && frame.text.includes(waiter.text)) {
+        if (
+          frame.endOffset > waiter.offset &&
+          frame.text.includes(waiter.text) &&
+          (waiter.absentText === undefined || !frame.text.includes(waiter.absentText))
+        ) {
           clearTimeout(waiter.guard);
           this.#frameWaiters.delete(waiter);
           waiter.resolve();
@@ -235,9 +240,17 @@ export class VirtualTerminal implements Terminal {
   }
 
   /** Observe a complete frame after an output checkpoint, including one produced before this call. */
-  async waitForFrameAfter(text: string, offset: number): Promise<void> {
+  async waitForFrameAfter(text: string, offset: number, absentText?: string): Promise<void> {
     requireTerminalExpectation(text);
-    if (this.#frames.some((frame) => frame.endOffset > offset && frame.text.includes(text))) {
+    if (absentText !== undefined) requireTerminalExpectation(absentText);
+    if (
+      this.#frames.some(
+        (frame) =>
+          frame.endOffset > offset &&
+          frame.text.includes(text) &&
+          (absentText === undefined || !frame.text.includes(absentText)),
+      )
+    ) {
       return;
     }
     if (this.#state === "stopped") {
@@ -247,6 +260,7 @@ export class VirtualTerminal implements Terminal {
     }
     await new Promise<void>((resolve, reject) => {
       const waiter: FrameWaiter = {
+        ...(absentText === undefined ? {} : { absentText }),
         guard: setTimeout(() => {
           this.#frameWaiters.delete(waiter);
           reject(

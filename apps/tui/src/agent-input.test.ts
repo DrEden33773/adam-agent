@@ -83,7 +83,7 @@ test("actual child Enter accepts one exact input, delivers at the read boundary,
     expect(next?.turn.turnId).not.toBe(first?.turn.turnId);
     expect(mainCalls).toBe(0);
     await h.press("\u001b", "Enter compose · Esc back");
-    await h.press("\u001b", "Esc Main");
+    await h.press("\u001b", "Esc Main", "Conversation ·");
     await h.press("\u001b", "Fleet · ↓ navigate");
     await h.press("Main prompt.\r", "Main after child completed.");
     expect(mainCalls).toBe(1);
@@ -251,7 +251,7 @@ test("a retained child draft rejects after another turn starts without rebinding
     await h.press("\r", "Cooperative");
     await h.press("Draft for the first turn only.", "Draft for the first turn only.");
     await h.press("\u001b", "Enter compose · Esc back");
-    await h.press("\u001b", "Esc Main");
+    await h.press("\u001b", "Esc Main", "Conversation ·");
     const first = h.presentation.getState().authoritative.managedControl?.threads[0];
     if (first === undefined) throw new Error("Missing first thread");
     const before = h.terminal.output().length;
@@ -343,7 +343,7 @@ test.each(["wait", "suspend"] as const)(
       await h.press("\r", "Cooperative");
       await h.press("Only the source child draft.", "Only the source child draft.");
       await h.press("\u001b", "Enter compose · Esc back");
-      await h.press("\u001b", "Esc Main");
+      await h.press("\u001b", "Esc Main", "Conversation ·");
       await h.press("\u001b", "Fleet · ↓ navigate");
       await h.press("/resume\r", "Select a project session");
       await h.press("Destination", "Search: Destination");

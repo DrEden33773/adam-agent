@@ -70,6 +70,7 @@ import {
   type ScriptedMcpServer,
 } from "./index.js";
 
+import { withManagedFailureGuard } from "./managed-agent-test-support.js";
 import {
   contextProfile,
   createPresentationSession,
@@ -996,6 +997,129 @@ test("PresentationSession never replaces settled Run truth with delayed draft ad
   } finally {
     releaseModel.resolve();
     terminalVisible.resolve();
+    await presentation?.close();
+    await lifecycle.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("PresentationSession retains a draft permission requested while activation hydrates older records", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-draft-permission-hydration-"));
+  const workspaceRoot = join(root, "workspace");
+  const stateRoot = join(root, "state");
+  await mkdir(workspaceRoot);
+  const captured = Promise.withResolvers<void>();
+  const requested = Promise.withResolvers<string>();
+  const visible = Promise.withResolvers<void>();
+  let requestId: string | undefined;
+  let capturedOnce = false;
+  const driver: ModelDriver = {
+    async *stream(request) {
+      if (
+        request.purpose !== "ordinary" ||
+        request.messages.some((message) => message.role === "tool")
+      ) {
+        yield { type: "text_delta", text: "Permission handled." };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      await captured.promise;
+      yield { type: "tool_call_start", id: "activation-read", name: "read_file" };
+      yield { type: "tool_call_delta", id: "activation-read", json: '{"path":"package.json"}' };
+      yield { type: "tool_call_end", id: "activation-read" };
+      yield { type: "finish", reason: "tool_calls" };
+    },
+  };
+  const modelTargets: ModelTargets = {
+    async resolve() {
+      return { identity: targetIdentity, driver, contextProfile };
+    },
+    async snapshot() {
+      return {
+        targets: [
+          {
+            identity: targetIdentity,
+            contextProfile,
+            readiness: { status: "available", credentialSource: "test" },
+          },
+        ],
+      };
+    },
+  };
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    modelTargets,
+    workspaceRoot,
+    stateRoot,
+    permissions: { decide: () => "ask" },
+    tools: createReadToolRegistry({ workspaceRoot }),
+  });
+  const unsubscribe = lifecycle.subscribe((event) => {
+    if (event.type === "tool_permission_requested") {
+      requestId = event.requestId;
+      requested.resolve(event.requestId);
+    }
+  });
+  let presentation: Awaited<ReturnType<typeof createPresentationSession>> | undefined;
+  try {
+    presentation = await createPresentationSession({
+      lifecycle,
+      modelTargets,
+      workspaceRoot,
+      stateRoot,
+      projectLabel: "workspace",
+      openProject: true,
+      [presentationSessionRecordReader]: async (sessionId) => {
+        const records = await readInMemoryPresentationRecords(harness.sessions)(sessionId);
+        if (!capturedOnce) {
+          capturedOnce = true;
+          captured.resolve();
+          await requested.promise;
+        }
+        return records;
+      },
+    });
+    const view = presentation;
+    const stop = view.subscribe(() => {
+      if (
+        view
+          .getState()
+          .authoritative.active?.pendingInteractions.some(
+            (interaction) => interaction.requestId === requestId,
+          )
+      )
+        visible.resolve();
+    });
+    try {
+      await view.dispatch({ type: "create_session", targetId: targetIdentity.targetId });
+      expect(
+        await view.dispatch({
+          type: "submit_draft_prompt",
+          text: "Read after activation starts",
+          skills: [],
+          thinkingSelection: null,
+        }),
+      ).toMatchObject({ status: "admitted" });
+      await withManagedFailureGuard(
+        visible.promise,
+        "The permission arriving during activation was lost.",
+      );
+      expect(view.getState().authoritative.active?.pendingInteractions).toMatchObject([
+        { requestId: await requested.promise, effect: "read" },
+      ]);
+      expect(
+        await view.dispatch({
+          type: "decide_permission",
+          requestId: await requested.promise,
+          decision: "deny",
+        }),
+      ).toMatchObject({ status: "admitted" });
+    } finally {
+      stop();
+    }
+  } finally {
+    captured.resolve();
+    unsubscribe();
     await presentation?.close();
     await lifecycle.close();
     await rm(root, { recursive: true, force: true });
@@ -12722,6 +12846,7 @@ test("PresentationSession degrades an admitted session when settlement and fallb
       targetIdentity,
       stateRoot,
       workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(readFailure.directory),
     });
     const degraded = Promise.withResolvers<{
       readonly status: "degraded";
@@ -12839,6 +12964,7 @@ test("PresentationSession degrades an admitted draft Plan when settlement and fa
       projectLabel: "workspace",
       stateRoot,
       workspaceRoot,
+      [presentationSessionRecordReader]: readInMemoryPresentationRecords(readFailure.directory),
     });
     const degraded = Promise.withResolvers<{
       readonly status: "degraded";
