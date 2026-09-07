@@ -17,7 +17,6 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import {
   AgentSession,
   type AgentSessionDependencies,
@@ -33,7 +32,6 @@ import {
   type ModelEvent,
   type ModelRequest,
   type RuntimeEvent,
-  type SessionEventRecord,
   type SessionStore,
   type ToolRegistry,
   type ToolResult,
@@ -46,8 +44,8 @@ import {
   sessionDurableContext,
 } from "@adam-agent/agent/internal-testing";
 import { describe, expect, expectTypeOf, test, vi } from "vitest";
-
 import { FakeModelDriver } from "./index.js";
+import { requireSessionEvent } from "./session-event.test-support.js";
 
 const cancelledResult = {
   status: "cancelled",
@@ -704,7 +702,7 @@ describe("AgentSession", () => {
     } as const;
     expect(result).toEqual(expectedResult);
     expect(events.at(-1)).toEqual({ type: "session_settled", result: expectedResult });
-    expect(await store.read()).toContainEqual(
+    expect((await store.read()).map(requireSessionEvent)).toContainEqual(
       expect.objectContaining({
         event: expect.objectContaining({ type: "session_settled", result: expectedResult }),
       }),
@@ -745,7 +743,7 @@ describe("AgentSession", () => {
         category: "unknown",
       },
     });
-    expect(await store.read()).toContainEqual(
+    expect((await store.read()).map(requireSessionEvent)).toContainEqual(
       expect.objectContaining({
         event: expect.objectContaining({ type: "session_settled", result }),
       }),
@@ -856,30 +854,42 @@ describe("AgentSession", () => {
           ],
           records: [
             {
-              schemaVersion: 2,
-              runId: expect.any(String),
+              schemaVersion: 3,
               sequence: 1,
-              event: { type: "user_message", text: "Persist this turn" },
+              record: {
+                type: "runtime_event",
+                runId: expect.any(String),
+                event: { type: "user_message", text: "Persist this turn" },
+              },
             },
             {
-              schemaVersion: 2,
-              runId: expect.any(String),
+              schemaVersion: 3,
               sequence: 2,
-              event: { type: "model_message_started" },
+              record: {
+                type: "runtime_event",
+                runId: expect.any(String),
+                event: { type: "model_message_started" },
+              },
             },
             {
-              schemaVersion: 2,
-              runId: expect.any(String),
+              schemaVersion: 3,
               sequence: 3,
-              event: { type: "model_message_completed", text: "Durable answer." },
+              record: {
+                type: "runtime_event",
+                runId: expect.any(String),
+                event: { type: "model_message_completed", text: "Durable answer." },
+              },
             },
             {
-              schemaVersion: 2,
-              runId: expect.any(String),
+              schemaVersion: 3,
               sequence: 4,
-              event: {
-                type: "session_settled",
-                result: { status: "completed", answer: "Durable answer." },
+              record: {
+                type: "runtime_event",
+                runId: expect.any(String),
+                event: {
+                  type: "session_settled",
+                  result: { status: "completed", answer: "Durable answer." },
+                },
               },
             },
           ],
@@ -936,7 +946,10 @@ describe("AgentSession", () => {
     let failReasoningStart = true;
     const store: SessionStore = {
       async append(record) {
-        if (failReasoningStart && record.event.type === "model_reasoning_started") {
+        if (
+          failReasoningStart &&
+          requireSessionEvent(record).event.type === "model_reasoning_started"
+        ) {
           failReasoningStart = false;
           throw new Error("Fail the first reasoning-start append.");
         }
@@ -973,7 +986,7 @@ describe("AgentSession", () => {
       second,
       reasoningEvents: events.filter((event) => event.type.startsWith("model_reasoning_")),
       durableReasoningEvents: (await store.read())
-        .map((record) => record.event)
+        .map((record) => requireSessionEvent(record).event)
         .filter((event) => event.type.startsWith("model_reasoning_")),
     }).toEqual({
       first: {
@@ -1021,10 +1034,13 @@ describe("AgentSession", () => {
       result: cancelledResult,
       settledEvents: [{ type: "session_settled", result: cancelledResult }],
       finalRecord: {
-        schemaVersion: 2,
-        runId: expect.any(String),
+        schemaVersion: 3,
         sequence: 4,
-        event: { type: "session_settled", result: cancelledResult },
+        record: {
+          type: "runtime_event",
+          runId: expect.any(String),
+          event: { type: "session_settled", result: cancelledResult },
+        },
       },
     });
   });
@@ -1051,11 +1067,11 @@ describe("AgentSession", () => {
     await pendingResult;
     const records = await store.read();
 
-    expect(new Set(records.map((record) => record.runId)).size).toBe(1);
-    expect(records[0]?.runId).toMatch(
+    expect(new Set(records.map((record) => requireSessionEvent(record).runId)).size).toBe(1);
+    expect(records[0] === undefined ? undefined : requireSessionEvent(records[0]).runId).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
     );
-    expect(records.map((record) => record.event.type)).toEqual([
+    expect(records.map((record) => requireSessionEvent(record).event.type)).toEqual([
       "user_message",
       "model_message_started",
       "session_interrupted",
@@ -1076,11 +1092,11 @@ describe("AgentSession", () => {
         });
       },
     };
-    const records: SessionEventRecord[] = [];
+    const records: SessionRecord[] = [];
     const store: SessionStore = {
       async append(record) {
         records.push(record);
-        if (record.event.type === "session_interrupted") {
+        if (requireSessionEvent(record).event.type === "session_interrupted") {
           throw new Error("The durable write completed before the adapter reported failure.");
         }
       },
@@ -1102,8 +1118,9 @@ describe("AgentSession", () => {
 
     expect({
       result,
-      interruptionCount: records.filter((record) => record.event.type === "session_interrupted")
-        .length,
+      interruptionCount: records.filter(
+        (record) => requireSessionEvent(record).event.type === "session_interrupted",
+      ).length,
     }).toEqual({
       result: {
         status: "failed",
@@ -2713,7 +2730,7 @@ describe("AgentSession", () => {
         decision: "allow",
       });
       const persistedToolEvents = (await store.read())
-        .map((record) => record.event)
+        .map((record) => requireSessionEvent(record).event)
         .filter((event) => event.type.startsWith("tool_"));
       const permissionRequest = persistedToolEvents.find(
         (event) => event.type === "tool_permission_requested",

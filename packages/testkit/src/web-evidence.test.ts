@@ -27,7 +27,7 @@ import {
   extractWebTextForTesting,
   resolveWebTargetForTesting,
   SafeWebHttpError,
-  type SessionEventRecord,
+  type SessionRecord,
   type SessionStore,
   sessionToolProfileNames,
   type WebHttpAdapter,
@@ -147,9 +147,9 @@ test("AgentSession fetches one approved Web source before opening its next immut
     },
   };
   const tools = await createWebEvidenceToolRegistry({ artifactStore, http });
-  const baseStore = createInMemorySessionStore<SessionEventRecord>();
+  const baseStore = createInMemorySessionStore<SessionRecord>();
   let rejectedRecord: unknown;
-  const store: SessionStore<SessionEventRecord> = {
+  const store: SessionStore<SessionRecord> = {
     async append(record) {
       try {
         await baseStore.append(record);

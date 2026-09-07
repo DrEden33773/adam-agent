@@ -54,6 +54,7 @@ import {
 } from "./structured-user-content.js";
 import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import { type TodoItemV1, todoItemV1Schema, todoPolicyVersionV1 } from "./todo.js";
+import { isCanonicalPatchPath, toolErrorSchema } from "./tool-error.js";
 import type { PermissionSubject, ToolCall, ToolEffect, ToolReplayClass } from "./tool-runtime.js";
 
 export type CanonicalRuntimeEvent = Exclude<
@@ -120,6 +121,7 @@ type VersionedCanonicalRuntimeEvent<Subject, ToolError> =
     });
 type V1CanonicalRuntimeEvent = VersionedCanonicalRuntimeEvent<V1PermissionSubject, V1ToolError>;
 
+/** Historical V1/V2 event envelopes. New runtime writes use SessionRecord V3 events. */
 export type SessionEventRecord =
   | {
       readonly schemaVersion: 1;
@@ -1110,9 +1112,9 @@ export class SessionLogicalQuotaError extends Error {
   }
 }
 
-export interface SessionStore<RecordType extends SessionRecord = SessionEventRecord> {
-  append(record: RecordType): Promise<void>;
-  appendBatch(records: readonly RecordType[]): Promise<void>;
+export interface SessionStore<RecordType extends SessionRecord = SessionRecord> {
+  readonly append: (record: RecordType) => Promise<void>;
+  readonly appendBatch: (records: readonly RecordType[]) => Promise<void>;
   read(): Promise<readonly RecordType[]>;
 }
 
@@ -1351,66 +1353,11 @@ const v2ToolErrorSchema = z.discriminatedUnion("code", [
     recoveryReference: z.strictObject({ id: z.uuid() }),
   }),
 ]);
+// V3 previously accepted the V2 reasonless indeterminate error. Decode those
+// existing bytes unchanged, while all new current failures use strict admission.
 const currentToolErrorSchema = z.union([
-  v2ToolErrorSchema,
-  z.strictObject({
-    code: z.enum([
-      "input_resource_corrupt",
-      "input_resource_cursor_invalid",
-      "input_resource_not_visible",
-      "input_resource_quota_exceeded",
-      "input_resource_unsupported",
-      "todo_aggregate_limit_exceeded",
-      "todo_completed_dependent",
-      "todo_cursor_invalid",
-      "todo_cursor_stale",
-      "todo_dependency_cycle",
-      "todo_dependency_incomplete",
-      "todo_entity_limit_exceeded",
-      "todo_revision_stale",
-      "managed_agent_cancelled",
-      "managed_agent_capacity_exceeded",
-      "managed_agent_deadline_exceeded",
-      "managed_agent_failed",
-      "managed_agent_result_too_large",
-      "managed_agent_unavailable",
-      "web_cancelled",
-      "web_deadline_exceeded",
-      "web_provider_invalid",
-      "web_provider_unavailable",
-      "web_response_invalid",
-      "web_response_too_large",
-      "web_source_unavailable",
-    ]),
-    message: z.string(),
-  }),
-  z.strictObject({
-    code: z.literal("tool_effect_indeterminate"),
-    reason: z.enum([
-      "mcp_request_timeout",
-      "mcp_caller_cancelled",
-      "mcp_connection_closed",
-      "mcp_protocol_error",
-      "process_restart",
-    ]),
-    message: z.string(),
-  }),
-  z.strictObject({
-    code: z.enum([
-      "mcp_output_invalid",
-      "mcp_output_unsupported",
-      "mcp_protocol_error",
-      "mcp_result_too_large",
-    ]),
-    message: z.string(),
-  }),
-  z.strictObject({
-    code: z.literal("mcp_catalog_stale"),
-    message: z.string(),
-    generationId: z.uuid(),
-    serverId: z.string().min(1).max(128),
-    catalogDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
-  }),
+  toolErrorSchema,
+  z.strictObject({ code: z.literal("tool_effect_indeterminate"), message: z.string() }),
 ]);
 const v1PermissionSubjectSchema = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("file"), path: z.string() }),
@@ -1802,14 +1749,6 @@ const currentPermissionSubjectSchema = z.discriminatedUnion("type", [
   }),
 ]) as unknown as z.ZodType<PermissionSubject>;
 
-function isCanonicalPatchPath(path: string): boolean {
-  return (
-    path.length > 0 &&
-    !path.startsWith("/") &&
-    !path.includes("\0") &&
-    path.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..")
-  );
-}
 const changePreviewArtifactReferenceSchema = z.strictObject({
   id: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   mediaType: z.literal("text/x-diff; charset=utf-8"),
@@ -3315,7 +3254,7 @@ export function isSessionRecordWithinSizeLimit(record: SessionRecord): boolean {
 }
 
 export function createInMemorySessionStore<
-  RecordType extends SessionRecord = SessionEventRecord,
+  RecordType extends SessionRecord = SessionRecord,
 >(): SessionStore<RecordType> {
   const records: RecordType[] = [];
   let nextSequence = 1;
@@ -3505,7 +3444,7 @@ export function createJsonlSessionStoreDirectory<
 }
 
 export async function createJsonlSessionStore<
-  RecordType extends SessionRecord = SessionEventRecord,
+  RecordType extends SessionRecord = SessionRecord,
 >(options: {
   readonly workspaceRoot: string;
   readonly sessionId: string;
@@ -3760,6 +3699,14 @@ function validateBoundedSessionEventRecord(value: unknown): {
   readonly storedByteLength: number;
 } {
   const record = validateSessionRecord(value);
+  if (
+    record.schemaVersion === 3 &&
+    record.record.type === "runtime_event" &&
+    record.record.event.type === "tool_failed" &&
+    !toolErrorSchema.safeParse(record.record.event.error).success
+  ) {
+    throw new SessionStoreError();
+  }
   const serialized = JSON.stringify(record);
   if (!isSessionRecordWithinSizeLimit(record)) {
     throw new SessionStoreError("session_log_too_large");
