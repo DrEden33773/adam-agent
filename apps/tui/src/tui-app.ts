@@ -111,6 +111,7 @@ import {
   createAdamStructuredEditorCompletion,
 } from "./structured-editor-completion.js";
 import { TargetPicker } from "./target-picker.js";
+import { parseTaskBudgetFollowUp } from "./task-budget-input.js";
 import { type AdamTuiTheme, createAdamTuiTheme } from "./theme.js";
 import { ThinkingPicker } from "./thinking-picker.js";
 import { TodoCompactOverlay } from "./todo-compact-overlay.js";
@@ -3918,7 +3919,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
             editor.setText("");
             showNotice(
               "info",
-              "Enter one bounded follow-up task for the exact terminal child.",
+              "Follow-up task · add tokens: /budget-add <tokens> <task>",
               "until_next_action",
               expectedSessionId,
             );
@@ -5383,6 +5384,22 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         "until_replaced",
         active.session.id,
       );
+      let followUpInput: ReturnType<typeof parseTaskBudgetFollowUp>;
+      try {
+        followUpInput =
+          managedInput.action === "follow_up" || managedInput.action === "recovery"
+            ? parseTaskBudgetFollowUp(text)
+            : { task: text };
+      } catch (error) {
+        editor.disableSubmit = false;
+        showNotice(
+          "error",
+          error instanceof Error ? error.message : "Invalid task budget input.",
+          "until_edit",
+        );
+        renderState();
+        return;
+      }
       const command: PresentationCommand =
         managedInput.action === "message" || managedInput.action === "reply"
           ? {
@@ -5401,14 +5418,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                 sessionId: active.session.id,
                 agentId: managedInput.agentId,
                 expectedRevision: managedInput.expectedRevision,
-                task: text,
+                ...followUpInput,
               }
             : {
                 type: "recover_managed_agent",
                 sessionId: active.session.id,
                 agentId: managedInput.agentId,
                 expectedRevision: managedInput.expectedRevision,
-                task: text,
+                ...followUpInput,
               };
       void options.presentation
         .dispatch(command)

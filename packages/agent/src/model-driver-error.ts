@@ -14,7 +14,10 @@ export const modelDriverErrorCategories = [
 
 export type ModelDriverErrorCategory = (typeof modelDriverErrorCategories)[number];
 
-export const modelDriverDiagnosticCodes = ["tool_schema_root_not_object"] as const;
+export const modelDriverDiagnosticCodes = [
+  "tool_schema_root_not_object",
+  "task_budget_exhausted",
+] as const;
 
 export type ModelDriverDiagnosticCode = (typeof modelDriverDiagnosticCodes)[number];
 

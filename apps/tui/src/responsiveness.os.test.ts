@@ -60,7 +60,7 @@ test.each([false, true])(
           "\r",
           argumentsBarrier
             ? "Live tool · read_file · generating arguments"
-            : "research.v2 · background · running",
+            : "research.v3 · background · running",
         );
         await measure("childBack", "\u001b[27;1;27~", "Agents · 2 active · 0 terminal");
         await measure(

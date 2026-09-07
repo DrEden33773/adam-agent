@@ -159,7 +159,7 @@ export class AgentWidget implements Component {
           : []),
         ...(isQueued && budget !== undefined
           ? [
-              `   ${budget.knownUsed} used · ${budget.outstandingReserved} reserved · ${budget.unknownReserved} unknown · ${budget.available} available`,
+              `   ${budget.knownUsed} used · ${budget.outstandingReserved} reserved · ${budget.unknownReserved} unknown · ${budget.available === null ? "no cumulative budget" : `${budget.available} available`}`,
             ]
           : []),
       ];

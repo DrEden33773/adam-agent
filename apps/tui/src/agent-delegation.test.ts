@@ -5,7 +5,7 @@ import type { ModelRequest } from "@adam-agent/agent";
 import { expect, test, vi } from "vitest";
 import { startManagedTui } from "./agent-fleet.test-support.js";
 
-test("custom aggregate limits validate the visible range and persist the exact non-preset value", async () => {
+test("custom task budgets validate explicit amounts and persist the exact grant", async () => {
   const requests: ModelRequest[] = [];
   const h = await startManagedTui({
     async *stream(request) {
@@ -21,15 +21,28 @@ test("custom aggregate limits validate the visible range and persist the exact n
     await h.press(" Inspect a custom grant.\r", "Delegation");
     await h.press("\x1b[B\x1b[B\x1b[B\r", "Execution and limits");
     await h.press("\x1b[A\r", "Custom limits");
-    await h.press("\r", "Custom aggregate tokens");
-    await h.press("\x01\x0b0\r", "Enter an integer from 1 to 512000.");
+    await h.press("\r", "Custom task budget tokens");
+    await h.press("\x01\x0b0\r", "Enter an integer from 1 to 9007199254740991.");
     expect(requests).toHaveLength(0);
     expect(await h.store.read()).toHaveLength(0);
     await h.press("\x01\x0b123457\r", "Limits updated.");
     await h.press("\r", "Completed");
     const admission = (await h.store.read()).find((record) => record.event.type === "admitted");
-    expect(admission?.event).toMatchObject({ envelope: { aggregateTokens: 123457 } });
+    expect(admission?.event).toMatchObject({
+      envelope: { taskBudget: { mode: "limited", grants: [{ tokens: 123457 }] } },
+    });
     expect(requests).toHaveLength(1);
+    await h.press("/agents\r", "Agents workspace");
+    await h.press("\r", "Enter compose");
+    await h.press("\r", "New turn");
+    await h.press("/budget-add 50000 Continue this task.\r", "Delivered");
+    const admissions = (await h.store.read()).filter((record) => record.event.type === "admitted");
+    expect(admissions).toHaveLength(2);
+    expect(admissions[1]?.event).toMatchObject({
+      envelope: {
+        taskBudget: { mode: "limited", grants: [{ tokens: 123457 }, { tokens: 50000 }] },
+      },
+    });
   } finally {
     await h.close();
   }
@@ -52,8 +65,10 @@ test("direct delegation reviews finite execution and token bounds before one exa
     await h.press("\r", "Execution and limits");
     await h.press("\x1b[B\x1b[B\x1b[B\r", "Foreground");
     await h.press("\x1b[B\r", "Limits updated.");
-    await h.press("\x1b[B\x1b[B\x1b[B\r", "Aggregate 1x");
-    await h.press("\x1b[B\x1b[B\r", "128000 tokens · Current request");
+    await h.press("\x1b[B\x1b[B\x1b[B\r", "No cumulative budget");
+    await h.press("\x1b[A\r", "Custom limits");
+    await h.press("\r", "Custom task budget tokens");
+    await h.press("\x01\x0b128000\r", "128000 task tokens");
     await h.press("\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r", "Enter apply");
     await h.press("\x01\x0bNamed evidence work\r", "Description updated.");
     expect(requests).toHaveLength(0);
@@ -68,8 +83,9 @@ test("direct delegation reviews finite execution and token bounds before one exa
         threads: 1,
         running: 1,
         queued: 0,
-        aggregateTokens: 128000,
-        sessionTokens: 2048000,
+        aggregateTokens: null,
+        taskBudget: { mode: "limited", grants: [{ tokens: 128000 }] },
+        sessionTokens: null,
         origin: { kind: "direct_request" },
       },
     });
@@ -111,8 +127,10 @@ test("a Main model delegation uses the exact editable grant in its pending permi
     await h.press("\r", "Execution and limits");
     await h.press("\x1b[B\x1b[B\r", "Task only");
     await h.press("\x1b[B\r", "Context updated.");
-    await h.press("\x1b[B\x1b[B\x1b[B\r", "Aggregate 1x");
-    await h.press("\x1b[B\x1b[B\r", "128000 tokens · Task only");
+    await h.press("\x1b[B\x1b[B\x1b[B\r", "No cumulative budget");
+    await h.press("\x1b[A\r", "Custom limits");
+    await h.press("\r", "Custom task budget tokens");
+    await h.press("\x01\x0b128000\r", "128000 task tokens");
     const pending = h.presentation.getState().authoritative.active?.pendingInteractions[0];
     if (pending?.delegation === undefined) throw new Error("No pending exact delegation.");
     expect(
@@ -132,7 +150,8 @@ test("a Main model delegation uses the exact editable grant in its pending permi
       context: { mode: "task" },
       envelope: {
         context: "task",
-        aggregateTokens: 128000,
+        aggregateTokens: null,
+        taskBudget: { mode: "limited", grants: [{ tokens: 128000 }] },
         origin: { kind: "main_run", callId: "model-spawn" },
       },
     });

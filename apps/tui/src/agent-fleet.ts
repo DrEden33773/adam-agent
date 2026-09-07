@@ -545,7 +545,7 @@ export class AgentWorkspace implements Component {
       if (budget !== undefined)
         lines.push(
           `${budget.knownUsed} used · ${budget.outstandingReserved} reserved`,
-          `${budget.unknownReserved} unknown · ${budget.available} available`,
+          `${budget.unknownReserved} unknown · ${budget.available === null ? "no cumulative budget" : `${budget.available} available`}`,
         );
       if (!thread.turn.hasStarted && thread.turn.outcome === undefined)
         lines.push(

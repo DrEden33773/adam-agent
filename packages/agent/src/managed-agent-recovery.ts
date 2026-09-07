@@ -20,6 +20,7 @@ import {
   type SessionStoreDirectory,
   SessionStoreError,
 } from "./session-store.js";
+import { validateTaskProviderReceipts } from "./task-budget.js";
 import type { ToolRegistry } from "./tool-runtime.js";
 
 /** Cross-store verification belongs to Control; child transcript bytes remain SessionStore-owned. */
@@ -27,6 +28,7 @@ export async function inspectManagedChildReceipt(
   thread: ManagedControlThread,
   stores: SessionStoreDirectory<SessionRecord>,
   admission?: ManagedControlRecord,
+  controlRecords?: readonly ManagedControlRecord[],
 ): Promise<ManagedControlThread> {
   const outcome = thread.turn.outcome;
   const receipt = outcome?.transcript ?? thread.turn.watchdog?.transcript;
@@ -53,6 +55,8 @@ export async function inspectManagedChildReceipt(
       (outcome !== undefined && (records.at(-1)?.sequence ?? 0) !== receipt.sequence)
     )
       throw new SessionStoreError();
+    if (outcome !== undefined && admission !== undefined && controlRecords !== undefined)
+      validateFleetTaskProviderReceipts(admission, records, controlRecords);
     return thread;
   } catch (error) {
     if (!(error instanceof SessionStoreError)) throw error;
@@ -357,5 +361,27 @@ export function validateManagedChildGenesis(
     (run.record.runId !== admission.turnId ||
       !isDeepStrictEqual(run.record.inputResources, admission.event.frozen.inputResources))
   )
+    throw new SessionStoreError();
+}
+
+export function validateFleetTaskProviderReceipts(
+  admission: ManagedControlRecord,
+  childRecords: readonly SessionRecord[] | undefined,
+  controlRecords: readonly ManagedControlRecord[],
+  allowPendingSource = false,
+): void {
+  if (admission.event.type !== "admitted" || admission.event.envelope?.version !== 2) return;
+  const receipts = controlRecords.flatMap((record) =>
+    record.turnId !== admission.turnId
+      ? []
+      : record.event.type === "provider_reserved"
+        ? [{ ...record.event, blocked: false }]
+        : record.event.type === "budget_blocked" &&
+            record.event.source !== undefined &&
+            record.event.purpose !== undefined
+          ? [{ source: record.event.source, purpose: record.event.purpose, blocked: true }]
+          : [],
+  );
+  if (!validateTaskProviderReceipts(childRecords, receipts, allowPendingSource))
     throw new SessionStoreError();
 }

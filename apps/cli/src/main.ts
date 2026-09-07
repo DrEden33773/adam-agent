@@ -321,7 +321,7 @@ function formatPermissionPrompt(
     return `Allow ${event.subject.count} ${event.subject.mode} agents for this exact batch: ${event.subject.envelope.running} running/${event.subject.envelope.queued} queued, ${event.subject.envelope.aggregateTokens} tokens; envelope ${event.subject.envelope.id} (${event.subject.argumentsDigest}) [y/N] `;
   }
   if (event.subject.type === "managed_agent_spawn") {
-    return `Allow ${event.subject.profile} ${event.subject.mode ?? "foreground"} scout for this exact task (${event.subject.taskDigest}) [y/N] `;
+    return `Allow ${event.subject.profile} ${event.subject.mode ?? "foreground"} scout for this exact task${event.subject.sharedTaskBudget?.mode === "limited" ? ` joining agent ${event.subject.shareBudgetWithAgentId}: ${event.subject.sharedTaskBudget.grants.reduce((sum, grant) => sum + grant.tokens, 0)} existing task tokens shared by all members; no tokens added` : ""}${event.subject.budgetTokens === undefined ? "" : ` with ${event.subject.budgetTokens} cumulative tokens shared across attempts`} (${event.subject.taskDigest}) [y/N] `;
   }
   if (event.subject.type === "managed_agent_control") {
     return `Allow managed-child ${event.subject.action} for this exact parent session [y/N] `;
@@ -579,7 +579,7 @@ async function runCliCommand(activeCommand: CliCommand): Promise<void> {
 async function createRunLifecycle(modelTargets: ModelTargets): Promise<SessionLifecycle> {
   const artifactStore = createLazyFileArtifactStore(join(stateRoot, "artifacts"));
   return createSessionLifecycle({
-    managedAgentTools: "managed-agent-tools.a1.v2",
+    managedAgentTools: "managed-agent-tools.a1.v3",
     modelTargets,
     preferences: createPresentationPreferences({ environment: userConfigurationEnvironment }),
     workspaceTrust: createWorkspaceTrust({

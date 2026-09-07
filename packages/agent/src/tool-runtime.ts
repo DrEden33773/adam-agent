@@ -8,7 +8,6 @@ import type {
   ManagedDelegationEnvelope,
   ManagedDelegationSelection,
 } from "@adam-agent/presentation";
-
 import { z } from "zod";
 import type { ArtifactStore } from "./artifact-store.js";
 import {
@@ -38,6 +37,7 @@ import {
   createRepositorySearchToolAdapter,
   type RepositorySearchBackend,
 } from "./repository-search.js";
+import type { TaskBudget } from "./task-budget.js";
 import {
   readTextRange,
   TextReadError,
@@ -332,9 +332,18 @@ export type PermissionSubject =
     }
   | {
       readonly type: "managed_agent_spawn";
+      readonly shareBudgetWithAgentId?: string;
+      readonly sharedTaskBudget?: TaskBudget;
+      readonly budgetTokens?: number;
       readonly parentRootId: string;
       readonly parentSessionId: string;
-      readonly profile: "scout.v1" | "scout.v2" | "research.v1" | "research.v2";
+      readonly profile:
+        | "scout.v1"
+        | "scout.v2"
+        | "scout.v3"
+        | "research.v1"
+        | "research.v2"
+        | "research.v3";
       readonly mode?: "foreground" | "background";
       readonly profileDigest: `sha256:${string}`;
       readonly selectedSkills?: readonly {
@@ -364,7 +373,8 @@ export type PermissionSubject =
             readonly maximumDeadlineMilliseconds: 600000;
           }
         | {
-            readonly maximumTokens: number;
+            readonly maximumTokens: number | null;
+            readonly contextWindowTokens?: number;
             readonly maximumInactivityMilliseconds: 300000;
           };
       readonly thinkingPolicy?: {

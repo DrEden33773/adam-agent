@@ -28,15 +28,16 @@ export type { ManagedControlCommand, ManagedControlReceipt } from "@adam-agent/p
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
-
 import {
   AgentSession,
   type ManagedAgentRequestBoundary,
+  type ManagedTaskBudgetBoundary,
   managedAgentInterruptAfterEffect,
   managedAgentPartialOutput,
   managedAgentRequestBoundary,
   managedAgentRuntimeBoundary,
   managedAgentStorageQuota,
+  managedTaskBudgetBoundary,
   sessionRecordCommittedBarrier,
 } from "./agent-session.js";
 import type { ModelDriver, RuntimeEvent } from "./agent-session-contracts.js";
@@ -57,11 +58,15 @@ import {
   fleetBudget,
   fleetSessionCeiling,
   fleetStorage,
+  fleetTaskBudget,
   managedChildTerminalBytes,
   managedControlTerminalBytes,
+  minimumTokenCeiling,
   requestedDelegationContext,
   resolveFleetPolicy,
   storedRecordBytes,
+  taskFleetEvents,
+  withinTokenCeiling,
 } from "./fleet-ledger.js";
 import {
   type ManagedAgentInactivityScheduler,
@@ -89,6 +94,7 @@ import {
   managedChildTerminalResult,
   materializeManagedOutcome,
   prepareManagedChildResume,
+  validateFleetTaskProviderReceipts,
   validateManagedChildGenesis,
   validateManagedParentHistory,
 } from "./managed-agent-recovery.js";
@@ -127,6 +133,13 @@ import { SessionLifecycleError } from "./session-lifecycle-error.js";
 import type { SessionRecord, SessionStore, SessionStoreDirectory } from "./session-store.js";
 import { SessionLogicalQuotaError, SessionStoreError } from "./session-store.js";
 import { createIndependentSkillContextV1, readActiveSkillContentsV1 } from "./skills.js";
+import {
+  addTaskBudgetGrant,
+  taskBudgetClosingAdvice,
+  taskBudgetContinues,
+  taskBudgetUsage,
+  taskRequestMaximumOutput,
+} from "./task-budget.js";
 import type { ThinkingPolicySelectionV1 } from "./thinking-policy.js";
 import {
   bindInputResourceToolRegistry,
@@ -312,6 +325,7 @@ const commandSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({
     type: z.literal("post_agent"),
+    additionalBudgetTokens: z.number().int().positive().safe().optional(),
     origin: delegationOriginSchema.optional(),
     envelope: delegationEnvelopeSchema.optional(),
     parentSessionId: z.uuid(),
@@ -385,6 +399,7 @@ const commandSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({
     type: z.literal("next_turn"),
+    additionalBudgetTokens: z.number().int().positive().safe().optional(),
     origin: delegationOriginSchema.optional(),
     envelope: delegationEnvelopeSchema.optional(),
     inputId: z.uuid().optional(),
@@ -669,12 +684,24 @@ export function createManagedAgentControl(options: {
         const inspected = await inspectManagedChildReceipt(
           {
             ...thread,
-            budget: fleetBudget(
-              records,
-              thread.turn.envelope?.threadTokens ?? policy.threadTokens,
-              (record) => record.threadId === thread.threadId,
-              new Set([...active.values()].map((entry) => entry.turnId)),
-            ),
+            budget:
+              thread.turn.envelope?.taskBudget === undefined
+                ? fleetBudget(
+                    records,
+                    thread.turn.envelope?.threadTokens ?? policy.threadTokens,
+                    (record) => record.threadId === thread.threadId,
+                    new Set([...active.values()].map((entry) => entry.turnId)),
+                  )
+                : taskBudgetUsage(
+                    fleetTaskBudget(records, thread.turn.envelope.taskBudget),
+                    taskFleetEvents(
+                      records,
+                      records.find(
+                        (record) =>
+                          record.event.type === "admitted" && record.turnId === thread.turn.turnId,
+                      ) as ManagedControlRecord,
+                    ),
+                  ),
             residency: live ? "live" : "unloaded",
             turn: {
               ...thread.turn,
@@ -709,6 +736,7 @@ export function createManagedAgentControl(options: {
           records.find(
             (record) => record.turnId === thread.turn.turnId && record.event.type === "admitted",
           ),
+          records,
         );
         const actions: ManagedControlAction[] = [];
         let recoveryDiagnostic = inspected.turn.diagnostic;
@@ -743,7 +771,9 @@ export function createManagedAgentControl(options: {
               origin.event.envelope !== undefined &&
               attempts <
                 Math.min(policy.maximumAttempts, origin.event.envelope.policy.maximumAttempts) &&
-              (inspected.budget?.available ?? 0) > 0
+              (origin.event.envelope.version === 2 ||
+                inspected.budget?.available === null ||
+                (inspected.budget?.available ?? 0) > 0)
             )
               actions.push("new_turn");
           }
@@ -775,6 +805,11 @@ export function createManagedAgentControl(options: {
               if (childRecords === undefined && !thread.turn.hasStarted) actions.push("resume");
               else if (childRecords !== undefined && childRecords[0] !== undefined) {
                 validateManagedChildGenesis(admission, childRecords[0], childRecords);
+                validateFleetTaskProviderReceipts(
+                  admission,
+                  childRecords,
+                  await controlStore.read(),
+                );
                 const terminal = await managedChildTerminalResult(
                   childRecords,
                   options.workspaceRoot,
@@ -1501,6 +1536,21 @@ export function createManagedAgentControl(options: {
           ...(options[sessionRecordCommittedBarrier] === undefined
             ? {}
             : { [sessionRecordCommittedBarrier]: options[sessionRecordCommittedBarrier] }),
+          [managedTaskBudgetBoundary]: async (
+            request: Parameters<ManagedTaskBudgetBoundary>[0],
+          ) => {
+            if (
+              admission?.event.type !== "admitted" ||
+              admission.event.envelope?.taskBudget?.mode !== "limited"
+            )
+              return undefined;
+            const records = await controlStore.read();
+            return taskBudgetClosingAdvice(
+              fleetTaskBudget(records, admission.event.envelope.taskBudget),
+              taskFleetEvents(records, admission),
+              request,
+            );
+          },
           model: {
             async *stream(request) {
               if (admission?.event.type !== "admitted" || admission.event.envelope === undefined) {
@@ -1510,6 +1560,8 @@ export function createManagedAgentControl(options: {
               await waitForCeiling(identity, request.signal);
               if (request.signal.aborted) return;
               const requestId = randomUUID();
+              let rejectedSource: { sequence: number; digest: string } | undefined;
+              let maximumOutput = request.maximumOutputTokens;
               let reserved = false;
               let settled = false;
               try {
@@ -1520,12 +1572,18 @@ export function createManagedAgentControl(options: {
                       "utf8",
                     ) / 4,
                   );
-                  assertFleetReservation(
-                    await controlStore.read(),
-                    admission,
-                    estimatedInput + request.maximumOutputTokens,
-                    policy,
-                  );
+                  const budgetRecords = await controlStore.read();
+                  if (
+                    admission.event.type === "admitted" &&
+                    admission.event.envelope?.taskBudget !== undefined &&
+                    admission.event.frozen?.review === undefined
+                  )
+                    maximumOutput = taskRequestMaximumOutput(
+                      fleetTaskBudget(budgetRecords, admission.event.envelope.taskBudget),
+                      taskFleetEvents(budgetRecords, admission),
+                      estimatedInput,
+                      request.maximumOutputTokens,
+                    );
                   const sourceRecords = await store.read();
                   const source = sourceRecords.findLast(
                     (record) =>
@@ -1535,12 +1593,53 @@ export function createManagedAgentControl(options: {
                   );
                   if (source === undefined)
                     throw new Error("Missing exact provider source receipt.");
+                  rejectedSource = {
+                    sequence: source.sequence,
+                    digest: managedControlDigest(source),
+                  };
+                  if (
+                    admission.event.type === "admitted" &&
+                    admission.event.envelope?.taskBudget?.mode === "limited"
+                  ) {
+                    for (const member of budgetRecords) {
+                      if (
+                        member.event.type !== "admitted" ||
+                        member.event.envelope?.taskBudget?.mode !== "limited" ||
+                        member.event.envelope.taskBudget.taskId !==
+                          admission.event.envelope.taskBudget.taskId
+                      )
+                        continue;
+                      try {
+                        const memberRecords = await (
+                          await options.childSessionStores.open(member.childSessionId)
+                        )?.read();
+                        validateFleetTaskProviderReceipts(
+                          member,
+                          memberRecords,
+                          budgetRecords,
+                          member.turnId === identity.turnId ||
+                            [...active.values()].some((entry) => entry.turnId === member.turnId),
+                        );
+                      } catch (error) {
+                        if (!(error instanceof SessionStoreError)) throw error;
+                        maximumOutput = 0;
+                        break;
+                      }
+                    }
+                  }
+                  if (maximumOutput <= 0) throw new FleetBudgetError("fleet_budget_exhausted");
+                  assertFleetReservation(
+                    budgetRecords,
+                    admission,
+                    estimatedInput + maximumOutput,
+                    policy,
+                  );
                   await append(identity, {
                     type: "provider_reserved",
                     requestId,
                     purpose: request.purpose === "compaction" ? "compaction" : "ordinary",
                     estimatedInput,
-                    maximumOutput: request.maximumOutputTokens,
+                    maximumOutput,
                     source: { sequence: source.sequence, digest: managedControlDigest(source) },
                   });
                   reserved = true;
@@ -1555,7 +1654,10 @@ export function createManagedAgentControl(options: {
                     resetInactivity();
                   }
                 });
-                for await (const event of target.model.stream(request)) {
+                for await (const event of target.model.stream({
+                  ...request,
+                  maximumOutputTokens: maximumOutput,
+                })) {
                   if (event.type === "usage") {
                     await control.settleUsage({
                       requestId,
@@ -1570,6 +1672,7 @@ export function createManagedAgentControl(options: {
                         record.event.requestId === requestId,
                     );
                     if (
+                      admission.event.envelope.version === 1 &&
                       reservation?.event.type === "provider_reserved" &&
                       event.inputTokens + event.outputTokens >
                         reservation.event.estimatedInput + reservation.event.maximumOutput
@@ -1583,6 +1686,15 @@ export function createManagedAgentControl(options: {
                   await serialized(async () => {
                     await append(identity, {
                       type: "budget_blocked",
+                      ...(!reserved && rejectedSource !== undefined
+                        ? {
+                            purpose:
+                              request.purpose === "compaction"
+                                ? ("compaction" as const)
+                                : ("ordinary" as const),
+                            source: rejectedSource,
+                          }
+                        : {}),
                       code: error.code,
                       message: error.message,
                     });
@@ -1813,6 +1925,16 @@ export function createManagedAgentControl(options: {
           )
             await append(identity, { type: "started" });
         });
+        const runTokenLimit =
+          admission?.event.type === "admitted" &&
+          admission.event.envelope?.version === 2 &&
+          frozen?.review === undefined
+            ? frozen?.roleDefinition?.limits?.maxTokens
+            : Math.min(
+                (frozen?.contextProfile ?? options.contextProfile).contextWindowTokens,
+                frozen?.roleDefinition?.limits?.maxTokens ?? Infinity,
+                frozen?.review?.maximumTokens ?? Infinity,
+              );
         const result = await child
           .run(
             {
@@ -1827,11 +1949,7 @@ export function createManagedAgentControl(options: {
             {
               signal: controller.signal,
               limits: {
-                maxTokens: Math.min(
-                  (frozen?.contextProfile ?? options.contextProfile).contextWindowTokens,
-                  frozen?.roleDefinition?.limits?.maxTokens ?? Infinity,
-                  frozen?.review?.maximumTokens ?? Infinity,
-                ),
+                ...(runTokenLimit === undefined ? {} : { maxTokens: runTokenLimit }),
                 ...(frozen?.roleDefinition?.limits?.maxTurns === undefined
                   ? {}
                   : { maxTurns: frozen.roleDefinition.limits.maxTurns }),
@@ -2115,11 +2233,11 @@ export function createManagedAgentControl(options: {
             policy.reserved.running + policy.reserved.queued
           )
             throw new ManagedReviewError("capacity_expired");
-          const maximumTokens = input.maximumTokens ?? policy.threadTokens;
+          const maximumTokens = input.maximumTokens ?? options.contextProfile.contextWindowTokens;
           if (
             !Number.isSafeInteger(maximumTokens) ||
             maximumTokens <= 0 ||
-            maximumTokens > policy.threadTokens
+            maximumTokens > options.contextProfile.contextWindowTokens
           )
             throw new ManagedReviewError("policy_denied");
           const envelope = createDelegationEnvelope(policy, {
@@ -2128,7 +2246,18 @@ export function createManagedAgentControl(options: {
             origin: { kind: "direct_request", id: input.reviewRunId },
             roles: ["builtin:reviewer"],
             context: "task",
-            threadTokens: maximumTokens,
+            ...(policy.version === 1
+              ? { threadTokens: maximumTokens }
+              : {
+                  taskBudget: {
+                    version: 1 as const,
+                    mode: "limited" as const,
+                    taskId: managedControlDigest(input.reviewRunId),
+                    grants: [
+                      { id: managedControlDigest(input.reviewRunId), tokens: maximumTokens },
+                    ],
+                  },
+                }),
             sessionTokens: fleetSessionCeiling(records, policy),
           });
           const frozen = managedControlFrozenSchema.parse({
@@ -2318,7 +2447,8 @@ export function createManagedAgentControl(options: {
       const records = await controlStore.read();
       const sessionTokens = fleetSessionCeiling(records, policy);
       const available = fleetBudget(records, sessionTokens).available;
-      if (available <= 0) throw new FleetBudgetError("fleet_budget_exhausted");
+      if (available !== null && available <= 0)
+        throw new FleetBudgetError("fleet_budget_exhausted");
       return createDelegationEnvelope(policy, {
         ...(limits === undefined ? {} : { limits }),
         mode: command.mode ?? "background",
@@ -2343,17 +2473,39 @@ export function createManagedAgentControl(options: {
         first.event.envelope === undefined
       )
         throw new TypeError("The original frozen thread authority is unavailable.");
-      const sessionTokens = fleetSessionCeiling(records, policy);
+      const origin = command.origin ?? {
+        kind: "direct_request" as const,
+        id: command.inputId ?? randomUUID(),
+      };
+      const inheritedBudget =
+        first.event.envelope.taskBudget === undefined
+          ? undefined
+          : fleetTaskBudget(records, first.event.envelope.taskBudget);
+      if (command.additionalBudgetTokens !== undefined && inheritedBudget?.mode !== "limited")
+        throw new TypeError("This task has no explicit budget to extend.");
+      const continuedBudget =
+        inheritedBudget === undefined
+          ? undefined
+          : command.additionalBudgetTokens === undefined
+            ? inheritedBudget
+            : addTaskBudgetGrant(
+                inheritedBudget,
+                command.additionalBudgetTokens,
+                managedControlDigest(origin),
+              );
+      const sessionTokens = fleetSessionCeiling(records, first.event.envelope.policy);
       const available = fleetBudget(records, sessionTokens).available;
-      if (available <= 0) throw new FleetBudgetError("fleet_budget_exhausted");
-      return createDelegationEnvelope(policy, {
+      if (available !== null && available <= 0)
+        throw new FleetBudgetError("fleet_budget_exhausted");
+      return createDelegationEnvelope(first.event.envelope.policy, {
         mode: first.event.lane === "reserved" ? "foreground" : "background",
         count: 1,
         roles: [first.event.role],
-        origin: command.origin ?? { kind: "direct_request", id: command.inputId ?? randomUUID() },
+        origin,
         sessionTokens,
         availableTokens: available,
         threadTokens: first.event.envelope.threadTokens,
+        ...(continuedBudget === undefined ? {} : { taskBudget: continuedBudget }),
       });
     },
     async settleUsage(input) {
@@ -3022,6 +3174,9 @@ export function createManagedAgentControl(options: {
             threadId: command.threadId,
             expectedTurnId: command.expectedTurnId,
             task: command.text,
+            ...(command.additionalBudgetTokens === undefined
+              ? {}
+              : { additionalBudgetTokens: command.additionalBudgetTokens }),
             inputId: command.inputId,
             ...(command.origin === undefined ? {} : { origin: command.origin }),
             ...(command.envelope === undefined ? {} : { envelope: command.envelope }),
@@ -3910,6 +4065,7 @@ export function createManagedAgentControl(options: {
           let childRecords = await childStore?.read();
           if (childRecords?.[0] !== undefined)
             validateManagedChildGenesis(admission, childRecords[0], childRecords);
+          validateFleetTaskProviderReceipts(admission, childRecords, await controlStore.read());
           if (childRecords !== undefined)
             await reconcileInputs(
               admission,
@@ -4112,6 +4268,21 @@ export function createManagedAgentControl(options: {
               "recovery_required",
               "The child transcript does not match its outcome receipt.",
             );
+          const meteringRecords = await controlStore.read();
+          const meteringAdmission = meteringRecords.find(
+            (record) => record.turnId === previous.turn.turnId && record.event.type === "admitted",
+          );
+          if (meteringAdmission === undefined)
+            return rejected("recovery_required", "The task admission is unavailable.");
+          try {
+            validateFleetTaskProviderReceipts(meteringAdmission, previousRecords, meteringRecords);
+          } catch (error) {
+            if (!(error instanceof SessionStoreError)) throw error;
+            return rejected(
+              "recovery_required",
+              "The task's provider accounting does not match its child transcript.",
+            );
+          }
           if (
             !(await frozenTargetAvailable(
               firstAdmission?.event.type === "admitted" ? firstAdmission.event.frozen : undefined,
@@ -4155,6 +4326,18 @@ export function createManagedAgentControl(options: {
         const { digest, ...fields } = envelope;
         const lane = inherited.lane ?? "background";
         if (
+          (command.additionalBudgetTokens !== undefined &&
+            (envelope.taskBudget?.mode !== "limited" ||
+              envelope.taskBudget.grants.at(-1)?.tokens !== command.additionalBudgetTokens)) ||
+          (inherited.envelope.taskBudget !== undefined &&
+            (envelope.taskBudget === undefined ||
+              !taskBudgetContinues(
+                fleetTaskBudget(await controlStore.read(), inherited.envelope.taskBudget),
+                envelope.taskBudget,
+                command.additionalBudgetTokens === undefined
+                  ? undefined
+                  : managedControlDigest(envelope.origin),
+              ))) ||
           digest !== managedControlDigest(fields) ||
           envelope.policyDigest !== managedControlDigest(envelope.policy) ||
           !isDeepStrictEqual(envelope.roles, [inherited.role]) ||
@@ -4162,9 +4345,15 @@ export function createManagedAgentControl(options: {
           envelope.running !== 1 ||
           envelope.mode !== (lane === "reserved" ? "foreground" : "background") ||
           envelope.skills.length !== 0 ||
-          envelope.threadTokens > Math.min(inherited.envelope.threadTokens, policy.threadTokens) ||
-          envelope.aggregateTokens > policy.batchTokens ||
-          envelope.sessionTokens > fleetSessionCeiling(await controlStore.read(), policy) ||
+          !withinTokenCeiling(
+            envelope.threadTokens,
+            minimumTokenCeiling(inherited.envelope.threadTokens, policy.threadTokens),
+          ) ||
+          !withinTokenCeiling(envelope.aggregateTokens, policy.batchTokens) ||
+          !withinTokenCeiling(
+            envelope.sessionTokens,
+            fleetSessionCeiling(await controlStore.read(), policy),
+          ) ||
           (command.origin !== undefined && !isDeepStrictEqual(envelope.origin, command.origin)) ||
           (await controlStore.read()).some(
             (record) =>
@@ -4534,8 +4723,11 @@ export function createManagedAgentControlToolRegistry(options: {
                       context: command.envelope.context,
                       skills: command.envelope.skills,
                     }) ||
-                    envelope.aggregateTokens > command.envelope.aggregateTokens ||
-                    envelope.threadTokens > command.envelope.threadTokens
+                    !withinTokenCeiling(
+                      envelope.aggregateTokens,
+                      command.envelope.aggregateTokens,
+                    ) ||
+                    !withinTokenCeiling(envelope.threadTokens, command.envelope.threadTokens)
                   )
                     throw new TypeError("A continuation must keep its frozen thread authority.");
                   const refined = {
@@ -4594,7 +4786,7 @@ export function createManagedAgentControlToolRegistry(options: {
                     context: requestedDelegationContext(entries),
                     skills: [...new Set(entries.flatMap((entry) => entry.skills ?? []))],
                   }) ||
-                  envelope.aggregateTokens > command.envelope.aggregateTokens
+                  !withinTokenCeiling(envelope.aggregateTokens, command.envelope.aggregateTokens)
                 )
                   throw new TypeError("The selected grant does not match this pending delegation.");
                 const refined = {

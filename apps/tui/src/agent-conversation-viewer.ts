@@ -38,6 +38,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { agentElapsedLabel } from "./agent-widget.js";
 import { safeTerminalText } from "./safe-terminal-text.js";
+import { parseTaskBudgetFollowUp } from "./task-budget-input.js";
 import type { AdamTuiTheme } from "./theme.js";
 import { ToolPreview } from "./tool-preview.js";
 
@@ -410,17 +411,32 @@ export class AgentConversationViewer implements Component {
       };
     const inputId = this.#submission.id;
     const submittedDraft: ManagedComposerDraft = { ...target, mode: this.#mode, inputId, text };
+    let followUpInput: ReturnType<typeof parseTaskBudgetFollowUp>;
+    try {
+      followUpInput = this.#mode === "new_turn" ? parseTaskBudgetFollowUp(text) : { task: text };
+    } catch (error) {
+      this.#inputNotice = error instanceof Error ? error.message : "Invalid task budget input.";
+      this.options.onChange();
+      return;
+    }
     const common = {
       parentSessionId: target.parentSessionId,
       threadId: target.threadId,
       expectedTurnId: target.expectedTurnId,
       inputId,
-      text,
+      text: followUpInput.task,
     };
     const command: ManagedControlCommand =
       this.#mode === "reply"
         ? { ...common, type: "reply_agent", attentionId: target.attentionId ?? "" }
-        : { ...common, type: "post_agent", mode: this.#mode };
+        : {
+            ...common,
+            type: "post_agent",
+            mode: this.#mode,
+            ...(followUpInput.additionalBudgetTokens === undefined
+              ? {}
+              : { additionalBudgetTokens: followUpInput.additionalBudgetTokens }),
+          };
     this.#sending = true;
     this.#inputNotice = "Accepting exact input…";
     this.options.onChange();
@@ -1189,7 +1205,10 @@ export class AgentConversationViewer implements Component {
       ...(thread.budget === undefined
         ? []
         : [
-            `${thread.budget.unknownReserved} unknown reserved · ${thread.budget.available} available`,
+            `${thread.budget.unknownReserved} unknown reserved · ${thread.budget.available === null ? "no cumulative budget" : `${thread.budget.available} available`}`,
+            ...(thread.budget.overrun > 0
+              ? [`Provider usage exceeded request estimates by ${thread.budget.overrun} tokens.`]
+              : []),
           ]),
       `${thread.turn.label}${agentElapsedLabel(thread)}`,
       ...(this.#activity?.tool?.status === "generating_arguments"

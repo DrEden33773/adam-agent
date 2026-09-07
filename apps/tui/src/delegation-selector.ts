@@ -14,7 +14,13 @@ import {
 import { safeTerminalText } from "./safe-terminal-text.js";
 import type { AdamTuiTheme } from "./theme.js";
 
-type NumericLimit = "aggregateTokens" | "threadTokens" | "running" | "queued" | "sessionTokens";
+type NumericLimit =
+  | "budgetTokens"
+  | "aggregateTokens"
+  | "threadTokens"
+  | "running"
+  | "queued"
+  | "sessionTokens";
 
 export class DelegationSelector implements Component {
   #list: SelectList;
@@ -132,14 +138,23 @@ export class DelegationSelector implements Component {
               },
             ]
           : this.#page === "custom"
-            ? (
-                ["aggregateTokens", "threadTokens", "running", "queued", "sessionTokens"] as const
+            ? (envelope.version === 2
+                ? this.options.canChangeMode === false
+                  ? (["running", "queued"] as const)
+                  : (["budgetTokens", "running", "queued"] as const)
+                : ([
+                    "aggregateTokens",
+                    "threadTokens",
+                    "running",
+                    "queued",
+                    "sessionTokens",
+                  ] as const)
               ).map((field) => {
                 const bound = this.#numericBound(field);
                 return {
                   value: field,
                   label: bound.label,
-                  description: `Current ${envelope[field]}; range ${bound.min}–${bound.max}`,
+                  description: `Current ${field === "budgetTokens" ? (envelope.taskBudget?.mode === "limited" ? envelope.taskBudget.grants.reduce((sum, grant) => sum + grant.tokens, 0) : "unbudgeted") : envelope[field]}; range ${bound.min}–${bound.max}`,
                 };
               })
             : this.#page === "limits"
@@ -162,17 +177,27 @@ export class DelegationSelector implements Component {
                         },
                       ]
                     : []),
-                  ...[1, 2, 4]
-                    .filter(
-                      (n) =>
-                        n * envelope.policy.threadTokens <=
-                        Math.min(envelope.policy.batchTokens, envelope.sessionTokens),
-                    )
-                    .map((n) => ({
-                      value: `tokens:${n * envelope.policy.threadTokens}`,
-                      label: `Aggregate ${n}x`,
-                      description: `${n * envelope.policy.threadTokens} tokens`,
-                    })),
+                  ...(envelope.version === 2
+                    ? this.options.canChangeMode === false
+                      ? []
+                      : [
+                          {
+                            value: "unbudgeted",
+                            label: "No cumulative budget",
+                            description: "Track usage without a task ceiling.",
+                          },
+                        ]
+                    : [1, 2, 4]
+                        .filter(
+                          (n) =>
+                            n * (envelope.policy.threadTokens ?? 0) <=
+                            Math.min(envelope.policy.batchTokens ?? 0, envelope.sessionTokens ?? 0),
+                        )
+                        .map((n) => ({
+                          value: `tokens:${n * (envelope.policy.threadTokens ?? 0)}`,
+                          label: `Aggregate ${n}x`,
+                          description: `${n * (envelope.policy.threadTokens ?? 0)} tokens`,
+                        }))),
                   ...Array.from({ length: lane.running }, (_, i) => i + 1)
                     .filter((running) => envelope.threads - running <= lane.queued)
                     .map((running) => ({
@@ -180,11 +205,13 @@ export class DelegationSelector implements Component {
                       label: `Running ${running}`,
                       description: `Range 1–${lane.running}; queued ${Math.max(0, envelope.threads - running)} (0–${lane.queued})`,
                     })),
-                  ...[0.25, 0.5, 1].map((n) => ({
-                    value: `thread:${Math.max(1, Math.floor(n * envelope.policy.threadTokens))}`,
-                    label: `Thread ${n}x`,
-                    description: `${Math.max(1, Math.floor(n * envelope.policy.threadTokens))} tokens`,
-                  })),
+                  ...(envelope.version === 2
+                    ? []
+                    : [0.25, 0.5, 1].map((n) => ({
+                        value: `thread:${Math.max(1, Math.floor(n * (envelope.policy.threadTokens ?? 0)))}`,
+                        label: `Thread ${n}x`,
+                        description: `${Math.max(1, Math.floor(n * (envelope.policy.threadTokens ?? 0)))} tokens`,
+                      }))),
                   {
                     value: "custom",
                     label: "Custom limits",
@@ -284,7 +311,15 @@ export class DelegationSelector implements Component {
         const field = item.value as NumericLimit;
         this.#numericField = field;
         this.#numericInput = new Input();
-        this.#numericInput.setValue(String(envelope[field]));
+        this.#numericInput.setValue(
+          String(
+            field === "budgetTokens"
+              ? envelope.taskBudget?.mode === "limited"
+                ? envelope.taskBudget.grants.reduce((sum, grant) => sum + grant.tokens, 0)
+                : "unbudgeted"
+              : envelope[field],
+          ),
+        );
         this.#numericInput.onSubmit = (raw) => {
           const value = Number(raw);
           const bound = this.#numericBound(field);
@@ -324,26 +359,28 @@ export class DelegationSelector implements Component {
         };
         const [field, raw] = item.value.split(":");
         const update: ManagedDelegationLimits =
-          field === "tokens"
-            ? { aggregateTokens: Number(raw) }
-            : field === "thread"
-              ? { threadTokens: Number(raw) }
-              : field === "running"
-                ? { running: Number(raw), queued: Math.max(0, envelope.threads - Number(raw)) }
-                : {
-                    mode: item.value === "foreground" ? "foreground" : "background",
-                    running: Math.min(
-                      envelope.threads,
-                      envelope.policy[item.value === "foreground" ? "reserved" : "background"]
-                        .running,
-                    ),
-                    queued: Math.max(
-                      0,
-                      envelope.threads -
+          item.value === "unbudgeted"
+            ? { budgetTokens: null }
+            : field === "tokens"
+              ? { aggregateTokens: Number(raw) }
+              : field === "thread"
+                ? { threadTokens: Number(raw) }
+                : field === "running"
+                  ? { running: Number(raw), queued: Math.max(0, envelope.threads - Number(raw)) }
+                  : {
+                      mode: item.value === "foreground" ? "foreground" : "background",
+                      running: Math.min(
+                        envelope.threads,
                         envelope.policy[item.value === "foreground" ? "reserved" : "background"]
                           .running,
-                    ),
-                  };
+                      ),
+                      queued: Math.max(
+                        0,
+                        envelope.threads -
+                          envelope.policy[item.value === "foreground" ? "reserved" : "background"]
+                            .running,
+                      ),
+                    };
         if (this.options.onLimits !== undefined)
           this.#update(
             this.options.onLimits({ ...limits, ...update }, this.#context, this.#skills),
@@ -417,20 +454,37 @@ export class DelegationSelector implements Component {
   }
   #limits(): ManagedDelegationLimits {
     const { mode, running, queued, aggregateTokens, threadTokens, sessionTokens } = this.#envelope;
-    return { mode, running, queued, aggregateTokens, threadTokens, sessionTokens };
+    return {
+      mode,
+      running,
+      queued,
+      aggregateTokens,
+      threadTokens,
+      sessionTokens,
+      ...(this.#envelope.version === 2 && this.options.canChangeMode !== false
+        ? {
+            budgetTokens:
+              this.#envelope.taskBudget?.mode === "limited"
+                ? this.#envelope.taskBudget.grants.reduce((sum, grant) => sum + grant.tokens, 0)
+                : null,
+          }
+        : {}),
+    };
   }
   #numericBound(field: NumericLimit): { label: string; min: number; max: number } {
     const envelope = this.#envelope;
     const lane = envelope.policy[envelope.mode === "background" ? "background" : "reserved"];
     switch (field) {
+      case "budgetTokens":
+        return { label: "Task budget tokens", min: 1, max: Number.MAX_SAFE_INTEGER };
       case "aggregateTokens":
         return {
           label: "Aggregate tokens",
           min: 1,
-          max: Math.min(envelope.policy.batchTokens, envelope.sessionTokens),
+          max: Math.min(envelope.policy.batchTokens ?? 0, envelope.sessionTokens ?? 0),
         };
       case "threadTokens":
-        return { label: "Thread tokens", min: 1, max: envelope.policy.threadTokens };
+        return { label: "Thread tokens", min: 1, max: envelope.policy.threadTokens ?? 0 };
       case "running":
         return {
           label: "Running slots",
@@ -446,8 +500,8 @@ export class DelegationSelector implements Component {
       case "sessionTokens":
         return {
           label: "Session ceiling",
-          min: envelope.aggregateTokens,
-          max: this.options.envelope.sessionTokens,
+          min: envelope.aggregateTokens ?? 1,
+          max: this.options.envelope.sessionTokens ?? 0,
         };
     }
   }
@@ -540,9 +594,20 @@ export class DelegationSelector implements Component {
         `${envelope.mode} · ${envelope.threads} thread · ${envelope.running} running`,
         width,
       ),
-      truncateToWidth(`${envelope.aggregateTokens} tokens · ${context}`, width),
-      truncateToWidth(`Queued ${envelope.queued} · Thread ${envelope.threadTokens}`, width),
-      truncateToWidth(`Session ceiling ${envelope.sessionTokens}`, width),
+      truncateToWidth(
+        `${envelope.taskBudget === undefined ? `${envelope.aggregateTokens} tokens` : envelope.taskBudget.mode === "unbudgeted" ? "No cumulative budget" : `${envelope.taskBudget.grants.reduce((sum, grant) => sum + grant.tokens, 0)} task tokens shared by all members`} · ${context}`,
+        width,
+      ),
+      truncateToWidth(
+        `Queued ${envelope.queued}${envelope.version === 1 ? ` · Thread ${envelope.threadTokens}` : ""}`,
+        width,
+      ),
+      truncateToWidth(
+        envelope.version === 1
+          ? `Session ceiling ${envelope.sessionTokens}`
+          : "Budget applies to this task and its continuations",
+        width,
+      ),
       ...envelope.skills.map((id) => truncateToWidth(`Skill: ${safeTerminalText(id)}`, width)),
       "",
       ...this.#list.render(width),

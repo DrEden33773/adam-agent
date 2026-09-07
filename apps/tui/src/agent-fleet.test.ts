@@ -244,7 +244,8 @@ test("Widget projects live child activity and individually frozen queued configu
       knownUsed: 0,
       outstandingReserved: 0,
       unknownReserved: 0,
-      available: 128000,
+      ceiling: null,
+      available: null,
     });
     expect(calls).toBe(4);
   } finally {
@@ -358,7 +359,7 @@ test("queued agents stay individually inspectable and exact cancellation never o
     const detail = h.terminal.lines().join("\n");
     expect(detail).toContain("deepseek-v4-flash.direct");
     expect(detail).toContain("thinking default");
-    expect(detail).toContain("128000 available");
+    expect(detail).toContain("no cumulative budget");
     expect(detail).not.toContain("Private task 5");
     await h.press("x", "x again to cancel");
     await h.press("x", "Cancelled");

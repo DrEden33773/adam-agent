@@ -425,11 +425,11 @@ test("active-run /agents opens the live managed overlay without ending the paren
     const beforeAgents = fixture.output().length;
     fixture.write("/agents\r");
     await fixture.waitForCompleteFrameAfter("Agents · 1 active · 0 terminal", beforeAgents);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("research.v2 · running");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("research.v3 · running");
 
     fixture.write("\u001b[27;1;27~");
     await fixture.resize(81, 24);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("research.v2 · running");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("research.v3 · running");
     await writeFile(join(controlRoot, "release-managed-active-child"), "release\n", "utf8");
     await fixture.waitForRecordedOutput("Managed active parent completed.");
     fixture.write("\u0011");
@@ -471,7 +471,7 @@ test("terminal managed follow-up restores responsive editor input before admissi
     fixture.write("\u001b[102;1:3u");
     await fixture.resize(81, 24);
     expect(fixture.screen()?.join("\n") ?? "").toContain(
-      "Enter one bounded follow-up task for the exact terminal child.",
+      "Follow-up task · add tokens: /budget-add <tokens> <task>",
     );
 
     const beforeDraft = fixture.output().length;
@@ -628,7 +628,7 @@ test("stalled managed viewer preserves controls at 40 and full truth at 120 with
     await waitForFileContents(join(controlRoot, "managed-active-child-held"), "held\n");
     await waitForFileContents(join(controlRoot, "managed-active-parent-waiting"), "waiting\n");
     await writeFile(join(controlRoot, "trigger-managed-stall"), "trigger\n", "utf8");
-    await fixture.waitForRecordedOutput("research.v2 · stalled");
+    await fixture.waitForRecordedOutput("research.v3 · stalled");
     fixture.write("/agents\r");
     await fixture.waitForScreen("Agents · 1 active · 0 terminal");
     fixture.write("\r");
@@ -738,7 +738,7 @@ test("managed viewer regains exact focus after a parent permission preempts it",
     const beforeRestore = fixture.output().length;
     fixture.write("\u001b[27;1;27~");
     await fixture.waitForCompleteFrameAfter("m message at next safe boundary", beforeRestore);
-    expect(fixture.screen()?.join("\n") ?? "").toContain("research.v2 · background · running");
+    expect(fixture.screen()?.join("\n") ?? "").toContain("research.v3 · background · running");
     fixture.write("m");
     await fixture.waitForRecordedOutput("Enter one bounded message");
 

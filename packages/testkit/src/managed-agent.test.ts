@@ -479,6 +479,110 @@ test("AgentManager current scout crosses the legacy token and provider-call boun
   }
 });
 
+test("AgentManager default task completes after cumulative usage exceeds its context window", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-current-capacity-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  await mkdir(workspaceRoot);
+  await writeFile(join(workspaceRoot, "evidence.txt"), "current child evidence\n", "utf8");
+  const currentContextProfile = {
+    version: 2,
+    contextWindowTokens: 1_000_000,
+    maximumOutputTokens: 384_000,
+    ordinaryOutputReserveTokens: 4_096,
+    compactionSummaryMaximumOutputTokens: 32_768,
+    compactAtTokens: 900_000,
+    postCompactTargetTokens: 200_000,
+    retainedTargetTokens: 20_000,
+    estimatorVersion: 1,
+  } as const;
+  let providerCalls = 0;
+  const childModel: ModelDriver = {
+    async *stream() {
+      providerCalls += 1;
+      if (providerCalls <= 9) {
+        const callId = `read-evidence-${providerCalls}`;
+        yield { type: "tool_call_start", id: callId, name: "read_file" };
+        yield { type: "tool_call_delta", id: callId, json: '{"path":"evidence.txt"}' };
+        yield { type: "tool_call_end", id: callId };
+        yield {
+          type: "usage",
+          inputTokens: 160_000,
+          outputTokens: 4,
+          reasoningTokens: 2,
+        };
+        yield { type: "finish", reason: "tool_calls" };
+        return;
+      }
+      yield { type: "text_delta", text: "Current scout completed after every read." };
+      yield { type: "usage", inputTokens: 160_000, outputTokens: 8, reasoningTokens: 3 };
+      yield { type: "finish", reason: "stop" };
+    },
+  };
+  const owner: ProjectLifecycleOwner = {
+    async acquire() {
+      return { async release() {} };
+    },
+    async run(operation) {
+      return operation();
+    },
+  };
+  const domain = createProjectExecutionDomain({ lifecycleOwner: owner });
+  const parentSessionId = "123e4567-e89b-42d3-a456-426614174501";
+  const parentRoot = await domain.claimRoot({ rootId: `session:${parentSessionId}` });
+  const managedStore = createInMemoryManagedAgentStore();
+  const baseChildSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  let childReadsUnavailable = false;
+  const childSessionStores: SessionStoreDirectory<SessionRecord> = {
+    create: (sessionId) => baseChildSessionStores.create(sessionId),
+    async open(sessionId) {
+      if (childReadsUnavailable) {
+        throw new Error("Child transcript reads are unavailable.");
+      }
+      return baseChildSessionStores.open(sessionId);
+    },
+    listSessionEntries: () => baseChildSessionStores.listSessionEntries(),
+    listSessionIds: () => baseChildSessionStores.listSessionIds(),
+  };
+  const currentProfileOptions = { builtInProfileVersion: 3 as const };
+  const manager = createAgentManager({
+    childContextProfile: currentContextProfile,
+    childModel,
+    childSessionStores,
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    parentSessionId,
+    projectId,
+    targetIdentity,
+    workspaceRoot,
+    ...currentProfileOptions,
+  });
+
+  try {
+    await expect(
+      manager.spawnForeground({
+        callId: "current-capacity-spawn",
+        parentSessionId: manager.parentSessionId,
+        signal: new AbortController().signal,
+        task: "Read every required evidence step before answering.",
+      }),
+    ).resolves.toMatchObject({
+      status: "completed",
+      output: {
+        profile: "scout.v3",
+        result: { text: "Current scout completed after every read." },
+      },
+    });
+    expect(providerCalls).toBe(10);
+  } finally {
+    childReadsUnavailable = false;
+    await manager.close();
+    await parentRoot.release();
+    await domain.close();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("AgentSession rejects managed profile selection before permission or child provider work", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-managed-profile-reject-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -7499,3 +7603,655 @@ test("PresentationSession replies to one exact attention without waking a parent
     await rm(testRoot, { recursive: true, force: true });
   }
 });
+
+async function taskBudgetFixture(
+  model: ModelDriver,
+  childContextProfile: Parameters<
+    typeof createAgentManager
+  >[0]["childContextProfile"] = contextProfile,
+) {
+  const root = await mkdtemp(join(tmpdir(), "adam-task-budget-"));
+  await writeFile(join(root, "evidence.txt"), "durable evidence\n");
+  const domain = createProjectExecutionDomain({
+    lifecycleOwner: {
+      async acquire() {
+        return { async release() {} };
+      },
+      async run(operation) {
+        return operation();
+      },
+    },
+  });
+  const parentSessionId = "00000000-0000-4000-8000-000000000001";
+  const parentRoot = await domain.claimRoot({ rootId: `session:${parentSessionId}` });
+  const managedStore = createInMemoryManagedAgentStore();
+  const childSessionStores = createInMemorySessionStoreDirectory<SessionRecord>();
+  const manager = createAgentManager({
+    builtInProfileVersion: 3,
+    childContextProfile,
+    childModel: model,
+    childSessionStores,
+    managedStore,
+    parentPermissions: createPermissionPolicy({ allowedEffects: ["read"] }),
+    parentRoot,
+    parentSessionId,
+    projectId,
+    targetIdentity,
+    workspaceRoot: root,
+  });
+  const spawn = (budgetTokens?: number, callId = "budget-task") =>
+    manager.spawnForeground({
+      callId,
+      parentSessionId,
+      signal: new AbortController().signal,
+      task: "Inspect the evidence and finish honestly.",
+      ...(budgetTokens === undefined ? {} : { budgetTokens }),
+    });
+  const followUp = async (additionalBudgetTokens?: number) => {
+    const agent = (await manager.snapshot()).agents[0];
+    if (agent === undefined) throw new Error("Missing task");
+    const result = await manager.followUp({
+      agentId: agent.agentId,
+      expectedRevision: agent.revision,
+      callId: `follow-${agent.revision}`,
+      parentSessionId,
+      signal: new AbortController().signal,
+      task: "Continue from the retained evidence.",
+      ...(additionalBudgetTokens === undefined ? {} : { additionalBudgetTokens }),
+    });
+    expect(result.status).toBe("completed");
+    await manager.wait({
+      agentIds: [agent.agentId],
+      until: "all_terminal",
+      signal: new AbortController().signal,
+    });
+    return (await manager.snapshot()).agents[0];
+  };
+  return {
+    workspaceRoot: root,
+    manager,
+    managedStore,
+    childSessionStores,
+    spawn,
+    followUp,
+    async close() {
+      await manager.close();
+      await parentRoot.release();
+      await domain.close();
+      await rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+test("explicit production task budget retains unknown spend, settles late exactly once, and never resets on continuation", async () => {
+  let calls = 0;
+  const f = await taskBudgetFixture({
+    async *stream() {
+      calls += 1;
+      if (calls === 1) {
+        yield { type: "text_delta", text: "Evidence found before missing usage." };
+        yield { type: "tool_call_start", id: "read", name: "read_file" };
+        yield { type: "tool_call_delta", id: "read", json: '{"path":"evidence.txt"}' };
+        yield { type: "tool_call_end", id: "read" };
+        yield { type: "finish", reason: "tool_calls" };
+      } else {
+        yield { type: "text_delta", text: "Finished using retained evidence." };
+        yield { type: "usage", inputTokens: 30, outputTokens: 10 };
+        yield { type: "finish", reason: "stop" };
+      }
+    },
+  });
+  try {
+    expect(await f.spawn(10_000)).toMatchObject({
+      status: "failed",
+      error: { message: expect.stringContaining("Task incomplete") },
+    });
+    expect(calls).toBe(1);
+    expect((await f.manager.snapshot()).agents[0]).toMatchObject({
+      status: "failed",
+      error: { code: "task_budget_exhausted" },
+      partialOutput: { text: "Evidence found before missing usage." },
+      taskBudget: { usage: { available: 0, knownUsed: 0, unknownReserved: expect.any(Number) } },
+    });
+    await f.followUp();
+    expect(calls).toBe(1);
+    const reservation = (await f.managedStore.read()).find(
+      (record) =>
+        record.type === "managed_agent_provider" && record.event.type === "provider_reserved",
+    );
+    if (reservation?.type !== "managed_agent_provider") throw new Error("Missing reservation");
+    const usage = {
+      type: "provider_usage" as const,
+      requestId: reservation.event.requestId,
+      inputTokens: 40,
+      outputTokens: 10,
+      reasoningTokens: 5,
+    };
+    await f.manager.settleUsage(usage);
+    const settled = await f.managedStore.read();
+    await f.manager.settleUsage(usage);
+    expect(await f.managedStore.read()).toEqual(settled);
+    await expect(f.manager.settleUsage({ ...usage, outputTokens: 11 })).rejects.toThrow(
+      "Conflicting",
+    );
+    expect(await f.followUp()).toMatchObject({
+      status: "completed",
+      taskBudget: { usage: { knownUsed: 90, unknownReserved: 0, ceiling: 10_000 } },
+    });
+    expect(calls).toBe(2);
+  } finally {
+    await f.close();
+  }
+});
+
+test("production budget additions are additive grants and unrelated tasks start unbudgeted", async () => {
+  let calls = 0;
+  const f = await taskBudgetFixture({
+    async *stream(request) {
+      calls += 1;
+      if (calls === 1) {
+        expect(request.maximumOutputTokens).toBeLessThanOrEqual(5000);
+        yield { type: "tool_call_start", id: "read", name: "read_file" };
+        yield { type: "tool_call_delta", id: "read", json: '{"path":"evidence.txt"}' };
+        yield { type: "tool_call_end", id: "read" };
+        yield { type: "usage", inputTokens: 5000, outputTokens: 0 };
+        yield { type: "finish", reason: "tool_calls" };
+      } else {
+        yield { type: "text_delta", text: "Completed." };
+        yield { type: "usage", inputTokens: 20, outputTokens: 10 };
+        yield { type: "finish", reason: "stop" };
+      }
+    },
+  });
+  try {
+    expect(await f.spawn(5000)).toMatchObject({ status: "failed" });
+    const first = (await f.managedStore.read()).find(
+      (record) => record.type === "managed_agent_admitted",
+    );
+    expect(await f.followUp(5000)).toMatchObject({
+      status: "completed",
+      taskBudget: { usage: { ceiling: 10_000, knownUsed: 5030 } },
+    });
+    const admissions = (await f.managedStore.read()).filter(
+      (record) => record.type === "managed_agent_admitted",
+    );
+    expect(admissions[0]).toEqual(first);
+    expect(admissions[1]?.taskBudget).toMatchObject({
+      mode: "limited",
+      grants: [{ tokens: 5000 }, { tokens: 5000 }],
+    });
+    expect(await f.spawn(undefined, "unrelated-task")).toMatchObject({ status: "completed" });
+    expect((await f.manager.snapshot()).agents.at(-1)?.taskBudget).toMatchObject({
+      policy: { mode: "unbudgeted" },
+      usage: { ceiling: null },
+    });
+    const records = await f.managedStore.read();
+    await recoverInterruptedManagedAgents(f.managedStore, f.childSessionStores);
+    expect(await f.managedStore.read()).toEqual(records);
+  } finally {
+    await f.close();
+  }
+});
+
+test.each(["managed-agent-tools.a3-long-lived.v3", "managed-agent-tools.a1.v3"] as const)(
+  "v3 spawn budget requires an exact user decision even when delegate is allowed: %s",
+  async (toolProfile) => {
+    let childCalls = 0;
+    const f = await taskBudgetFixture({
+      async *stream(request) {
+        childCalls += 1;
+        expect(request.maximumOutputTokens).toBeLessThanOrEqual(4096);
+        yield { type: "text_delta", text: "Approved task completed." };
+        yield { type: "usage", inputTokens: 4990, outputTokens: 0 };
+        yield { type: "finish", reason: "stop" };
+      },
+    });
+    const requested =
+      Promise.withResolvers<Extract<RuntimeEvent, { type: "tool_permission_requested" }>>();
+    const sharedRequested =
+      Promise.withResolvers<Extract<RuntimeEvent, { type: "tool_permission_requested" }>>();
+    let mainCalls = 0;
+    const parentTools = createManagedAgentToolRegistry({
+      manager: f.manager,
+      profile: toolProfile,
+    });
+    const promptContext = createPromptContextV1(parentTools);
+    const parentStore = createInMemorySessionStore();
+    await parentStore.append({
+      schemaVersion: 3,
+      sequence: 1,
+      record: {
+        type: "session_genesis",
+        recordVersion: 2,
+        sessionId: f.manager.parentSessionId,
+        projectId,
+        targetIdentity,
+        contextProfile,
+        promptContext,
+        managedAgentTools: toolProfile,
+      },
+    });
+    const dependencies: AgentSessionDependencies & {
+      readonly [sessionToolProfileNames]: readonly string[];
+      readonly [sessionDurableContext]: {
+        readonly nextSequence: number;
+        readonly sessionId: string;
+        readonly targetIdentity: typeof targetIdentity;
+        readonly promptContext: typeof promptContext;
+      };
+    } = {
+      [sessionDurableContext]: {
+        nextSequence: 2,
+        sessionId: f.manager.parentSessionId,
+        targetIdentity,
+        promptContext,
+      },
+      [sessionToolProfileNames]: ["spawn_agent"],
+      contextProfile,
+      tools: parentTools,
+      permissions: createPermissionPolicy({ allowedEffects: ["delegate"] }),
+      store: parentStore,
+      model: {
+        async *stream(request) {
+          if (++mainCalls === 1) {
+            yield { type: "tool_call_start", id: "budget-grant", name: "spawn_agent" };
+            yield {
+              type: "tool_call_delta",
+              id: "budget-grant",
+              json: JSON.stringify({
+                ...(toolProfile.includes("a3-long-lived") ? { profile: "scout.v3" } : {}),
+                task: "Inspect the evidence.",
+                budgetTokens: 5000,
+              }),
+            };
+            yield { type: "tool_call_end", id: "budget-grant" };
+            yield { type: "finish", reason: "tool_calls" };
+          } else if (mainCalls === 2) {
+            const result = request.messages.findLast((message) => message.role === "tool");
+            const output =
+              result?.role === "tool" && result.result.status === "completed"
+                ? result.result.output
+                : undefined;
+            if (typeof output !== "object" || output === null || !("agentId" in output))
+              throw new Error("Missing admitted task identity.");
+            const { agentId } = output;
+            if (typeof agentId !== "string") throw new Error("Missing agent identity.");
+            yield { type: "tool_call_start", id: "budget-member", name: "spawn_agent" };
+            yield {
+              type: "tool_call_delta",
+              id: "budget-member",
+              json: JSON.stringify({
+                ...(toolProfile.includes("a3-long-lived") ? { profile: "scout.v3" } : {}),
+                task: "Inspect another part of the same task.",
+                shareBudgetWithAgentId: agentId,
+              }),
+            };
+            yield { type: "tool_call_end", id: "budget-member" };
+            yield { type: "finish", reason: "tool_calls" };
+          } else {
+            yield { type: "text_delta", text: "Done." };
+            yield { type: "finish", reason: "stop" };
+          }
+        },
+      },
+    };
+    const parent = new AgentSession(dependencies);
+    const unsubscribe = parent.subscribe((event) => {
+      if (event.type === "tool_permission_requested") {
+        if (event.callId === "budget-member") sharedRequested.resolve(event);
+        else requested.resolve(event);
+      }
+    });
+    try {
+      const run = parent.run({ text: "Delegate the evidence task." });
+      const permission = await withManagedFailureGuard(
+        requested.promise,
+        "exact task budget permission",
+      );
+      expect(permission.subject).toMatchObject({
+        type: "managed_agent_spawn",
+        profile: "scout.v3",
+        budgetTokens: 5000,
+      });
+      expect(childCalls).toBe(0);
+      expect(await f.managedStore.read()).toEqual([]);
+      expect(
+        parent.decidePermission({ requestId: permission.requestId, decision: "allow" }),
+      ).toMatchObject({ status: "accepted" });
+      const sharedPermission = await withManagedFailureGuard(
+        sharedRequested.promise,
+        "shared task membership approval",
+      );
+      expect(childCalls).toBe(1);
+      expect((await f.manager.snapshot()).agents).toHaveLength(1);
+      expect(sharedPermission.subject).toMatchObject({
+        type: "managed_agent_spawn",
+        shareBudgetWithAgentId: expect.any(String),
+        sharedTaskBudget: { mode: "limited", grants: [{ tokens: 5000 }] },
+      });
+      parent.decidePermission({ requestId: sharedPermission.requestId, decision: "allow" });
+      expect(await run).toMatchObject({ status: "completed" });
+      expect(childCalls).toBe(1);
+      const members = (await f.manager.snapshot()).agents;
+      expect(members).toHaveLength(2);
+      expect(members[1]).toMatchObject({
+        status: "failed",
+        error: { code: "task_budget_exhausted" },
+      });
+      expect(members.map((member) => member.taskBudget?.usage.knownUsed)).toEqual([4990, 4990]);
+      expect(members[1]?.taskBudget?.policy).toEqual(members[0]?.taskBudget?.policy);
+      expect(members[0]?.taskBudget).toMatchObject({
+        policy: { mode: "limited", grants: [{ tokens: 5000 }] },
+      });
+    } finally {
+      unsubscribe();
+      await f.close();
+    }
+  },
+);
+
+test("a funded production closing request reports retained evidence without more tools", async () => {
+  let calls = 0;
+  const f = await taskBudgetFixture({
+    async *stream(request) {
+      calls += 1;
+      if (calls === 1) {
+        yield { type: "tool_call_start", id: "read", name: "read_file" };
+        yield { type: "tool_call_delta", id: "read", json: '{"path":"evidence.txt"}' };
+        yield { type: "tool_call_end", id: "read" };
+        yield { type: "usage", inputTokens: 12000, outputTokens: 10 };
+        yield { type: "finish", reason: "tool_calls" };
+      } else {
+        expect(request.tools).toEqual([]);
+        expect(JSON.stringify(request.messages)).toContain("Task budget closing request");
+        expect(JSON.stringify(request.messages)).toContain("durable evidence");
+        yield {
+          type: "text_delta",
+          text: "Found durable evidence. Remaining cross-checks are incomplete.",
+        };
+        yield { type: "usage", inputTokens: 1000, outputTokens: 50 };
+        yield { type: "finish", reason: "stop" };
+      }
+    },
+  });
+  try {
+    expect(await f.spawn(20000)).toMatchObject({
+      status: "completed",
+      output: {
+        result: { text: "Found durable evidence. Remaining cross-checks are incomplete." },
+      },
+    });
+    expect(calls).toBe(2);
+    const records = await f.managedStore.read();
+    const admission = records.find((record) => record.type === "managed_agent_admitted");
+    if (admission?.type !== "managed_agent_admitted") throw new Error("Missing admission");
+    const child = await (await f.childSessionStores.open(admission.childSessionId))?.read();
+    expect(
+      child?.some(
+        (record) =>
+          record.schemaVersion === 3 &&
+          record.record.type === "provider_attempt_started" &&
+          record.record.taskBudgetClosing === true,
+      ),
+    ).toBe(true);
+    expect((await f.manager.snapshot()).agents[0]?.taskBudget?.usage.knownUsed).toBe(13060);
+    await recoverInterruptedManagedAgents(f.managedStore, f.childSessionStores);
+    expect(await f.managedStore.read()).toEqual(records);
+  } finally {
+    await f.close();
+  }
+});
+
+test.each([
+  { missingUsage: false, budgetTokens: 20000 },
+  { missingUsage: true, budgetTokens: 20000 },
+  { missingUsage: true, budgetTokens: undefined },
+])(
+  "production compaction uses the shared task ledger: %j",
+  async ({ missingUsage, budgetTokens }) => {
+    const blocked = missingUsage && budgetTokens !== undefined;
+    const purposes: string[] = [];
+    let ordinary = 0;
+    const f = await taskBudgetFixture(
+      {
+        async *stream(request) {
+          purposes.push(request.purpose ?? "ordinary");
+          if (request.purpose === "compaction") {
+            yield {
+              type: "text_delta",
+              text: JSON.stringify({
+                schemaVersion: 1,
+                objective: "Inspect evidence.",
+                constraints: [],
+                progress: ["Read evidence."],
+                unresolvedQuestions: [],
+                failures: [],
+                remainingVerification: [],
+                nextSafeAction: "Report retained evidence.",
+              }),
+            };
+            if (!missingUsage) yield { type: "usage", inputTokens: 200, outputTokens: 100 };
+            yield { type: "finish", reason: "stop" };
+          } else if (++ordinary === 1) {
+            yield { type: "tool_call_start", id: "read", name: "read_file" };
+            yield { type: "tool_call_delta", id: "read", json: '{"path":"evidence.txt"}' };
+            yield { type: "tool_call_end", id: "read" };
+            yield { type: "usage", inputTokens: 100, outputTokens: 10 };
+            yield { type: "finish", reason: "tool_calls" };
+          } else {
+            yield { type: "text_delta", text: "Compacted evidence reported." };
+            yield { type: "usage", inputTokens: 20, outputTokens: 10 };
+            yield { type: "finish", reason: "stop" };
+          }
+        },
+      },
+      {
+        ...contextProfile,
+        contextWindowTokens: 32000,
+        maximumOutputTokens: 512,
+        compactAtTokens: 4000,
+        postCompactTargetTokens: 2500,
+        retainedTargetTokens: 500,
+      },
+    );
+    try {
+      await writeFile(join(f.workspaceRoot, "evidence.txt"), `${"e".repeat(99)}\n`.repeat(200));
+      expect(await f.spawn(budgetTokens)).toMatchObject({
+        status: blocked ? "failed" : "completed",
+      });
+      expect(purposes).toEqual(
+        blocked ? ["ordinary", "compaction"] : ["ordinary", "compaction", "ordinary"],
+      );
+      const budget = (await f.manager.snapshot()).agents[0]?.taskBudget?.usage;
+      expect(budget?.knownUsed).toBe(blocked ? 110 : missingUsage ? 140 : 440);
+      if (missingUsage) expect(budget?.unknownReserved).toBeGreaterThan(0);
+      else expect(budget?.unknownReserved).toBe(0);
+      const records = await f.managedStore.read();
+      await recoverInterruptedManagedAgents(f.managedStore, f.childSessionStores);
+      expect(await f.managedStore.read()).toEqual(records);
+    } finally {
+      await f.close();
+    }
+  },
+);
+
+test("production recovery fences missing provider accounting instead of refunding a completed request", async () => {
+  let calls = 0;
+  const f = await taskBudgetFixture({
+    async *stream() {
+      calls += 1;
+      yield { type: "text_delta", text: "Completed evidence." };
+      yield { type: "usage", inputTokens: 100, outputTokens: 20 };
+      yield { type: "finish", reason: "stop" };
+    },
+  });
+  try {
+    expect(await f.spawn(10000)).toMatchObject({ status: "completed" });
+    const damaged = createInMemoryManagedAgentStore();
+    let sequence = 0;
+    for (const record of await f.managedStore.read()) {
+      if (record.type === "managed_agent_provider") continue;
+      await damaged.append({ ...record, sequence: ++sequence });
+    }
+    await recoverInterruptedManagedAgents(damaged, f.childSessionStores);
+    expect((await damaged.read()).at(-1)).toMatchObject({
+      type: "managed_agent_inspection_required",
+    });
+    expect(calls).toBe(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("cancelling a production task retains unsettled spend and cannot reset it by follow-up", async () => {
+  const started = Promise.withResolvers<void>();
+  let calls = 0;
+  const f = await taskBudgetFixture({
+    async *stream(request) {
+      calls += 1;
+      started.resolve();
+      await new Promise<void>((resolve) => {
+        if (request.signal.aborted) resolve();
+        else request.signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      yield { type: "finish", reason: "stop" };
+    },
+  });
+  try {
+    const run = f.spawn(10000);
+    await withManagedFailureGuard(started.promise, "provider reservation and execution");
+    const agent = (await f.manager.snapshot()).agents[0];
+    if (agent === undefined) throw new Error("Missing live task");
+    expect(
+      await f.manager.cancel({ agentId: agent.agentId, expectedRevision: agent.revision }),
+    ).toMatchObject({ status: "completed" });
+    expect(await run).toMatchObject({
+      status: "failed",
+      error: { code: "managed_agent_cancelled" },
+    });
+    expect(
+      (await f.manager.snapshot()).agents[0]?.taskBudget?.usage.unknownReserved,
+    ).toBeGreaterThan(0);
+    expect(await f.followUp()).toMatchObject({
+      status: "failed",
+      error: { code: "task_budget_exhausted" },
+    });
+    expect(calls).toBe(1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("concurrent production members reserve from one approved task allowance", async () => {
+  const bothStarted = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const outputs: number[] = [];
+  const f = await taskBudgetFixture({
+    async *stream(request) {
+      outputs.push(request.maximumOutputTokens);
+      if (outputs.length === 2) bothStarted.resolve();
+      await release.promise;
+      yield { type: "text_delta", text: "Member evidence." };
+      yield { type: "usage", inputTokens: 100, outputTokens: 10 };
+      yield { type: "finish", reason: "stop" };
+    },
+  });
+  try {
+    const common = {
+      parentSessionId: f.manager.parentSessionId,
+      signal: new AbortController().signal,
+      task: "Inspect one part of the shared task.",
+    };
+    expect(
+      await f.manager.spawnBackground({ ...common, callId: "shared-first", budgetTokens: 20000 }),
+    ).toMatchObject({ status: "completed" });
+    const first = (await f.manager.snapshot()).agents[0];
+    if (first?.taskBudget?.policy.mode !== "limited") throw new Error("Missing approved budget");
+    expect(
+      await f.manager.spawnBackground({
+        ...common,
+        callId: "shared-second",
+        sharedTaskBudget: { agentId: first.agentId, policy: first.taskBudget.policy },
+      }),
+    ).toMatchObject({ status: "completed" });
+    await withManagedFailureGuard(bothStarted.promise, "both funded member requests");
+    const reservations = (await f.managedStore.read()).flatMap((record) =>
+      record.type === "managed_agent_provider" && record.event.type === "provider_reserved"
+        ? [record.event]
+        : [],
+    );
+    expect(reservations).toHaveLength(2);
+    expect(
+      reservations.reduce(
+        (sum, request) => sum + request.estimatedInput + request.maximumOutput,
+        0,
+      ),
+    ).toBeLessThanOrEqual(20000);
+    expect(reservations.map((request) => request.maximumOutput).sort((a, b) => a - b)).toEqual(
+      outputs.toSorted((a, b) => a - b),
+    );
+    release.resolve();
+    const agents = (await f.manager.snapshot()).agents;
+    await f.manager.wait({
+      agentIds: agents.map((agent) => agent.agentId),
+      until: "all_terminal",
+      signal: new AbortController().signal,
+    });
+    expect(
+      (await f.manager.snapshot()).agents.map((agent) => agent.taskBudget?.usage.knownUsed),
+    ).toEqual([220, 220]);
+  } finally {
+    release.resolve();
+    await f.close();
+  }
+});
+
+test.each([false, true])(
+  "recovery rejects a no-dispatch receipt with provider evidence, reasoning evidence %s",
+  async (partialText) => {
+    const f = await taskBudgetFixture({
+      async *stream() {
+        if (partialText) {
+          yield {
+            type: "reasoning_start",
+            id: "dispatch-proof",
+            artifactType: "provider_reasoning",
+          };
+          yield { type: "text_delta", text: "Partial provider evidence." };
+        } else yield { type: "usage", inputTokens: 100, outputTokens: 20 };
+        throw new ModelDriverError("invalid_request", "Fixture error after provider evidence.", {
+          cause: undefined,
+        });
+      },
+    });
+    try {
+      expect(await f.spawn(10000)).toMatchObject({ status: "failed" });
+      expect((await f.manager.snapshot()).agents[0]?.taskBudget?.usage.knownUsed).toBe(
+        partialText ? 0 : 120,
+      );
+      const damaged = createInMemoryManagedAgentStore();
+      let sequence = 0;
+      for (const record of await f.managedStore.read()) {
+        if (record.type === "managed_agent_provider") {
+          if (record.event.type === "provider_reserved")
+            await damaged.append({
+              schemaVersion: 1,
+              sequence: ++sequence,
+              type: "managed_agent_provider_blocked",
+              agentId: record.agentId,
+              attemptId: record.attemptId,
+              childSessionId: record.childSessionId,
+              purpose: record.event.purpose,
+              source: record.event.source,
+            });
+        } else await damaged.append({ ...record, sequence: ++sequence });
+      }
+      await recoverInterruptedManagedAgents(damaged, f.childSessionStores);
+      expect((await damaged.read()).at(-1)).toMatchObject({
+        type: "managed_agent_inspection_required",
+      });
+    } finally {
+      await f.close();
+    }
+  },
+);

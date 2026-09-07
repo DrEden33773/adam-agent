@@ -5,6 +5,13 @@ import { z } from "zod";
 import type { ContextProfile } from "./context-profile.js";
 import type { ManagedControlRecord } from "./managed-agent-folds.js";
 import { agentRoleIdSchema } from "./role-catalog.js";
+import {
+  latestTaskBudget,
+  type TaskBudget,
+  taskBudgetSchema,
+  taskBudgetUsage,
+  taskProviderEventSchema,
+} from "./task-budget.js";
 export function managedControlDigest(value: unknown): `sha256:${string}` {
   return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
 }
@@ -36,24 +43,40 @@ export function requestedDelegationContext(
       ? "task"
       : "current_request";
 }
-export const fleetPolicySchema = z.strictObject({
-  version: z.literal(1),
-  background: z.strictObject({ running: positive.max(4), queued: z.number().int().min(0).max(32) }),
-  reserved: z.strictObject({ running: z.literal(1), queued: z.number().int().min(0).max(4) }),
-  maximumAttempts: positive.max(4),
-  threadTokens: positive,
-  batchTokens: positive,
-  sessionTokens: positive,
-  storageBytes: positive.max(32 * 1024 * 1024),
-});
+export const fleetPolicySchema = z
+  .strictObject({
+    version: z.union([z.literal(1), z.literal(2)]),
+    background: z.strictObject({
+      running: positive.max(4),
+      queued: z.number().int().min(0).max(32),
+    }),
+    reserved: z.strictObject({ running: z.literal(1), queued: z.number().int().min(0).max(4) }),
+    maximumAttempts: positive.max(4),
+    threadTokens: positive.nullable(),
+    batchTokens: positive.nullable(),
+    sessionTokens: positive.nullable(),
+    storageBytes: positive.max(32 * 1024 * 1024),
+  })
+  .refine(
+    (policy) =>
+      policy.version === 1
+        ? policy.threadTokens !== null &&
+          policy.batchTokens !== null &&
+          policy.sessionTokens !== null
+        : policy.threadTokens === null &&
+          policy.batchTokens === null &&
+          policy.sessionTokens === null,
+    "Token policy fields must match their frozen version.",
+  );
 export type FleetPolicy = z.infer<typeof fleetPolicySchema>;
 export const delegationOriginSchema = z.strictObject({
   kind: z.enum(["main_run", "direct_request"]),
   id: z.uuid(),
   callId: z.string().min(1).max(512).optional(),
 });
-export const delegationEnvelopeSchema = z.strictObject({
-  version: z.literal(1),
+const delegationEnvelopeFields = z.strictObject({
+  version: z.union([z.literal(1), z.literal(2)]),
+  taskBudget: taskBudgetSchema.optional(),
   id: z.uuid(),
   digest: z
     .templateLiteral(["sha256:", z.string()])
@@ -67,9 +90,9 @@ export const delegationEnvelopeSchema = z.strictObject({
   threads: positive.max(32),
   running: positive.max(4),
   queued: z.number().int().min(0).max(32),
-  aggregateTokens: positive,
-  threadTokens: positive,
-  sessionTokens: positive,
+  aggregateTokens: positive.nullable(),
+  threadTokens: positive.nullable(),
+  sessionTokens: positive.nullable(),
   context: z.enum(["task", "current_request", "selected_messages"]),
   skills: z.array(z.string().max(512)).max(64),
   policy: fleetPolicySchema,
@@ -77,8 +100,22 @@ export const delegationEnvelopeSchema = z.strictObject({
     .templateLiteral(["sha256:", z.string()])
     .refine((value) => /^sha256:[a-f0-9]{64}$/u.test(value)),
 });
+export const delegationEnvelopeSchema = delegationEnvelopeFields.refine(
+  (envelope) =>
+    envelope.version === envelope.policy.version &&
+    (envelope.version === 1
+      ? envelope.taskBudget === undefined &&
+        envelope.aggregateTokens !== null &&
+        envelope.threadTokens !== null &&
+        envelope.sessionTokens !== null
+      : envelope.taskBudget !== undefined &&
+        envelope.aggregateTokens === null &&
+        envelope.threadTokens === null &&
+        envelope.sessionTokens === null),
+  "Delegation budget fields must match their frozen version.",
+);
 export type DelegationEnvelope = z.infer<typeof delegationEnvelopeSchema>;
-const delegationLimitsSchema = delegationEnvelopeSchema
+const delegationLimitsSchema = delegationEnvelopeFields
   .pick({
     mode: true,
     running: true,
@@ -87,48 +124,29 @@ const delegationLimitsSchema = delegationEnvelopeSchema
     threadTokens: true,
     sessionTokens: true,
   })
-  .partial();
-export const fleetProviderEventSchema = z.discriminatedUnion("type", [
-  z.strictObject({
-    type: z.literal("provider_reserved"),
-    requestId: z.uuid(),
-    purpose: z.enum(["ordinary", "compaction"]),
-    estimatedInput: z.number().int().nonnegative(),
-    maximumOutput: positive,
-    source: z.strictObject({
-      sequence: positive,
-      digest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
-    }),
-  }),
-  z.strictObject({
-    type: z.literal("provider_usage"),
-    requestId: z.uuid(),
-    inputTokens: z.number().int().nonnegative(),
-    outputTokens: z.number().int().nonnegative(),
-    reasoningTokens: z.number().int().nonnegative(),
-  }),
-  z.strictObject({ type: z.literal("provider_unknown"), requestId: z.uuid() }),
-]);
+  .partial()
+  .extend({ budgetTokens: positive.nullable().optional() });
+export const fleetProviderEventSchema = taskProviderEventSchema;
 export type FleetProviderEvent = z.infer<typeof fleetProviderEventSchema>;
 export type FleetUsage = Omit<Extract<FleetProviderEvent, { type: "provider_usage" }>, "type">;
 
 export function resolveFleetPolicy(profile: ContextProfile, input?: FleetPolicy): FleetPolicy {
   const policy = fleetPolicySchema.parse(
     input ?? {
-      version: 1,
+      version: 2,
       background: { running: 4, queued: 32 },
       reserved: { running: 1, queued: 4 },
       maximumAttempts: 4,
-      threadTokens: profile.contextWindowTokens,
-      batchTokens: 4 * profile.contextWindowTokens,
-      sessionTokens: 16 * profile.contextWindowTokens,
+      threadTokens: null,
+      batchTokens: null,
+      sessionTokens: null,
       storageBytes: 32 * 1024 * 1024,
     },
   );
   if (
-    policy.threadTokens > profile.contextWindowTokens ||
-    policy.batchTokens > 4 * profile.contextWindowTokens ||
-    policy.sessionTokens > 16 * profile.contextWindowTokens
+    (policy.threadTokens !== null && policy.threadTokens > profile.contextWindowTokens) ||
+    (policy.batchTokens !== null && policy.batchTokens > 4 * profile.contextWindowTokens) ||
+    (policy.sessionTokens !== null && policy.sessionTokens > 16 * profile.contextWindowTokens)
   )
     throw new TypeError("Owner policy cannot enlarge certified token ceilings.");
   return policy;
@@ -139,9 +157,10 @@ export function createDelegationEnvelope(
     mode: "background" | "foreground";
     count: number;
     origin: DelegationEnvelope["origin"];
-    sessionTokens: number;
-    availableTokens?: number;
-    threadTokens?: number;
+    sessionTokens: number | null;
+    availableTokens?: number | null;
+    threadTokens?: number | null;
+    taskBudget?: TaskBudget;
     roles?: DelegationEnvelope["roles"];
     context?: DelegationEnvelope["context"];
     skills?: readonly string[];
@@ -149,8 +168,19 @@ export function createDelegationEnvelope(
   },
 ): DelegationEnvelope {
   const lane = input.mode === "background" ? policy.background : policy.reserved;
+  const { budgetTokens, ...limits } = delegationLimitsSchema.parse(input.limits ?? {});
+  if (policy.version === 1 && budgetTokens !== undefined)
+    throw new TypeError("Historical envelopes retain their original token policy.");
+  const taskId = managedControlDigest(input.origin);
+  const taskBudget: TaskBudget =
+    budgetTokens === undefined
+      ? (input.taskBudget ?? { version: 1, mode: "unbudgeted" })
+      : budgetTokens === null
+        ? { version: 1, mode: "unbudgeted" }
+        : { version: 1, mode: "limited", taskId, grants: [{ id: taskId, tokens: budgetTokens }] };
   const value = {
-    version: 1 as const,
+    version: policy.version,
+    ...(policy.version === 2 ? { taskBudget } : {}),
     id: randomUUID(),
     origin: input.origin,
     roles: input.roles ?? ["builtin:explore"],
@@ -158,16 +188,19 @@ export function createDelegationEnvelope(
     threads: input.count,
     running: Math.min(lane.running, input.count),
     queued: Math.max(0, input.count - lane.running),
-    aggregateTokens: Math.min(
+    aggregateTokens: minimumTokenCeiling(
       policy.batchTokens,
       input.sessionTokens,
       input.availableTokens ?? input.sessionTokens,
     ),
-    threadTokens: Math.min(policy.threadTokens, input.threadTokens ?? policy.threadTokens),
+    threadTokens: minimumTokenCeiling(
+      policy.threadTokens,
+      input.threadTokens ?? policy.threadTokens,
+    ),
     sessionTokens: input.sessionTokens,
     context: input.context ?? "current_request",
     skills: [...(input.skills ?? [])],
-    ...delegationLimitsSchema.parse(input.limits ?? {}),
+    ...limits,
     policy,
     policyDigest: managedControlDigest(policy),
   };
@@ -186,7 +219,7 @@ export function createDelegationEnvelope(
       context: value.context,
       skills: value.skills,
     }) ||
-    envelope.aggregateTokens > (input.availableTokens ?? input.sessionTokens)
+    !withinTokenCeiling(envelope.aggregateTokens, input.availableTokens ?? input.sessionTokens)
   )
     throw new TypeError("Delegation limits exceed the available policy or Session budget.");
   return envelope;
@@ -200,7 +233,7 @@ export function delegationEnvelopeMatches(
     readonly count: number;
     readonly mode: "background" | "foreground";
     readonly origin?: DelegationEnvelope["origin"];
-    readonly sessionTokens: number;
+    readonly sessionTokens: number | null;
     readonly context?: DelegationEnvelope["context"];
     readonly skills?: readonly string[];
   },
@@ -225,15 +258,15 @@ export function delegationEnvelopeMatches(
     envelope.queued <=
       expected.policy[envelope.mode === "background" ? "background" : "reserved"].queued &&
     (envelope.mode !== "foreground" || envelope.threads === 1) &&
-    envelope.aggregateTokens <= expected.policy.batchTokens &&
-    envelope.aggregateTokens <= envelope.sessionTokens &&
-    envelope.threadTokens <= expected.policy.threadTokens &&
-    envelope.sessionTokens <= expected.sessionTokens
+    withinTokenCeiling(envelope.aggregateTokens, expected.policy.batchTokens) &&
+    withinTokenCeiling(envelope.aggregateTokens, envelope.sessionTokens) &&
+    withinTokenCeiling(envelope.threadTokens, expected.policy.threadTokens) &&
+    withinTokenCeiling(envelope.sessionTokens, expected.sessionTokens)
   );
 }
 export function fleetBudget(
   records: readonly ManagedControlRecord[],
-  ceiling: number,
+  ceiling: number | null,
   select: (record: ManagedControlRecord) => boolean = () => true,
   live?: ReadonlySet<string>,
 ) {
@@ -241,13 +274,20 @@ export function fleetBudget(
   let outstandingReserved = 0;
   let unknownReserved = 0;
   let overrun = 0;
+  const usages = new Map(
+    records.flatMap((record) =>
+      record.event.type === "provider_usage" ? [[record.event.requestId, record] as const] : [],
+    ),
+  );
+  const unknown = new Set(
+    records.flatMap((record) =>
+      record.event.type === "provider_unknown" ? [record.event.requestId] : [],
+    ),
+  );
   for (const record of records) {
     if (record.event.type !== "provider_reserved" || !select(record)) continue;
     const reservation = record.event;
-    const settled = records.find(
-      (entry) =>
-        entry.event.type === "provider_usage" && entry.event.requestId === reservation.requestId,
-    );
+    const settled = usages.get(reservation.requestId);
     const reserved = reservation.estimatedInput + reservation.maximumOutput;
     if (settled?.event.type === "provider_usage") {
       const used = settled.event.inputTokens + settled.event.outputTokens;
@@ -255,11 +295,7 @@ export function fleetBudget(
       overrun += Math.max(0, used - reserved);
     } else if (
       (live !== undefined && !live.has(record.turnId)) ||
-      records.some(
-        (entry) =>
-          entry.event.type === "provider_unknown" &&
-          entry.event.requestId === reservation.requestId,
-      )
+      unknown.has(reservation.requestId)
     )
       unknownReserved += reserved;
     else outstandingReserved += reserved;
@@ -269,18 +305,22 @@ export function fleetBudget(
     knownUsed,
     outstandingReserved,
     unknownReserved,
-    available: Math.max(0, ceiling - knownUsed - outstandingReserved - unknownReserved),
+    available:
+      ceiling === null
+        ? null
+        : Math.max(0, ceiling - knownUsed - outstandingReserved - unknownReserved),
     overrun,
   };
 }
 export function fleetSessionCeiling(
   records: readonly ManagedControlRecord[],
   policy: FleetPolicy,
-): number {
+): number | null {
+  if (policy.version === 2) return null;
   const first = records.find(
     (entry) => entry.event.type === "admitted" && entry.event.envelope !== undefined,
   );
-  return Math.min(
+  return minimumTokenCeiling(
     policy.sessionTokens,
     first?.event.type === "admitted"
       ? (first.event.envelope?.sessionTokens ?? policy.sessionTokens)
@@ -304,6 +344,15 @@ export function assertFleetReservation(
 ): void {
   if (admission.event.type !== "admitted" || admission.event.envelope === undefined) return;
   const envelope = admission.event.envelope;
+  if (envelope.version === 2 && envelope.taskBudget !== undefined) {
+    const budget = taskBudgetUsage(
+      fleetTaskBudget(records, envelope.taskBudget),
+      taskFleetEvents(records, admission),
+    );
+    if (budget.available !== null && budget.available !== null && budget.available < amount)
+      throw new FleetBudgetError("fleet_budget_exhausted");
+    return;
+  }
   const first = records.find(
     (record) => record.threadId === admission.threadId && record.event.type === "admitted",
   );
@@ -313,7 +362,12 @@ export function assertFleetReservation(
       : envelope.threadTokens;
   const thread = fleetBudget(
     records,
-    Math.min(initialThreadTokens, envelope.threadTokens, policy.threadTokens),
+    minimumTokenCeiling(
+      initialThreadTokens,
+      envelope.threadTokens,
+      envelope.policy.threadTokens,
+      policy.threadTokens,
+    ),
     (record) => record.threadId === admission.threadId,
   );
   const batchTurns = new Set(
@@ -325,13 +379,20 @@ export function assertFleetReservation(
   );
   const batch = fleetBudget(
     records,
-    Math.min(envelope.aggregateTokens, policy.batchTokens),
+    minimumTokenCeiling(envelope.aggregateTokens, envelope.policy.batchTokens, policy.batchTokens),
     (record) => batchTurns.has(record.turnId),
   );
-  const session = fleetBudget(records, fleetSessionCeiling(records, policy));
+  const session = fleetBudget(
+    records,
+    minimumTokenCeiling(fleetSessionCeiling(records, envelope.policy), policy.sessionTokens),
+  );
   if ([thread, batch, session].some((budget) => budget.overrun > 0))
     throw new FleetBudgetError("fleet_estimator_overrun");
-  if ([thread, batch, session].some((budget) => budget.available < amount))
+  if (
+    [thread, batch, session].some(
+      (budget) => budget.available !== null && budget.available < amount,
+    )
+  )
     throw new FleetBudgetError("fleet_budget_exhausted");
 }
 
@@ -371,4 +432,52 @@ export function fleetStorage(
     reservedTerminalBytes,
     availableBytes: Math.max(0, ceiling - usedBytes - reservedTerminalBytes),
   };
+}
+
+export function minimumTokenCeiling(...values: readonly (number | null)[]): number | null {
+  const configured = values.filter((value): value is number => value !== null);
+  return configured.length === 0 ? null : Math.min(...configured);
+}
+export function withinTokenCeiling(value: number | null, ceiling: number | null): boolean {
+  return ceiling === null || (value !== null && value <= ceiling);
+}
+export function taskFleetEvents(
+  records: readonly ManagedControlRecord[],
+  admission: ManagedControlRecord,
+): FleetProviderEvent[] {
+  if (admission.event.type !== "admitted") return [];
+  const taskBudget = admission.event.envelope?.taskBudget;
+  const turns = new Set(
+    records.flatMap((record) =>
+      record.event.type === "admitted" &&
+      (taskBudget?.mode === "limited"
+        ? record.event.envelope?.taskBudget?.mode === "limited" &&
+          record.event.envelope.taskBudget.taskId === taskBudget.taskId
+        : record.threadId === admission.threadId)
+        ? [record.turnId]
+        : [],
+    ),
+  );
+  return records.flatMap((record) =>
+    turns.has(record.turnId) &&
+    (record.event.type === "provider_reserved" ||
+      record.event.type === "provider_usage" ||
+      record.event.type === "provider_unknown")
+      ? [record.event]
+      : [],
+  );
+}
+
+export function fleetTaskBudget(
+  records: readonly ManagedControlRecord[],
+  policy: TaskBudget,
+): TaskBudget {
+  return latestTaskBudget(
+    policy,
+    records.flatMap((record) =>
+      record.event.type === "admitted" && record.event.envelope?.taskBudget !== undefined
+        ? [record.event.envelope.taskBudget]
+        : [],
+    ),
+  );
 }

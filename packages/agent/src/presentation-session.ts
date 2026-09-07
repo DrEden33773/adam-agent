@@ -5457,7 +5457,10 @@ export async function createPresentationSession(
             throw new TypeError("Choose only requested Skill pre-activations.");
           if (selectedContext !== undefined)
             resolveDelegationContext(selectedContext, "", pending.delegationMessages ?? []);
+          if (pending.delegationCanChangeMode !== true && command.limits.budgetTokens !== undefined)
+            throw new TypeError("Use the agent composer to explicitly add a task-budget grant.");
           const envelope = createDelegationEnvelope(original.policy, {
+            ...(original.taskBudget === undefined ? {} : { taskBudget: original.taskBudget }),
             mode: command.limits.mode ?? original.mode,
             count: original.threads,
             origin: original.origin,
