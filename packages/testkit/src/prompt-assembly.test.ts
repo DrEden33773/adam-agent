@@ -183,16 +183,59 @@ const expectedTodoTools = [
       additionalProperties: false,
     },
   },
+  {
+    name: "update_todos",
+    description:
+      "Atomically update 1–16 distinct Todos against one expectedStoreRevision and each expectedItemRevision. Validate dependencies in the complete candidate state. One permission decision; all updates commit or none do. Read current revisions before retrying a rejected batch.",
+    inputSchema: {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: {
+        expectedStoreRevision: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+        updates: {
+          type: "array",
+          minItems: 1,
+          maxItems: 16,
+          items: {
+            type: "object",
+            properties: {
+              id: uuidSchema,
+              expectedItemRevision: {
+                type: "integer",
+                exclusiveMinimum: 0,
+                maximum: Number.MAX_SAFE_INTEGER,
+              },
+              title: { type: "string" },
+              details: { anyOf: [{ type: "string" }, { type: "null" }] },
+              dependencyIds: { maxItems: 64, type: "array", items: uuidSchema },
+              status: { type: "string", enum: ["pending", "in_progress", "completed"] },
+            },
+            required: ["id", "expectedItemRevision"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["expectedStoreRevision", "updates"],
+      additionalProperties: false,
+    },
+  },
 ] as const;
 
 const expectedCodingTools = [
   {
     name: "read_file",
-    description: "Read a UTF-8 text file inside the workspace.",
+    description:
+      "Read a bounded UTF-8 range inside the workspace. startLine is 1-based relative to byteOffset (default 0); maxLines defaults to 200, maximum 2000. Follow nextRead exactly for UTF-8 safe continuation, including long lines and bounded scanning. byteRange is absolute and end-exclusive; lineRange is absolute only when reading from byte 0. A changed file requires restarting. Each call scans at most 8 MiB and returns at most 64 KiB of JSON.",
     inputSchema: {
       $schema: "https://json-schema.org/draft/2020-12/schema",
       type: "object",
-      properties: { path: { type: "string", minLength: 1 } },
+      properties: {
+        path: { type: "string", minLength: 1, maxLength: 4096 },
+        startLine: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+        maxLines: { type: "integer", minimum: 1, maximum: 2000 },
+        byteOffset: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+        expectedFileVersion: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+      },
       required: ["path"],
       additionalProperties: false,
     },
@@ -364,7 +407,7 @@ const expectedCodingTools = [
 ] as const;
 const expectedTransientCodingTools = [...expectedCodingTools.slice(0, 5), ...expectedTodoTools];
 
-test("a newly created v3 session sends code-owned prompts before the current user request with the exact twelve-tool profile", async () => {
+test("a newly created v3 session sends code-owned prompts before the current user request with the exact thirteen-tool profile", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-prompt-assembly-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -537,7 +580,7 @@ test("a new v3 session persists bounded prompt and Skill identity without exposi
       definitions: [
         {
           name: "read_file",
-          digest: "sha256:84c7b9fde73815162c795cd0a12361061332b903018efe55266598639014cff3",
+          digest: "sha256:bdb41fa898c899908b16e170104c84f1bc6cd5393747d1c00f7bc72bb7526698",
         },
         {
           name: "search_repository",
@@ -583,8 +626,12 @@ test("a new v3 session persists bounded prompt and Skill identity without exposi
           name: "update_todo",
           digest: "sha256:862986580edb1216123bb51c83f171fd660419d55dee238eee1353b995b5a142",
         },
+        {
+          name: "update_todos",
+          digest: "sha256:7b996f5cafc0c80fdada49cfcacda572a0b74fe70e2331be5697efe4c8a98842",
+        },
       ],
-      digest: "sha256:d76ecac0966ef2b3d82985a0ec73add097b5fa5bafc808c698f7a3f09a80b182",
+      digest: "sha256:f8282573fbc7802d2cbd34ab0d1f58d7c90709837742ad2d16949e2e79a0a6c1",
     },
     repository: {
       version: 1,
@@ -714,6 +761,7 @@ test("v3 accounting compacts for the assembled messages and tools while keeping 
         "get_todo",
         "list_todos",
         "update_todo",
+        "update_todos",
       ],
     ]);
     expect(requests[0]?.messages[0]).not.toEqual({ role: "system", content: basePrompt });
@@ -723,7 +771,7 @@ test("v3 accounting compacts for the assembled messages and tools while keeping 
   }
 });
 
-test("transient v1 base and nine current tools reduce the profile-v2 ordinary output clamp", async () => {
+test("transient v1 base and ten current tools reduce the profile-v2 ordinary output clamp", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-prompt-output-clamp-"));
   const workspaceRoot = join(testRoot, "workspace");
   const stateRoot = join(testRoot, "state");
@@ -765,7 +813,7 @@ test("transient v1 base and nine current tools reduce the profile-v2 ordinary ou
         { role: "user", content: "Clamp v1." },
       ],
       tools: expectedTransientCodingTools,
-      maximumOutputTokens: 5_797,
+      maximumOutputTokens: 5_259,
     });
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -1549,11 +1597,11 @@ test("a v3 provider attempt persists only the safe exact request projection dige
     expect({ continuedPromptContext, inspectedPromptContext }).toMatchObject({
       continuedPromptContext: {
         lastRequestProjectionDigest:
-          "sha256:8ce9f1a508d816ddc04f89f9f3963b7b84aa51e4ec553455c72e42291aea6b4c",
+          "sha256:73b1ca9a15be972b5f8de421b0e323146dc0c6263ae31de877c3e5c0f2a81ca6",
       },
       inspectedPromptContext: {
         lastRequestProjectionDigest:
-          "sha256:8ce9f1a508d816ddc04f89f9f3963b7b84aa51e4ec553455c72e42291aea6b4c",
+          "sha256:73b1ca9a15be972b5f8de421b0e323146dc0c6263ae31de877c3e5c0f2a81ca6",
       },
     });
     expect(JSON.stringify({ continued, inspected })).not.toContain("Inspect the project.");

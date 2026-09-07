@@ -635,6 +635,7 @@ test("SessionLifecycle bounds unknown frontmatter fields and reports allowed-too
       "get_todo",
       "list_todos",
       "update_todo",
+      "update_todos",
     ]);
   } finally {
     await rm(testRoot, { recursive: true, force: true });
@@ -698,6 +699,7 @@ test("SessionLifecycle admits audited Skill metadata arrays without granting lis
       "get_todo",
       "list_todos",
       "update_todo",
+      "update_todos",
     ]);
   } finally {
     if (previousHome === undefined) {

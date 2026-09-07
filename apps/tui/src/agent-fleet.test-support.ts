@@ -12,6 +12,7 @@ import {
   createDirectDeepSeekThinkingCapability,
   createInMemoryManagedAgentControlStore,
   createInMemorySessionStoreDirectory,
+  createJsonlSessionStoreDirectory,
   createTrustedWorkspaceTrustForTesting,
   managedAgentRecordBarrier,
   managedAgentSettlementBarrier,
@@ -91,6 +92,7 @@ export async function startManagedTui(
     readonly restore?: ManagedTuiStorage;
     readonly withDestination?: boolean;
     readonly initialPrompt?: string;
+    readonly durableSessions?: boolean;
     readonly blankDraft?: boolean;
     readonly thinking?: boolean;
     readonly controlReceiptBarrier?: (
@@ -117,9 +119,18 @@ export async function startManagedTui(
     viewport.restore?.stateRoot ?? (await mkdtemp(join(tmpdir(), "adam-fleet-ui-")));
   const workspaceRoot = viewport.workspaceRoot ?? process.cwd();
   const sessions =
-    viewport.restore?.sessions ?? createInMemorySessionStoreDirectory<SessionRecord>();
+    viewport.restore?.sessions ??
+    (viewport.durableSessions
+      ? createJsonlSessionStoreDirectory<SessionRecord>({ workspaceRoot, stateRoot })
+      : createInMemorySessionStoreDirectory<SessionRecord>());
   const children =
-    viewport.restore?.children ?? createInMemorySessionStoreDirectory<SessionRecord>();
+    viewport.restore?.children ??
+    (viewport.durableSessions
+      ? createJsonlSessionStoreDirectory<SessionRecord>({
+          workspaceRoot,
+          stateRoot: join(stateRoot, "managed-children"),
+        })
+      : createInMemorySessionStoreDirectory<SessionRecord>());
   const store = viewport.restore?.store ?? createInMemoryManagedAgentControlStore();
   const thinking = viewport.thinking
     ? { thinkingCapability: createDirectDeepSeekThinkingCapability(identity) }
@@ -246,9 +257,10 @@ export async function startManagedTui(
   });
   const terminal = new VirtualTerminal({ columns: 80, rows: 32, ...viewport });
   let waitingForFrame = "initial frame";
+  let shutdownStage = "not requested";
   onTestFailed(() =>
     console.error(
-      `Fleet screen at failure (${waitingForFrame}):\n${terminal.lines().join("\n")}\nPending transition: ${JSON.stringify(presentation.getState().authoritative.managedTransition)}\nAttention: ${JSON.stringify(presentation.getState().managedAttention)}\nControl: ${JSON.stringify(presentation.getState().authoritative.managedControl?.threads.map((thread) => ({ handle: thread.handle, phase: thread.turn.phase, label: thread.turn.label, diagnostic: thread.turn.diagnostic, outcome: thread.turn.outcome, attention: thread.turn.attention, actions: thread.actions })))}`,
+      `Fleet screen at failure (${waitingForFrame}; shutdown=${shutdownStage}; terminal running=${terminal.running()}):\n${terminal.lines().join("\n")}\nPending transition: ${JSON.stringify(presentation.getState().authoritative.managedTransition)}\nAttention: ${JSON.stringify(presentation.getState().managedAttention)}\nControl: ${JSON.stringify(presentation.getState().authoritative.managedControl?.threads.map((thread) => ({ handle: thread.handle, phase: thread.turn.phase, label: thread.turn.label, diagnostic: thread.turn.diagnostic, outcome: thread.turn.outcome, attention: thread.turn.attention, actions: thread.actions })))}`,
     ),
   );
   const running = runTui({
@@ -259,8 +271,11 @@ export async function startManagedTui(
       ? {}
       : { deadlineScheduler: viewport.deadlineScheduler }),
     closeRuntime: async () => {
+      shutdownStage = "closing presentation";
       await presentation.close();
+      shutdownStage = "closing lifecycle";
       await lifecycle.close();
+      shutdownStage = "runtime closed";
     },
   });
   // The selected target remains visible when the minimum-height layout compresses the title.
@@ -310,6 +325,7 @@ export async function startManagedTui(
     press,
 
     async close() {
+      shutdownStage = "quit requested";
       if (terminal.running()) terminal.input("\u0011");
       try {
         await running;

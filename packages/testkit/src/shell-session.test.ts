@@ -15,7 +15,7 @@ import { expect, test } from "vitest";
 import { FakeModelDriver } from "./index.js";
 import { requireSessionEvent } from "./session-event.test-support.js";
 
-test("the default coding registry exposes the twelve current prompt tools", async () => {
+test("the default coding registry exposes the thirteen current prompt tools", async () => {
   const workspaceRoot = await mkdtemp(join(tmpdir(), "adam-agent-coding-registry-"));
 
   try {
@@ -55,6 +55,7 @@ test("the default coding registry exposes the twelve current prompt tools", asyn
         "get_todo",
         "list_todos",
         "update_todo",
+        "update_todos",
       ],
       listFiles: undefined,
       searchText: undefined,

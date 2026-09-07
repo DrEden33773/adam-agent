@@ -64,6 +64,7 @@ export const fixtureScenarios = [
   "target-picker-hostile",
   "target-unavailable",
   "todo",
+  "todo-batch",
   "todo-active",
   "tool-artifact",
   "tool-multiple",

@@ -10,7 +10,6 @@ import type {
 } from "@adam-agent/presentation";
 
 import { z } from "zod";
-
 import type { ArtifactStore } from "./artifact-store.js";
 import {
   InputResourceError,
@@ -40,6 +39,12 @@ import {
   type RepositorySearchBackend,
 } from "./repository-search.js";
 import {
+  readTextRange,
+  TextReadError,
+  textReadInputSchema,
+  textReadOutputSchema,
+} from "./text-read.js";
+import {
   createTodoInputV1Schema,
   createTodoToolDefinitionV1,
   getTodoInputV1Schema,
@@ -47,6 +52,9 @@ import {
   listTodoInputV1Schema,
   listTodoToolDefinitionV1,
   updateTodoInputV1Schema,
+  updateTodosInputV1Schema,
+  updateTodosOutputV1Schema,
+  updateTodosToolDefinitionV1,
   updateTodoToolDefinitionV1,
 } from "./todo.js";
 import type { ToolError } from "./tool-error.js";
@@ -87,6 +95,7 @@ export type ToolResult =
   | { readonly status: "failed"; readonly error: ToolError };
 
 export type ToolAdapter = {
+  readonly retainedVersions?: readonly ToolAdapter[];
   readonly definition: ModelToolDefinition;
   readonly definitionDigest: string;
   readonly outputSchema: z.ZodType<JsonValue>;
@@ -143,6 +152,22 @@ export function createInternalToolRegistry(adapters: readonly ToolAdapter[]): To
     definitions: () => [...byName.values()].map((adapter) => adapter.definition),
     resolve: (name) => byName.get(name),
   };
+}
+
+export function resolveToolDefinition(
+  tools: ToolRegistry,
+  name: string,
+  digest: string,
+): ToolAdapter | undefined {
+  const current = tools.resolve(name);
+  if (current === undefined) return undefined;
+  return [current, ...(current.retainedVersions ?? [])].find(
+    (adapter) =>
+      adapter.definition.name === name &&
+      `sha256:${createHash("sha256")
+        .update(canonicalJson({ version: 1, definition: adapter.definition }))
+        .digest("hex")}` === digest,
+  );
 }
 
 function canonicalJson(value: unknown): string {
@@ -598,7 +623,7 @@ function createReadToolRegistryInternal(options: {
   readonly repositorySearchBackend?: RepositorySearchBackend;
 }): ToolRegistry {
   const workspaceRoot = resolve(options.workspaceRoot);
-  const readFileAdapter = identifyToolAdapter(
+  const legacyReadFileAdapter = identifyToolAdapter(
     {
       definition: {
         name: "read_file",
@@ -637,6 +662,48 @@ function createReadToolRegistryInternal(options: {
               );
               return { path: parsedArguments.data.path, content, truncated };
             });
+          },
+        };
+      },
+    },
+    "safe",
+  );
+  const readFileAdapter = identifyToolAdapter(
+    {
+      definition: {
+        name: "read_file",
+        description:
+          "Read a bounded UTF-8 range inside the workspace. startLine is 1-based relative to byteOffset (default 0); maxLines defaults to 200, maximum 2000. Follow nextRead exactly for UTF-8 safe continuation, including long lines and bounded scanning. byteRange is absolute and end-exclusive; lineRange is absolute only when reading from byte 0. A changed file requires restarting. Each call scans at most 8 MiB and returns at most 64 KiB of JSON.",
+        inputSchema: z.toJSONSchema(textReadInputSchema),
+      },
+      retainedVersions: [legacyReadFileAdapter],
+      outputSchema: textReadOutputSchema,
+      effect: "read",
+      cancellation: "abort_signal",
+      maximumResult: readFileMaximumResult,
+      prepare(argumentsJson) {
+        const parsed = parseInput(textReadInputSchema, argumentsJson);
+        if (!parsed.success)
+          return actionableInputFailure(parsed, {
+            path: "supply a nonempty path of at most 4096 characters",
+            startLine: "supply a positive integer",
+            maxLines: "supply an integer from 1 to 2000",
+            byteOffset: "use the nonnegative integer from nextRead",
+            expectedFileVersion: "use the exact sha256 file version from nextRead",
+          });
+        const permissionSubject = preparePermissionSubject(workspaceRoot, parsed.data.path, "file");
+        if ("status" in permissionSubject) return permissionSubject;
+        return {
+          status: "ready",
+          permissionSubject,
+          async execute(context) {
+            return executeSafely(textReadOutputSchema, async () =>
+              readTextRange(
+                await resolveConfinedPath(workspaceRoot, parsed.data.path),
+                parsed.data,
+                context.signal,
+              ),
+            );
           },
         };
       },
@@ -1247,6 +1314,46 @@ function createCodingToolRegistryInternal(options: {
     },
     "never",
   );
+  const updateTodosAdapter = identifyToolAdapter(
+    {
+      definition: updateTodosToolDefinitionV1,
+      outputSchema: z
+        .json()
+        .refine((output) => updateTodosOutputV1Schema.safeParse(output).success),
+      effect: "write",
+      cancellation: "unsupported",
+      maximumResult: {},
+      prepare(argumentsJson) {
+        const parsed = parseInput(updateTodosInputV1Schema, argumentsJson);
+        if (!parsed.success) {
+          return actionableInputFailure(parsed, {
+            expectedStoreRevision: "supply the current nonnegative store revision",
+            updates: "supply 1–16 updates with distinct Todo IDs and explicit mutations",
+            id: "supply an existing Todo UUID",
+            expectedItemRevision: "supply the current positive item revision",
+            title: "supply a nonempty title of at most 512 UTF-8 bytes",
+            details: "supply at most 8192 UTF-8 bytes, or null to clear",
+            dependencyIds: "supply at most 64 Todo UUIDs",
+            status: "use pending, in_progress, or completed",
+          });
+        }
+        return {
+          status: "ready",
+          permissionSubject: { type: "workspace_path", path: "." },
+          async execute() {
+            return {
+              status: "failed",
+              error: {
+                code: "unknown_tool",
+                message: "update_todos requires an active Adam session.",
+              },
+            };
+          },
+        };
+      },
+    },
+    "never",
+  );
   const adapters = [
     requireAdapter(readTools, "read_file"),
     requireAdapter(readTools, "search_repository"),
@@ -1260,6 +1367,7 @@ function createCodingToolRegistryInternal(options: {
     getTodoAdapter,
     listTodoAdapter,
     updateTodoAdapter,
+    updateTodosAdapter,
   ];
   const adaptersByName = new Map(adapters.map((adapter) => [adapter.definition.name, adapter]));
 
@@ -1750,6 +1858,9 @@ async function executeSafely(
     }
     return { status: "completed", output: output.data };
   } catch (error) {
+    if (error instanceof TextReadError) {
+      return { status: "failed", error: { code: error.code, message: error.message } };
+    }
     if (error instanceof PatchTransactionError) {
       if (
         error.code === "patch_recovery_cleanup_failed" &&
@@ -1903,7 +2014,9 @@ function patchOperationSortKey(operation: NormalizedPatchOperation): string {
 function parseInput<T>(
   schema: z.ZodType<T>,
   argumentsJson: string,
-): { readonly success: true; readonly data: T } | { readonly success: false } {
+):
+  | { readonly success: true; readonly data: T }
+  | { readonly success: false; readonly issues?: readonly z.core.$ZodIssue[] } {
   let untrustedInput: unknown;
   try {
     untrustedInput = JSON.parse(argumentsJson);
@@ -1912,15 +2025,33 @@ function parseInput<T>(
   }
 
   const result = schema.safeParse(untrustedInput);
-  return result.success ? { success: true, data: result.data } : { success: false };
+  return result.success
+    ? { success: true, data: result.data }
+    : { success: false, issues: result.error.issues };
 }
 
-function invalidToolInput(): FailedToolResult {
+function actionableInputFailure(
+  failure: { readonly issues?: readonly z.core.$ZodIssue[] },
+  rules: Readonly<Record<string, string>>,
+): FailedToolResult {
+  if (failure.issues === undefined) return invalidToolInput("input: supply one valid JSON object.");
+  const messages = failure.issues.slice(0, 3).map((issue) => {
+    const field = issue.path.findLast(
+      (part) => typeof part === "string" && Object.hasOwn(rules, part),
+    );
+    return typeof field === "string" && issue.code !== "unrecognized_keys"
+      ? `${field}: ${rules[field]}.`
+      : "input: remove unsupported fields and follow the declared object schema.";
+  });
+  return invalidToolInput([...new Set(messages)].join(" "));
+}
+
+function invalidToolInput(message = "The tool input did not match its schema."): FailedToolResult {
   return {
     status: "failed",
     error: {
       code: "invalid_tool_input",
-      message: "The tool input did not match its schema.",
+      message,
     },
   };
 }

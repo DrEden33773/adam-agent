@@ -84,6 +84,28 @@ export const updateTodoToolDefinitionV1: ModelToolDefinition = {
   inputSchema: z.toJSONSchema(updateTodoInputV1Schema),
 };
 
+export const updateTodosInputV1Schema = z.strictObject({
+  expectedStoreRevision: z.number().int().nonnegative(),
+  updates: z
+    .array(
+      z
+        .strictObject({
+          ...updateTodoInputV1Schema.shape,
+          expectedStoreRevision: z.never().optional(),
+        })
+        .omit({ expectedStoreRevision: true }),
+    )
+    .min(1)
+    .max(16),
+});
+
+export const updateTodosToolDefinitionV1: ModelToolDefinition = {
+  name: "update_todos",
+  description:
+    "Atomically update 1–16 distinct Todos against one expectedStoreRevision and each expectedItemRevision. Validate dependencies in the complete candidate state. One permission decision; all updates commit or none do. Read current revisions before retrying a rejected batch.",
+  inputSchema: z.toJSONSchema(updateTodosInputV1Schema),
+};
+
 export const todoItemV1Schema = z.strictObject({
   id: z.uuid(),
   createdOrdinal: z.number().int().positive(),
@@ -92,6 +114,13 @@ export const todoItemV1Schema = z.strictObject({
   title: boundedUtf8String(todoLimitsV1.maximumTitleBytes).refine((value) => value.length > 0),
   details: boundedUtf8String(todoLimitsV1.maximumDetailsBytes).optional(),
   dependencyIds: z.array(z.uuid()).max(todoLimitsV1.maximumDirectDependencies),
+});
+
+export const updateTodosOutputV1Schema = z.strictObject({
+  batchVersion: z.literal(1),
+  policyVersion: z.literal(todoPolicyVersionV1),
+  storeRevision: z.number().int().positive(),
+  items: z.array(todoItemV1Schema).min(1).max(16),
 });
 
 export type TodoItemV1 = z.infer<typeof todoItemV1Schema>;
@@ -212,6 +241,17 @@ export function todoStoreSnapshotFromRecordsV1(
       for (const item of entry.record.items) {
         items.set(item.id, item);
       }
+      continue;
+    }
+    if (
+      entry.schemaVersion === 3 &&
+      entry.record.type === "runtime_event" &&
+      entry.record.event.type === "tool_completed" &&
+      entry.record.event.name === "update_todos"
+    ) {
+      const batch = updateTodosOutputV1Schema.parse(entry.record.event.output);
+      storeRevision = batch.storeRevision;
+      for (const item of batch.items) items.set(item.id, item);
       continue;
     }
     if (
@@ -341,6 +381,15 @@ export function updateTodoMutationV1(
   snapshot: TodoStoreSnapshotV1,
   input: unknown,
 ): TodoMutationSuccessV1 | TodoMutationFailureV1 {
+  return prepareTodoUpdate(snapshot, input);
+}
+
+function prepareTodoUpdate(
+  snapshot: TodoStoreSnapshotV1,
+  input: unknown,
+  candidate?: TodoStoreSnapshotV1,
+): TodoMutationSuccessV1 | TodoMutationFailureV1 {
+  const graph = candidate ?? snapshot;
   const parsed = updateTodoInputV1Schema.safeParse(input);
   const current = parsed.success
     ? snapshot.items.find((item) => item.id === parsed.data.id)
@@ -376,7 +425,7 @@ export function updateTodoMutationV1(
   if (!transitionAllowed || !dependenciesValid) {
     return invalidTodoUpdate();
   }
-  if (wouldCreateTodoDependencyCycleV1(snapshot, current.id, dependencyIds)) {
+  if (wouldCreateTodoDependencyCycleV1(graph, current.id, dependencyIds)) {
     return {
       status: "failed",
       error: {
@@ -388,7 +437,7 @@ export function updateTodoMutationV1(
   if (
     current.status === "completed" &&
     status !== "completed" &&
-    hasNonPendingTodoDependentV1(snapshot, current.id)
+    hasNonPendingTodoDependentV1(graph, current.id)
   ) {
     return {
       status: "failed",
@@ -403,7 +452,7 @@ export function updateTodoMutationV1(
     (status === "in_progress" || status === "completed") &&
     dependencyIds.some(
       (dependencyId) =>
-        snapshot.items.find((item) => item.id === dependencyId)?.status !== "completed",
+        graph.items.find((item) => item.id === dependencyId)?.status !== "completed",
     )
   ) {
     return {
@@ -451,7 +500,7 @@ export function updateTodoMutationV1(
     Buffer.byteLength(JSON.stringify(current), "utf8") +
     Buffer.byteLength(JSON.stringify(item), "utf8") +
     todoStoreRevisionByteDelta(snapshot.storeRevision, nextSnapshot.storeRevision);
-  if (nextFoldedStateBytes > todoLimitsV1.maximumFoldedStateBytes) {
+  if (candidate === undefined && nextFoldedStateBytes > todoLimitsV1.maximumFoldedStateBytes) {
     return {
       status: "failed",
       error: {
@@ -463,6 +512,72 @@ export function updateTodoMutationV1(
   todoFoldedStateBytesCache.set(nextSnapshot, nextFoldedStateBytes);
   todoSummaryCache.set(nextSnapshot, computeTodoSummaryV1(nextSnapshot));
   return { status: "completed", snapshot: nextSnapshot, item };
+}
+
+export function updateTodosMutationV1(
+  snapshot: TodoStoreSnapshotV1,
+  input: unknown,
+):
+  | {
+      readonly status: "completed";
+      readonly snapshot: TodoStoreSnapshotV1;
+      readonly items: readonly TodoItemV1[];
+    }
+  | TodoMutationFailureV1 {
+  const parsed = updateTodosInputV1Schema.safeParse(input);
+  if (
+    !parsed.success ||
+    new Set(parsed.data.updates.map((update) => update.id)).size !== parsed.data.updates.length
+  ) {
+    return {
+      status: "failed",
+      error: {
+        code: "invalid_tool_input",
+        message:
+          "update_todos requires 1–16 distinct targets, one expectedStoreRevision, each expectedItemRevision, and explicit valid mutations.",
+      },
+    };
+  }
+  const updates = new Map(parsed.data.updates.map((update) => [update.id, update]));
+  const candidate: TodoStoreSnapshotV1 = {
+    policyVersion: todoPolicyVersionV1,
+    storeRevision: snapshot.storeRevision + 1,
+    items: snapshot.items.map((item) => {
+      const update = updates.get(item.id);
+      if (update === undefined) return item;
+      const details = update.details === null ? undefined : (update.details ?? item.details);
+      return {
+        id: item.id,
+        createdOrdinal: item.createdOrdinal,
+        itemRevision: item.itemRevision + 1,
+        title: update.title ?? item.title,
+        status: update.status ?? item.status,
+        dependencyIds: update.dependencyIds ?? item.dependencyIds,
+        ...(details === undefined ? {} : { details }),
+      };
+    }),
+  };
+  const items: TodoItemV1[] = [];
+  for (const update of parsed.data.updates) {
+    const prepared = prepareTodoUpdate(
+      snapshot,
+      { ...update, expectedStoreRevision: parsed.data.expectedStoreRevision },
+      candidate,
+    );
+    if (prepared.status === "failed") return prepared;
+    items.push(prepared.item);
+  }
+  if (todoFoldedStateBytesV1(candidate) > todoLimitsV1.maximumFoldedStateBytes) {
+    return {
+      status: "failed",
+      error: {
+        code: "todo_aggregate_limit_exceeded",
+        message: "The batch would exceed the 8 MiB folded Todo-state limit.",
+      },
+    };
+  }
+  todoSummaryCache.set(candidate, computeTodoSummaryV1(candidate));
+  return { status: "completed", snapshot: candidate, items };
 }
 
 function todoFoldedStateBytesV1(snapshot: TodoStoreSnapshotV1): number {

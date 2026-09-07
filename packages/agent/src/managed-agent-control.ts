@@ -654,7 +654,7 @@ export function createManagedAgentControl(options: {
     admittingTurnId?: string,
   ): Promise<ManagedWorkspaceSnapshot> => {
     const snapshot = foldManagedControl(records, parentSessionId);
-    const policyAllowsInput = await currentCeilingAllows();
+    const policyAllowsInput = !closing && (await currentCeilingAllows());
     const threads = await Promise.all(
       snapshot.threads.map(async (thread) => {
         const local = active.get(thread.threadId)?.attemptId === thread.turn.attemptId;
@@ -3261,7 +3261,11 @@ export function createManagedAgentControl(options: {
                   await append(admission, { type: "suspend_requested" });
               }
             });
-          if (snapshot.status === "ready" || active.size > 0) {
+          if (
+            (snapshot.status === "ready" &&
+              snapshot.threads.some((thread) => thread.turn.phase !== "idle")) ||
+            active.size > 0
+          ) {
             const suspended = await control.dispatch({
               type: "suspend_agents",
               parentSessionId: options.parentSessionId,

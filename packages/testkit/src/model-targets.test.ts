@@ -1,13 +1,11 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
 import {
   AgentSession,
   createInMemorySessionStore,
   createModelTargets,
   createPermissionPolicy,
-  createReadToolRegistry,
   ModelDriverError,
   type ModelEvent,
   ModelTargetError,
@@ -19,6 +17,7 @@ import {
 } from "@adam-agent/agent";
 import { AiSdkModelDriverForTesting } from "@adam-agent/agent/internal-testing";
 import { expect, test, vi } from "vitest";
+import { createFrozenPrefixReadRegistry } from "./frozen-read-registry.test-support.js";
 
 test("an exact Direct DeepSeek target returns a public answer-only model driver", async () => {
   const requests: Array<{ readonly url: string; readonly body: unknown }> = [];
@@ -974,7 +973,7 @@ test.each([
     const session = new AgentSession({
       maximumOutputTokens: resolved.contextProfile.maximumOutputTokens,
       model: resolved.driver,
-      tools: createReadToolRegistry({ workspaceRoot }),
+      tools: createFrozenPrefixReadRegistry({ workspaceRoot }),
       permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
       store: createInMemorySessionStore(),
     });
@@ -1182,7 +1181,7 @@ test("AgentSession keeps tool execution and replay state while using the unified
   const session = new AgentSession({
     maximumOutputTokens: 32_768,
     model: driver,
-    tools: createReadToolRegistry({ workspaceRoot }),
+    tools: createFrozenPrefixReadRegistry({ workspaceRoot }),
     permissions: createPermissionPolicy({ allowedEffects: ["read"] }),
     store,
   });
