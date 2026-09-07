@@ -1192,6 +1192,9 @@ export class AgentConversationViewer implements Component {
             `${thread.budget.unknownReserved} unknown reserved · ${thread.budget.available} available`,
           ]),
       `${thread.turn.label}${agentElapsedLabel(thread)}`,
+      ...(this.#activity?.tool?.status === "generating_arguments"
+        ? [`Generating arguments · ${safeTerminalText(this.#activity.tool.name)}`]
+        : []),
       ...(thread.turn.diagnostic === undefined
         ? []
         : wrapTextWithAnsi(safeTerminalText(thread.turn.diagnostic), width)),

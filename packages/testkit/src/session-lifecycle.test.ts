@@ -10966,3 +10966,73 @@ function createAppendCrashDirectory(
 function isToolEvent(event: RuntimeEvent): boolean {
   return event.type.startsWith("tool_");
 }
+
+test("Lifecycle revalidates nested mutations in shallow-frozen adapter snapshots", async () => {
+  const root = await mkdtemp(join(tmpdir(), "adam-shallow-frozen-history-"));
+  const workspaceRoot = join(root, "workspace");
+  await mkdir(workspaceRoot);
+  const backing = createInMemorySessionStoreDirectory<SessionRecord>();
+  let snapshot: readonly SessionRecord[] | undefined;
+  const directory: SessionStoreDirectory<SessionRecord> = {
+    create: (id) => backing.create(id),
+    listSessionEntries: () => backing.listSessionEntries(),
+    listSessionIds: () => backing.listSessionIds(),
+    async open(id) {
+      const store = await backing.open(id);
+      if (store === undefined) return undefined;
+      return {
+        append: async (record) => {
+          snapshot = undefined;
+          await store.append(record);
+        },
+        appendBatch: async (records) => {
+          snapshot = undefined;
+          await store.appendBatch(records);
+        },
+        async read() {
+          snapshot ??= Object.freeze(await store.read());
+          return snapshot;
+        },
+      };
+    },
+  };
+  const lifecycle = createSessionLifecycle({
+    workspaceRoot,
+    stateRoot: join(root, "state"),
+    modelTargets: modelTargetsWithDriver(
+      new FakeModelDriver([
+        { type: "text_delta", text: "Verified response." },
+        { type: "finish", reason: "stop" },
+      ]),
+    ),
+    [sessionStoreDirectory]: directory,
+  });
+  try {
+    const created = await lifecycle.create({ targetIdentity });
+    await lifecycle.continue({
+      sessionId: created.sessionId,
+      input: { text: "Verify the snapshot." },
+    });
+    await lifecycle.inspect({ sessionId: created.sessionId });
+    const attempt = snapshot?.find(
+      (entry) => entry.schemaVersion === 3 && entry.record.type === "provider_attempt_started",
+    );
+    if (
+      attempt?.schemaVersion !== 3 ||
+      attempt.record.type !== "provider_attempt_started" ||
+      attempt.record.promptProjection === undefined
+    )
+      throw new Error("Missing exact request projection.");
+    Reflect.set(
+      attempt.record.promptProjection,
+      "requestProjectionDigest",
+      `sha256:${"0".repeat(64)}`,
+    );
+    await expect(lifecycle.inspect({ sessionId: created.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+  } finally {
+    await lifecycle.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

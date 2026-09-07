@@ -90,6 +90,7 @@ export async function startManagedTui(
     readonly draftPersistencePolicy?: "process_only" | "recoverable";
     readonly restore?: ManagedTuiStorage;
     readonly withDestination?: boolean;
+    readonly initialPrompt?: string;
     readonly blankDraft?: boolean;
     readonly thinking?: boolean;
     readonly controlReceiptBarrier?: (
@@ -103,6 +104,7 @@ export async function startManagedTui(
     readonly childRecordBarrier?: (record: SessionRecord) => Promise<void>;
     readonly workspaceRoot?: string;
     readonly modelTargets?: ModelTargets;
+    readonly contextProfile?: import("@adam-agent/agent").ContextProfile;
     readonly permissions?: NonNullable<Parameters<typeof createSessionLifecycle>[0]["permissions"]>;
     readonly webHttp?: Parameters<typeof createSessionLifecycle>[0]["webHttp"];
     readonly webSearchConfiguration?: Parameters<
@@ -124,14 +126,19 @@ export async function startManagedTui(
     : {};
   const modelTargets: ModelTargets = viewport.modelTargets ?? {
     async resolve() {
-      return { identity, contextProfile, driver, ...thinking };
+      return {
+        identity,
+        contextProfile: viewport.contextProfile ?? contextProfile,
+        driver,
+        ...thinking,
+      };
     },
     async snapshot() {
       return {
         targets: [
           {
             identity,
-            contextProfile,
+            contextProfile: viewport.contextProfile ?? contextProfile,
             ...thinking,
             readiness: { status: "available", credentialSource: "test" },
           },
@@ -198,6 +205,12 @@ export async function startManagedTui(
       : { sessionId: viewport.restore.sessionId };
   if (viewport.restore === undefined)
     await lifecycle.setSessionManualName({ sessionId: parent.sessionId, name: "Fleet fixture" });
+  if (viewport.initialPrompt !== undefined) {
+    await lifecycle.continue({
+      sessionId: parent.sessionId,
+      input: { text: viewport.initialPrompt },
+    });
+  }
   if (viewport.withDestination)
     await lifecycle.continue({
       sessionId: parent.sessionId,

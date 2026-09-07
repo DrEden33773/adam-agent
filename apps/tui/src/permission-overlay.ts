@@ -20,6 +20,7 @@ export class PermissionOverlay implements Component, Focusable {
   #previewOffset = 0;
   #previewPageSize = 8;
   #selection: "allow" | "deny";
+  #submitting: "allow" | "deny" | undefined;
   #subjectLineCount = 0;
   #subjectOffset = 0;
   #subjectPageSize = 4;
@@ -44,6 +45,7 @@ export class PermissionOverlay implements Component, Focusable {
   }
 
   handleInput(data: string): void {
+    if (this.#submitting !== undefined) return;
     const wheel = data.codePointAt(0) === 27 ? data.slice(1).match(/^\[<(64|65);\d+;\d+M$/u) : null;
     if (wheel !== null) {
       this.#scrollAuthorityOrPreview(wheel[1] === "64" ? -3 : 3);
@@ -69,15 +71,21 @@ export class PermissionOverlay implements Component, Focusable {
       return;
     }
     if (matchesKey(data, Key.escape)) {
+      this.#submitting = "deny";
       this.#onDecision("deny");
       return;
     }
     if (matchesKey(data, Key.enter)) {
+      this.#submitting = this.#selection;
       this.#onDecision(this.#selection);
     }
   }
 
   invalidate(): void {}
+
+  decisionFailed(): void {
+    this.#submitting = undefined;
+  }
 
   render(width: number): string[] {
     const subject = exactTerminalSubject(this.#interaction.subject.value);
@@ -128,11 +136,14 @@ export class PermissionOverlay implements Component, Focusable {
         : wrapExactText(safeTerminalText(this.#interaction.warning), Math.max(1, width)).map(
             (line) => this.#theme.danger(line),
           );
-    const options = this.#allowEnabled
-      ? `${this.#selection === "allow" ? ">" : " "} ${this.#theme.allow("Allow")}    ${
-          this.#selection === "deny" ? ">" : " "
-        } ${this.#theme.deny("Deny")}`
-      : `  ${this.#theme.allow("Allow")} unavailable    > ${this.#theme.deny("Deny")}`;
+    const options =
+      this.#submitting !== undefined
+        ? `Submitting ${this.#submitting} decision…`
+        : this.#allowEnabled
+          ? `${this.#selection === "allow" ? ">" : " "} ${this.#theme.allow("Allow")}    ${
+              this.#selection === "deny" ? ">" : " "
+            } ${this.#theme.deny("Deny")}`
+          : `  ${this.#theme.allow("Allow")} unavailable    > ${this.#theme.deny("Deny")}`;
     const previewLines = this.#preview.split("\n");
     this.#previewPageSize = width < 60 ? 2 : 8;
     this.#previewOffset = Math.min(

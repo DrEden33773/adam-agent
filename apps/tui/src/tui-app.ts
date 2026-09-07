@@ -360,6 +360,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   };
   let editor = createEditor(options.presentation.getState().authoritative.active);
   const draftMutationQueue = new PQueue({ concurrency: 1 });
+  let pendingDraftText: { text: string } | undefined;
+  const enqueueDraftMutation = <T>(operation: () => Promise<T>) => {
+    // An atom, undo, or other ordered edit ends the coalescible text segment.
+    pendingDraftText = undefined;
+    return draftMutationQueue.add(operation);
+  };
+
   let projectedPromptHistory = authoritativePromptHistory(
     options.presentation.getState().authoritative.active,
   );
@@ -408,6 +415,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   const legacyDuplicateGuard = new LegacyDuplicateGuard(deadlineScheduler);
   let previousRunActive: boolean | undefined;
   const expandedToolIds = new Set<string>();
+  const toolComponents = new Map<string, { readonly key: string; readonly component: Box }>();
+  const assistantMarkdown = new Map<
+    string,
+    { readonly text: string; readonly component: Markdown }
+  >();
+
   let pendingOperationBaseline: {
     readonly sessionId: string;
     readonly operationIds: ReadonlySet<string>;
@@ -1608,6 +1621,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       pendingOperationBaseline = null;
       expandedReasoningIds.clear();
       expandedToolIds.clear();
+      toolComponents.clear();
+      assistantMarkdown.clear();
       reasoningArtifactReads.clear();
       reasoningArtifactTexts.clear();
       largeReasoningViews.clear();
@@ -2123,7 +2138,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       } else if (item.type === "assistant_message") {
         transcript.addChild(new Spacer(1));
         if (item.text !== null) {
-          const assistant = new Markdown(safeTerminalText(item.text), 0, 0, theme.markdown);
+          let cached = assistantMarkdown.get(item.id);
+          if (cached?.text !== item.text) {
+            cached = {
+              text: item.text,
+              component: new Markdown(safeTerminalText(item.text), 0, 0, theme.markdown),
+            };
+            assistantMarkdown.set(item.id, cached);
+          }
+          const assistant = cached.component;
           transcript.addChild(assistant);
           itemAnchor = assistant;
         } else if (item.artifact !== null) {
@@ -2180,78 +2203,90 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         previousWasAssistant = false;
       } else if (item.type === "tool_call") {
         const expanded = expandedToolIds.has(item.id);
-        const tool = new Box(1, 1, theme.toolBackground);
-        const subject = item.subject?.value;
-        const label = safeTerminalText(item.label);
-        const baseTitle =
-          item.kind === "shell"
-            ? subject === undefined
-              ? "$"
-              : `$ ${safeTerminalText(subject)}`
-            : subject === undefined
-              ? label
-              : `${label} ${safeTerminalText(subject)}`;
-        const action = `Ctrl+O ${expanded ? "fold" : "expand"}`;
-        const titleWithAction = (baseWidth: number): string =>
-          `${theme.toolTitle(truncateToWidth(baseTitle, baseWidth))}${theme.text(` · ${action}`)}`;
-        const toolTitle = new ResponsiveText(() => physicalTerminal.columns);
-        toolTitle.setText({
-          narrow: titleWithAction(14),
-          standard: titleWithAction(32),
-          wide: `${theme.toolTitle(baseTitle)}${theme.text(` · ${action}`)}`,
-        });
-        tool.addChild(toolTitle);
-        for (const admission of item.managedAdmissions ?? []) {
-          tool.addChild(
-            new ResponsiveLine(
-              theme.toolOutput(
-                safeTerminalText(
-                  `${admission.status === "started" ? "Started" : "Queued"} ${admission.handle} · ${admission.displayName} · ${admission.description}`,
-                ),
-              ),
-            ),
-          );
-        }
-        if (item.preview !== null) {
-          tool.addChild(new ToolPreview(item.preview, expanded, theme));
-        }
-        const detail = item.resultSummary ?? toolStatusText(item.status, item.outcome?.status);
-        if (detail !== null) {
-          tool.addChild(new ResponsiveLine(theme.toolOutput(safeTerminalText(detail))));
-        }
-        if (expanded) {
-          const replay = item.source?.replay ?? "unavailable";
-          tool.addChild(
-            new Text(theme.muted(safeTerminalText(`safe summary · ${detail ?? "unavailable"}`))),
-          );
-          tool.addChild(
-            new Text(
-              theme.muted(
-                safeTerminalText(
-                  `${item.qualifiedName} · ${item.effect ?? "effect unknown"} · ${item.status} · replay ${replay} · duration ${item.durationMs === null ? "unavailable" : `${item.durationMs} ms`}`,
-                ),
-              ),
-            ),
-          );
-          if (item.source !== null) {
+        const key = JSON.stringify([item, expanded]);
+        let cachedTool = toolComponents.get(item.id);
+        if (cachedTool?.key !== key) {
+          const tool = new Box(1, 1, theme.toolBackground);
+          const subject = item.subject?.value;
+          const label = safeTerminalText(item.label);
+          const baseTitle =
+            item.kind === "shell"
+              ? subject === undefined
+                ? "$"
+                : `$ ${safeTerminalText(subject)}`
+              : subject === undefined
+                ? label
+                : `${label} ${safeTerminalText(subject)}`;
+          const action = `Ctrl+O ${expanded ? "fold" : "expand"}`;
+          const firstTitleLine = baseTitle.split("\n", 1)[0] ?? "";
+          const singleLineTitle = firstTitleLine === baseTitle ? baseTitle : `${firstTitleLine} …`;
+          const titleWithAction = (baseWidth: number): string =>
+            `${theme.toolTitle(truncateToWidth(singleLineTitle, baseWidth))}${theme.text(` · ${action}`)}`;
+          const toolTitle = new ResponsiveText(() => physicalTerminal.columns);
+          toolTitle.setText({
+            narrow: titleWithAction(14),
+            standard: titleWithAction(32),
+            wide: titleWithAction(90),
+          });
+          tool.addChild(toolTitle);
+          for (const admission of item.managedAdmissions ?? []) {
             tool.addChild(
-              new Text(
-                theme.muted(
+              new ResponsiveLine(
+                theme.toolOutput(
                   safeTerminalText(
-                    `provider model response · response ${item.source.responseSequence} · arguments ${item.source.argumentsDigest} · definition ${item.source.definitionDigest ?? "unknown"}`,
+                    `${admission.status === "started" ? "Started" : "Queued"} ${admission.handle} · ${admission.displayName} · ${admission.description}`,
                   ),
                 ),
               ),
             );
           }
-          tool.addChild(
-            new Text(
-              theme.muted(
-                `${item.artifacts.length} artifact${item.artifacts.length === 1 ? "" : "s"} · change preview ${item.changePreviewRef === null ? "none" : "available"}`,
+          if (item.preview !== null) {
+            tool.addChild(new ToolPreview(item.preview, expanded, theme));
+          }
+          const detail = item.resultSummary ?? toolStatusText(item.status, item.outcome?.status);
+          if (detail !== null) {
+            tool.addChild(new ResponsiveLine(theme.toolOutput(safeTerminalText(detail))));
+          }
+          if (expanded) {
+            if (item.kind === "shell" && subject !== undefined) {
+              tool.addChild(new Text(theme.toolOutput(safeTerminalText(subject))));
+            }
+            const replay = item.source?.replay ?? "unavailable";
+            tool.addChild(
+              new Text(theme.muted(safeTerminalText(`safe summary · ${detail ?? "unavailable"}`))),
+            );
+            tool.addChild(
+              new Text(
+                theme.muted(
+                  safeTerminalText(
+                    `${item.qualifiedName} · ${item.effect ?? "effect unknown"} · ${item.status} · replay ${replay} · duration ${item.durationMs === null ? "unavailable" : `${item.durationMs} ms`}`,
+                  ),
+                ),
               ),
-            ),
-          );
+            );
+            if (item.source !== null) {
+              tool.addChild(
+                new Text(
+                  theme.muted(
+                    safeTerminalText(
+                      `provider model response · response ${item.source.responseSequence} · arguments ${item.source.argumentsDigest} · definition ${item.source.definitionDigest ?? "unknown"}`,
+                    ),
+                  ),
+                ),
+              );
+            }
+            tool.addChild(
+              new Text(
+                theme.muted(
+                  `${item.artifacts.length} artifact${item.artifacts.length === 1 ? "" : "s"} · change preview ${item.changePreviewRef === null ? "none" : "available"}`,
+                ),
+              ),
+            );
+          }
+          cachedTool = { key, component: tool };
+          toolComponents.set(item.id, cachedTool);
         }
+        const tool = cachedTool.component;
         transcript.addChild(new Spacer(1));
         transcript.addChild(tool);
         itemAnchor = tool;
@@ -2367,6 +2402,20 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         }
       }
     }
+    const visibleToolIds = new Set(
+      active?.transcript.items.filter((item) => item.type === "tool_call").map((item) => item.id),
+    );
+    for (const id of toolComponents.keys()) {
+      if (!visibleToolIds.has(id)) toolComponents.delete(id);
+    }
+    const visibleAssistantIds = new Set(
+      active?.transcript.items
+        .filter((item) => item.type === "assistant_message")
+        .map((item) => item.id),
+    );
+    for (const id of assistantMarkdown.keys()) {
+      if (!visibleAssistantIds.has(id)) assistantMarkdown.delete(id);
+    }
     for (const [operationId, loader] of operationLoaders) {
       if (!visibleRunningOperations.has(operationId)) {
         loader.stop();
@@ -2399,6 +2448,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       renderReasoning(transientReasoning, null);
     }
     const transientAssistant = state.transient?.assistant?.text;
+    if (state.transient?.toolArguments !== undefined) {
+      transcript.addChild(
+        new ResponsiveLine(
+          theme.toolTitle(
+            `Generating arguments · ${safeTerminalText(state.transient.toolArguments.name)}`,
+          ),
+        ),
+      );
+    }
     const showWorking = state.transient?.activity === "working" && transientReasoning === null;
     if (showWorking) {
       transcript.addChild(new Spacer(1));
@@ -2500,7 +2558,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                 return receipt.delegation.envelope;
               },
               onConfirm(delegation) {
-                void options.presentation
+                return options.presentation
                   .dispatch({
                     type: "decide_permission",
                     requestId: pending.requestId,
@@ -2509,27 +2567,44 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
                     ...(delegationSelection === undefined ? {} : { delegationSelection }),
                   })
                   .then((receipt) => {
-                    if (receipt.status === "rejected")
-                      showNotice("error", receipt.message, "until_edit");
+                    if (receipt.status === "rejected") throw new Error(receipt.message);
                   });
               },
               onCancel() {
-                void options.presentation.dispatch({
-                  type: "decide_permission",
-                  requestId: pending.requestId,
-                  decision: "deny",
-                });
+                return options.presentation
+                  .dispatch({
+                    type: "decide_permission",
+                    requestId: pending.requestId,
+                    decision: "deny",
+                  })
+                  .then((receipt) => {
+                    if (receipt.status === "rejected") throw new Error(receipt.message);
+                  });
               },
             })
           : new PermissionOverlay({
               interaction: pending,
               theme,
               onDecision(decision) {
-                void options.presentation.dispatch({
-                  type: "decide_permission",
-                  requestId: pending.requestId,
-                  decision,
-                });
+                tui.requestRender();
+                const failed = (message: string) => {
+                  if (permission?.requestId !== pending.requestId) return;
+                  if (permission.overlay instanceof PermissionOverlay) {
+                    permission.overlay.decisionFailed();
+                  }
+                  showNotice("error", message, "until_edit");
+                  tui.requestRender();
+                };
+                void options.presentation
+                  .dispatch({
+                    type: "decide_permission",
+                    requestId: pending.requestId,
+                    decision,
+                  })
+                  .then((receipt) => {
+                    if (receipt.status === "rejected") failed(receipt.message);
+                  })
+                  .catch(() => failed("The permission decision could not be saved."));
               },
             });
       const handle = showOverlay(overlay, {
@@ -2892,8 +2967,17 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     if (options.presentation.getState().composer.sealed) {
       return;
     }
+    if (pendingDraftText !== undefined) {
+      pendingDraftText.text = text;
+      return;
+    }
+    const pending = { text };
+    pendingDraftText = pending;
     void draftMutationQueue
-      .add(() => options.presentation.dispatch({ type: "update_draft_text", text }))
+      .add(() => {
+        if (pendingDraftText === pending) pendingDraftText = undefined;
+        return options.presentation.dispatch({ type: "update_draft_text", text: pending.text });
+      })
       .then((receipt) => {
         if (receipt?.status === "rejected" && receipt.code !== "conflict") {
           showNotice("error", receipt.message, "until_edit");
@@ -2971,7 +3055,7 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     return { at, baseRevision: composer.draftRevision };
   };
   const stagePastedText = (intent: EditorPasteIntent, visibleTextBeforePaste: string) =>
-    draftMutationQueue.add(async () => {
+    enqueueDraftMutation(async () => {
       const mutation = await prepareDraftInsertion(intent, visibleTextBeforePaste);
       if ("status" in mutation) {
         return mutation;
@@ -3009,15 +3093,14 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
   };
   editor.onEditIntent = (intent) => {
     if (intent.type === "remove_atom") {
-      void draftMutationQueue
-        .add(() => {
-          const composer = options.presentation.getState().composer;
-          return options.presentation.dispatch({
-            type: "remove_draft_element",
-            baseRevision: composer.draftRevision,
-            elementId: intent.atomId,
-          });
-        })
+      void enqueueDraftMutation(() => {
+        const composer = options.presentation.getState().composer;
+        return options.presentation.dispatch({
+          type: "remove_draft_element",
+          baseRevision: composer.draftRevision,
+          elementId: intent.atomId,
+        });
+      })
         .then((receipt) => {
           if (receipt?.status === "admitted") {
             pathAtomValues.delete(intent.atomId);
@@ -3039,14 +3122,13 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       return;
     }
     if (intent.type === "undo") {
-      void draftMutationQueue
-        .add(() => {
-          const composer = options.presentation.getState().composer;
-          return options.presentation.dispatch({
-            type: "undo_draft",
-            baseRevision: composer.draftRevision,
-          });
-        })
+      void enqueueDraftMutation(() => {
+        const composer = options.presentation.getState().composer;
+        return options.presentation.dispatch({
+          type: "undo_draft",
+          baseRevision: composer.draftRevision,
+        });
+      })
         .then((receipt) => {
           if (receipt?.status === "admitted") {
             showNotice("success", "Draft edit undone.", "until_next_action");
@@ -3074,41 +3156,40 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       renderState();
       return;
     }
-    void draftMutationQueue
-      .add(() => {
-        const composer = options.presentation.getState().composer;
-        return options.presentation.dispatch({
-          type: "replace_draft_text",
-          baseRevision: composer.draftRevision,
-          document: intent.document.map((part) =>
-            part.type === "text"
-              ? { type: "text", text: part.text }
-              : mentionAtoms.has(part.id)
-                ? (mentionAtoms.get(part.id) as DraftMentionElement)
-                : skillAtomIdentities.has(part.id)
+    void enqueueDraftMutation(() => {
+      const composer = options.presentation.getState().composer;
+      return options.presentation.dispatch({
+        type: "replace_draft_text",
+        baseRevision: composer.draftRevision,
+        document: intent.document.map((part) =>
+          part.type === "text"
+            ? { type: "text", text: part.text }
+            : mentionAtoms.has(part.id)
+              ? (mentionAtoms.get(part.id) as DraftMentionElement)
+              : skillAtomIdentities.has(part.id)
+                ? {
+                    type: "skill" as const,
+                    elementId: part.id,
+                    name: skillAtomIdentities.get(part.id)?.name ?? "",
+                    qualifiedId: skillAtomIdentities.get(part.id)?.qualifiedId ?? "",
+                  }
+                : pathAtomValues.has(part.id)
                   ? {
-                      type: "skill" as const,
+                      type: "path" as const,
                       elementId: part.id,
-                      name: skillAtomIdentities.get(part.id)?.name ?? "",
-                      qualifiedId: skillAtomIdentities.get(part.id)?.qualifiedId ?? "",
+                      path: pathAtomValues.get(part.id) ?? "",
                     }
-                  : pathAtomValues.has(part.id)
-                    ? {
-                        type: "path" as const,
-                        elementId: part.id,
-                        path: pathAtomValues.get(part.id) ?? "",
-                      }
-                    : {
-                        type:
-                          composer.elements.find((element) => element.elementId === part.id)
-                            ?.type === "pasted_text"
-                            ? ("pasted_text" as const)
-                            : ("resource" as const),
-                        elementId: part.id,
-                      },
-          ),
-        });
-      })
+                  : {
+                      type:
+                        composer.elements.find((element) => element.elementId === part.id)?.type ===
+                        "pasted_text"
+                          ? ("pasted_text" as const)
+                          : ("resource" as const),
+                      elementId: part.id,
+                    },
+        ),
+      });
+    })
       .then((receipt) => {
         if (receipt?.status === "rejected") {
           showNotice("error", receipt.message, "until_edit");
@@ -4645,8 +4726,9 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     editor.setText("");
     editor.disableSubmit = false;
     const actionId = showNotice("progress", "Staging input resource…", "until_replaced", sessionId);
-    void draftMutationQueue
-      .add(() => options.presentation.dispatch({ type: "update_draft_text", text: "" }))
+    void enqueueDraftMutation(() =>
+      options.presentation.dispatch({ type: "update_draft_text", text: "" }),
+    )
       .then((cleared) =>
         cleared?.status === "rejected"
           ? cleared
@@ -4845,19 +4927,15 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       renderState();
     };
     const mutate = (command: PresentationCommand) => {
-      void draftMutationQueue
-        .add(() => options.presentation.dispatch(command))
-        .then((receipt) => {
-          close();
-          showNotice(
-            receipt?.status === "rejected" ? "error" : "success",
-            receipt?.status === "rejected"
-              ? receipt.message
-              : "Recipient updated. Review and send.",
-            "until_edit",
-          );
-          renderState();
-        });
+      void enqueueDraftMutation(() => options.presentation.dispatch(command)).then((receipt) => {
+        close();
+        showNotice(
+          receipt?.status === "rejected" ? "error" : "success",
+          receipt?.status === "rejected" ? receipt.message : "Recipient updated. Review and send.",
+          "until_edit",
+        );
+        renderState();
+      });
     };
     const selector = new MentionRecipientSelector({
       title: `Recipient unavailable · ${recipient.literal}`,
@@ -4981,22 +5059,19 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
         onChoose(value) {
           const elementId = value === "remove-extra" ? recipients[0]?.elementId : value;
           if (elementId === undefined) return;
-          void draftMutationQueue
-            .add(() =>
-              options.presentation.dispatch({
-                type: "resolve_draft_recipient",
-                baseRevision: state.composer.draftRevision,
-                elementId,
-                action: "keep",
-              }),
-            )
-            .then((receipt) => {
-              close();
-              if (receipt?.status === "rejected")
-                showNotice("error", receipt.message, "until_edit");
-              else showNotice("success", "Recipient selected. Review and send.", "until_edit");
-              renderState();
-            });
+          void enqueueDraftMutation(() =>
+            options.presentation.dispatch({
+              type: "resolve_draft_recipient",
+              baseRevision: state.composer.draftRevision,
+              elementId,
+              action: "keep",
+            }),
+          ).then((receipt) => {
+            close();
+            if (receipt?.status === "rejected") showNotice("error", receipt.message, "until_edit");
+            else showNotice("success", "Recipient selected. Review and send.", "until_edit");
+            renderState();
+          });
         },
       });
       handle = showOverlay(selector, { width: "90%", maxHeight: "80%", margin: 1 });
@@ -6662,7 +6737,12 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
     const nextTarget = targetForState(state);
     const nextThinkingLevel = selectedThinkingLevel(nextTarget);
     transcriptViewport.followEnd();
-    const promptActionId = beginNoticeAction();
+    const promptActionId = showNotice(
+      "progress",
+      "Submitting prompt…",
+      "until_replaced",
+      active.session.id,
+    );
     void options.presentation
       .dispatch({
         type: "submit_prompt",
@@ -6711,6 +6791,8 @@ export async function runTui(options: RunTuiOptions): Promise<void> {
       }
     }
     editor.disableSubmit = true;
+    showNotice("progress", "Submitting prompt…", "until_replaced");
+    renderState();
     void draftMutationQueue
       .onIdle()
       .then(() => {

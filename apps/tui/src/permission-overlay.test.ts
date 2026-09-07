@@ -4,6 +4,29 @@ import { expect, test } from "vitest";
 import { PermissionOverlay } from "./permission-overlay.js";
 import { createAdamTuiTheme } from "./theme.js";
 
+test("permission Enter shows a pending decision and ignores repeated decisions", () => {
+  const decisions: string[] = [];
+  const overlay = new PermissionOverlay({
+    interaction: {
+      type: "permission",
+      requestId: "pending-permission",
+      callId: "pending-call",
+      effect: "execute",
+      subject: { type: "command", value: "inspect" },
+      canAllow: true,
+      changePreviewRef: null,
+    },
+    onDecision: (decision) => decisions.push(decision),
+    theme: createAdamTuiTheme(true),
+  });
+  overlay.setPreview({ readable: true, text: "Exact preview" });
+  overlay.handleInput("\r");
+  expect(overlay.render(80).join("\n")).toContain("Submitting allow decision");
+  overlay.handleInput("\r");
+  overlay.handleInput("\u001b");
+  expect(decisions).toEqual(["allow"]);
+});
+
 test("Plan shell permission renders the exact command and truthful execution warning", () => {
   const interaction: PendingInteraction = {
     type: "permission",

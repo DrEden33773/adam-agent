@@ -2,11 +2,10 @@ import { createHash } from "node:crypto";
 import type { Dirent } from "node:fs";
 import { lstat, open, readdir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, extname, join, relative, resolve, sep } from "node:path";
-
 import { parseDocument } from "yaml";
 import { z } from "zod";
-
 import type { ArtifactReference, ArtifactStore, SkillArtifactSource } from "./artifact-store.js";
+import { isDeeplyImmutable } from "./immutable-value.js";
 
 export type SkillDigest = `sha256:${string}`;
 
@@ -801,11 +800,19 @@ export function createEmptySkillContextV1(input: {
   });
 }
 
+const validatedImmutableSkillContexts = new WeakSet<SkillContextRecordV1>();
+const validatedSkillContexts = new WeakMap<SkillContextRecordV1, string>();
+
 export function isSkillContextRecordV1Valid(context: SkillContextRecordV1): boolean {
+  if (validatedImmutableSkillContexts.has(context)) return true;
   if (!skillContextRecordV1Schema.safeParse(context).success) {
     return false;
   }
   try {
+    // Compare the complete value so even caller-owned mutable contexts cannot reuse
+    // a validation after a path, activation, catalog or revocation change.
+    const serialized = canonicalJson(context);
+    if (validatedSkillContexts.get(context) === serialized) return true;
     const rebuilt = createSkillContextV1({
       userHomeDigest: context.userHomeDigest,
       revision: context.registry.revision,
@@ -819,7 +826,12 @@ export function isSkillContextRecordV1Valid(context: SkillContextRecordV1): bool
       activationCounter: context.activationCounter,
       revocations: context.revocations,
     });
-    return canonicalJson(context) === canonicalJson(rebuilt);
+    const valid = serialized === canonicalJson(rebuilt);
+    if (valid) {
+      validatedSkillContexts.set(context, serialized);
+      if (isDeeplyImmutable(context)) validatedImmutableSkillContexts.add(context);
+    }
+    return valid;
   } catch {
     return false;
   }

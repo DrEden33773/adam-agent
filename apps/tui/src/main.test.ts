@@ -8678,6 +8678,88 @@ test("a shell tool card uses the accepted dollar-command grammar", async () => {
   }
 });
 
+test.each(["complete", "cancel"])(
+  "tool argument generation remains visible after reasoning and commentary: %s",
+  async (outcome) => {
+    const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-tool-arguments-"));
+    const workspaceRoot = join(testRoot, "workspace");
+    const stateRoot = join(testRoot, "state");
+    const controlRoot = join(testRoot, "control");
+    await mkdir(workspaceRoot);
+    await mkdir(controlRoot);
+    try {
+      const fixture = startFixture({
+        noColor: true,
+        scenario: "shell",
+        stateRoot,
+        workspaceRoot,
+        controlRoot,
+      });
+      await fixture.waitForScreen("Adam · New session");
+      const checkpoint = fixture.output().length;
+      fixture.write("Generate shell arguments\r");
+      await waitForPath(join(controlRoot, "arguments-started"));
+      await fixture.waitForCompleteFrameAfter("Generating arguments · run_shell", checkpoint);
+      const records = await readFilesRecursively(stateRoot);
+      expect(records).not.toContain('"type":"tool_started"');
+      if (outcome === "cancel") {
+        const beforeCancel = fixture.output().length;
+        fixture.write("\u0003");
+        await fixture.waitForCompleteFrameAfter("cancelled", beforeCancel);
+        const cancelled = await readFilesRecursively(stateRoot);
+        expect(cancelled).toContain('"status":"cancelled"');
+        expect(cancelled).not.toContain('"type":"tool_started"');
+        const beforeContinue = fixture.output().length;
+        fixture.write("Continue after argument cancellation\r");
+        await fixture.waitForCompleteFrameAfter("Shell card complete.", beforeContinue);
+      } else {
+        await writeFile(join(controlRoot, "release-arguments"), "release\n", "utf8");
+        await fixture.waitForScreen("Shell card complete.");
+      }
+      fixture.write("\u0011");
+      await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    } finally {
+      await rm(testRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test("collapsed multiline shell titles remain bounded across terminal widths", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-multiline-card-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  await mkdir(workspaceRoot);
+  try {
+    const fixture = startFixture({ noColor: true, scenario: "shell", stateRoot, workspaceRoot });
+    await fixture.waitForScreen("Adam · New session");
+    fixture.write("Show multiline shell card\r");
+    await fixture.waitForScreen("Shell card complete.");
+    for (const columns of [40, 80, 119, 120, 160, 240]) {
+      const checkpoint = fixture.output().length;
+      await fixture.resize(columns, 40);
+      const lines = latestSynchronizedFrame(fixture.output().slice(checkpoint));
+      expect(lines.join("\n"), `${columns} columns`).not.toContain("command-detail-");
+      expect(
+        lines.find((line) => line.includes("$ printf")),
+        `${columns} columns`,
+      ).toContain("Ctrl+O expand");
+    }
+    let checkpoint = fixture.output().length;
+    fixture.write("\u000f");
+    await fixture.waitForCompleteFrameAfter("command-detail-0", checkpoint);
+    checkpoint = fixture.output().length;
+    fixture.write("\u001b[F");
+    await fixture.waitForCompleteFrameAfter("command-detail-316", checkpoint);
+    checkpoint = fixture.output().length;
+    fixture.write("\u000f");
+    await fixture.waitForCompleteFrameAfter("Ctrl+O expand", checkpoint, "command-detail-");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("tool subjects keep their full bounded value only in the 120-column layout", async () => {
   const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-responsive-tool-card-"));
   const workspaceRoot = join(testRoot, "workspace");
@@ -9452,6 +9534,45 @@ test("slash Clone branches at the latest complete boundary with an empty editor"
     });
     expect(await readFilesRecursively(stateRoot)).not.toContain('"text":"/clone"');
   } finally {
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("ordinary Enter stays visibly pending until durable admission before provider dispatch", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-agent-tui-enter-admission-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  try {
+    const fixture = startFixture({
+      scenario: "prompt-admission-barrier",
+      stateRoot,
+      workspaceRoot,
+      controlRoot,
+    });
+    await fixture.waitForScreen("Adam · New session");
+    fixture.write("Keep the final durable draft");
+    await fixture.waitForScreen("Keep the final durable draft");
+    const checkpoint = fixture.output().length;
+    fixture.write("\r");
+    await waitForPath(join(controlRoot, "prompt-durable"));
+    await fixture.waitForCompleteFrameAfter("Submitting prompt…", checkpoint);
+    await fixture.resize(81, 24);
+    expect(fixture.screen()?.join("\n")).toContain("Submitting prompt…");
+    await expect(access(join(controlRoot, "provider-dispatched"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    const durable = await readFilesRecursively(stateRoot);
+    expect(durable).toContain('"userMessage":"Keep the final durable draft"');
+    await writeFile(join(controlRoot, "release-prompt"), "release\n");
+    await waitForPath(join(controlRoot, "provider-dispatched"));
+    await fixture.waitForScreen("Durable prompt received.");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+  } finally {
+    await writeFile(join(controlRoot, "release-prompt"), "release\n").catch(() => {});
     await rm(testRoot, { recursive: true, force: true });
   }
 });

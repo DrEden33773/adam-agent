@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
-
 import { z } from "zod";
 import type { ModelMessage } from "./agent-session-contracts.js";
 import type { ContextProfile } from "./context-profile.js";
+import { isDeeplyImmutable } from "./immutable-value.js";
 import type { McpToolProfileV1 } from "./mcp-profile-contracts.js";
 import type { SkillContextRecordV1 } from "./skills.js";
 import type { ModelToolDefinition, ToolRegistry } from "./tool-runtime.js";
@@ -694,7 +694,15 @@ function isOrderedToolProfileSubset(
   return true;
 }
 
+const validatedImmutablePromptContexts = new WeakSet<PromptContextRecord>();
 export function isPromptContextRecordValid(context: PromptContextRecord): boolean {
+  if (validatedImmutablePromptContexts.has(context)) return true;
+  const valid = validatePromptContextRecord(context);
+  if (valid && isDeeplyImmutable(context)) validatedImmutablePromptContexts.add(context);
+  return valid;
+}
+
+function validatePromptContextRecord(context: PromptContextRecord): boolean {
   try {
     if (
       (context.recordVersion !== 1 && context.recordVersion !== 2 && context.recordVersion !== 3) ||

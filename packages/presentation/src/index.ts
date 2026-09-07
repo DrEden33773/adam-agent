@@ -1140,6 +1140,7 @@ export type AuthoritativePresentationSnapshot = {
 };
 
 export type PresentationTransientState = {
+  readonly toolArguments?: { readonly callId: string; readonly name: string };
   readonly activity: "working" | "replying" | "using_tool" | null;
   readonly assistant: {
     readonly streamId: string;
@@ -1343,7 +1344,7 @@ export type PresentationDisplayState = {
     readonly tool?: {
       readonly callId: string;
       readonly name: string;
-      readonly status: "requested" | "running";
+      readonly status: "generating_arguments" | "requested" | "running";
     };
   }[];
 };
@@ -1943,6 +1944,7 @@ export function reconcilePresentationUpdate(
       draft: state.draft,
       composer: state.composer,
       transient: {
+        ...state.transient,
         activity: state.transient?.activity ?? "working",
         assistant: state.transient?.assistant ?? null,
         reasoning: update.reasoning,
@@ -1956,6 +1958,7 @@ export function reconcilePresentationUpdate(
     draft: state.draft,
     composer: state.composer,
     transient: {
+      ...state.transient,
       activity: "replying",
       assistant: {
         streamId: update.streamId,

@@ -37,6 +37,7 @@ import {
   type SessionRecord,
   type SessionStore,
   type SessionStoreDirectory,
+  sessionLogicalRunStartedBarrier,
   sessionManagedAgentInactivityScheduler,
   sessionStoreDirectory,
   turnComposerStageBarrier,
@@ -340,7 +341,23 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
       ? createInMemorySessionStoreDirectory<SessionRecord>()
       : undefined;
   const lifecycle = createSessionLifecycle({
-    ...(options.scenario === "managed-attention" ||
+    ...(options.scenario === "prompt-admission-barrier" && options.controlRoot !== undefined
+      ? {
+          [sessionLogicalRunStartedBarrier]: {
+            async afterDurableRecord() {
+              await writeFile(join(options.controlRoot as string, "prompt-durable"), "durable\n");
+              await waitForFile(
+                options.controlRoot as string,
+                "release-prompt",
+                new AbortController().signal,
+              );
+            },
+          },
+        }
+      : {}),
+    ...(options.scenario === "responsiveness" ||
+    options.scenario === "responsiveness-arguments" ||
+    options.scenario === "managed-attention" ||
     options.scenario === "managed-active" ||
     options.scenario === "managed-artifact" ||
     options.scenario === "managed-live-scroll" ||
@@ -400,18 +417,20 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     ...(historicalPlanRegistry === undefined ? {} : { tools: historicalPlanRegistry }),
     permissions: createPermissionPolicy({
       allowedEffects:
-        options.scenario === "managed-attention" ||
-        options.scenario === "managed-active" ||
-        options.scenario === "managed-artifact" ||
-        options.scenario === "managed-live-scroll" ||
-        options.scenario === "managed-parent-permission" ||
-        options.scenario === "managed-stalled"
-          ? ["read", "delegate"]
-          : options.scenario === "todo-active"
-            ? ["read", "write"]
-            : options.scenario === "tool-artifact" || options.scenario === "shell"
-              ? ["read", "execute"]
-              : ["read"],
+        options.scenario === "responsiveness" || options.scenario === "responsiveness-arguments"
+          ? ["read", "write", "delegate"]
+          : options.scenario === "managed-attention" ||
+              options.scenario === "managed-active" ||
+              options.scenario === "managed-artifact" ||
+              options.scenario === "managed-live-scroll" ||
+              options.scenario === "managed-parent-permission" ||
+              options.scenario === "managed-stalled"
+            ? ["read", "delegate"]
+            : options.scenario === "todo-active"
+              ? ["read", "write"]
+              : options.scenario === "tool-artifact" || options.scenario === "shell"
+                ? ["read", "execute"]
+                : ["read"],
       askedEffects: options.scenario === "web-search" ? ["write", "network"] : ["write"],
     }),
     workspaceTrust:
@@ -508,8 +527,19 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
         name: "Tool disclosure switch session",
       });
     }
+    const performanceSessionId =
+      options.scenario === "responsiveness" || options.scenario === "responsiveness-arguments"
+        ? await lifecycle.create({ targetIdentity }).then(async (created) => {
+            await lifecycle.continue({
+              sessionId: created.sessionId,
+              input: { text: "Seed responsiveness history" },
+            });
+            return created.sessionId;
+          })
+        : undefined;
     const resumedSessionId =
       options.sessionId ??
+      performanceSessionId ??
       (options.scenario === "resume" ||
       options.scenario === "history" ||
       options.scenario === "artifact-history" ||
@@ -1337,8 +1367,137 @@ function createFixtureModelTargets(options: {
   let managedAttentionParentOrdinal = 0;
   let managedAttentionChildOrdinal = 0;
   let managedAttentionAgentId = "";
+  let performanceSeedAttempt = 0;
+  let performanceChildOrdinal = 0;
   const model: ModelDriver = {
     async *stream(request) {
+      if (
+        (options.scenario === "responsiveness" ||
+          options.scenario === "responsiveness-arguments") &&
+        request.tools.length > 0
+      ) {
+        const child = request.messages.some(
+          (message) =>
+            message.role === "developer" &&
+            message.content.startsWith("Managed child profile research.v2"),
+        );
+        if (child) {
+          if (request.messages.at(-1)?.role === "tool") {
+            yield { type: "text_delta", text: "Child evidence complete." };
+            yield { type: "usage", inputTokens: 10000, outputTokens: 100 };
+            yield { type: "finish", reason: "stop" };
+            return;
+          }
+
+          const ordinal = ++performanceChildOrdinal;
+          for (let index = 0; index < 40; index++)
+            yield { type: "text_delta", text: `Child ${ordinal} evidence ${index}.\n` };
+          if (options.scenario === "responsiveness-arguments") {
+            yield {
+              type: "reasoning_start",
+              id: "provider-reasoning-0",
+              artifactType: "provider_reasoning",
+            };
+            yield { type: "tool_call_start", id: "inspect-child", name: "read_file" };
+            yield { type: "text_delta", text: "Checking the child arguments." };
+            yield {
+              type: "reasoning_delta",
+              id: "provider-reasoning-0",
+              text: "Confirm the evidence path.",
+            };
+            yield { type: "reasoning_end", id: "provider-reasoning-0" };
+            yield { type: "tool_call_delta", id: "inspect-child", json: " " };
+          }
+          await writeFile(
+            join(options.controlRoot as string, `performance-child-${ordinal}`),
+            "ready\n",
+          );
+          if (
+            !(await waitForFile(
+              options.controlRoot as string,
+              "release-performance-children",
+              request.signal,
+            ))
+          )
+            throw request.signal.reason;
+          if (options.scenario === "responsiveness-arguments") {
+            yield {
+              type: "tool_call_delta",
+              id: "inspect-child",
+              json: JSON.stringify({ path: "area-0/evidence.txt" }),
+            };
+            yield { type: "tool_call_end", id: "inspect-child" };
+            yield { type: "usage", inputTokens: 10000, outputTokens: 100 };
+            yield { type: "finish", reason: "tool_calls" };
+            return;
+          }
+          yield { type: "text_delta", text: "Child evidence complete." };
+        } else {
+          const user = request.messages.findLast((message) => message.role === "user");
+          if (
+            user?.role === "user" &&
+            user.content === "Seed responsiveness history" &&
+            performanceSeedAttempt < 40
+          ) {
+            const index = performanceSeedAttempt++;
+            const name = index < 4 ? "create_todo" : "read_file";
+            yield { type: "tool_call_start", id: `seed-${index}`, name };
+            yield {
+              type: "tool_call_delta",
+              id: `seed-${index}`,
+              json: JSON.stringify(
+                index < 4
+                  ? { title: `Evidence task ${index}` }
+                  : { path: `area-${index % 3}/evidence.txt` },
+              ),
+            };
+            yield { type: "tool_call_end", id: `seed-${index}` };
+            yield { type: "finish", reason: "tool_calls" };
+            return;
+          }
+          if (
+            user?.role === "user" &&
+            user.content === "Start two performance children" &&
+            request.messages.at(-1)?.role === "user"
+          ) {
+            for (let index = 0; index < 2; index++) {
+              yield {
+                type: "tool_call_start",
+                id: `performance-spawn-${index}`,
+                name: "spawn_agent",
+              };
+              yield {
+                type: "tool_call_delta",
+                id: `performance-spawn-${index}`,
+                json: JSON.stringify({
+                  task: `Inspect evidence ${index}`,
+                  profile: "research.v2",
+                  mode: "background",
+                }),
+              };
+              yield { type: "tool_call_end", id: `performance-spawn-${index}` };
+            }
+            yield { type: "finish", reason: "tool_calls" };
+            return;
+          }
+          yield {
+            type: "text_delta",
+            text:
+              user?.role === "user" && user.content === "Final Main response"
+                ? "Final Main response durably accepted."
+                : "Main responsiveness ready.",
+          };
+        }
+        yield { type: "usage", inputTokens: 10000, outputTokens: 100 };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
+      if (options.scenario === "prompt-admission-barrier") {
+        await writeFile(join(options.controlRoot as string, "provider-dispatched"), "dispatched\n");
+        yield { type: "text_delta", text: "Durable prompt received." };
+        yield { type: "finish", reason: "stop" };
+        return;
+      }
       if (request.tools.length === 0) {
         yield {
           type: "text_delta",
@@ -1924,12 +2083,48 @@ function createFixtureModelTargets(options: {
       } else if (options.scenario === "shell") {
         const latest = request.messages.at(-1);
         if (latest?.role === "user") {
+          const delayedArguments = latest.content === "Generate shell arguments";
+          if (delayedArguments) {
+            yield {
+              type: "reasoning_start",
+              id: "provider-reasoning-0",
+              artifactType: "provider_reasoning",
+            };
+            yield {
+              type: "reasoning_delta",
+              id: "provider-reasoning-0",
+              text: "Inspect the command.",
+            };
+            yield { type: "reasoning_end", id: "provider-reasoning-0" };
+            yield { type: "text_delta", text: "Preparing the command." };
+          }
           yield { type: "tool_call_start", id: "shell-card", name: "run_shell" };
+          if (delayedArguments) {
+            yield { type: "text_delta", text: " Checking the final arguments." };
+            yield { type: "tool_call_delta", id: "shell-card", json: " " };
+            await writeFile(
+              join(options.controlRoot as string, "arguments-started"),
+              "started\n",
+              "utf8",
+            );
+            if (
+              !(await waitForFile(
+                options.controlRoot as string,
+                "release-arguments",
+                request.signal,
+              ))
+            ) {
+              throw request.signal.reason;
+            }
+          }
           yield {
             type: "tool_call_delta",
             id: "shell-card",
             json: JSON.stringify({
-              command: "printf shell-card-fixture-with-bounded-secondary-provenance-and-wide-tail",
+              command:
+                latest.content === "Show multiline shell card"
+                  ? `printf shell-card-fixture\n${Array.from({ length: 317 }, (_, index) => `# command-detail-${index} ${"x".repeat(70)}`).join("\n")}`
+                  : "printf shell-card-fixture-with-bounded-secondary-provenance-and-wide-tail",
             }),
           };
           yield { type: "tool_call_end", id: "shell-card" };
@@ -2262,9 +2457,18 @@ function createFixtureModelTargets(options: {
         identity,
         driver: model,
         contextProfile:
-          identity.profileVersion >= 2 || identity.modelId === "deepseek-v4-flash-vision-exp"
-            ? preparedDirectDeepSeekV2ContextProfile
-            : contextProfile,
+          options.scenario === "responsiveness" || options.scenario === "responsiveness-arguments"
+            ? {
+                ...contextProfile,
+                contextWindowTokens: 1_000_000,
+                maximumOutputTokens: 32_768,
+                compactAtTokens: 800_000,
+                postCompactTargetTokens: 200_000,
+                retainedTargetTokens: 20_000,
+              }
+            : identity.profileVersion >= 2 || identity.modelId === "deepseek-v4-flash-vision-exp"
+              ? preparedDirectDeepSeekV2ContextProfile
+              : contextProfile,
         ...(identity.modelId === "deepseek-v4-flash-vision-exp"
           ? {
               modalityProfile: {

@@ -1863,40 +1863,53 @@ export async function createPresentationSession(
       publishStateChange();
     };
     let runtimeRefresh = Promise.resolve();
-    let managedAgentRefresh = Promise.resolve();
+    let managedAgentRefresh: Promise<void> | undefined;
+    let pendingManagedAgentSession: string | undefined;
     let metadataRefresh = Promise.resolve();
     const seenRuntimeNotificationIds = new Set<string>();
     const runtimeNotificationOrder: string[] = [];
-    const refreshManagedAgents = (parentSessionId: string) => {
-      managedAgentRefresh = managedAgentRefresh
-        .catch(() => undefined)
-        .then(async () => {
-          const active = state.authoritative.active;
-          if (closed || active === null || active.session.id !== parentSessionId) {
-            return;
+    const refreshManagedAgents = (sessionId: string) => {
+      pendingManagedAgentSession = sessionId;
+      if (managedAgentRefresh !== undefined) return;
+      managedAgentRefresh = (async () => {
+        while (pendingManagedAgentSession !== undefined) {
+          const parentSessionId = pendingManagedAgentSession;
+          pendingManagedAgentSession = undefined;
+          try {
+            const active = state.authoritative.active;
+            if (closed || active === null || active.session.id !== parentSessionId) {
+              continue;
+            }
+            const managedAgents = await options.lifecycle.inspectManagedAgents({
+              sessionId: parentSessionId,
+            });
+            const current = state.authoritative.active;
+            if (closed || current === null || current.session.id !== parentSessionId) {
+              continue;
+            }
+            managedAgentActivity = managedAgentActivity.filter((activity) =>
+              managedAgents.agents.some(
+                (agent) =>
+                  agent.agentId === activity.agentId &&
+                  agent.attemptId === activity.attemptId &&
+                  agent.phase !== "terminal",
+              ),
+            );
+            state = {
+              ...state,
+              revision: state.revision + 1,
+              authoritative: { ...state.authoritative, managedAgents },
+            };
+            publishStateChange();
+          } catch {
+            // A later notification can retry inspection; preserve the last proven state.
           }
-          const managedAgents = await options.lifecycle.inspectManagedAgents({
-            sessionId: parentSessionId,
-          });
-          const current = state.authoritative.active;
-          if (closed || current === null || current.session.id !== parentSessionId) {
-            return;
-          }
-          managedAgentActivity = managedAgentActivity.filter((activity) =>
-            managedAgents.agents.some(
-              (agent) =>
-                agent.agentId === activity.agentId &&
-                agent.attemptId === activity.attemptId &&
-                agent.phase !== "terminal",
-            ),
-          );
-          state = {
-            ...state,
-            revision: state.revision + 1,
-            authoritative: { ...state.authoritative, managedAgents },
-          };
-          publishStateChange();
-        });
+        }
+      })().finally(() => {
+        managedAgentRefresh = undefined;
+        if (pendingManagedAgentSession !== undefined)
+          refreshManagedAgents(pendingManagedAgentSession);
+      });
       void managedAgentRefresh.catch(() => undefined);
     };
     handleManagedAgentEvent = (notification) => {
@@ -1925,13 +1938,16 @@ export async function createPresentationSession(
         const current = managedAgentActivity.find(
           (activity) => activity.agentId === agentId && activity.attemptId === attemptId,
         );
+        const generatingTool =
+          current?.tool?.status === "generating_arguments" ? current.tool : undefined;
         let projected = current;
         if (event.type === "model_message_started") {
           projected = {
             agentId,
             attemptId,
             childSessionId,
-            activity: "replying",
+            activity: generatingTool === undefined ? "replying" : "using_tool",
+            ...(generatingTool === undefined ? {} : { tool: generatingTool }),
             assistant: { itemId: `${attemptId}:assistant`, text: "" },
           };
         } else if (event.type === "model_message_delta") {
@@ -1947,7 +1963,8 @@ export async function createPresentationSession(
             agentId,
             attemptId,
             childSessionId,
-            activity: "replying",
+            activity: generatingTool === undefined ? "replying" : "using_tool",
+            ...(generatingTool === undefined ? {} : { tool: generatingTool }),
             assistant: {
               itemId: current?.assistant?.itemId ?? `${attemptId}:assistant`,
               text,
@@ -1964,7 +1981,8 @@ export async function createPresentationSession(
             agentId,
             attemptId,
             childSessionId,
-            activity: "thinking",
+            activity: generatingTool === undefined ? "thinking" : "using_tool",
+            ...(generatingTool === undefined ? {} : { tool: generatingTool }),
             reasoning: { itemId: event.id, status: "active", hasContent: false },
           };
         } else if (event.type === "model_reasoning_updated") {
@@ -1972,21 +1990,40 @@ export async function createPresentationSession(
             agentId,
             attemptId,
             childSessionId,
-            activity: "thinking",
+            activity: generatingTool === undefined ? "thinking" : "using_tool",
+            ...(generatingTool === undefined ? {} : { tool: generatingTool }),
             reasoning: { itemId: event.id, status: "active", hasContent: event.text.length > 0 },
           };
         } else if (event.type === "model_reasoning_settled") {
-          projected = undefined;
-        } else if (event.type === "tool_requested" || event.type === "tool_started") {
+          projected =
+            generatingTool === undefined
+              ? undefined
+              : {
+                  agentId,
+                  attemptId,
+                  childSessionId,
+                  activity: "using_tool",
+                  tool: generatingTool,
+                };
+        } else if (
+          event.type === "tool_requested" ||
+          event.type === "tool_started" ||
+          event.type === "model_tool_arguments_started"
+        ) {
           projected = {
             agentId,
             attemptId,
             childSessionId,
             activity: "using_tool",
             tool: {
-              callId: event.callId,
+              callId: event.type === "model_tool_arguments_started" ? event.id : event.callId,
               name: event.name,
-              status: event.type === "tool_started" ? "running" : "requested",
+              status:
+                event.type === "model_tool_arguments_started"
+                  ? "generating_arguments"
+                  : event.type === "tool_started"
+                    ? "running"
+                    : "requested",
             },
           };
         } else if (
@@ -2103,6 +2140,20 @@ export async function createPresentationSession(
               return;
             }
             const event = notification.event;
+            if (event.type === "model_tool_arguments_started") {
+              state = {
+                ...state,
+                revision: state.revision + 1,
+                transient: {
+                  activity: "working",
+                  assistant: state.transient?.assistant ?? null,
+                  reasoning: state.transient?.reasoning ?? null,
+                  toolArguments: { callId: event.id, name: event.name },
+                },
+              };
+              publishStateChange();
+              return;
+            }
             if (
               event.type === "user_message" &&
               executionFailure?.sessionId === notification.sessionId &&
@@ -2144,6 +2195,7 @@ export async function createPresentationSession(
                 draft: state.draft,
                 composer: state.composer,
                 transient: {
+                  ...state.transient,
                   activity: "working",
                   assistant: state.transient?.assistant ?? null,
                   reasoning: {
@@ -2172,6 +2224,7 @@ export async function createPresentationSession(
                   draft: state.draft,
                   composer: state.composer,
                   transient: {
+                    ...state.transient,
                     activity: state.transient?.activity ?? "working",
                     assistant: state.transient?.assistant ?? null,
                     reasoning: { ...reasoning, status: event.status },
