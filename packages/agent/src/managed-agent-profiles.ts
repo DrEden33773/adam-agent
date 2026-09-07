@@ -188,3 +188,33 @@ export const reviewerManagedAgentProfileV2 = {
 };
 
 export type ReviewerManagedAgentProfileV2 = typeof reviewerManagedAgentProfileV2;
+
+// New admissions separate cumulative spending policy from model context capacity.
+const scoutManagedAgentProfileDefinitionV3 = {
+  ...scoutManagedAgentProfileDefinitionV2,
+  id: "scout.v3",
+  version: 3,
+  limits: {
+    ...scoutManagedAgentProfileDefinitionV2.limits,
+    maximumCumulativeTokens: "optional_task_budget",
+  },
+} as const;
+export const scoutManagedAgentProfileV3 = {
+  ...scoutManagedAgentProfileDefinitionV3,
+  digest:
+    `sha256:${createHash("sha256").update(JSON.stringify(scoutManagedAgentProfileDefinitionV3)).digest("hex")}` as const,
+};
+const researchManagedAgentProfileDefinitionV3 = {
+  ...researchManagedAgentProfileDefinitionV2,
+  id: "research.v3",
+  version: 3,
+  limits: {
+    ...researchManagedAgentProfileDefinitionV2.limits,
+    maximumCumulativeTokens: "optional_task_budget",
+  },
+} as const;
+export const researchManagedAgentProfileV3 = {
+  ...researchManagedAgentProfileDefinitionV3,
+  digest:
+    `sha256:${createHash("sha256").update(JSON.stringify(researchManagedAgentProfileDefinitionV3)).digest("hex")}` as const,
+};

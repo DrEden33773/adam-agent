@@ -18,6 +18,7 @@ import { promisify } from "node:util";
 
 import {
   createExtensionHost,
+  createJsonlManagedAgentStore,
   createJsonlOperationStore,
   createModelTargets,
   createSessionLifecycle,
@@ -1947,6 +1948,76 @@ test("candidate ProjectRuntime runs real JSONL child Enter, Main response, layer
       console.error(
         `Candidate PTY waiting for ${waiting}:\n${fixture.screen()?.join("\n")}\n${fixture.output().slice(-2000)}`,
       );
+    await fixture.cleanup();
+    await rm(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("production task budget approval and additive follow-up Enter persist exact JSONL grants", async () => {
+  const testRoot = await mkdtemp(join(tmpdir(), "adam-budget-enter-"));
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateRoot = join(testRoot, "state");
+  const controlRoot = join(testRoot, "control");
+  await mkdir(workspaceRoot);
+  await mkdir(controlRoot);
+  const fixture = startFixture({
+    scenario: "managed-active",
+    workspaceRoot,
+    stateRoot,
+    controlRoot,
+  });
+  try {
+    await fixture.waitForScreen("Adam · New session");
+    fixture.write("Start one child with an explicit budget.\r");
+    await fixture.waitForScreen("10000 task tokens");
+    await fixture.waitForScreen("> Allow");
+    await expect(stat(join(controlRoot, "managed-active-child-held"))).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    fixture.write("\r");
+    await waitForPath(join(controlRoot, "managed-active-child-held"));
+    const beforeCompleted = fixture.output().length;
+    await writeFile(join(controlRoot, "release-managed-active-child"), "release\n");
+    await fixture.waitForCompleteFrameAfter("Managed active parent completed.", beforeCompleted);
+    await waitForFileContents(join(controlRoot, "submit_prompt-settled"), "admitted\n");
+    await fixture.waitForCompleteFrameAfter(" · idle", beforeCompleted);
+    fixture.write("/agents\r");
+    await fixture.waitForScreen("Agents · 0 active · 1 terminal");
+    fixture.write("\r");
+    await fixture.waitForRecordedOutput("f follow-up from exact terminal evidence");
+    fixture.write("f");
+    await fixture.waitForScreen("Follow-up task · add tokens:");
+    const beforeFollowUp = fixture.output().length;
+    fixture.write("/budget-add 5000 Continue from exact evidence.\r");
+    await fixture.waitForCompleteFrameAfter(
+      "Managed-child follow-up started from exact terminal evidence.",
+      beforeFollowUp,
+    );
+    await fixture.waitForScreen("Agents 0 active/1 terminal");
+    fixture.write("\u0011");
+    await expect(fixture.closed).resolves.toMatchObject({ code: 0, signal: null, stderr: "" });
+    const records = await (await createJsonlManagedAgentStore({ stateRoot, workspaceRoot })).read();
+    const admissions = records.filter((record) => record.type === "managed_agent_admitted");
+    expect(admissions).toHaveLength(2);
+    expect(admissions[0]?.taskBudget).toMatchObject({
+      mode: "limited",
+      grants: [{ tokens: 10000 }],
+    });
+    expect(admissions[1]?.taskBudget).toMatchObject({
+      mode: "limited",
+      grants: [{ tokens: 10000 }, { tokens: 5000 }],
+    });
+    expect(admissions[1]?.agentId).toBe(admissions[0]?.agentId);
+    expect(
+      records.find(
+        (record) =>
+          record.type === "managed_agent_terminal" && record.attemptId === admissions[1]?.attemptId,
+      ),
+    ).toMatchObject({ status: "completed" });
+  } finally {
+    await writeFile(join(controlRoot, "release-managed-active-child"), "release\n").catch(
+      () => undefined,
+    );
     await fixture.cleanup();
     await rm(testRoot, { recursive: true, force: true });
   }

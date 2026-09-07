@@ -8,6 +8,7 @@ import type {
   ModelEvent,
   ModelMessage,
   ModelModalityProfile,
+  ModelRequest,
   PermissionDecisionCommand,
   PermissionDecisionCommandResult,
   RunOptions,
@@ -200,6 +201,10 @@ export const managedAgentInterruptAfterEffect = Symbol(
 export const managedAgentStorageQuota = Symbol("adam-agent.managed-agent-storage-quota");
 export const managedAgentRuntimeBoundary = Symbol("adam-agent.managed-agent-runtime-boundary");
 export const managedAgentRequestBoundary = Symbol("adam-agent.managed-agent-request-boundary");
+export const managedTaskBudgetBoundary = Symbol("adam-agent.managed-task-budget-boundary");
+export type ManagedTaskBudgetBoundary = (
+  request: Pick<ModelRequest, "messages" | "tools" | "maximumOutputTokens">,
+) => Promise<{ readonly closing: true; readonly summary: string } | undefined>;
 export const managedAgentPartialOutput = Symbol("adam-agent.managed-agent-partial-output");
 /** Internal crash conformance barrier, after the canonical append has succeeded. */
 export const sessionRecordCommittedBarrier = Symbol("adam-agent.session-record-committed-barrier");
@@ -241,6 +246,8 @@ export class AgentSession {
   #plan: PlanCycleSnapshot | undefined;
   #planGitAttestation: PlanGitAttestationV1 | undefined;
   readonly #permissions: PermissionPolicy | undefined;
+  readonly #managedTaskBudgetBoundary: ManagedTaskBudgetBoundary | undefined;
+  #taskBudgetSummary: string | undefined;
   readonly #managedAgentPromptSummary: (() => string) | undefined;
   readonly #managedAgentInterruptAfterEffect:
     | (() => Promise<
@@ -392,6 +399,9 @@ export class AgentSession {
           ? (this.#tools?.definitions() ?? [])
           : planRequestToolDefinitions(this.#tools, this.#plan);
     this.#permissions = dependencies.permissions;
+    this.#managedTaskBudgetBoundary = (
+      dependencies as { readonly [managedTaskBudgetBoundary]?: ManagedTaskBudgetBoundary }
+    )[managedTaskBudgetBoundary];
     this.#managedAgentPromptSummary = (
       dependencies as AgentSessionDependencies & {
         readonly [managedAgentPromptSummary]?: () => string;
@@ -793,8 +803,9 @@ export class AgentSession {
       if (!retryingSameTurn && limits?.maxTurns !== undefined && modelTurns >= limits.maxTurns) {
         return this.#settleTurnLimitExceeded();
       }
+      this.#taskBudgetSummary = undefined;
       let requestMessages = this.#assemblePromptMessages(messages);
-      const requestTools = this.#fixedRequestTools ?? this.#tools?.definitions() ?? [];
+      let requestTools = this.#fixedRequestTools ?? this.#tools?.definitions() ?? [];
       let activeEstimate =
         this.#contextProfile === undefined
           ? undefined
@@ -867,7 +878,7 @@ export class AgentSession {
             ? undefined
             : this.#estimatePromptTokens(requestMessages, requestTools);
       }
-      const maximumOutputTokens =
+      let maximumOutputTokens =
         this.#contextProfile === undefined
           ? this.#maximumOutputTokens
           : resolveOrdinaryMaximumOutputTokens(
@@ -881,6 +892,31 @@ export class AgentSession {
             "The active context leaves no safe output capacity for this model request.",
           ),
         );
+      }
+      const taskBudgetAdvice = await this.#managedTaskBudgetBoundary?.({
+        messages: requestMessages,
+        tools: requestTools,
+        maximumOutputTokens,
+      });
+      if (taskBudgetAdvice?.closing === true) {
+        this.#taskBudgetSummary = taskBudgetAdvice.summary;
+        requestTools = [];
+        requestMessages = this.#assemblePromptMessages(messages);
+        activeEstimate =
+          this.#contextProfile === undefined
+            ? undefined
+            : this.#estimatePromptTokens(requestMessages, requestTools);
+        maximumOutputTokens =
+          this.#contextProfile === undefined
+            ? this.#maximumOutputTokens
+            : resolveOrdinaryMaximumOutputTokens(this.#contextProfile, activeEstimate ?? 0);
+        if (!isPositiveSafeInteger(maximumOutputTokens))
+          return this.#settleContextCompactionFailed(
+            new ContextCompactionError(
+              "context_window_unrecoverable",
+              "The closing report has no safe context capacity.",
+            ),
+          );
       }
       if (!retryingSameTurn) {
         modelTurns += 1;
@@ -928,6 +964,7 @@ export class AgentSession {
             sequence: this.#nextSequence + deliveryRecords.length,
             record: {
               type: "provider_attempt_started",
+              ...(taskBudgetAdvice?.closing === true ? { taskBudgetClosing: true as const } : {}),
               runId: this.#activeRunId as string,
               turn: modelTurns,
               attempt: attemptNumber,
@@ -1422,6 +1459,10 @@ export class AgentSession {
           "submit_plan must be the only tool request in its terminal model response.",
         );
       }
+      if (taskBudgetAdvice?.closing === true && completedCalls.length > 0)
+        return this.#settleProtocolInvalid(
+          "The task-budget closing response requested more tools. Existing evidence is retained; the task remains incomplete.",
+        );
       const toolIntents = completedCalls.map((call) => this.#createToolIntent(call));
 
       const persisted = await this.#persistDurableModelResponse({
@@ -1521,7 +1562,10 @@ export class AgentSession {
             this.#skillContext,
             this.#activeSkillContents,
           );
-    const managedSummary = this.#managedAgentPromptSummary?.();
+    const managedSummary =
+      [this.#managedAgentPromptSummary?.(), this.#taskBudgetSummary]
+        .filter((value) => value !== undefined)
+        .join("\n") || undefined;
     this.#lastManagedAgentPromptSummary = managedSummary;
     if (managedSummary !== undefined) {
       if (Buffer.byteLength(managedSummary, "utf8") > 1024) {
@@ -2588,6 +2632,9 @@ export class AgentSession {
           ? "allow"
           : (this.#permissions?.decide(permissionInput) ?? "deny");
     const freshEnvelope =
+      (preparedPermissionSubject.type === "managed_agent_spawn" &&
+        (preparedPermissionSubject.budgetTokens !== undefined ||
+          preparedPermissionSubject.shareBudgetWithAgentId !== undefined)) ||
       preparedPermissionSubject.type === "managed_agent_batch" ||
       (preparedPermissionSubject.type === "managed_agent_action" &&
         preparedPermissionSubject.envelope !== undefined);

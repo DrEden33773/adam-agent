@@ -52,6 +52,7 @@ import {
   sessionUserContentV1Schema,
   validateSessionUserContentV1,
 } from "./structured-user-content.js";
+import { taskBudgetSchema } from "./task-budget.js";
 import type { ThinkingPolicySnapshotV1 } from "./thinking-policy.js";
 import { type TodoItemV1, todoItemV1Schema, todoPolicyVersionV1 } from "./todo.js";
 import { isCanonicalPatchPath, toolErrorSchema } from "./tool-error.js";
@@ -162,7 +163,9 @@ export type SessionGenesisRecord = {
       | "managed-agent-tools.a3-long-lived.v1"
       | "managed-agent-tools.a1.v2"
       | "managed-agent-tools.a2-long-lived.v2"
-      | "managed-agent-tools.a3-long-lived.v2";
+      | "managed-agent-tools.a3-long-lived.v2"
+      | "managed-agent-tools.a3-long-lived.v3"
+      | "managed-agent-tools.a1.v3";
     readonly webEvidence?: {
       readonly version: 1;
       readonly searchProvider: null | {
@@ -778,6 +781,7 @@ export type SessionProviderAttemptStartedRecord = {
   readonly sequence: number;
   readonly record: {
     readonly type: "provider_attempt_started";
+    readonly taskBudgetClosing?: true;
     readonly runId: string;
     readonly turn: number;
     readonly attempt: number;
@@ -1472,9 +1476,19 @@ const skillPermissionSubjectSchema = z.strictObject({
 });
 const managedAgentSpawnPermissionSubjectSchema = z.strictObject({
   type: z.literal("managed_agent_spawn"),
+  shareBudgetWithAgentId: z.uuid().optional(),
+  sharedTaskBudget: taskBudgetSchema.optional(),
+  budgetTokens: z.number().int().positive().safe().optional(),
   parentRootId: z.string().min(1).max(256),
   parentSessionId: z.uuid(),
-  profile: z.enum(["scout.v1", "scout.v2", "research.v1", "research.v2"]),
+  profile: z.enum([
+    "scout.v1",
+    "scout.v2",
+    "scout.v3",
+    "research.v1",
+    "research.v2",
+    "research.v3",
+  ]),
   mode: z.enum(["foreground", "background"]).optional(),
   profileDigest: z.string().regex(/^sha256:[0-9a-f]{64}$/u),
   selectedSkills: z
@@ -1511,7 +1525,8 @@ const managedAgentSpawnPermissionSubjectSchema = z.strictObject({
       maximumDeadlineMilliseconds: z.literal(600_000),
     }),
     z.strictObject({
-      maximumTokens: z.number().int().positive().safe(),
+      maximumTokens: z.number().int().positive().safe().nullable(),
+      contextWindowTokens: z.number().int().positive().safe().optional(),
       maximumInactivityMilliseconds: z.literal(300_000),
     }),
   ]),
@@ -2177,6 +2192,8 @@ const sessionGenesisV1RecordSchema = z.strictObject({
       "managed-agent-tools.a1.v2",
       "managed-agent-tools.a2-long-lived.v2",
       "managed-agent-tools.a3-long-lived.v2",
+      "managed-agent-tools.a3-long-lived.v3",
+      "managed-agent-tools.a1.v3",
     ])
     .optional(),
   webEvidence: z
@@ -3042,6 +3059,7 @@ const sessionV3RecordSchema = z.union([
   z
     .strictObject({
       type: z.literal("provider_attempt_started"),
+      taskBudgetClosing: z.literal(true).optional(),
       runId: z.uuid(),
       turn: z.number().int().positive(),
       attempt: z.number().int().positive(),

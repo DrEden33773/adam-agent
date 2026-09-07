@@ -223,7 +223,7 @@ export async function createProductionProjectRuntime(
   lifecycle = createSessionLifecycle({
     extensionHost: host,
     ...(options[projectRuntimeManagedControl] === undefined
-      ? { managedAgentTools: "managed-agent-tools.a3-long-lived.v2" as const }
+      ? { managedAgentTools: "managed-agent-tools.a3-long-lived.v3" as const }
       : { [sessionManagedControl]: options[projectRuntimeManagedControl] }),
     modelTargets: options.modelTargets,
     permissions: options.permissions,

@@ -363,7 +363,7 @@ export async function runTuiFixture(options: TuiFixtureOptions): Promise<void> {
     options.scenario === "managed-live-scroll" ||
     options.scenario === "managed-parent-permission" ||
     options.scenario === "managed-stalled"
-      ? { managedAgentTools: "managed-agent-tools.a3-long-lived.v2" as const }
+      ? { managedAgentTools: "managed-agent-tools.a3-long-lived.v3" as const }
       : {}),
     ...(options.scenario === "managed-stalled" && options.controlRoot !== undefined
       ? {
@@ -1379,7 +1379,7 @@ function createFixtureModelTargets(options: {
         const child = request.messages.some(
           (message) =>
             message.role === "developer" &&
-            message.content.startsWith("Managed child profile research.v2"),
+            message.content.startsWith("Managed child profile research.v3"),
         );
         if (child) {
           if (request.messages.at(-1)?.role === "tool") {
@@ -1471,7 +1471,7 @@ function createFixtureModelTargets(options: {
                 id: `performance-spawn-${index}`,
                 json: JSON.stringify({
                   task: `Inspect evidence ${index}`,
-                  profile: "research.v2",
+                  profile: "research.v3",
                   mode: "background",
                 }),
               };
@@ -1532,7 +1532,7 @@ function createFixtureModelTargets(options: {
         const child = request.messages.some(
           (message) =>
             message.role === "developer" &&
-            message.content.startsWith("Managed child profile research.v2"),
+            message.content.startsWith("Managed child profile research.v3"),
         );
         if (child) {
           if (options.controlRoot === undefined) {
@@ -1562,7 +1562,7 @@ function createFixtureModelTargets(options: {
           yield {
             type: "tool_call_delta",
             id: "fixture-spawn-permission",
-            json: '{"task":"Hold during parent permission.","profile":"research.v2","mode":"background"}',
+            json: '{"task":"Hold during parent permission.","profile":"research.v3","mode":"background"}',
           };
           yield { type: "tool_call_end", id: "fixture-spawn-permission" };
           yield { type: "finish", reason: "tool_calls" };
@@ -1610,7 +1610,7 @@ function createFixtureModelTargets(options: {
         const child = request.messages.some(
           (message) =>
             message.role === "developer" &&
-            message.content.startsWith("Managed child profile research.v2"),
+            message.content.startsWith("Managed child profile research.v3"),
         );
         if (child) {
           if (options.scenario === "managed-artifact") {
@@ -1676,7 +1676,19 @@ function createFixtureModelTargets(options: {
           yield {
             type: "tool_call_delta",
             id: "fixture-spawn-active",
-            json: '{"task":"Hold exact active evidence.","profile":"research.v2","mode":"background"}',
+            json: JSON.stringify({
+              task: "Hold exact active evidence.",
+              profile: "research.v3",
+              mode: "background",
+              ...(request.messages.some(
+                (message) =>
+                  message.role === "user" &&
+                  typeof message.content === "string" &&
+                  message.content.includes("explicit budget"),
+              )
+                ? { budgetTokens: 10000 }
+                : {}),
+            }),
           };
           yield { type: "tool_call_end", id: "fixture-spawn-active" };
           yield { type: "finish", reason: "tool_calls" };
@@ -1729,7 +1741,7 @@ function createFixtureModelTargets(options: {
         const child = request.messages.some(
           (message) =>
             message.role === "developer" &&
-            message.content.startsWith("Managed child profile research.v2"),
+            message.content.startsWith("Managed child profile research.v3"),
         );
         if (child) {
           managedAttentionChildOrdinal += 1;
@@ -1790,7 +1802,7 @@ function createFixtureModelTargets(options: {
           yield {
             type: "tool_call_delta",
             id: "fixture-spawn-research",
-            json: '{"task":"Request exact fixture input.","profile":"research.v2","mode":"background"}',
+            json: '{"task":"Request exact fixture input.","profile":"research.v3","mode":"background"}',
           };
           yield { type: "tool_call_end", id: "fixture-spawn-research" };
           yield { type: "finish", reason: "tool_calls" };

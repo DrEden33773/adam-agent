@@ -462,6 +462,18 @@ function safeToolSubject(
       value: `${subject.agentId} (${subject.profile}) · ${subject.providerOrigin} · ${subject.operation} ${JSON.stringify(subject.queryOrUrl)}`,
     };
   }
+  if (subject?.type === "managed_agent_spawn" && subject.profile.endsWith(".v3")) {
+    const budget =
+      subject.sharedTaskBudget?.mode === "limited"
+        ? `join ${subject.sharedTaskBudget.grants.reduce((sum, grant) => sum + grant.tokens, 0)} existing task tokens shared by all members; no tokens added · source ${subject.shareBudgetWithAgentId}`
+        : subject.budgetTokens === undefined
+          ? "no cumulative budget"
+          : `${subject.budgetTokens} task tokens shared across members and attempts`;
+    return {
+      type: "generic",
+      value: `${budget} · ${subject.profile} · ${subject.mode ?? "foreground"} · exact task ${subject.taskDigest}`,
+    };
+  }
   if (subject?.type === "web_artifact") {
     return { type: "generic", value: subject.artifactId };
   }

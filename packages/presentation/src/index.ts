@@ -1000,7 +1000,13 @@ export type AuthoritativePresentationSnapshot = {
       readonly readOnly?: true;
       readonly agentId: string;
       readonly attemptId: string;
-      readonly profile: "scout.v1" | "scout.v2" | "research.v1" | "research.v2";
+      readonly profile:
+        | "scout.v1"
+        | "scout.v2"
+        | "scout.v3"
+        | "research.v1"
+        | "research.v2"
+        | "research.v3";
       readonly mode: "foreground" | "background";
       readonly targetIdentity: {
         readonly targetId: string;
@@ -1119,6 +1125,10 @@ export type AuthoritativePresentationSnapshot = {
         readonly outputTokens: number;
         readonly reasoningTokens: number;
         readonly providerCalls: number;
+      };
+      readonly taskBudget?: {
+        readonly policy: NonNullable<ManagedDelegationEnvelope["taskBudget"]>;
+        readonly usage: NonNullable<ManagedWorkspaceSnapshot["budget"]>;
       };
       readonly budget?: {
         readonly maximumCumulativeTokens: number;
@@ -1611,6 +1621,7 @@ export type PresentationCommand =
       readonly agentId: string;
       readonly expectedRevision: number;
       readonly task: string;
+      readonly additionalBudgetTokens?: number;
     }
   | {
       readonly type: "recover_managed_agent";
@@ -1618,6 +1629,7 @@ export type PresentationCommand =
       readonly agentId: string;
       readonly expectedRevision: number;
       readonly task: string;
+      readonly additionalBudgetTokens?: number;
     }
   | {
       readonly type: "select_session";
@@ -2148,11 +2160,11 @@ export type ManagedWorkspaceSnapshot = {
     readonly availableBytes: number;
   };
   readonly budget?: {
-    readonly ceiling: number;
+    readonly ceiling: number | null;
     readonly knownUsed: number;
     readonly outstandingReserved: number;
     readonly unknownReserved: number;
-    readonly available: number;
+    readonly available: number | null;
     readonly overrun: number;
   };
   readonly completions: readonly {
@@ -2172,13 +2184,13 @@ export type ManagedWorkspaceSnapshot = {
 };
 
 export type ManagedFleetPolicy = {
-  readonly version: 1;
+  readonly version: 1 | 2;
   readonly background: { readonly running: number; readonly queued: number };
   readonly reserved: { readonly running: 1; readonly queued: number };
   readonly maximumAttempts: number;
-  readonly threadTokens: number;
-  readonly batchTokens: number;
-  readonly sessionTokens: number;
+  readonly threadTokens: number | null;
+  readonly batchTokens: number | null;
+  readonly sessionTokens: number | null;
   readonly storageBytes: number;
 };
 export type ManagedDelegationMessage = ManagedControlLink & {
@@ -2195,7 +2207,7 @@ export type ManagedDelegationSelection = {
   readonly skills?: readonly string[];
 };
 
-export type ManagedDelegationLimits = Partial<
+export type ManagedDelegationLimits = { readonly budgetTokens?: number | null } & Partial<
   Pick<
     ManagedDelegationEnvelope,
     "mode" | "running" | "queued" | "aggregateTokens" | "threadTokens" | "sessionTokens"
@@ -2203,7 +2215,16 @@ export type ManagedDelegationLimits = Partial<
 >;
 
 export type ManagedDelegationEnvelope = {
-  readonly version: 1;
+  readonly taskBudget?:
+    | { readonly version: 1; readonly mode: "unbudgeted" }
+    | {
+        readonly version: 1;
+        readonly mode: "limited";
+        readonly taskId: string;
+        readonly grants: { readonly id: string; readonly tokens: number }[];
+      }
+    | undefined;
+  readonly version: 1 | 2;
   readonly id: string;
   readonly digest: `sha256:${string}`;
   readonly origin: {
@@ -2216,9 +2237,9 @@ export type ManagedDelegationEnvelope = {
   readonly threads: number;
   readonly running: number;
   readonly queued: number;
-  readonly aggregateTokens: number;
-  readonly threadTokens: number;
-  readonly sessionTokens: number;
+  readonly aggregateTokens: number | null;
+  readonly threadTokens: number | null;
+  readonly sessionTokens: number | null;
   readonly context: "task" | "current_request" | "selected_messages";
   readonly skills: readonly string[];
   readonly policy: ManagedFleetPolicy;
@@ -2273,6 +2294,7 @@ export type ManagedControlCommand =
     }
   | {
       readonly type: "post_agent";
+      readonly additionalBudgetTokens?: number;
       readonly origin?: ManagedDelegationEnvelope["origin"];
       readonly envelope?: ManagedDelegationEnvelope;
       readonly parentSessionId: string;
@@ -2347,6 +2369,7 @@ export type ManagedControlCommand =
     }
   | {
       readonly type: "next_turn";
+      readonly additionalBudgetTokens?: number;
       readonly origin?: ManagedDelegationEnvelope["origin"];
       readonly envelope?: ManagedDelegationEnvelope;
       readonly inputId?: string;

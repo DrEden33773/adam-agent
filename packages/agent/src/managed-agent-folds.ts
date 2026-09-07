@@ -7,6 +7,7 @@ import type {
   ManagedWorkspaceSnapshot,
 } from "@adam-agent/presentation";
 import { agentExportFields, presentationAgentExportMaximumBytes } from "@adam-agent/presentation";
+import { latestTaskBudget, taskBudgetContinues } from "./task-budget.js";
 
 export type {
   ManagedControlIdentity,
@@ -147,6 +148,8 @@ export type ManagedControlEvent =
   | FleetProviderEvent
   | {
       readonly type: "budget_blocked";
+      readonly purpose?: "ordinary" | "compaction";
+      readonly source?: { readonly sequence: number; readonly digest: string };
       readonly code: "fleet_budget_exhausted" | "fleet_estimator_overrun";
       readonly message: string;
     }
@@ -259,6 +262,13 @@ const eventSchema = z.discriminatedUnion("type", [
   }),
   z.strictObject({
     type: z.literal("budget_blocked"),
+    purpose: z.enum(["ordinary", "compaction"]).optional(),
+    source: z
+      .strictObject({
+        sequence: z.number().int().positive(),
+        digest: z.string().regex(/^sha256:[a-f0-9]{64}$/u),
+      })
+      .optional(),
     code: z.enum(["fleet_budget_exhausted", "fleet_estimator_overrun"]),
     message: z.string().min(1).max(1024),
   }),
@@ -381,6 +391,40 @@ export function validateManagedControlRecord(
     if (
       record.schemaVersion !== 3 &&
       (record.event.context !== undefined || record.event.skills !== undefined)
+    )
+      return invalid();
+    const priorAdmission = threadRecords.findLast((entry) => entry.event.type === "admitted");
+    const taskBudget = record.event.envelope?.taskBudget;
+    if (taskBudget !== undefined) {
+      const priorBudget =
+        priorAdmission?.event.type === "admitted"
+          ? priorAdmission.event.envelope?.taskBudget
+          : undefined;
+      if (
+        priorAdmission !== undefined
+          ? priorBudget === undefined ||
+            !taskBudgetContinues(
+              latestTaskBudget(
+                priorBudget,
+                previous.flatMap((entry) =>
+                  entry.event.type === "admitted" && entry.event.envelope?.taskBudget !== undefined
+                    ? [entry.event.envelope.taskBudget]
+                    : [],
+                ),
+              ),
+              taskBudget,
+              managedControlDigest(record.event.envelope?.origin),
+            )
+          : taskBudget.mode === "limited" &&
+            record.event.frozen?.review === undefined &&
+            (taskBudget.taskId !== managedControlDigest(record.event.envelope?.origin) ||
+              taskBudget.grants.length !== 1 ||
+              taskBudget.grants[0]?.id !== taskBudget.taskId)
+      )
+        return invalid();
+    } else if (
+      priorAdmission?.event.type === "admitted" &&
+      priorAdmission.event.envelope?.taskBudget !== undefined
     )
       return invalid();
     const admittedInputId = record.event.inputId;

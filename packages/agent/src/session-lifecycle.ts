@@ -500,7 +500,9 @@ export type SessionLifecycleOptions = {
     | "managed-agent-tools.a3-long-lived.v1"
     | "managed-agent-tools.a1.v2"
     | "managed-agent-tools.a2-long-lived.v2"
-    | "managed-agent-tools.a3-long-lived.v2";
+    | "managed-agent-tools.a3-long-lived.v2"
+    | "managed-agent-tools.a3-long-lived.v3"
+    | "managed-agent-tools.a1.v3";
   readonly permissions?: PermissionPolicy;
   readonly preferences?: UserModelPolicyResolver;
   readonly workspaceRoot: string;
@@ -546,8 +548,8 @@ function hasManagedAgentCoordination(profile: ManagedAgentToolsProfile | undefin
   return profile?.includes(".a3-long-lived.") === true;
 }
 
-function managedAgentToolsVersion(profile: ManagedAgentToolsProfile | undefined): 1 | 2 {
-  return profile?.endsWith(".v2") === true ? 2 : 1;
+function managedAgentToolsVersion(profile: ManagedAgentToolsProfile | undefined): 1 | 2 | 3 {
+  return profile?.endsWith(".v3") === true ? 3 : profile?.endsWith(".v2") === true ? 2 : 1;
 }
 
 type WebEvidenceProfileV1 = NonNullable<SessionGenesisRecord["record"]["webEvidence"]>;
@@ -899,6 +901,7 @@ export interface SessionLifecycle {
     readonly expectedRevision: number;
     readonly callId: string;
     readonly task: string;
+    readonly additionalBudgetTokens?: number;
     readonly signal: AbortSignal;
   }): Promise<ManagedAgentControlResult>;
   recoverManagedAgent(input: {
@@ -907,6 +910,7 @@ export interface SessionLifecycle {
     readonly expectedRevision: number;
     readonly callId: string;
     readonly task: string;
+    readonly additionalBudgetTokens?: number;
     readonly signal: AbortSignal;
   }): Promise<ManagedAgentControlResult>;
   inspectWorkspaceTrust(): Promise<WorkspaceTrustSnapshot>;
@@ -1791,7 +1795,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         managedAgentTools !== "managed-agent-tools.a3-long-lived.v1" &&
         managedAgentTools !== "managed-agent-tools.a1.v2" &&
         managedAgentTools !== "managed-agent-tools.a2-long-lived.v2" &&
-        managedAgentTools !== "managed-agent-tools.a3-long-lived.v2")
+        managedAgentTools !== "managed-agent-tools.a3-long-lived.v2" &&
+        managedAgentTools !== "managed-agent-tools.a3-long-lived.v3" &&
+        managedAgentTools !== "managed-agent-tools.a1.v3")
     ) {
       if (baseWithWeb === undefined) {
         throw new SessionLifecycleError("session_invalid");
@@ -1806,7 +1812,12 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
     const managerRouter: AgentManager = {
       parentRootId: `session:${sessionId}`,
       parentSessionId: sessionId,
-      builtInProfileVersion: managedAgentTools.endsWith(".v2") ? 2 : 1,
+      builtInProfileVersion: managedAgentToolsVersion(managedAgentTools),
+      async settleUsage(input) {
+        const manager = activeAgentManagers.get(sessionId);
+        if (manager === undefined) throw new SessionLifecycleError("session_invalid");
+        await manager.settleUsage(input);
+      },
       get contextWindowTokens() {
         return activeAgentManagers.get(sessionId)?.contextWindowTokens ?? 0;
       },
@@ -2365,7 +2376,11 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       artifactStore: sharedArtifactStore,
       childContextProfile,
       childModel: resolved.driver,
-      builtInProfileVersion: admission.profile.endsWith(".v2") ? 2 : 1,
+      builtInProfileVersion: admission.profile.endsWith(".v3")
+        ? 3
+        : admission.profile.endsWith(".v2")
+          ? 2
+          : 1,
       childSessionStores: managedChildSessionStores,
       managedStore: managedAgentStore,
       parentPermissions: options.permissions ?? createPermissionPolicy({ allowedEffects: [] }),
@@ -2485,6 +2500,7 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
       readonly expectedRevision: number;
       readonly callId: string;
       readonly task: string;
+      readonly additionalBudgetTokens?: number;
       readonly signal: AbortSignal;
     },
     kind: "follow_up" | "recovery",
@@ -2515,6 +2531,9 @@ export function createSessionLifecycle(providedOptions: SessionLifecycleOptions)
         parentSessionId: input.sessionId,
         signal: input.signal,
         task: input.task,
+        ...(input.additionalBudgetTokens === undefined
+          ? {}
+          : { additionalBudgetTokens: input.additionalBudgetTokens }),
       });
       if (result.status !== "completed") {
         throw new SessionLifecycleError("session_invalid");
@@ -7638,24 +7657,26 @@ async function validatePromptProjectionDigests(
       : managedMessages;
     const plan = planCycleSnapshotFromRecords(prefix);
     const tools =
-      plan === undefined
-        ? context.toolProfile.definitions.map(({ definition }) => definition)
-        : [
-            ...plan.eligibleToolProfile.definitions.map((eligible) => {
-              const definition = context.toolProfile.definitions.find(
-                (candidate) => candidate.name === eligible.name,
-              )?.definition;
-              if (
-                definition === undefined ||
-                plan.eligibleToolProfile.source.version !== context.toolProfile.version ||
-                plan.eligibleToolProfile.source.digest !== context.toolProfile.digest
-              ) {
-                throw new SessionLifecycleError("session_invalid");
-              }
-              return definition;
-            }),
-            ...(plan.state === "exploring" ? [submitPlanToolDefinitionV1] : []),
-          ];
+      entry.record.taskBudgetClosing === true
+        ? []
+        : plan === undefined
+          ? context.toolProfile.definitions.map(({ definition }) => definition)
+          : [
+              ...plan.eligibleToolProfile.definitions.map((eligible) => {
+                const definition = context.toolProfile.definitions.find(
+                  (candidate) => candidate.name === eligible.name,
+                )?.definition;
+                if (
+                  definition === undefined ||
+                  plan.eligibleToolProfile.source.version !== context.toolProfile.version ||
+                  plan.eligibleToolProfile.source.digest !== context.toolProfile.digest
+                ) {
+                  throw new SessionLifecycleError("session_invalid");
+                }
+                return definition;
+              }),
+              ...(plan.state === "exploring" ? [submitPlanToolDefinitionV1] : []),
+            ];
     const providerRunId = entry.record.runId;
     const kickoff = prefix.findLast(
       (candidate) =>

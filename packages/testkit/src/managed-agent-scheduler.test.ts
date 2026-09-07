@@ -671,14 +671,28 @@ test("immutable grants share one Session ceiling and unknown provider usage reta
 
 test("provider overshoot is durable and blocks further dispatch without counting reasoning twice", async () => {
   let calls = 0;
-  const f = await schedulerFixture({
-    async *stream() {
-      calls++;
-      yield { type: "usage", inputTokens: 6000, outputTokens: 100, reasoningTokens: 70 };
-      yield { type: "text_delta", text: "Must not be called success." };
-      yield { type: "finish", reason: "stop" };
+  const f = await schedulerFixture(
+    {
+      async *stream() {
+        calls++;
+        yield { type: "usage", inputTokens: 6000, outputTokens: 100, reasoningTokens: 70 };
+        yield { type: "text_delta", text: "Must not be called success." };
+        yield { type: "finish", reason: "stop" };
+      },
     },
-  });
+    {
+      policy: {
+        version: 1,
+        background: { running: 4, queued: 32 },
+        reserved: { running: 1, queued: 4 },
+        maximumAttempts: 4,
+        threadTokens: 128000,
+        batchTokens: 512000,
+        sessionTokens: 2048000,
+        storageBytes: 32 * 1024 * 1024,
+      },
+    },
+  );
   try {
     expect(await f.control.dispatch({ ...batch(1), mode: "foreground" })).toMatchObject({
       status: "completed",
@@ -2523,5 +2537,159 @@ test("Lifecycle admission serialization releases before a foreground join so bac
   } finally {
     await lifecycle.close();
     await foreground;
+  }
+});
+
+test("default candidate task completes beyond cumulative context capacity without lowering output capability", async () => {
+  let calls = 0;
+  const f = await schedulerFixture({
+    async *stream(request) {
+      calls += 1;
+      expect(request.maximumOutputTokens).toBe(4096);
+      if (calls <= 7) {
+        const id = `read-${calls}`;
+        yield { type: "tool_call_start", id, name: "read_file" };
+        yield { type: "tool_call_delta", id, json: '{"path":"package.json"}' };
+        yield { type: "tool_call_end", id };
+        yield { type: "usage", inputTokens: 20_000, outputTokens: 10 };
+        yield { type: "finish", reason: "tool_calls" };
+      } else {
+        yield { type: "text_delta", text: "All seven evidence steps completed." };
+        yield { type: "usage", inputTokens: 20_000, outputTokens: 10 };
+        yield { type: "finish", reason: "stop" };
+      }
+    },
+  });
+  try {
+    expect(await f.control.dispatch({ ...batch(1), mode: "foreground" })).toMatchObject({
+      status: "completed",
+      results: [
+        { outcome: { status: "completed", summary: "All seven evidence steps completed." } },
+      ],
+    });
+    expect(calls).toBe(8);
+    expect((await f.control.inspect({ parentSessionId })).threads[0]?.budget).toMatchObject({
+      ceiling: null,
+      knownUsed: 160_080,
+      available: null,
+      overrun: expect.any(Number),
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+test("candidate members and continuations share one explicit task grant while new tasks remain unbudgeted", async () => {
+  let calls = 0;
+  const f = await schedulerFixture({
+    async *stream() {
+      calls += 1;
+      yield { type: "text_delta", text: "Evidence retained." };
+      yield { type: "usage", inputTokens: calls === 1 ? 7000 : 10, outputTokens: 0 };
+      yield { type: "finish", reason: "stop" };
+    },
+  });
+  try {
+    const command = batch(2);
+    const envelope = await f.control.prepareDelegation(command, {
+      budgetTokens: 7000,
+      running: 1,
+      queued: 1,
+    });
+    expect(await f.control.dispatch({ ...command, envelope })).toMatchObject({
+      status: "admitted",
+    });
+    await observeUntil(
+      f.control,
+      (snapshot) =>
+        snapshot.threads.length === 2 &&
+        snapshot.threads.every((thread) => thread.turn.phase === "idle"),
+    );
+    expect(calls).toBe(1);
+    const snapshot = await f.control.inspect({ parentSessionId });
+    expect(snapshot.threads.map((thread) => thread.budget)).toEqual([
+      expect.objectContaining({ ceiling: 7000, knownUsed: 7000, available: 0 }),
+      expect.objectContaining({ ceiling: 7000, knownUsed: 7000, available: 0 }),
+    ]);
+    const failed = snapshot.threads.find((thread) => thread.turn.outcome?.status === "failed");
+    if (failed === undefined) throw new Error("Missing budget-stopped member");
+    expect(
+      await f.control.dispatch({
+        type: "next_turn",
+        parentSessionId,
+        threadId: failed.threadId,
+        expectedTurnId: failed.turn.turnId,
+        inputId: "00000000-0000-4000-8000-000000000090",
+        task: "Continue with the retained evidence.",
+        additionalBudgetTokens: 7000,
+      }),
+    ).toMatchObject({ status: "accepted" });
+    await observeUntil(f.control, (current) =>
+      current.threads.every((thread) => thread.turn.phase === "idle"),
+    );
+    expect(calls).toBe(2);
+    expect((await f.control.inspect({ parentSessionId })).threads[0]?.budget).toMatchObject({
+      ceiling: 14000,
+      knownUsed: 7010,
+    });
+    const admissions = (await f.store.read()).filter((record) => record.event.type === "admitted");
+    expect(admissions[0]?.event).toMatchObject({
+      envelope: { taskBudget: { mode: "limited", grants: [{ tokens: 7000 }] } },
+    });
+    expect(admissions.at(-1)?.event).toMatchObject({
+      envelope: { taskBudget: { mode: "limited", grants: [{ tokens: 7000 }, { tokens: 7000 }] } },
+    });
+    expect(
+      await f.control.dispatch({ ...batch(1, "Unrelated"), mode: "foreground" }),
+    ).toMatchObject({ status: "completed", results: [{ outcome: { status: "completed" } }] });
+    expect(calls).toBe(3);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a funded candidate closing request uses existing evidence and records its exact tool-free prompt", async () => {
+  let calls = 0;
+  const f = await schedulerFixture({
+    async *stream(request) {
+      calls += 1;
+      if (calls === 1) {
+        yield { type: "tool_call_start", id: "read", name: "read_file" };
+        yield { type: "tool_call_delta", id: "read", json: '{"path":"package.json"}' };
+        yield { type: "tool_call_end", id: "read" };
+        yield { type: "usage", inputTokens: 12000, outputTokens: 10 };
+        yield { type: "finish", reason: "tool_calls" };
+      } else {
+        expect(request.tools).toEqual([]);
+        expect(JSON.stringify(request.messages)).toContain("Task budget closing request");
+        yield {
+          type: "text_delta",
+          text: "Package evidence collected; remaining checks are incomplete.",
+        };
+        yield { type: "usage", inputTokens: 1000, outputTokens: 50 };
+        yield { type: "finish", reason: "stop" };
+      }
+    },
+  });
+  try {
+    const command = { ...batch(1), mode: "foreground" as const };
+    const envelope = await f.control.prepareDelegation(command, { budgetTokens: 20000 });
+    expect(await f.control.dispatch({ ...command, envelope })).toMatchObject({
+      status: "completed",
+      results: [
+        {
+          outcome: {
+            status: "completed",
+            summary: "Package evidence collected; remaining checks are incomplete.",
+          },
+        },
+      ],
+    });
+    expect(calls).toBe(2);
+    const thread = (await f.control.inspect({ parentSessionId })).threads[0];
+    expect(thread?.budget).toMatchObject({ ceiling: 20000, knownUsed: 13060 });
+    expect(thread?.turn.recovery).not.toBe("required");
+  } finally {
+    await f.close();
   }
 });

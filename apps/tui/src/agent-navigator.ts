@@ -415,9 +415,18 @@ export class AgentNavigator implements Component {
         detail.usage === undefined
           ? "Usage unavailable"
           : `Usage ${detail.usage.inputTokens} in + ${detail.usage.outputTokens} out · ${detail.usage.reasoningTokens} reasoning · ${detail.usage.providerCalls} calls`,
-        detail.budget === undefined
-          ? "Budget unavailable"
-          : `Budget ${detail.budget.usedTokens}/${detail.budget.maximumCumulativeTokens} · ${detail.budget.remainingTokens} left`,
+        detail.taskBudget !== undefined
+          ? detail.taskBudget.policy.mode === "unbudgeted"
+            ? `No cumulative budget · ${detail.taskBudget.usage.knownUsed} used · ${detail.taskBudget.usage.unknownReserved} unknown reserved`
+            : `Task budget ${detail.taskBudget.usage.knownUsed}/${detail.taskBudget.usage.ceiling} · ${detail.taskBudget.usage.available} available · ${detail.taskBudget.usage.unknownReserved} unknown reserved`
+          : detail.budget === undefined
+            ? "Budget unavailable"
+            : `Budget ${detail.budget.usedTokens}/${detail.budget.maximumCumulativeTokens} · ${detail.budget.remainingTokens} left`,
+        ...((detail.taskBudget?.usage.overrun ?? 0) > 0
+          ? [
+              `Provider usage exceeded request estimates by ${detail.taskBudget?.usage.overrun} tokens.`,
+            ]
+          : []),
         `${detail.watchdog === undefined ? "Watchdog unavailable" : `Watchdog ${detail.watchdog.state} · ${detail.watchdog.maximumInactivityMilliseconds} ms`}${detail.attempts === undefined ? "" : ` · attempts ${detail.attempts.childAttempts}/${detail.attempts.maximumChildAttempts} child ${detail.attempts.parentAttempts}/${detail.attempts.maximumParentAttempts} parent`}`,
         `Agent ${safeTerminalText(detail.agentId)} · Attempt ${safeTerminalText(detail.attemptId)}`,
       ];
