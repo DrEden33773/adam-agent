@@ -1925,6 +1925,16 @@ export function createManagedAgentControl(options: {
           )
             await append(identity, { type: "started" });
         });
+        const runTokenLimit =
+          admission?.event.type === "admitted" &&
+          admission.event.envelope?.version === 2 &&
+          frozen?.review === undefined
+            ? frozen?.roleDefinition?.limits?.maxTokens
+            : Math.min(
+                (frozen?.contextProfile ?? options.contextProfile).contextWindowTokens,
+                frozen?.roleDefinition?.limits?.maxTokens ?? Infinity,
+                frozen?.review?.maximumTokens ?? Infinity,
+              );
         const result = await child
           .run(
             {
@@ -1939,18 +1949,7 @@ export function createManagedAgentControl(options: {
             {
               signal: controller.signal,
               limits: {
-                ...(admission?.event.type === "admitted" &&
-                admission.event.envelope?.version === 2 &&
-                frozen?.roleDefinition?.limits?.maxTokens === undefined &&
-                frozen?.review === undefined
-                  ? {}
-                  : {
-                      maxTokens: Math.min(
-                        (frozen?.contextProfile ?? options.contextProfile).contextWindowTokens,
-                        frozen?.roleDefinition?.limits?.maxTokens ?? Infinity,
-                        frozen?.review?.maximumTokens ?? Infinity,
-                      ),
-                    }),
+                ...(runTokenLimit === undefined ? {} : { maxTokens: runTokenLimit }),
                 ...(frozen?.roleDefinition?.limits?.maxTurns === undefined
                   ? {}
                   : { maxTurns: frozen.roleDefinition.limits.maxTurns }),

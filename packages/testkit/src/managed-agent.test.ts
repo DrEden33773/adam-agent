@@ -8205,3 +8205,53 @@ test("concurrent production members reserve from one approved task allowance", a
     await f.close();
   }
 });
+
+test.each([false, true])(
+  "recovery rejects a no-dispatch receipt with provider evidence, reasoning evidence %s",
+  async (partialText) => {
+    const f = await taskBudgetFixture({
+      async *stream() {
+        if (partialText) {
+          yield {
+            type: "reasoning_start",
+            id: "dispatch-proof",
+            artifactType: "provider_reasoning",
+          };
+          yield { type: "text_delta", text: "Partial provider evidence." };
+        } else yield { type: "usage", inputTokens: 100, outputTokens: 20 };
+        throw new ModelDriverError("invalid_request", "Fixture error after provider evidence.", {
+          cause: undefined,
+        });
+      },
+    });
+    try {
+      expect(await f.spawn(10000)).toMatchObject({ status: "failed" });
+      expect((await f.manager.snapshot()).agents[0]?.taskBudget?.usage.knownUsed).toBe(
+        partialText ? 0 : 120,
+      );
+      const damaged = createInMemoryManagedAgentStore();
+      let sequence = 0;
+      for (const record of await f.managedStore.read()) {
+        if (record.type === "managed_agent_provider") {
+          if (record.event.type === "provider_reserved")
+            await damaged.append({
+              schemaVersion: 1,
+              sequence: ++sequence,
+              type: "managed_agent_provider_blocked",
+              agentId: record.agentId,
+              attemptId: record.attemptId,
+              childSessionId: record.childSessionId,
+              purpose: record.event.purpose,
+              source: record.event.source,
+            });
+        } else await damaged.append({ ...record, sequence: ++sequence });
+      }
+      await recoverInterruptedManagedAgents(damaged, f.childSessionStores);
+      expect((await damaged.read()).at(-1)).toMatchObject({
+        type: "managed_agent_inspection_required",
+      });
+    } finally {
+      await f.close();
+    }
+  },
+);

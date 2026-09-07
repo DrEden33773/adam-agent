@@ -188,6 +188,15 @@ export type TaskProviderReceipt = {
   readonly blocked: boolean;
 };
 
+function isDispatchedModelEvent(type: string): boolean {
+  return (
+    type === "model_usage" ||
+    type === "model_message_completed" ||
+    type === "model_reasoning_started" ||
+    type === "model_reasoning_settled"
+  );
+}
+
 /** Every v3 provider boundary has either a reservation or an explicit no-dispatch receipt. */
 export function validateTaskProviderReceipts(
   childRecords: readonly SessionRecord[] | undefined,
@@ -196,6 +205,17 @@ export function validateTaskProviderReceipts(
 ): boolean {
   const sources = new Map(childRecords?.map((record) => [record.sequence, record]));
   const seen = new Set<number>();
+  const boundaries =
+    childRecords?.filter(
+      (record) =>
+        record.schemaVersion === 3 &&
+        (record.record.type === "provider_attempt_started" ||
+          record.record.type === "context_compaction_started"),
+    ) ?? [];
+  const nextBoundary = new Map(
+    boundaries.map((source, index) => [source.sequence, boundaries[index + 1]?.sequence]),
+  );
+
   for (const receipt of receipts) {
     const source = sources.get(receipt.source.sequence);
     if (
@@ -214,13 +234,31 @@ export function validateTaskProviderReceipts(
       receipt.blocked &&
       childRecords?.some((record) => {
         if (record.schemaVersion !== 3) return false;
-        if (source.record.type === "provider_attempt_started")
+        if (source.record.type === "provider_attempt_started") {
+          if (record.record.type === "runtime_event") {
+            const end = nextBoundary.get(source.sequence);
+            return (
+              record.sequence > source.sequence &&
+              (end === undefined || record.sequence < end) &&
+              record.record.runId === source.record.runId &&
+              isDispatchedModelEvent(record.record.event.type)
+            );
+          }
+          if (record.record.type === "provider_attempt_interrupted")
+            return (
+              record.record.runId === source.record.runId &&
+              record.record.turn === source.record.turn &&
+              record.record.attempt === source.record.attempt &&
+              record.record.reason === "run_terminal" &&
+              (record.record.partialOutput?.byteCount ?? 0) > 0
+            );
           return (
             record.record.type === "model_response_completed" &&
             record.record.runId === source.record.runId &&
             record.record.turn === source.record.turn &&
             record.record.attempt === source.record.attempt
           );
+        }
         return (
           source.record.type === "context_compaction_started" &&
           (record.record.type === "context_compaction_committed" ||
@@ -234,13 +272,6 @@ export function validateTaskProviderReceipts(
     )
       return false;
   }
-  const boundaries =
-    childRecords?.filter(
-      (record) =>
-        record.schemaVersion === 3 &&
-        (record.record.type === "provider_attempt_started" ||
-          record.record.type === "context_compaction_started"),
-    ) ?? [];
   return (
     boundaries.every((source) => {
       if (seen.has(source.sequence)) return true;
@@ -257,7 +288,7 @@ export function validateTaskProviderReceipts(
               record.record.attempt === source.record.attempt) ||
             (record.record.type === "runtime_event" &&
               record.record.runId === source.record.runId &&
-              record.record.event.type === "model_usage")
+              isDispatchedModelEvent(record.record.event.type))
           );
         return (
           source.record.type === "context_compaction_started" &&
