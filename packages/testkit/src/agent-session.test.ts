@@ -1713,6 +1713,8 @@ describe("AgentSession", () => {
         tools: createCodingToolRegistryForTesting({
           workspaceRoot,
           repositorySearchBackend: createScriptedRepositorySearchBackend([
+            { records: ["src/selected.ts"] },
+            { records: [] },
             {
               records: scriptedContentRecords([
                 {
@@ -1743,12 +1745,10 @@ describe("AgentSession", () => {
         "--color",
         "never",
         "--glob",
-        "**/*.ts",
-        "--glob",
         "!tests/**",
         "--",
         "Needle[A-Z][a-z]+",
-        ".",
+        "./src/selected.ts",
       ]);
       expect(searchOutput).toMatchObject({
         kind: "content",
@@ -2173,8 +2173,9 @@ describe("AgentSession", () => {
         tools: createCodingToolRegistryForTesting({
           workspaceRoot,
           repositorySearchBackend: createScriptedRepositorySearchBackend([
+            { records: ["src/alpha.test.ts", "tests/beta.test.ts", "src/alpha.ts"] },
             {
-              records: ["src/alpha.test.ts", "tests/beta.test.ts"],
+              records: ["src/alpha.ts"],
               assertArguments(arguments_) {
                 observedArguments = arguments_;
               },
@@ -2199,12 +2200,16 @@ describe("AgentSession", () => {
       expect(observedArguments).toEqual([
         "--no-config",
         "--no-require-git",
+        "--no-follow",
         "--files",
         "--null",
+        "--maxdepth",
+        "1",
         "--glob",
-        "{src,tests}/**/*.test.ts",
+        "!{src,tests}/**/*.test.ts",
         "--",
-        ".",
+        "./src",
+        "./tests",
       ]);
     } finally {
       await rm(workspaceRoot, { recursive: true, force: true });
