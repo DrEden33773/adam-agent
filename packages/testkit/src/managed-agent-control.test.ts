@@ -1457,3 +1457,105 @@ test("ManagedAgentControl requires recovery after a committed child terminal bar
     await harness.close();
   }
 });
+
+test("completed Control shutdown does not depend on a newly unreadable parent admission policy", async () => {
+  const harness = createInMemorySessionLifecycleHarness();
+  const lifecycle = harness.createLifecycle({
+    workspaceRoot: process.cwd(),
+    modelTargets: {
+      async snapshot() {
+        return {
+          targets: [
+            {
+              identity: targetIdentity,
+              contextProfile,
+              readiness: { status: "available" as const, credentialSource: "test" },
+            },
+          ],
+        };
+      },
+      async resolve() {
+        return {
+          identity: targetIdentity,
+          contextProfile,
+          driver: {
+            async *stream() {
+              yield { type: "text_delta" as const, text: "Durable child evidence." };
+              yield { type: "usage" as const, inputTokens: 20, outputTokens: 5 };
+              yield { type: "finish" as const, reason: "stop" as const };
+            },
+          },
+        };
+      },
+    },
+    permissions: createPermissionPolicy({ allowedEffects: ["read", "delegate"] }),
+    [sessionManagedControl]: {
+      store: createInMemoryManagedAgentControlStore(),
+      childSessionStores: createInMemorySessionStoreDirectory<SessionRecord>(),
+    },
+  });
+  const observer = new AbortController();
+  let restore: (() => void) | undefined;
+  try {
+    const parent = await lifecycle.create({ targetIdentity });
+    const control = await lifecycle[sessionManagedControl](parent.sessionId);
+    if (control === undefined) throw new Error("Expected current Control owner");
+    const completed = (async () => {
+      for await (const frame of control.observe({
+        parentSessionId: parent.sessionId,
+        signal: observer.signal,
+      })) {
+        if (
+          frame.snapshot.threads[0]?.turn.phase === "idle" &&
+          frame.snapshot.completions.length === 1
+        )
+          return frame.snapshot.threads[0];
+      }
+      throw new Error("Missing completed child");
+    })();
+    await control.dispatch({
+      type: "start_thread",
+      parentSessionId: parent.sessionId,
+      role: "builtin:explore",
+      task: "Inspect evidence",
+      description: "Completed evidence",
+    });
+    const thread = await withManagedFailureGuard(completed, "completed child receipt");
+    expect(thread.turn.outcome).toMatchObject({
+      status: "completed",
+      summary: "Durable child evidence.",
+    });
+    const records = await (await harness.sessions.open(parent.sessionId))?.read();
+    const genesis = records?.[0];
+    if (
+      genesis?.schemaVersion !== 3 ||
+      genesis.record.type !== "session_genesis" ||
+      genesis.record.promptContext === undefined
+    )
+      throw new Error("Expected parent profile");
+    const base = genesis.record.promptContext.base;
+    const digest = base.digest;
+    restore = () => Object.assign(base, { digest });
+    Object.assign(base, { digest: `sha256:${"0".repeat(64)}` });
+    await expect(lifecycle.inspect({ sessionId: parent.sessionId })).rejects.toMatchObject({
+      code: "session_invalid",
+    });
+    await expect(lifecycle.close()).resolves.toMatchObject({ status: "closed" });
+    expect(
+      (await control.inspect({ parentSessionId: parent.sessionId })).threads[0]?.turn.outcome,
+    ).toEqual(thread.turn.outcome);
+    expect(
+      await control.dispatch({
+        type: "start_thread",
+        parentSessionId: parent.sessionId,
+        role: "builtin:explore",
+        task: "Must stay closed",
+        description: "No new work",
+      }),
+    ).toMatchObject({ status: "rejected" });
+  } finally {
+    observer.abort();
+    restore?.();
+    await lifecycle.close().catch(() => undefined);
+  }
+});
