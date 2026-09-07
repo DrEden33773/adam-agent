@@ -367,8 +367,8 @@ test("queued agents stay individually inspectable and exact cancellation never o
       lastOutcome: "cancelled",
     });
     expect(calls).toBe(4);
-    await h.press("\u001b", "Agents workspace");
-    await h.press("\u001b", "Fleet");
+    await h.press("\u001b[27;1;27~", "Agents workspace", "Esc list");
+    await h.press("\u001b[27;1;27~", "Fleet", "Agents workspace");
     expect(
       h.terminal.lines().join("\n").slice(h.terminal.lines().join("\n").indexOf("Fleet ·")),
     ).not.toContain("@explore-5");
