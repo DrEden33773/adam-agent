@@ -2,7 +2,7 @@ import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { constants, lstatSync, realpathSync } from "node:fs";
 import { lstat, open } from "node:fs/promises";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 
 import { rgPath } from "@vscode/ripgrep";
@@ -57,14 +57,20 @@ const searchRepositoryInputSchema = z.discriminatedUnion("kind", [
   }),
 ]);
 
+const snippetSchema = z
+  .string()
+  .refine(
+    (value) => value.isWellFormed() && Array.from(value).length <= maximumSnippetCharacters,
+    "Search snippets must contain at most 500 complete Unicode characters.",
+  );
 const contextLineSchema = z.strictObject({
   line: z.number().int().positive(),
-  snippet: z.string().max(maximumSnippetCharacters),
+  snippet: snippetSchema,
 });
 const contentMatchSchema = z.strictObject({
   line: z.number().int().positive(),
   column: z.number().int().positive(),
-  snippet: z.string().max(maximumSnippetCharacters),
+  snippet: snippetSchema,
   rankReason: z.enum(["literal", "regex"]),
   contextBefore: z.array(contextLineSchema).max(3),
   contextAfter: z.array(contextLineSchema).max(3),
@@ -302,11 +308,21 @@ class SearchSnapshotRegistry {
     readonly limit: number;
   }) {
     const boundedMatches = input.matches.slice(0, maximumSnapshotResults);
+    const identity: ContentPageIdentity = {
+      id: randomUUID(),
+      query: input.query,
+      path: input.path,
+      mode: input.mode,
+      case: input.case,
+      context: input.context,
+      resultCount: boundedMatches.length,
+    };
     const pages = createContentPages(
       boundedMatches,
       input.limit,
       input.matches.length,
       input.omissions,
+      identity,
     );
     const byteCount = Buffer.byteLength(JSON.stringify(pages), "utf8");
     if (byteCount > maximumSnapshotBytes) {
@@ -318,7 +334,7 @@ class SearchSnapshotRegistry {
     const now = Date.now();
     this.#pruneExpired(now);
     const snapshot: SearchSnapshot = {
-      id: randomUUID(),
+      id: identity.id,
       sessionId: input.sessionId,
       toolProfileDigest: input.toolProfileDigest,
       requestKey: input.requestKey,
@@ -349,11 +365,19 @@ class SearchSnapshotRegistry {
     readonly limit: number;
   }) {
     const boundedEntries = input.entries.slice(0, maximumSnapshotResults);
+    const identity: PathPageIdentity = {
+      id: randomUUID(),
+      query: input.query,
+      path: input.path,
+      mode: input.mode,
+      resultCount: boundedEntries.length,
+    };
     const pages = createPathPages(
       boundedEntries,
       input.limit,
       input.entries.length,
       input.omissions,
+      identity,
     );
     const byteCount = Buffer.byteLength(JSON.stringify(pages), "utf8");
     if (byteCount > maximumSnapshotBytes) {
@@ -365,7 +389,7 @@ class SearchSnapshotRegistry {
     const now = Date.now();
     this.#pruneExpired(now);
     const snapshot: PathSearchSnapshot = {
-      id: randomUUID(),
+      id: identity.id,
       sessionId: input.sessionId,
       toolProfileDigest: input.toolProfileDigest,
       requestKey: input.requestKey,
@@ -426,64 +450,37 @@ class SearchSnapshotRegistry {
   }
 
   #output(snapshot: SearchSnapshot, pageIndex: number) {
-    const nextPageIndex = pageIndex + 1;
+    const hasNext = pageIndex + 1 < snapshot.pages.length;
     if (snapshot.kind === "path") {
       const page = snapshot.pages[pageIndex] ?? { entries: [], omissions: [] };
       const consumed = snapshot.pages
-        .slice(0, nextPageIndex)
+        .slice(0, pageIndex + 1)
         .reduce((total, candidate) => total + candidate.entries.length, 0);
-      return {
-        schemaVersion: 1 as const,
-        policyVersion: searchPolicyVersion,
-        kind: "path" as const,
-        mode: snapshot.mode,
-        query: snapshot.query,
-        path: snapshot.path,
-        resultCount: page.entries.length,
-        snapshotResultCount: snapshot.resultCount,
-        pageIndex,
-        remainingResultCount: snapshot.resultCount - consumed,
-        ...(nextPageIndex < snapshot.pages.length
-          ? { nextCursor: encodeCursor(snapshot.id, nextPageIndex) }
-          : {}),
-        currentContentMustBeReread: true as const,
-        entries: page.entries,
-        omissions: page.omissions,
-      };
+      return validateSearchOutput(
+        pathPageOutput(snapshot, page, pageIndex, snapshot.resultCount - consumed, hasNext),
+      );
     }
     const page = snapshot.pages[pageIndex] ?? { matches: [], omissions: [] };
     const consumed = snapshot.pages
-      .slice(0, nextPageIndex)
+      .slice(0, pageIndex + 1)
       .reduce((total, candidate) => total + candidate.matches.length, 0);
-    const groups = new Map<string, ContentMatch[]>();
-    for (const { path, ...match } of page.matches) {
-      const grouped = groups.get(path) ?? [];
-      grouped.push(match);
-      groups.set(path, grouped);
-    }
-    return {
-      schemaVersion: 1 as const,
-      policyVersion: searchPolicyVersion,
-      kind: "content" as const,
-      mode: snapshot.mode,
-      case: snapshot.case,
-      context: snapshot.context,
-      query: snapshot.query,
-      path: snapshot.path,
-      resultCount: page.matches.length,
-      snapshotResultCount: snapshot.resultCount,
-      pageIndex,
-      remainingResultCount: snapshot.resultCount - consumed,
-      ...(nextPageIndex < snapshot.pages.length
-        ? { nextCursor: encodeCursor(snapshot.id, nextPageIndex) }
-        : {}),
-      currentContentMustBeReread: true as const,
-      groups: [...groups].map(([path, matches]) => ({ path, matches })),
-      omissions: page.omissions,
-    };
+    return validateSearchOutput(
+      contentPageOutput(snapshot, page, pageIndex, snapshot.resultCount - consumed, hasNext),
+    );
   }
 
   #admit(snapshot: SearchSnapshot) {
+    for (let pageIndex = 0; pageIndex < snapshot.pages.length; pageIndex += 1) {
+      if (
+        Buffer.byteLength(JSON.stringify(this.#output(snapshot, pageIndex)), "utf8") >
+        maximumPageBytes
+      ) {
+        throw new SearchCursorError(
+          "search_quota_exceeded",
+          "The repository search page metadata exceeded its UTF-8 byte limit.",
+        );
+      }
+    }
     while (
       this.#snapshots.size >= maximumSnapshots ||
       this.#aggregateBytes + snapshot.byteCount > maximumAggregateSnapshotBytes
@@ -497,17 +494,6 @@ class SearchSnapshotRegistry {
         "search_quota_exceeded",
         "The repository search snapshot registry is full.",
       );
-    }
-    for (let pageIndex = 0; pageIndex < snapshot.pages.length; pageIndex += 1) {
-      if (
-        Buffer.byteLength(JSON.stringify(this.#output(snapshot, pageIndex)), "utf8") >
-        maximumPageBytes
-      ) {
-        throw new SearchCursorError(
-          "search_quota_exceeded",
-          "The repository search page metadata exceeded its UTF-8 byte limit.",
-        );
-      }
     }
     this.#snapshots.set(snapshot.id, snapshot);
     this.#aggregateBytes += snapshot.byteCount;
@@ -763,6 +749,7 @@ export type RepositorySearchProcessObserver = {
   recorded?(): void;
   signalled?(signal: NodeJS.Signals): void;
   closed(): void;
+  gitClosed?(): void;
 };
 
 export type RepositorySearchBackend = {
@@ -793,7 +780,13 @@ function createProcessRepositorySearchBackend(options: {
 }): RepositorySearchBackend {
   return {
     readChangedPaths(input) {
-      return readGitChangedPaths(input.workspaceRoot, input.path, input.signal, input.budget);
+      return readGitChangedPaths(
+        input.workspaceRoot,
+        input.path,
+        input.signal,
+        input.budget,
+        options.processObserver,
+      );
     },
     runRecords(input) {
       return runRipgrepRecords({
@@ -868,12 +861,10 @@ async function runContentSearch(options: {
         : ["--ignore-case"]),
     "--color",
     "never",
-    ...options.include.flatMap((glob) => ["--glob", glob]),
     ...options.exclude.flatMap((glob) => ["--glob", `!${glob}`]),
     ...(options.context === 0 ? [] : ["--context", String(options.context)]),
     "--",
     options.query,
-    options.path,
   ];
   const changedPaths = await options.backend.readChangedPaths({
     workspaceRoot: options.workspaceRoot,
@@ -882,21 +873,60 @@ async function runContentSearch(options: {
     budget: options.budget,
   });
   try {
+    const discovery =
+      options.include.length > 0 || options.path !== "."
+        ? await discoverSearchPaths({
+            ...options,
+            positiveGlobs: options.include,
+            negativeGlobs: options.exclude.map((glob) => `!${glob}`),
+          })
+        : undefined;
+    const preflight =
+      discovery === undefined
+        ? undefined
+        : await probeCandidatePaths(
+            options.workspaceRoot,
+            discovery.paths,
+            options.budget,
+            options.probeFileSystem,
+            options.signal,
+            discovery.identities,
+          );
+    const admission =
+      discovery === undefined || preflight === undefined
+        ? undefined
+        : {
+            paths: new Set(preflight.paths),
+            identities: discovery.identities,
+          };
     const collector = new ContentMatchCollector(
       options.mode,
       options.context,
       changedPaths,
       options.budget,
       options.workspaceRoot,
+      admission,
     );
-    await options.backend.runRecords({
-      args,
-      workspaceRoot: options.workspaceRoot,
-      signal: options.signal,
-      separator: "\n",
-      accept: (record) => collector.accept(record),
-      budget: options.budget,
-    });
+    const batches =
+      preflight === undefined ? [[options.path]] : searchPathArgumentBatches(preflight.paths);
+    for (const batch of batches.length === 0 ? [[]] : batches) {
+      options.signal.throwIfAborted();
+      await options.backend.runRecords({
+        // Empty stdin still lets the native backend validate a regex when
+        // discovery admitted no files, without scanning excluded paths.
+        args: [
+          ...args,
+          ...(batch.length === 0
+            ? ["-"]
+            : batch.map((path) => (path === "." ? path : `./${path}`))),
+        ],
+        workspaceRoot: options.workspaceRoot,
+        signal: options.signal,
+        separator: "\n",
+        accept: (record) => collector.accept(record),
+        budget: options.budget,
+      });
+    }
     const parsed = collector.finish();
     const probed = await probeCandidatePaths(
       options.workspaceRoot,
@@ -910,6 +940,7 @@ async function runContentSearch(options: {
     return {
       matches: parsed.matches.filter((match) => accepted.has(match.path)),
       omissions: [
+        ...(preflight?.omissions ?? []),
         ...probed.omissions,
         ...(parsed.omittedCandidateCount > 0
           ? [
@@ -949,51 +980,31 @@ async function runPathSearch(options: {
     signal: options.signal,
     budget: options.budget,
   });
-  let rawRecordCount = 0;
+  const discovery = await discoverSearchPaths({
+    ...options,
+    positiveGlobs: options.mode === "glob" && !options.query.startsWith("!") ? [options.query] : [],
+    negativeGlobs: options.mode === "glob" && options.query.startsWith("!") ? [options.query] : [],
+  });
   let rankedCandidateCount = 0;
-  const initialFileIdentities = new Map<string, FileIdentity | undefined>();
   const candidates = new BoundedBestCandidates<{
     readonly path: string;
     readonly tier: number;
     readonly rankReason: PathRankReason;
-  }>(maximumRankedCandidates, (left, right) => {
-    return left.tier - right.tier || compareChangedThenPath(left.path, right.path, changedPaths);
-  });
-  await options.backend.runRecords({
-    args: [
-      "--no-config",
-      "--no-require-git",
-      "--files",
-      "--null",
-      ...(options.mode === "glob" ? ["--glob", options.query] : []),
-      "--",
-      options.path,
-    ],
-    workspaceRoot: options.workspaceRoot,
-    signal: options.signal,
-    separator: "\0",
-    budget: options.budget,
-    accept(record) {
-      options.budget.consumeWorkRecord();
-      rawRecordCount += 1;
-      if (rawRecordCount > maximumRawRecords || rawRecordCount > maximumWorkRecords) {
-        throw new SearchCursorError(
-          "search_quota_exceeded",
-          "Repository path search exceeded its record limit.",
-        );
-      }
-      const path = record.split(sep).join("/").replace(/^\.\//u, "");
-      initialFileIdentities.set(path, captureFileIdentity(options.workspaceRoot, path));
-      const rank =
-        options.mode === "glob"
-          ? { tier: 0, rankReason: "glob" as const }
-          : fuzzyPathRank(options.query, path);
-      if (rank !== undefined) {
-        rankedCandidateCount += 1;
-        candidates.add({ path, ...rank });
-      }
-    },
-  });
+  }>(
+    maximumRankedCandidates,
+    (left, right) =>
+      left.tier - right.tier || compareChangedThenPath(left.path, right.path, changedPaths),
+  );
+  for (const path of discovery.paths) {
+    const rank =
+      options.mode === "glob"
+        ? { tier: 0, rankReason: "glob" as const }
+        : fuzzyPathRank(options.query, path);
+    if (rank !== undefined) {
+      rankedCandidateCount += 1;
+      candidates.add({ path, ...rank });
+    }
+  }
   options.signal.throwIfAborted();
   const ranked = candidates.sorted();
   const probed = await probeCandidatePaths(
@@ -1002,7 +1013,7 @@ async function runPathSearch(options: {
     options.budget,
     options.probeFileSystem,
     options.signal,
-    initialFileIdentities,
+    discovery.identities,
   );
   const accepted = new Set(probed.paths);
   const candidateOmissions =
@@ -1021,6 +1032,125 @@ async function runPathSearch(options: {
   return { entries, omissions: [...probed.omissions, ...candidateOmissions] };
 }
 
+const maximumSearchPathArgumentBytes = 64 * 1024;
+
+function searchPathArgumentBatches(paths: readonly string[]): readonly string[][] {
+  const batches: string[][] = [];
+  let batch: string[] = [];
+  let bytes = 0;
+  for (const path of paths) {
+    const size = Buffer.byteLength(path, "utf8") + 3;
+    if (size > maximumSearchPathArgumentBytes)
+      throw new SearchCursorError(
+        "search_quota_exceeded",
+        "One repository path exceeded the process argument bound.",
+      );
+    if (batch.length > 0 && bytes + size > maximumSearchPathArgumentBytes) {
+      batches.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(path);
+    bytes += size;
+  }
+  if (batch.length > 0) batches.push(batch);
+  return batches;
+}
+
+async function discoverSearchPaths(options: {
+  readonly workspaceRoot: string;
+  readonly path: string;
+  readonly signal: AbortSignal;
+  readonly budget: SearchRequestBudget;
+  readonly backend: RepositorySearchBackend;
+  readonly positiveGlobs: readonly string[];
+  readonly negativeGlobs: readonly string[];
+}): Promise<{
+  readonly paths: readonly string[];
+  readonly identities: ReadonlyMap<string, FileIdentity | undefined>;
+}> {
+  const identities = new Map<string, FileIdentity | undefined>();
+  let rawRecords = 0;
+  const args = [
+    "--no-config",
+    "--no-require-git",
+    "--no-follow",
+    "--files",
+    "--null",
+    ...options.negativeGlobs.flatMap((glob) => ["--glob", glob]),
+  ];
+  await options.backend.runRecords({
+    // An explicit ignored file or directory bypasses rg's ignore rules. Root
+    // metadata admission is filtered to the requested scope before any probe.
+    args: [...args, "--", "."],
+    workspaceRoot: options.workspaceRoot,
+    signal: options.signal,
+    separator: "\0",
+    budget: options.budget,
+    accept(record) {
+      options.budget.consumeWorkRecord();
+      rawRecords += 1;
+      if (rawRecords > maximumRawRecords)
+        throw new SearchCursorError(
+          "search_quota_exceeded",
+          "Repository path discovery exceeded its record limit.",
+        );
+      const path = normalizeSearchPath(record);
+      if (
+        path === undefined ||
+        (options.path !== "." && path !== options.path && !path.startsWith(`${options.path}/`))
+      )
+        return;
+      identities.set(path, captureFileIdentity(options.workspaceRoot, path));
+    },
+  });
+  // GitignoreBuilder treats raw comment and blank override lines as no-ops.
+  const positive = options.positiveGlobs.filter(
+    (glob) => !glob.startsWith("#") && !/^\p{White_Space}*$/u.test(glob),
+  );
+  if (positive.length === 0) return { paths: [...identities.keys()].sort(), identities };
+  const matching = new Set(identities.keys());
+  const parents = [...new Set([...matching].map((path) => dirname(path)))].sort();
+  for (const batch of searchPathArgumentBatches(parents.length === 0 ? ["."] : parents)) {
+    await options.backend.runRecords({
+      // A negative-only walk cannot override hidden or ignore exclusions. Its
+      // complement gives the exact native positive glob matches. Explicit
+      // admitted parents + depth one prevent directory pruning from making a
+      // directory-name match accidentally include all of its descendants.
+      args: [
+        ...args,
+        "--maxdepth",
+        parents.length === 0 ? "0" : "1",
+        ...positive.flatMap((glob) => ["--glob", `!${glob}`]),
+        "--",
+        ...batch.map((path) => (path === "." ? path : `./${path}`)),
+      ],
+      workspaceRoot: options.workspaceRoot,
+      signal: options.signal,
+      separator: "\0",
+      budget: options.budget,
+      accept(record) {
+        options.budget.consumeWorkRecord();
+        const path = normalizeSearchPath(record);
+        if (path !== undefined) matching.delete(path);
+      },
+    });
+  }
+  return { paths: [...matching].sort(), identities };
+}
+
+function normalizeSearchPath(value: string): string | undefined {
+  const path = value.split(sep).join("/").replace(/^\.\//u, "");
+  if (
+    path.length === 0 ||
+    isAbsolute(path) ||
+    hasHiddenPathComponent(path) ||
+    path.split("/").some((part) => part === "" || part === "." || part === "..")
+  )
+    return undefined;
+  return path;
+}
+
 function compareChangedThenPath(left: string, right: string, changedPaths: ReadonlySet<string>) {
   const changedDifference = Number(changedPaths.has(right)) - Number(changedPaths.has(left));
   return changedDifference || (left < right ? -1 : left > right ? 1 : 0);
@@ -1031,6 +1161,7 @@ function readGitChangedPaths(
   path: string,
   signal: AbortSignal,
   budget: RepositorySearchBackendBudget,
+  observer?: RepositorySearchProcessObserver,
 ): Promise<ReadonlySet<string>> {
   signal.throwIfAborted();
   return new Promise((resolvePromise, rejectPromise) => {
@@ -1068,77 +1199,61 @@ function readGitChangedPaths(
       return;
     }
     const chunks: Buffer[] = [];
-    let byteCount = 0;
     let settled = false;
-    let terminalError = false;
+    let unavailable = false;
+    let terminalError: unknown;
     const termination = createBoundedChildTermination(child);
     const abort = () => termination.start();
-    if (signal.aborted) {
-      abort();
-    } else {
-      signal.addEventListener("abort", abort, { once: true });
-    }
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
     child.stdout.on("data", (chunk: Buffer) => {
+      if (terminalError !== undefined) return;
       try {
         budget.consumeRawBytes(chunk.length);
-      } catch {
-        byteCount = maximumRawParsedBytes + 1;
+        chunks.push(chunk);
+      } catch (error) {
+        terminalError = error;
         termination.start();
-        return;
       }
-      byteCount += chunk.length;
-      chunks.push(chunk);
     });
     child.stderr.resume();
     child.once("error", () => {
-      if (settled) {
-        return;
-      }
-      terminalError = true;
+      if (settled) return;
+      unavailable = true;
       termination.start();
     });
     child.once("close", (exitCode) => {
-      if (settled) {
-        return;
-      }
+      if (settled) return;
       settled = true;
       termination.closed();
       signal.removeEventListener("abort", abort);
-      if (signal.aborted) {
-        rejectPromise(signal.reason);
-        return;
-      }
-      if (byteCount > maximumRawParsedBytes) {
-        rejectPromise(
-          new SearchCursorError(
-            "search_quota_exceeded",
-            "Repository Git status exceeded the raw byte limit.",
-          ),
-        );
-        return;
-      }
-      if (terminalError || exitCode !== 0) {
-        resolvePromise(new Set());
-        return;
-      }
-      const fields = Buffer.concat(chunks).toString("utf8").split("\0");
-      const paths = new Set<string>();
-      for (let index = 0; index < fields.length; index += 1) {
-        const field = fields[index];
-        if (field === undefined || field.length < 4) {
-          continue;
+      try {
+        observer?.gitClosed?.();
+        if (signal.aborted) throw signal.reason;
+        if (terminalError !== undefined) throw terminalError;
+        if (unavailable || exitCode !== 0) {
+          resolvePromise(new Set());
+          return;
         }
-        budget.consumeWorkRecord();
-        paths.add(field.slice(3).split(sep).join("/"));
-        if (field[0] === "R" || field[1] === "R" || field[0] === "C" || field[1] === "C") {
-          const source = fields[index + 1];
-          if (source !== undefined) {
-            paths.add(source.split(sep).join("/"));
-            index += 1;
+        const fields = Buffer.concat(chunks).toString("utf8").split("\0");
+        const paths = new Set<string>();
+        for (let index = 0; index < fields.length; index += 1) {
+          const field = fields[index];
+          if (field === undefined || field.length < 4) continue;
+          budget.consumeWorkRecord();
+          paths.add(field.slice(3).split(sep).join("/"));
+          if (field[0] === "R" || field[1] === "R" || field[0] === "C" || field[1] === "C") {
+            const source = fields[index + 1];
+            if (source !== undefined) {
+              paths.add(source.split(sep).join("/"));
+              index += 1;
+            }
           }
         }
+        resolvePromise(paths);
+      } catch (error) {
+        rejectPromise(error);
       }
-      resolvePromise(paths);
     });
   });
 }
@@ -1207,7 +1322,11 @@ async function probeCandidatePath(
     signal.throwIfAborted();
     const before = await fileSystem.lstat(absolutePath);
     signal.throwIfAborted();
-    if (!before.isFile() || before.isSymbolicLink()) {
+    if (
+      !before.isFile() ||
+      before.isSymbolicLink() ||
+      realpathSync(absolutePath) !== absolutePath
+    ) {
       return "non_ordinary";
     }
     if (
@@ -1273,6 +1392,7 @@ function captureFileIdentity(workspaceRoot: string, path: string): FileIdentity 
   }
   try {
     const current = lstatSync(absolutePath);
+    if (realpathSync(absolutePath) !== absolutePath) return undefined;
     return {
       dev: current.dev,
       ino: current.ino,
@@ -1354,6 +1474,7 @@ function runRipgrepRecords(options: {
   readonly processObserver?: RepositorySearchProcessObserver;
   accept(record: string): void;
 }): Promise<void> {
+  options.signal.throwIfAborted();
   return new Promise((resolvePromise, rejectPromise) => {
     let child: ChildProcessWithoutNullStreams;
     try {
@@ -1512,6 +1633,10 @@ class ContentMatchCollector {
     readonly changedPaths: ReadonlySet<string>,
     readonly budget: SearchRequestBudget,
     readonly workspaceRoot: string,
+    readonly admission?: {
+      readonly paths: ReadonlySet<string>;
+      readonly identities: ReadonlyMap<string, FileIdentity | undefined>;
+    },
   ) {
     this.#candidates = new BoundedBestCandidates(maximumRankedCandidates, (left, right) => {
       return (
@@ -1533,22 +1658,25 @@ class ContentMatchCollector {
     }
     const event = ripgrepEventSchema.parse(JSON.parse(line));
     if (event.type === "begin") {
-      const path = event.data.path.text.split(sep).join("/").replace(/^\.\//u, "");
-      this.#initialFileIdentities.set(path, captureFileIdentity(this.workspaceRoot, path));
+      const path = normalizeSearchPath(event.data.path.text);
+      if (path !== undefined && this.admission === undefined)
+        this.#initialFileIdentities.set(path, captureFileIdentity(this.workspaceRoot, path));
       return;
     }
     if (event.type !== "match" && event.type !== "context") {
       return;
     }
-    const path = event.data.path.text.split(sep).join("/").replace(/^\.\//u, "");
+    const path = normalizeSearchPath(event.data.path.text);
+    if (path === undefined || (this.admission !== undefined && !this.admission.paths.has(path)))
+      return;
     const snippet = truncateDisplayedCharacters(event.data.lines.text.replace(/[\r\n]+$/u, ""));
-    if (event.type === "context") {
+    if (this.context > 0) {
       this.#contextLines.set(`${path}\0${event.data.line_number}`, {
         line: event.data.line_number,
         snippet,
       });
-      return;
     }
+    if (event.type === "context") return;
     this.#rawMatchCount += event.data.submatches.length;
     if (this.#rawMatchCount > maximumRawRecords) {
       throw new SearchCursorError(
@@ -1597,7 +1725,7 @@ class ContentMatchCollector {
     return {
       matches,
       omittedCandidateCount: Math.max(0, this.#rawMatchCount - matches.length),
-      initialFileIdentities: this.#initialFileIdentities,
+      initialFileIdentities: this.admission?.identities ?? this.#initialFileIdentities,
     };
   }
 }
@@ -1652,171 +1780,254 @@ function truncateDisplayedCharacters(value: string): string {
   return Array.from(value).slice(0, maximumSnippetCharacters).join("");
 }
 
+type Omission = z.infer<typeof omissionSchema>;
+type PageIdentity = Pick<SearchSnapshotBase, "id" | "query" | "path" | "resultCount">;
+type PathPageIdentity = PageIdentity & Pick<PathSearchSnapshot, "mode">;
+type ContentPageIdentity = PageIdentity & Pick<ContentSearchSnapshot, "mode" | "case" | "context">;
+
+function pageEnvelope(
+  identity: PageIdentity,
+  pageIndex: number,
+  resultCount: number,
+  remainingResultCount: number,
+  hasNext: boolean,
+) {
+  return {
+    schemaVersion: 1 as const,
+    policyVersion: searchPolicyVersion,
+    query: identity.query,
+    path: identity.path,
+    resultCount,
+    snapshotResultCount: identity.resultCount,
+    pageIndex,
+    remainingResultCount,
+    ...(hasNext ? { nextCursor: encodeCursor(identity.id, pageIndex + 1) } : {}),
+    currentContentMustBeReread: true as const,
+  };
+}
+
+function pathPageOutput(
+  identity: PathPageIdentity,
+  page: PathPage,
+  pageIndex: number,
+  remaining: number,
+  hasNext: boolean,
+) {
+  return {
+    ...pageEnvelope(identity, pageIndex, page.entries.length, remaining, hasNext),
+    kind: "path" as const,
+    mode: identity.mode,
+    entries: page.entries,
+    omissions: page.omissions,
+  };
+}
+
+function contentPageOutput(
+  identity: ContentPageIdentity,
+  page: ContentPage,
+  pageIndex: number,
+  remaining: number,
+  hasNext: boolean,
+) {
+  return {
+    ...pageEnvelope(identity, pageIndex, page.matches.length, remaining, hasNext),
+    kind: "content" as const,
+    mode: identity.mode,
+    case: identity.case,
+    context: identity.context,
+    groups: [...groupMatches(page.matches)].map(([path, matches]) => ({
+      path,
+      matches: matches.map(({ path: _path, ...match }) => match),
+    })),
+    omissions: page.omissions,
+  };
+}
+
+function validateSearchOutput<T>(output: T): T {
+  if (!repositorySearchOutputSchema.safeParse(output).success) {
+    throw new Error("The repository search produced an invalid result.");
+  }
+  return output;
+}
+
+function pageFits(output: unknown): boolean {
+  return Buffer.byteLength(JSON.stringify(output), "utf8") <= maximumPageBytes;
+}
+
+function summarizeOmissions(omissions: readonly Omission[]): readonly Omission[] {
+  const counts = new Map<Omission["reason"], number>();
+  for (const omission of omissions)
+    counts.set(omission.reason, (counts.get(omission.reason) ?? 0) + omission.count);
+  return [...counts].map(([reason, count]) => ({ reason, path: ".", count }));
+}
+
+function snapshotOmissions(
+  initial: readonly Omission[],
+  unboundedCount: number,
+  resultCount: number,
+): readonly Omission[] {
+  return [
+    ...initial,
+    ...(unboundedCount > resultCount
+      ? [
+          {
+            reason: "snapshot_result_limit" as const,
+            path: ".",
+            count: unboundedCount - resultCount,
+          },
+        ]
+      : []),
+  ];
+}
+
 function createPathPages(
   entries: readonly PathEntry[],
   limit: number,
   unboundedResultCount: number,
-  initialOmissions: readonly z.infer<typeof omissionSchema>[],
+  initialOmissions: readonly Omission[],
+  identity: PathPageIdentity,
 ): readonly PathPage[] {
   const pages: PathPage[] = [];
+  const initial = snapshotOmissions(initialOmissions, unboundedResultCount, entries.length);
   let offset = 0;
-  while (offset < entries.length) {
-    const accepted: PathEntry[] = [];
-    const omissions = pages.length === 0 ? [...initialOmissions] : [];
-    while (accepted.length < limit && offset + accepted.length < entries.length) {
-      const entry = entries[offset + accepted.length];
-      if (entry === undefined) {
-        break;
+  do {
+    let candidates: PathEntry[] = [];
+    let page: PathPage | undefined;
+    const fixed = pages.length === 0 ? initial : [];
+    const compact = summarizeOmissions(fixed);
+    const fit = (candidate: PathEntry[]): PathPage | undefined => {
+      const rest = entries.length - offset - candidate.length;
+      const remainder: Omission[] =
+        rest > 0
+          ? [
+              {
+                reason: candidate.length === limit ? "page_limit" : "page_byte_limit",
+                path: ".",
+                count: rest,
+              },
+            ]
+          : [];
+      for (const accounting of [fixed, compact]) {
+        const proposal = { entries: candidate, omissions: [...accounting, ...remainder] };
+        if (pageFits(pathPageOutput(identity, proposal, pages.length, rest, rest > 0)))
+          return proposal;
       }
-      const remaining = entries.length - offset - accepted.length - 1;
-      const candidateOmissions =
-        remaining > 0
-          ? [...omissions, { reason: "page_byte_limit" as const, path: ".", count: remaining }]
-          : omissions;
+      return undefined;
+    };
+    while (candidates.length < limit && offset + candidates.length < entries.length) {
+      const entry = entries[offset + candidates.length];
+      if (entry === undefined) break;
+      candidates = [...candidates, entry];
+      // Omissions and cursors can disappear in a longer prefix. Only the
+      // mandatory result body is monotonic, so use it as the stopping bound.
       if (
-        Buffer.byteLength(
-          JSON.stringify({ entries: [...accepted, entry], omissions: candidateOmissions }),
-          "utf8",
-        ) >
-        12 * 1_024
-      ) {
+        !pageFits(
+          pathPageOutput(identity, { entries: candidates, omissions: [] }, pages.length, 0, false),
+        )
+      )
         break;
-      }
-      accepted.push(entry);
+      page = fit(candidates) ?? page;
     }
-    if (accepted.length === 0) {
+    if (entries.length === 0) page = fit([]);
+    if (page === undefined)
       throw new SearchCursorError(
         "search_quota_exceeded",
-        "One normalized repository path result exceeded the page byte limit.",
+        "One normalized repository path result and its accounting exceeded the page byte limit.",
       );
-    }
-    offset += accepted.length;
-    if (offset < entries.length) {
-      omissions.push({
-        reason: accepted.length === limit ? "page_limit" : "page_byte_limit",
-        path: ".",
-        count: entries.length - offset,
-      });
-    }
-    if (pages.length === 0 && unboundedResultCount > entries.length) {
-      omissions.push({
-        reason: "snapshot_result_limit",
-        path: ".",
-        count: unboundedResultCount - entries.length,
-      });
-    }
-    pages.push({ entries: accepted, omissions });
-  }
-  return pages.length === 0 ? [{ entries: [], omissions: [...initialOmissions] }] : pages;
+    pages.push(page);
+    offset += page.entries.length;
+  } while (offset < entries.length);
+  return pages;
 }
 
 function createContentPages(
   matches: readonly RankedContentMatch[],
   limit: number,
   unboundedResultCount: number,
-  initialOmissions: readonly z.infer<typeof omissionSchema>[],
+  initialOmissions: readonly Omission[],
+  identity: ContentPageIdentity,
 ): readonly ContentPage[] {
-  let remaining = [...groupMatches(matches).entries()].map(([path, grouped]) => ({
-    path,
-    matches: grouped,
-  }));
+  let remaining = [...groupMatches(matches)].map(([path, grouped]) => ({ path, matches: grouped }));
   const pages: ContentPage[] = [];
-  while (remaining.length > 0) {
-    const accepted: RankedContentMatch[] = [];
-    const next: typeof remaining = [];
-    const omissions: z.infer<typeof omissionSchema>[] =
-      pages.length === 0 ? [...initialOmissions] : [];
-    let byteLimited = false;
-    for (let groupIndex = 0; groupIndex < remaining.length; groupIndex += 1) {
-      const group = remaining[groupIndex] as (typeof remaining)[number];
-      const available = limit - accepted.length;
-      const maximumAcceptedCount = Math.min(
-        group.matches.length,
-        maximumMatchesPerFilePerPage,
-        Math.max(0, available),
-      );
-      let acceptedCount = 0;
-      while (acceptedCount < maximumAcceptedCount) {
-        const match = group.matches[acceptedCount];
-        if (match === undefined) {
+  const initial = snapshotOmissions(initialOmissions, unboundedResultCount, matches.length);
+  let consumed = 0;
+  do {
+    let candidates: RankedContentMatch[] = [];
+    const candidateCounts = new Map<string, { total: number; count: number }>();
+    let page: ContentPage | undefined;
+    const fixed = pages.length === 0 ? initial : [];
+    const compact = summarizeOmissions(fixed);
+    const fit = (candidate: RankedContentMatch[]): ContentPage | undefined => {
+      const rest = matches.length - consumed - candidate.length;
+      const reason =
+        candidate.length === limit ? ("page_limit" as const) : ("page_byte_limit" as const);
+      const remainders: Omission[] = [];
+      let displayedRemainder = 0;
+      for (const [path, group] of candidateCounts) {
+        const count = group.total - group.count;
+        if (count > 0) {
+          displayedRemainder += count;
+          remainders.push({
+            reason: group.count === maximumMatchesPerFilePerPage ? "per_file_page_limit" : reason,
+            path,
+            count,
+          });
+        }
+      }
+      const undisplayed = rest - displayedRemainder;
+      if (undisplayed > 0) remainders.push({ reason, path: ".", count: undisplayed });
+      for (const accounting of [fixed, compact]) {
+        const proposal = { matches: candidate, omissions: [...accounting, ...remainders] };
+        if (pageFits(contentPageOutput(identity, proposal, pages.length, rest, rest > 0)))
+          return proposal;
+      }
+      return undefined;
+    };
+    let full = false;
+    for (const group of remaining) {
+      for (const match of group.matches.slice(0, maximumMatchesPerFilePerPage)) {
+        if (candidates.length === limit) {
+          full = true;
           break;
         }
-        const candidateMatches = [...accepted, match];
-        const remainingCount =
-          remaining
-            .slice(groupIndex)
-            .reduce((total, candidate) => total + candidate.matches.length, 0) -
-          acceptedCount -
-          1;
-        const candidateOmissions =
-          remainingCount > 0
-            ? [
-                ...omissions,
-                {
-                  reason: "page_byte_limit" as const,
-                  path: ".",
-                  count: remainingCount,
-                },
-              ]
-            : omissions;
-        if (contentPagePayloadBytes(candidateMatches, candidateOmissions) > 12 * 1_024) {
-          byteLimited = true;
+        const previousCount = candidateCounts.get(group.path)?.count ?? 0;
+        candidateCounts.set(group.path, { total: group.matches.length, count: previousCount + 1 });
+        candidates = [...candidates, match];
+        if (
+          !pageFits(
+            contentPageOutput(
+              identity,
+              { matches: candidates, omissions: [] },
+              pages.length,
+              0,
+              false,
+            ),
+          )
+        ) {
+          full = true;
           break;
         }
-        accepted.push(match);
-        acceptedCount += 1;
+        page = fit(candidates) ?? page;
       }
-      const rest = group.matches.slice(acceptedCount);
-      if (rest.length > 0) {
-        next.push({ path: group.path, matches: rest });
-        omissions.push({
-          reason: byteLimited
-            ? "page_byte_limit"
-            : acceptedCount >= maximumMatchesPerFilePerPage
-              ? "per_file_page_limit"
-              : "page_limit",
-          path: group.path,
-          count: rest.length,
-        });
-      }
-      if (byteLimited) {
-        next.push(...remaining.slice(groupIndex + 1));
-        break;
-      }
+      if (full) break;
     }
-    if (accepted.length === 0) {
+    if (matches.length === 0) page = fit([]);
+    if (page === undefined)
       throw new SearchCursorError(
         "search_quota_exceeded",
-        "The repository search page could not make bounded progress.",
+        "The repository search result and its accounting could not make bounded progress.",
       );
-    }
-    if (pages.length === 0 && unboundedResultCount > matches.length) {
-      omissions.push({
-        reason: "snapshot_result_limit",
-        path: ".",
-        count: unboundedResultCount - matches.length,
-      });
-    }
-    pages.push({ matches: accepted, omissions });
-    remaining = next;
-  }
-  return pages.length === 0 ? [{ matches: [], omissions: [...initialOmissions] }] : pages;
-}
-
-function contentPagePayloadBytes(
-  matches: readonly RankedContentMatch[],
-  omissions: readonly z.infer<typeof omissionSchema>[],
-): number {
-  return Buffer.byteLength(
-    JSON.stringify({
-      groups: [...groupMatches(matches)].map(([path, grouped]) => ({
-        path,
-        matches: grouped.map(({ path: _path, ...match }) => match),
-      })),
-      omissions,
-    }),
-    "utf8",
-  );
+    pages.push(page);
+    consumed += page.matches.length;
+    const consumedByPath = new Map<string, number>();
+    for (const match of page.matches)
+      consumedByPath.set(match.path, (consumedByPath.get(match.path) ?? 0) + 1);
+    remaining = remaining.flatMap((group) => {
+      const rest = group.matches.slice(consumedByPath.get(group.path) ?? 0);
+      return rest.length === 0 ? [] : [{ path: group.path, matches: rest }];
+    });
+  } while (remaining.length > 0);
+  return pages;
 }
 
 function groupMatches(
