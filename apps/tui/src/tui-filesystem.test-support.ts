@@ -1,4 +1,5 @@
-import { access, readdir, readFile, rm, watch } from "node:fs/promises";
+import { watch } from "node:fs";
+import { access, readdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 import { cleanupActiveTuiFixtures } from "./tui-fixture.test-support.js";
@@ -43,42 +44,34 @@ export async function waitForFileContents(path: string, expected: string): Promi
   );
 }
 
-async function waitForFilesystemEffect<T>(
+export async function waitForFilesystemEffect<T>(
   path: string,
   observe: () => Promise<T | undefined>,
   action: string,
 ): Promise<T> {
   const directory = join(path, "..");
   const filename = path.slice(directory.length + 1);
-  const watcher = watch(directory);
+  let change = Promise.withResolvers<void>();
   const failure = Promise.withResolvers<never>();
+  // fs.watch subscribes immediately; the promise-based iterator is lazy.
+  const watcher = watch(directory, () => change.resolve());
+  watcher.on("error", failure.reject);
   const guard = setTimeout(
     () => failure.reject(new Error(`The fixture did not ${action} ${filename}.`)),
     missingFilesystemEffectFailureMilliseconds,
   );
   guard.unref();
   try {
-    const initial = await observe();
-    if (initial !== undefined) {
-      return initial;
+    while (true) {
+      const changed = change.promise;
+      const observed = await Promise.race([observe(), failure.promise]);
+      if (observed !== undefined) return observed;
+      await Promise.race([changed, failure.promise]);
+      change = Promise.withResolvers<void>();
     }
-    return await Promise.race([
-      (async () => {
-        for await (const _event of watcher) {
-          const observed = await observe();
-          if (observed !== undefined) {
-            return observed;
-          }
-        }
-        throw new Error(
-          `The filesystem watcher closed before the fixture could ${action} ${filename}.`,
-        );
-      })(),
-      failure.promise,
-    ]);
   } finally {
     clearTimeout(guard);
-    await watcher.return?.();
+    watcher.close();
   }
 }
 
